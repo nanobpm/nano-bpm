@@ -54,7 +54,7 @@
     clippy::expect_used,
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
@@ -157,7 +157,7 @@ fn journal_service_task_lifecycle() -> NamedJournal {
     );
 
     for i in 0..4u64 {
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("amount".to_string(), Value::Int(1000 + i as i64));
         events.extend(
             engine

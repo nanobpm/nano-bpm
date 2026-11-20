@@ -10,7 +10,7 @@
 //! applying every event through [`state::apply`] as it goes. The processor
 //! ([`Engine::process_step`]) only *reads* state and *decides*; it never mutates.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::command::{Command, JobAttribution};
@@ -23,6 +23,7 @@ mod api;
 mod boundary;
 mod call_activity;
 mod debug;
+mod event_subprocess;
 mod expression;
 mod flow_scope;
 mod memory;
@@ -30,7 +31,7 @@ mod migration;
 mod modify;
 mod resolve;
 pub use debug::{BreakCondition, DebugSession};
-use resolve::{JobProps, ResolvedUserTask};
+use resolve::{rearm_repetitions, JobProps, ResolvedUserTask};
 
 /// Whether the fixpoint loop should keep draining after a processed step, or pause
 /// and hand control back to a debugger. See [`StepDriver`].
@@ -170,6 +171,12 @@ pub struct Engine {
     /// never reads a wall clock itself; replay is unaffected because the
     /// timestamp is carried on the event.
     now: u64,
+    /// Per-command FEEL evaluation environment (#1642): the command's `now`
+    /// plus an RNG seeded from replicated engine state, installed around
+    /// planning and draining so FEEL's `now()`/`today()`/`random number()`/
+    /// `uuid()` agree across Raft replicas. Reseeded by every
+    /// `plan_command_at`, so it is per-command scratch and never snapshotted.
+    feel_env: crate::feel::EvalEnv,
     /// Round-robin cursor for spreading start-triggered (message-/timer-start)
     /// instances across the cluster's partitions. Not derived from events (the
     /// chosen target is baked onto the emitted `StartInstanceDispatched` event,
@@ -178,18 +185,14 @@ pub struct Engine {
     /// restores — a replica seeded from the journal then routes the next
     /// round-robin start exactly like a peer that never restarted.
     start_dispatch_rr: u64,
-    /// When `true`, a `CompleteJob` / `FailJob` / `ThrowJobError` is accepted for a
-    /// job that has never been activated (the `activated` latch is not required).
-    /// This supports a clustered mode where the activation lock is *leader-local*
-    /// (not replicated through Raft): a follower's engine never observes the
-    /// `JobActivated` event, so a replicated completion would otherwise fail the
-    /// `JobNotActivated` check and diverge from the leader. Possession of the job
-    /// key *is* the capability (keys are only handed out by activation), so this
-    /// stays within the at-least-once contract. Runtime config (set identically on
-    /// every replica from `NANOBPMN_REPLICATE_ACTIVATION`); NOT part of the
-    /// snapshot, so it never affects replay/snapshot determinism. Defaults to
-    /// `false` — the strict single-node/RF=1 behaviour is unchanged.
-    lenient_completion: bool,
+    /// LEGACY (pre-cutover) lenient completion (#1661, ADR 0066 "Rolling
+    /// upgrade"): host config set from the activation policy at startup,
+    /// identically on every node — today's (pre-#1661) behaviour, kept only
+    /// until every cluster member advertises the replicated-lenient feature and
+    /// the leader commits `SetLenientCompletion`. From that log index on the
+    /// replicated [`State::lenient_completion`] governs; this flag can then only
+    /// agree with it (lenience is one-way). NOT part of the snapshot.
+    legacy_lenient_completion: bool,
     /// The current command's proposer-stamped terminal deadline (#1494):
     /// `(job_key, JobAttribution::deadline)` from a stamped `CompleteJob` /
     /// `FailJob` / `ThrowJobError`, read by [`Engine::job_terminal_deadline`]
@@ -197,6 +200,13 @@ pub struct Engine {
     /// `plan_command_at`, so a rejected command's stamp can never leak into a
     /// later one. Never snapshotted.
     terminal_deadline_stamp: Option<(Key, Option<u64>)>,
+    /// The current command's caller `operationReference` (#1556), set ONLY by
+    /// [`Engine::apply_command_records_at`] — the single seam that stamps it on
+    /// every [`Record`](crate::Record) the command produces — and read at the
+    /// [`Engine::emit`] choke point for the legacy per-event audit fields.
+    /// Per-command scratch: reset by every `plan_command_at`. Never
+    /// snapshotted.
+    operation_reference: Option<i64>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -208,11 +218,11 @@ pub struct Engine {
     /// Instances whose process-level variables changed since the last
     /// [`drain_dirty_vars`](Engine::drain_dirty_vars) (i.e. since the last
     /// snapshot checkpoint). Only populated when [`track_dirty_vars`] is set.
-    dirty_vars: HashSet<Key>,
+    dirty_vars: BTreeSet<Key>,
     /// Instances evicted (terminal) since the last checkpoint, whose durable
     /// variable rows must be deleted from the store. Only populated when
     /// [`track_dirty_vars`] is set.
-    forgotten_vars: HashSet<Key>,
+    forgotten_vars: BTreeSet<Key>,
     /// Follower-only safety net for the retirement digest (RF>1). A leader completes
     /// and exporter-evicts an instance and broadcasts its key, but under leader-durable
     /// the ack happens on the leader before the async learner has applied the
@@ -224,7 +234,7 @@ pub struct Engine {
     /// per-command check is free). Bounded — it only ever holds keys in the brief
     /// window between a retirement and its create, so it drains continuously. NOT
     /// part of the snapshot; pure host-side bookkeeping, never affects determinism.
-    retired_tombstones: HashSet<Key>,
+    retired_tombstones: BTreeSet<Key>,
     /// Sub-process scopes torn down (by a scoped terminate end or an interrupting
     /// boundary) during the command currently draining. A scoped teardown removes
     /// every descendant token but deliberately leaves the enclosing sub-process
@@ -238,15 +248,17 @@ pub struct Engine {
     /// emitted events, never re-runs the guard), and the whole window lives inside
     /// one command's drain — so it is cleared at the top of every
     /// [`plan_command_at`](Self::plan_command_at) and never affects determinism.
-    torn_down_scopes: HashSet<Key>,
-    /// Host-injected **cluster variables** (see [`crate::cluster_vars`]): a shared,
-    /// mutable snapshot of global + per-tenant configuration values that FEEL
-    /// expressions resolve at runtime. External configuration, not journaled
-    /// state: it is never part of a snapshot and never affects replay determinism
-    /// (the host re-installs the shared handle on every engine rebuild via
-    /// [`set_cluster_variables`](Engine::set_cluster_variables)). Empty by default,
-    /// in which case variable resolution keeps its zero-copy fast path.
-    cluster_variables: crate::cluster_vars::ClusterVariables,
+    torn_down_scopes: BTreeSet<Key>,
+    /// Event payloads (message / signal variables) for an event sub-process
+    /// whose start event carries output mappings, keyed by `(instance_key,
+    /// host_scope_key, esp_element_id)` (#1555, Zeebe parity): Zeebe creates
+    /// such a payload LOCAL to the start event instance — only the mapped
+    /// targets propagate. This in-drain scratch only bridges correlation to
+    /// the container activation queued in the SAME drain, which journals the
+    /// payload as [`Event::EventSubProcessPayloadHeld`] against the concrete
+    /// container instance (durable from then on). Cleared per command, like
+    /// [`torn_down_scopes`](Self::torn_down_scopes).
+    esp_start_payloads: BTreeMap<(Key, Key, String), BTreeMap<String, Value>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -312,6 +324,16 @@ enum JoinKind {
 /// A unit of internal work in the processing loop — one transition of the BPMN
 /// element lifecycle.
 enum Step {
+    /// Fire the **interrupting** event sub-process `esp_element_id` hosted by
+    /// scope `scope` (`0` = the process root) — queued by an escalation throw
+    /// caught by an interrupting escalation event sub-process (#1555), so the
+    /// interrupt runs once the throw's own completion is applied. Handled in
+    /// the drain loop (it needs the queue to purge host-scope work).
+    TriggerEventSubProcess {
+        instance_key: Key,
+        scope: Key,
+        esp_element_id: String,
+    },
     /// Run an element through `ACTIVATING -> ACTIVATED` (and decide what comes
     /// next based on its kind).
     Activate {
@@ -326,6 +348,16 @@ enum Step {
         /// per flow (#1233). Build flow activations with
         /// [`Engine::take_flow`], never by hand.
         via: Option<IncomingFlow>,
+    },
+    /// Re-run ONLY the catch walk of an [`ErrorEndEvent`](ElementKind::ErrorEndEvent)
+    /// parked by an `UNHANDLED_ERROR` incident (#1592). The element already
+    /// rests in COMPLETING with its output mappings applied and its end
+    /// listeners finished, so resolving the incident must not re-drive
+    /// `Complete` (which would re-apply outputs and re-fire listeners).
+    RetryErrorEndThrow {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
     },
     /// Run an already-activated element through `COMPLETING -> COMPLETED` and take
     /// its outgoing sequence flows.
@@ -349,7 +381,7 @@ enum Step {
         element_id: String,
         container_key: Key,
         inner_key: Key,
-        output_updates: HashMap<String, Value>,
+        output_updates: BTreeMap<String, Value>,
     },
     /// Create a fresh job for an already-active service-task element instance.
     /// Used to retry a parked service task when its incident is resolved (the
@@ -439,6 +471,19 @@ enum Step {
         /// scope — the same view the failed arming used).
         base: Key,
     },
+    /// Retry ONLY the re-arm of a fired repeating timer cycle whose FEEL
+    /// expression failed ([`state::IoMappingRedrive::TimerCycleRearm`], #1596
+    /// review), resuming its partially consumed repetition count from the
+    /// fired timer's due time — never the host's activation, which would reset
+    /// a bounded cycle to its full count.
+    RetryTimerCycleRearm {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        kind: state::TimerKind,
+        previous_due_at: u64,
+        remaining: Option<u32>,
+    },
     /// Re-drive the completion of an already-activated multi-instance child
     /// whose `outputElement` / the body's `completionCondition` raised
     /// ([`state::IoMappingRedrive::MiChildCompletion`], #1398 review).
@@ -450,7 +495,7 @@ enum Step {
         element_id: String,
         body_key: Key,
         child_key: Key,
-        output_overlay: Option<HashMap<String, Value>>,
+        output_overlay: Option<BTreeMap<String, Value>>,
     },
     /// Run the activation body of an element a process-instance modification
     /// already activated and seeded with element-local variables (Zeebe sets a
@@ -473,7 +518,7 @@ enum Step {
         instance_key: Key,
         element_id: String,
         scope: Key,
-        locals: Vec<HashMap<String, Value>>,
+        locals: Vec<BTreeMap<String, Value>>,
     },
     /// Activate one child of a multi-instance body: instantiate `element_id`
     /// again in the body's scope with the `index`-th item's local bindings. The
@@ -496,7 +541,7 @@ enum Step {
         instance_key: Key,
         container_key: Key,
         element_id: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
     /// Complete an ad-hoc container: write its aggregated `outputCollection`,
     /// (when `cancel`) cancel any tool children still running, drop its runtime
@@ -543,7 +588,7 @@ enum Step {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
-        child_variables: HashMap<String, Value>,
+        child_variables: BTreeMap<String, Value>,
     },
     /// Re-drive a multi-instance **child**'s activation after its input-mapping
     /// incident is resolved (#946): re-apply the child's inputs against its
@@ -587,7 +632,7 @@ enum Step {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
-        preserved_seed: Option<HashMap<String, Value>>,
+        preserved_seed: Option<BTreeMap<String, Value>>,
     },
 }
 
@@ -595,6 +640,12 @@ enum Step {
 /// activity parks on an incident instead of recursing further. Guards against
 /// self / mutually-recursive callees that never terminate.
 const MAX_CALL_ACTIVITY_DEPTH: usize = 1000;
+
+/// `reason` of a resident off-heap orphan's `VariablesLost` incident (#1384).
+const RESIDENT_ORPHAN_REASON: &str = "variables lost: spill row missing";
+/// `reason` of a cold off-heap orphan's `VariablesLost` incident (#1481).
+const COLD_ORPHAN_REASON: &str = "variables lost: cold instance row missing from the spill \
+                                  store; the whole instance is unrecoverable";
 
 impl Engine {
     /// Creates an empty engine for the single-partition (id `0`) namespace.
@@ -620,15 +671,17 @@ impl Engine {
             next_local: 0,
             num_partitions: 1,
             now: 0,
+            feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: 0,
-            lenient_completion: false,
+            legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
+            operation_reference: None,
             track_dirty_vars: false,
-            dirty_vars: HashSet::new(),
-            forgotten_vars: HashSet::new(),
-            retired_tombstones: HashSet::new(),
-            torn_down_scopes: HashSet::new(),
-            cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            dirty_vars: BTreeSet::new(),
+            forgotten_vars: BTreeSet::new(),
+            retired_tombstones: BTreeSet::new(),
+            torn_down_scopes: BTreeSet::new(),
+            esp_start_payloads: BTreeMap::new(),
             raft_applied: None,
         }
     }
@@ -636,6 +689,15 @@ impl Engine {
     /// Read-only access to the full engine state (useful for queries and tests).
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// The clock reading of the command currently being processed (the units the
+    /// host supplies — Unix epoch ms on the server). The engine never reads a
+    /// wall clock itself; this is the logical `now` the last `apply_command_at`
+    /// set, used by hosts that need to compare a persisted deadline (e.g. a
+    /// job's `retryBackOff`, #933) against the engine's clock.
+    pub fn now(&self) -> u64 {
+        self.now
     }
 
     /// Mutable access to the full engine state, for tests that need to simulate
@@ -657,16 +719,6 @@ impl Engine {
         self.num_partitions = num_partitions.max(1);
     }
 
-    /// Enables (or disables) lenient completion: when `true`, `CompleteJob` /
-    /// `FailJob` / `ThrowJobError` no longer require the job to have been activated
-    /// first. A clustered host sets this from `NANOBPMN_REPLICATE_ACTIVATION=0` so
-    /// the activation lock can stay leader-local (un-replicated) while replicated
-    /// completions still apply cleanly on followers that never saw the activation.
-    /// See the `lenient_completion` field. Must be set identically on every replica.
-    pub fn set_lenient_completion(&mut self, lenient: bool) {
-        self.lenient_completion = lenient;
-    }
-
     /// The worker a terminal job event attributes (#963): the replicated
     /// command's stamp when present (authoritative on every replica, including
     /// a "resolved absent" `worker: None`), else the live job's attribution for
@@ -682,28 +734,41 @@ impl Engine {
         }
     }
 
-    /// Whether lenient completion is enabled (see [`Self::set_lenient_completion`]).
+    /// Whether lenient completion is in effect: the replicated
+    /// [`State::lenient_completion`] (set by [`Command::SetLenientCompletion`])
+    /// OR the pre-cutover legacy host flag (see
+    /// [`Self::set_legacy_lenient_completion`]).
     pub fn lenient_completion(&self) -> bool {
-        self.lenient_completion
+        self.state.lenient_completion || self.legacy_lenient_completion
     }
 
-    /// Installs the shared [`ClusterVariables`](crate::cluster_vars::ClusterVariables)
-    /// handle the engine reads while assembling a FEEL evaluation context. The host
-    /// (the gateway) owns the write side and mutates the snapshot as REST create /
-    /// update / delete requests land; the engine observes the live set. Cluster
-    /// variables are external configuration, so this is host-side wiring that never
-    /// affects replay/snapshot determinism — the host re-installs the handle after
-    /// every engine rebuild (replay / snapshot restore) so the link survives.
-    pub fn set_cluster_variables(
-        &mut self,
-        cluster_variables: crate::cluster_vars::ClusterVariables,
-    ) {
-        self.cluster_variables = cluster_variables;
+    /// Whether the REPLICATED lenient-completion flag has been committed (#1661).
+    /// One-way: once `true` it stays `true` for the partition's life.
+    pub fn replicated_lenient_completion(&self) -> bool {
+        self.state.lenient_completion
     }
 
-    /// The shared cluster-variable handle (see [`Self::set_cluster_variables`]).
-    pub fn cluster_variables(&self) -> &crate::cluster_vars::ClusterVariables {
-        &self.cluster_variables
+    /// Sets the pre-cutover legacy lenient-completion host flag (#1661, ADR 0066
+    /// "Rolling upgrade"): set identically on every node from the activation
+    /// policy at startup, exactly as before #1661, so a mixed-version cluster
+    /// keeps today's behaviour until the replicated flag is committed.
+    pub fn set_legacy_lenient_completion(&mut self, lenient: bool) {
+        self.legacy_lenient_completion = lenient;
+    }
+
+    /// The replicated cluster-variable state (#1657) every FEEL evaluation
+    /// reads: engine state, changed only by the cluster-variable commands, so
+    /// it is the value at the log position being applied.
+    pub fn cluster_variables(&self) -> &crate::cluster_vars::ClusterVariableState {
+        &self.state.cluster_variables
+    }
+
+    /// Whether this partition has EVER applied a cluster-variable create
+    /// (#1657). One-way: the id cursor is never reset, so this stays `true`
+    /// after every variable is deleted and across snapshot recovery — the
+    /// retained log/snapshot still depends on `cluster-variables-v1`.
+    pub fn cluster_variables_ever_used(&self) -> bool {
+        !self.state.cluster_variables.is_unused()
     }
 
     /// The cluster-wide partition count this engine is configured with.
@@ -776,15 +841,17 @@ impl Engine {
             next_local,
             num_partitions: 1,
             now: 0,
+            feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr,
-            lenient_completion: false,
+            legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
+            operation_reference: None,
             track_dirty_vars: false,
-            dirty_vars: HashSet::new(),
-            forgotten_vars: HashSet::new(),
-            retired_tombstones: HashSet::new(),
-            torn_down_scopes: HashSet::new(),
-            cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            dirty_vars: BTreeSet::new(),
+            forgotten_vars: BTreeSet::new(),
+            retired_tombstones: BTreeSet::new(),
+            torn_down_scopes: BTreeSet::new(),
+            esp_start_payloads: BTreeMap::new(),
             raft_applied,
         }
     }
@@ -817,6 +884,19 @@ impl Engine {
             self.partition_id
         );
         state::compose_key(self.partition_id, self.next_local)
+    }
+
+    /// The key [`mint_key`](Self::mint_key) will issue next, WITHOUT advancing
+    /// the allocator. Pure read. Used by the orphan-quarantine leader to stamp
+    /// its proposal's loss-episode id (#1587): two stamped copies of one
+    /// detection episode agree, and a delayed duplicate of a resolved episode
+    /// is a no-op. The episode is the leader's allocator position AT STAMP
+    /// TIME — unrelated key-minting work can advance the allocator before the
+    /// proposal commits, so the apply gate treats a mismatch as a SUPERSEDED
+    /// stamp (re-stamp + re-propose via [`Event::OrphanStampSuperseded`]),
+    /// never as authority to drop a still-pending report (#1587 review).
+    fn peek_next_key(&self) -> Key {
+        state::compose_key(self.partition_id, self.next_local.saturating_add(1))
     }
 
     /// The root (top-level ancestor) process instance key for `instance_key`:
@@ -1511,7 +1591,7 @@ impl Engine {
         queue: &mut VecDeque<Step>,
         process_id: String,
         start_event: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         process_definition_key: Key,
@@ -1566,7 +1646,7 @@ impl Engine {
         queue: &mut VecDeque<Step>,
         process_id: String,
         start_event: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         message_start: Option<MessageStartCorrelation>,
@@ -1621,7 +1701,7 @@ impl Engine {
         queue: &mut VecDeque<Step>,
         process_id: String,
         start_event: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         message_start: Option<MessageStartCorrelation>,
@@ -1658,13 +1738,281 @@ impl Engine {
         }
     }
 
+    /// Registers one deployment bundle under a single shared deployment key
+    /// (see [`Command::DeployBundle`]). Processes are preflighted (and may be
+    /// rejected) before anything is emitted, so the bundle stays atomic; the
+    /// other kinds cannot fail.
+    fn deploy_bundle(
+        &mut self,
+        log: &mut Vec<Event>,
+        mut bundle: crate::command::DeploymentBundle,
+    ) -> Result<(), EngineError> {
+        for process in &mut bundle.processes {
+            process.normalize_legacy_agent_tasks();
+        }
+        // Zeebe: an all-duplicate deployment is a no-op; otherwise every
+        // resource is re-versioned under the new deployment key so the bundle
+        // stays mutually resolvable for `bindingType: deployment`.
+        //
+        // …with one membership refinement (#1193 review): content equality does
+        // not imply SHARED deployment membership. A duplicate process may be
+        // reused only while the bundle's submitted `deployment` bindings still
+        // resolve against the deployment the reuse pins — otherwise the bundle
+        // is re-versioned together. Deploying a process and its form separately
+        // and then resubmitting them unchanged together must not leave the
+        // process pinned to a deployment without the form (an incident on every
+        // instance).
+        //
+        // `force` is computed DIRECTLY from the two checks — never by mutating
+        // the submitted XML and recursing (#1193 review): rewriting
+        // `bindingType="deployment"` to `latest` to break byte-equality both
+        // fails to terminate (single-quoted / whitespace-separated attributes,
+        // or a programmatic definition with empty `xml`, never rewrite, so the
+        // recursion never progresses and exhausts the host stack) and, when it
+        // does rewrite, persists XML whose binding semantics differ from what
+        // executes. Forcing re-versioning of the verbatim bundle avoids both.
+        let all_duplicates = self.bundle_is_all_duplicates(&bundle);
+        let force =
+            !all_duplicates || !self.bundle_membership_satisfies_submitted_bindings(&bundle);
+        let crate::command::DeploymentBundle {
+            processes,
+            decisions,
+            forms,
+            resources,
+        } = bundle;
+        let deployment_key = self.deploy(log, processes, force)?;
+        self.deploy_decisions(log, decisions, deployment_key, force);
+        self.deploy_forms(log, forms, deployment_key, force);
+        self.deploy_generic_resources(log, resources, deployment_key, force);
+        Ok(())
+    }
+
+    /// Whether every resource in `bundle` is identical to its latest deployed
+    /// version (the per-kind duplicate rules below, in one place).
+    fn bundle_is_all_duplicates(&self, bundle: &crate::command::DeploymentBundle) -> bool {
+        bundle
+            .processes
+            .iter()
+            .all(|p| self.is_duplicate_process(p))
+            && bundle.decisions.iter().all(|d| self.is_duplicate_drg(d))
+            && bundle.forms.iter().all(|f| self.is_duplicate_form(f))
+            && bundle
+                .resources
+                .iter()
+                .all(|r| self.is_duplicate_resource(r))
+    }
+
+    /// Whether reusing every duplicate resource's existing version (the
+    /// all-duplicates no-op) keeps the bundle's submitted `deployment` bindings
+    /// resolvable (#1193 review): for each `deployment`-bound form / linked
+    /// resource a bundle process declares AND the bundle itself carries, the
+    /// bound id must already be versioned under the deployment the process's
+    /// reuse pins — at the SUBMITTED content, not merely by id. Merely being
+    /// submitted in the same bundle is NOT sufficient — an unchanged submission
+    /// is itself skipped, so it would not join the process's deployment. A
+    /// bundle that fails this is re-versioned together instead of skipping, so
+    /// the bindings become satisfiable.
+    ///
+    /// Only dependencies the bundle CARRIES constrain reuse (#1193 review): a
+    /// binding whose form / linked resource is NOT in the submission cannot be
+    /// repaired by re-versioning this bundle — the process-only resubmission
+    /// contains nothing that would co-deploy the missing dependency, so forcing
+    /// a new version would mint one on EVERY identical resubmission and reset
+    /// timer starts without ever making the binding resolvable. Such a binding
+    /// is left to its runtime resolution (a resolvable incident), and the
+    /// unchanged redeployment stays the idempotent no-op Zeebe specifies.
+    fn bundle_membership_satisfies_submitted_bindings(
+        &self,
+        bundle: &crate::command::DeploymentBundle,
+    ) -> bool {
+        bundle.processes.iter().all(|process| {
+            // Every `deployment`-bound form id and linked resource id the
+            // process declares — across both the executable graph
+            // (`process.elements`) and the ad-hoc tool catalog
+            // (`process.adhoc[*].tools`, whose pruned user-task tools still
+            // carry a form binding, #1193 review) — INTERSECTED with the ids
+            // this bundle actually carries. A binding to a dependency outside
+            // the bundle is unrepairable here, so it does not force reuse.
+            let mut bound_form_ids: Vec<&str> = Vec::new();
+            let mut bound_resource_ids: Vec<&str> = Vec::new();
+            for element in process.elements.values() {
+                Self::collect_deployment_bindings(
+                    &element.kind,
+                    &mut bound_form_ids,
+                    &mut bound_resource_ids,
+                );
+            }
+            for adhoc in &process.adhoc {
+                for tool in &adhoc.tools {
+                    if let crate::model::AdHocToolKind::UserTask(props) = &tool.kind {
+                        // As above, an external form reference makes the binding
+                        // moot — it resolves no deployed version (#1193 review).
+                        if props.form_binding_type == crate::model::BindingType::Deployment
+                            && props.external_form_reference.is_none()
+                        {
+                            if let Some(form_id) = props.form_id.as_deref() {
+                                bound_form_ids.push(form_id);
+                            }
+                        }
+                    }
+                }
+            }
+            bound_form_ids.retain(|id| bundle.forms.iter().any(|f| f.id == *id));
+            bound_resource_ids.retain(|id| bundle.resources.iter().any(|r| r.resource_id == *id));
+
+            let deployment_key = self
+                .state
+                .processes
+                .get(&process.id)
+                .map(|existing| existing.deployment_key)
+                .unwrap_or(0);
+            if deployment_key == 0 {
+                // The process predates deployment tracking (a legacy-snapshot
+                // restore) or is new. A NEW process is not a reusable duplicate,
+                // so this gate is moot for it; but a legacy-restored process IS
+                // a duplicate (the definition compares equal) whose deployment
+                // membership is UNKNOWN — and key 0 never resolves a
+                // `deployment` binding. Treat unknown membership as unsatisfied
+                // whenever the bundle carries a repairable deployment binding,
+                // so the bundle is re-versioned together under a real key (#1193
+                // review). With no bundle-carried deployment binding there is
+                // nothing this redeployment can repair, so reuse stays a no-op.
+                return bound_form_ids.is_empty() && bound_resource_ids.is_empty();
+            }
+
+            // Each bundle-carried bound id must be versioned under the pinned
+            // deployment at the SUBMITTED content — otherwise reuse would bind
+            // the STALE co-deployed version (e.g. P+F(v1) deployed together, F
+            // updated to v2 separately, then P+F(v2) resubmitted: an id-only
+            // check finds v1 and binds it, not the submitted v2, #1193 review).
+            bound_form_ids.iter().all(|form_id| {
+                self.form_versioned_under(
+                    form_id,
+                    deployment_key,
+                    bundle.forms.iter().find(|f| f.id == *form_id),
+                )
+            }) && bound_resource_ids.iter().all(|resource_id| {
+                self.resource_versioned_under(
+                    resource_id,
+                    deployment_key,
+                    bundle
+                        .resources
+                        .iter()
+                        .find(|r| r.resource_id == *resource_id),
+                )
+            })
+        })
+    }
+
+    /// Collects the `deployment`-bound form ids and linked resource ids one
+    /// executable-graph element declares (#1193 review).
+    fn collect_deployment_bindings<'a>(
+        kind: &'a ElementKind,
+        bound_form_ids: &mut Vec<&'a str>,
+        bound_resource_ids: &mut Vec<&'a str>,
+    ) {
+        match kind {
+            // An external form reference wins over `form_id` at runtime and
+            // resolves no deployed version (the binding is moot, #1193 review),
+            // so only a task WITHOUT one constrains bundle membership.
+            ElementKind::UserTask(props)
+                if props.form_binding_type == crate::model::BindingType::Deployment
+                    && props.external_form_reference.is_none() =>
+            {
+                if let Some(form_id) = props.form_id.as_deref() {
+                    bound_form_ids.push(form_id);
+                }
+            }
+            ElementKind::ServiceTask {
+                linked_resources, ..
+            } => {
+                for link in linked_resources {
+                    if link.binding_type == crate::model::BindingType::Deployment {
+                        bound_resource_ids.push(link.resource_id.as_str());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a deployed version of `form_id` is pinned to `deployment_key` —
+    /// at the submitted schema/tag when `submitted` carries it (#1193 review).
+    fn form_versioned_under(
+        &self,
+        form_id: &str,
+        deployment_key: Key,
+        submitted: Option<&crate::command::FormResource>,
+    ) -> bool {
+        self.state.form_versions.values().any(|f| {
+            f.form_id == form_id
+                && f.deployment_key == deployment_key
+                && submitted.is_none_or(|s| f.schema == s.schema && f.version_tag == s.version_tag)
+        })
+    }
+
+    /// Whether a deployed version of `resource_id` is pinned to `deployment_key`
+    /// — at the submitted name/content/tag when `submitted` carries it (#1193
+    /// review).
+    fn resource_versioned_under(
+        &self,
+        resource_id: &str,
+        deployment_key: Key,
+        submitted: Option<&crate::command::GenericResource>,
+    ) -> bool {
+        self.state.resource_versions.values().any(|r| {
+            r.resource_id == resource_id
+                && r.deployment_key == deployment_key
+                && submitted.is_none_or(|s| {
+                    r.resource_name == s.resource_name
+                        && r.content == s.content
+                        && r.version_tag == s.version_tag
+                })
+        })
+    }
+
+    fn is_duplicate_process(&self, process: &ProcessDefinition) -> bool {
+        self.state
+            .processes
+            .get(&process.id)
+            .is_some_and(|existing| existing.definition == *process)
+    }
+
+    fn is_duplicate_drg(&self, drg: &crate::dmn::DecisionRequirementsGraph) -> bool {
+        self.state
+            .decision_requirements
+            .get(&drg.id)
+            .is_some_and(|existing| existing.drg == *drg)
+    }
+
+    /// The `version_tag` must match too (#1193 review): a schema-identical
+    /// redeploy that carries a NEW tag is not a duplicate.
+    fn is_duplicate_form(&self, form: &crate::command::FormResource) -> bool {
+        self.state.forms.get(&form.id).is_some_and(|existing| {
+            existing.schema == form.schema && existing.version_tag == form.version_tag
+        })
+    }
+
+    /// Zeebe's name+checksum duplicate rule, plus the `version_tag` (#1193).
+    fn is_duplicate_resource(&self, resource: &crate::command::GenericResource) -> bool {
+        self.state
+            .resources
+            .get(&resource.resource_id)
+            .is_some_and(|existing| {
+                existing.resource_name == resource.resource_name
+                    && existing.content == resource.content
+                    && existing.version_tag == resource.version_tag
+            })
+    }
+
     /// Validates and registers a batch of process definitions as one deployment.
     ///
     /// All processes are validated first, so the deployment is atomic: if any is
     /// invalid, none are emitted. Each *new or changed* process is assigned a
     /// unique process-definition key and a per-id version (latest known + 1).
     ///
-    /// Deployment is idempotent: a process that is byte-for-byte identical to the
+    /// Deployment is idempotent (within a non-forced bundle — see
+    /// [`Self::deploy_bundle`]): a process that is byte-for-byte identical to the
     /// current latest version of the same id (`existing.definition == process`,
     /// which includes the verbatim BPMN [`ProcessDefinition::xml`]) reuses that
     /// version's identity and emits **nothing** — no new key, no version bump, no
@@ -1673,11 +2021,16 @@ impl Engine {
     /// deploys (e.g. on every app startup) from growing the journal. Keys are
     /// minted only for emitted events so replay (which derives the key counter
     /// from the max key seen in the log) stays in lock-step with the live engine.
+    ///
+    /// Preflights and registers `processes`, then mints the deployment key
+    /// (emitting [`Event::DeploymentCreated`]) and returns it. A duplicate of
+    /// the latest version is skipped unless `force` (see [`Self::deploy_bundle`]).
     fn deploy(
         &mut self,
         log: &mut Vec<Event>,
         mut processes: Vec<ProcessDefinition>,
-    ) -> Result<(), EngineError> {
+        force: bool,
+    ) -> Result<Key, EngineError> {
         for process in &mut processes {
             process.normalize_legacy_agent_tasks();
         }
@@ -1687,6 +2040,19 @@ impl Engine {
                     process_id: process.id.clone(),
                 });
             }
+        }
+
+        // Structural preflight: a definition handed straight to
+        // `DeployProcess`/`DeployResources` bypasses `ProcessBuilder::build`
+        // and the BPMN parser, so re-run the shared event-sub-process
+        // validation here before anything is emitted (atomic for a batch).
+        for process in &processes {
+            process.validate_event_subprocesses().map_err(|e| {
+                EngineError::InvalidProcessModel {
+                    process_id: process.id.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
         }
 
         // Preflight EVERY process's typed start expressions before anything
@@ -1708,43 +2074,55 @@ impl Engine {
             // are wired. So scan all process-level (`parent.is_none()`) typed
             // starts, deterministically ordered by element id so key minting
             // and replay stay in lock-step.
-            let mut typed_starts: Vec<(ElementId, ElementKind, Option<crate::model::TimerDef>)> =
-                process
-                    .elements
-                    .values()
-                    .filter(|e| e.parent.is_none())
-                    .filter(|e| {
-                        matches!(
-                            e.kind,
-                            ElementKind::MessageStartEvent { .. }
-                                | ElementKind::TimerStartEvent { .. }
-                        )
-                    })
-                    .map(|e| (e.id.clone(), e.kind.clone(), e.timer.clone()))
-                    .collect();
-            typed_starts.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut typed_starts: Vec<&crate::model::Element> = process
+                .elements
+                .values()
+                .filter(|e| e.parent.is_none())
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        ElementKind::MessageStartEvent { .. } | ElementKind::TimerStartEvent { .. }
+                    )
+                })
+                .collect();
+            typed_starts.sort_by(|a, b| a.id.cmp(&b.id));
             // Per Zeebe, a start-event message name / timer expression is
             // evaluated at deploy time against an empty context; a failure
             // rejects the deployment (Zeebe `ProcessTransformer` /
             // `TimerStartEventSubscription` validation, #1398) — never a
             // subscription named after the expression text or a static
             // fallback timer. Resolve all before anything is emitted.
-            let empty = HashMap::new();
+            let empty = BTreeMap::new();
             let mut resolved_starts = Vec::with_capacity(typed_starts.len());
-            for (start_element_id, start_kind, start_timer_def) in typed_starts {
+            for start in typed_starts {
+                let (start_element_id, start_kind, start_timer_def, start_properties) = (
+                    start.id.clone(),
+                    start.kind.clone(),
+                    start.timer.clone(),
+                    &start.properties,
+                );
                 let resolved = match start_kind {
                     ElementKind::MessageStartEvent { message_name } => self
                         .resolve_event_name(&empty, &message_name)
-                        .map(ResolvedStart::Message),
+                        .map(|message_name| ResolvedStart::Message {
+                            message_name,
+                            // The MCP tool markers declared on the start event
+                            // via `zeebe:properties` (Camunda 8.10, #1499) ride
+                            // the subscription so the read model / REST search
+                            // can project them without re-parsing the XML.
+                            tool_name: crate::model::tool_name_of(start_properties),
+                            tool_properties: crate::model::tool_properties_of(start_properties),
+                        }),
                     ElementKind::TimerStartEvent {
                         interval_millis,
                         repeating,
                     } => self
                         .resolve_timer(&empty, start_timer_def.as_ref(), self.now, interval_millis)
-                        .map(|(due_at, interval_millis)| ResolvedStart::Timer {
-                            due_at,
-                            interval_millis,
+                        .map(|t| ResolvedStart::Timer {
+                            due_at: t.due_at,
+                            interval_millis: t.interval_millis,
                             repeating,
+                            repetitions: if repeating { t.repetitions } else { None },
                         }),
                     _ => continue,
                 };
@@ -1756,6 +2134,26 @@ impl Engine {
                             element_id: start_element_id,
                             reason: failure.message,
                         })
+                    }
+                }
+            }
+            // Two message starts whose names differ textually (`go` vs
+            // `="go"`) can still resolve to the same name. The raw-name
+            // duplicate rule cannot see that, so reject resolved collisions
+            // here: otherwise the engine and the read model would each keep a
+            // different start for the one subscription (#1499, Zeebe rejects
+            // duplicate message start names).
+            let mut seen_message_names: BTreeSet<&str> = BTreeSet::new();
+            for (start_element_id, r) in &resolved_starts {
+                if let ResolvedStart::Message { message_name, .. } = r {
+                    if !seen_message_names.insert(message_name.as_str()) {
+                        return Err(EngineError::StartEventExpressionInvalid {
+                            process_id: process.id.clone(),
+                            element_id: start_element_id.clone(),
+                            reason: format!(
+                                "multiple message start events resolve to the same message name '{message_name}'"
+                            ),
+                        });
                     }
                 }
             }
@@ -1771,12 +2169,7 @@ impl Engine {
         self.emit(log, Event::DeploymentCreated { deployment_key });
 
         for (process, resolved_starts) in processes.into_iter().zip(preflight) {
-            if self
-                .state
-                .processes
-                .get(&process.id)
-                .is_some_and(|existing| existing.definition == process)
-            {
+            if !force && self.is_duplicate_process(&process) {
                 // Idempotent redeploy of the latest version: reuse its identity
                 // and skip it entirely (no event, no new subscription/timer).
                 continue;
@@ -1795,7 +2188,11 @@ impl Engine {
             );
             for (start_element_id, resolved) in resolved_starts {
                 match resolved {
-                    ResolvedStart::Message(message_name) => {
+                    ResolvedStart::Message {
+                        message_name,
+                        tool_name,
+                        tool_properties,
+                    } => {
                         self.emit(
                             log,
                             Event::MessageStartSubscriptionCreated {
@@ -1803,6 +2200,8 @@ impl Engine {
                                 process_id: process_id.clone(),
                                 message_name,
                                 start_element_id,
+                                tool_name,
+                                tool_properties,
                             },
                         );
                     }
@@ -1810,6 +2209,7 @@ impl Engine {
                         due_at,
                         interval_millis,
                         repeating,
+                        repetitions,
                     } => {
                         let timer_key = self.mint_key();
                         self.emit(
@@ -1822,13 +2222,14 @@ impl Engine {
                                 due_at,
                                 interval_millis,
                                 repeating,
+                                repetitions,
                             },
                         );
                     }
                 }
             }
         }
-        Ok(())
+        Ok(deployment_key)
     }
 
     /// The version that the next deployment of `process_id` will receive.
@@ -1840,26 +2241,20 @@ impl Engine {
             .unwrap_or(1)
     }
 
-    /// Registers one or more decision requirements graphs as a deployment,
-    /// mirroring [`Engine::deploy`]: a shared deployment key, one
+    /// Registers decision requirements graphs under `deployment_key` (minted by
+    /// [`Engine::deploy_bundle`]): one
     /// [`Event::DecisionRequirementsDeployed`] per DRG, and one
     /// [`Event::DecisionDeployed`] per decision it contains (indexed by id).
-    /// An idempotent redeploy of the identical latest DRG is skipped.
+    /// An identical latest DRG is skipped unless `force`.
     fn deploy_decisions(
         &mut self,
         log: &mut Vec<Event>,
         graphs: Vec<crate::dmn::DecisionRequirementsGraph>,
-    ) -> Result<(), EngineError> {
-        let deployment_key = self.mint_key();
-        self.emit(log, Event::DeploymentCreated { deployment_key });
-
+        deployment_key: Key,
+        force: bool,
+    ) {
         for drg in graphs {
-            if self
-                .state
-                .decision_requirements
-                .get(&drg.id)
-                .is_some_and(|existing| existing.drg == drg)
-            {
+            if !force && self.is_duplicate_drg(&drg) {
                 // Idempotent redeploy of the identical latest DRG: skip.
                 continue;
             }
@@ -1905,29 +2300,21 @@ impl Engine {
                 );
             }
         }
-        Ok(())
     }
 
-    /// Registers one or more forms as a deployment, mirroring
-    /// [`Engine::deploy_decisions`]: a shared deployment key and one
-    /// [`Event::FormDeployed`] per form (versioned per form id). An idempotent
-    /// redeploy of the identical latest form is skipped. The engine does not
+    /// Registers forms under `deployment_key`: one [`Event::FormDeployed`] per
+    /// form (versioned per form id). An identical latest form is skipped unless
+    /// `force`. The engine does not
     /// execute forms; it stores them so `GetFormByKey` can serve the schema.
     fn deploy_forms(
         &mut self,
         log: &mut Vec<Event>,
         forms: Vec<crate::command::FormResource>,
-    ) -> Result<(), EngineError> {
-        let deployment_key = self.mint_key();
-        self.emit(log, Event::DeploymentCreated { deployment_key });
-
+        deployment_key: Key,
+        force: bool,
+    ) {
         for form in forms {
-            if self
-                .state
-                .forms
-                .get(&form.id)
-                .is_some_and(|existing| existing.schema == form.schema)
-            {
+            if !force && self.is_duplicate_form(&form) {
                 // Idempotent redeploy of the identical latest form: skip.
                 continue;
             }
@@ -1947,37 +2334,25 @@ impl Engine {
                     form_id: form.id,
                     resource_name: form.resource_name,
                     schema: form.schema,
+                    version_tag: form.version_tag,
                 },
             );
         }
-        Ok(())
     }
 
-    /// Registers one or more generic resources as a deployment, mirroring
-    /// [`Engine::deploy_forms`]: a shared deployment key and one
+    /// Registers generic resources under `deployment_key`: one
     /// [`Event::GenericResourceDeployed`] per resource (versioned per
-    /// `resource_id`). An idempotent redeploy of the identical latest resource
-    /// (same `resource_name` and content — Zeebe's name+checksum duplicate rule)
-    /// is skipped. The engine does not execute generic resources; it stores them
+    /// `resource_id`). An identical latest resource is skipped unless `force`. The engine does not execute generic resources; it stores them
     /// so `GetResourceByKey` / `searchResources` can serve the content.
     fn deploy_generic_resources(
         &mut self,
         log: &mut Vec<Event>,
         resources: Vec<crate::command::GenericResource>,
-    ) -> Result<(), EngineError> {
-        let deployment_key = self.mint_key();
-        self.emit(log, Event::DeploymentCreated { deployment_key });
-
+        deployment_key: Key,
+        force: bool,
+    ) {
         for resource in resources {
-            if self
-                .state
-                .resources
-                .get(&resource.resource_id)
-                .is_some_and(|existing| {
-                    existing.resource_name == resource.resource_name
-                        && existing.content == resource.content
-                })
-            {
+            if !force && self.is_duplicate_resource(&resource) {
                 // Idempotent redeploy of the identical latest resource: skip.
                 continue;
             }
@@ -1997,10 +2372,10 @@ impl Engine {
                     resource_id: resource.resource_id,
                     resource_name: resource.resource_name,
                     content: resource.content,
+                    version_tag: resource.version_tag,
                 },
             );
         }
-        Ok(())
     }
 
     /// Records one decision evaluation as an [`Event::DecisionEvaluated`]: the
@@ -2072,11 +2447,45 @@ impl Engine {
         command: Command,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
-        let (mut log, queue) = self.plan_command_at(command, now)?;
-        self.run(&mut log, queue);
-        self.cascade_cancel_children(&mut log);
-        self.finish_command(&log);
-        Ok(log)
+        self.apply_command_events(command, now, None)
+    }
+
+    /// Applies a command carrying a caller `operationReference` (#1556) and
+    /// returns its output as [`Record`](crate::Record)s, each stamped with the
+    /// reference. This is THE single propagation seam — Zeebe stamps a
+    /// command's `operationReference` on every record it produces, generically
+    /// — so no command variant carries its own copy. The legacy per-event
+    /// audit fields (`JobRetriesUpdated`/`JobTimeoutUpdated`/`IncidentResolved`
+    /// `.operation_reference`) are derived from the same value at
+    /// [`emit`](Self::emit).
+    pub fn apply_command_records_at(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<Vec<crate::Record>, EngineError> {
+        let events = self.apply_command_events(command, now, operation_reference)?;
+        Ok(crate::Record::stamp_all(events, operation_reference))
+    }
+
+    fn apply_command_events(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<Vec<Event>, EngineError> {
+        // Armed BEFORE planning: the planner itself emits (e.g. the
+        // `IncidentResolved` of a `ResolveIncident`). Cleared on every exit so
+        // a reference can never leak into a later command.
+        self.operation_reference = operation_reference;
+        let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
+            self.run(&mut log, queue);
+            self.cascade_cancel_children(&mut log);
+            self.finish_command(&log);
+            log
+        });
+        self.operation_reference = None;
+        result
     }
 
     /// Post-drain tail shared by [`apply_command_at`](Self::apply_command_at) and
@@ -2115,11 +2524,42 @@ impl Engine {
         now: u64,
     ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
         self.now = now;
+        // Seed the FEEL environment from replicated inputs only (#1642), never
+        // a wall clock or process-local entropy. The seed is a PURE function of
+        // (a) the partition-qualified allocator position `peek_next_key()` —
+        // so partitions sharing `(now, next_local)` get disjoint streams and
+        // any key-minting command moves its successor's stream on — and (b)
+        // the command's own identity `Command::seed_fingerprint()` — so two
+        // same-timestamp commands that mint no keys (e.g. completing two
+        // sink tasks) still differ by their target key (#1649 review).
+        //
+        // Deliberately NO engine-held counter: hidden seed state must be
+        // snapshotted, replayed from events, kept in step across batched Raft
+        // entries and kept out of leader-local lease operations — each a
+        // replica/recovery divergence surface. Deriving from the replicated
+        // command + replicated state removes that whole class.
+        let seed = command
+            .seed_fingerprint()
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ self.peek_next_key();
+        self.feel_env = crate::feel::EvalEnv::new(now, seed);
+        let mut env = self.feel_env;
+        let result = crate::feel::with_env(&mut env, || self.plan_command_inner(command));
+        self.feel_env = env;
+        result
+    }
+
+    fn plan_command_inner(
+        &mut self,
+        command: Command,
+    ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
+        let now = self.now;
         // Clear the per-command scratch of sub-process scopes torn down mid-drain
         // (see [`torn_down_scopes`]): each command drains independently, so a
         // scope invalidated by a previous command's terminate must not leak into
         // this one's dead-scope guard.
         self.torn_down_scopes.clear();
+        self.esp_start_payloads.clear();
         // Per-command terminal-deadline stamp (#1494): set from THIS command
         // only (or cleared), never inherited from a previous one.
         self.terminal_deadline_stamp = match &command {
@@ -2144,24 +2584,61 @@ impl Engine {
         let mut queue: VecDeque<Step> = VecDeque::new();
 
         match command {
+            // Every deploy command is one bundle: the single canonical deploy
+            // path, so a per-kind command and a mixed deployment cannot drift
+            // in key minting or duplicate semantics (#1193).
             Command::DeployProcess(process) => {
-                self.deploy(&mut log, vec![process])?;
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        processes: vec![process],
+                        ..Default::default()
+                    },
+                )?;
             }
 
             Command::DeployResources(processes) => {
-                self.deploy(&mut log, processes)?;
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        processes,
+                        ..Default::default()
+                    },
+                )?;
             }
 
-            Command::DeployDecisionRequirements(graphs) => {
-                self.deploy_decisions(&mut log, graphs)?;
+            Command::DeployDecisionRequirements(decisions) => {
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        decisions,
+                        ..Default::default()
+                    },
+                )?;
             }
 
             Command::DeployForms(forms) => {
-                self.deploy_forms(&mut log, forms)?;
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        forms,
+                        ..Default::default()
+                    },
+                )?;
             }
 
             Command::DeployGenericResources(resources) => {
-                self.deploy_generic_resources(&mut log, resources)?;
+                self.deploy_bundle(
+                    &mut log,
+                    crate::command::DeploymentBundle {
+                        resources,
+                        ..Default::default()
+                    },
+                )?;
+            }
+
+            Command::DeployBundle(bundle) => {
+                self.deploy_bundle(&mut log, bundle)?;
             }
 
             Command::DeleteDecisionInstance {
@@ -2178,6 +2655,88 @@ impl Engine {
                         decision_evaluation_key,
                     },
                 );
+            }
+
+            Command::CreateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                kind,
+                metadata,
+                distributed,
+            } => {
+                // Zeebe `ClusterVariableCreateProcessor`: a duplicate is
+                // rejected on the authoritative partition; a distributed copy
+                // upserts the already-validated record.
+                if !distributed
+                    && self
+                        .state
+                        .cluster_variables
+                        .get(tenant_id.as_deref(), &name)
+                        .is_some()
+                {
+                    return Err(EngineError::ClusterVariableAlreadyExists { tenant_id, name });
+                }
+                self.emit(
+                    &mut log,
+                    Event::ClusterVariableCreated {
+                        tenant_id,
+                        name,
+                        value,
+                        kind,
+                        metadata,
+                    },
+                );
+            }
+
+            Command::UpdateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                metadata,
+            } => {
+                // Capture the preserved kind in the same turn that validates
+                // and commits the update, so the event carries the complete
+                // post-mutation record (bar the id): a consumer deriving the
+                // response from the proposal's own events then never re-reads
+                // live state, where a concurrent delete/recreate could swap
+                // the kind under it (PR #1670 review).
+                let Some(existing) = self
+                    .state
+                    .cluster_variables
+                    .get(tenant_id.as_deref(), &name)
+                else {
+                    return Err(EngineError::ClusterVariableNotFound { tenant_id, name });
+                };
+                let kind = existing.kind;
+                self.emit(
+                    &mut log,
+                    Event::ClusterVariableUpdated {
+                        tenant_id,
+                        name,
+                        value,
+                        metadata,
+                        kind,
+                    },
+                );
+            }
+
+            Command::DeleteClusterVariable {
+                tenant_id,
+                name,
+                distributed,
+            } => {
+                let exists = self
+                    .state
+                    .cluster_variables
+                    .get(tenant_id.as_deref(), &name)
+                    .is_some();
+                if exists {
+                    self.emit(&mut log, Event::ClusterVariableDeleted { tenant_id, name });
+                } else if !distributed {
+                    return Err(EngineError::ClusterVariableNotFound { tenant_id, name });
+                }
+                // else: an idempotent fan-out copy, already absent here.
             }
 
             Command::EvaluateDecision {
@@ -2294,13 +2853,20 @@ impl Engine {
                     .jobs
                     .get(&job_key)
                     .ok_or(EngineError::JobNotFound { job_key })?;
+                // Zeebe parity (#1401): a terminal-settled job is CONSUMED
+                // (Zeebe deletes the entity on completion/cancellation/error),
+                // so re-completing it is NOT_FOUND. Only a live-but-parked job
+                // (`Failed` — no retries left, incident raised, recoverable via
+                // `UpdateJobRetries` + `ResolveIncident`) is INVALID_STATE.
                 if matches!(
                     job.state,
                     state::JobState::Completed
-                        | state::JobState::Failed
                         | state::JobState::Errored
                         | state::JobState::Canceled
                 ) {
+                    return Err(EngineError::JobNotFound { job_key });
+                }
+                if job.state == state::JobState::Failed {
                     return Err(EngineError::JobNotActive { job_key });
                 }
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
@@ -2309,7 +2875,7 @@ impl Engine {
                 // completion (leader-local locks; see `lenient_completion`) the
                 // activation may not have been replicated to this engine, so the
                 // latch is not required.
-                if !self.lenient_completion && !job.activated {
+                if !self.lenient_completion() && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -2609,7 +3175,14 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created || task.pending.is_some() {
+                // Zeebe parity (#1401): a terminal user task is CONSUMED (Zeebe
+                // deletes the entity on completion/cancellation), so operating
+                // on it is NOT_FOUND. Only a live task mid-listener-transition
+                // (`pending`) is INVALID_STATE.
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotFound { user_task_key });
+                }
+                if task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 // Mirror Camunda: when override is disallowed and the task is
@@ -2631,7 +3204,7 @@ impl Engine {
                         event_type: crate::model::TaskListenerEventType::Assigning,
                         assignee: Some(assignee),
                         update: None,
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     for event in self.start_task_listener_chain(
@@ -2664,7 +3237,12 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created || task.pending.is_some() {
+                // Zeebe parity (#1401): terminal => consumed => NOT_FOUND; only
+                // a live task mid-listener-transition is INVALID_STATE.
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotFound { user_task_key });
+                }
+                if task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 let instance_key = task.instance_key;
@@ -2680,7 +3258,7 @@ impl Engine {
                         event_type: crate::model::TaskListenerEventType::Assigning,
                         assignee: None,
                         update: None,
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     for event in self.start_task_listener_chain(
@@ -2716,7 +3294,12 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created || task.pending.is_some() {
+                // Zeebe parity (#1401): terminal => consumed => NOT_FOUND; only
+                // a live task mid-listener-transition is INVALID_STATE.
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotFound { user_task_key });
+                }
+                if task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 let instance_key = task.instance_key;
@@ -2747,7 +3330,7 @@ impl Engine {
                             follow_up_date,
                             priority,
                         }),
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     for event in self.start_task_listener_chain(
@@ -2787,7 +3370,14 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created || task.pending.is_some() {
+                // Zeebe parity (#1401): completion/cancellation CONSUMES the
+                // user task (Zeebe deletes the entity), so re-completing it is
+                // NOT_FOUND — never the INVALID_STATE of a live task that is
+                // merely mid-listener-transition (`pending`).
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotFound { user_task_key });
+                }
+                if task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 let instance_key = task.instance_key;
@@ -2937,6 +3527,7 @@ impl Engine {
                     let element_id = timer.element_id.clone();
                     let due_at = timer.due_at;
                     let kind = timer.kind.clone();
+                    let repetitions = timer.repetitions;
 
                     self.emit(
                         &mut log,
@@ -2992,55 +3583,50 @@ impl Engine {
                                 scope: self.scope_of(instance_key, element_instance_key),
                                 via: None,
                             });
-                            if let Some(ElementKind::TimerBoundaryEvent {
-                                duration_millis,
-                                repeating: true,
-                                ..
-                            }) = self.element_kind(instance_key, &boundary_element_id)
-                            {
-                                let next_timer_key = self.mint_key();
-                                // Re-evaluate a FEEL cycle against current vars so
-                                // the next interval reflects any updated variable;
-                                // a static cycle keeps its parsed interval.
-                                let timer_def =
-                                    self.timer_def_of(instance_key, &boundary_element_id);
-                                let rearm_vars =
-                                    self.variables_for_element(instance_key, element_instance_key);
-                                match self.resolve_timer(
-                                    &rearm_vars,
-                                    timer_def.as_ref(),
+                            // A repeating cycle re-arms for the next interval; a
+                            // bounded `Rn/…` cycle stops after its n-th fire
+                            // (Zeebe parity, #1596).
+                            self.rearm_fired_cycle(
+                                &mut log,
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                state::TimerKind::NonInterruptingBoundary {
+                                    boundary_element_id,
+                                },
+                                due_at,
+                                repetitions,
+                            );
+                        }
+                        // Event sub-process timer: `element_instance_key` is the
+                        // enclosing scope, `element_id` the ESP start event. A
+                        // non-interrupting cycle re-arms for the next interval.
+                        state::TimerKind::EventSubProcess {
+                            esp_element_id,
+                            interrupting,
+                        } => {
+                            if !interrupting {
+                                self.rearm_fired_cycle(
+                                    &mut log,
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id.clone(),
+                                    state::TimerKind::EventSubProcess {
+                                        esp_element_id: esp_element_id.clone(),
+                                        interrupting,
+                                    },
                                     due_at,
-                                    duration_millis,
-                                ) {
-                                    Ok((next_due_at, _)) => self.emit(
-                                        &mut log,
-                                        Event::TimerCreated {
-                                            timer_key: next_timer_key,
-                                            instance_key,
-                                            element_instance_key,
-                                            element_id: element_id.clone(),
-                                            due_at: next_due_at,
-                                            kind: state::TimerKind::NonInterruptingBoundary {
-                                                boundary_element_id,
-                                            },
-                                        },
-                                    ),
-                                    // The cycle no longer evaluates (a variable it
-                                    // reads changed): raise the host's
-                                    // EXTRACT_VALUE_ERROR rather than silently
-                                    // re-arming on the static interval (#1398).
-                                    Err(failure) => {
-                                        let incident = self.expression_incident(
-                                            instance_key,
-                                            element_instance_key,
-                                            element_id.clone(),
-                                            failure,
-                                            None,
-                                        );
-                                        self.emit(&mut log, incident);
-                                    }
-                                }
+                                    repetitions,
+                                );
                             }
+                            self.trigger_event_subprocess(
+                                &mut log,
+                                &mut queue,
+                                instance_key,
+                                element_instance_key,
+                                esp_element_id,
+                                interrupting,
+                            );
                         }
                     }
                 }
@@ -3068,11 +3654,14 @@ impl Engine {
                         Some(d) => d,
                         None => continue,
                     };
-                    let next_due_at = if timer.repeating {
-                        Some(due_at.saturating_add(timer.interval_millis))
-                    } else {
-                        None
-                    };
+                    // A bounded `Rn/…` start cycle stops re-arming after its
+                    // n-th fire (#1596).
+                    let next_due_at =
+                        if timer.repeating && rearm_repetitions(timer.repetitions).is_some() {
+                            Some(due_at.saturating_add(timer.interval_millis))
+                        } else {
+                            None
+                        };
                     self.emit(
                         &mut log,
                         Event::ProcessStartTimerFired {
@@ -3085,7 +3674,7 @@ impl Engine {
                         &mut queue,
                         process_id,
                         start_element_id,
-                        HashMap::new(),
+                        BTreeMap::new(),
                         Vec::new(),
                         None,
                         None,
@@ -3099,6 +3688,7 @@ impl Engine {
                 lease_token,
                 retries,
                 error_message,
+                retry_back_off,
             } => {
                 // Idempotent replay (#1181): the same fence re-asserting the
                 // outcome it already recorded is a no-op success on any replica.
@@ -3123,19 +3713,25 @@ impl Engine {
                     .jobs
                     .get(&job_key)
                     .ok_or(EngineError::JobNotFound { job_key })?;
+                // Zeebe parity (#1401): a terminal-settled job is CONSUMED, so
+                // settling it again is NOT_FOUND. Only a live-but-parked job
+                // (`Failed` — no retries left, incident raised) is
+                // INVALID_STATE.
                 if matches!(
                     job.state,
                     state::JobState::Completed
-                        | state::JobState::Failed
                         | state::JobState::Errored
                         | state::JobState::Canceled
                 ) {
+                    return Err(EngineError::JobNotFound { job_key });
+                }
+                if job.state == state::JobState::Failed {
                     return Err(EngineError::JobNotActive { job_key });
                 }
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
                 // Like completion, failing a job requires that it was activated
                 // (unless lenient completion allows leader-local activation).
-                if !self.lenient_completion && !job.activated {
+                if !self.lenient_completion() && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -3143,6 +3739,13 @@ impl Engine {
                 let element_id = job.element_id.clone();
                 let worker = Self::terminal_worker(job, attribution.as_ref());
                 let retries = retries.max(0);
+                // Camunda 8 v2 `retryBackOff` (#933): a positive backoff with
+                // retries left defers re-activation until `now + backoff`;
+                // zero/absent (negatives are clamped to zero at the boundary)
+                // is retryable immediately; with no retries left the job parks
+                // with an incident, so a backoff is meaningless and dropped.
+                let retry_backoff_until = (retries > 0 && retry_back_off > 0)
+                    .then(|| self.now.saturating_add(retry_back_off));
 
                 self.record_settlement(
                     &mut log,
@@ -3158,6 +3761,7 @@ impl Engine {
                         retries,
                         worker,
                         error_message: Some(limit_error_message(error_message.clone())),
+                        retry_backoff_until,
                     },
                 );
                 // No retries left: park the job and raise an incident so the
@@ -3212,16 +3816,22 @@ impl Engine {
                     .jobs
                     .get(&job_key)
                     .ok_or(EngineError::JobNotFound { job_key })?;
+                // Zeebe parity (#1401): a terminal-settled job is CONSUMED, so
+                // settling it again is NOT_FOUND. Only a live-but-parked job
+                // (`Failed` — no retries left, incident raised) is
+                // INVALID_STATE.
                 if matches!(
                     job.state,
                     state::JobState::Completed
-                        | state::JobState::Failed
                         | state::JobState::Errored
                         | state::JobState::Canceled
                 ) {
+                    return Err(EngineError::JobNotFound { job_key });
+                }
+                if job.state == state::JobState::Failed {
                     return Err(EngineError::JobNotActive { job_key });
                 }
-                if !self.lenient_completion && !job.activated {
+                if !self.lenient_completion() && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -3248,16 +3858,45 @@ impl Engine {
                     },
                 );
 
-                match self.find_catching_error_boundary(
+                match self.find_error_catch(
                     instance_key,
                     &task_element_id,
                     element_instance_key,
                     &error_code,
                 ) {
+                    // Caught by an error event sub-process (#1555): always
+                    // interrupting — its host scope's other work (the throwing
+                    // task included) is torn down and the event sub-process
+                    // runs alone in it. The error's variables are seeded at the
+                    // host scope, like a boundary catch seeds its scope.
+                    Some(boundary::ThrowCatch::EventSubProcess {
+                        scope_eik, esp_id, ..
+                    }) => {
+                        self.trigger_event_subprocess(
+                            &mut log,
+                            &mut queue,
+                            instance_key,
+                            scope_eik,
+                            esp_id,
+                            true,
+                        );
+                        if !variables.is_empty() {
+                            for event in
+                                self.propagated_updates(instance_key, scope_eik, variables, true)
+                            {
+                                self.emit(&mut log, event);
+                            }
+                        }
+                    }
                     // Caught: interrupt the catching activity (the throwing task
                     // itself, or an enclosing sub-process) and run the boundary
                     // event's error-handling path.
-                    Some((boundary_id, caught_eik, caught_element_id)) => {
+                    Some(boundary::ThrowCatch::Boundary {
+                        boundary_id,
+                        caught_eik,
+                        caught_element_id,
+                        ..
+                    }) => {
                         // Capture the catching activity's scope before completing
                         // it (completion clears its scope entry); the boundary
                         // event runs in that same scope.
@@ -3295,6 +3934,18 @@ impl Engine {
                         }
                         for event in self.resolve_incidents_on(instance_key, caught_eik) {
                             self.emit(&mut log, event);
+                        }
+                        // A boundary caught at a multi-instance BODY: clear the
+                        // body's active-child record too (only
+                        // `MultiInstanceCompleted` does), or the loop hangs.
+                        if self.is_multi_instance_body(instance_key, caught_eik) {
+                            self.emit(
+                                &mut log,
+                                Event::MultiInstanceCompleted {
+                                    instance_key,
+                                    body_key: caught_eik,
+                                },
+                            );
                         }
                         self.emit(
                             &mut log,
@@ -3377,14 +4028,12 @@ impl Engine {
                 job_key,
                 lease_token,
                 retries,
-                operation_reference,
             } => {
                 self.update_job_properties(
                     &mut log,
                     job_key,
                     Some(retries),
                     None,
-                    operation_reference,
                     lease_token.as_deref(),
                 )?;
             }
@@ -3393,14 +4042,12 @@ impl Engine {
                 job_key,
                 lease_token,
                 timeout,
-                operation_reference,
             } => {
                 self.update_job_properties(
                     &mut log,
                     job_key,
                     None,
                     Some(timeout),
-                    operation_reference,
                     lease_token.as_deref(),
                 )?;
             }
@@ -3408,7 +4055,6 @@ impl Engine {
                 job_key,
                 retries,
                 timeout,
-                operation_reference,
                 lease_token,
             } => {
                 self.update_job_properties(
@@ -3416,15 +4062,11 @@ impl Engine {
                     job_key,
                     retries,
                     timeout,
-                    operation_reference,
                     lease_token.as_deref(),
                 )?;
             }
 
-            Command::ResolveIncident {
-                incident_key,
-                operation_reference,
-            } => {
+            Command::ResolveIncident { incident_key } => {
                 let incident = self
                     .state
                     .incidents
@@ -3464,7 +4106,7 @@ impl Engine {
                         instance_key,
                         job_key,
                         resolved_at: self.now,
-                        operation_reference,
+                        operation_reference: None,
                     },
                 );
                 // Resolution retries the failed work rather than merely clearing
@@ -3652,6 +4294,22 @@ impl Engine {
                                 boundary_element_id,
                                 base,
                             });
+                        } else if let Some(state::IoMappingRedrive::TimerCycleRearm {
+                            kind,
+                            previous_due_at,
+                            remaining,
+                        }) = redrive
+                        {
+                            // A fired cycle's re-arm failed (#1596 review): retry
+                            // only that re-arm, resuming its remaining count.
+                            queue.push_back(Step::RetryTimerCycleRearm {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                kind,
+                                previous_due_at,
+                                remaining,
+                            });
                         } else if let Some(state::IoMappingRedrive::MiChildCompletion {
                             body_key,
                             output_overlay,
@@ -3716,6 +4374,18 @@ impl Engine {
                                 element_id: tool_element_id.clone(),
                                 variables,
                             });
+                        } else if let Some(state::IoMappingRedrive::AdHocContainerCompletion {
+                            cancel,
+                        }) = redrive
+                        {
+                            // A container completion deferred on a missing
+                            // `outputCollection` binding (#1630 review): retry
+                            // the container completion itself.
+                            queue.push_back(Step::CompleteAdHoc {
+                                instance_key,
+                                container_key: element_instance_key,
+                                cancel,
+                            });
                         } else if let Some(state::IoMappingRedrive::AdHocToolOutputCollection {
                             precomputed_output,
                         }) = &redrive
@@ -3769,13 +4439,28 @@ impl Engine {
                     // `RerunActivationBody` is reserved for correlation-key (ACTIVATING)
                     // failures, which surface as `ExpressionEvaluation`.
                     // Uncaught business error: re-create a job for the still-active
-                    // service task so a worker can attempt it again.
+                    // service task so a worker can attempt it again. An error END
+                    // event (#1592) owns no job — its throw runs at completion — so
+                    // resolving re-runs ONLY the catch walk (`RetryErrorEndThrow`)
+                    // against the (possibly migrated) model: its outputs and end
+                    // listeners already ran before the incident was raised.
                     state::IncidentKind::UnhandledError => {
-                        queue.push_back(Step::CreateJob {
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                        });
+                        if matches!(
+                            self.element_kind(instance_key, &element_id),
+                            Some(ElementKind::ErrorEndEvent { .. })
+                        ) {
+                            queue.push_back(Step::RetryErrorEndThrow {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        } else {
+                            queue.push_back(Step::CreateJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        }
                     }
                     // A `zeebe:ioMapping` failure (input or output, any element
                     // type) or a job-type extraction failure (#1390, Zeebe
@@ -3851,6 +4536,20 @@ impl Engine {
                                 boundary_element_id,
                                 base,
                             }),
+                            // A fired cycle's re-arm failed (#1596 review):
+                            // retry only that re-arm with its remaining count.
+                            Some(state::IoMappingRedrive::TimerCycleRearm {
+                                kind,
+                                previous_due_at,
+                                remaining,
+                            }) => Some(Step::RetryTimerCycleRearm {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                kind,
+                                previous_due_at,
+                                remaining,
+                            }),
                             // An MI child's completion failed: re-drive it,
                             // reusing the preserved call-activity output overlay.
                             Some(state::IoMappingRedrive::MiChildCompletion {
@@ -3877,10 +4576,11 @@ impl Engine {
                             // still-drained sub-process and re-projects the
                             // now-fixed output mapping.
                             Some(state::IoMappingRedrive::Completion) => {
-                                if matches!(
-                                    self.element_kind(instance_key, &element_id),
-                                    Some(ElementKind::SubProcess { .. })
-                                ) {
+                                if self
+                                    .element_kind(instance_key, &element_id)
+                                    .as_ref()
+                                    .is_some_and(ElementKind::owns_token_scope)
+                                {
                                     // Re-driven by the drain sweep, not a step.
                                     None
                                 } else {
@@ -4004,6 +4704,15 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                 })),
+                            // Deferred container completion (#1630 review);
+                            // surfaces as `ExpressionEvaluation`, handled above.
+                            Some(state::IoMappingRedrive::AdHocContainerCompletion { cancel }) => {
+                                Some(Step::CompleteAdHoc {
+                                    instance_key,
+                                    container_key: element_instance_key,
+                                    cancel,
+                                })
+                            }
                             // Ad-hoc tool job-type failure (#1390): re-activate the
                             // tool with its preserved seed, overlaid with the
                             // operator's post-incident scope corrections (see
@@ -4318,6 +5027,66 @@ impl Engine {
                 }
             }
 
+            Command::EvaluateConditionalStartEvents {
+                variables,
+                process_definition_key,
+            } => {
+                // The candidate definitions: the exact version named by key, or
+                // the latest version of every deployed process id. Ordered by
+                // process id (then start element id below) so key minting is
+                // deterministic and replay stays in lock-step.
+                let mut candidates: Vec<(Key, ProcessDefinition)> = match process_definition_key {
+                    Some(key) => {
+                        let p = self.state.process_by_key(key).ok_or_else(|| {
+                            EngineError::ProcessNotFound {
+                                process_id: key.to_string(),
+                            }
+                        })?;
+                        vec![(p.key, p.definition.clone())]
+                    }
+                    None => self
+                        .state
+                        .processes
+                        .values()
+                        .filter(|p| has_conditional_start(&p.definition))
+                        .map(|p| (p.key, p.definition.clone()))
+                        .collect(),
+                };
+                candidates.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+                for (definition_key, definition) in candidates {
+                    let mut starts: Vec<(&ElementId, &String)> = definition
+                        .elements
+                        .values()
+                        .filter(|e| e.parent.is_none())
+                        .filter_map(|e| match &e.kind {
+                            ElementKind::ConditionalStartEvent { condition } => {
+                                Some((&e.id, condition))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    starts.sort_by(|a, b| a.0.cmp(b.0));
+                    for (start_id, condition) in starts {
+                        // A condition that errors or is non-boolean is simply
+                        // not satisfied — the same wait-until reading the
+                        // conditional catch event applies.
+                        if !matches!(crate::feel::eval_bool(condition, &variables), Ok(true)) {
+                            continue;
+                        }
+                        self.start_instance(
+                            &mut log,
+                            &mut queue,
+                            definition.id.clone(),
+                            start_id.clone(),
+                            variables.clone(),
+                            Vec::new(),
+                            None,
+                            definition_key,
+                        );
+                    }
+                }
+            }
+
             // These three commands are routed by the host between the instance
             // partition (where a token waits) and the message partition
             // (`hash(correlation_key)`, where the canonical subscription lives and
@@ -4412,13 +5181,21 @@ impl Engine {
                 // message model is unbuffered, so a dropped correlation does not
                 // re-correlate on resume — drop-on-suspend is the documented
                 // suspension semantics for messages.
-                let advance = matches!(
-                    self.state
-                        .message_subscriptions
-                        .get(&subscription_key)
-                        .map(|s| s.state),
-                    Some(state::MessageSubscriptionState::Opening)
-                ) && !self.instance_is_suspended(instance_key);
+                //
+                // A persistent subscription (non-interrupting boundary / event
+                // sub-process) never settles, so it instead dedupes on delivery
+                // identity: a `message_key` it already correlated is a
+                // redelivery and is ignored, while each distinct message still
+                // advances.
+                let advance = self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .is_some_and(|s| {
+                        s.state == state::MessageSubscriptionState::Opening
+                            && !s.correlated_message_keys.contains(&message_key)
+                    })
+                    && !self.instance_is_suspended(instance_key);
                 if advance {
                     // The continuation metadata the canonical (message-partition)
                     // record forwards can be stale: a migration re-points the
@@ -4730,7 +5507,7 @@ impl Engine {
                             event_type: crate::model::TaskListenerEventType::Canceling,
                             assignee: None,
                             update: None,
-                            variables: std::collections::HashMap::new(),
+                            variables: std::collections::BTreeMap::new(),
                             corrections: crate::model::UserTaskCorrections::default(),
                         };
                         for event in self.start_task_listener_chain(
@@ -4848,8 +5625,7 @@ impl Engine {
                 //    exists; each mapped pair keeps the same BPMN type (compared
                 //    by discriminant only, so a service task may map to one with a
                 //    different job type — Zeebe parity).
-                let mut mapped: HashMap<String, String> =
-                    HashMap::with_capacity(mapping_instructions.len());
+                let mut mapped: BTreeMap<String, String> = BTreeMap::new();
                 for (src, tgt) in &mapping_instructions {
                     if mapped.contains_key(src) {
                         return Err(EngineError::DuplicateMappingSourceElement {
@@ -4857,20 +5633,32 @@ impl Engine {
                             element_id: src.clone(),
                         });
                     }
-                    let src_el = source_def.definition.element(src).ok_or_else(|| {
-                        EngineError::MappingSourceElementNotFound {
+                    let src_el = migration::migration_node(&source_def.definition, src)
+                        .ok_or_else(|| EngineError::MappingSourceElementNotFound {
                             instance_key,
                             element_id: src.clone(),
-                        }
-                    })?;
-                    let tgt_el = target.definition.element(tgt).ok_or_else(|| {
-                        EngineError::MappingTargetElementNotFound {
-                            target_process_definition_key,
-                            element_id: tgt.clone(),
-                        }
-                    })?;
-                    if std::mem::discriminant(&src_el.kind) != std::mem::discriminant(&tgt_el.kind)
+                        })?;
+                    let tgt_el =
+                        migration::migration_node(&target.definition, tgt).ok_or_else(|| {
+                            EngineError::MappingTargetElementNotFound {
+                                target_process_definition_key,
+                                element_id: tgt.clone(),
+                            }
+                        })?;
+                    // A compensation boundary mapped onto a boundary of another
+                    // event type gets Zeebe's dedicated rejection (#1631).
+                    if let Some(target_event_type) =
+                        migration::compensation_boundary_type_change(&src_el, &tgt_el)
                     {
+                        return Err(EngineError::MigrationCompensationBoundaryTypeChanged {
+                            instance_key,
+                            process_id: source_process_id.clone(),
+                            source_boundary_id: src.clone(),
+                            target_boundary_id: tgt.clone(),
+                            target_event_type,
+                        });
+                    }
+                    if !src_el.same_type_as(&source_def.definition, &tgt_el, &target.definition) {
                         return Err(EngineError::MappedElementTypeChanged {
                             instance_key,
                             source_element_id: src.clone(),
@@ -4879,6 +5667,23 @@ impl Engine {
                     }
                     mapped.insert(src.clone(), tgt.clone());
                 }
+                // 3a. Ad-hoc sub-process inner instances (#1630): each activated
+                //     tool runs beneath a `<container>#innerInstance` element
+                //     instance that has no definition element of its own, so
+                //     it cannot be named in a mapping instruction (an explicit
+                //     one fails the source-element lookup above, Zeebe parity).
+                //     Like Zeebe, derive its mapping from the container's.
+                let mut mapping_instructions = mapping_instructions;
+                let mut inner_mappings: Vec<(String, String)> = mapping_instructions
+                    .iter()
+                    .filter(|(src, _)| migration::is_adhoc_container(&source_def.definition, src))
+                    .map(|(src, tgt)| (adhoc_inner_instance_id(src), adhoc_inner_instance_id(tgt)))
+                    .collect();
+                inner_mappings.sort();
+                for (src, tgt) in &inner_mappings {
+                    mapped.insert(src.clone(), tgt.clone());
+                }
+                mapping_instructions.extend(inner_mappings);
 
                 // 4. Reject element classes Zeebe does not migrate yet: an
                 //    active element instance whose kind is listed in
@@ -4895,12 +5700,12 @@ impl Engine {
                     .instances
                     .get(&instance_key)
                     .expect("instance existence checked above");
+                // `active` is a BTreeMap (#1662): already in key order.
                 let mut active_elements: Vec<(Key, String)> = instance
                     .active
                     .iter()
                     .map(|(k, e)| (*k, e.clone()))
                     .collect();
-                active_elements.sort();
                 let mut active_ids: Vec<String> =
                     active_elements.iter().map(|(_, e)| e.clone()).collect();
                 active_ids.sort();
@@ -4917,62 +5722,23 @@ impl Engine {
                     }
                 }
 
-                //    An active multi-instance body or ad-hoc sub-process
-                //    container: their per-element bookkeeping lives in
-                //    `ProcessInstance.multi_instances` / `adhoc_instances`,
-                //    which the applier (`state::apply`) does not remap, so
-                //    migrating one would leave that bookkeeping pointing at
-                //    the source element id and desync engine runtime.
-                let mut unremappable: Vec<String> = instance
-                    .multi_instances
-                    .values()
-                    .map(|mi| mi.element_id.clone())
-                    .chain(
-                        instance
-                            .adhoc_instances
-                            .values()
-                            .map(|adhoc| adhoc.element_id.clone()),
-                    )
-                    .collect();
-                unremappable.sort();
-                if let Some(element_id) = unremappable.into_iter().next() {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id,
-                        reason: "multi-instance and ad-hoc sub-process activities are not \
-                                 migratable yet"
-                            .to_string(),
-                    });
-                }
+                // 4a. Compensation subscriptions (#1631, Zeebe
+                //     `ProcessInstanceMigrationCatchEventBehavior`): a completed
+                //     compensable activity whose compensation boundary is mapped
+                //     follows it (with its flow-scope chain) to the target; an
+                //     unmapped one is deleted. In-flight waits are keyed by
+                //     active elements, which the general mapping re-points.
+                let compensation_subscriptions = migration::plan_compensation_migration(
+                    instance_key,
+                    &source_process_id,
+                    &target_process_id,
+                    &source_def.definition,
+                    &target.definition,
+                    &mapped,
+                    &instance.compensable,
+                )?;
 
-                //    Compensation runtime (`compensable` / `compensation_waits`)
-                //    is keyed by source element ids (activity, handler, throw)
-                //    the applier does not remap: a migrated in-flight throw
-                //    would never be released by its renamed handler. Fail
-                //    closed until supported.
-                let mut compensation_refs: Vec<String> = instance
-                    .compensable
-                    .iter()
-                    .map(|c| c.element_id.clone())
-                    .chain(
-                        instance
-                            .compensation_waits
-                            .values()
-                            .map(|w| w.throw_element_id.clone()),
-                    )
-                    .collect();
-                compensation_refs.sort();
-                if let Some(element_id) = compensation_refs.into_iter().next() {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id,
-                        reason: "instances with compensation subscriptions or an \
-                                 in-flight compensation are not migratable yet"
-                            .to_string(),
-                    });
-                }
-
-                // 4a. Event-based gateway races (#1554): validate where mapped
+                // 4b. Event-based gateway races (#1554): validate where mapped
                 //     catch events land and collect unmapped race members to
                 //     withdraw (exempt from the step-5 mapping requirement).
                 let withdrawn = Self::check_migrated_event_gateway_races(
@@ -4985,6 +5751,10 @@ impl Engine {
                 )?;
                 active_elements.retain(|e| !withdrawn.contains(e));
                 active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
+                // 4c. Event sub-process triggers (#1555) rest on their host
+                //     *scope*, not on an active element: they are reconciled
+                //     per scope against the target by `plan_migration`
+                //     (`plan_event_subprocess_migration`, #1379).
 
                 // 5. Every active element instance must have a mapping.
                 for eid in &active_ids {
@@ -4992,6 +5762,63 @@ impl Engine {
                         return Err(EngineError::UnmappedActiveElement {
                             instance_key,
                             element_id: eid.clone(),
+                        });
+                    }
+                }
+
+                // 5b. A parked ad-hoc tool retry (#1630 review): an
+                //     activation / job-type incident names a PENDING tool
+                //     that has no active element instance yet, so step 5
+                //     cannot see it. Resolving the incident re-activates
+                //     that tool under the target, so it must be mapped like
+                //     an active element and stay in its mapped container.
+                let mut pending_tools: Vec<String> = self
+                    .state
+                    .incidents
+                    .values()
+                    .filter(|i| {
+                        i.instance_key == instance_key
+                            && i.state == crate::state::IncidentState::Active
+                    })
+                    .filter_map(|i| match &i.redrive {
+                        Some(crate::state::IoMappingRedrive::AdHocToolActivation {
+                            element_id,
+                            ..
+                        })
+                        | Some(crate::state::IoMappingRedrive::AdHocToolJobType {
+                            element_id,
+                            ..
+                        }) => Some(element_id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                pending_tools.sort();
+                pending_tools.dedup();
+                for tool in &pending_tools {
+                    let Some(tgt_tool) = mapped.get(tool) else {
+                        return Err(EngineError::UnmappedActiveElement {
+                            instance_key,
+                            element_id: tool.clone(),
+                        });
+                    };
+                    let container_of = |def: &ProcessDefinition, id: &str| {
+                        def.adhoc
+                            .iter()
+                            .find(|ad| ad.tools.iter().any(|t| t.element_id == id))
+                            .map(|ad| ad.container_id.clone())
+                    };
+                    let source_container = container_of(&source_def.definition, tool);
+                    let expected = source_container
+                        .as_ref()
+                        .and_then(|c| mapped.get(c).cloned())
+                        .or(source_container);
+                    let actual = container_of(&target.definition, tgt_tool);
+                    if expected != actual {
+                        return Err(EngineError::MigrationFlowScopeChanged {
+                            instance_key,
+                            element_id: tool.clone(),
+                            source_flow_scope_id: expected,
+                            target_flow_scope_id: actual,
                         });
                     }
                 }
@@ -5022,23 +5849,51 @@ impl Engine {
                         .definition
                         .element(tgt)
                         .and_then(|e| e.multi_instance.as_ref().map(|m| m.sequential));
-                    if source_mi != target_mi {
-                        return Err(EngineError::MigrationMultiInstanceMismatch {
-                            instance_key,
-                            source_element_id: eid.clone(),
-                            target_element_id: tgt.clone(),
-                        });
+                    match (source_mi, target_mi) {
+                        (Some(s), Some(t)) if s != t => {
+                            return Err(EngineError::MigrationLoopCharacteristicsChanged {
+                                instance_key,
+                                source_element_id: eid.clone(),
+                                target_element_id: tgt.clone(),
+                            });
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            // Zeebe reports the element-instance types: an MI
+                            // body is `MULTI_INSTANCE_BODY`, a plain activity
+                            // its own BPMN type.
+                            let type_of = |def: &ProcessDefinition, id: &str, mi: bool| {
+                                if mi {
+                                    "MULTI_INSTANCE_BODY".to_string()
+                                } else {
+                                    def.element(id)
+                                        .map(|e| e.kind.type_name().to_string())
+                                        .unwrap_or_default()
+                                }
+                            };
+                            return Err(EngineError::MigrationMultiInstanceMismatch {
+                                instance_key,
+                                source_element_id: eid.clone(),
+                                source_element_type: type_of(
+                                    &source_def.definition,
+                                    eid,
+                                    source_mi.is_some(),
+                                ),
+                                target_element_id: tgt.clone(),
+                                target_element_type: type_of(
+                                    &target.definition,
+                                    tgt,
+                                    target_mi.is_some(),
+                                ),
+                            });
+                        }
+                        _ => {}
                     }
                     let expected =
-                        match flow_scope::element_flow_scope_chain(&source_def.definition, eid)
-                            .first()
-                        {
-                            Some(scope) => mapped.get(scope).cloned(),
+                        match migration::migration_flow_scope(&source_def.definition, eid) {
+                            Some(scope) => mapped.get(&scope).cloned(),
                             None => Some(target_process_id.clone()),
                         };
-                    let actual = flow_scope::element_flow_scope_chain(&target.definition, tgt)
-                        .first()
-                        .cloned()
+                    let actual = migration::migration_flow_scope(&target.definition, tgt)
                         .unwrap_or_else(|| target_process_id.clone());
                     if expected.as_deref() != Some(actual.as_str()) {
                         return Err(EngineError::MigrationFlowScopeChanged {
@@ -5057,6 +5912,15 @@ impl Engine {
                         tgt,
                     )?;
                 }
+                // 5a'. Event sub-processes of a live scope may not merge onto
+                //      one target event sub-process (#1379).
+                Self::check_migrated_event_subprocesses(
+                    instance_key,
+                    &source_def.definition,
+                    &target.definition,
+                    &mapped,
+                    &active_elements,
+                )?;
 
                 // 5b. An already-*open* parallel-gateway join (a token has
                 //     arrived on some but not all of its incoming flows) carries
@@ -5086,9 +5950,13 @@ impl Engine {
                     .instances
                     .get(&instance_key)
                     .expect("instance existence checked above");
-                let mut open_joins: Vec<String> = instance.join_instances.keys().cloned().collect();
-                open_joins.sort();
-                for src in open_joins {
+                // Joins are keyed per flow-scope instance (#1580): every open
+                // join of every scope instance is checked.
+                // `join_instances` is a BTreeMap (#1662): keys iterate in order.
+                let open_joins: Vec<state::JoinKey> =
+                    instance.join_instances.keys().cloned().collect();
+                for join in open_joins {
+                    let src = join.element_id.clone();
                     let join_kind = source_def.definition.elements.get(&src).map(|e| &e.kind);
                     let is_parallel_join = matches!(join_kind, Some(ElementKind::ParallelGateway));
                     let is_inclusive_join =
@@ -5113,7 +5981,7 @@ impl Engine {
                     // (`join_counts`) counts as one taken flow of the arity it
                     // was recorded under, so it needs parity just like a
                     // parallel join.
-                    let has_unidentified = instance.join_counts.get(&src).is_some_and(|n| *n > 0);
+                    let has_unidentified = instance.join_counts.get(&join).is_some_and(|n| *n > 0);
                     if is_parallel_join || has_unidentified {
                         let source_incoming_count = source_def.definition.incoming_count(&src);
                         let target_incoming_count = target.definition.incoming_count(tgt);
@@ -5143,7 +6011,7 @@ impl Engine {
                     // parity check above keeps that reading valid in the target.
                     // Rejecting them instead would strand every half-open
                     // legacy join on its old definition.
-                    if let Some(arrivals) = instance.join_flow_arrivals.get(&src) {
+                    if let Some(arrivals) = instance.join_flow_arrivals.get(&join) {
                         for (flow, _) in arrivals.iter() {
                             let migrated = IncomingFlow {
                                 from: mapped.get(&flow.from).unwrap_or(&flow.from).clone(),
@@ -5282,8 +6150,53 @@ impl Engine {
                         migrated_flow_scopes: plan.migrated_flow_scopes,
                         subscriptions: plan.subscriptions,
                         child_instances: plan.child_instances,
+                        join_scoped: true,
+                        compensation_subscriptions,
+                        compensation_migrated: true,
                     },
                 );
+                // Refresh each ad-hoc container's advertised tool catalog
+                // (`adHocSubProcessElements`) from the TARGET definition
+                // (#1630 review): the tools may have been renamed, and the
+                // next agent turn reads this engine-owned variable. Emitted as
+                // a scoped variable update (not mutated in the applier) so
+                // read-model projections observe the refreshed value too.
+                let mut catalog_refresh: Vec<(Key, Value)> = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|inst| {
+                        inst.adhoc_instances
+                            .iter()
+                            .filter_map(|(container_key, adhoc)| {
+                                target_definition
+                                    .adhoc
+                                    .iter()
+                                    .find(|a| a.container_id == adhoc.element_id)
+                                    .map(|spec| {
+                                        (
+                                            *container_key,
+                                            Value::List(Self::advertised_adhoc_catalog(spec)),
+                                        )
+                                    })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                catalog_refresh.sort_by_key(|(k, _)| *k);
+                for (scope_key, catalog) in catalog_refresh {
+                    self.emit(
+                        &mut log,
+                        Event::ScopedVariablesUpdated {
+                            instance_key,
+                            scope_key,
+                            variables: BTreeMap::from([(
+                                "adHocSubProcessElements".to_string(),
+                                catalog,
+                            )]),
+                        },
+                    );
+                }
                 for event in plan.after {
                     self.emit(&mut log, event);
                 }
@@ -5489,11 +6402,168 @@ impl Engine {
                 self.process_complete_agent_instance(&mut log, agent_instance_key)?;
             }
 
-            Command::QuarantineOffheapOrphan { instance_key } => {
+            Command::QuarantineOffheapOrphan {
+                instance_key,
+                stamp: None,
+            } => {
                 self.process_quarantine_offheap_orphan(&mut log, instance_key);
+            }
+            Command::QuarantineOffheapOrphan {
+                instance_key,
+                stamp: Some(stamp),
+            } => {
+                // Replicated form (#1447): no residency branch — that reads
+                // replica-local state. The leader decided the incident metadata. The idempotency
+                // guard, however, reads ONLY replicated state (the dedup
+                // tombstone every replica applies identically), so it is safe
+                // here and required: two committed stamped proposals for the same
+                // outstanding loss (a promoted member re-proposing its parked
+                // report before an inherited quarantine entry applies) must not
+                // mint a second incident (#1574 review).
+                //
+                // A duplicate (the guard already holds this loss episode) is a
+                // complete no-op.
+                //
+                // The guard reads ONLY the replicated tombstone, never the hot
+                // incident map: the latter is residency-dependent (a cold-tiered
+                // replica has drained it), so it would split replicas.
+                //
+                // Terminal gate (#1574 review, cancellation race): a report
+                // queued before a cancel/complete can commit after it and must
+                // not raise an incident on the finished instance. Decided from
+                // REPLICATED state only, so every replica agrees. The decision
+                // uses the TARGET's own replicated lifecycle validity, never the
+                // global epoch distance (review 5899722557): the global
+                // `terminal_epoch` counts EVERY terminal transition, so an
+                // unrelated instance completing between the stamp and the
+                // commitment would otherwise be misread as the target's
+                // termination and wrongly suppress a LIVE orphan report.
+                //
+                // The terminal gate must be REPLICA-UNIFORM: every replica
+                // applies the same committed command, so the decision must be a
+                // pure function of replicated state, never of replica-local
+                // residency. The rule is target-specific (review 5899722557):
+                // no-op iff the TARGET is provably terminal — its own
+                // replicated `terminated_epoch` is set (a resident terminal
+                // instance), or its key is in the replicated terminal ring, or
+                // the leader recovered its terminal epoch into the stamp. The
+                // global epoch DISTANCE is deliberately NOT used: it counts
+                // EVERY terminal transition, so an unrelated instance completing
+                // between the stamp and the commitment would be misread as the
+                // target's termination and wrongly suppress a LIVE orphan
+                // report (the review's finding). A live orphan (no terminal
+                // record anywhere) always raises, identically on every replica.
+                //
+                // The resident record's `terminated_epoch` is deliberately NOT
+                // consulted: whether a terminal instance is still resident is
+                // replica-local (eviction), so once the ring wraps past a
+                // stamp-before-cancel target it would split replicas (one
+                // no-ops, one raises and mints a key). Only replicated inputs —
+                // the stamp and the ring — decide; past the ring's reach every
+                // replica uniformly fails open (raises).
+                let target_terminated = stamp.target_terminated_epoch > 0
+                    || self.state.recently_terminated.contains(&instance_key);
+                if target_terminated {
+                    return Ok((log, queue));
+                }
+                // Episode gate (#1587). The stamp carries the replicated
+                // loss-episode id the leader resolved at stamp time. Decide
+                // from the replicated tombstone alone (never the residency-
+                // dependent hot incident map), so every replica agrees:
+                //
+                // - A live tombstone for this instance means the episode is
+                //   still open: a duplicate of it is a no-op. (A stamp whose
+                //   episode DIFFERS from the live tombstone's cannot be
+                //   produced by the leader — `orphan_incident_stamp` returns
+                //   `None` while a tombstone is live — so any such frame is a
+                //   legacy/episode-0 frame, handled below.)
+                // - NO live tombstone + a NONZERO episode means this proposal's
+                //   episode already ran its course: its incident was resolved
+                //   and the tombstone lifted, so this is a DELAYED DUPLICATE of
+                //   a resolved episode. It must be a deterministic no-op — it
+                //   must NOT raise a fresh incident (today's tombstone-less
+                //   behaviour re-reported it as a new episode). A genuinely new
+                //   loss after resolution stamps a FRESH, distinct episode id
+                //   (the leader mints it from its advanced allocator), so it
+                //   still applies and is reported.
+                //
+                // `episode == 0` is a legacy (pre-#1587) stamp: keep the
+                // episode-blind #1574 dedup (tombstone-presence only).
+                //
+                // STALE-STAMP SUPERSERVE (#1587 review): the gate compares the
+                // episode against the allocator's CURRENT position, which
+                // unrelated key-minting work can advance between the leader
+                // stamping the report and the proposal committing. A mismatch
+                // then means one of two things the gate cannot tell apart from
+                // replicated state alone: a delayed duplicate of a RESOLVED
+                // episode (the common case — no-op), or a FRESH report whose
+                // stamp went stale in flight (its loss is still outstanding
+                // and must still be reported). So a mismatch never silently
+                // clears the pending report: it emits
+                // [`Event::OrphanStampSuperseded`] — journaled, so the decision
+                // is replica-deterministic. The leader's journal observes that
+                // event, keeps the report in its backlog, and re-drains it
+                // through the gated backlog drain (leader-only, one in-flight
+                // proposal per key), which re-stamps it at the allocator's
+                // now-current position and re-proposes it. A delayed
+                // duplicate's report is already settled out of the backlog, so
+                // it is not re-proposed; a genuinely fresh report is never
+                // silently cleared.
+                let tombstone = self.state.variables_lost_quarantined.get(&instance_key);
+                match (tombstone, stamp.episode) {
+                    // An open episode: dedup any repeat of it.
+                    (Some(_), _) => return Ok((log, queue)),
+                    // A delayed duplicate of a resolved episode OR a fresh
+                    // report whose stamp went stale in flight: supersede it —
+                    // journal the decision so the leader's journal re-stamps
+                    // the still-pending report. Equality — the episode IS the next key — means a
+                    // FRESH proposal at the allocator's current position:
+                    // apply it.
+                    (None, episode) if episode > 0 => {
+                        if episode != self.peek_next_key() {
+                            self.emit(
+                                &mut log,
+                                Event::OrphanStampSuperseded {
+                                    instance_key,
+                                    episode,
+                                },
+                            );
+                            return Ok((log, queue));
+                        }
+                    }
+                    // Legacy episode-blind stamp with no live tombstone: apply.
+                    (None, _) => {}
+                }
+                let incident_key = self.emit_variables_lost(
+                    &mut log,
+                    instance_key,
+                    stamp.element_id,
+                    stamp.reason,
+                );
+                // Record the replicated dedup tombstone (with its episode id,
+                // #1587). Deliberately NO variable install and no off-heap row
+                // cleanup (#1574): the command must be replica-deterministic,
+                // and a leader-snapshotted payload is not (it can roll back an
+                // intervening SetVariables).
+                self.emit(
+                    &mut log,
+                    Event::VariablesLostQuarantined {
+                        instance_key,
+                        incident_key,
+                        episode: stamp.episode,
+                    },
+                );
             }
             Command::QuarantineColdOrphan { instance_key } => {
                 self.process_quarantine_cold_orphan(&mut log, instance_key);
+            }
+            Command::SetLenientCompletion { lenient } => {
+                // One-way (#1661): lenience can only be enabled. A `false`
+                // command is a no-op, so no replica can ever clear the flag and
+                // strand a leader-local activation it never saw.
+                if lenient {
+                    self.emit(&mut log, Event::LenientCompletionSet { lenient });
+                }
             }
         }
 
@@ -5529,6 +6599,23 @@ impl Engine {
     fn run_with<D: StepDriver>(
         &mut self,
         log: &mut Vec<Event>,
+        queue: VecDeque<Step>,
+        cursor: usize,
+        driver: &mut D,
+    ) -> Option<Paused> {
+        // Every FEEL evaluation while draining sees the command's replicated
+        // environment (#1642); the advanced RNG state is carried back so a
+        // paused debug session resumes the same stream.
+        let mut env = self.feel_env;
+        let result =
+            crate::feel::with_env(&mut env, || self.run_with_inner(log, queue, cursor, driver));
+        self.feel_env = env;
+        result
+    }
+
+    fn run_with_inner<D: StepDriver>(
+        &mut self,
+        log: &mut Vec<Event>,
         mut queue: VecDeque<Step>,
         mut cursor: usize,
         driver: &mut D,
@@ -5553,6 +6640,29 @@ impl Engine {
                         scope,
                         locals,
                     );
+                    if let Drive::Pause = driver.after_step(&log[emitted_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                    continue;
+                }
+                if let Step::TriggerEventSubProcess {
+                    instance_key,
+                    scope,
+                    ref esp_element_id,
+                } = step
+                {
+                    let emitted_from = log.len();
+                    if !self.step_targets_dead_scope(&step) {
+                        let esp_element_id = esp_element_id.clone();
+                        self.trigger_event_subprocess(
+                            log,
+                            &mut queue,
+                            instance_key,
+                            scope,
+                            esp_element_id,
+                            true,
+                        );
+                    }
                     if let Drive::Pause = driver.after_step(&log[emitted_from..]) {
                         return Some(Paused { queue, cursor });
                     }
@@ -5587,14 +6697,43 @@ impl Engine {
             // enqueue more work (and, in turn, drain an enclosing sub-process), so
             // loop until nothing more completes.
             let drain_from = log.len();
-            let followups = self.complete_drained_subprocesses(log);
-            queue.extend(followups);
+            // A sweep pass that completed a scope while enqueueing no follow-up
+            // (a drained event sub-process has no outgoing flow, #1555) may have
+            // drained the ENCLOSING scope — but its output mappings may also
+            // satisfy a conditional trigger armed on that enclosing scope. The
+            // re-sweep must therefore go through the conditional re-evaluation
+            // below first (never recurse inside the sweep: that would complete
+            // the freshly-drained host and disarm the trigger before it can
+            // fire, r4557686184). Carried across the re-evaluation, which does
+            // not clear it: a fire enqueues work, and the sweep re-runs once
+            // that work drains.
+            let mut needs_resweep = false;
             // Re-evaluate any conditional-event subscriptions whose condition may
             // now hold: those opened, or whose referenced variables changed, since
             // the last pass. A satisfied condition fires (advancing a catch token,
             // interrupting an activity, or spawning a non-interrupting token),
             // which enqueues more work — so this runs inside the same fixpoint loop.
+            //
+            // It runs BEFORE the drained-scope sweep: a scope whose inner flow
+            // has already drained is still live here, so a trigger it owns (a
+            // conditional event sub-process armed with the scope, #1555) gets its
+            // initial evaluation before the sweep completes the scope and
+            // disarms it. A fire enqueues work, which the loop drains before the
+            // sweep reconsiders the scope.
             cursor = self.reevaluate_conditionals(log, &mut queue, cursor);
+            let mut swept = false;
+            if queue.is_empty() {
+                let sweep_from = log.len();
+                let followups = self.complete_drained_subprocesses(log);
+                queue.extend(followups);
+                // The sweep's own events (a completed scope's output mappings)
+                // may satisfy a conditional: loop to re-evaluate them.
+                swept = log.len() > sweep_from;
+                // A pass that completed something with no follow-up work left a
+                // possibly-drained enclosing scope behind; re-sweep on the next
+                // pass, after the conditional re-evaluation above.
+                needs_resweep = swept && queue.is_empty();
+            }
             // Consult the driver on the events the drain sweep itself emitted
             // (a sub-process's own `ElementCompleted`, a conditional/boundary
             // firing) — these do not pass through `process_step`, so without this a
@@ -5608,7 +6747,7 @@ impl Engine {
                     return Some(Paused { queue, cursor });
                 }
             }
-            if !queue.is_empty() {
+            if !queue.is_empty() || swept || needs_resweep {
                 continue;
             }
             // Token quiescence. Complete any instance whose tokens have all
@@ -5649,6 +6788,13 @@ impl Engine {
     /// other queued step runs; a join guard evaluated in between therefore sees
     /// the same live paths as Zeebe's (#1244).
     fn completes_inline(&self, step: &Step) -> bool {
+        // An interrupting event sub-process queued by a throw fires right
+        // after the throw's completion is applied, before any sibling step
+        // (#1555): a parallel sibling throw must not complete first and
+        // purge this handler's activation.
+        if matches!(step, Step::TriggerEventSubProcess { .. }) {
+            return true;
+        }
         let Step::Complete {
             instance_key,
             element_id,
@@ -5690,9 +6836,9 @@ impl Engine {
         // invisible to (or shadowed from) a subscription's scope must not
         // re-fire it, or a non-interrupting boundary whose handler writes a
         // local of the same name would loop forever.
-        let mut changed: HashMap<Key, HashMap<String, std::collections::HashSet<Key>>> =
-            HashMap::new();
-        let mut opened: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut changed: BTreeMap<Key, BTreeMap<String, std::collections::BTreeSet<Key>>> =
+            BTreeMap::new();
+        let mut opened: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
         for event in &log[cursor..scan_end] {
             match event {
                 Event::VariablesUpdated {
@@ -5839,6 +6985,19 @@ impl Engine {
                         via: None,
                     });
                 }
+                state::MessageSubscriptionKind::EventSubProcess {
+                    esp_element_id,
+                    interrupting,
+                } => {
+                    self.trigger_event_subprocess(
+                        log,
+                        queue,
+                        instance_key,
+                        element_instance_key,
+                        esp_element_id,
+                        interrupting,
+                    );
+                }
             }
         }
         scan_end
@@ -5862,7 +7021,7 @@ impl Engine {
         element_instance_key: Key,
         element_id: ElementId,
         kind: state::MessageSubscriptionKind,
-        variables: &HashMap<String, Value>,
+        variables: &BTreeMap<String, Value>,
     ) {
         self.emit(
             log,
@@ -5878,13 +7037,7 @@ impl Engine {
         // instance before its token advances, propagating from the catching
         // element's enclosing (flow) scope upward (nearest defining ancestor,
         // else root). Root-only instances collapse to the flat `VariablesUpdated`.
-        if !variables.is_empty() {
-            let flow_scope = self.scope_of(instance_key, element_instance_key);
-            for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
-            {
-                self.emit(log, event);
-            }
-        }
+        self.merge_event_payload(log, instance_key, element_instance_key, &kind, variables);
 
         match kind {
             // Catch event: completing it resumes the token along its own outgoing
@@ -5931,6 +7084,19 @@ impl Engine {
                     via: None,
                 });
             }
+            state::MessageSubscriptionKind::EventSubProcess {
+                esp_element_id,
+                interrupting,
+            } => {
+                self.trigger_event_subprocess(
+                    log,
+                    queue,
+                    instance_key,
+                    element_instance_key,
+                    esp_element_id,
+                    interrupting,
+                );
+            }
         }
     }
 
@@ -5949,7 +7115,7 @@ impl Engine {
         element_instance_key: Key,
         element_id: ElementId,
         kind: state::MessageSubscriptionKind,
-        variables: &HashMap<String, Value>,
+        variables: &BTreeMap<String, Value>,
     ) {
         self.emit(
             log,
@@ -5961,15 +7127,7 @@ impl Engine {
                 element_id: element_id.clone(),
             },
         );
-        if !variables.is_empty() {
-            // Signal payload propagates from the catching element's enclosing
-            // (flow) scope upward, defaulting to root.
-            let flow_scope = self.scope_of(instance_key, element_instance_key);
-            for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
-            {
-                self.emit(log, event);
-            }
-        }
+        self.merge_event_payload(log, instance_key, element_instance_key, &kind, variables);
 
         match kind {
             state::MessageSubscriptionKind::IntermediateCatch => {
@@ -6006,6 +7164,19 @@ impl Engine {
                     via: None,
                 });
             }
+            state::MessageSubscriptionKind::EventSubProcess {
+                esp_element_id,
+                interrupting,
+            } => {
+                self.trigger_event_subprocess(
+                    log,
+                    queue,
+                    instance_key,
+                    element_instance_key,
+                    esp_element_id,
+                    interrupting,
+                );
+            }
         }
     }
 
@@ -6021,7 +7192,7 @@ impl Engine {
         // active instance instead made this O(total active backlog) per command:
         // under a large undrained backlog that scan dominated the engine thread
         // (per-command cost grew linearly with the backlog).
-        let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
         let mut drained: Vec<(Key, Key, ElementId)> = Vec::new();
         for instance_key in &touched {
             let Some(instance) = self.state.instances.get(instance_key) else {
@@ -6034,10 +7205,10 @@ impl Engine {
                 continue;
             };
             for (eik, element_id) in &instance.active {
-                let is_subprocess = matches!(
-                    process.definition.element(element_id).map(|e| &e.kind),
-                    Some(ElementKind::SubProcess { .. })
-                );
+                let is_subprocess = process
+                    .definition
+                    .element(element_id)
+                    .is_some_and(|e| e.kind.owns_token_scope());
                 if !is_subprocess {
                     continue;
                 }
@@ -6102,6 +7273,9 @@ impl Engine {
                 for event in self.cancel_boundary_signal_subscriptions_on(eik) {
                     self.emit(log, event);
                 }
+                for event in self.disarm_event_subprocess_events(instance_key, eik) {
+                    self.emit(log, event);
+                }
                 for event in self.cancel_boundary_conditional_subscriptions_on(eik) {
                     self.emit(log, event);
                 }
@@ -6158,7 +7332,7 @@ impl Engine {
             // scoped writes after `ElementCompleted` has dropped the local scope.
             let outputs = self.io_outputs(instance_key, &element_id);
             let output_updates = if outputs.is_empty() {
-                HashMap::new()
+                BTreeMap::new()
             } else {
                 let visible = self.variables_for_element(instance_key, eik);
                 match self.eval_io_mappings_in(&visible, &outputs) {
@@ -6182,6 +7356,11 @@ impl Engine {
                     }
                 }
             };
+            // The sub-process scope is completing: disarm the start-event
+            // triggers of the event sub-processes it contains (#1555).
+            for event in self.disarm_event_subprocess_events(instance_key, eik) {
+                self.emit(log, event);
+            }
             self.emit(
                 log,
                 Event::ElementCompleting {
@@ -6354,8 +7533,23 @@ impl Engine {
                 instance_key,
                 scope,
                 ..
+            }
+            | Step::TriggerEventSubProcess {
+                instance_key,
+                scope,
+                ..
+            }
+            | Step::RetryTimerCycleRearm {
+                instance_key,
+                element_instance_key: scope,
+                ..
             } => (*instance_key, Some(*scope), None, None),
             Step::Complete {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::RetryErrorEndThrow {
                 instance_key,
                 element_instance_key,
                 ..
@@ -6540,22 +7734,24 @@ impl Engine {
         let Step::Activate {
             instance_key,
             element_id,
+            scope,
             via: Some(_),
-            ..
         } = step
         else {
             return Vec::new();
         };
+        let join = state::JoinKey::new(*scope, element_id.as_str());
         let holds_tokens = self.state.instances.get(instance_key).is_some_and(|i| {
-            i.join_flow_arrivals.contains_key(element_id) || i.join_counts.contains_key(element_id)
+            i.join_flow_arrivals.contains_key(&join) || i.join_counts.contains_key(&join)
         });
         if holds_tokens
             && self.join_kind(*instance_key, element_id).is_some()
-            && self.join_eik(*instance_key, element_id).is_none()
+            && self.join_eik(*instance_key, *scope, element_id).is_none()
         {
             vec![Event::ParallelJoinReset {
                 instance_key: *instance_key,
                 element_id: element_id.clone(),
+                scope: Some(*scope),
             }]
         } else {
             Vec::new()
@@ -6571,7 +7767,7 @@ impl Engine {
         if !cfg!(debug_assertions) {
             return;
         }
-        let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
         for key in touched {
             let Some(instance) = self.state.instances.get(&key) else {
                 continue;
@@ -6586,7 +7782,9 @@ impl Engine {
             {
                 debug_assert!(
                     instance.join_instances.contains_key(join),
-                    "instance {key}: join `{join}` holds tokens but no open join instance"
+                    "instance {key}: join `{}` (scope {}) holds tokens but no open join instance",
+                    join.element_id,
+                    join.scope
                 );
             }
         }
@@ -6624,6 +7822,11 @@ impl Engine {
                 element_instance_key,
                 element_id,
             } => self.complete(instance_key, element_instance_key, element_id),
+            Step::RetryErrorEndThrow {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => self.retry_error_end_throw(instance_key, element_instance_key, element_id),
             Step::CompleteAdHocCallActivityTool {
                 instance_key,
                 element_instance_key,
@@ -6706,6 +7909,14 @@ impl Engine {
                 element_id,
                 pending,
             } => {
+                // A parked user-task ad-hoc TOOL lives only in its container's
+                // catalog, not the executable graph: resume it via the
+                // catalog-aware retry (#1193 review).
+                if let Some(events) =
+                    self.adhoc_user_task_tool_retry(instance_key, element_instance_key, &element_id)
+                {
+                    return (events, Vec::new());
+                }
                 // The catch element instance is already ACTIVATED (its token is
                 // parked on the resolved incident); reconstruct its enclosing
                 // scope (absent from `scopes` ⇒ root) and re-derive only the
@@ -6724,6 +7935,9 @@ impl Engine {
                     element_instance_key,
                     scope,
                     vars,
+                    // A re-driven body never sees the mapping-time view:
+                    // no secret provenance (fail closed, #1640).
+                    Vec::new(),
                 );
                 if pending {
                     (gate_activated(events, activated, 0), followups)
@@ -6764,6 +7978,37 @@ impl Engine {
                     ));
                 }
                 (events, Vec::new())
+            }
+            Step::RetryTimerCycleRearm {
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind,
+                previous_due_at,
+                remaining,
+            } => {
+                // A re-arm incident can outlive its instance: resolving it after
+                // the instance completed must not mint a timer (or raise another
+                // incident) on the completed instance (#1596 review).
+                if self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .is_some_and(|i| i.state == ProcessInstanceState::Completed)
+                {
+                    return (Vec::new(), Vec::new());
+                }
+                (
+                    self.cycle_rearm_events(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        kind,
+                        previous_due_at,
+                        remaining,
+                    ),
+                    Vec::new(),
+                )
             }
             Step::RetryMiChildCompletion {
                 instance_key,
@@ -6890,6 +8135,10 @@ impl Engine {
             } => {
                 debug_assert!(false, "ActivateSeededJoin is dispatched by run_with");
                 self.activate(instance_key, element_id, scope, None, pending)
+            }
+            Step::TriggerEventSubProcess { .. } => {
+                debug_assert!(false, "TriggerEventSubProcess is dispatched by run_with");
+                (Vec::new(), Vec::new())
             }
             Step::ActivateMiChild {
                 instance_key,
@@ -7067,7 +8316,7 @@ impl Engine {
         // activation, BEFORE the input mappings run; a resolved input-mapping
         // incident re-runs only `activate_body`, which sees the scope already
         // registered and does not re-create it.
-        let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
+        let is_sub_process = kind.as_ref().is_some_and(ElementKind::owns_token_scope);
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
         // #1437 (Zeebe parity): an element declaring execution listeners is a
@@ -7088,12 +8337,63 @@ impl Engine {
             });
         }
 
-        let (body_events, body_followups) = self.activate_body(
-            instance_key,
-            element_id.clone(),
-            element_instance_key,
-            scope,
-        );
+        // An event sub-process container whose trigger carried a payload for
+        // an output-mapped start event journals the hold against this
+        // concrete container instance, so it survives a deferred start (a
+        // container `start` listener) and replay.
+        if matches!(kind, Some(ElementKind::EventSubProcess { .. })) {
+            if let Some(variables) =
+                self.esp_start_payloads
+                    .remove(&(instance_key, scope, element_id.clone()))
+            {
+                events.push(Event::EventSubProcessPayloadHeld {
+                    instance_key,
+                    scope_key: element_instance_key,
+                    variables,
+                });
+            }
+        }
+        // An event sub-process start event with output mappings receives its
+        // trigger's payload as LOCAL variables before it runs (Zeebe parity),
+        // visible to its own activation-time expressions (listener job types,
+        // input mappings) as well.
+        let mut view_overlay = None;
+        if let Some(payload) = self.held_esp_start_payload(instance_key, &element_id, scope) {
+            if !(is_sub_process || is_adhoc_container || has_listeners) {
+                events.push(Event::VariableScopeCreated {
+                    instance_key,
+                    scope_key: element_instance_key,
+                    parent_scope_key: scope,
+                });
+            }
+            events.push(Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key: element_instance_key,
+                variables: payload.clone(),
+            });
+            view_overlay = Some(payload);
+        }
+        let (body_events, body_followups) = match view_overlay {
+            None => self.activate_body(
+                instance_key,
+                element_id.clone(),
+                element_instance_key,
+                scope,
+            ),
+            Some(payload) => {
+                let mut vars = (*self.variables_for_element(instance_key, scope)).clone();
+                vars.extend(payload);
+                self.activate_body_with_vars(
+                    instance_key,
+                    element_id.clone(),
+                    element_instance_key,
+                    scope,
+                    scope,
+                    Arc::new(vars),
+                    true,
+                )
+            }
+        };
         events.extend(body_events);
         followups.extend(body_followups);
         // `ElementActivated` sits right after `ElementActivating` — unless the
@@ -7147,13 +8447,76 @@ impl Engine {
         scope: Key,
         view_scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        // The scoped variable view the activating element evaluates against: both
+        // its input-mapping *source* expressions and its own FEEL attributes (job
+        // type, retries, priority, timer/message/signal name, correlation key,
+        // user-task fields). It is the element's enclosing flow scope — a
+        // root-scope element gets the shared root Arc (a cheap refcount bump), so
+        // evaluation is byte-identical to the flat engine; an element inside a
+        // sub-process or multi-instance body additionally sees its enclosing
+        // scope's locals, so an input mapping that reads an enclosing-scope-local
+        // variable resolves correctly (Zeebe parity). A sub-process's own inputs
+        // are evaluated here against its *parent* scope and then applied local to
+        // the new sub-process scope.
+        let element_vars = self.variables_for_element(instance_key, view_scope);
+        self.activate_body_with_vars(
+            instance_key,
+            element_id,
+            element_instance_key,
+            scope,
+            view_scope,
+            element_vars,
+            false,
+        )
+    }
+
+    /// The payload held (journaled [`Event::EventSubProcessPayloadHeld`]) for
+    /// `element_id` iff it is the start event of the event sub-process
+    /// container instance `scope`.
+    fn held_esp_start_payload(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+        scope: Key,
+    ) -> Option<BTreeMap<String, Value>> {
+        let held = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .esp_held_payloads
+            .get(&scope)?;
+        let container_id = self.element_id_of_instance(instance_key, scope)?;
+        match self.element_kind(instance_key, &container_id) {
+            Some(ElementKind::EventSubProcess { start_event, .. }) if start_event == element_id => {
+                Some(held.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// [`activate_body_in`] against an explicit variable view. `view_scope` is
+    /// the scope that view was built from (the mapping's evaluation scope): it
+    /// decides which bindings shadow a trusted cluster-variable root for
+    /// secret-reference provenance — only bindings on `view_scope`'s own
+    /// visible chain, never a sibling branch's locals (#1652 round-5 review).
+    #[allow(clippy::too_many_arguments)]
+    fn activate_body_with_vars(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        element_instance_key: Key,
+        scope: Key,
+        view_scope: Key,
+        element_vars: Arc<BTreeMap<String, Value>>,
+        scope_pre_registered: bool,
+    ) -> (Vec<Event>, Vec<Step>) {
         // Input mappings (zeebe:input): evaluate against the variables visible to
         // the activating element and create the mapped values LOCAL to the
         // element's own scope (Zeebe semantics) — visible to the element's job or
         // inner flow, not propagated to the parent, and dropped when the element
         // completes.
         let kind = self.element_kind(instance_key, &element_id);
-        let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
+        let is_sub_process = kind.as_ref().is_some_and(ElementKind::owns_token_scope);
         let is_call_activity = matches!(kind, Some(ElementKind::CallActivity { .. }));
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
@@ -7161,8 +8524,11 @@ impl Engine {
         // sub-process/ad-hoc container or a listener-bearing element (#1437)
         // (before this body runs); a leaf activity registers it lazily below,
         // only if its inputs produce values.
-        // A modification may have registered it already (seeded locals).
-        let scope_registered = is_sub_process
+        // A modification may have registered it already (seeded locals), or
+        // the caller may register it in the same activation (an event
+        // sub-process start event seeded with its trigger payload).
+        let scope_registered = scope_pre_registered
+            || is_sub_process
             || is_adhoc_container
             || self.has_execution_listeners(instance_key, &element_id)
             || self
@@ -7183,19 +8549,6 @@ impl Engine {
             self.io_inputs(instance_key, &element_id)
         };
 
-        // The scoped variable view the activating element evaluates against: both
-        // its input-mapping *source* expressions and its own FEEL attributes (job
-        // type, retries, priority, timer/message/signal name, correlation key,
-        // user-task fields). It is the element's enclosing flow scope — a
-        // root-scope element gets the shared root Arc (a cheap refcount bump), so
-        // evaluation is byte-identical to the flat engine; an element inside a
-        // sub-process or multi-instance body additionally sees its enclosing
-        // scope's locals, so an input mapping that reads an enclosing-scope-local
-        // variable resolves correctly (Zeebe parity). A sub-process's own inputs
-        // are evaluated here against its *parent* scope and then applied local to
-        // the new sub-process scope.
-        let element_vars = self.variables_for_element(instance_key, view_scope);
-
         let mut events: Vec<Event> = Vec::new();
         let followups: Vec<Step> = Vec::new();
 
@@ -7211,17 +8564,31 @@ impl Engine {
             events.push(Event::ScopedVariablesUpdated {
                 instance_key,
                 scope_key: element_instance_key,
-                variables: HashMap::from([(name, Value::List(Vec::new()))]),
+                variables: BTreeMap::from([(name, Value::List(Vec::new()))]),
             });
         }
         // A source expression that fails to evaluate raises an `IO_MAPPING_ERROR`
         // incident and halts the element (no scope write, no behaviour) — the
         // resolution re-drives this body (#939).
-        let input_updates = if inputs.is_empty() {
-            HashMap::new()
+        //
+        // Value AND secret-reference provenance (#1640) are captured in ONE
+        // evaluation per mapping (`eval_input_mappings_with_provenance`): a
+        // nondeterministic source (`random number()`, `now()`) re-evaluated
+        // for provenance after the value was computed could take a different
+        // branch, decoupling the journaled value from its recorded trust
+        // (#1652 round-5 review). The provenance is taken from the exact view
+        // the mappings evaluated against — never re-derived later — and
+        // journaled on the element's `JobCreated`.
+        let (input_updates, secret_provenance) = if inputs.is_empty() {
+            (BTreeMap::new(), Vec::new())
         } else {
-            match self.eval_io_mappings_in(&element_vars, &inputs) {
-                Ok(updates) => updates,
+            match self.eval_input_mappings_with_provenance(
+                instance_key,
+                view_scope,
+                &element_vars,
+                &inputs,
+            ) {
+                Ok(evaluated) => evaluated,
                 Err(failure) => {
                     return (
                         vec![self.io_mapping_incident(
@@ -7338,6 +8705,7 @@ impl Engine {
             element_instance_key,
             scope,
             activation_vars,
+            secret_provenance,
         );
         events.extend(kind_events);
         (events, kind_followups)
@@ -7402,6 +8770,130 @@ impl Engine {
         }
     }
 
+    /// Re-arm a fired repeating cycle timer (a non-interrupting boundary or a
+    /// non-interrupting event sub-process timer) for its next interval and emit
+    /// the outcome into `log`: the next `TimerCreated`, nothing once a bounded
+    /// `Rn/…` cycle is exhausted (#1596), or — when the cycle's FEEL expression
+    /// no longer evaluates — the host's `EXTRACT_VALUE_ERROR` (#1398) carrying a
+    /// [`state::IoMappingRedrive::TimerCycleRearm`] descriptor, so resolution
+    /// retries exactly this re-arm with the partially consumed repetition count.
+    #[allow(clippy::too_many_arguments)]
+    fn rearm_fired_cycle(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        kind: state::TimerKind,
+        previous_due_at: u64,
+        remaining: Option<u32>,
+    ) {
+        for event in self.cycle_rearm_events(
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind,
+            previous_due_at,
+            remaining,
+        ) {
+            self.emit(log, event);
+        }
+    }
+
+    /// The single canonical cycle re-arm (#1596 review), shared by the timer
+    /// fire path and the [`Step::RetryTimerCycleRearm`] incident redrive so
+    /// both schedule from the same base with the same remaining count.
+    fn cycle_rearm_events(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        kind: state::TimerKind,
+        previous_due_at: u64,
+        remaining: Option<u32>,
+    ) -> Vec<Event> {
+        let rearmed = match &kind {
+            state::TimerKind::NonInterruptingBoundary {
+                boundary_element_id,
+            } => self.rearm_boundary_cycle_timer(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                boundary_element_id,
+                previous_due_at,
+                remaining,
+            ),
+            state::TimerKind::EventSubProcess {
+                esp_element_id,
+                interrupting: false,
+            } => self.rearm_event_subprocess_timer(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                esp_element_id,
+                previous_due_at,
+                remaining,
+            ),
+            // One-shot / interrupting timers never re-arm.
+            _ => Ok(None),
+        };
+        match rearmed {
+            Ok(event) => event.into_iter().collect(),
+            Err(failure) => vec![self.expression_incident(
+                instance_key,
+                element_instance_key,
+                element_id,
+                failure,
+                Some(state::IoMappingRedrive::TimerCycleRearm {
+                    kind,
+                    previous_due_at,
+                    remaining,
+                }),
+            )],
+        }
+    }
+
+    /// Re-arm a fired non-interrupting boundary cycle for its next interval.
+    /// A FEEL cycle re-evaluates against current variables; a static cycle
+    /// keeps its parsed interval. `Ok(None)` when the boundary is not a
+    /// repeating cycle or a bounded cycle is exhausted (#1596).
+    fn rearm_boundary_cycle_timer(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        boundary_element_id: &str,
+        previous_due_at: u64,
+        remaining: Option<u32>,
+    ) -> Result<Option<Event>, expression::Failure> {
+        let Some(ElementKind::TimerBoundaryEvent {
+            duration_millis,
+            repeating: true,
+            ..
+        }) = self.element_kind(instance_key, boundary_element_id)
+        else {
+            return Ok(None);
+        };
+        let Some(repetitions) = rearm_repetitions(remaining) else {
+            return Ok(None);
+        };
+        let timer_def = self.timer_def_of(instance_key, boundary_element_id);
+        let vars = self.variables_for_element(instance_key, element_instance_key);
+        let next =
+            self.resolve_timer(&vars, timer_def.as_ref(), previous_due_at, duration_millis)?;
+        Ok(Some(Event::TimerCreated {
+            timer_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id: element_id.to_string(),
+            due_at: next.due_at,
+            kind: state::TimerKind::NonInterruptingBoundary {
+                boundary_element_id: boundary_element_id.to_string(),
+            },
+            repetitions,
+        }))
+    }
+
     fn expression_incident(
         &mut self,
         instance_key: Key,
@@ -7463,6 +8955,24 @@ impl Engine {
             return;
         }
         let element_id = instance.process_id.clone();
+        self.emit_variables_lost(
+            log,
+            instance_key,
+            element_id,
+            RESIDENT_ORPHAN_REASON.to_string(),
+        );
+    }
+
+    /// Emits the single instance-root `VariablesLost` incident every orphan
+    /// quarantine form shares (#1384/#1481/#1447): one canonical shape, so the
+    /// local and replicated forms cannot drift.
+    fn emit_variables_lost(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        element_id: String,
+        reason: String,
+    ) -> Key {
         let incident_key = self.mint_key();
         self.emit(
             log,
@@ -7473,11 +8983,96 @@ impl Engine {
                 element_id,
                 kind: state::IncidentKind::VariablesLost,
                 redrive: None,
-                reason: "variables lost: spill row missing".to_string(),
+                reason,
                 job_key: None,
                 created_at: self.now,
             },
         );
+        incident_key
+    }
+
+    /// Whether an active `VariablesLost` incident already names `instance_key`
+    /// in this engine's state.
+    ///
+    /// The quarantine idempotency guard must be **replica-identical** (#1574
+    /// review), so it reads the replicated dedup tombstone
+    /// ([`State::variables_lost_quarantined`]) first: that set is recorded by the
+    /// quarantine's own event and is independent of instance residency and
+    /// terminal eviction, whereas the `VariablesLost` *incident record* leaves
+    /// hot state when its instance cold-spills and is dropped on eviction — a
+    /// guard reading only `incidents` would go blind on exactly the replica that
+    /// tiered and mint a duplicate incident there. The tombstone is the
+    /// authoritative answer; the incident scan below is the legacy fallback for
+    /// an incident journaled before the tombstone event existed (a pre-#1574
+    /// journal mid-replay) and for the resident fast path.
+    pub fn has_active_variables_lost(&self, instance_key: Key) -> bool {
+        if self
+            .state
+            .variables_lost_quarantined
+            .contains_key(&instance_key)
+        {
+            return true;
+        }
+        self.state.incidents.values().any(|i| {
+            i.instance_key == instance_key
+                && i.state == state::IncidentState::Active
+                && i.kind == state::IncidentKind::VariablesLost
+        })
+    }
+
+    /// Resolves, from THIS (proposing leader's) state, the stamp a replicated
+    /// [`Command::QuarantineOffheapOrphan`] carries (#1447) — every replica then
+    /// applies the identical incident. `None` means nothing should be proposed:
+    /// the leader already holds an active `VariablesLost` incident for the
+    /// instance, or holds it resident in a terminal state (the loss no longer
+    /// matters to any live work). Pure read.
+    pub fn orphan_incident_stamp(
+        &self,
+        instance_key: Key,
+        kind: crate::command::OrphanKind,
+    ) -> Option<crate::command::OrphanIncidentStamp> {
+        if self.has_active_variables_lost(instance_key) {
+            return None;
+        }
+        let element_id = match self.state.instances.get(&instance_key) {
+            Some(instance)
+                if !matches!(
+                    instance.state,
+                    ProcessInstanceState::Active | ProcessInstanceState::Suspended
+                ) =>
+            {
+                return None;
+            }
+            Some(instance) => instance.process_id.clone(),
+            None => String::new(),
+        };
+        let reason = match kind {
+            crate::command::OrphanKind::Resident => RESIDENT_ORPHAN_REASON,
+            crate::command::OrphanKind::Cold => COLD_ORPHAN_REASON,
+        };
+        Some(crate::command::OrphanIncidentStamp {
+            kind,
+            element_id,
+            reason: reason.to_string(),
+            terminal_epoch: self.state.terminal_epoch,
+            // The target's own terminal epoch at stamp time, read from the
+            // resident record OR the replicated terminal ring (a leader that
+            // already evicted its terminal shell still proves the target's
+            // terminal epoch from the ring). `0` while the target is live (a
+            // resident terminal instance returns `None` above) or so old the
+            // ring has wrapped past it. The cold apply path reads it to detect
+            // the target terminating after the stamp.
+            target_terminated_epoch: self.state.terminated_epoch_of(instance_key).unwrap_or(0),
+            // The loss-episode id (#1587): the allocator's next key at stamp
+            // time. Two stamped copies of one episode agree, and a delayed
+            // duplicate of a resolved episode (whose tombstone lifted) is a
+            // deterministic no-op. The allocator can advance between this stamp
+            // and the proposal's commitment (unrelated key-minting work), so
+            // the apply gate treats a position mismatch as a SUPERSEDED stamp —
+            // re-stamped and re-proposed via `Event::OrphanStampSuperseded` —
+            // never as authority to drop a still-pending report (#1587 review).
+            episode: self.peek_next_key(),
+        })
     }
 
     /// Process a [`Command::QuarantineColdOrphan`] (#1481): record a durable
@@ -7491,30 +9086,14 @@ impl Engine {
             self.process_quarantine_offheap_orphan(log, instance_key);
             return;
         }
-        let already_raised = self.state.incidents.values().any(|i| {
-            i.instance_key == instance_key
-                && i.state == state::IncidentState::Active
-                && i.kind == state::IncidentKind::VariablesLost
-        });
-        if already_raised {
+        if self.has_active_variables_lost(instance_key) {
             return;
         }
-        let incident_key = self.mint_key();
-        self.emit(
+        self.emit_variables_lost(
             log,
-            Event::IncidentRaised {
-                incident_key,
-                instance_key,
-                element_instance_key: instance_key,
-                element_id: String::new(),
-                kind: state::IncidentKind::VariablesLost,
-                redrive: None,
-                reason: "variables lost: cold instance row missing from the spill store; \
-                         the whole instance is unrecoverable"
-                    .to_string(),
-                job_key: None,
-                created_at: self.now,
-            },
+            instance_key,
+            String::new(),
+            COLD_ORPHAN_REASON.to_string(),
         );
     }
 
@@ -7545,7 +9124,8 @@ impl Engine {
         element_id: String,
         element_instance_key: Key,
         scope: Key,
-        element_vars: Arc<HashMap<String, Value>>,
+        element_vars: Arc<BTreeMap<String, Value>>,
+        secret_provenance: Vec<state::SecretProvenance>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
         match self.try_activation_body(
@@ -7554,6 +9134,7 @@ impl Engine {
             element_instance_key,
             scope,
             element_vars,
+            secret_provenance,
         ) {
             Ok(planned) => planned,
             Err(failure) => {
@@ -7644,12 +9225,22 @@ impl Engine {
         element_id: String,
         element_instance_key: Key,
         scope: Key,
-        element_vars: Arc<HashMap<String, Value>>,
+        element_vars: Arc<BTreeMap<String, Value>>,
+        secret_provenance: Vec<state::SecretProvenance>,
     ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let kind = self.element_kind(instance_key, &element_id);
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let mut events: Vec<Event> = Vec::new();
         let mut followups: Vec<Step> = Vec::new();
+
+        // The process-level start event activating opens the process scope:
+        // arm the start-event triggers of the root's event sub-processes
+        // (#1555). (An event sub-process's own start event activates in the
+        // event sub-process scope, never scope 0.)
+        if scope == 0 && kind.as_ref().is_some_and(ElementKind::is_start_event) {
+            let root_vars = self.variables_for_element(instance_key, 0);
+            events.extend(self.arm_event_subprocesses(instance_key, 0, None, &root_vars)?);
+        }
 
         match kind {
             // A service task creates a job and parks the token.
@@ -7696,7 +9287,7 @@ impl Engine {
                             instance_key,
                             container_key: element_instance_key,
                             element_id: id.clone(),
-                            variables: HashMap::new(),
+                            variables: BTreeMap::new(),
                         });
                     }
                     // An empty collection has nothing to run: the container
@@ -7742,6 +9333,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: secret_provenance.clone(),
                 });
                 // An ad-hoc container: register its runtime state alongside the
                 // agent job. The container element instance is the ad-hoc scope
@@ -7765,7 +9357,7 @@ impl Engine {
                     // without leaking to the parent instance. Per-tool
                     // documentation / `zeebe:properties` / `fromAi` parameter
                     // schema are not parsed by nano yet (deferred; see #614).
-                    let mut catalog_var = HashMap::new();
+                    let mut catalog_var = BTreeMap::new();
                     catalog_var.insert(
                         "adHocSubProcessElements".to_string(),
                         Value::List(Self::advertised_adhoc_catalog(def)),
@@ -7805,9 +9397,46 @@ impl Engine {
                 let user_task_key = self.mint_key();
                 // Resolve the form linkage, enforcing the Zeebe invariant that
                 // `formId` and `externalReference` are mutually exclusive (an
-                // external reference wins and suppresses `form_key` resolution).
+                // external reference wins and suppresses `form_key` resolution)
+                // and dispatching on the declared binding (Zeebe
+                // `BpmnUserTaskBehavior.findLinkedForm`, #1193). A
+                // `deployment`/`versionTag` miss raises a resolvable incident
+                // and creates no task: the element stays parked in ACTIVATING
+                // (the token only advances on task completion) and resolving
+                // the incident re-runs the activation body.
                 let (form_key, external_form_reference) =
-                    self.resolve_user_task_form_linkage(&props);
+                    match self.resolve_user_task_form_linkage(instance_key, &props) {
+                        crate::engine::resolve::FormLinkage::Unbound {
+                            external_form_reference,
+                        } => (None, external_form_reference),
+                        crate::engine::resolve::FormLinkage::Resolved { form_key } => {
+                            (Some(form_key), None)
+                        }
+                        crate::engine::resolve::FormLinkage::Miss { reason } => {
+                            events.push(Event::IncidentRaised {
+                                incident_key: self.mint_key(),
+                                instance_key,
+                                element_instance_key,
+                                element_id: element_id.clone(),
+                                kind: state::IncidentKind::CalledElementError,
+                                // The form lookup runs AFTER the element's input
+                                // mappings and `start` listeners already succeeded
+                                // (#1193 review): resolution must re-run ONLY the
+                                // activation body, never re-apply the (possibly
+                                // non-idempotent, e.g. `=counter + 1 -> counter`)
+                                // inputs or re-fire the completed start listeners.
+                                // `gate_activated` re-tags this
+                                // `ActivationBodyPending` and withholds
+                                // `ElementActivated` when the token is still
+                                // ACTIVATING.
+                                redrive: Some(state::IoMappingRedrive::ActivationBody),
+                                reason,
+                                job_key: None,
+                                created_at: self.now,
+                            });
+                            return Ok((events, followups));
+                        }
+                    };
                 // An initial assignee (zeebe:assignmentDefinition) must fire the
                 // `assigning` listeners exactly as a runtime assign does (Zeebe
                 // parity: the assignee is stripped off the CREATED record and
@@ -7859,7 +9488,7 @@ impl Engine {
                         // assigning transition when creating drains.
                         assignee: deferred_initial_assignee,
                         update: None,
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     events.extend(self.start_task_listener_chain(
@@ -7889,7 +9518,7 @@ impl Engine {
                             event_type: crate::model::TaskListenerEventType::Assigning,
                             assignee: Some(initial),
                             update: None,
-                            variables: std::collections::HashMap::new(),
+                            variables: std::collections::BTreeMap::new(),
                             corrections: crate::model::UserTaskCorrections::default(),
                         };
                         events.extend(self.start_task_listener_chain(
@@ -7984,6 +9613,31 @@ impl Engine {
                     scope,
                     &element_id,
                 )?;
+                // The sub-process scope opens: arm its event sub-processes.
+                events.extend(self.arm_event_subprocesses(
+                    instance_key,
+                    element_instance_key,
+                    Some(&element_id),
+                    &element_vars,
+                )?);
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: start_event,
+                    scope: element_instance_key,
+                    via: None,
+                });
+            }
+            // A triggered event sub-process opens its own token scope and
+            // activates its start event inside it (#1555); it completes once
+            // that scope drains, exactly like an embedded sub-process. Nested
+            // event sub-processes arm with it.
+            Some(ElementKind::EventSubProcess { start_event, .. }) => {
+                events.extend(self.arm_event_subprocesses(
+                    instance_key,
+                    element_instance_key,
+                    Some(&element_id),
+                    &element_vars,
+                )?);
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
@@ -8317,7 +9971,7 @@ impl Engine {
             self.io_inputs(instance_key, &element_id)
         };
         let input_updates = if inputs.is_empty() {
-            HashMap::new()
+            BTreeMap::new()
         } else {
             // Tolerate a mapping that fails because it references a per-child
             // binding (`loopCounter` / the configured `inputElement`) absent at the
@@ -8325,7 +9979,7 @@ impl Engine {
             // fails for any other reason is a genuine failure: park the body on an
             // `IO_MAPPING_ERROR` incident whose resolution re-drives this body
             // activation (#946).
-            let mut tolerated = std::collections::HashSet::new();
+            let mut tolerated = std::collections::BTreeSet::new();
             tolerated.insert("loopCounter".to_string());
             if let Some(name) = &mi.input_element {
                 tolerated.insert(name.clone());
@@ -8353,7 +10007,7 @@ impl Engine {
         }
         // The input collection is evaluated in the body scope view (the enclosing
         // scope with any body input mappings overlaid).
-        let vars: Arc<HashMap<String, Value>> = {
+        let vars: Arc<BTreeMap<String, Value>> = {
             if input_updates.is_empty() {
                 enclosing_vars
             } else {
@@ -8561,7 +10215,7 @@ impl Engine {
         };
 
         let child_key = self.mint_key();
-        let mut locals: HashMap<String, Value> = HashMap::new();
+        let mut locals: BTreeMap<String, Value> = BTreeMap::new();
         if let Some(name) = &input_element {
             locals.insert(name.clone(), item);
         }
@@ -8751,7 +10405,7 @@ impl Engine {
         body_key: Key,
         child_key: Key,
         child_index: usize,
-        child_vars: &HashMap<String, Value>,
+        child_vars: &BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
         match self.try_mi_child_behaviour(instance_key, element_id.clone(), child_key, child_vars) {
@@ -8778,7 +10432,7 @@ impl Engine {
         instance_key: Key,
         element_id: String,
         child_key: Key,
-        child_vars: &HashMap<String, Value>,
+        child_vars: &BTreeMap<String, Value>,
     ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let mut events = Vec::new();
         let mut followups = Vec::new();
@@ -8835,7 +10489,7 @@ impl Engine {
                             instance_key,
                             container_key: child_key,
                             element_id: id.clone(),
-                            variables: HashMap::new(),
+                            variables: BTreeMap::new(),
                         });
                     }
                     // An empty collection has nothing to run: the container
@@ -8874,6 +10528,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: Vec::new(),
                 });
                 // A multi-instance child that is a JOB_WORKER ad-hoc container
                 // (`adHocSubProcess` with a `zeebe:taskDefinition`) registers its
@@ -8894,7 +10549,7 @@ impl Engine {
                         output_collection: def.output_collection.clone(),
                         output_element: def.output_element.clone(),
                     });
-                    let mut catalog_var = HashMap::new();
+                    let mut catalog_var = BTreeMap::new();
                     catalog_var.insert(
                         "adHocSubProcessElements".to_string(),
                         Value::List(Self::advertised_adhoc_catalog(def)),
@@ -8917,6 +10572,12 @@ impl Engine {
             // flow. This is what makes the nested "wave" pattern — a sequential MI
             // over waves wrapping a parallel MI over a wave's tasks — executable.
             Some(ElementKind::SubProcess { start_event }) => {
+                events.extend(self.arm_event_subprocesses(
+                    instance_key,
+                    child_key,
+                    Some(&element_id),
+                    child_vars,
+                )?);
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
@@ -9044,7 +10705,7 @@ impl Engine {
         child_eik: Key,
         element_id: String,
         body_key: Key,
-        output_overlay: Option<HashMap<String, Value>>,
+        output_overlay: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut events = vec![
             Event::ElementCompleting {
@@ -9148,7 +10809,7 @@ impl Engine {
         // `output_overlay` so a call-activity child collects its real
         // (already-projected) result rather than re-deriving — and losing — it
         // (#1398 review).
-        let post_view: Option<Arc<HashMap<String, Value>>> =
+        let post_view: Option<Arc<BTreeMap<String, Value>>> =
             if output_element.is_none() && completion_condition.is_none() {
                 None
             } else {
@@ -9341,8 +11002,8 @@ impl Engine {
     /// body-level read would publish `null` (review r4535034038).
     fn mi_body_tolerated_bindings(
         mi: &crate::state::MultiInstanceState,
-    ) -> std::collections::HashSet<String> {
-        let mut tolerated = std::collections::HashSet::from(["loopCounter".to_string()]);
+    ) -> std::collections::BTreeSet<String> {
+        let mut tolerated = std::collections::BTreeSet::from(["loopCounter".to_string()]);
         if let Some(name) = &mi.input_element {
             tolerated.insert(name.clone());
         }
@@ -9368,7 +11029,7 @@ impl Engine {
         &self,
         instance_key: Key,
         body_key: Key,
-    ) -> Option<HashMap<String, Value>> {
+    ) -> Option<BTreeMap<String, Value>> {
         let mi = self
             .state
             .instances
@@ -9376,7 +11037,7 @@ impl Engine {
             .multi_instances
             .get(&body_key)?;
         mi.output_collection.as_ref().map(|name| {
-            HashMap::from([(
+            BTreeMap::from([(
                 name.clone(),
                 Value::List(
                     mi.output_values
@@ -9395,7 +11056,7 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         let (element_id, tolerated, active): (
             ElementId,
-            std::collections::HashSet<String>,
+            std::collections::BTreeSet<String>,
             Vec<Key>,
         ) = match self
             .state
@@ -9419,7 +11080,7 @@ impl Engine {
         let collection_map = self.mi_body_collection_overlay(instance_key, body_key);
         let outputs = self.io_outputs(instance_key, &element_id);
         let output_updates = if outputs.is_empty() {
-            HashMap::new()
+            BTreeMap::new()
         } else {
             let mut ctx = (*self.variables_for_element(instance_key, body_key)).clone();
             if let Some(map) = &collection_map {
@@ -9982,7 +11643,7 @@ impl Engine {
     /// container activation (`run_activation_body`) and the nested-container tool
     /// activation (`activate_adhoc_tool`, #631) so both stand up an identical
     /// catalog.
-    fn advertised_adhoc_catalog(def: &crate::model::AdHocSubProcessDef) -> Vec<Value> {
+    pub(crate) fn advertised_adhoc_catalog(def: &crate::model::AdHocSubProcessDef) -> Vec<Value> {
         def.tools
             .iter()
             .filter(|t| !matches!(t.kind, crate::model::AdHocToolKind::Other))
@@ -10116,13 +11777,13 @@ impl Engine {
         instance_key: Key,
         container_element_id: &str,
         tool_element_id: &str,
-        view: &HashMap<String, Value>,
-    ) -> Result<HashMap<String, Value>, IoMappingFailure> {
+        view: &BTreeMap<String, Value>,
+    ) -> Result<BTreeMap<String, Value>, IoMappingFailure> {
         let inputs = self
             .adhoc_tool_io(instance_key, container_element_id, tool_element_id)
             .inputs;
         if inputs.is_empty() {
-            Ok(HashMap::new())
+            Ok(BTreeMap::new())
         } else {
             self.eval_io_mappings_in(view, &inputs)
         }
@@ -10141,7 +11802,7 @@ impl Engine {
     fn eval_adhoc_active_elements(
         &self,
         expr: &str,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         def: &crate::model::AdHocSubProcessDef,
         container_key: Key,
     ) -> Result<Vec<String>, expression::Failure> {
@@ -10155,7 +11816,7 @@ impl Engine {
                 f.message
             ))
         })?;
-        let names: std::collections::HashSet<&str> =
+        let names: std::collections::BTreeSet<&str> =
             def.tools.iter().map(|t| t.element_id.as_str()).collect();
         let missing: Vec<&str> = ids
             .iter()
@@ -10185,7 +11846,7 @@ impl Engine {
         container_key: Key,
         container_element_id: Option<String>,
         element_id: String,
-        redrive_seed: HashMap<String, Value>,
+        redrive_seed: BTreeMap<String, Value>,
         failure: expression::Failure,
         key_mark: u64,
     ) -> (Vec<Event>, Vec<Step>) {
@@ -10203,6 +11864,129 @@ impl Engine {
         (vec![event], Vec::new())
     }
 
+    /// The task-creation step of a user-task ad-hoc tool, shared by the first
+    /// activation and the incident retry so they cannot drift (#1193): the
+    /// form linkage dispatches on the declared binding exactly like an
+    /// ordinary user-task activation. Returns the event and whether it is the
+    /// `UserTaskCreated` (`true`) or the resolvable form-miss incident (redrive `ActivationBody`: the tool
+    /// child is already ACTIVATED, so resolution re-runs only this step).
+    fn adhoc_user_task_event(
+        &mut self,
+        instance_key: Key,
+        child_key: Key,
+        element_id: String,
+        props: &crate::model::UserTaskProps,
+        resolved: ResolvedUserTask,
+    ) -> (Event, bool) {
+        let (form_key, external_form_reference) = match self
+            .resolve_user_task_form_linkage(instance_key, props)
+        {
+            crate::engine::resolve::FormLinkage::Unbound {
+                external_form_reference,
+            } => (None, external_form_reference),
+            crate::engine::resolve::FormLinkage::Resolved { form_key } => (Some(form_key), None),
+            crate::engine::resolve::FormLinkage::Miss { reason } => {
+                return (
+                    Event::IncidentRaised {
+                        incident_key: self.mint_key(),
+                        instance_key,
+                        element_instance_key: child_key,
+                        element_id,
+                        kind: state::IncidentKind::CalledElementError,
+                        redrive: Some(state::IoMappingRedrive::ActivationBody),
+                        reason,
+                        job_key: None,
+                        created_at: self.now,
+                    },
+                    false,
+                );
+            }
+        };
+        let ResolvedUserTask {
+            assignee,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
+        } = resolved;
+        (
+            Event::UserTaskCreated {
+                user_task_key: self.mint_key(),
+                instance_key,
+                element_instance_key: child_key,
+                element_id,
+                created_at: self.now,
+                assignee,
+                candidate_groups,
+                candidate_users,
+                due_date,
+                follow_up_date,
+                priority,
+                form_key,
+                external_form_reference,
+            },
+            true,
+        )
+    }
+
+    /// The incident retry of a parked user-task ad-hoc TOOL child, or `None`
+    /// when `child_key` is not one. Leaf tools exist only in their container's
+    /// ad-hoc catalog (pruned from the executable graph), so the generic
+    /// activation-body rerun cannot see them; this resumes the existing child
+    /// by re-running only its task-creation step (#1193 review).
+    fn adhoc_user_task_tool_retry(
+        &mut self,
+        instance_key: Key,
+        child_key: Key,
+        element_id: &str,
+    ) -> Option<Vec<Event>> {
+        let container_element_id = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .adhoc_instances
+            .values()
+            .find(|a| a.active.contains(&child_key))?
+            .element_id
+            .clone();
+        let props = self
+            .adhoc_def_of(instance_key, &container_element_id)?
+            .tools
+            .iter()
+            .find(|t| t.element_id == element_id)
+            .and_then(|t| match &t.kind {
+                crate::model::AdHocToolKind::UserTask(props) => Some(props.clone()),
+                _ => None,
+            })?;
+        // A nested ad-hoc container shares the user-task shape only by id;
+        // it never parks on a form, so it is not this retry's concern.
+        if self.adhoc_def_of(instance_key, element_id).is_some() {
+            return None;
+        }
+        let vars = self.variables_for_element(instance_key, child_key);
+        let event = match self.resolve_user_task_props(&vars, &props) {
+            Ok(resolved) => {
+                self.adhoc_user_task_event(
+                    instance_key,
+                    child_key,
+                    element_id.to_string(),
+                    &props,
+                    resolved,
+                )
+                .0
+            }
+            Err(failure) => self.expression_incident(
+                instance_key,
+                child_key,
+                element_id.to_string(),
+                failure,
+                Some(state::IoMappingRedrive::ActivationBody),
+            ),
+        };
+        Some(vec![event])
+    }
+
     /// Activates one ad-hoc "tool" child (ADR 0023 seam 2): instantiates
     /// `element_id` inside the container scope, seeding the agent's
     /// activate-element `variables` as the child's local overlay, and marks it
@@ -10215,7 +11999,7 @@ impl Engine {
         instance_key: Key,
         container_key: Key,
         element_id: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
         let child_key = self.mint_key();
@@ -10248,7 +12032,7 @@ impl Engine {
         // The tool's own input-mapping results, kept aside so a `callActivity`
         // tool can seed its spawned child with exactly them when
         // `propagateAllParentVariables=false` (issue #1159).
-        let mut applied_inputs: HashMap<String, Value> = HashMap::new();
+        let mut applied_inputs: BTreeMap<String, Value> = BTreeMap::new();
         if let Some(cid) = container_element_id.as_deref() {
             match self.adhoc_tool_input_updates(instance_key, cid, &element_id, &child_vars) {
                 Ok(input_updates) => {
@@ -10462,7 +12246,7 @@ impl Engine {
                 events.push(Event::ScopedVariablesUpdated {
                     instance_key,
                     scope_key: child_key,
-                    variables: HashMap::from([(name, Value::List(Vec::new()))]),
+                    variables: BTreeMap::from([(name, Value::List(Vec::new()))]),
                 });
             }
             if nested_def.impl_type == crate::model::AdHocImplementationType::BpmnTask {
@@ -10475,7 +12259,7 @@ impl Engine {
                         instance_key,
                         container_key: child_key,
                         element_id: id.clone(),
-                        variables: HashMap::new(),
+                        variables: BTreeMap::new(),
                     });
                 }
                 if ids.is_empty() {
@@ -10494,7 +12278,7 @@ impl Engine {
                 events.push(Event::ScopedVariablesUpdated {
                     instance_key,
                     scope_key: child_key,
-                    variables: HashMap::from([(
+                    variables: BTreeMap::from([(
                         "adHocSubProcessElements".to_string(),
                         Value::List(Self::advertised_adhoc_catalog(&nested_def)),
                     )]),
@@ -10520,6 +12304,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: Vec::new(),
                 });
             }
             return (events, followups);
@@ -10548,6 +12333,7 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                    secret_provenance: Vec::new(),
                 });
             }
             // A user-task tool parks the child on a real user task, resolving its
@@ -10560,35 +12346,27 @@ impl Engine {
             // Task listeners declared on the tool are pruned with it, so v1 emits
             // the plain CREATED record without a listener chain.
             Some(crate::model::AdHocToolKind::UserTask(props)) => {
-                let Some(ResolvedUserTask {
-                    assignee,
-                    candidate_groups,
-                    candidate_users,
-                    due_date,
-                    follow_up_date,
-                    priority,
-                }) = resolved_user_task
-                else {
+                let Some(resolved) = resolved_user_task else {
                     unreachable!("user-task tool resolved its properties above");
                 };
-                let user_task_key = self.mint_key();
-                let (form_key, external_form_reference) =
-                    self.resolve_user_task_form_linkage(&props);
-                events.push(Event::UserTaskCreated {
-                    user_task_key,
+                // A `deployment`/`versionTag` form miss raises a resolvable
+                // incident and creates no task; the tool child stays parked
+                // (its activation events are already emitted) and resolving
+                // the incident re-creates only the task
+                // (`adhoc_user_task_tool_retry`, #1193).
+                match self.adhoc_user_task_event(
                     instance_key,
-                    element_instance_key: child_key,
+                    child_key,
                     element_id,
-                    created_at: self.now,
-                    assignee,
-                    candidate_groups,
-                    candidate_users,
-                    due_date,
-                    follow_up_date,
-                    priority,
-                    form_key,
-                    external_form_reference,
-                });
+                    &props,
+                    resolved,
+                ) {
+                    (created, true) => events.push(created),
+                    (incident, false) => {
+                        events.push(incident);
+                        return (events, followups);
+                    }
+                }
             }
             // An embedded `subProcess` tool (#872): run its multi-element body by
             // ordinary token flow within the tool's scope. The tool child (the
@@ -10604,6 +12382,30 @@ impl Engine {
             // the subProcess tool arm exactly like a normal embedded sub-process.
             Some(crate::model::AdHocToolKind::SubProcess { start_event }) => {
                 match self.arm_boundary_events(instance_key, child_key, inner_key, &element_id) {
+                    Ok(armed) => events.extend(armed),
+                    Err(failure) => {
+                        return self.adhoc_tool_incident(
+                            instance_key,
+                            container_key,
+                            container_element_id,
+                            element_id,
+                            redrive_seed,
+                            failure,
+                            key_mark,
+                        );
+                    }
+                }
+                // The tool's scope opens here — bypassing the activation body —
+                // so arm the event sub-processes its body contains (#1555)
+                // against the tool's post-input view, exactly like a normally
+                // activated sub-process. A trigger expression failure is the
+                // same clean-retry incident as a boundary's above.
+                match self.arm_event_subprocesses(
+                    instance_key,
+                    child_key,
+                    Some(&element_id),
+                    &child_vars,
+                ) {
                     Ok(armed) => events.extend(armed),
                     Err(failure) => {
                         return self.adhoc_tool_incident(
@@ -10720,7 +12522,7 @@ impl Engine {
         instance_key: Key,
         container_key: Key,
         container_element_id: &str,
-        output_updates: &HashMap<String, Value>,
+        output_updates: &BTreeMap<String, Value>,
         others: usize,
     ) -> Result<AdHocPostTool, expression::Failure> {
         // Borrow the container's catalog entry once by reference (no clone of the
@@ -10824,7 +12626,7 @@ impl Engine {
         // single-pass semantics where every mapping reads the original view. An
         // ordinary (single-activity) tool passes `None` and the mapping is
         // evaluated here as before.
-        precomputed_output: Option<HashMap<String, Value>>,
+        precomputed_output: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let tool_element_id = element_id;
         let (output_element, output_collection, active_now, container_element_id) = match self
@@ -10901,13 +12703,22 @@ impl Engine {
         // binding directly (it is seeded/appended local to the container scope) —
         // no need to merge the whole visible variable chain.
         //
-        // On a type mismatch, DEFER the tool's completion for full Zeebe parity
-        // (retry-on-resolve): park an EXTRACT_VALUE_ERROR incident on the TOOL
-        // child and return WITHOUT emitting any completion event. The child stays
-        // in the container's `active` set with its local scope intact, so
-        // resolving the incident re-drives `Step::Complete` for this child (see
-        // `ResolveIncident` → `ExpressionEvaluation`) and re-attempts the append
-        // once the target has been corrected — nothing is discarded.
+        // A MISSING binding is guarded too: a migration that renamed the
+        // container's `outputCollection` re-points `AdHocState.output_collection`
+        // at the target name while the accumulated list stays under its source
+        // name, so the target binding is absent until repaired. Appending anyway
+        // would silently discard the tool's output and let the container publish
+        // an empty list — so an absent binding is treated exactly like a
+        // wrong-typed one (#1630 review).
+        //
+        // On a type mismatch or a missing binding, DEFER the tool's completion
+        // for full Zeebe parity (retry-on-resolve): park an EXTRACT_VALUE_ERROR
+        // incident on the TOOL child and return WITHOUT emitting any completion
+        // event. The child stays in the container's `active` set with its local
+        // scope intact, so resolving the incident re-drives `Step::Complete` for
+        // this child (see `ResolveIncident` → `ExpressionEvaluation`) and
+        // re-attempts the append once the target has been corrected — nothing is
+        // discarded.
         if output.is_some() {
             if let Some(name) = &output_collection {
                 let current = self
@@ -10917,12 +12728,24 @@ impl Engine {
                     .and_then(|i| i.scope_variables.get(&container_key))
                     .and_then(|m| m.get(name))
                     .cloned();
-                if matches!(current, Some(v) if !matches!(v, Value::List(_))) {
+                let unappendable = match &current {
+                    // Absent binding (e.g. a renamed collection not yet repaired).
+                    None => true,
+                    // Present but not an array.
+                    Some(v) => !matches!(v, Value::List(_)),
+                };
+                if unappendable {
                     let incident_key = self.mint_key();
-                    let reason = format!(
-                        "the output collection '{name}' of ad-hoc sub-process \
-                         '{container_element_id}' has the wrong type: expected an array"
-                    );
+                    let reason = match &current {
+                        None => format!(
+                            "the output collection '{name}' of ad-hoc sub-process \
+                             '{container_element_id}' is not defined: expected an array"
+                        ),
+                        Some(_) => format!(
+                            "the output collection '{name}' of ad-hoc sub-process \
+                             '{container_element_id}' has the wrong type: expected an array"
+                        ),
+                    };
                     // Preserve the tool's single-pass output projection on the
                     // redrive when it is a call-activity tool (#1176): the projection
                     // was already evaluated once by `complete_adhoc_call_activity_tool`
@@ -10978,6 +12801,11 @@ impl Engine {
                 element_id: tool_element_id.clone(),
             },
         ];
+        // An embedded-subProcess tool's scope opened on activation (arming its
+        // event sub-processes, #1555); completing the tool disarms them, exactly
+        // like a drained sub-process's sweep does. Emitted before the scope's
+        // `ElementCompleted` applies (events are batched, state read live).
+        events.extend(self.disarm_event_subprocess_events(instance_key, child_eik));
         events.extend(self.adhoc_inner_instance_teardown(instance_key, inner_key));
         events.push(Event::AdHocToolCompleted {
             instance_key,
@@ -11003,7 +12831,7 @@ impl Engine {
                     .adhoc_tool_io(instance_key, &container_element_id, &tool_element_id)
                     .outputs;
                 if outputs.is_empty() {
-                    HashMap::new()
+                    BTreeMap::new()
                 } else {
                     let vars = self.variables_for_element(instance_key, child_eik);
                     match self.eval_io_mappings_in(&vars, &outputs) {
@@ -11155,7 +12983,7 @@ impl Engine {
         // (`summary -> summaryCopy` then `summaryCopy -> toolCallResult`), exactly
         // the divergence the leaf path guards against. `Some` ⇒ use verbatim;
         // an ordinary tool passes `None` and the mapping is evaluated here.
-        precomputed_output: Option<HashMap<String, Value>>,
+        precomputed_output: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         // Resolve the container's identity and its active count from live state.
         // The caller already early-returns when this lookup is absent, but resolve
@@ -11185,6 +13013,10 @@ impl Engine {
                 element_id: tool_element_id.clone(),
             },
         ];
+        // An embedded-subProcess tool's event sub-processes (#1555) disarm as
+        // its scope completes, exactly like the leaf path in
+        // `complete_adhoc_tool`.
+        events.extend(self.disarm_event_subprocess_events(instance_key, child_eik));
         // Tear down the tool's dedicated inner-instance wrapper (only when its id
         // resolves — see `adhoc_inner_instance_teardown`).
         events.extend(self.adhoc_inner_instance_teardown(instance_key, inner_key));
@@ -11218,7 +13050,7 @@ impl Engine {
                     .adhoc_tool_io(instance_key, &container_element_id, &tool_element_id)
                     .outputs;
                 if outputs.is_empty() {
-                    HashMap::new()
+                    BTreeMap::new()
                 } else {
                     let vars = self.variables_for_element(instance_key, child_eik);
                     match self.eval_io_mappings_in(&vars, &outputs) {
@@ -11303,7 +13135,7 @@ impl Engine {
                 instance_key,
                 container_key,
                 element_id: target,
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
             });
         }
         (events, followups)
@@ -11319,7 +13151,7 @@ impl Engine {
         instance_key: Key,
         child_eik: Key,
         tool_element_id: String,
-        precomputed_output: Option<&HashMap<String, Value>>,
+        precomputed_output: Option<&BTreeMap<String, Value>>,
         failure: expression::Failure,
     ) -> (Vec<Event>, Vec<Step>) {
         let redrive = match precomputed_output {
@@ -11388,6 +13220,7 @@ impl Engine {
             created_at: self.now,
             priority,
             retries,
+            secret_provenance: Vec::new(),
         }]
     }
 
@@ -11450,14 +13283,14 @@ impl Engine {
         &self,
         instance_key: Key,
         container_key: Key,
-        seed: HashMap<String, Value>,
-    ) -> HashMap<String, Value> {
+        seed: BTreeMap<String, Value>,
+    ) -> BTreeMap<String, Value> {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return seed;
         };
         // Collect the scope chain's bindings NEAREST scope first (the same
         // resolution order the original activation's evaluation view used).
-        let mut chain: Vec<&HashMap<String, Value>> = Vec::new();
+        let mut chain: Vec<&BTreeMap<String, Value>> = Vec::new();
         let mut cur = self.variable_scope_of(instance, container_key);
         loop {
             let scope_vars = if cur == 0 || cur == instance.key {
@@ -11594,6 +13427,43 @@ impl Engine {
             return (Vec::new(), Vec::new());
         }
 
+        // A MISSING `outputCollection` binding (a migration renamed the
+        // collection while the accumulated list stays under its source name,
+        // #1630 review) must not complete: substituting `[]` would silently
+        // discard every collected output. Defer — before any teardown or
+        // propagation — with a recoverable incident on the container whose
+        // resolution re-drives this completion (same `cancel` flag) once the
+        // operator has repaired the binding. Mirrors the per-tool append guard
+        // in `complete_adhoc_tool`.
+        if let Some(name) = &output_collection {
+            let bound = self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.scope_variables.get(&container_key))
+                .is_some_and(|m| m.contains_key(name));
+            if !bound {
+                let incident_key = self.mint_key();
+                return (
+                    vec![Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key: container_key,
+                        element_id: element_id.clone(),
+                        kind: state::IncidentKind::ExpressionEvaluation,
+                        redrive: Some(state::IoMappingRedrive::AdHocContainerCompletion { cancel }),
+                        reason: format!(
+                            "the output collection '{name}' of ad-hoc sub-process \
+                             '{element_id}' is not defined: expected an array"
+                        ),
+                        job_key: None,
+                        created_at: self.now,
+                    }],
+                    Vec::new(),
+                );
+            }
+        }
+
         // A JOB_WORKER ad-hoc container that is a MULTI-INSTANCE child (its token
         // parks in an MI body whose loop element is this container): its
         // completion must feed the loop's output collection / completion condition
@@ -11719,7 +13589,7 @@ impl Engine {
                 .and_then(|m| m.get(&name))
                 .cloned()
                 .unwrap_or_else(|| Value::List(Vec::new()));
-            HashMap::from([(name, value)])
+            BTreeMap::from([(name, value)])
         });
         if let Some(map) = &collection_map {
             if !is_nested_tool {
@@ -11977,7 +13847,7 @@ impl Engine {
         // incident is raised and the element stays active — matching Zeebe, which
         // re-evaluates the script when the incident is resolved (the resolution
         // re-runs completion), exactly as an exclusive gateway condition does.
-        let mut script_update: Option<HashMap<String, Value>> = None;
+        let mut script_update: Option<BTreeMap<String, Value>> = None;
         if let Some(ElementKind::ScriptTask {
             expression,
             result_variable,
@@ -11986,7 +13856,7 @@ impl Engine {
             let vars = self.variables_for_element(instance_key, element_instance_key);
             match crate::feel::eval(&expression, &vars) {
                 Ok(value) => {
-                    let mut update = HashMap::new();
+                    let mut update = BTreeMap::new();
                     update.insert(result_variable, value);
                     script_update = Some(update);
                 }
@@ -12111,7 +13981,7 @@ impl Engine {
             // the output under that name; without one, a map output is spread into
             // the scope (Zeebe requires a resultVariable for a scalar output, but
             // spreading a context output is the natural no-name behaviour).
-            let mut update = HashMap::new();
+            let mut update = BTreeMap::new();
             match &result_variable {
                 Some(name) if !name.is_empty() => {
                     update.insert(name.clone(), result.decision_output.clone());
@@ -12148,7 +14018,7 @@ impl Engine {
         // returns, so evaluating here sees the same variable view as merging below.
         let outputs = self.io_outputs(instance_key, &element_id);
         let output_updates = if outputs.is_empty() {
-            HashMap::new()
+            BTreeMap::new()
         } else {
             let visible = self.variables_for_element(instance_key, element_instance_key);
             let eval = match &script_update {
@@ -12361,6 +14231,24 @@ impl Engine {
             );
         }
 
+        // An error end event (`errorEventDefinition` on an `endEvent`, #1592):
+        // throw the BPMN error exactly like a worker `ThrowJobError` — the catch
+        // walk is shared (`find_error_catch`, Zeebe `CatchEventAnalyzer` parity).
+        // Mirrors the deferred `finalize_completion` handoff for the end-listener
+        // path.
+        if let Some(ElementKind::ErrorEndEvent { error_code }) =
+            self.element_kind(instance_key, &element_id)
+        {
+            return self.throw_error_from_end_event(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+                error_code,
+                events,
+            );
+        }
+
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
@@ -12543,7 +14431,7 @@ impl Engine {
         event_type: crate::model::ListenerEventType,
         index: usize,
         scope: Key,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Event {
         let listeners = self.listeners_of(instance_key, element_id, event_type);
         // A failed listener job restarts its chain on resolution
@@ -12622,7 +14510,7 @@ impl Engine {
         element_instance_key: Key,
         element_id: &str,
         scope: Key,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Option<Event> {
         let end_listeners = self.listeners_of(
             instance_key,
@@ -12692,7 +14580,7 @@ impl Engine {
                 element_id,
                 scope,
             ),
-            Some(ElementKind::SubProcess { .. }) => {
+            Some(ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. }) => {
                 self.finalize_subprocess(instance_key, element_instance_key, element_id, scope)
             }
             Some(ElementKind::TerminateEndEvent) => {
@@ -12769,6 +14657,21 @@ impl Engine {
                 events,
             );
         }
+        // An error end event (`errorEventDefinition` on an `endEvent`, #1592):
+        // throw the BPMN error exactly like a worker `ThrowJobError` — the catch
+        // walk is shared (`find_error_catch`, Zeebe `CatchEventAnalyzer` parity).
+        if let Some(ElementKind::ErrorEndEvent { error_code }) =
+            self.element_kind(instance_key, &element_id)
+        {
+            return self.throw_error_from_end_event(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+                error_code,
+                events,
+            );
+        }
         // #901: compensation registration (explicit boundary subscription, or
         // a sub-process's scope subscription, and nothing at all for undo work
         // inside a pending handler) has one canonical home.
@@ -12801,7 +14704,8 @@ impl Engine {
     ///
     /// The catch is resolved by propagating up the enclosing sub-process scopes
     /// from the throw's `scope`, preferring an exact escalation-code match over a
-    /// catch-all (see [`find_catching_escalation_boundary`](Self::find_catching_escalation_boundary)).
+    /// catch-all, and an escalation event sub-process hosted by a scope over a
+    /// boundary attached to it (see [`find_escalation_catch`](Self::find_escalation_catch)).
     fn raise_escalation_from_throw(
         &mut self,
         instance_key: Key,
@@ -12812,7 +14716,47 @@ impl Engine {
         mut events: Vec<Event>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut followups = Vec::new();
-        let caught = self.find_catching_escalation_boundary(instance_key, scope, &escalation_code);
+        let caught = match self.find_escalation_catch(instance_key, scope, &escalation_code) {
+            // Caught by an escalation event sub-process (#1555).
+            Some(boundary::ThrowCatch::EventSubProcess {
+                scope_eik,
+                esp_id,
+                interrupting,
+            }) => {
+                if interrupting {
+                    // The throw's flow is NOT taken. The interrupt runs as a
+                    // queued step, after this throw's completion is applied, so
+                    // the teardown sees exactly the scope's other work.
+                    followups.push(Step::TriggerEventSubProcess {
+                        instance_key,
+                        scope: scope_eik,
+                        esp_element_id: esp_id,
+                    });
+                } else {
+                    // Non-interrupting: the throw continues and the event
+                    // sub-process runs concurrently in its host scope.
+                    for (taken, step) in self.take_all_flows(instance_key, &throw_element_id, scope)
+                    {
+                        events.extend(taken);
+                        followups.push(step);
+                    }
+                    followups.push(Step::Activate {
+                        instance_key,
+                        element_id: esp_id,
+                        scope: scope_eik,
+                        via: None,
+                    });
+                }
+                return (events, followups);
+            }
+            Some(boundary::ThrowCatch::Boundary {
+                boundary_id,
+                caught_eik,
+                caught_element_id,
+                interrupting,
+            }) => Some((boundary_id, caught_eik, caught_element_id, interrupting)),
+            None => None,
+        };
         // Build the throw's outgoing flows up front (owned) so routing does not
         // hold an immutable borrow of `self` across the teardown mutation.
         let outgoing_flows = self.take_all_flows(instance_key, &throw_element_id, scope);
@@ -12941,6 +14885,194 @@ impl Engine {
                     element_id: boundary_id,
                     scope: boundary_scope,
                     via: None,
+                });
+            }
+        }
+        (events, followups)
+    }
+
+    /// Resolves an `UNHANDLED_ERROR` incident on an error end event by re-running
+    /// only its catch walk (see [`Step::RetryErrorEndThrow`]).
+    fn retry_error_end_throw(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    ) -> (Vec<Event>, Vec<Step>) {
+        // The model may have been migrated while the incident was open; an
+        // element that is no longer an error end has nothing to re-throw, so
+        // re-drive its plain completion rather than strand the token.
+        let Some(ElementKind::ErrorEndEvent { error_code }) =
+            self.element_kind(instance_key, &element_id)
+        else {
+            return self.complete(instance_key, element_instance_key, element_id);
+        };
+        let scope = self.scope_of(instance_key, element_instance_key);
+        // Same shape `complete` / `finalize_completion` hand to the throw: the
+        // element's `ElementCompleted` (withheld again if still uncaught). No
+        // output mapping or end-listener step is re-run.
+        let events = vec![Event::ElementCompleted {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        }];
+        self.throw_error_from_end_event(
+            instance_key,
+            element_instance_key,
+            element_id,
+            scope,
+            error_code,
+            events,
+        )
+    }
+
+    /// Throws the BPMN error of a just-completed
+    /// [`ErrorEndEvent`](ElementKind::ErrorEndEvent) (#1592). `events` already
+    /// carries the end event's own `ElementCompleted` — the throwing token is
+    /// consumed by the throw either way, exactly like a worker `ThrowJobError`
+    /// consumes its job. The catch is resolved by
+    /// [`find_error_catch`](Self::find_error_catch) from the throwing element
+    /// instance outward (Zeebe `CatchEventAnalyzer` parity):
+    ///
+    /// * **caught by an error event sub-process** — always interrupting: the
+    ///   host scope's other work is torn down and the event sub-process runs in
+    ///   it (queued as a step, after this completion is applied);
+    /// * **caught by an error boundary** — always interrupting: the caught
+    ///   activity (an enclosing sub-process — the walk starts at the throwing
+    ///   end event, and an end event carries no boundaries of its own) has its
+    ///   inner scope torn down and completes, and the boundary activates in the
+    ///   caught activity's enclosing scope;
+    /// * **uncaught** — an `UNHANDLED_ERROR` incident is raised on the end
+    ///   event's element instance, matching the unhandled job-error lifecycle:
+    ///   the token parks there (its `ElementCompleted` is withheld) and the
+    ///   incident's resolution re-drives the completion.
+    fn throw_error_from_end_event(
+        &mut self,
+        instance_key: Key,
+        throw_eik: Key,
+        throw_element_id: String,
+        scope: Key,
+        error_code: String,
+        mut events: Vec<Event>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        // `scope` (the throw's enclosing scope) is unused: the catch walk starts
+        // at the throwing element INSTANCE (`throw_eik`) and derives every level
+        // from it — an end event owns no inner scope, so its own level offers no
+        // catch candidates and the walk proceeds straight to its ancestors.
+        let _ = scope;
+        let mut followups = Vec::new();
+        match self.find_error_catch(instance_key, &throw_element_id, throw_eik, &error_code) {
+            // Caught by an error event sub-process (#1555): always interrupting.
+            // The interrupt runs as a queued step, after this throw's completion
+            // is applied, so the teardown sees exactly the scope's other work
+            // (mirrors the escalation-throw handoff).
+            Some(boundary::ThrowCatch::EventSubProcess {
+                scope_eik, esp_id, ..
+            }) => {
+                followups.push(Step::TriggerEventSubProcess {
+                    instance_key,
+                    scope: scope_eik,
+                    esp_element_id: esp_id,
+                });
+            }
+            // Caught by an error boundary: interrupt the catching activity (an
+            // enclosing sub-process) and run the boundary's error-handling path.
+            Some(boundary::ThrowCatch::Boundary {
+                boundary_id,
+                caught_eik,
+                caught_element_id,
+                ..
+            }) => {
+                // Capture the catching activity's scope before completing it
+                // (completion clears its scope entry); the boundary event runs in
+                // that same scope.
+                let boundary_scope = self.scope_of(instance_key, caught_eik);
+                // The caught activity is never the throwing end event itself (an
+                // end event carries no boundaries), so its inner scope — the
+                // throw included — is always torn down here. The throw's own
+                // lifecycle records are filtered out: its `ElementCompleted` is
+                // already in `events` (and it already rests in COMPLETING, so a
+                // duplicate `ElementCompleting` is dropped — one per element
+                // instance, as in Zeebe).
+                for event in self.scope_teardown_events(instance_key, caught_eik) {
+                    if matches!(
+                        &event,
+                        Event::ElementCompleting { element_instance_key: eik, .. }
+                        | Event::ElementCompleted { element_instance_key: eik, .. }
+                            if *eik == throw_eik
+                    ) {
+                        continue;
+                    }
+                    events.push(event);
+                }
+                // The teardown sweeps only the caught activity's DESCENDANTS; its
+                // own root record (a parked incident, an MI-body / ad-hoc active
+                // child set, a still-live job) is cleared exactly as the
+                // interrupting boundary paths do (#1173, #1508).
+                for event in self.boundary_root_teardown_events(instance_key, caught_eik) {
+                    events.push(event);
+                }
+                self.torn_down_scopes.insert(caught_eik);
+                events.push(Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: caught_eik,
+                    element_id: caught_element_id.clone(),
+                });
+                events.push(Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: caught_eik,
+                    element_id: caught_element_id,
+                });
+                // Interrupting the activity also disarms any sibling boundary
+                // timers and message/signal/conditional subscriptions on it.
+                for event in self.cancel_boundary_timers_on(caught_eik) {
+                    events.push(event);
+                }
+                for event in self.cancel_boundary_message_subscriptions_on(caught_eik) {
+                    events.push(event);
+                }
+                for event in self.cancel_boundary_signal_subscriptions_on(caught_eik) {
+                    events.push(event);
+                }
+                for event in self.cancel_boundary_conditional_subscriptions_on(caught_eik) {
+                    events.push(event);
+                }
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: boundary_id,
+                    scope: boundary_scope,
+                    via: None,
+                });
+            }
+            // Unhandled: raise an `UNHANDLED_ERROR` incident on the end event's
+            // element instance. Its `ElementCompleted` is NOT journaled: the
+            // applier would drop the token and the post-drain sweep would
+            // complete the instance outright, stranding the incident on a
+            // finished instance — whereas the unhandled job-error lifecycle this
+            // mirrors keeps the token parked (a job error consumes the JOB, never
+            // the token) so resolving the incident re-drives the completion and
+            // the throw re-resolves against the (possibly fixed) model. The
+            // caller prepended `ElementCompleted` unconditionally; remove it.
+            None => {
+                events.retain(|e| {
+                    !matches!(
+                        e,
+                        Event::ElementCompleted { element_instance_key, .. }
+                            if *element_instance_key == throw_eik
+                    )
+                });
+                let reason = format!("unhandled BPMN error '{error_code}'");
+                let incident_key = self.mint_key();
+                events.push(Event::IncidentRaised {
+                    incident_key,
+                    instance_key,
+                    element_instance_key: throw_eik,
+                    element_id: throw_element_id,
+                    kind: state::IncidentKind::UnhandledError,
+                    redrive: None,
+                    reason,
+                    job_key: None,
+                    created_at: self.now,
                 });
             }
         }
@@ -13275,7 +15407,7 @@ impl Engine {
             // `TerminateEndCompletion::outputs_applied` is therefore no longer
             // consulted; it is kept only so older journals still decode.
             let outputs = self.io_outputs(instance_key, &element_id);
-            let mut output_updates = HashMap::new();
+            let mut output_updates = BTreeMap::new();
             if !outputs.is_empty() {
                 let visible = self.variables_for_element(instance_key, element_instance_key);
                 match self.eval_io_mappings_in(&visible, &outputs) {
@@ -13346,7 +15478,7 @@ impl Engine {
                 // ONCE, here (the single projection pass), so listeners 1..n and
                 // an incident resume read the output-mapped view without
                 // re-evaluating outputs; later listener writes still land after.
-                let shadowed: HashMap<String, Value> = self
+                let shadowed: BTreeMap<String, Value> = self
                     .state
                     .instances
                     .get(&instance_key)
@@ -13579,6 +15711,10 @@ impl Engine {
                         element_instance_key,
                         scope,
                         vars,
+                        // Listeners ran between the mappings and the body and
+                        // may have rewritten the scope: no secret provenance
+                        // (fail closed, #1640).
+                        Vec::new(),
                     );
                     if owed {
                         (gate_activated(events, activated, 0), followups)
@@ -13622,7 +15758,7 @@ impl Engine {
         event_type: crate::model::TaskListenerEventType,
         pending: state::PendingUserTaskTransition,
         first: &crate::model::TaskListener,
-        staged_vars: Option<&HashMap<String, Value>>,
+        staged_vars: Option<&BTreeMap<String, Value>>,
     ) -> Vec<Event> {
         let job_event = self.mint_task_listener_job(
             user_task_key,
@@ -13665,7 +15801,7 @@ impl Engine {
         event_type: crate::model::TaskListenerEventType,
         index: usize,
         listener: &crate::model::TaskListener,
-        staged_vars: Option<&HashMap<String, Value>>,
+        staged_vars: Option<&BTreeMap<String, Value>>,
     ) -> Event {
         let persisted;
         let listener_vars = match staged_vars {
@@ -13926,7 +16062,7 @@ impl Engine {
                         event_type: crate::model::TaskListenerEventType::Assigning,
                         assignee: Some(initial),
                         update: None,
-                        variables: std::collections::HashMap::new(),
+                        variables: std::collections::BTreeMap::new(),
                         corrections: crate::model::UserTaskCorrections::default(),
                     };
                     events.extend(self.start_task_listener_chain(
@@ -14085,6 +16221,7 @@ impl Engine {
                         created_at: self.now,
                         priority,
                         retries,
+                        secret_provenance: Vec::new(),
                     }],
                     Vec::new(),
                 )
@@ -14118,7 +16255,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
-        vars: Option<&HashMap<String, Value>>,
+        vars: Option<&BTreeMap<String, Value>>,
     ) -> Result<usize, RoutingFailure> {
         let owned;
         let variables = match vars {
@@ -14301,7 +16438,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
-        vars: Option<&HashMap<String, Value>>,
+        vars: Option<&BTreeMap<String, Value>>,
     ) -> Result<Vec<usize>, RoutingFailure> {
         let owned;
         let variables = match vars {
@@ -14516,8 +16653,8 @@ impl Engine {
         scope: Key,
         events: &mut Vec<Event>,
     ) {
-        if self.join_eik(instance_key, element_id) == Some(element_instance_key) {
-            let arrivals = self.join_arrivals(instance_key, element_id);
+        if self.join_eik(instance_key, scope, element_id) == Some(element_instance_key) {
+            let arrivals = self.join_arrivals(instance_key, scope, element_id);
             self.fire_join(instance_key, element_id, scope, arrivals, events);
         }
     }
@@ -14570,6 +16707,7 @@ impl Engine {
                 instance_key,
                 element_id: to.clone(),
                 flow: Some(flow.clone()),
+                scope: Some(scope),
             });
         }
         (
@@ -14628,17 +16766,22 @@ impl Engine {
             .state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.join_counts.get(&element_id).copied())
+            .and_then(|i| {
+                i.join_counts
+                    .get(&state::JoinKey::new(scope, element_id.as_str()))
+                    .copied()
+            })
             .unwrap_or(0);
         if via.is_none() {
             events.push(Event::ParallelJoinTokenArrived {
                 instance_key,
                 element_id: element_id.clone(),
                 flow: None,
+                scope: Some(scope),
             });
             unidentified += 1;
         }
-        let arrivals = self.join_arrivals(instance_key, &element_id);
+        let arrivals = self.join_arrivals(instance_key, scope, &element_id);
         let taken = arrivals.distinct_flows() + unidentified;
         let all_taken = taken >= self.incoming_count(instance_key, &element_id);
         let accepted = match join {
@@ -14656,7 +16799,7 @@ impl Engine {
             }
         };
 
-        let open = self.join_eik(instance_key, &element_id);
+        let open = self.join_eik(instance_key, scope, &element_id);
         if !accepted {
             if taken > 0 && open.is_none() {
                 self.open_join(instance_key, &element_id, scope, &mut events);
@@ -14812,6 +16955,7 @@ impl Engine {
         events.push(Event::ParallelJoinFired {
             instance_key,
             element_id: element_id.to_string(),
+            scope: Some(scope),
         });
         arrivals.consume_one_each();
         if !arrivals.is_empty() {
@@ -14819,12 +16963,21 @@ impl Engine {
         }
     }
 
-    /// The per-flow tokens currently waiting on `element_id`'s open join.
-    fn join_arrivals(&self, instance_key: Key, element_id: &str) -> state::FlowArrivals {
+    /// The per-flow tokens currently waiting on `element_id`'s open join in
+    /// flow-scope instance `scope`.
+    pub(crate) fn join_arrivals(
+        &self,
+        instance_key: Key,
+        scope: Key,
+        element_id: &str,
+    ) -> state::FlowArrivals {
         self.state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.join_flow_arrivals.get(element_id))
+            .and_then(|i| {
+                i.join_flow_arrivals
+                    .get(&state::JoinKey::new(scope, element_id))
+            })
             .cloned()
             .unwrap_or_default()
     }
@@ -14863,7 +17016,7 @@ impl Engine {
     /// completion — currently the [`Step::CompleteCallActivity`] that releases a
     /// parent's parked call-activity token when its spawned child finishes.
     fn complete_finished_instances(&mut self, log: &mut Vec<Event>) -> Vec<Step> {
-        let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
         let mut finished: Vec<Key> = touched
             .into_iter()
             .filter(|k| {
@@ -14884,6 +17037,11 @@ impl Engine {
             // variables so the call activity's output mappings still see them.
             if let Some(step) = self.call_activity_completion_step(instance_key) {
                 followups.push(step);
+            }
+            // The process scope completes: disarm its event sub-process
+            // start-event triggers (#1555).
+            for event in self.disarm_event_subprocess_events(instance_key, 0) {
+                self.emit(log, event);
             }
             self.emit(log, Event::ProcessInstanceCompleted { instance_key });
         }
@@ -14924,7 +17082,7 @@ impl Engine {
         child_eik: Key,
         container_key: Key,
         element_id: String,
-        preserved_seed: Option<HashMap<String, Value>>,
+        preserved_seed: Option<BTreeMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let container_element_id = match self
             .state
@@ -15066,7 +17224,7 @@ impl Engine {
         element_id: String,
         container_key: Key,
         inner_key: Key,
-        child_variables: HashMap<String, Value>,
+        child_variables: BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let container_element_id = match self
             .state
@@ -15104,7 +17262,7 @@ impl Engine {
             .adhoc_tool_io(instance_key, &container_element_id, &element_id)
             .outputs;
         let output_updates = if outputs.is_empty() {
-            HashMap::new()
+            BTreeMap::new()
         } else {
             match self.eval_io_mappings_in(&child_variables, &outputs) {
                 Ok(updates) => updates,
@@ -15195,7 +17353,7 @@ impl Engine {
     ///   instance while its sibling call-activity children are still live and
     ///   must be terminated here.
     fn cascade_cancel_children(&mut self, log: &mut Vec<Event>) {
-        let mut ended: HashSet<Key> = log
+        let mut ended: BTreeSet<Key> = log
             .iter()
             .filter_map(|e| match e {
                 Event::ProcessInstanceTerminated { instance_key }
@@ -15467,6 +17625,44 @@ impl Engine {
             // (`disarm_subscription_event` and the `&self` teardown helpers
             // above it) cannot mint. A `0` means "not yet minted"; a non-zero
             // value (none today — the disarm path always emits `0`) is kept.
+            // Legacy per-event audit fields (#1556): derived from the
+            // command's single generic `operationReference`, never set by an
+            // emission site, so they cannot drift from the record envelope.
+            Event::JobRetriesUpdated {
+                job_key,
+                instance_key,
+                retries,
+                operation_reference: _,
+            } => Event::JobRetriesUpdated {
+                job_key,
+                instance_key,
+                retries,
+                operation_reference: self.operation_reference,
+            },
+            Event::JobTimeoutUpdated {
+                job_key,
+                instance_key,
+                deadline,
+                operation_reference: _,
+            } => Event::JobTimeoutUpdated {
+                job_key,
+                instance_key,
+                deadline,
+                operation_reference: self.operation_reference,
+            },
+            Event::IncidentResolved {
+                incident_key,
+                instance_key,
+                job_key,
+                resolved_at,
+                operation_reference: _,
+            } => Event::IncidentResolved {
+                incident_key,
+                instance_key,
+                job_key,
+                resolved_at,
+                operation_reference: self.operation_reference,
+            },
             Event::MessageSubscriptionClosing {
                 subscription_key,
                 instance_key,
@@ -15604,7 +17800,7 @@ impl Engine {
             options,
             durable,
         } = plan;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::BTreeSet::new();
         for job_key in job_keys {
             if !seen.insert(job_key) {
                 continue;
@@ -15612,7 +17808,8 @@ impl Engine {
             let Some(job) = self.state.jobs.get(&job_key) else {
                 continue;
             };
-            let activatable = job.state == state::JobState::Created
+            let activatable = (job.state == state::JobState::Created
+                && job_backoff_elapsed(job, now))
                 || (job.state == state::JobState::Activated
                     && !self.job_requires_durable_activation(job_key));
             if !activatable || (!options.with_lease && job.lease_token.is_some()) {
@@ -15651,7 +17848,6 @@ impl Engine {
         job_key: Key,
         retries: Option<i32>,
         timeout: Option<i64>,
-        operation_reference: Option<i64>,
         lease_token: Option<&str>,
     ) -> Result<(), EngineError> {
         let job = self
@@ -15659,11 +17855,14 @@ impl Engine {
             .jobs
             .get(&job_key)
             .ok_or(EngineError::JobNotFound { job_key })?;
+        // Zeebe parity (#1401): a terminal-settled job is CONSUMED, so updating
+        // it is NOT_FOUND — the same rejection as for an unknown key, not the
+        // INVALID_STATE of a live-but-parked job.
         if matches!(
             job.state,
             state::JobState::Completed | state::JobState::Canceled
         ) {
-            return Err(EngineError::JobNotActive { job_key });
+            return Err(EngineError::JobNotFound { job_key });
         }
         Self::validate_job_lease(job, lease_token, false)?;
         if retries.is_some_and(|value| value < 1) {
@@ -15680,6 +17879,8 @@ impl Engine {
             });
         }
         let instance_key = job.instance_key;
+        // `operation_reference: None` here: `emit` derives it from the
+        // command's generic reference (#1556).
         if let Some(retries) = retries {
             self.emit(
                 log,
@@ -15687,7 +17888,7 @@ impl Engine {
                     job_key,
                     instance_key,
                     retries,
-                    operation_reference,
+                    operation_reference: None,
                 },
             );
         }
@@ -15698,7 +17899,7 @@ impl Engine {
                     job_key,
                     instance_key,
                     deadline: self.now.saturating_add_signed(timeout),
-                    operation_reference,
+                    operation_reference: None,
                 },
             );
         }
@@ -15911,7 +18112,7 @@ fn path_reaches_join(
     join: &str,
     taken: &state::FlowArrivals,
 ) -> bool {
-    let mut visited: HashSet<&str> = HashSet::new();
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
     let mut to_visit: VecDeque<&str> = VecDeque::from([source]);
     while let Some(node) = to_visit.pop_front() {
         if node == join {
@@ -15952,11 +18153,10 @@ fn path_reaches_join(
 }
 
 fn sorted_referenced_vars(condition: &str) -> Vec<String> {
-    let mut vars: Vec<String> = crate::feel::referenced_variables(condition)
+    // `referenced_variables` is a BTreeSet (#1662): already sorted.
+    crate::feel::referenced_variables(condition)
         .into_iter()
-        .collect();
-    vars.sort();
-    vars
+        .collect()
 }
 
 /// The postfix Zeebe appends to an ad-hoc sub-process id to form its
@@ -15975,7 +18175,7 @@ pub fn adhoc_inner_instance_id(container_element_id: &str) -> String {
 /// Removes from `map` every entity owned by `instance_key`, returning them. Used
 /// to lift an instance's timers/subscriptions/user-tasks/incidents out of hot
 /// state when snapshotting it for cold spill.
-fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key) -> Vec<V> {
+fn drain_owned<V: OwnedByInstance>(map: &mut BTreeMap<Key, V>, instance_key: Key) -> Vec<V> {
     let owned: Vec<Key> = map
         .iter()
         .filter(|(_, v)| v.instance_key() == instance_key)
@@ -15990,10 +18190,10 @@ fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key)
 /// [`drain_owned`] once per instance (which is quadratic over a backlog).
 #[cfg(feature = "serde")]
 fn group_owned<V: OwnedByInstance>(
-    map: &mut HashMap<Key, V>,
-    owners: &HashSet<Key>,
-) -> HashMap<Key, Vec<V>> {
-    let mut grouped: HashMap<Key, Vec<V>> = HashMap::new();
+    map: &mut BTreeMap<Key, V>,
+    owners: &BTreeSet<Key>,
+) -> BTreeMap<Key, Vec<V>> {
+    let mut grouped: BTreeMap<Key, Vec<V>> = BTreeMap::new();
     let owned: Vec<Key> = map
         .iter()
         .filter(|(_, v)| owners.contains(&v.instance_key()))
@@ -16009,11 +18209,19 @@ fn group_owned<V: OwnedByInstance>(
 
 /// A process start event's deploy-time-resolved trigger.
 enum ResolvedStart {
-    Message(String),
+    Message {
+        message_name: String,
+        /// The start event's `io.camunda.tool:name` zeebe:property (#1499).
+        tool_name: Option<String>,
+        /// The start event's `io.camunda.tool:*` zeebe:properties subset.
+        tool_properties: std::collections::BTreeMap<String, String>,
+    },
     Timer {
         due_at: u64,
         interval_millis: u64,
         repeating: bool,
+        /// A bounded `Rn/…` cycle's fire count (#1596).
+        repetitions: Option<u32>,
     },
 }
 
@@ -16025,6 +18233,18 @@ pub enum EngineError {
     /// `EvaluateDecision` referenced a decision (by id or key) that was never
     /// deployed. `reference` describes it (`id 'x'` / `key 123`).
     DecisionNotFound { reference: String },
+    /// `CreateClusterVariable` named a `(tenant, name)` that already exists
+    /// (#1657). `tenant_id` `None` is the global scope.
+    ClusterVariableAlreadyExists {
+        tenant_id: Option<String>,
+        name: String,
+    },
+    /// `UpdateClusterVariable` / `DeleteClusterVariable` named a
+    /// `(tenant, name)` that does not exist (#1657).
+    ClusterVariableNotFound {
+        tenant_id: Option<String>,
+        name: String,
+    },
     /// `DeployProcess` was given a definition whose `start_event` is not among
     /// its elements.
     NoStartEvent { process_id: String },
@@ -16037,6 +18257,10 @@ pub enum EngineError {
         element_id: String,
         reason: String,
     },
+    /// `DeployProcess`/`DeployResources` was given a structurally invalid
+    /// process (e.g. a malformed event sub-process) that the builder or BPMN
+    /// parser would have rejected; direct deploys run the same validation.
+    InvalidProcessModel { process_id: String, reason: String },
     /// `CompleteJob` referenced a job key that does not exist.
     JobNotFound { job_key: Key },
     /// `CompleteJob`/`FailJob` referenced a job that is not in a state where it
@@ -16229,9 +18453,8 @@ pub enum EngineError {
         flow_index: usize,
     },
     /// A `MigrateInstance` targeted an instance that contains an active element
-    /// class this phase does not yet support migrating (event subprocesses,
-    /// multi-instance bodies, ad-hoc sub-processes, compensation runtime,
-    /// event-based-gateway catch events). Maps to HTTP 409. Zeebe itself
+    /// class this phase does not yet support migrating (currently none is
+    /// listed in `unsupported_migration_reason`). Maps to HTTP 409. Zeebe itself
     /// rejects several of these as "not supported yet"; reproducing the
     /// rejection is parity.
     UnsupportedMigration {
@@ -16305,9 +18528,21 @@ pub enum EngineError {
         target_flow_scope_id: Option<String>,
     },
     /// A migration mapped a multi-instance element onto a non-multi-instance
-    /// one or vice versa, or a parallel multi-instance element onto a
-    /// sequential one or vice versa. HTTP 409.
+    /// one or vice versa: the element-instance types differ
+    /// (`MULTI_INSTANCE_BODY` vs. the plain activity type). HTTP 409. Zeebe
+    /// `requireSameElementType` (`ERROR_ELEMENT_TYPE_CHANGED`, INVALID_STATE).
     MigrationMultiInstanceMismatch {
+        instance_key: Key,
+        source_element_id: String,
+        source_element_type: String,
+        target_element_id: String,
+        target_element_type: String,
+    },
+    /// A migration mapped a parallel multi-instance element onto a sequential
+    /// one or vice versa. HTTP 409. Zeebe
+    /// `requireSameMultiInstanceLoopCharacteristics`
+    /// (`ERROR_UPDATED_LOOP_CHARACTERISTICS`, INVALID_STATE).
+    MigrationLoopCharacteristicsChanged {
         instance_key: Key,
         source_element_id: String,
         target_element_id: String,
@@ -16331,6 +18566,32 @@ pub enum EngineError {
         element_id: String,
         target_catch_event_id: String,
         source_catch_event_ids: Vec<String>,
+    },
+    /// A migration mapped a compensation boundary event onto a target boundary
+    /// event of a different event type (#1631). HTTP 400. Zeebe
+    /// `ERROR_BOUNDARY_HAS_WRONG_EVENT_TYPE` (INVALID_ARGUMENT).
+    MigrationCompensationBoundaryTypeChanged {
+        instance_key: Key,
+        /// The source process id (Zeebe names it in the message).
+        process_id: String,
+        source_boundary_id: String,
+        target_boundary_id: String,
+        /// The target boundary's event type, e.g. `TIMER`.
+        target_event_type: &'static str,
+    },
+    /// A migrated compensation subscription's compensable activity would sit
+    /// at a different flow-scope depth in the target (#1631). HTTP 409. Zeebe
+    /// `ERROR_COMPENSATION_SUBSCRIPTION_FLOW_SCOPE_CHANGED` (INVALID_STATE).
+    MigrationCompensationFlowScopeChanged {
+        instance_key: Key,
+        /// The source process id (Zeebe names it in the message).
+        process_id: String,
+        /// The source-side flow scope at the level that diverged (the process
+        /// id when the source reached the root first).
+        source_flow_scope_id: String,
+        /// The target-side flow scope at that level (the target process id
+        /// when the target reached the root first).
+        target_flow_scope_id: String,
     },
     /// A target catch event the migrated element must subscribe to has an
     /// expression (message / signal name, correlation key, timer) that fails
@@ -16414,6 +18675,16 @@ pub enum EngineError {
     InstanceUnavailable { instance_key: Key },
 }
 
+/// Whether `definition` declares a process-level (root) conditional start
+/// event — the definitions a [`Command::EvaluateConditionalStartEvents`] can
+/// trigger.
+fn has_conditional_start(definition: &ProcessDefinition) -> bool {
+    definition
+        .elements
+        .values()
+        .any(|e| e.parent.is_none() && matches!(e.kind, ElementKind::ConditionalStartEvent { .. }))
+}
+
 /// Whether `element_id` is an intermediate catch event — the only element
 /// class that takes part in an event-based gateway's deferred choice.
 fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str) -> bool {
@@ -16447,7 +18718,7 @@ fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str
 ///   concurrent activations could arm several instances of each sibling in one
 ///   scope, and siblings (matched by element id + scope) could not be isolated.
 pub(crate) struct EventGatewayRaceIndex<'a> {
-    owners: HashMap<&'a str, &'a crate::model::Element>,
+    owners: BTreeMap<&'a str, &'a crate::model::Element>,
 }
 
 impl<'a> EventGatewayRaceIndex<'a> {
@@ -16484,13 +18755,13 @@ impl<'a> EventGatewayRaceIndex<'a> {
 pub(crate) fn event_gateway_race_index(
     def: &crate::model::ProcessDefinition,
 ) -> EventGatewayRaceIndex<'_> {
-    let mut incoming: HashMap<&str, usize> = HashMap::with_capacity(def.elements.len());
+    let mut incoming: BTreeMap<&str, usize> = BTreeMap::new();
     for element in def.elements.values() {
         for flow in &element.outgoing {
             *incoming.entry(flow.to.as_str()).or_default() += 1;
         }
     }
-    let mut owners: HashMap<&str, &crate::model::Element> = HashMap::new();
+    let mut owners: BTreeMap<&str, &crate::model::Element> = BTreeMap::new();
     for gateway in def.elements.values() {
         if !matches!(gateway.kind, ElementKind::EventBasedGateway)
             || incoming.get(gateway.id.as_str()).copied().unwrap_or(0) != 1
@@ -16569,9 +18840,13 @@ impl std::fmt::Display for EngineError {
                 source_flow_scope_id.as_deref().unwrap_or("<process>"),
                 target_flow_scope_id.as_deref().unwrap_or("<process>")
             ),
-            EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, target_element_id } => write!(
+            EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, source_element_type, target_element_id, target_element_type } => write!(
                 f,
-                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' is mapped to element with id '{target_element_id}' which changes multi-instance characteristics. Changing between multi-instance and non-multi-instance elements, or between parallel and sequential multi-instance, is not supported."
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' and type '{source_element_type}' is mapped to an element with id '{target_element_id}' and different type '{target_element_type}'. Elements must be mapped to elements of the same type."
+            ),
+            EngineError::MigrationLoopCharacteristicsChanged { instance_key, source_element_id, target_element_id } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' has a different loop characteristics than the target element with id '{target_element_id}'. Both elements must have either sequential or parallel loop characteristics."
             ),
             EngineError::MigrationCatchEventDetached { instance_key, element_id, target_element_id, catch_event_id, target_catch_event_id } => write!(
                 f,
@@ -16580,6 +18855,14 @@ impl std::fmt::Display for EngineError {
             EngineError::MigrationCatchEventSubscriptionFailed { instance_key, element_id, target_element_id, reason } => write!(
                 f,
                 "Expected to migrate process instance '{instance_key}' but active element with id '{element_id}' is mapped to element with id '{target_element_id}' that must be subscribed to a catch event. {reason}"
+            ),
+            EngineError::MigrationCompensationBoundaryTypeChanged { process_id, source_boundary_id, target_boundary_id, target_event_type, .. } => write!(
+                f,
+                "Expected to migrate process instance with id '{process_id}' but compensation boundary event '{source_boundary_id}' is mapped to a target boundary event '{target_boundary_id}' that has event type '{target_event_type}' different than compensation boundary event type."
+            ),
+            EngineError::MigrationCompensationFlowScopeChanged { process_id, source_flow_scope_id, target_flow_scope_id, .. } => write!(
+                f,
+                "Expected to migrate process instance with id '{process_id}' but the flow scope of compensation boundary event is changed. Flow scope '{source_flow_scope_id}' is not in the same level as '{target_flow_scope_id}'. The flow scope of a compensation boundary event cannot be changed during migration yet."
             ),
             EngineError::MigrationCatchEventsMerged { instance_key, element_id, target_catch_event_id, source_catch_event_ids } => write!(
                 f,
@@ -16592,6 +18875,17 @@ impl std::fmt::Display for EngineError {
             EngineError::DecisionNotFound { reference } => {
                 write!(f, "no deployed decision with {reference}")
             }
+            EngineError::ClusterVariableAlreadyExists { tenant_id, name } => match tenant_id {
+                None => write!(f, "a global cluster variable named '{name}' already exists"),
+                Some(t) => write!(
+                    f,
+                    "a cluster variable named '{name}' already exists for tenant '{t}'"
+                ),
+            },
+            EngineError::ClusterVariableNotFound { tenant_id, name } => match tenant_id {
+                None => write!(f, "no global cluster variable named '{name}'"),
+                Some(t) => write!(f, "no cluster variable named '{name}' for tenant '{t}'"),
+            },
             EngineError::StartEventExpressionInvalid {
                 process_id,
                 element_id,
@@ -16599,6 +18893,10 @@ impl std::fmt::Display for EngineError {
             } => write!(
                 f,
                 "Expected to deploy process '{process_id}' but start event '{element_id}' has an invalid expression: {reason}"
+            ),
+            EngineError::InvalidProcessModel { process_id, reason } => write!(
+                f,
+                "Expected to deploy process '{process_id}' but it is invalid: {reason}"
             ),
             EngineError::NoStartEvent { process_id } => {
                 write!(
@@ -17001,8 +19299,11 @@ impl EngineError {
             // replicated truth.
             EngineError::ProcessNotFound { .. }
             | EngineError::DecisionNotFound { .. }
+            | EngineError::ClusterVariableAlreadyExists { .. }
+            | EngineError::ClusterVariableNotFound { .. }
             | EngineError::NoStartEvent { .. }
             | EngineError::StartEventExpressionInvalid { .. }
+            | EngineError::InvalidProcessModel { .. }
             | EngineError::JobNotFound { .. }
             | EngineError::JobNotActive { .. }
             | EngineError::JobLeaseMismatch { .. }
@@ -17051,8 +19352,11 @@ impl EngineError {
             | EngineError::ElementNotActivatable { .. }
             | EngineError::MigrationFlowScopeChanged { .. }
             | EngineError::MigrationMultiInstanceMismatch { .. }
+            | EngineError::MigrationLoopCharacteristicsChanged { .. }
             | EngineError::MigrationCatchEventDetached { .. }
             | EngineError::MigrationCatchEventsMerged { .. }
+            | EngineError::MigrationCompensationBoundaryTypeChanged { .. }
+            | EngineError::MigrationCompensationFlowScopeChanged { .. }
             | EngineError::MigrationCatchEventSubscriptionFailed { .. }
             | EngineError::AgentInstanceNotFound { .. }
             | EngineError::AgentInstanceElementInstanceInactive { .. }
@@ -17116,7 +19420,7 @@ pub struct ActivatedJob {
     /// `Arc` with the engine's instance state, so activation does not deep-clone
     /// the (up to 50 KB) value tree on the single command thread; the response
     /// mapper encodes it to JSON off-thread by borrowing.
-    pub variables: Arc<HashMap<String, Value>>,
+    pub variables: Arc<BTreeMap<String, Value>>,
     /// Whether this is an ordinary BPMN-element job or an execution-listener job
     /// (ADR 0037), surfaced so the worker/transport can report `jobKind` and
     /// `listenerEventType` (Camunda parity).
@@ -17132,9 +19436,16 @@ fn job_activatable(job: &state::Job, now: u64) -> bool {
         | state::JobState::Failed
         | state::JobState::Errored
         | state::JobState::Canceled => false,
-        state::JobState::Created => true,
+        // A failed-with-backoff job (#933) waits out its `retryBackOff`.
+        state::JobState::Created => job_backoff_elapsed(job, now),
         state::JobState::Activated => job.deadline.is_some_and(|d| d <= now),
     }
+}
+
+/// Whether a job's Camunda 8 v2 `retryBackOff` (#933) has elapsed at `now`:
+/// true when no backoff is pending or its instant has been reached.
+fn job_backoff_elapsed(job: &state::Job, now: u64) -> bool {
+    job.retry_backoff_until.is_none_or(|until| until <= now)
 }
 
 #[cfg(test)]
@@ -17348,18 +19659,18 @@ fn drain_scope_subscriptions(
     };
     // Hash-based membership + per-scope open-child counts derived once, so the
     // fixpoint is O(n log n) instead of rescanning every open entry per step.
-    let handler_scope_set: HashSet<Key> = remaining_handler_scopes.into_iter().collect();
-    let mut index_of: HashMap<Key, usize> = HashMap::with_capacity(subs.len());
+    let handler_scope_set: BTreeSet<Key> = remaining_handler_scopes.into_iter().collect();
+    let mut index_of: BTreeMap<Key, usize> = BTreeMap::new();
     for (i, k) in subs.iter().enumerate() {
         index_of.entry(*k).or_insert(i);
     }
-    let mut open_children: HashMap<Key, usize> = HashMap::new();
+    let mut open_children: BTreeMap<Key, usize> = BTreeMap::new();
     for i in 0..subs.len() {
         if let Some(p) = parent_of(i) {
             *open_children.entry(p).or_default() += 1;
         }
     }
-    let eligible = |k: &Key, open_children: &HashMap<Key, usize>| {
+    let eligible = |k: &Key, open_children: &BTreeMap<Key, usize>| {
         !handler_scope_set.contains(k) && open_children.get(k).copied().unwrap_or(0) == 0
     };
     // Lowest-index eligible entry first — the same retirement order as the

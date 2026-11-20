@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 17;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -63,6 +63,22 @@ const JOB_EVENT_POSITION_SCHEMA_VERSION: i64 = 13;
 /// bounds those rows in place so a warm upgrade converges with a reseed
 /// without replaying the journal (see [`ReadStore::ensure_schema_on`]).
 const JOB_TERMINAL_CREATION_BOUND_SCHEMA_VERSION: i64 = 14;
+/// The schema version that introduced `message_start_subscriptions` (the
+/// definition-scoped message start event subscriptions carrying the MCP tool
+/// metadata, #1499). A database migrated across it starts with the table empty
+/// while the warm cursor keeps the already-deployed subscriptions' creation
+/// events below it, so the migration flags an engine-state backfill
+/// ([`MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY`]).
+const MESSAGE_START_SUBSCRIPTIONS_SCHEMA_VERSION: i64 = 15;
+/// The schema version that introduced the durable replay identity of a
+/// message start subscription (`message_start_subscriptions.last_event_position`).
+/// A database migrated across it receives `0`; every existing row already
+/// reflects every event below the warm cursor, so the migration stamps it.
+const MESSAGE_START_POSITION_SCHEMA_VERSION: i64 = 16;
+/// `meta` key flagging that `message_start_subscriptions` awaits an
+/// engine-state backfill (see [`ReadStore::backfill_pending_event_waits`]).
+const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
+    "message_start_subscriptions_backfill_pending";
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -72,7 +88,7 @@ const JOB_TERMINAL_CREATION_BOUND_SCHEMA_VERSION: i64 = 14;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -6165013068443496289;
+const SCHEMA_FINGERPRINT: i64 = 5885629061888775070;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -328,6 +344,19 @@ CREATE TABLE message_subscriptions (
     non_interrupting       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
+CREATE TABLE message_start_subscriptions (
+    message_name           TEXT PRIMARY KEY,
+    process_definition_key INTEGER NOT NULL,
+    process_id             TEXT NOT NULL,
+    start_element_id       TEXT NOT NULL,
+    tool_name              TEXT,
+    tool_properties        TEXT NOT NULL DEFAULT '{}',
+    created_at_ms          INTEGER NOT NULL DEFAULT 0,
+    -- journal position of the creation event the row reflects (a seed stamps
+    -- the shard cursor): a same-definition replacement applies only from a
+    -- strictly later position, so an overlapping replay never regresses it.
+    last_event_position    INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE event_waits (
     wait_key               INTEGER PRIMARY KEY,
     wait_type              TEXT NOT NULL,
@@ -369,7 +398,8 @@ CREATE TABLE resources (
     version        INTEGER NOT NULL,
     version_tag    TEXT,
     content        TEXT NOT NULL,
-    tenant_id      TEXT NOT NULL DEFAULT '<default>'
+    tenant_id      TEXT NOT NULL DEFAULT '<default>',
+    deployment_key INTEGER
 );
 CREATE INDEX idx_resources_id ON resources(resource_id);
 CREATE TABLE agent_instances (
@@ -1569,6 +1599,40 @@ pub struct MessageSubscriptionRow {
     pub business_id: Option<String>,
 }
 
+/// A projected **message start event** subscription: the definition-scoped
+/// subscription a deployed process's message start event holds, materialized
+/// from `MessageStartSubscriptionCreated` (Camunda 8.10 `START_EVENT` type,
+/// #1499). Keyed by message name — re-deploying a process with the same start
+/// message replaces the row. Unlike a [`MessageSubscriptionRow`] it is not
+/// bound to an instance (`instance_key`/`element_instance_key` are absent) and
+/// never settles; it stays open for the life of the deployment. Carries the MCP
+/// tool metadata the start event declared via `zeebe:properties`
+/// (`io.camunda.tool:*`).
+pub struct MessageStartSubscriptionRow {
+    /// The stable, unique `messageSubscriptionKey` of this subscription,
+    /// derived by [`message_start_subscription_key`] from
+    /// `(process_definition_key, message_name)`. A process may declare several
+    /// message start events, so the definition key alone is not unique.
+    pub subscription_key: Key,
+    /// The BPMN message name that triggers a new instance (the primary key).
+    pub message_name: String,
+    /// The definition (and version) whose instances this start event creates.
+    pub process_definition_key: Key,
+    pub process_id: String,
+    /// The start event element a new instance begins at.
+    pub start_element_id: String,
+    /// The MCP tool name (`io.camunda.tool:name`), when the start event
+    /// declares one.
+    pub tool_name: Option<String>,
+    /// The start event's `io.camunda.tool:*` zeebe:properties subset as a JSON
+    /// object string (the wire representation of the REST `toolProperties`
+    /// field). `"{}"` when the start event declares no tool properties.
+    pub tool_properties: String,
+    /// Projection-time timestamp (ms since epoch) of when this row was
+    /// materialised; surfaces as `lastUpdatedDate` in the search API.
+    pub created_at_ms: u64,
+}
+
 /// The kind of a non-job, non-message event wait (the TIMER / SIGNAL /
 /// CONDITION variants of the element-instance wait-state API).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1766,6 +1830,10 @@ pub struct ResourceMetaRow {
     pub version: i32,
     pub version_tag: Option<String>,
     pub tenant_id: String,
+    /// The key of the deployment that created this resource version, when
+    /// known. `None` only for a row projected before schema v17 (or seeded from
+    /// a legacy engine snapshot whose `deployment_key` is `0`) — sorts as absent.
+    pub deployment_key: Option<Key>,
 }
 
 /// Minimum `-wal` sidecar size (bytes) before the adaptive pruner spends a
@@ -2078,6 +2146,17 @@ impl ReadStore {
         // and then returned to `Created` before the upgrade, whose activation
         // instant is unrecoverable) is closed by the v13 durable-position
         // backfill below, which holds any replay at or below the warm cursor.
+        // `message_start_subscriptions` (v15) is likewise projected from
+        // creation events only: flag the same boot-time engine-state backfill
+        // so already-deployed message start subscriptions are not missing
+        // from search after a warm upgrade.
+        if stored_version.is_none_or(|v| v < MESSAGE_START_SUBSCRIPTIONS_SCHEMA_VERSION) {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, 1)",
+                params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
+            )?;
+            rekey_legacy_start_correlations(conn)?;
+        }
         if stored_version.is_none_or(|v| v < JOB_REPLAY_FLOOR_SCHEMA_VERSION) {
             conn.execute(
                 "UPDATE jobs SET last_event_identity_ms = \
@@ -2109,6 +2188,14 @@ impl ReadStore {
             conn.execute(
                 "UPDATE jobs SET created_at_ms = MIN(created_at_ms, end_ms) \
                  WHERE end_ms IS NOT NULL AND created_at_ms > end_ms",
+                [],
+            )?;
+        }
+        if stored_version.is_none_or(|v| v < MESSAGE_START_POSITION_SCHEMA_VERSION) {
+            conn.execute(
+                "UPDATE message_start_subscriptions SET last_event_position = \
+                 MAX(last_event_position, \
+                 COALESCE((SELECT v FROM meta WHERE k = 'exported_position'), 0))",
                 [],
             )?;
         }
@@ -2375,9 +2462,10 @@ impl ReadStore {
         restored
     }
 
-    /// Backfills `event_waits` from the boot engine `state` if this store was
-    /// migrated from a schema predating it (see [`Self::ensure_schema_on`]),
-    /// then clears the pending flag. Call it BEFORE replaying the journal tail
+    /// Backfills `event_waits` (and, independently, `message_start_subscriptions`)
+    /// from the boot engine `state` if this store was migrated from a schema
+    /// predating it (see [`Self::ensure_schema_on`]), then clears the pending
+    /// flag(s). Call it BEFORE replaying the journal tail
     /// the `state` already reflects: replaying a `*Created` for a backfilled
     /// wait is a no-op and a later settle event deletes it, so the result
     /// matches a full projection. Returns whether a backfill ran.
@@ -2403,8 +2491,23 @@ impl ReadStore {
                 params![EVENT_WAITS_BACKFILL_KEY],
             )?;
         }
+        let start_pending = tx
+            .query_row(
+                "SELECT v FROM meta WHERE k = ?1",
+                params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if start_pending {
+            project_message_start_subscriptions_from_state(&tx, state, now_ms())?;
+            tx.execute(
+                "DELETE FROM meta WHERE k = ?1",
+                params![MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY],
+            )?;
+        }
         tx.commit()?;
-        Ok(pending)
+        Ok(pending || start_pending)
     }
 
     /// Rebuilds this (reset) shard's rows from a boot engine [`State`] snapshot,
@@ -2721,7 +2824,7 @@ impl ReadStore {
     /// transitions the row, the other is a no-op, so the instance is counted
     /// exactly once. Returns the number of rows reconciled — the amount by which
     /// the in-flight gauge was over-counting.
-    pub fn reconcile_orphaned_active(&self, live: &std::collections::HashSet<Key>) -> usize {
+    pub fn reconcile_orphaned_active(&self, live: &std::collections::BTreeSet<Key>) -> usize {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let active: Vec<i64> = {
             let mut stmt = match conn.prepare("SELECT key FROM process_instances WHERE state = 0") {
@@ -2991,6 +3094,22 @@ impl ReadStore {
         let rows = stmt
             .query_map([], map_message_subscription)
             .or_corrupt("query message_subscriptions");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// All message **start event** subscriptions in this shard (the
+    /// definition-scoped `START_EVENT` subscriptions, #1499), keyed by message
+    /// name.
+    pub fn message_start_subscriptions(&self) -> Vec<MessageStartSubscriptionRow> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {MESSAGE_START_SUBSCRIPTION_COLS} FROM message_start_subscriptions"
+            ))
+            .or_corrupt("prepare message_start_subscriptions");
+        let rows = stmt
+            .query_map([], map_message_start_subscription)
+            .or_corrupt("query message_start_subscriptions");
         rows.filter_map(Result::ok).collect()
     }
 
@@ -3534,6 +3653,81 @@ fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscr
     })
 }
 
+/// Re-keys pre-v14 start-event correlation history (#1499) to the canonical
+/// derived [`message_start_subscription_key`], preserving every other column
+/// (notably `correlation_time_ms`). Before v14 a `MessageStartEventCorrelated`
+/// row stored the event's definition-key placeholder as its `subscription_key`
+/// (start correlations are the only rows with `element_instance_key = 0`), so
+/// filtering by a `START_EVENT` row's derived key would miss them and a
+/// replayed old correlation would insert a duplicate under the new key instead
+/// of conflicting with the retained row. Derived keys live in `[2^62, 2^63)`,
+/// so already-migrated rows are skipped and the step is idempotent.
+fn rekey_legacy_start_correlations(conn: &Connection) -> rusqlite::Result<()> {
+    let legacy: Vec<(i64, i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT message_key, subscription_key, message_name \
+             FROM correlated_message_subscriptions \
+             WHERE element_instance_key = 0 AND subscription_key < ?1",
+        )?;
+        stmt.query_map(params![1i64 << 62], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    let mut update = conn.prepare(
+        "UPDATE correlated_message_subscriptions SET subscription_key = ?3 \
+         WHERE message_key = ?1 AND subscription_key = ?2",
+    )?;
+    for (message_key, definition_key, message_name) in legacy {
+        let derived = message_start_subscription_key(definition_key as Key, &message_name) as i64;
+        update.execute(params![message_key, definition_key, derived])?;
+    }
+    Ok(())
+}
+
+/// The canonical `messageSubscriptionKey` of a definition-scoped message start
+/// subscription (#1499): a deterministic FNV-1a hash of
+/// `(process_definition_key, message_name)`. Stable across restarts and
+/// reseeds (it depends only on the subscription's identity), unique per start
+/// event of a definition, and confined to `[2^62, 2^63)` so it stays a
+/// positive `i64` and is disjoint from engine-allocated keys (which are far
+/// below `2^62`).
+pub fn message_start_subscription_key(process_definition_key: Key, message_name: &str) -> Key {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for b in process_definition_key
+        .to_le_bytes()
+        .iter()
+        .chain(message_name.as_bytes())
+    {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(PRIME);
+    }
+    (h & ((1u64 << 62) - 1)) | (1u64 << 62)
+}
+
+/// Column list for `message_start_subscriptions` selects.
+const MESSAGE_START_SUBSCRIPTION_COLS: &str = "message_name, process_definition_key, process_id, \
+     start_element_id, tool_name, tool_properties, created_at_ms";
+
+fn map_message_start_subscription(
+    r: &rusqlite::Row,
+) -> rusqlite::Result<MessageStartSubscriptionRow> {
+    let message_name: String = r.get(0)?;
+    let process_definition_key = r.get::<_, i64>(1)? as Key;
+    Ok(MessageStartSubscriptionRow {
+        subscription_key: message_start_subscription_key(process_definition_key, &message_name),
+        message_name,
+        process_definition_key,
+        process_id: r.get(2)?,
+        start_element_id: r.get(3)?,
+        tool_name: r.get(4)?,
+        tool_properties: r.get(5)?,
+        created_at_ms: r.get::<_, i64>(6)?.max(0) as u64,
+    })
+}
+
 /// Column list for `correlated_message_subscriptions` selects.
 const CORRELATED_MESSAGE_SUBSCRIPTION_COLS: &str = "message_key, subscription_key, instance_key, element_instance_key, element_id, \
      message_name, correlation_key, correlation_time_ms, partition_id, business_id";
@@ -3648,7 +3842,7 @@ fn map_resource(r: &rusqlite::Row) -> rusqlite::Result<ResourceRow> {
 }
 
 const RESOURCE_META_COLS: &str =
-    "resource_key, resource_id, resource_name, version, version_tag, tenant_id";
+    "resource_key, resource_id, resource_name, version, version_tag, tenant_id, deployment_key";
 
 fn map_resource_meta(r: &rusqlite::Row) -> rusqlite::Result<ResourceMetaRow> {
     Ok(ResourceMetaRow {
@@ -3658,6 +3852,7 @@ fn map_resource_meta(r: &rusqlite::Row) -> rusqlite::Result<ResourceMetaRow> {
         version: r.get(3)?,
         version_tag: r.get(4)?,
         tenant_id: r.get(5)?,
+        deployment_key: r.get::<_, Option<i64>>(6)?.map(|k| k as Key),
     })
 }
 /// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
@@ -3753,6 +3948,50 @@ pub fn dmn_decision_type_name(kind: &nanobpmn_engine_core::dmn::DecisionType) ->
 /// unaffected). `type_name()` hard-codes both to `INTERMEDIATE_THROW_EVENT`; a
 /// terminal (no-outgoing-flow) throw is an end event, so classify it as
 /// `END_EVENT` here (#917, #1173). Every other kind passes through unchanged.
+/// Every `(element_id, element_type, element_name)` row a deployed definition
+/// contributes to `definition_elements` — the single derivation shared by the
+/// deploy projection and the snapshot rebuild. Besides `def.elements` it
+/// covers the ad-hoc catalog tools (pruned from the executable graph) and each
+/// container's synthetic `<container>#innerInstance`, so a migration whose
+/// derived mapping targets either resolves its metadata (#1630 review).
+fn definition_element_rows(
+    def: &nanobpmn_engine_core::ProcessDefinition,
+) -> Vec<(String, String, Option<String>)> {
+    let mut rows: Vec<(String, String, Option<String>)> = def
+        .elements
+        .iter()
+        .map(|(id, el)| {
+            (
+                id.clone(),
+                element_type_name(el).to_string(),
+                el.name.clone(),
+            )
+        })
+        .collect();
+    for ad in &def.adhoc {
+        rows.push((
+            nanobpmn_engine_core::adhoc_inner_instance_id(&ad.container_id),
+            "AD_HOC_SUB_PROCESS_INNER_INSTANCE".to_string(),
+            None,
+        ));
+        for tool in &ad.tools {
+            if def.elements.contains_key(&tool.element_id) {
+                continue;
+            }
+            let ty = match tool.kind {
+                nanobpmn_engine_core::AdHocToolKind::ServiceTask { .. } => "SERVICE_TASK",
+                nanobpmn_engine_core::AdHocToolKind::UserTask(_) => "USER_TASK",
+                nanobpmn_engine_core::AdHocToolKind::CallActivity { .. } => "CALL_ACTIVITY",
+                nanobpmn_engine_core::AdHocToolKind::SubProcess { .. } => "SUB_PROCESS",
+                nanobpmn_engine_core::AdHocToolKind::Other => "UNKNOWN",
+            };
+            let name = (!tool.name.is_empty()).then(|| tool.name.clone());
+            rows.push((tool.element_id.clone(), ty.to_string(), name));
+        }
+    }
+    rows
+}
+
 fn element_type_name(element: &nanobpmn_engine_core::Element) -> &'static str {
     match element.kind {
         nanobpmn_engine_core::ElementKind::CompensationThrowEvent
@@ -3838,7 +4077,7 @@ fn upsert_variables(
     tx: &rusqlite::Transaction,
     instance_key: Key,
     scope_key: Key,
-    variables: &std::collections::HashMap<String, Value>,
+    variables: &std::collections::BTreeMap<String, Value>,
 ) -> rusqlite::Result<()> {
     if variables.is_empty() {
         return Ok(());
@@ -4002,18 +4241,13 @@ fn project_engine_state(
                 def.start_form_id.as_ref()
             ],
         )?;
-        for (element_id, element) in &def.elements {
+        for (element_id, element_type, element_name) in definition_element_rows(def) {
             tx.cexecute(
                 "INSERT INTO definition_elements (process_definition_key, element_id, element_type, element_name) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(process_definition_key, element_id) DO UPDATE SET \
                  element_type = excluded.element_type, element_name = excluded.element_name",
-                params![
-                    deployed.key as i64,
-                    element_id,
-                    element_type_name(element),
-                    element.name.as_ref(),
-                ],
+                params![deployed.key as i64, element_id, element_type, element_name],
             )?;
         }
     }
@@ -4091,20 +4325,24 @@ fn project_engine_state(
     for res in state.resources.values() {
         tx.cexecute(
             "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
-             version_tag, content, tenant_id) \
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
+             version_tag, content, tenant_id, deployment_key) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7) \
              ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
              resource_name = excluded.resource_name, version = excluded.version, \
              version_tag = excluded.version_tag, content = excluded.content, \
-             tenant_id = excluded.tenant_id",
+             tenant_id = excluded.tenant_id, \
+             deployment_key = COALESCE(excluded.deployment_key, resources.deployment_key)",
             // `tenant_id` is not modeled in engine state; default to '<default>'.
+            // `deployment_key` is carried by the snapshot; only the legacy `0`
+            // means unknown, which binds NULL and preserves any existing value.
             params![
                 res.key as i64,
                 res.resource_id,
                 res.resource_name,
                 res.version,
                 res.content,
-                "<default>"
+                "<default>",
+                (res.deployment_key != 0).then_some(res.deployment_key as i64),
             ],
         )?;
     }
@@ -4414,11 +4652,8 @@ fn project_engine_state(
             nanobpmn_engine_core::MessageSubscriptionState::Open
                 | nanobpmn_engine_core::MessageSubscriptionState::Opening
         );
-        if open && sub.element_instance_key != 0 {
-            let non_interrupting = matches!(
-                sub.kind,
-                nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary { .. }
-            );
+        if open && is_tracked_message_wait(sub.element_instance_key, &sub.kind) {
+            let non_interrupting = is_non_interrupting(&sub.kind);
             tx.cexecute(
                 "INSERT INTO message_subscriptions (subscription_key, instance_key, \
                  element_instance_key, element_id, message_name, correlation_key, created_at_ms, \
@@ -4433,7 +4668,7 @@ fn project_engine_state(
                 params![
                     sub.key as i64,
                     sub.instance_key as i64,
-                    sub.element_instance_key as i64,
+                    wait_host_key(sub.instance_key, sub.element_instance_key) as i64,
                     sub.element_id,
                     sub.message_name,
                     sub.correlation_key,
@@ -4444,7 +4679,111 @@ fn project_engine_state(
         }
     }
 
+    // 11) Message start event subscriptions (definition-scoped, #1499). These
+    //     never settle, so every one held in engine state is live; project them
+    //     all, keyed by message name like the event projector.
+    project_message_start_subscriptions_from_state(tx, state, now_ms)?;
+
     project_event_waits_from_state(tx, state)
+}
+
+/// Projects every message start subscription held by the live engine `state`
+/// (definition-scoped, never settle — so all are live). Shared by the #732
+/// reseed and the schema-v15 upgrade backfill
+/// ([`ReadStore::backfill_pending_event_waits`]); idempotent.
+fn project_message_start_subscriptions_from_state(
+    tx: &rusqlite::Transaction,
+    state: &nanobpmn_engine_core::State,
+    now_ms: u64,
+) -> rusqlite::Result<()> {
+    // Seeded rows reflect every event below the cursor: that is their floor.
+    let cursor: i64 = tx
+        .query_row(
+            "SELECT v FROM meta WHERE k = 'exported_position'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    for sub in state.message_start_subscriptions.values() {
+        upsert_message_start_subscription(
+            tx,
+            &sub.message_name,
+            sub.process_definition_key,
+            &sub.process_id,
+            &sub.start_element_id,
+            sub.tool_name.as_deref(),
+            &sub.tool_properties,
+            cursor.max(0) as u64,
+            now_ms,
+        )?;
+    }
+    Ok(())
+}
+
+/// The single upsert for a `message_start_subscriptions` row, shared by the
+/// event projector and the engine-state seed/backfill.
+///
+/// Replay-safe under `ReadStore::export`'s overlapping-prefix contract: a row
+/// is only replaced by a **strictly newer** definition (process definition
+/// keys are allocated monotonically, so a later deployment always carries a
+/// larger key). Replaying the same or an older deployment's creation is a
+/// no-op — it neither regresses the definition/tool metadata nor re-stamps
+/// `created_at_ms` (`lastUpdatedDate`). The ordering is durable in the row
+/// itself, so it holds equally after a snapshot seed.
+///
+/// Same-definition conflict (older journals: two starts in one definition whose
+/// names resolve to the same message, e.g. `go` and `="go"`): the engine keeps
+/// the **later** creation, so a same-key creation for a *different* element
+/// replaces the element/tool fields — but only from a **strictly later**
+/// journal `position` than the row's `last_event_position` (seeds stamp the
+/// cursor), so replaying the earlier creation after the later one is a no-op.
+/// It never re-stamps `created_at_ms`.
+#[allow(clippy::too_many_arguments)]
+fn upsert_message_start_subscription(
+    tx: &rusqlite::Transaction,
+    message_name: &str,
+    process_definition_key: Key,
+    process_id: &str,
+    start_element_id: &str,
+    tool_name: Option<&str>,
+    tool_properties: &std::collections::BTreeMap<String, String>,
+    position: u64,
+    now_ms: u64,
+) -> rusqlite::Result<()> {
+    let tool_properties_json =
+        serde_json::to_string(tool_properties).unwrap_or_else(|_| "{}".to_string());
+    tx.cexecute(
+        "INSERT INTO message_start_subscriptions (message_name, process_definition_key, \
+         process_id, start_element_id, tool_name, tool_properties, created_at_ms, \
+         last_event_position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(message_name) DO UPDATE SET \
+         process_definition_key = excluded.process_definition_key, \
+         process_id = excluded.process_id, \
+         start_element_id = excluded.start_element_id, \
+         tool_name = excluded.tool_name, \
+         tool_properties = excluded.tool_properties, \
+         created_at_ms = CASE WHEN excluded.process_definition_key > \
+         message_start_subscriptions.process_definition_key THEN excluded.created_at_ms \
+         ELSE message_start_subscriptions.created_at_ms END, \
+         last_event_position = MAX(excluded.last_event_position, \
+         message_start_subscriptions.last_event_position) \
+         WHERE excluded.process_definition_key > message_start_subscriptions.process_definition_key \
+         OR (excluded.process_definition_key = message_start_subscriptions.process_definition_key \
+         AND excluded.start_element_id <> message_start_subscriptions.start_element_id \
+         AND excluded.last_event_position > message_start_subscriptions.last_event_position)",
+        params![
+            message_name,
+            process_definition_key as i64,
+            process_id,
+            start_element_id,
+            tool_name,
+            tool_properties_json,
+            now_ms as i64,
+            position as i64,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Projects every open timer / signal / conditional wait held by the live engine
@@ -4455,7 +4794,7 @@ fn project_event_waits_from_state(
     tx: &rusqlite::Transaction,
     state: &nanobpmn_engine_core::State,
 ) -> rusqlite::Result<()> {
-    use nanobpmn_engine_core::{MessageSubscriptionState, TimerKind, TimerState};
+    use nanobpmn_engine_core::{MessageSubscriptionState, TimerState};
     let open = |s: MessageSubscriptionState| {
         matches!(
             s,
@@ -4473,7 +4812,7 @@ fn project_event_waits_from_state(
                 &t.element_id,
                 "",
                 Some(t.due_at),
-                matches!(t.kind, TimerKind::NonInterruptingBoundary { .. }),
+                is_non_interrupting_timer(&t.kind),
             )?;
         }
     }
@@ -4520,10 +4859,54 @@ fn project_event_waits_from_state(
 /// persisted before that normalization existed, and when *seeding* from a
 /// pre-normalization snapshot in `project_engine_state`.
 fn is_non_interrupting(kind: &nanobpmn_engine_core::MessageSubscriptionKind) -> bool {
+    // Derived from the engine's own retention rule (a non-interrupting
+    // boundary or a non-interrupting event sub-process start stays open after
+    // it triggers), so the projection cannot drift from the engine (#1555).
+    kind.stays_open_after_trigger()
+}
+
+/// Whether a timer is non-interrupting (projected as such). Mirrors
+/// [`is_non_interrupting`] for the timer kinds.
+fn is_non_interrupting_timer(kind: &nanobpmn_engine_core::TimerKind) -> bool {
     matches!(
         kind,
-        nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary { .. }
+        nanobpmn_engine_core::TimerKind::NonInterruptingBoundary { .. }
+            | nanobpmn_engine_core::TimerKind::EventSubProcess {
+                interrupting: false,
+                ..
+            }
     )
+}
+
+/// The element-instance key a wait projects under. The engine parks a
+/// process-level event sub-process start (#1555) on the engine-only host key
+/// `0` — the process scope itself — but the process scope's element instance
+/// IS the process instance, so the read model reports the process-instance key
+/// there (Zeebe parity; filters by that key must match). Every wait insert —
+/// open message / timer / signal / conditional rows, the seed path, and the
+/// correlation history — routes through this one normalisation (review
+/// r4578375368), so no projection path can leak the `0`.
+fn wait_host_key(instance_key: Key, element_instance_key: Key) -> Key {
+    if element_instance_key == 0 {
+        instance_key
+    } else {
+        element_instance_key
+    }
+}
+
+/// Whether a message subscription is an instance wait state the read model
+/// tracks. Every engine message subscription belongs to a running instance;
+/// the only one resting on element instance `0` is a process-level event
+/// sub-process start (#1555), which rests on the process scope itself.
+fn is_tracked_message_wait(
+    element_instance_key: Key,
+    kind: &nanobpmn_engine_core::MessageSubscriptionKind,
+) -> bool {
+    element_instance_key != 0
+        || matches!(
+            kind,
+            nanobpmn_engine_core::MessageSubscriptionKind::EventSubProcess { .. }
+        )
 }
 
 /// Upserts one open timer / signal / conditional wait row — the single insert
@@ -4548,7 +4931,7 @@ fn insert_event_wait(
             wait_key as i64,
             wait_type.as_str(),
             instance_key as i64,
-            element_instance_key as i64,
+            wait_host_key(instance_key, element_instance_key) as i64,
             element_id,
             detail,
             due_at_ms.map(|d| d as i64),
@@ -4696,7 +5079,7 @@ fn project_event(
             // id): the per-element lifecycle events carry only an element id, so
             // the element-instance read model resolves `type`/`elementName` here,
             // from the deployed model (the single source of truth).
-            for (element_id, element) in &process.elements {
+            for (element_id, element_type, element_name) in definition_element_rows(process) {
                 tx.cexecute(
                     "INSERT INTO definition_elements (process_definition_key, element_id, element_type, element_name) \
                      VALUES (?1, ?2, ?3, ?4) \
@@ -4705,8 +5088,8 @@ fn project_event(
                     params![
                         *process_definition_key as i64,
                         element_id,
-                        element_type_name(element),
-                        element.name.as_ref(),
+                        element_type,
+                        element_name
                     ],
                 )?;
             }
@@ -4948,6 +5331,7 @@ fn project_event(
             element_id,
             due_at,
             kind,
+            ..
         } => insert_event_wait(
             tx,
             *timer_key,
@@ -4957,10 +5341,7 @@ fn project_event(
             element_id,
             "",
             Some(*due_at),
-            matches!(
-                kind,
-                nanobpmn_engine_core::TimerKind::NonInterruptingBoundary { .. }
-            ),
+            is_non_interrupting_timer(kind),
         )?,
         Event::SignalSubscriptionCreated {
             subscription_key,
@@ -5045,11 +5426,8 @@ fn project_event(
             correlation_key,
             kind,
         } => {
-            if *element_instance_key != 0 {
-                let non_interrupting = matches!(
-                    kind,
-                    nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                );
+            if is_tracked_message_wait(*element_instance_key, kind) {
+                let non_interrupting = is_non_interrupting(kind);
                 tx.cexecute(
                     "INSERT INTO message_subscriptions (subscription_key, instance_key, \
                      element_instance_key, element_id, message_name, correlation_key, created_at_ms, \
@@ -5064,7 +5442,7 @@ fn project_event(
                     params![
                         *subscription_key as i64,
                         *instance_key as i64,
-                        *element_instance_key as i64,
+                        wait_host_key(*instance_key, *element_instance_key) as i64,
                         element_id,
                         message_name,
                         correlation_key,
@@ -5073,6 +5451,34 @@ fn project_event(
                     ],
                 )?;
             }
+        }
+
+        // A process-level message start event subscription opened at deploy time
+        // (#1499): the definition-scoped `START_EVENT` row, carrying the MCP tool
+        // metadata the start event declared via `zeebe:properties`. Keyed by
+        // message name — a redeploy with the same start message replaces the row
+        // (mirroring the engine's `message_start_subscriptions` map). The
+        // `tool_properties` map is stored as a JSON object string (the REST
+        // `toolProperties` wire shape).
+        Event::MessageStartSubscriptionCreated {
+            process_definition_key,
+            process_id,
+            message_name,
+            start_element_id,
+            tool_name,
+            tool_properties,
+        } => {
+            upsert_message_start_subscription(
+                tx,
+                message_name,
+                *process_definition_key,
+                process_id,
+                start_element_id,
+                tool_name.as_deref(),
+                tool_properties,
+                position,
+                now_ms,
+            )?;
         }
 
         // A message correlated to an open subscription: record it in the
@@ -5100,9 +5506,12 @@ fn project_event(
             element_id,
             ..
         } => {
-            // Instance-scoped correlations (a running element instance parked on a
-            // catch) are the only ones the open read model tracks; mirror that.
-            if *element_instance_key != 0 {
+            // Only a subscription the open read model tracks (see
+            // `is_tracked_message_wait`) has an open row to recover the message
+            // name / key / flag from; the row lookup below is that check, so a
+            // process-level event sub-process wait (element instance `0`) is
+            // recorded too (#1555).
+            {
                 // Recover the message name / correlation key / interrupting flag
                 // from the open row. If the open row is absent (out-of-order replay
                 // or partial seeding), skip the history insert entirely rather than
@@ -5127,7 +5536,7 @@ fn project_event(
                             *message_key as i64,
                             *subscription_key as i64,
                             *instance_key as i64,
-                            *element_instance_key as i64,
+                            wait_host_key(*instance_key, *element_instance_key) as i64,
                             element_id,
                             message_name,
                             correlation_key,
@@ -5158,10 +5567,15 @@ fn project_event(
         // message name / correlation key itself. The start event has not been
         // activated yet, so its element instance key is unknown (0). The
         // business id is snapshotted from the instance the message created
-        // (projected by the preceding `ProcessInstanceCreated`).
+        // (projected by the preceding `ProcessInstanceCreated`). The
+        // subscription key is the canonical derived start-subscription key
+        // ([`message_start_subscription_key`]) — the same identity the
+        // `START_EVENT` search rows carry — rather than the event's
+        // definition-key placeholder, which is shared by every message start
+        // event of one definition (#1499).
         Event::MessageStartEventCorrelated {
             message_key,
-            subscription_key,
+            process_definition_key,
             instance_key,
             element_id,
             message_name,
@@ -5176,7 +5590,7 @@ fn project_event(
                  ON CONFLICT(message_key, subscription_key) DO NOTHING",
                 params![
                     *message_key as i64,
-                    *subscription_key as i64,
+                    message_start_subscription_key(*process_definition_key, message_name) as i64,
                     *instance_key as i64,
                     element_id,
                     message_name,
@@ -6212,6 +6626,7 @@ fn project_event(
         }
 
         Event::GenericResourceDeployed {
+            deployment_key,
             resource_key,
             version,
             resource_id,
@@ -6224,12 +6639,12 @@ fn project_event(
             // is idempotent on a journal replay.
             tx.cexecute(
                 "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
-                 version_tag, content, tenant_id) \
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
+                 version_tag, content, tenant_id, deployment_key) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7) \
                  ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
                  resource_name = excluded.resource_name, version = excluded.version, \
                  version_tag = excluded.version_tag, content = excluded.content, \
-                 tenant_id = excluded.tenant_id",
+                 tenant_id = excluded.tenant_id, deployment_key = excluded.deployment_key",
                 params![
                     *resource_key as i64,
                     resource_id,
@@ -6237,6 +6652,7 @@ fn project_event(
                     version,
                     content,
                     "<default>",
+                    *deployment_key as i64,
                 ],
             )?;
         }
@@ -6685,7 +7101,6 @@ fn project_event(
         | Event::ElementCompleting { .. }
         | Event::GatewayRouteSelected { .. }
         | Event::MessagePublished { .. }
-        | Event::MessageStartSubscriptionCreated { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }
@@ -6702,9 +7117,16 @@ fn project_event(
         | Event::ProcessStartTimerFired { .. }
         // A Raft applied-entry record (#1405): no read-model state.
         | Event::RaftEntryApplied { .. }
+        // Replicated lenient-completion mode (#1661): engine-internal config.
+        | Event::LenientCompletionSet { .. }
         // Engine-internal routed-delivery dedup / close-tombstone ledger
         // (#1497): no read-model projection.
         | Event::RoutedDeliveryRecorded { .. }
+        // Cluster variables (#1657) are served from replicated engine state
+        // (the one source of truth), not projected into the read model.
+        | Event::ClusterVariableCreated { .. }
+        | Event::ClusterVariableUpdated { .. }
+        | Event::ClusterVariableDeleted { .. }
         | Event::ScopedCompensationCleared { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }
@@ -6716,7 +7138,14 @@ fn project_event(
         | Event::UserTaskTransitionDeferred { .. }
         | Event::UserTaskTransitionResolved { .. }
         | Event::VariableScopeCreated { .. }
-        | Event::VariableScopeDestroyed { .. } => {}
+        | Event::VariableScopeDestroyed { .. }
+        | Event::EventSubProcessPayloadHeld { .. }
+        // Engine-internal quarantine dedup tombstone (#1574): the read model
+        // projects the companion `IncidentRaised`.
+        | Event::VariablesLostQuarantined { .. }
+        // Engine-internal orphan-stamp supersede signal (#1587 review): no
+        // projection — the re-proposed quarantine raises its own incident.
+        | Event::OrphanStampSuperseded { .. } => {}
     }
     Ok(delta)
 }
@@ -7945,6 +8374,7 @@ mod writability_tests {
                 created_at: 900,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             },
             900,
         );
@@ -7964,6 +8394,7 @@ mod writability_tests {
             process_id: "p".to_string(),
             process_definition_key: 0,
             state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            terminated_epoch: 0,
             suspended_at: None,
             created_at: 50,
             tags: Vec::new(),
@@ -7988,6 +8419,7 @@ mod writability_tests {
             compensable: Default::default(),
             compensation_waits: Default::default(),
             agent_instances: Default::default(),
+            esp_held_payloads: Default::default(),
             agent_history: Default::default(),
         };
         inst.active.insert(7_701, "t".to_string());
@@ -8020,6 +8452,8 @@ mod writability_tests {
                     at: 600,
                     deadline: None,
                 }),
+                secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
         store.seed_from_engine_state(&state).unwrap();
@@ -8105,6 +8539,7 @@ mod writability_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         apply_at(&store, &created, 9_000);
         let row = job_row(&store, 12);
@@ -8323,6 +8758,7 @@ mod definition_xml_tests {
             DeployedProcess {
                 key,
                 version,
+                deployment_key: 0,
                 definition: def,
             }
         };
@@ -8362,6 +8798,40 @@ mod definition_xml_tests {
     }
 
     #[test]
+    fn seed_from_engine_state_carries_resource_deployment_key() {
+        use nanobpmn_engine_core::{DeployedResource, State};
+
+        let mk = |key, deployment_key| DeployedResource {
+            key,
+            version: 1,
+            resource_id: format!("r{key}.txt"),
+            resource_name: format!("r{key}.txt"),
+            content: "c".to_string(),
+            deployment_key,
+            version_tag: None,
+        };
+        let mut state = State::default();
+        state.resources.insert("r7.txt".to_string(), mk(7, 99));
+        state.resources.insert("r8.txt".to_string(), mk(8, 0));
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        assert_eq!(
+            store.resource_by_key_meta(7).unwrap().deployment_key,
+            Some(99)
+        );
+        assert_eq!(store.resource_by_key_meta(8).unwrap().deployment_key, None);
+
+        // A legacy (0) snapshot value must not clobber a known key.
+        state.resources.insert("r7.txt".to_string(), mk(7, 0));
+        store.seed_from_engine_state(&state).unwrap();
+        assert_eq!(
+            store.resource_by_key_meta(7).unwrap().deployment_key,
+            Some(99)
+        );
+    }
+
+    #[test]
     fn seed_from_engine_state_falls_back_to_latest_index_for_legacy_snapshots() {
         use nanobpmn_engine_core::{DeployedProcess, State};
 
@@ -8382,6 +8852,7 @@ mod definition_xml_tests {
             DeployedProcess {
                 key: 42,
                 version: 3,
+                deployment_key: 0,
                 definition: def,
             },
         );
@@ -8427,6 +8898,7 @@ mod definition_xml_tests {
             process_id: "p".to_string(),
             process_definition_key: 0,
             state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            terminated_epoch: 0,
             suspended_at: None,
             created_at: 50,
             tags: Vec::new(),
@@ -8448,6 +8920,7 @@ mod definition_xml_tests {
             adhoc_instances: Default::default(),
             scope_parents: Default::default(),
             scope_variables: Default::default(),
+            esp_held_payloads: Default::default(),
             compensable: Default::default(),
             compensation_waits: Default::default(),
             agent_instances: Default::default(),
@@ -8480,6 +8953,8 @@ mod definition_xml_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
 
@@ -8540,6 +9015,7 @@ mod definition_xml_tests {
                 created_at: 100,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             },
             100,
         );
@@ -8689,6 +9165,7 @@ mod definition_xml_tests {
             process_id: "p".to_string(),
             process_definition_key: 0,
             state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            terminated_epoch: 0,
             suspended_at: None,
             created_at: 50,
             tags: Vec::new(),
@@ -8710,6 +9187,7 @@ mod definition_xml_tests {
             adhoc_instances: Default::default(),
             scope_parents: Default::default(),
             scope_variables: Default::default(),
+            esp_held_payloads: Default::default(),
             compensable: Default::default(),
             compensation_waits: Default::default(),
             agent_instances: Default::default(),
@@ -8749,6 +9227,8 @@ mod definition_xml_tests {
                     at: 600,
                     deadline: Some(70_000),
                 }),
+                secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
 
@@ -8792,6 +9272,7 @@ mod definition_xml_tests {
                 created_at: 900,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             },
             900,
         );
@@ -9041,7 +9522,9 @@ mod definition_xml_tests {
             .build()
             .unwrap();
         let mut engine = Engine::new();
-        engine.set_lenient_completion(true);
+        engine
+            .apply_command(Command::SetLenientCompletion { lenient: true })
+            .unwrap();
         engine
             .apply_command_at(Command::DeployProcess(def), 1_000)
             .unwrap();
@@ -9115,7 +9598,9 @@ mod definition_xml_tests {
             .build()
             .unwrap();
         let mut engine = Engine::new();
-        engine.set_lenient_completion(true);
+        engine
+            .apply_command(Command::SetLenientCompletion { lenient: true })
+            .unwrap();
         let store = ReadStore::open(None).unwrap();
         let run = |engine: &mut Engine, cmd: Command, now: u64| {
             let events = engine.apply_command_at(cmd, now).unwrap();
@@ -9297,6 +9782,7 @@ mod definition_xml_tests {
                 created_at: 100,
                 priority: 0,
                 retries: 1,
+                secret_provenance: Vec::new(),
             },
             Event::JobFailed {
                 job_key: 8_950,
@@ -9304,6 +9790,7 @@ mod definition_xml_tests {
                 retries: 0,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             },
             Event::JobCanceled {
                 job_key: 8_950,
@@ -9351,6 +9838,7 @@ mod definition_xml_tests {
                 created_at: 100,
                 priority: 0,
                 retries: 1,
+                secret_provenance: Vec::new(),
             },
             Event::JobActivated {
                 job_key: 8_900,
@@ -9368,6 +9856,7 @@ mod definition_xml_tests {
                 retries: 0,
                 worker: Some("w1".to_string()),
                 error_message: None,
+                retry_backoff_until: None,
             },
             Event::JobRetriesUpdated {
                 job_key: 8_900,
@@ -9473,7 +9962,7 @@ mod definition_xml_tests {
         // Engine truth: only 11 is genuinely live (e.g. cold-spilled). 10 and 12
         // are orphans — their CREATE was projected but the terminal event never
         // was — so the engine holds no such instance.
-        let mut live = std::collections::HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         live.insert(11u64);
 
         let reconciled = store.reconcile_orphaned_active(&live);
@@ -9588,6 +10077,7 @@ mod definition_xml_tests {
         store
             .export(&[
                 &Event::TimerCreated {
+                    repetitions: None,
                     timer_key: 10,
                     instance_key: 7,
                     element_instance_key: 20,
@@ -9694,6 +10184,188 @@ mod definition_xml_tests {
     }
 
     #[test]
+    fn message_start_subscription_keys_are_unique_per_start_event_and_stable() {
+        let a = super::message_start_subscription_key(7, "order");
+        let b = super::message_start_subscription_key(7, "refund");
+        assert_ne!(
+            a, b,
+            "two start events of one definition need distinct keys"
+        );
+        assert_eq!(a, super::message_start_subscription_key(7, "order"));
+        assert_ne!(a, super::message_start_subscription_key(8, "order"));
+        assert!((1 << 62..1 << 63).contains(&a));
+    }
+
+    fn start_created(def_key: super::Key, tool: &str) -> Event {
+        Event::MessageStartSubscriptionCreated {
+            process_definition_key: def_key,
+            process_id: "p".into(),
+            message_name: "go".into(),
+            start_element_id: "s".into(),
+            tool_name: Some(tool.into()),
+            tool_properties: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn replaying_older_or_duplicate_message_start_creations_leaves_the_row_unchanged() {
+        let store = ReadStore::open(None).unwrap();
+        replay_at(&store, &start_created(20, "new"), 1, 1_000);
+        let row = |s: &ReadStore| {
+            let r = s.message_start_subscriptions().pop().unwrap();
+            (r.process_definition_key, r.tool_name, r.created_at_ms)
+        };
+        assert_eq!(row(&store), (20, Some("new".into()), 1_000));
+        // Duplicate replay: no re-stamp of lastUpdatedDate.
+        replay_at(&store, &start_created(20, "new"), 1, 5_000);
+        assert_eq!(row(&store), (20, Some("new".into()), 1_000));
+        // Older deployment replay: no regression of definition/tool metadata.
+        replay_at(&store, &start_created(10, "old"), 0, 6_000);
+        assert_eq!(row(&store), (20, Some("new".into()), 1_000));
+        // A genuine later deployment replaces it.
+        replay_at(&store, &start_created(30, "newer"), 2, 7_000);
+        assert_eq!(row(&store), (30, Some("newer".into()), 7_000));
+    }
+
+    /// Regression (#1586 review): an older journal can hold two starts in ONE
+    /// definition resolving to the same message name; the engine keeps the
+    /// later creation, so cold replay must expose the second element — without
+    /// re-stamping `created_at_ms`, and a same-element duplicate stays a no-op.
+    #[test]
+    fn same_definition_message_name_conflict_keeps_the_later_start() {
+        let store = ReadStore::open(None).unwrap();
+        let created = |element: &str| Event::MessageStartSubscriptionCreated {
+            process_definition_key: 20,
+            process_id: "p".into(),
+            message_name: "go".into(),
+            start_element_id: element.into(),
+            tool_name: None,
+            tool_properties: std::collections::BTreeMap::new(),
+        };
+        let row = |s: &ReadStore| {
+            let r = s.message_start_subscriptions().pop().unwrap();
+            (r.start_element_id, r.created_at_ms)
+        };
+        replay_at(&store, &created("first"), 1, 1_000);
+        replay_at(&store, &created("second"), 2, 2_000);
+        assert_eq!(row(&store), ("second".to_string(), 1_000));
+        replay_at(&store, &created("second"), 2, 3_000);
+        assert_eq!(row(&store), ("second".to_string(), 1_000));
+        // Overlapping replay of the EARLIER creation must not regress the row.
+        replay_at(&store, &created("first"), 1, 4_000);
+        assert_eq!(row(&store), ("second".to_string(), 1_000));
+    }
+
+    /// Regression (#1540 review): a warm v13→v15 upgrade must re-key retained
+    /// start-correlation history from the definition-key placeholder to the
+    /// derived start-subscription key — so filtering by a `START_EVENT` row's
+    /// key finds it — while preserving its timestamp, and a replayed old
+    /// correlation must conflict with (not duplicate) the migrated row.
+    #[test]
+    fn upgrading_to_v15_rekeys_legacy_start_correlations() {
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-start-corr-rekey-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ReadStore::open(Some(&path)).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
+                 instance_key, element_instance_key, element_id, message_name, correlation_key, \
+                 correlation_time_ms, partition_id, business_id) \
+                 VALUES (55, 900, 7001, 0, 'start', 'order-placed', 'c-1', 1234, 1, NULL); \
+                 DROP TABLE message_start_subscriptions; \
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let store = ReadStore::open(Some(&path)).unwrap();
+        let derived = super::message_start_subscription_key(900, "order-placed");
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].subscription_key, derived);
+        assert_eq!(corr[0].correlation_time_ms, 1234, "timestamp preserved");
+
+        // Overlapping replay of the old correlation: conflicts, no duplicate.
+        store
+            .export(&[&Event::MessageStartEventCorrelated {
+                message_key: 55,
+                subscription_key: 900,
+                process_definition_key: 900,
+                process_id: "p".into(),
+                instance_key: 7001,
+                element_id: "start".into(),
+                message_name: "order-placed".into(),
+                correlation_key: "c-1".into(),
+            }])
+            .unwrap();
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].correlation_time_ms, 1234);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrading_from_before_message_start_subscriptions_backfills_them_from_engine_state() {
+        use nanobpmn_engine_core::{MessageStartSubscription, State};
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-msg-start-backfill-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ReadStore::open(Some(&path)).unwrap();
+        assert!(
+            !store
+                .backfill_pending_event_waits(&State::default())
+                .unwrap()
+        );
+        // Wind it back to a v13 store (no `message_start_subscriptions`).
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE message_start_subscriptions; \
+                 UPDATE meta SET v = 13 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let store = ReadStore::open(Some(&path)).unwrap();
+        assert!(store.message_start_subscriptions().is_empty());
+        let mut state = State::default();
+        state.message_start_subscriptions.insert(
+            "go".into(),
+            MessageStartSubscription {
+                process_definition_key: 5,
+                process_id: "p".into(),
+                message_name: "go".into(),
+                start_element_id: "s".into(),
+                tool_name: Some("tool".into()),
+                tool_properties: std::collections::BTreeMap::new(),
+            },
+        );
+        assert!(store.backfill_pending_event_waits(&state).unwrap());
+        let rows = store.message_start_subscriptions();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool_name.as_deref(), Some("tool"));
+        // The flag is cleared: the backfill runs once.
+        assert!(!store.backfill_pending_event_waits(&state).unwrap());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn upgrading_from_before_event_waits_backfills_live_waits_from_the_engine_state() {
         use nanobpmn_engine_core::{
             ConditionalSubscription, MessageSubscriptionKind, MessageSubscriptionState, State,
@@ -9729,6 +10401,7 @@ mod definition_xml_tests {
         let store = ReadStore::open(Some(&path)).unwrap();
         let mut state = State::default();
         let timer = |key, state| Timer {
+            repetitions: None,
             key,
             instance_key: 7,
             element_instance_key: 20,
@@ -9924,7 +10597,7 @@ mod definition_xml_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -9947,7 +10620,7 @@ mod definition_xml_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: process_id.to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -9969,7 +10642,7 @@ mod definition_xml_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -10763,7 +11436,7 @@ mod definition_xml_tests {
             .export(&[
                 &Event::VariablesUpdated {
                     instance_key,
-                    variables: std::collections::HashMap::from([(
+                    variables: std::collections::BTreeMap::from([(
                         "amount".to_string(),
                         Value::Int(10),
                     )]),
@@ -10771,7 +11444,7 @@ mod definition_xml_tests {
                 &Event::ScopedVariablesUpdated {
                     instance_key,
                     scope_key,
-                    variables: std::collections::HashMap::from([
+                    variables: std::collections::BTreeMap::from([
                         ("amount".to_string(), Value::Int(20)),
                         ("item".to_string(), Value::Int(7)),
                     ]),
@@ -10810,7 +11483,7 @@ mod definition_xml_tests {
             .export(&[&Event::ScopedVariablesUpdated {
                 instance_key,
                 scope_key,
-                variables: std::collections::HashMap::from([(
+                variables: std::collections::BTreeMap::from([(
                     "amount".to_string(),
                     Value::Int(99),
                 )]),
@@ -11078,6 +11751,7 @@ mod decision_deletion_tests {
             created_at: 0,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let task = |user_task_key| Event::UserTaskCreated {
             user_task_key,
@@ -11113,7 +11787,7 @@ mod decision_deletion_tests {
         let created = Event::ProcessInstanceCreated {
             instance_key: 7,
             process_id: "p".into(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -11259,7 +11933,7 @@ mod decision_deletion_tests {
 
 #[cfg(test)]
 mod element_instance_tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use nanobpmn_engine_core::{Event, JobKind, JobState, Key, ProcessBuilder};
 
@@ -11293,7 +11967,7 @@ mod element_instance_tests {
         Event::ProcessInstanceCreated {
             instance_key: INST,
             process_id: "p".to_string(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             created_at: 1,
             tags: Vec::new(),
             business_id: None,
@@ -11321,7 +11995,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: CHILD,
                     process_id: "p".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 2,
                     tags: Vec::new(),
                     business_id: None,
@@ -11531,7 +12205,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: COMP_INST,
                     process_id: "comp".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
@@ -11597,7 +12271,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: ESC_INST,
                     process_id: "esc".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
@@ -11671,7 +12345,7 @@ mod element_instance_tests {
                 &Event::ProcessInstanceCreated {
                     instance_key: INST + 100,
                     process_id: "p".to_string(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
@@ -11804,7 +12478,7 @@ mod element_instance_tests {
                 element_instance_key: TASK_EI,
                 element_id: "await".to_string(),
                 kind: MessageSubscriptionKind::IntermediateCatch,
-                variables: std::collections::HashMap::new(),
+                variables: std::collections::BTreeMap::new(),
                 delivery_key: 0,
             }])
             .unwrap();
@@ -11866,6 +12540,9 @@ mod element_instance_tests {
                 migrated_flow_scopes: vec![],
                 subscriptions: vec![],
                 child_instances: vec![],
+                join_scoped: true,
+                compensation_subscriptions: vec![],
+                compensation_migrated: true,
             }])
             .unwrap();
 
@@ -11922,6 +12599,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 7001,
@@ -11929,6 +12607,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: None,
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 // A terminal errored job on the same source element.
                 &Event::JobCreated {
@@ -11940,6 +12619,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 7002,
@@ -11964,6 +12644,9 @@ mod element_instance_tests {
                 migrated_flow_scopes: vec![],
                 subscriptions: vec![],
                 child_instances: vec![],
+                join_scoped: true,
+                compensation_subscriptions: vec![],
+                compensation_migrated: true,
             }])
             .unwrap();
 
@@ -12002,6 +12685,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 8001,
@@ -12019,6 +12703,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: Some("w1".to_string()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 // A job that throws a terminal (uncaught) error after activation by `w2`.
                 &Event::JobCreated {
@@ -12030,6 +12715,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 8002,
@@ -12058,6 +12744,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 2,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 8003,
@@ -12075,6 +12762,7 @@ mod element_instance_tests {
                     retries: 1,
                     worker: Some("w3".to_string()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
             ])
             .unwrap();
@@ -12119,6 +12807,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 9001,
@@ -12126,6 +12815,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: Some("host-a-senior".to_string()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 // Errored terminally — again no JobActivated projection.
                 &Event::JobCreated {
@@ -12137,6 +12827,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 9002,
@@ -12183,6 +12874,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobCompleted {
                     job_key: 9101,
@@ -12203,6 +12895,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobCompleted {
                     job_key: 9102,
@@ -12251,6 +12944,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobCompleted {
                     job_key: 9201,
@@ -12270,6 +12964,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 9202,
@@ -12277,6 +12972,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: Some(String::new()),
                     error_message: None,
+                    retry_backoff_until: None,
                 },
                 &Event::JobCreated {
                     job_key: 9203,
@@ -12287,6 +12983,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 9203,
@@ -12338,6 +13035,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 // Durable activation with an explicitly-empty worker: the
                 // projection must land NULL, not `""`.
@@ -12413,6 +13111,8 @@ mod element_instance_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
 
@@ -12482,6 +13182,8 @@ mod element_instance_tests {
             has_failed_with_retries_left: false,
             settled_tokens: Vec::new(),
             terminal_end: None,
+            secret_provenance: Vec::new(),
+            retry_backoff_until: None,
         };
         let mut state = State::default();
         // Failed with retries left.
@@ -12592,6 +13294,7 @@ mod element_instance_tests {
                     retries: 0,
                     worker: None,
                     error_message: None,
+                    retry_backoff_until: None,
                 },
             ),
             (
@@ -12663,6 +13366,7 @@ mod element_instance_tests {
             created_at: 123,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activate = |key, deadline| Event::JobActivated {
             job_key: key,
@@ -12751,6 +13455,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             }])
             .unwrap();
         let failed = get(7003);
@@ -12789,6 +13494,7 @@ mod element_instance_tests {
             created_at: 123,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
 
@@ -12820,6 +13526,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("late".into()),
+                retry_backoff_until: None,
             },
             Event::JobErrorThrown {
                 job_key: 8001,
@@ -12877,6 +13584,7 @@ mod element_instance_tests {
                 retries: 1,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert_eq!(
@@ -12906,6 +13614,7 @@ mod element_instance_tests {
             created_at: 123,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
 
@@ -12920,6 +13629,7 @@ mod element_instance_tests {
             retries: 0,
             worker: None,
             error_message: Some("boom".into()),
+            retry_backoff_until: None,
         };
         store.export(&[&fail(8201)]).unwrap();
         let failed = get(8201);
@@ -12974,6 +13684,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("stray".into()),
+                retry_backoff_until: None,
             },
             Event::JobErrorThrown {
                 job_key: 8202,
@@ -13022,6 +13733,7 @@ mod element_instance_tests {
                     created_at: 0,
                     priority: 0,
                     retries: 3,
+                    secret_provenance: Vec::new(),
                 },
             ])
             .unwrap();
@@ -13127,6 +13839,8 @@ mod element_instance_tests {
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
                 terminal_end: None,
+                secret_provenance: Vec::new(),
+                retry_backoff_until: None,
             },
         );
         let store = ReadStore::open(None).unwrap();
@@ -13160,6 +13874,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 3,
+                    secret_provenance: Vec::new(),
                 },
             ])
             .unwrap();
@@ -13210,6 +13925,7 @@ mod element_instance_tests {
             created_at: 1,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let row = |store: &ReadStore, key| store.jobs().into_iter().find(|j| j.key == key).unwrap();
         store
@@ -13225,6 +13941,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("upstream 503".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         let r = row(&store, 7001);
@@ -13241,6 +13958,7 @@ mod element_instance_tests {
                 retries: 1,
                 worker: None,
                 error_message: None,
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert_eq!(
@@ -13254,6 +13972,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("gave up".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         let r = row(&store, 7001);
@@ -13294,6 +14013,7 @@ mod element_instance_tests {
             created_at: 1,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let row = |store: &ReadStore, key| store.jobs().into_iter().find(|j| j.key == key).unwrap();
         store
@@ -13315,6 +14035,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("flaky".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(row(&store, 7001).has_failed_with_retries_left);
@@ -13339,6 +14060,7 @@ mod element_instance_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("gave up".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(!row(&store, 7002).has_failed_with_retries_left);
@@ -13363,6 +14085,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("flaky".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(row(&store, 7003).has_failed_with_retries_left);
@@ -13389,6 +14112,7 @@ mod element_instance_tests {
                 retries: 2,
                 worker: None,
                 error_message: Some("flaky".to_string()),
+                retry_backoff_until: None,
             }])
             .unwrap();
         assert!(row(&store, 7004).has_failed_with_retries_left);
@@ -13428,6 +14152,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 7001,
@@ -13449,6 +14174,7 @@ mod element_instance_tests {
                     created_at: 1,
                     priority: 0,
                     retries: 1,
+                    secret_provenance: Vec::new(),
                 },
                 &Event::JobActivated {
                     job_key: 7002,
@@ -13492,6 +14218,243 @@ mod element_instance_tests {
             jobs[&7001].read_set,
             vec!["a".to_string(), "c".to_string()],
             "a declaration-free re-activation preserves the last declared read-set"
+        );
+    }
+
+    #[test]
+    fn event_subprocess_message_waits_are_tracked_and_retained_per_interrupting_flag() {
+        // #1555: a process-level event sub-process subscription rests on the
+        // process scope (element instance 0) yet is a live wait; a
+        // non-interrupting one stays open after each correlation while an
+        // interrupting one settles.
+        use nanobpmn_engine_core::MessageSubscriptionKind;
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        let esp = |interrupting| MessageSubscriptionKind::EventSubProcess {
+            esp_element_id: "esp".to_string(),
+            interrupting,
+        };
+        let created_sub = |key, interrupting| Event::MessageSubscriptionCreated {
+            subscription_key: key,
+            instance_key: INST,
+            element_instance_key: 0,
+            element_id: "esp_start".to_string(),
+            message_name: "Ping".to_string(),
+            correlation_key: "K1".to_string(),
+            kind: esp(interrupting),
+        };
+        let correlate = |key, message_key| Event::MessageCorrelated {
+            subscription_key: key,
+            message_key,
+            instance_key: INST,
+            element_instance_key: 0,
+            element_id: "esp_start".to_string(),
+        };
+        store
+            .export(&[&created_sub(5001, false), &created_sub(5002, true)])
+            .unwrap();
+        assert_eq!(
+            store.message_subscriptions().len(),
+            2,
+            "root ESP waits projected"
+        );
+        store
+            .export(&[
+                &correlate(5001, 21),
+                &correlate(5001, 22),
+                &correlate(5002, 23),
+            ])
+            .unwrap();
+        let open: Vec<_> = store
+            .message_subscriptions()
+            .into_iter()
+            .map(|s| s.subscription_key)
+            .collect();
+        assert_eq!(
+            open,
+            vec![5001],
+            "non-interrupting stays open, interrupting settles"
+        );
+        assert_eq!(
+            store.correlated_message_subscriptions().len(),
+            3,
+            "every correlation recorded in history"
+        );
+        // Review r4578375368: the engine-only host key `0` must not leak. A
+        // root ESP wait rests on the process scope, whose element instance is
+        // the process instance itself — so both the open wait and every history
+        // row carry the process-instance key (filters by it then match).
+        assert!(
+            store
+                .message_subscriptions()
+                .iter()
+                .all(|s| s.element_instance_key == INST)
+        );
+        assert!(
+            store
+                .correlated_message_subscriptions()
+                .iter()
+                .all(|c| c.element_instance_key == INST)
+        );
+    }
+
+    #[test]
+    fn root_event_subprocess_timer_and_signal_waits_use_the_process_instance_key() {
+        // Review r4578375368 (the class): every wait projected from an event
+        // resting on the process scope (element instance `0`) — timer, signal,
+        // conditional — reports the process-instance key, not `0`.
+        use nanobpmn_engine_core::{MessageSubscriptionKind, TimerKind};
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        let ni = MessageSubscriptionKind::EventSubProcess {
+            esp_element_id: "esp".to_string(),
+            interrupting: false,
+        };
+        store
+            .export(&[
+                &Event::TimerCreated {
+                    repetitions: None,
+                    timer_key: 6001,
+                    instance_key: INST,
+                    element_instance_key: 0,
+                    element_id: "esp_start".to_string(),
+                    due_at: 5_000,
+                    kind: TimerKind::EventSubProcess {
+                        esp_element_id: "esp".to_string(),
+                        interrupting: false,
+                    },
+                },
+                &Event::SignalSubscriptionCreated {
+                    subscription_key: 6002,
+                    instance_key: INST,
+                    element_instance_key: 0,
+                    element_id: "esp_start".to_string(),
+                    signal_name: "go".to_string(),
+                    kind: ni,
+                },
+            ])
+            .unwrap();
+        let waits = store.event_waits();
+        assert_eq!(waits.len(), 2);
+        assert!(
+            waits.iter().all(|w| w.element_instance_key == INST),
+            "root ESP waits carry the process-instance key"
+        );
+    }
+
+    #[test]
+    fn event_subprocess_waits_reseed_from_engine_state() {
+        // The #732 reseed must project the same ESP rows the event projector
+        // does: a root (element instance 0) message wait, and non-interrupting
+        // signal / conditional / timer waits flagged as such.
+        use nanobpmn_engine_core::{
+            ConditionalSubscription, MessageSubscription, MessageSubscriptionKind as SubKind,
+            MessageSubscriptionState as S, SignalSubscription, State, Timer, TimerKind, TimerState,
+        };
+        let ni = SubKind::EventSubProcess {
+            esp_element_id: "esp".into(),
+            interrupting: false,
+        };
+        let mut state = State::default();
+        state.message_subscriptions.insert(
+            1,
+            MessageSubscription {
+                key: 1,
+                instance_key: INST,
+                element_instance_key: 0,
+                element_id: "esp_start".into(),
+                message_name: "Ping".into(),
+                correlation_key: "K1".into(),
+                state: S::Open,
+                kind: ni.clone(),
+                correlated_message_keys: Default::default(),
+            },
+        );
+        state.signal_subscriptions.insert(
+            2,
+            SignalSubscription {
+                key: 2,
+                instance_key: INST,
+                element_instance_key: 0,
+                element_id: "esp_start".into(),
+                signal_name: "go".into(),
+                state: S::Open,
+                kind: ni.clone(),
+            },
+        );
+        state.conditional_subscriptions.insert(
+            3,
+            ConditionalSubscription {
+                key: 3,
+                instance_key: INST,
+                element_instance_key: 0,
+                element_id: "esp_start".into(),
+                condition: "=x".into(),
+                referenced_vars: vec!["x".into()],
+                state: S::Open,
+                kind: ni,
+            },
+        );
+        state.timers.insert(
+            4,
+            Timer {
+                repetitions: None,
+                key: 4,
+                instance_key: INST,
+                element_instance_key: 0,
+                element_id: "esp_start".into(),
+                due_at: 5_000,
+                state: TimerState::Created,
+                kind: TimerKind::EventSubProcess {
+                    esp_element_id: "esp".into(),
+                    interrupting: false,
+                },
+            },
+        );
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        let subs = store.message_subscriptions();
+        assert_eq!(subs.len(), 1, "root ESP message wait reseeded");
+        assert_eq!(
+            subs[0].element_instance_key, INST,
+            "reseeded root ESP wait carries the process-instance key, not 0"
+        );
+        assert!(
+            store
+                .event_waits()
+                .iter()
+                .all(|w| w.element_instance_key == INST),
+            "reseeded root ESP timer/signal/conditional waits carry the process-instance key"
+        );
+        assert_eq!(
+            store.event_waits().len(),
+            3,
+            "ESP signal/conditional/timer waits reseeded"
+        );
+        // Reseeded as non-interrupting: firing the signal / condition keeps the
+        // wait open (the ESP can fire again).
+        store
+            .export(&[
+                &Event::SignalCorrelated {
+                    subscription_key: 2,
+                    signal_key: 90,
+                    instance_key: INST,
+                    element_instance_key: 0,
+                    element_id: "esp_start".into(),
+                },
+                &Event::ConditionalTriggered {
+                    subscription_key: 3,
+                    instance_key: INST,
+                    element_instance_key: 0,
+                    element_id: "esp_start".into(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            store.event_waits().len(),
+            3,
+            "non-interrupting ESP signal / conditional waits stay open"
         );
     }
 
@@ -13577,7 +14540,7 @@ mod element_instance_tests {
         let created = Event::ProcessInstanceCreated {
             instance_key: 7001,
             process_id: "p".into(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: Some("biz-7".into()),
@@ -13606,7 +14569,11 @@ mod element_instance_tests {
         let row = &corr[0];
         assert_eq!(
             (row.message_key, row.subscription_key, row.instance_key),
-            (55, 900, 7001)
+            (
+                55,
+                super::message_start_subscription_key(900, "order-placed"),
+                7001
+            )
         );
         assert_eq!(row.element_instance_key, 0, "start event not yet activated");
         assert_eq!(row.element_id, "start");
@@ -13663,6 +14630,7 @@ mod read_surface_tests {
             form_id: form_id.to_string(),
             resource_name: format!("{form_id}.form"),
             schema: schema.to_string(),
+            version_tag: None,
         }
     }
 
@@ -13774,7 +14742,7 @@ mod read_surface_tests {
         let top_instance = Event::ProcessInstanceCreated {
             instance_key: 10,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -13786,7 +14754,7 @@ mod read_surface_tests {
         let child_instance = Event::ProcessInstanceCreated {
             instance_key: 20,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -13855,6 +14823,7 @@ mod read_surface_tests {
                 created_at: 0,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             }])
             .unwrap();
         assert_ne!(
@@ -13879,6 +14848,7 @@ mod read_surface_tests {
                 created_at: 1_724_000_000_000,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             }])
             .unwrap();
 
@@ -13962,6 +14932,7 @@ mod read_surface_tests {
             created_at: 0,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         // First delivery stamps the batch-time fallback for both timestamps.
         apply_at(&store, &legacy, 1_000);
@@ -14030,6 +15001,7 @@ mod read_surface_tests {
                     created_at: 0,
                     priority: 0,
                     retries: 3,
+                    secret_provenance: Vec::new(),
                 },
                 9_000,
             );
@@ -14117,6 +15089,7 @@ mod read_surface_tests {
                         created_at: 1_000,
                         priority: 0,
                         retries: 3,
+                        secret_provenance: Vec::new(),
                     },
                     1_000,
                 );
@@ -14175,6 +15148,7 @@ mod read_surface_tests {
                 retries: 0,
                 worker: None,
                 error_message: Some("boom".to_string()),
+                retry_backoff_until: None,
             },
             Event::JobErrorThrown {
                 job_key: 8400,
@@ -14194,6 +15168,7 @@ mod read_surface_tests {
                 created_at: 123,
                 priority: 0,
                 retries: 0,
+                secret_provenance: Vec::new(),
             };
             apply_at(&store, &created, 1_000);
             apply_at(&store, &terminal, 2_000);
@@ -14255,6 +15230,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8600,
@@ -14344,6 +15320,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8601,
@@ -14361,6 +15338,7 @@ mod read_surface_tests {
             retries: 2,
             worker: Some("w1".to_string()),
             error_message: Some("boom".to_string()),
+            retry_backoff_until: None,
         };
 
         let p_created = apply_at(&store, &created, 1_000);
@@ -14417,6 +15395,7 @@ mod read_surface_tests {
             created_at: at,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8602,
@@ -14480,6 +15459,7 @@ mod read_surface_tests {
             created_at: at,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8620,
@@ -14544,6 +15524,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = Event::JobActivated {
             job_key: 8605,
@@ -14601,6 +15582,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         let activated = |at: u64, worker: &str| Event::JobActivated {
             job_key: 8610,
@@ -14660,6 +15642,7 @@ mod read_surface_tests {
             created_at: 100,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         };
         // Same-tick activation: `activated_at == created_at` (both from the
         // engine's per-command `self.now`).
@@ -14730,6 +15713,7 @@ mod read_surface_tests {
             created_at: 123,
             priority: 0,
             retries: 1,
+            secret_provenance: Vec::new(),
         };
         let fail = Event::JobFailed {
             job_key: 8500,
@@ -14737,6 +15721,7 @@ mod read_surface_tests {
             retries: 0,
             worker: None,
             error_message: Some("boom".into()),
+            retry_backoff_until: None,
         };
 
         apply_at(&store, &created, 1_000);
@@ -14784,6 +15769,7 @@ mod read_surface_tests {
                 created_at: 1_724_000_000_000,
                 priority: 0,
                 retries: 3,
+                secret_provenance: Vec::new(),
             }])
             .unwrap();
 
@@ -14910,6 +15896,33 @@ mod agent_projection_tests {
         let refs: Vec<&Event> = events.iter().collect();
         store.export(&refs).unwrap();
         store
+    }
+
+    /// Issue #1298: `searchResources` sorts on `deploymentKey`, so the resource
+    /// projection must retain the creating deployment's key (resources of one
+    /// deployment share it), not substitute the per-resource key.
+    #[test]
+    fn generic_resource_projection_retains_deployment_key() {
+        let deployed = |deployment_key, resource_key, id: &str| Event::GenericResourceDeployed {
+            deployment_key,
+            resource_key,
+            version: 1,
+            resource_id: id.to_string(),
+            resource_name: id.to_string(),
+            content: String::new(),
+            version_tag: None,
+        };
+        let store = store_with(&[
+            deployed(10, 11, "a.txt"),
+            deployed(10, 12, "b.txt"),
+            deployed(20, 21, "c.txt"),
+        ]);
+        let got: Vec<(Key, Option<Key>)> = store
+            .resources_meta()
+            .into_iter()
+            .map(|r| (r.resource_key, r.deployment_key))
+            .collect();
+        assert_eq!(got, vec![(11, Some(10)), (12, Some(10)), (21, Some(20))]);
     }
 
     #[test]
@@ -15683,7 +16696,7 @@ mod try_query_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -15743,6 +16756,7 @@ mod job_position_gate_tests {
             created_at: at,
             priority: 0,
             retries: 3,
+            secret_provenance: Vec::new(),
         }
     }
 
@@ -15779,6 +16793,7 @@ mod job_position_gate_tests {
             retries: 2,
             worker: Some("w1".to_string()),
             error_message: None,
+            retry_backoff_until: None,
         };
         store
             .export(&[
@@ -15792,5 +16807,133 @@ mod job_position_gate_tests {
         assert_eq!(r.state, JobState::Activated);
         assert_eq!(r.worker.as_deref(), Some("w2"));
         assert_eq!(r.deadline_ms, Some(20_000));
+    }
+}
+
+#[cfg(test)]
+mod adhoc_migration_export_tests {
+    use std::collections::BTreeMap;
+
+    use nanobpmn_engine_core::{
+        AdHocActivateElement, AdHocJobResult, Command, Engine, Event, ProcessDefinition,
+        bpmn::parse_bpmn,
+    };
+
+    use super::ReadStore;
+
+    fn adhoc(process: &str, container: &str, tool_a: &str, tool_b: &str) -> ProcessDefinition {
+        let xml = format!(
+            r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+          <bpmn:process id="{process}">
+            <bpmn:startEvent id="s" />
+            <bpmn:adHocSubProcess id="{container}">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="agent-worker" />
+                <zeebe:adHoc outputCollection="results" outputElement="=result" />
+              </bpmn:extensionElements>
+              <bpmn:serviceTask id="{tool_a}" name="Tool A">
+                <bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:serviceTask id="{tool_b}">
+                <bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements>
+              </bpmn:serviceTask>
+            </bpmn:adHocSubProcess>
+            <bpmn:endEvent id="e" />
+            <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="{container}" />
+            <bpmn:sequenceFlow id="f2" sourceRef="{container}" targetRef="e" />
+          </bpmn:process>
+        </bpmn:definitions>"#
+        );
+        parse_bpmn(&xml).unwrap().remove(0)
+    }
+
+    fn deployed_key(events: &[Event]) -> u64 {
+        events
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessDeployed {
+                    process_definition_key,
+                    ..
+                } => Some(*process_definition_key),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// The complete journal of a mid-flight ad-hoc migration (renamed
+    /// container + tools, an active tool and its synthetic inner instance)
+    /// exports through `ReadStore` (#1630 review): every derived mapping
+    /// target resolves its `definition_elements` metadata, and the projected
+    /// `adHocSubProcessElements` variable advertises the TARGET tool ids.
+    #[test]
+    fn adhoc_migration_journal_exports_and_projects_refreshed_catalog() {
+        let mut engine = Engine::new();
+        let mut log: Vec<Event> = Vec::new();
+        let ev = engine
+            .apply_command(Command::DeployProcess(adhoc(
+                "src", "agent", "toolA", "toolB",
+            )))
+            .unwrap();
+        log.extend(ev);
+        let ev = engine
+            .apply_command(Command::DeployProcess(adhoc(
+                "tgt", "agent2", "toolA2", "toolB2",
+            )))
+            .unwrap();
+        let target_key = deployed_key(&ev);
+        log.extend(ev);
+        let ev = engine
+            .apply_command(Command::create_instance("src"))
+            .unwrap();
+        let inst = ev.iter().find_map(|e| e.instance_key()).unwrap();
+        log.extend(ev);
+        let agent = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+        let ev = engine
+            .apply_command(Command::complete_job_with_result(
+                agent[0].key,
+                BTreeMap::new(),
+                AdHocJobResult {
+                    activate_elements: vec![AdHocActivateElement {
+                        element_id: "toolA".to_string(),
+                        variables: BTreeMap::new(),
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        log.extend(ev);
+        let ev = engine
+            .apply_command(Command::migrate_instance(
+                inst,
+                target_key,
+                vec![
+                    ("agent".to_string(), "agent2".to_string()),
+                    ("toolA".to_string(), "toolA2".to_string()),
+                    ("toolB".to_string(), "toolB2".to_string()),
+                ],
+            ))
+            .unwrap();
+        log.extend(ev);
+
+        let store = ReadStore::open(None).unwrap();
+        let refs: Vec<&Event> = log.iter().collect();
+        store.export(&refs).unwrap();
+
+        let catalog = store
+            .instance_variables(inst)
+            .into_iter()
+            .find(|v| v.name == "adHocSubProcessElements")
+            .expect("catalog variable projected");
+        assert!(
+            catalog.value.contains("toolA2") && catalog.value.contains("toolB2"),
+            "projected catalog advertises target ids: {}",
+            catalog.value
+        );
+        assert!(
+            !catalog.value.contains("\"toolA\""),
+            "no stale source id: {}",
+            catalog.value
+        );
     }
 }

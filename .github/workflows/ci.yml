@@ -71,6 +71,7 @@ jobs:
       dapadapter: ${{ steps.filter.outputs.dapadapter }}
       formal: ${{ steps.filter.outputs.formal }}
       parityruntime: ${{ steps.filter.outputs.parityruntime }}
+      paritycoverage: ${{ steps.filter.outputs.paritycoverage }}
       code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v5
@@ -166,6 +167,7 @@ jobs:
             # fixtures as evidence, so renaming one must re-run the guard.
             formal:
               - 'formal/**'
+              - 'processos/assets/bpmn/nano-moddle.json'  # canonical descriptor read by formal/parity/extensions.test.mjs (#1261)
               - 'engine-core/src/**'
               - 'engine-core/tests/**'
               - 'engine-core/examples/**'
@@ -183,8 +185,22 @@ jobs:
             # so a skipped or absent-runtime run never blocks a sibling PR. The
             # runner drives the engine-wasm read-model build, so a change to the
             # sources it is built from must re-run it.
+            # Nano half of the parity-corpus coverage ratchet (#1247): the
+            # engine it measures, the corpus it replays, and the report/ratchet.
+            paritycoverage:
+              - 'formal/parity/coverage/**'
+              - 'formal/parity/runtime/corpus/**'
+              - 'formal/corpus/**'
+              - 'formal/parity/check.mjs'
+              - 'formal/parity/coverage.json'
+              - 'formal/parity/zeebe-surface.json'
+              - 'engine-core/**'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
             parityruntime:
               - 'formal/parity/runtime/**'
+              # The bounded-exhaustive generator (#1246) feeds the same runner.
+              - 'formal/corpus/**'
               # The inputs of the engine-wasm/pkg build it tests (#668: the
               # pkg is built from source per run, not committed), so an engine
               # change re-runs it against the new wasm.
@@ -312,6 +328,88 @@ jobs:
       - name: Doctests
         working-directory: engine-core
         run: cargo test --doc --features serde
+
+  # Determinism CI (ADR 0066 slice 6, #1665). Re-executes the command corpus
+  # (engine-core/examples/determinism/: every Command variant + a seeded
+  # workload) and compares generated records + canonical state checkpoints
+  # across hash seeds and process restarts (inside each cell), build profiles
+  # and platforms (across cells), and the previous release (aggregate job).
+  # The logic lives in scripts/determinism-ci.sh so a cell reproduces locally.
+  determinism-cell:
+    name: determinism cell (${{ matrix.os }}, ${{ matrix.profile }})
+    needs: changes
+    if: *code_gate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        profile: [debug, release]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-core
+          key: determinism-${{ matrix.profile }}
+      - name: Install mold linker
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu;
+        # without mold the ubuntu-24.04 (x86_64) cells fail at link time.
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
+      - name: Seed/restart cell
+        run: scripts/determinism-ci.sh cell "$RUNNER_TEMP/det" ${{ matrix.profile }}
+      - name: Name the cell digest
+        run: cp "$RUNNER_TEMP/det/digest.txt" "$RUNNER_TEMP/det/digest-${{ matrix.os }}-${{ matrix.profile }}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: determinism-digest-${{ matrix.os }}-${{ matrix.profile }}
+          path: ${{ runner.temp }}/det/digest-*.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  # The single required check: cross-cell digest comparison, the canary (the
+  # gate must detect a seeded HashMap non-determinism) and the
+  # previous-release replay. `always()` so a FAILED cell fails this job
+  # instead of skipping it — a skipped required check counts as passing.
+  determinism:
+    name: determinism (seed/profile/platform/previous-release)
+    runs-on: ubuntu-24.04
+    needs: [changes, determinism-cell]
+    if: ${{ always() && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true') }}
+    steps:
+      - name: Every cell passed
+        if: ${{ needs.determinism-cell.result != 'success' }}
+        run: |
+          echo "::error::determinism cell result: ${{ needs.determinism-cell.result }}"
+          exit 1
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-core
+          key: determinism-debug
+      - name: Install mold linker
+        # The canary and previous-release steps build the examples on this
+        # x86_64 runner, where .cargo/config.toml sets `-fuse-ld=mold`.
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: determinism-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - name: Profiles and platforms agree
+        run: scripts/determinism-ci.sh compare "$RUNNER_TEMP"/digests/digest-*.txt
+      - name: Canary (seeded HashMap non-determinism must be detected)
+        run: scripts/determinism-ci.sh canary "$RUNNER_TEMP/canary"
+      - name: Previous release replays identically
+        run: scripts/determinism-ci.sh prev-release "$RUNNER_TEMP/prev"
 
   engine-wasm-ffi-dist:
     name: engine-wasm-ffi (dist + verify)
@@ -451,6 +549,13 @@ jobs:
         # it reuses the package built above instead of rebuilding it.
         run: npm install && npm test
         working-directory: engine-wasm/tests/agent-instance-e2e
+      - name: Event sub-process e2e (lean + read-model TestEngine)
+        # #1616: the reproducible form of the #1597 hand-run wasm probe. A
+        # non-interrupting timer ESP runs alongside `work`; an interrupting
+        # message ESP terminates the siblings and completes the instance via
+        # its own end event. Reuses the package built above.
+        run: npm install && npm test
+        working-directory: engine-wasm/tests/event-subprocess-e2e
       - name: Test-Studio record loop (embedded-engine isolation example)
         # Worked example + guard (nanobpm/nano-bpm example): drives a
         # Test-Studio-style recording session entirely through the freshly built
@@ -762,10 +867,26 @@ jobs:
           path: ~/.cache/nanobpm-formal
           key: tla2tools-${{ steps.tla.outputs.version }}
       - name: Model-check
-        run: formal/tla/check.sh
+        # Keep every model's TLC log (with its -coverage statistics) for the
+        # action-coverage gate below (#1248).
+        run: FORMAL_LOG_DIR="$RUNNER_TEMP/tlc-logs" formal/tla/check.sh
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
+      - name: Corpus generator + bounded-exhaustive enumeration tests
+        run: node --test formal/corpus/*.test.mjs
+      - name: Bounded-exhaustive TLC (#1246) — every graph in the CI bound, nano spec vs Zeebe reference
+        # The bound is the `ci` entry of formal/corpus/bounds.json; the nightly
+        # workflow (parity-exhaustive-nightly.yml) runs the larger `nightly` one.
+        # Any divergence not committed (with a filed issue) to
+        # formal/corpus/divergences.json fails the job.
+        run: node formal/corpus/exhaustive.mjs --bound ci --tlc --coverage-dir "$RUNNER_TEMP/tlc-exhaustive-logs"
+      - name: TLC action coverage (#1248) — every spec action and disjunct fires in some model
+        run: |
+          set -o pipefail
+          node --test formal/tla/coverage.test.mjs formal/tla/mutate.test.mjs
+          node formal/tla/coverage.mjs "$RUNNER_TEMP/tlc-logs" --extra "$RUNNER_TEMP/tlc-exhaustive-logs" | tee "$RUNNER_TEMP/coverage.txt"
+          { echo '### TLC action coverage'; echo '```'; cat "$RUNNER_TEMP/coverage.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/cache@v4
         with:
           path: ~/.cache/nanobpm-parity
@@ -779,6 +900,13 @@ jobs:
           git diff --exit-code -- formal/parity/zeebe-surface.json
       - name: Parity matrix tests
         run: node --test formal/parity/*.test.mjs
+      - name: Extension-register guard (#1261)
+        # The Nano-only surface register (formal/parity/extensions.json): fails
+        # if an entry is malformed, collides with the Camunda surface (a
+        # difference there is a DEFECT, not an extension), or a parity-checked
+        # corpus model is tagged as an extension. The live "Camunda accepts a
+        # registered extension" probe runs in parity-camunda-daily.yml.
+        run: node formal/parity/extensions.mjs
       - name: Trace parser tests
         run: node --test formal/tla/trace/*.test.mjs
       - name: Generative Zeebe differential (#1521) — generator tests + budget drift guard
@@ -934,6 +1062,18 @@ jobs:
         run: node --test formal/parity/runtime/*.test.mjs
       - name: Nano backend — corpus vs. its expect oracle
         run: node formal/parity/runtime/run.mjs --backend nano
+      - name: Nano backend — bounded-exhaustive scenarios (#1246, CI bound) + spec oracle (#1261)
+        # Every route x command order of every graph in the `ci` bound of
+        # formal/corpus/bounds.json, checked against the reference outcome AND
+        # the ZeebeTokenFlow spec oracle (#1261: each nano observation must be a
+        # behaviour of the spec — its token-flow milestone multiset must equal
+        # the generating run's).
+        run: node formal/corpus/exhaustive.mjs --bound ci --backend nano
+      - name: Nano backend — permanent fuzz corpus replay (#1250)
+        # Every committed minimal reproducer of formal/corpus/fuzz-corpus.json:
+        # an open case must still reproduce, a fixed one must agree (regression
+        # guard). The random fuzzing itself is nightly (parity-fuzz-nightly.yml).
+        run: node formal/corpus/fuzz.mjs --replay-only
       # Live Camunda 8 differential. Off by default (skip-tolerant): the step is
       # gated on the RUN_CAMUNDA_PARITY repo variable so the job stays green
       # until a maintainer provisions a Camunda 8 runtime and turns it on. When
@@ -952,6 +1092,51 @@ jobs:
           CAMUNDA_AUTH_TOKEN: ${{ secrets.CAMUNDA_AUTH_TOKEN }}
           CAMUNDA_BASIC_AUTH: ${{ secrets.CAMUNDA_BASIC_AUTH }}
         run: node formal/parity/runtime/run.mjs --backend both
+
+  # Nano half of the dual-engine parity-corpus coverage (#1247): replay the
+  # seed + bounded-exhaustive corpus natively over engine-core under
+  # `cargo llvm-cov` and ratchet the region coverage against
+  # formal/parity/coverage/baseline.json (a drop fails). The Camunda/JaCoCo
+  # half needs a live broker and runs in parity-camunda-daily.yml. Not a
+  # required check (not in the merge protocol). No retries.
+  parity-coverage-nano:
+    name: parity-coverage (nano llvm-cov)
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.paritycoverage == 'true' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-core
+      - name: Install mold linker
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu;
+        # the llvm-cov build below links host build scripts / the test binary,
+        # so the job fails at the link without it (same as every other
+        # host-compiling job). No apt (#1546).
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Report + ratchet unit tests
+        run: node --test formal/parity/coverage/*.test.mjs
+      - name: Measure engine-core coverage while the corpus replays
+        run: formal/parity/coverage/nano-coverage.sh "$RUNNER_TEMP/nano-llvm-cov.json" ci
+      - name: Report (tagged) + ratchet
+        run: node formal/parity/coverage/report.mjs --nano "$RUNNER_TEMP/nano-llvm-cov.json" --out "$RUNNER_TEMP/nano-coverage-report.json" --check
+      - name: Upload the tagged uncovered-site report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: parity-coverage-nano
+          path: ${{ runner.temp }}/nano-coverage-report.json
+          if-no-files-found: ignore
 
   processos:
     name: processos (clippy + test)
@@ -1042,6 +1227,8 @@ jobs:
         with:
           mold: 'true'
       - uses: taiki-e/install-action@nextest
+      - name: Restore the cached openapi-generator JAR (#1684)
+        uses: ./.github/actions/openapi-generator-cache
       - name: Generate REST layer + stub impls
         # The server depends on the path crate ../generated and on
         # server/src/stub_impls.rs, both produced by codegen (gitignored). Mirror

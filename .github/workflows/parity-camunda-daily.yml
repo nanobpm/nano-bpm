@@ -23,6 +23,8 @@ on:
       # corpus, the sources the nano read-model wasm is built from (#668: the
       # wasm is built per run, not committed), and the Zeebe pin.
       - 'formal/parity/runtime/**'
+      - 'formal/parity/extensions.json'
+      - 'formal/parity/extensions.mjs'
       - 'engine-core/**'
       - 'engine-wasm/**'
       - 'read-model/**'
@@ -31,6 +33,11 @@ on:
       - '.github/actions/engine-wasm-pkg/**'
       - '.github/actions/wasm-pack-cache/**'
       - 'formal/parity/zeebe-surface.json'
+      # The JaCoCo coverage job (#1247): report, ratchet, matrix it tags against.
+      - 'formal/parity/coverage/**'
+      - 'formal/parity/coverage.json'
+      # The exhaustive corpus generator + bounds the Zeebe measurement replays.
+      - 'formal/corpus/**'
 
 permissions:
   contents: read
@@ -57,6 +64,54 @@ jobs:
         env:
           CAMUNDA_REST_ADDRESS: http://localhost:8080
         run: node formal/parity/runtime/run.mjs --backend both --require-camunda
+      - name: Extension-acceptance probe (#1261)
+        # Every registered Nano-only extension must be REJECTED (or honoured only
+        # as inert metadata) by Camunda. A registered extension Camunda ACCEPTS
+        # as executable surface is not an extension — fail. --require-camunda so
+        # a green run has probed every entry.
+        env:
+          CAMUNDA_REST_ADDRESS: http://localhost:8080
+        run: node formal/parity/runtime/extension-acceptance.mjs --require-camunda
       - name: Camunda logs
         if: failure()
         run: docker logs parity-camunda 2>&1 | tail -300
+
+  # Camunda half of the dual-engine parity-corpus coverage (#1247): the same
+  # corpus on a live Camunda 8 with the JaCoCo agent attached to the broker,
+  # zeebe/engine branch coverage tagged against the coverage matrix, and the
+  # ratchet (formal/parity/coverage/baseline.json) failing on a drop.
+  zeebe-coverage:
+    name: parity-coverage (zeebe JaCoCo)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build engine-wasm/pkg (the runner's nano reference backend)
+        uses: ./.github/actions/engine-wasm-pkg
+      - name: Report + ratchet unit tests
+        run: node --test formal/parity/coverage/*.test.mjs
+      - name: Measure zeebe/engine coverage while the corpus runs
+        run: formal/parity/coverage/zeebe-coverage.sh "$RUNNER_TEMP/zeebe-jacoco.xml" ci
+      - name: Report (tagged against the coverage matrix) + ratchet
+        # --self-test 3 (#1707): re-parses the identical JaCoCo XML 3× and fails
+        # loudly with the differing branches if the measurement is not
+        # byte-identical — the gate must never flip on a nondeterministic
+        # measurement. The timing-dependent surface is excluded via
+        # coverage/zeebe-excludes.json, so identical inputs measure identically.
+        run: node formal/parity/coverage/report.mjs --zeebe "$RUNNER_TEMP/zeebe-jacoco.xml" --out "$RUNNER_TEMP/zeebe-coverage-report.json" --self-test 3 --check
+      - name: Upload the tagged uncovered-branch report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: parity-coverage-zeebe
+          path: |
+            ${{ runner.temp }}/zeebe-coverage-report.json
+            ${{ runner.temp }}/zeebe-jacoco.xml
+          if-no-files-found: ignore

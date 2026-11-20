@@ -1,0 +1,94 @@
+{
+  "spec": "ZeebeTokenFlow",
+  "model": "ZMCParallelDiamond",
+  "graph": {
+    "start": "S",
+    "nodes": {
+      "A": "task",
+      "B": "task",
+      "E": "end",
+      "P1": "and",
+      "P2": "and",
+      "S": "start"
+    },
+    "flows": [
+      {
+        "id": "f1",
+        "from": "S",
+        "to": "P1"
+      },
+      {
+        "id": "f2",
+        "from": "P1",
+        "to": "A"
+      },
+      {
+        "id": "f3",
+        "from": "P1",
+        "to": "B"
+      },
+      {
+        "id": "f4",
+        "from": "A",
+        "to": "P2"
+      },
+      {
+        "id": "f5",
+        "from": "B",
+        "to": "P2"
+      },
+      {
+        "id": "f6",
+        "from": "P2",
+        "to": "E"
+      }
+    ]
+  },
+  "milestones": [
+    {
+      "kind": "completed"
+    },
+    {
+      "kind": "flow",
+      "from": "A",
+      "to": "P2"
+    },
+    {
+      "kind": "flow",
+      "from": "B",
+      "to": "P2"
+    },
+    {
+      "kind": "flow",
+      "from": "P1",
+      "to": "A"
+    },
+    {
+      "kind": "flow",
+      "from": "P1",
+      "to": "B"
+    },
+    {
+      "kind": "flow",
+      "from": "P2",
+      "to": "E"
+    },
+    {
+      "kind": "flow",
+      "from": "S",
+      "to": "P1"
+    },
+    {
+      "kind": "joinFired",
+      "node": "P2"
+    },
+    {
+      "kind": "task",
+      "node": "A"
+    },
+    {
+      "kind": "task",
+      "node": "B"
+    }
+  ]
+}

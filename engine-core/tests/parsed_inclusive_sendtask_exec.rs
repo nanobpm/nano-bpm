@@ -10,7 +10,7 @@
     clippy::expect_used,
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{bpmn::parse_bpmn, Command, Engine, Event, Value};
 
@@ -70,7 +70,7 @@ fn inclusive_gateway_parsed_from_bpmn_routes_conditional_and_default() {
         engine
             .apply_command(Command::create_instance_with(
                 "review",
-                HashMap::from([("go".to_string(), Value::Bool(go))]),
+                BTreeMap::from([("go".to_string(), Value::Bool(go))]),
             ))
             .unwrap();
 
@@ -113,7 +113,7 @@ fn inclusive_gateway_snapshot_round_trips_through_serde() {
     engine
         .apply_command(Command::create_instance_with(
             "review",
-            HashMap::from([("go".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
 

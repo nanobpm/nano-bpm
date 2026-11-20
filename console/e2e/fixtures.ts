@@ -193,6 +193,20 @@ export async function stubConsoleApi(
     if (url.endsWith("/console/api/extensions")) {
       return json({ extensions: [], yolo: false });
     }
+    if (url.endsWith("/console/api/mcp/processes")) {
+      // The Rust `console_catalog` shape (server/src/mcp/processes_tools.rs).
+      return json({
+        enabled: true,
+        envVar: "NANOBPM_MCP_ENABLED",
+        path: "/mcp/processes",
+        staticTools: [
+          "searchIncidents",
+          "getProcessInstance",
+          "searchVariables",
+        ],
+        tools: [],
+      });
+    }
     return json({});
   });
 }

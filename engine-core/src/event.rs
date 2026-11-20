@@ -5,12 +5,20 @@
 //! carries enough data to rebuild state, the event stream is a replayable log —
 //! persist it however you like and replay to recover.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::model::{ElementId, IncomingFlow, ProcessDefinition, Value};
 use crate::state::types::{
     IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind,
 };
+
+/// `skip_serializing_if` predicate for an optional-by-zero [`Key`] field: a
+/// zero key is the legacy/absent sentinel (additive fields default to it), so
+/// it is omitted from the serialized frame.
+#[cfg(feature = "serde")]
+fn is_zero_key(k: &Key) -> bool {
+    *k == 0
+}
 
 /// One activation instruction of a [`crate::command::Command::ModifyInstance`]: place a new
 /// token at `element_id`, first merging `variables` into the instance's root
@@ -25,7 +33,7 @@ pub struct ActivateElementInstruction {
     /// Variables merged into the instance's root scope before the token is
     /// placed (Zeebe's global variable instructions). Empty for none.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
     /// The ancestor element instance (an existing flow-scope instance) to
     /// activate the element under (Zeebe `ancestorElementInstanceKey`). `None`
     /// (Zeebe's `-1`) = use the single existing instance of the flow scope, or
@@ -48,7 +56,7 @@ pub struct ActivateElementInstruction {
 pub struct VariableInstruction {
     /// The variables to set.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
     /// The element id of the scope to set them on; `None` = process root.
     #[cfg_attr(feature = "serde", serde(default))]
     pub scope_id: Option<ElementId>,
@@ -185,6 +193,37 @@ pub struct MigratedChildInstance {
     pub target_element_id: ElementId,
 }
 
+/// A completed compensable activity's compensation subscription re-pointed by
+/// a migration (#1631, Zeebe `CompensationSubscriptionIntent.MIGRATED`): every
+/// subscription recorded for `source_element_id` now names
+/// `target_element_id` and runs `target_handler` when compensation is thrown.
+/// Scope subscriptions (#901, completed sub-processes) carry an empty handler.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MigratedCompensationSubscription {
+    pub source_element_id: ElementId,
+    /// The migrated subscription's element instance key, so each plan entry
+    /// names one subscription occurrence (a task with several compensation
+    /// boundaries holds one subscription per boundary).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_element_instance_key: Key,
+    /// The migrated subscription's source handler (empty for a scope
+    /// subscription), identifying which boundary's subscription this is.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_handler: ElementId,
+    /// The migrated subscription's source compensation boundary (empty for a
+    /// scope subscription, or a pre-#1635 subscription recorded without one).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_boundary_id: ElementId,
+    pub target_element_id: ElementId,
+    pub target_handler: ElementId,
+    /// The mapped target compensation boundary the subscription now belongs
+    /// to (empty for a scope subscription), persisted so successive
+    /// migrations and throws keep the boundary identity.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub target_boundary_id: ElementId,
+}
+
 /// The message that triggered a **message start event** (#1300), carried on a
 /// cross-partition [`Event::StartInstanceDispatched`] /
 /// [`crate::Command::DispatchStartInstance`] so the partition that mints the
@@ -300,6 +339,12 @@ pub enum Event {
         resource_name: String,
         /// The verbatim form-js JSON document.
         schema: String,
+        /// The optional version tag this form version carries (form-js
+        /// `versionTag`), matched by a `versionTag`-bound user-task form
+        /// (#1193). Additive: `serde(default)` so journals written before the
+        /// field existed decode with `None` (no tag).
+        #[cfg_attr(feature = "serde", serde(default))]
+        version_tag: Option<String>,
     },
 
     /// A generic resource (any deployed file that is not a BPMN/DMN/form — e.g. a
@@ -318,6 +363,12 @@ pub enum Event {
         resource_name: String,
         /// The verbatim resource content.
         content: String,
+        /// The optional version tag this resource version carries (Zeebe
+        /// `versionTag` deploy metadata), matched by a `versionTag`-bound
+        /// `zeebe:linkedResource` (#1193). Additive: `serde(default)` so
+        /// journals written before the field existed decode with `None`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        version_tag: Option<String>,
     },
 
     /// A decision was evaluated — by a `businessRuleTask` (with `instance_key` /
@@ -374,6 +425,48 @@ pub enum Event {
         decision_evaluation_key: Key,
     },
 
+    /// A cluster variable was created (#1657; Zeebe `ClusterVariableIntent.CREATED`)
+    /// — or, for a distributed fan-out copy, upserted (an existing variable keeps
+    /// its id). `tenant_id` `None` is the global scope. Partition-agnostic
+    /// configuration state: carries no key; a shared journal tags it with the
+    /// partition that wrote it.
+    ClusterVariableCreated {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        #[cfg_attr(feature = "serde", serde(default))]
+        kind: crate::cluster_vars::ClusterVariableKind,
+        #[cfg_attr(feature = "serde", serde(default))]
+        metadata: std::collections::BTreeMap<String, Value>,
+    },
+
+    /// A cluster variable's value and metadata were replaced (#1657; Zeebe
+    /// `ClusterVariableIntent.UPDATED`). Its id and kind are preserved.
+    ///
+    /// `kind` is the variable's preserved kind, captured by the applying
+    /// engine in the same turn that commits the update. Carrying it on the
+    /// event lets a gateway derive the response/fan-out record entirely from
+    /// the proposal's own events — a live-state re-read runs in a separate
+    /// actor turn, so a concurrent delete/recreate could otherwise combine
+    /// the new value with a replacement's kind (PR #1670 review). Additive
+    /// (`serde(default)`): records written before this field decode with the
+    /// `Json` default, which only the (unused) response projection ever read.
+    ClusterVariableUpdated {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        #[cfg_attr(feature = "serde", serde(default))]
+        metadata: std::collections::BTreeMap<String, Value>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        kind: crate::cluster_vars::ClusterVariableKind,
+    },
+
+    /// A cluster variable was deleted (#1657; Zeebe `ClusterVariableIntent.DELETED`).
+    ClusterVariableDeleted {
+        tenant_id: Option<String>,
+        name: String,
+    },
+
     /// A new process instance was created (carries a single token at its start
     /// event) with its initial variables. `created_at` is the logical instant
     /// the instance was started, carried on the command (the engine never reads
@@ -383,7 +476,7 @@ pub enum Event {
     ProcessInstanceCreated {
         instance_key: Key,
         process_id: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         created_at: u64,
         #[cfg_attr(feature = "serde", serde(default))]
@@ -419,7 +512,7 @@ pub enum Event {
     /// Variables were merged into a process instance.
     VariablesUpdated {
         instance_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
 
     /// Variables were merged into a specific variable scope (Part C hierarchical
@@ -431,7 +524,7 @@ pub enum Event {
     ScopedVariablesUpdated {
         instance_key: Key,
         scope_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
     /// A non-root variable scope was opened (Part C). Registers `scope_key`
     /// (a scope-owning element instance: sub-process, multi-instance body or
@@ -446,6 +539,19 @@ pub enum Event {
     /// dropped and its tree entry removed. Emitted as the owning element instance
     /// completes or is terminated.
     VariableScopeDestroyed { instance_key: Key, scope_key: Key },
+    /// A correlated message / signal payload is held for an event
+    /// sub-process whose start event carries output mappings (#1555, Zeebe
+    /// parity): Zeebe creates such a payload LOCAL to the start event
+    /// instance, so it is parked against the event sub-process container
+    /// instance `scope_key` until that container's start event activates
+    /// (possibly in a later command, e.g. after a container `start`
+    /// execution listener completes). Journaled so the hold survives replay;
+    /// dropped with the container's scope (`VariableScopeDestroyed`).
+    EventSubProcessPayloadHeld {
+        instance_key: Key,
+        scope_key: Key,
+        variables: BTreeMap<String, Value>,
+    },
 
     /// An element instance entered `ACTIVATING`. It registers the element
     /// instance as a live token (so a token parked in `ACTIVATING` on an
@@ -542,6 +648,12 @@ pub enum Event {
     ParallelJoinTokenArrived {
         instance_key: Key,
         element_id: ElementId,
+        /// The flow-scope instance whose join this is (`0` = process root,
+        /// #1580): joins count per flow-scope instance. `None` for a journal
+        /// written before #1580, when joins were keyed by element id alone;
+        /// the applier then addresses the element's single join slot.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
         #[cfg_attr(feature = "serde", serde(default))]
         flow: Option<IncomingFlow>,
     },
@@ -551,6 +663,12 @@ pub enum Event {
     ParallelJoinReset {
         instance_key: Key,
         element_id: ElementId,
+        /// The flow-scope instance whose join this is (`0` = process root,
+        /// #1580): joins count per flow-scope instance. `None` for a journal
+        /// written before #1580, when joins were keyed by element id alone;
+        /// the applier then addresses the element's single join slot.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
     },
     /// A join fired: a parallel join because every incoming flow has been taken,
     /// an inclusive join because every incoming flow has been taken or no active
@@ -561,6 +679,12 @@ pub enum Event {
     ParallelJoinFired {
         instance_key: Key,
         element_id: ElementId,
+        /// The flow-scope instance whose join this is (`0` = process root,
+        /// #1580): joins count per flow-scope instance. `None` for a journal
+        /// written before #1580, when joins were keyed by element id alone;
+        /// the applier then addresses the element's single join slot.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
     },
 
     /// A job was created for a service task; the token now rests until the job
@@ -586,6 +710,16 @@ pub enum Event {
             serde(default = "crate::state::types::default_job_retries")
         )]
         retries: i32,
+        /// Mapping-time secret-reference provenance (#1640): the input-mapping
+        /// target paths holding trusted `camunda.secrets.<name>` references,
+        /// captured when the mappings ran (never re-derived later). Paths and
+        /// secret NAMES only — never plaintext. Additive: a pre-#1640 record
+        /// decodes to empty provenance, which resolves nothing (fail closed).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        secret_provenance: Vec<crate::state::SecretProvenance>,
     },
     /// A job was created for one execution listener in an element's sequential
     /// listener chain (ADR 0037). Distinct from [`Event::JobCreated`] so that
@@ -706,6 +840,18 @@ pub enum Event {
         /// for events serialized before this field existed.
         #[cfg_attr(feature = "serde", serde(default))]
         error_message: Option<String>,
+        /// Camunda 8 v2 `retryBackOff` (#933): the absolute logical instant
+        /// (ms) before which the job, returned to the pool with retries left,
+        /// must not be re-activated (`now + retryBackOff` at fail time).
+        /// `None` when no backoff was requested (retryable immediately), when
+        /// no retries remain, and for events serialized before this field
+        /// existed. Skipped when `None`, so backoff-less fails stay
+        /// byte-identical.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        retry_backoff_until: Option<u64>,
     },
     /// A worker threw a business error from a job. The job is consumed; either a
     /// matching error boundary event interrupts the activity, or an
@@ -837,7 +983,9 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         retries: i32,
-        /// Optional caller audit correlation id (Camunda `operationReference`).
+        /// Caller audit correlation id (Camunda `operationReference`). Derived
+        /// at `Engine::emit` from the command's generic reference — the same
+        /// value its [`Record`] envelope carries (#1556); never set per-site.
         #[cfg_attr(feature = "serde", serde(default))]
         operation_reference: Option<i64>,
     },
@@ -850,7 +998,9 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         deadline: u64,
-        /// Optional caller audit correlation id (Camunda `operationReference`).
+        /// Caller audit correlation id (Camunda `operationReference`). Derived
+        /// at `Engine::emit` from the command's generic reference — the same
+        /// value its [`Record`] envelope carries (#1556); never set per-site.
         #[cfg_attr(feature = "serde", serde(default))]
         operation_reference: Option<i64>,
     },
@@ -1076,6 +1226,23 @@ pub enum Event {
         /// call-activity element instance (#1374). Additive; empty when none.
         #[cfg_attr(feature = "serde", serde(default))]
         child_instances: Vec<MigratedChildInstance>,
+        /// Whether the join bookkeeping was migrated per flow-scope instance
+        /// (#1580). Additive; a legacy record decodes `false` and replays the
+        /// pre-#1580 element-wide merge (one slot per target join element).
+        #[cfg_attr(feature = "serde", serde(default))]
+        join_scoped: bool,
+        /// The compensation subscriptions re-pointed by this migration
+        /// (#1631). Only applied when `compensation_migrated` is set: such a
+        /// migration also deletes every subscription NOT listed (its
+        /// compensation boundary was left unmapped, Zeebe parity) and remaps
+        /// in-flight compensation waits. Additive; empty when none.
+        #[cfg_attr(feature = "serde", serde(default))]
+        compensation_subscriptions: Vec<MigratedCompensationSubscription>,
+        /// Whether this migration carries the compensation plan (#1631).
+        /// Additive; a legacy record decodes `false` (pre-#1631 migrations
+        /// rejected every instance holding compensation state).
+        #[cfg_attr(feature = "serde", serde(default))]
+        compensation_migrated: bool,
     },
 
     /// A process instance was modified (Zeebe `ProcessInstanceModification
@@ -1112,6 +1279,15 @@ pub enum Event {
         element_id: ElementId,
         due_at: u64,
         kind: TimerKind,
+        /// Remaining fires of a bounded cycle (`Rn/…`) INCLUDING this one;
+        /// the timer is not re-armed after the fire that consumes the last
+        /// (#1596). `None` for an unbounded cycle, a one-shot, and records
+        /// serialized before this field existed.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        repetitions: Option<u32>,
     },
     /// A due timer fired. For an intermediate catch event its token is released
     /// along the event's outgoing flow; for an interrupting boundary timer the
@@ -1238,7 +1414,7 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
         kind: MessageSubscriptionKind,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
     },
@@ -1276,6 +1452,14 @@ pub enum Event {
     /// record (skipping command re-execution) restores it from here and routes
     /// the next round-robin start identically to a peer that never restarted.
     /// Additive: a pre-existing record decodes with `0`.
+    /// The partition's lenient-completion mode was set (#1661, ADR 0066 slice
+    /// 2) by a replicated [`crate::Command::SetLenientCompletion`]. When
+    /// `lenient` is `true`, `CompleteJob` / `FailJob` / `ThrowJobError` no longer
+    /// require the job to have been activated on this replica (activation is
+    /// leader-local). Engine state, not host config: every replica flips it at
+    /// the same log index, a snapshot carries it and a journal replay restores
+    /// it. Additive variant (old journals never contain it).
+    LenientCompletionSet { lenient: bool },
     RaftEntryApplied {
         index: u64,
         raft_state: String,
@@ -1399,6 +1583,13 @@ pub enum Event {
         scope: Key,
         #[cfg_attr(feature = "serde", serde(default))]
         scope_subscription: bool,
+        /// The compensation boundary event this subscription was recorded for
+        /// (#1635), so a throw and a later migration resolve the subscription's
+        /// boundary by identity rather than by occurrence order. Empty for a
+        /// scope subscription. Additive: `serde(default)` decodes older records
+        /// as empty, and resolution falls back to boundary-id occurrence order.
+        #[cfg_attr(feature = "serde", serde(default))]
+        boundary_id: ElementId,
     },
     /// A compensation throw event fired: it consumed the compensable
     /// subscriptions in its `scope` and triggered their handlers. `handlers`
@@ -1530,7 +1721,7 @@ pub enum Event {
         body_key: Key,
         child_key: Key,
         index: usize,
-        local_variables: HashMap<String, Value>,
+        local_variables: BTreeMap<String, Value>,
     },
     /// A multi-instance child completed: its `output` (the evaluated
     /// `output_element`, if any) is recorded at `index` in the body's collected
@@ -1570,7 +1761,7 @@ pub enum Event {
         instance_key: Key,
         container_key: Key,
         child_key: Key,
-        local_variables: HashMap<String, Value>,
+        local_variables: BTreeMap<String, Value>,
     },
     /// An ad-hoc tool child completed: its `output` (the container's evaluated
     /// `output_element`, if any) is appended to the container's accumulated
@@ -1651,6 +1842,20 @@ pub enum Event {
         process_id: String,
         message_name: String,
         start_element_id: ElementId,
+        /// The MCP tool name declared on the start event via the
+        /// `io.camunda.tool:name` zeebe:property (Camunda 8.10 MCP gateway,
+        /// #1499), when present. Additive: `None` for events serialized before
+        /// this field existed.
+        #[cfg_attr(feature = "serde", serde(default))]
+        tool_name: Option<String>,
+        /// The start event's `zeebe:properties` subset whose keys carry the
+        /// `io.camunda.tool:` prefix (`:purpose`, `:input_N_*`, …), projected so
+        /// the `/mcp/processes` server and the REST `toolProperties` field can
+        /// assemble the tool description/input schema without re-parsing the
+        /// BPMN XML. Empty when the start event declares no tool properties and
+        /// for events serialized before this field existed.
+        #[cfg_attr(feature = "serde", serde(default))]
+        tool_properties: std::collections::BTreeMap<String, String>,
     },
     /// A process-level timer start event was armed at deploy time, first due at
     /// `due_at`. When it fires a new instance of `process_id` is created.
@@ -1662,6 +1867,15 @@ pub enum Event {
         due_at: u64,
         interval_millis: u64,
         repeating: bool,
+        /// Remaining fires of a bounded cycle (`Rn/…`) INCLUDING this one;
+        /// the timer is not re-armed after the fire that consumes the last
+        /// (#1596). `None` for an unbounded cycle, a one-shot, and records
+        /// serialized before this field existed.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        repetitions: Option<u32>,
     },
     /// A process-level timer start event fired (a `ProcessInstanceCreated` and
     /// the new instance's flow events follow). `next_due_at` is `Some` for a
@@ -1683,7 +1897,7 @@ pub enum Event {
     StartInstanceDispatched {
         process_id: String,
         start_element_id: ElementId,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         tags: Vec<String>,
         #[cfg_attr(feature = "serde", serde(default))]
@@ -1794,6 +2008,53 @@ pub enum Event {
         /// duplicate resolves to.
         original_agent_history_key: Key,
     },
+
+    /// An instance's off-heap variable payload was quarantined as lost (#1574).
+    /// Emitted by the stamped [`crate::Command::QuarantineOffheapOrphan`]
+    /// alongside its `IncidentRaised`, its reducer records the instance in
+    /// [`crate::state::State::variables_lost_quarantined`], the replicated
+    /// dedup tombstone the quarantine idempotency guard reads (lifted when
+    /// `incident_key` is resolved). It carries **no** variable payload
+    /// and mutates no instance state: the payload-carrying repair was dropped
+    /// because a leader-snapshotted payload is not safe under Raft ordering
+    /// (it can roll back an intervening `SetVariables`). Deterministic
+    /// apply-time repair is the #1447 follow-up.
+    VariablesLostQuarantined {
+        instance_key: Key,
+        /// The `VariablesLost` incident this quarantine raised: the loss
+        /// episode. Resolving exactly this incident lifts the tombstone, keyed
+        /// on the replicated `IncidentResolved.incident_key` so the lift does
+        /// not depend on whether the incident record is resident.
+        incident_key: Key,
+        /// The replicated loss-episode id the quarantine's stamp carried
+        /// (#1587), recorded into the tombstone so a delayed duplicate of the
+        /// SAME episode (applying after the incident was resolved and the
+        /// tombstone lifted) is a deterministic no-op instead of a fresh
+        /// incident. `0` for a frame written before this field existed
+        /// (episode-blind, pre-#1587 behaviour). Additive: `serde(default)`.
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_key"))]
+        episode: Key,
+    },
+
+    /// A stamped orphan-quarantine proposal could not apply because its
+    /// loss-episode id no longer matches the incident key a fresh proposal
+    /// would mint (#1587 review): unrelated key-minting work advanced the
+    /// replicated allocator between the leader stamping the report and the
+    /// proposal committing. The report itself is still pending in the leader's
+    /// journal backlog, so this event is the **replicated** signal every
+    /// replica (and the leader's journal, which watches applied events)
+    /// observes identically: the leader re-stamps the still-pending report at
+    /// its now-current allocator position and re-proposes it, instead of
+    /// silently clearing the pending report without raising `VariablesLost`.
+    /// Carries no state change — the reducers ignore it; it exists so the
+    /// supersede decision is journaled and replica-deterministic. Additive
+    /// variant: no snapshot-format bump.
+    OrphanStampSuperseded {
+        instance_key: Key,
+        /// The superseded loss-episode id (the stamp's `episode`), recorded so
+        /// the journal can correlate the reissue with the report it parked.
+        episode: Key,
+    },
 }
 
 impl Event {
@@ -1821,6 +2082,7 @@ impl Event {
             | Event::ScopedVariablesUpdated { instance_key, .. }
             | Event::VariableScopeCreated { instance_key, .. }
             | Event::VariableScopeDestroyed { instance_key, .. }
+            | Event::EventSubProcessPayloadHeld { instance_key, .. }
             | Event::ElementActivating { instance_key, .. }
             | Event::ElementActivated { instance_key, .. }
             | Event::ElementCompleting { instance_key, .. }
@@ -1885,6 +2147,8 @@ impl Event {
             | Event::AdHocCompletionConditionFulfilled { instance_key, .. }
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
+            | Event::VariablesLostQuarantined { instance_key, .. }
+            | Event::OrphanStampSuperseded { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             // A standalone decision evaluation (and its deletion) belongs to no
@@ -1918,9 +2182,28 @@ impl Event {
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
             | Event::RaftEntryApplied { .. }
+            | Event::LenientCompletionSet { .. }
             | Event::RoutedDeliveryRecorded { .. }
+            | Event::ClusterVariableCreated { .. }
+            | Event::ClusterVariableUpdated { .. }
+            | Event::ClusterVariableDeleted { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }
+    }
+
+    /// `true` for the cluster-variable lifecycle events (#1657): keyless and
+    /// partition-agnostic, replicated to EVERY partition by the fan-out. Any
+    /// recovery path reading an untagged (legacy) journal must broadcast them
+    /// to every partition rather than route them by [`Event::owning_partition`]
+    /// (which assigns the keyless record to partition 0). The single canonical
+    /// predicate shared by the legacy demux and segmented recovery.
+    pub fn is_cluster_variable_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Event::ClusterVariableCreated { .. }
+                | Event::ClusterVariableUpdated { .. }
+                | Event::ClusterVariableDeleted { .. }
+        )
     }
 
     /// The decision evaluation an [`Event::DecisionEvaluated`] records — Zeebe's
@@ -2528,6 +2811,264 @@ pub fn decode_event_json(line: &str) -> Result<Event, EventDecodeError> {
             }
         }
     }
+}
+
+/// One journaled record: an [`Event`] plus the per-record metadata Zeebe
+/// carries on every record (#1556). Today that is the caller's
+/// `operationReference` — the correlation id a client attaches to a command,
+/// propagated **generically** to every record the command produces (Zeebe
+/// parity). [`Event`] itself stays untouched: the reference lives once, on this
+/// envelope, stamped at the engine's single command seam
+/// ([`Engine::apply_command_records_at`](crate::Engine::apply_command_records_at)),
+/// so no per-variant copy can drift.
+///
+/// **Wire form** (`serde` feature): a record WITH a reference serializes as the
+/// envelope `{"event":{…},"operation_reference":N}`; a record WITHOUT one
+/// serializes as the bare legacy [`Event`] (`{"VariantName":{…}}`). Every
+/// pre-#1556 journal line is therefore already a valid record, and
+/// [`decode_record_json`] reads both shapes — no `SNAPSHOT_FORMAT_VERSION`
+/// bump. The `event` key cannot collide with an event tag (variants are
+/// PascalCase).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    /// The domain event.
+    pub event: Event,
+    /// The `operationReference` of the command that produced this record.
+    pub operation_reference: Option<i64>,
+}
+
+impl Record {
+    /// A record with no operation reference (the bare-event wire form).
+    pub fn bare(event: Event) -> Self {
+        Self {
+            event,
+            operation_reference: None,
+        }
+    }
+
+    /// Stamps `operation_reference` onto every event of one command's output —
+    /// the single, generic propagation seam (#1556).
+    pub fn stamp_all(events: Vec<Event>, operation_reference: Option<i64>) -> Vec<Self> {
+        events
+            .into_iter()
+            .map(|event| Self {
+                event,
+                operation_reference,
+            })
+            .collect()
+    }
+}
+
+impl From<Event> for Record {
+    fn from(event: Event) -> Self {
+        Self::bare(event)
+    }
+}
+
+/// Borrowed serialization view of a [`Record`] — the ONE implementation of the
+/// record wire form, shared by `Record`'s `Serialize` and
+/// [`encode_record_json`] (which journals without cloning the event).
+#[cfg(feature = "serde")]
+struct RecordView<'a> {
+    event: &'a Event,
+    operation_reference: Option<i64>,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for RecordView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self.operation_reference {
+            None => self.event.serialize(serializer),
+            Some(reference) => {
+                let mut s = serializer.serialize_struct("Record", 2)?;
+                s.serialize_field("event", self.event)?;
+                s.serialize_field("operation_reference", &reference)?;
+                s.end()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Record {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        RecordView {
+            event: &self.event,
+            operation_reference: self.operation_reference,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Encodes one journal line for `event` produced by a command carrying
+/// `operation_reference` — the writer-side twin of [`decode_record_json`]
+/// (#1556). Without a reference this is exactly the legacy bare-`Event` line.
+#[cfg(feature = "serde")]
+pub fn encode_record_json(
+    event: &Event,
+    operation_reference: Option<i64>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&RecordView {
+        event,
+        operation_reference,
+    })
+}
+
+/// Decodes one journal line into a [`Record`] — the replay-boundary reader for
+/// the #1556 envelope. Accepts both the envelope and the legacy bare-[`Event`]
+/// form (which decodes with `operation_reference: None`). The envelope is
+/// recognised by the PARSED top-level `event` member, never by property order,
+/// so a producer that reorders keys (`{"operation_reference":N,"event":…}`)
+/// still decodes. The inner event is decoded through [`decode_event_json`], so
+/// an unknown variant is still the typed [`EventDecodeError::UnknownVariant`]
+/// rejection — never a silent drop.
+///
+/// Two disciplines keep this safe AND cheap on the hot recovery path:
+///
+/// * **Decode the event FIRST, validate the envelope metadata SECOND.** An
+///   envelope whose `event` names a variant this build does not know must
+///   surface the typed [`EventDecodeError::UnknownVariant`] even when the
+///   surrounding metadata is also invalid (a bad `operation_reference` type or
+///   an unrecognised extra field). Validating metadata first would return
+///   [`EventDecodeError::Malformed`], which the journal reader
+///   (`read_segment_with`) tolerates as a torn tail and DROPS — silently
+///   discarding a real cross-version frame (#1065 class). Decoding the event
+///   first guarantees the fail-closed `UnknownVariant` wins.
+/// * **No double parse of the event payload.** The envelope probe borrows the
+///   `event` member as a [`serde_json::value::RawValue`] and hands it straight
+///   to [`decode_event_json`] — the payload is parsed exactly once, never
+///   materialized into a [`serde_json::Value`] DOM and re-serialized. Bare
+///   events (unreferenced commands) skip the probe's payload capture entirely.
+#[cfg(feature = "serde")]
+pub fn decode_record_json(line: &str) -> Result<Record, EventDecodeError> {
+    // A borrowed probe over the raw line: the `event`/`operation_reference`
+    // members are captured by reference as a `RawValue` (no DOM, no copy of the
+    // payload). Any OTHER top-level key is collected into `extra` so an
+    // unrecognised envelope field can be rejected AFTER the event is decoded.
+    // `extra` is a `Value` map only because serde's `flatten` cannot deserialize
+    // into a borrowed `RawValue`; it stays empty for every well-formed record,
+    // so the hot path never builds a DOM.
+    #[derive(serde::Deserialize)]
+    struct Probe<'a> {
+        #[serde(borrow)]
+        event: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        operation_reference: Option<&'a serde_json::value::RawValue>,
+        #[serde(flatten)]
+        extra: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+
+    let probe: Probe<'_> = match serde_json::from_str(line) {
+        Ok(probe) => probe,
+        // Not an object the probe recognises. Either a legacy bare event (whose
+        // top-level key is a PascalCase variant tag, collected into `extra` —
+        // but then `event` is absent and we fall through below) or genuinely
+        // malformed JSON. The bare-event decode classifies both precisely.
+        // Probe failures (e.g. duplicate `operation_reference`/`event` keys,
+        // which the derived probe rejects) must never mask the inner event's
+        // typed `UnknownVariant`: this cold path re-parses as a DOM (duplicate
+        // keys are accepted there) and decodes any `event` member FIRST.
+        // Only genuinely unparseable JSON (a torn tail) stays `Malformed`.
+        Err(e) => {
+            let malformed = || EventDecodeError::Malformed {
+                detail: e.to_string(),
+            };
+            // Walk EVERY top-level member (duplicates included — a DOM would
+            // keep only the last) so each `event` occurrence is classified.
+            return match top_level_members(line) {
+                None => Err(malformed()),
+                Some(members) => {
+                    // Scan ALL `event` occurrences before failing: a malformed
+                    // sibling must never short-circuit past an unknown one, so
+                    // any `UnknownVariant` wins regardless of key order.
+                    let mut saw_event = false;
+                    for (key, raw) in &members {
+                        if key == "event" {
+                            saw_event = true;
+                            if let Err(err @ EventDecodeError::UnknownVariant { .. }) =
+                                decode_event_json(raw.get())
+                            {
+                                return Err(err);
+                            }
+                        }
+                    }
+                    if saw_event {
+                        Err(malformed())
+                    } else {
+                        decode_event_json(line).map(Record::bare)
+                    }
+                }
+            };
+        }
+    };
+
+    let event_raw = match probe.event {
+        Some(raw) => raw,
+        // No `event` member: a legacy bare event (variant tags are PascalCase,
+        // never the lowercase `event` key). Decode it directly.
+        None => return decode_event_json(line).map(Record::bare),
+    };
+
+    // Decode the inner event FIRST (straight from the borrowed raw payload, no
+    // re-serialization) so an unknown variant is the typed fail-closed
+    // rejection even when the envelope metadata below is also invalid.
+    let event = decode_event_json(event_raw.get())?;
+
+    // Only now validate the envelope metadata. An unrecognised field or a bad
+    // `operation_reference` is `Malformed` — but the event is already known to
+    // be decodable, so this can never mask an `UnknownVariant`.
+    if let Some(extra) = probe.extra.keys().next() {
+        return Err(EventDecodeError::Malformed {
+            detail: format!("unknown record envelope field `{extra}`"),
+        });
+    }
+    let operation_reference = match probe.operation_reference {
+        None => None,
+        // `RawValue::get` returns the exact source slice, so an explicit null
+        // may carry whitespace (`" null"`); trim before comparing.
+        Some(raw) if raw.get().trim() == "null" => None,
+        Some(raw) => Some(serde_json::from_str::<i64>(raw.get()).map_err(|e| {
+            EventDecodeError::Malformed {
+                detail: format!("operation_reference: {e}"),
+            }
+        })?),
+    };
+    Ok(Record {
+        event,
+        operation_reference,
+    })
+}
+
+/// Every top-level `(key, raw value)` member of a JSON object IN SOURCE ORDER,
+/// duplicates preserved (unlike a `Value` map, which keeps only the last).
+/// `None` if `line` is not a parseable JSON object.
+#[cfg(feature = "serde")]
+fn top_level_members(line: &str) -> Option<Vec<(String, Box<serde_json::value::RawValue>)>> {
+    struct Members(Vec<(String, Box<serde_json::value::RawValue>)>);
+    impl<'de> serde::Deserialize<'de> for Members {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Members;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Members, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some(entry) = map.next_entry()? {
+                        out.push(entry);
+                    }
+                    Ok(Members(out))
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+    serde_json::from_str::<Members>(line).ok().map(|m| m.0)
 }
 
 /// Extract the offending variant name from serde's

@@ -27,7 +27,7 @@
 //! `completed: false`); timers auto-advance as in `sim`. Truncated captures are
 //! rejected up front (an incomplete log is not safe to replay).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{
     Command, Engine, Event, JobState, MessageSubscriptionState, ProcessDefinition,
@@ -50,7 +50,7 @@ use crate::contracts::{InstanceTrace, Variables};
 /// replayed population take the approve branch of an exclusive gateway and ~30%
 /// the reject branch — reproducibly, because the outcome is chosen by a stable
 /// seed (instance key + job type + invocation index), not a live RNG.
-pub type MockWorkers = HashMap<String, MockWorker>;
+pub type MockWorkers = BTreeMap<String, MockWorker>;
 
 /// One possible output of a mock worker, with a relative `weight` within its
 /// worker's distribution. An outcome is normally a *completion* carrying `output`
@@ -61,7 +61,7 @@ pub type MockWorkers = HashMap<String, MockWorker>;
 #[derive(Clone, Debug)]
 pub struct MockOutcome {
     pub weight: f64,
-    pub output: HashMap<String, Json>,
+    pub output: BTreeMap<String, Json>,
     /// When set, this outcome throws a BPMN business error with this code instead
     /// of completing the job. `output` is ignored for a throw outcome.
     pub error_code: Option<String>,
@@ -79,7 +79,7 @@ pub struct MockWorker {
 
 impl MockWorker {
     /// A deterministic mock that always emits `output`.
-    pub fn deterministic(output: HashMap<String, Json>) -> Self {
+    pub fn deterministic(output: BTreeMap<String, Json>) -> Self {
         Self {
             outcomes: vec![MockOutcome {
                 weight: 1.0,
@@ -96,7 +96,7 @@ impl MockWorker {
         Self {
             outcomes: vec![MockOutcome {
                 weight: 1.0,
-                output: HashMap::new(),
+                output: BTreeMap::new(),
                 error_code: Some(error_code.into()),
                 error_message: None,
             }],
@@ -208,7 +208,7 @@ fn parse_mock_worker(spec: &Json) -> Option<MockWorker> {
                     Some(o) => o,
                     None => continue,
                 };
-                let output: HashMap<String, Json> = io
+                let output: BTreeMap<String, Json> = io
                     .get("output")
                     .and_then(|o| o.as_object())
                     .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -234,13 +234,13 @@ fn parse_mock_worker(spec: &Json) -> Option<MockWorker> {
                 return Some(MockWorker {
                     outcomes: vec![MockOutcome {
                         weight: 1.0,
-                        output: HashMap::new(),
+                        output: BTreeMap::new(),
                         error_code,
                         error_message,
                     }],
                 });
             }
-            let output: HashMap<String, Json> =
+            let output: BTreeMap<String, Json> =
                 obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             Some(MockWorker::deterministic(output))
         }
@@ -251,7 +251,7 @@ pub struct RecordedInstance {
     pub instance_key: String,
     pub process_id: String,
     pub started_at: u64,
-    pub creation_variables: HashMap<String, Json>,
+    pub creation_variables: BTreeMap<String, Json>,
     pub stimuli: Vec<RecordedStimulus>,
 }
 
@@ -263,7 +263,7 @@ pub struct RecordedStimulus {
     pub at: u64,
     pub kind: String,
     pub reference: Option<String>,
-    pub variables: Option<HashMap<String, Json>>,
+    pub variables: Option<BTreeMap<String, Json>>,
 }
 
 /// Why a trace cannot be replayed (as opposed to a candidate scoring poorly).
@@ -311,7 +311,7 @@ impl RecordedInstance {
             Some(v) => resolve(v)?,
             // Stimuli present but no creation snapshot: an instance created with no
             // variables. Treat as empty inputs rather than unavailable.
-            None => HashMap::new(),
+            None => BTreeMap::new(),
         };
 
         let mut stimuli = Vec::with_capacity(stimuli_src.len());
@@ -344,14 +344,14 @@ impl RecordedInstance {
 
 /// Resolve a captured [`Variables`] snapshot to a JSON object map, rejecting a
 /// truncated snapshot (its values are absent, so replay would be wrong).
-fn resolve(v: &Variables) -> Result<HashMap<String, Json>, ReplayUnavailable> {
+fn resolve(v: &Variables) -> Result<BTreeMap<String, Json>, ReplayUnavailable> {
     if v.truncated {
         return Err(ReplayUnavailable::SnapshotTruncated);
     }
     match &v.values {
         Some(Json::Object(map)) => Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         // A non-object or absent value with truncated == false means "no variables".
-        _ => Ok(HashMap::new()),
+        _ => Ok(BTreeMap::new()),
     }
 }
 
@@ -413,7 +413,7 @@ pub struct ReplayResult {
 struct PendingInput {
     reference: Option<String>,
     at: u64,
-    vars: HashMap<String, Value>,
+    vars: BTreeMap<String, Value>,
 }
 
 /// Pop the first queued input whose `reference` matches `element_id` (exact catch
@@ -463,9 +463,9 @@ pub fn replay_instance_with_mocks(
 
     // FIFO of recorded job outputs, keyed by job type. Each entry is that
     // completion's output delta (empty when the job recorded no output).
-    let mut job_outputs: HashMap<String, std::collections::VecDeque<HashMap<String, Json>>> =
-        HashMap::new();
-    let mut recorded_counts: HashMap<String, u32> = HashMap::new();
+    let mut job_outputs: BTreeMap<String, std::collections::VecDeque<BTreeMap<String, Json>>> =
+        BTreeMap::new();
+    let mut recorded_counts: BTreeMap<String, u32> = BTreeMap::new();
     // Non-job recorded inputs (messages, native user tasks, signals, timer
     // fires), drained in `seq` order. Each carries the catch element id (when
     // recorded), the real timestamp, and the payload delta it merged.
@@ -488,7 +488,7 @@ pub fn replay_instance_with_mocks(
             }
             continue;
         }
-        let vars: HashMap<String, Value> = s
+        let vars: BTreeMap<String, Value> = s
             .variables
             .as_ref()
             .map(|m| {
@@ -517,7 +517,7 @@ pub fn replay_instance_with_mocks(
     if let Err(e) = engine.apply_command_at(Command::DeployResources(defs.to_vec()), clock) {
         return invalid(rec, format!("candidate failed to deploy: {e:?}"));
     }
-    let vars: HashMap<String, Value> = rec
+    let vars: BTreeMap<String, Value> = rec
         .creation_variables
         .iter()
         .map(|(k, v)| (k.clone(), json_to_value(v)))
@@ -536,7 +536,7 @@ pub fn replay_instance_with_mocks(
         return invalid(rec, format!("candidate failed to create instance: {e:?}"));
     }
 
-    let mut issued: HashMap<String, u32> = HashMap::new();
+    let mut issued: BTreeMap<String, u32> = BTreeMap::new();
     let mut uncovered: Vec<String> = Vec::new();
     let mut mocked: Vec<String> = Vec::new();
 
@@ -546,7 +546,7 @@ pub fn replay_instance_with_mocks(
     // works: the engine drops a terminal instance's variable payload on
     // completion (ADR 0012), so the exporter/analysis path must project from
     // events instead.
-    let mut produced: HashMap<String, Json> = rec
+    let mut produced: BTreeMap<String, Json> = rec
         .creation_variables
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -753,7 +753,7 @@ pub fn replay_instance_with_mocks(
             let output = job_outputs.get_mut(&job_type).and_then(|q| q.pop_front());
             match output {
                 Some(out_vars) => {
-                    let out: HashMap<String, Value> = out_vars
+                    let out: BTreeMap<String, Value> = out_vars
                         .iter()
                         .map(|(k, v)| (k.clone(), json_to_value(v)))
                         .collect();
@@ -793,7 +793,7 @@ pub fn replay_instance_with_mocks(
                                     clock,
                                 );
                             } else {
-                                let out: HashMap<String, Value> = mock_out
+                                let out: BTreeMap<String, Value> = mock_out
                                     .output
                                     .iter()
                                     .map(|(k, v)| (k.clone(), json_to_value(v)))
@@ -813,7 +813,7 @@ pub fn replay_instance_with_mocks(
                             apply_and_fold(
                                 &mut engine,
                                 &mut produced,
-                                Command::complete_job_with(job_key, HashMap::new()),
+                                Command::complete_job_with(job_key, BTreeMap::new()),
                                 clock,
                             );
                         }
@@ -878,7 +878,7 @@ pub fn replay_instance_with_mocks(
 
 /// The recorded terminal variable state: creation inputs merged with every
 /// stimulus delta in `seq` order (last-writer-wins) — the original run's output.
-fn recorded_terminal(rec: &RecordedInstance) -> HashMap<String, Json> {
+fn recorded_terminal(rec: &RecordedInstance) -> BTreeMap<String, Json> {
     let mut acc = rec.creation_variables.clone();
     for s in &rec.stimuli {
         if let Some(vars) = &s.variables {
@@ -1005,7 +1005,7 @@ pub fn replay_dataset_with_mocks(
     uncovered_all.sort();
     uncovered_all.dedup();
 
-    let recorded_job_types: std::collections::HashSet<String> = dataset
+    let recorded_job_types: std::collections::BTreeSet<String> = dataset
         .iter()
         .flat_map(|rec| rec.stimuli.iter())
         .filter(|s| s.kind == "jobCompleted")
@@ -1031,7 +1031,7 @@ pub fn replay_dataset_with_mocks(
     mocked.dedup();
 
     // Which recorded-terminal keys diverge most across the dataset.
-    let mut key_counts: HashMap<String, u32> = HashMap::new();
+    let mut key_counts: BTreeMap<String, u32> = BTreeMap::new();
     for r in &results {
         for d in &r.divergences {
             *key_counts.entry(d.key.clone()).or_insert(0) += 1;
@@ -1116,7 +1116,7 @@ fn percentile(sorted: &[u64], p: u64) -> u64 {
 /// prior `let _ =` behaviour.
 fn apply_and_fold(
     engine: &mut Engine,
-    produced: &mut HashMap<String, Json>,
+    produced: &mut BTreeMap<String, Json>,
     cmd: Command,
     clock: u64,
 ) {
@@ -1220,7 +1220,7 @@ mod tests {
   </bpmn:process>
 </bpmn:definitions>"#;
 
-    fn map(pairs: &[(&str, Json)]) -> HashMap<String, Json> {
+    fn map(pairs: &[(&str, Json)]) -> BTreeMap<String, Json> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
@@ -1515,7 +1515,7 @@ mod tests {
         assert_eq!(res.uncovered_job_types, vec!["summarize".to_string()]);
         assert!(!res.conserved, "uncovered jobs must break conservation");
         // summarize shows issued 1 / recorded 0.
-        let cov: HashMap<_, _> = res
+        let cov: BTreeMap<_, _> = res
             .coverage
             .iter()
             .map(|c| (c.job_type.clone(), (c.issued, c.recorded)))

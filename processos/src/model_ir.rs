@@ -43,7 +43,7 @@
 // the module keeps a dead-code allowance for that residue.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
@@ -54,7 +54,7 @@ use nanobpmn_engine_core::{
 /// Render a process definition to canonical IR text. `names` maps element id → human label (as
 /// recovered from the source BPMN, which the engine model itself drops); ids absent from the map
 /// render without a quoted name.
-pub fn definition_to_ir(def: &ProcessDefinition, names: &HashMap<String, String>) -> String {
+pub fn definition_to_ir(def: &ProcessDefinition, names: &BTreeMap<String, String>) -> String {
     let mut normalized = def.clone();
     normalized.normalize_legacy_agent_tasks();
     let def = &normalized;
@@ -146,6 +146,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::StartEvent => "startEvent",
         ElementKind::EndEvent => "endEvent",
         ElementKind::TerminateEndEvent => "terminateEndEvent",
+        ElementKind::ErrorEndEvent { .. } => "errorEndEvent",
         ElementKind::ServiceTask { .. } => "serviceTask",
         ElementKind::BusinessRuleTask { .. } => "businessRuleTask",
         ElementKind::UserTask(_) => "userTask",
@@ -160,7 +161,9 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::MessageBoundaryEvent { .. } => "messageBoundaryEvent",
         ElementKind::MessageStartEvent { .. } => "messageStartEvent",
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
+        ElementKind::ConditionalStartEvent { .. } => "conditionalStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
+        ElementKind::EventSubProcess { .. } => "eventSubProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
         ElementKind::EscalationThrowEvent { .. } => "escalationThrowEvent",
         ElementKind::EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
@@ -248,6 +251,20 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             if let Some(v) = &props.form_id {
                 attrs.push(format!("formId {}", quote(v)));
             }
+            // The form binding attributes (#1193) are emitted only off the
+            // default, so a pre-#1193 IR text (which never carries them)
+            // round-trips byte-identically.
+            if props.form_binding_type != nanobpmn_engine_core::BindingType::Latest {
+                let binding = match props.form_binding_type {
+                    nanobpmn_engine_core::BindingType::Deployment => "deployment",
+                    nanobpmn_engine_core::BindingType::Latest => unreachable!("guarded above"),
+                    nanobpmn_engine_core::BindingType::VersionTag => "versionTag",
+                };
+                attrs.push(format!("formBindingType {}", quote(binding)));
+            }
+            if let Some(v) = &props.form_version_tag {
+                attrs.push(format!("formVersionTag {}", quote(v)));
+            }
             if let Some(v) = &props.external_form_reference {
                 attrs.push(format!("externalFormReference {}", quote(v)));
             }
@@ -258,6 +275,11 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         } => {
             attrs.push(format!("attachedTo {attached_to}"));
             attrs.push(format!("errorCode {}", quote(error_code)));
+        }
+        ElementKind::ErrorEndEvent { error_code } => {
+            if !error_code.is_empty() {
+                attrs.push(format!("errorCode {}", quote(error_code)));
+            }
         }
         ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
             attrs.push(format!("duration {duration_millis}ms"));
@@ -304,6 +326,15 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         ElementKind::SubProcess { start_event } => {
             attrs.push(format!("startEvent {start_event}"));
         }
+        ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            interrupting,
+        } => {
+            attrs.push(format!("startEvent {start_event}"));
+            attrs.push(format!("trigger {}", quote(&render_esp_trigger(trigger))));
+            attrs.push(format!("interrupting {interrupting}"));
+        }
         ElementKind::ScriptTask {
             expression,
             result_variable,
@@ -340,7 +371,8 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             attrs.push(format!("signal {}", quote(signal_name)));
             attrs.push(format!("interrupting {interrupting}"));
         }
-        ElementKind::ConditionalIntermediateCatchEvent { condition } => {
+        ElementKind::ConditionalIntermediateCatchEvent { condition }
+        | ElementKind::ConditionalStartEvent { condition } => {
             attrs.push(format!("condition {}", quote(condition)));
         }
         ElementKind::ConditionalBoundaryEvent {
@@ -396,6 +428,13 @@ fn render_element_attrs(el: &Element, attrs: &mut Vec<String>) {
     }
     for m in &el.io.outputs {
         attrs.push(format!("output {} <- {}", m.target, quote(&m.source)));
+    }
+    // `zeebe:properties` extension properties (e.g. the `io.camunda.tool:*` MCP
+    // tool metadata, #1499) round-trip through the IR so an IR edit → BPMN
+    // re-emit never silently strips them. BTreeMap order keeps the emission
+    // deterministic.
+    for (name, value) in &el.properties {
+        attrs.push(format!("property {} {}", quote(name), quote(value)));
     }
     if let Some(mi) = &el.multi_instance {
         let mut parts: Vec<String> = vec![format!("collection {}", quote(&mi.input_collection))];
@@ -457,6 +496,169 @@ fn quote(s: &str) -> String {
     out
 }
 
+/// Render an event sub-process trigger as a single-quoted-free IR token string,
+/// e.g. `message "orderMsg"`, `timer duration "PT5M"`, `error "E_FAIL"`,
+/// `error` (catch-all), `conditional "=x > 5"`. The whole thing is embedded as
+/// one quoted `trigger` attribute value by [`render_kind_attrs`]; the inner
+/// payloads use their own quoting, so the IR stays unambiguous and round-trips.
+fn render_esp_trigger(trigger: &nanobpmn_engine_core::EventSubProcessTrigger) -> String {
+    use nanobpmn_engine_core::EventSubProcessTrigger as T;
+    match trigger {
+        T::Message {
+            message_name,
+            correlation_key,
+        } => format!(
+            "message {} correlationKey {}",
+            quote(message_name),
+            quote(correlation_key)
+        ),
+        T::Timer(def) => {
+            let kind = match def.kind {
+                nanobpmn_engine_core::TimerDefKind::Duration => "duration",
+                nanobpmn_engine_core::TimerDefKind::Cycle => "cycle",
+                nanobpmn_engine_core::TimerDefKind::Date => "date",
+            };
+            format!("timer {} {}", kind, quote(&def.expr))
+        }
+        T::Signal { signal_name } => format!("signal {}", quote(signal_name)),
+        T::Error {
+            error_code: Some(code),
+        } => format!("error {}", quote(code)),
+        T::Error { error_code: None } => "error".to_string(),
+        T::Escalation {
+            escalation_code: Some(code),
+        } => format!("escalation {}", quote(code)),
+        T::Escalation {
+            escalation_code: None,
+        } => "escalation".to_string(),
+        T::Conditional { condition } => format!("conditional {}", quote(condition)),
+    }
+}
+
+/// Parse the string produced by [`render_esp_trigger`] back into an
+/// [`EventSubProcessTrigger`](nanobpmn_engine_core::EventSubProcessTrigger).
+/// `id` is the owning element id, used only for error messages.
+fn parse_esp_trigger(
+    raw: &str,
+    id: &str,
+) -> Result<nanobpmn_engine_core::EventSubProcessTrigger, String> {
+    use nanobpmn_engine_core::EventSubProcessTrigger as T;
+    // Split into the leading keyword and the rest, honouring the double-quoted
+    // payloads (which may contain spaces).
+    let err = |m: &str| format!("element {id}: invalid eventSubProcess trigger: {m}");
+    let mut tokens = split_ir_tokens(raw).map_err(|m| err(&m))?.into_iter();
+    let kw = tokens
+        .next()
+        .ok_or_else(|| format!("element {id}: empty eventSubProcess trigger"))?;
+    let trigger = match kw.as_str() {
+        "message" => {
+            let message_name = tokens.next().ok_or_else(|| err("message needs a name"))?;
+            let ck_kw = tokens
+                .next()
+                .ok_or_else(|| err("message needs `correlationKey`"))?;
+            if ck_kw != "correlationKey" {
+                return Err(err("message needs `correlationKey <expr>`"));
+            }
+            let correlation_key = tokens
+                .next()
+                .ok_or_else(|| err("message correlationKey needs a value"))?;
+            Ok(T::Message {
+                message_name,
+                correlation_key,
+            })
+        }
+        "timer" => {
+            let kind = tokens.next().ok_or_else(|| err("timer needs a kind"))?;
+            let expr = tokens
+                .next()
+                .ok_or_else(|| err("timer needs an expression"))?;
+            let kind = match kind.as_str() {
+                "duration" => nanobpmn_engine_core::TimerDefKind::Duration,
+                "cycle" => nanobpmn_engine_core::TimerDefKind::Cycle,
+                "date" => nanobpmn_engine_core::TimerDefKind::Date,
+                other => return Err(err(&format!("unknown timer kind '{other}'"))),
+            };
+            Ok(T::Timer(nanobpmn_engine_core::TimerDef { kind, expr }))
+        }
+        "signal" => {
+            let signal_name = tokens.next().ok_or_else(|| err("signal needs a name"))?;
+            Ok(T::Signal { signal_name })
+        }
+        "error" => Ok(T::Error {
+            error_code: tokens.next(),
+        }),
+        "escalation" => Ok(T::Escalation {
+            escalation_code: tokens.next(),
+        }),
+        "conditional" => {
+            let condition = tokens
+                .next()
+                .ok_or_else(|| err("conditional needs a condition"))?;
+            Ok(T::Conditional { condition })
+        }
+        other => Err(err(&format!("unknown trigger kind '{other}'"))),
+    }?;
+    // Every token must be consumed: trailing input would otherwise be dropped
+    // silently and the IR rewritten into a different trigger.
+    if let Some(extra) = tokens.next() {
+        return Err(err(&format!("unexpected trailing token '{extra}'")));
+    }
+    Ok(trigger)
+}
+
+/// Split an IR attribute payload into whitespace-separated tokens, treating a
+/// double-quoted span (with `\"` / `\\` escapes) as one token and unquoting it.
+/// An unterminated quote or a dangling trailing `\\` is an error, never an
+/// implicit close at end of input.
+fn split_ir_tokens(raw: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            chars.next();
+            let mut tok = String::new();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        let n = chars
+                            .next()
+                            .ok_or_else(|| "dangling escape at end of input".to_string())?;
+                        tok.push(match n {
+                            'n' => '\n',
+                            other => other,
+                        });
+                    }
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    other => tok.push(other),
+                }
+            }
+            if !closed {
+                return Err("unterminated quoted string".to_string());
+            }
+            tokens.push(tok);
+        } else {
+            let mut tok = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                tok.push(c);
+                chars.next();
+            }
+            tokens.push(tok);
+        }
+    }
+    Ok(tokens)
+}
+
 // ===========================================================================================
 // Phase 2 (ADR 0001): the total, validating parser `IR text → ProcessDefinition`.
 //
@@ -472,7 +674,7 @@ fn quote(s: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct ParsedIr {
     pub definition: ProcessDefinition,
-    pub names: HashMap<String, String>,
+    pub names: BTreeMap<String, String>,
 }
 
 /// Parse canonical IR text into a [`ProcessDefinition`] and its element-name map, validating
@@ -756,11 +958,14 @@ fn read_string(chars: &[char], start: usize) -> Result<(String, usize), String> 
 #[derive(Default)]
 struct NodeAttrs {
     /// Scalar `key value` attributes (value already unquoted); keyed by attribute name.
-    scalars: HashMap<String, String>,
+    scalars: BTreeMap<String, String>,
     inputs: Vec<Mapping>,
     outputs: Vec<Mapping>,
     /// `zeebe:taskHeaders` entries (serviceTask only), keyed by header name.
     headers: BTreeMap<String, String>,
+    /// `zeebe:properties` entries (`property "name" "value"` lines), keyed by
+    /// property name.
+    properties: BTreeMap<String, String>,
     timer: Option<TimerDef>,
     multi_instance: Option<MultiInstance>,
 }
@@ -862,8 +1067,8 @@ impl<'a> Parser<'a> {
         }
         let start_event = self.expect_word("for the start event id")?;
 
-        let mut elements: HashMap<String, Element> = HashMap::new();
-        let mut names: HashMap<String, String> = HashMap::new();
+        let mut elements: BTreeMap<String, Element> = BTreeMap::new();
+        let mut names: BTreeMap<String, String> = BTreeMap::new();
         // Collect flows until every node is known, then attach (so forward references resolve).
         let mut pending_flows: Vec<(String, SequenceFlow)> = Vec::new();
 
@@ -934,18 +1139,21 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(ParsedIr {
-            definition: ProcessDefinition {
-                id: process_id,
-                name: None,
-                elements,
-                start_event,
-                xml: String::new(),
-                adhoc: Vec::new(),
-                start_form_id: None,
-            },
-            names,
-        })
+        let definition = ProcessDefinition {
+            id: process_id,
+            name: None,
+            elements,
+            start_event,
+            xml: String::new(),
+            adhoc: Vec::new(),
+            start_form_id: None,
+        };
+        // Event sub-process structural constraints — the same canonical check
+        // `ProcessBuilder::build` (and so the BPMN parser) applies.
+        definition
+            .validate_event_subprocesses()
+            .map_err(|e| e.to_string())?;
+        Ok(ParsedIr { definition, names })
     }
 
     /// Parse one node statement: `<keyword> <id> ["<name>"] [{ <attrs> }]`.
@@ -983,6 +1191,10 @@ impl<'a> Parser<'a> {
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
             task_listeners: Vec::new(),
+            // `zeebe:properties` extension properties round-trip through the IR
+            // as `property "name" "value"` lines (MCP tool metadata lives here,
+            // #1499), so an IR parse → BPMN re-emit preserves them.
+            properties: std::mem::take(&mut attrs.properties),
         };
         if let Some((leftover, _)) = attrs.scalars.iter().next() {
             return Err(format!(
@@ -1036,6 +1248,11 @@ impl<'a> Parser<'a> {
                 self.expect_tok(&Tok::LArrow, "in a task header")?;
                 let value = self.expect_str("for a task header value")?;
                 attrs.headers.insert(key, value);
+            }
+            "property" => {
+                let name = self.expect_str("for a property name")?;
+                let value = self.expect_str("for a property value")?;
+                attrs.properties.insert(name, value);
             }
             "timer" => {
                 let kind_word = self.expect_word("for a timer kind")?;
@@ -1204,19 +1421,37 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             decision_id: attrs.require("decisionId", id)?,
             result_variable: attrs.take("resultVariable"),
         },
-        "userTask" => ElementKind::UserTask(nanobpmn_engine_core::UserTaskProps {
-            assignee: attrs.take("assignee"),
-            candidate_groups: attrs.take("candidateGroups"),
-            candidate_users: attrs.take("candidateUsers"),
-            due_date: attrs.take("dueDate"),
-            follow_up_date: attrs.take("followUpDate"),
-            priority: attrs.take("priority"),
-            form_id: attrs.take("formId"),
-            external_form_reference: attrs.take("externalFormReference"),
-        }),
+        "userTask" => {
+            let form_binding_type = match attrs.take("formBindingType").as_deref() {
+                None | Some("latest") => nanobpmn_engine_core::BindingType::Latest,
+                Some("deployment") => nanobpmn_engine_core::BindingType::Deployment,
+                Some("versionTag") => nanobpmn_engine_core::BindingType::VersionTag,
+                Some(other) => {
+                    return Err(format!(
+                        "userTask {id}: unknown formBindingType {other:?} \
+                         (expected latest, deployment or versionTag)"
+                    ));
+                }
+            };
+            ElementKind::UserTask(nanobpmn_engine_core::UserTaskProps {
+                assignee: attrs.take("assignee"),
+                candidate_groups: attrs.take("candidateGroups"),
+                candidate_users: attrs.take("candidateUsers"),
+                due_date: attrs.take("dueDate"),
+                follow_up_date: attrs.take("followUpDate"),
+                priority: attrs.take("priority"),
+                form_id: attrs.take("formId"),
+                form_binding_type,
+                form_version_tag: attrs.take("formVersionTag"),
+                external_form_reference: attrs.take("externalFormReference"),
+            })
+        }
         "errorBoundaryEvent" => ElementKind::ErrorBoundaryEvent {
             attached_to: attrs.require("attachedTo", id)?,
             error_code: attrs.require("errorCode", id)?,
+        },
+        "errorEndEvent" => ElementKind::ErrorEndEvent {
+            error_code: attrs.take("errorCode").unwrap_or_default(),
         },
         "timerIntermediateCatchEvent" => {
             let d = attrs.require("duration", id)?;
@@ -1253,8 +1488,16 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
                 repeating: attrs.bool_or("repeating", false)?,
             }
         }
+        "conditionalStartEvent" => ElementKind::ConditionalStartEvent {
+            condition: attrs.require("condition", id)?,
+        },
         "subProcess" => ElementKind::SubProcess {
             start_event: attrs.require("startEvent", id)?,
+        },
+        "eventSubProcess" => ElementKind::EventSubProcess {
+            start_event: attrs.require("startEvent", id)?,
+            trigger: parse_esp_trigger(&attrs.require("trigger", id)?, id)?,
+            interrupting: attrs.bool_or("interrupting", true)?,
         },
         "scriptTask" => ElementKind::ScriptTask {
             expression: attrs.require("expression", id)?,
@@ -1411,7 +1654,7 @@ mod tests {
             .connect_default("Gate", "Alpha")
             .build()
             .unwrap();
-        let ir = definition_to_ir(&def, &HashMap::new());
+        let ir = definition_to_ir(&def, &BTreeMap::new());
         let zeta = ir.find("Gate -> Zeta").expect("zeta flow present");
         let alpha = ir.find("Gate -> Alpha").expect("alpha flow present");
         assert!(
@@ -1449,7 +1692,7 @@ mod tests {
                 crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
             assert!(xml.contains("<bpmndi:BPMNDiagram"));
             let reparsed = parse_bpmn(&xml).unwrap();
-            assert_eq!(definition_to_ir(&reparsed[0], &HashMap::new()), canonical);
+            assert_eq!(definition_to_ir(&reparsed[0], &BTreeMap::new()), canonical);
         }
     }
 
@@ -1508,8 +1751,8 @@ mod tests {
                     definition: AgentDefinition::default(),
                     limits: None,
                 };
-                let ir = definition_to_ir(&def, &HashMap::new());
-                let xml = crate::bpmn_model::definition_to_xml_labeled(&def, &HashMap::new());
+                let ir = definition_to_ir(&def, &BTreeMap::new());
+                let xml = crate::bpmn_model::definition_to_xml_labeled(&def, &BTreeMap::new());
                 assert!(ir.contains("serviceTask Agent"));
                 assert!(!ir.contains("agentTask Agent"));
                 assert!(xml.contains("<zeebe:taskDefinition"));
@@ -1554,7 +1797,7 @@ mod tests {
             target: "approved".into(),
         });
         work.retries = Some("5".into());
-        let ir = definition_to_ir(&def, &HashMap::new());
+        let ir = definition_to_ir(&def, &BTreeMap::new());
         assert!(ir.contains("input amount <- \"=order.amount\""), "\n{ir}");
         assert!(ir.contains("output approved <- \"=result.ok\""), "\n{ir}");
         assert!(ir.contains("retries \"5\""), "\n{ir}");
@@ -1573,7 +1816,7 @@ mod tests {
             .connect("OnDecline", "Declined")
             .build()
             .unwrap();
-        let ir = definition_to_ir(&def, &HashMap::new());
+        let ir = definition_to_ir(&def, &BTreeMap::new());
         assert!(
             ir.contains("errorBoundaryEvent OnDecline {\n    attachedTo Charge\n    errorCode \"CARD_DECLINED\"\n  }\n"),
             "\n{ir}"
@@ -1590,7 +1833,7 @@ mod tests {
             .connect("Start", "Done")
             .build()
             .unwrap();
-        let mut names = HashMap::new();
+        let mut names = BTreeMap::new();
         names.insert("Start".to_string(), "the \"real\" start".to_string());
         let ir = definition_to_ir(&def, &names);
         assert!(
@@ -1671,7 +1914,7 @@ mod tests {
                 sequential: true,
             });
         }
-        let ir1 = definition_to_ir(&def, &HashMap::new());
+        let ir1 = definition_to_ir(&def, &BTreeMap::new());
         let parsed = ir_to_definition(&ir1).expect("parse");
         let ir2 = definition_to_ir(&parsed.definition, &parsed.names);
         assert_eq!(ir1, ir2, "annotations must survive the round-trip:\n{ir1}");
@@ -1707,7 +1950,7 @@ mod tests {
             .connect_default("Gate", "Alpha")
             .build()
             .unwrap();
-        let ir = definition_to_ir(&def, &HashMap::new());
+        let ir = definition_to_ir(&def, &BTreeMap::new());
         let parsed = ir_to_definition(&ir).expect("parse");
         let gate = &parsed.definition.elements["Gate"];
         // First declared flow (the conditional) must remain first after parsing.
@@ -1774,8 +2017,8 @@ mod tests {
         // `Element.name` (which engine-core's parser now populates from `name=`);
         // compare the structural model with that display-only field cleared.
         fn strip_names(
-            els: &std::collections::HashMap<String, Element>,
-        ) -> std::collections::HashMap<String, Element> {
+            els: &std::collections::BTreeMap<String, Element>,
+        ) -> std::collections::BTreeMap<String, Element> {
             let mut m = els.clone();
             for el in m.values_mut() {
                 el.name = None;
@@ -2212,7 +2455,7 @@ mod tests {
 
 #[cfg(test)]
 mod cancel_remaining_instances_ir_tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use nanobpmn_engine_core::{MultiInstance, ProcessBuilder};
 
@@ -2234,7 +2477,7 @@ mod cancel_remaining_instances_ir_tests {
                 cancel_remaining_instances: cancel,
                 ..Default::default()
             });
-            let ir1 = definition_to_ir(&def, &HashMap::new());
+            let ir1 = definition_to_ir(&def, &BTreeMap::new());
             let parsed = ir_to_definition(&ir1).expect("parse");
             let mi = parsed.definition.elements["Work"]
                 .multi_instance
@@ -2243,5 +2486,85 @@ mod cancel_remaining_instances_ir_tests {
             assert_eq!(mi.cancel_remaining_instances, cancel, "{ir1}");
             assert_eq!(ir1, definition_to_ir(&parsed.definition, &parsed.names));
         }
+    }
+}
+
+#[cfg(test)]
+mod esp_validation_tests {
+    use std::collections::BTreeMap;
+
+    use nanobpmn_engine_core::{EventSubProcessTrigger, ProcessBuilder};
+
+    use super::{definition_to_ir, ir_to_definition};
+
+    /// A valid model with an event sub-process, rendered to IR.
+    fn valid_ir(trigger: EventSubProcessTrigger) -> String {
+        let def = ProcessBuilder::new("P")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .event_sub_process("esp", "esp_start", trigger, true)
+            .start_event("esp_start")
+            .end_event("esp_end")
+            .connect("esp_start", "esp_end")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_end", "esp")
+            .build()
+            .unwrap();
+        definition_to_ir(&def, &BTreeMap::new())
+    }
+
+    fn signal() -> EventSubProcessTrigger {
+        EventSubProcessTrigger::Signal {
+            signal_name: "sig".into(),
+        }
+    }
+
+    fn assert_rejected(ir: &str) {
+        let err = ir_to_definition(ir)
+            .err()
+            .unwrap_or_else(|| panic!("IR must be rejected:\n{ir}"));
+        assert!(err.contains("event sub-process esp"), "{err}\n{ir}");
+    }
+
+    #[test]
+    fn valid_event_subprocess_ir_parses() {
+        ir_to_definition(&valid_ir(signal())).unwrap();
+    }
+
+    #[test]
+    fn ir_rejects_event_subprocess_with_unknown_start() {
+        let ir = valid_ir(signal()).replace("    startEvent esp_start\n", "    startEvent ghost\n");
+        assert!(ir.contains("ghost"), "fixture rewrite failed:\n{ir}");
+        assert_rejected(&ir);
+    }
+
+    #[test]
+    fn ir_rejects_flows_into_or_out_of_event_subprocess() {
+        let base = valid_ir(signal());
+        for extra in ["s -> esp", "esp -> e"] {
+            let close = base.trim_end().rfind('}').expect("process block closes");
+            let ir = format!("{}  {extra}\n}}\n", &base[..close]);
+            assert_rejected(&ir);
+        }
+    }
+
+    #[test]
+    fn esp_trigger_rejects_malformed_or_partially_consumed_payloads() {
+        for bad in [
+            "signal \"abort",              // unterminated quote
+            "signal \"abort\\",            // dangling escape inside a quote
+            "signal \"abort\" unexpected", // trailing token
+            "error \"E\" extra",
+            "timer duration \"PT5M\" x",
+            "message \"m\" correlationKey \"k\" x",
+        ] {
+            assert!(
+                crate::model_ir::parse_esp_trigger(bad, "esp").is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        assert!(crate::model_ir::parse_esp_trigger("signal \"abort\"", "esp").is_ok());
+        assert!(crate::model_ir::parse_esp_trigger("error", "esp").is_ok());
     }
 }

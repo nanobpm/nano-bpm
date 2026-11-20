@@ -254,7 +254,7 @@ fn multi_instance_call_activity_completes_normally_and_aggregates_output() {
         engine
             .apply_command(Command::complete_job_with_result(
                 job.key,
-                HashMap::from([("result".to_string(), item)]),
+                BTreeMap::from([("result".to_string(), item)]),
                 crate::model::AdHocJobResult::default(),
             ))
             .unwrap();
@@ -452,10 +452,7 @@ fn multi_instance_call_activity_spawn_retry_is_mi_aware() {
         .apply_command(Command::DeployProcess(callee))
         .unwrap();
     engine
-        .apply_command(Command::ResolveIncident {
-            incident_key,
-            operation_reference: None,
-        })
+        .apply_command(Command::ResolveIncident { incident_key })
         .unwrap();
 
     assert!(
@@ -579,7 +576,7 @@ fn inline_call_activities_expands_a_call_into_an_embedded_subprocess() {
         .connect("c1", "end")
         .build()
         .unwrap();
-    let mut library = std::collections::HashMap::new();
+    let mut library = std::collections::BTreeMap::new();
     library.insert("phase".to_string(), phase_process("phase", "work"));
 
     let expanded = orchestrator.inline_call_activities(&library).unwrap();
@@ -615,7 +612,7 @@ fn an_expanded_call_activity_runs_to_completion_through_the_engine() {
         .connect("c1", "end")
         .build()
         .unwrap();
-    let mut library = std::collections::HashMap::new();
+    let mut library = std::collections::BTreeMap::new();
     library.insert("phase".to_string(), phase_process("phase", "work"));
     let expanded = orchestrator.inline_call_activities(&library).unwrap();
 
@@ -661,7 +658,7 @@ fn inline_call_activities_expands_nested_calls_with_unique_prefixes() {
         .connect("m", "pend")
         .build()
         .unwrap();
-    let mut library = std::collections::HashMap::new();
+    let mut library = std::collections::BTreeMap::new();
     library.insert("middle".to_string(), middle);
     library.insert("leaf".to_string(), phase_process("leaf", "work"));
 
@@ -687,7 +684,7 @@ fn inline_call_activities_rejects_unknown_and_cyclic_callees() {
         .connect("c1", "end")
         .build()
         .unwrap();
-    let empty = std::collections::HashMap::new();
+    let empty = std::collections::BTreeMap::new();
     assert!(orchestrator
         .inline_call_activities(&empty)
         .unwrap_err()
@@ -702,7 +699,7 @@ fn inline_call_activities_rejects_unknown_and_cyclic_callees() {
         .connect("again", "end")
         .build()
         .unwrap();
-    let mut library = std::collections::HashMap::new();
+    let mut library = std::collections::BTreeMap::new();
     library.insert("loop".to_string(), recursive.clone());
     assert!(recursive
         .inline_call_activities(&library)
@@ -1111,7 +1108,7 @@ fn call_activity_input_mapping_failure_raises_io_mapping_and_respawns_on_resolve
     engine
         .apply_command(Command::set_variables(
             parent,
-            HashMap::from([("orderId".to_string(), Value::Int(41))]),
+            BTreeMap::from([("orderId".to_string(), Value::Int(41))]),
         ))
         .unwrap();
     engine

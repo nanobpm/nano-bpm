@@ -1,9 +1,25 @@
 [
   {
+    "EventSubProcessPayloadHeld": {
+      "instance_key": 30,
+      "scope_key": 31,
+      "variables": {
+        "x": {
+          "Int": 1
+        }
+      }
+    }
+  },
+  {
     "RaftEntryApplied": {
       "index": 41,
       "raft_state": "{\"opaque\":true}",
       "start_dispatch_rr": 7
+    }
+  },
+  {
+    "LenientCompletionSet": {
+      "lenient": true
     }
   },
   {
@@ -143,6 +159,18 @@
           "target_element_id": "call2"
         }
       ],
+      "compensation_migrated": true,
+      "compensation_subscriptions": [
+        {
+          "source_boundary_id": "bA",
+          "source_element_id": "a",
+          "source_element_instance_key": 20,
+          "source_handler": "undoA",
+          "target_boundary_id": "bC",
+          "target_element_id": "c",
+          "target_handler": "undoC"
+        }
+      ],
       "element_mappings": [
         [
           "sub",
@@ -150,6 +178,7 @@
         ]
       ],
       "instance_key": 1,
+      "join_scoped": true,
       "migrated_flow_scopes": [
         {
           "element_instance_key": 8,
@@ -215,6 +244,55 @@
       "job_key": 23,
       "lease_token": "nano-lease:0000000000000019",
       "outcome": "failed"
+    }
+  },
+  {
+    "VariablesLostQuarantined": {
+      "episode": 26,
+      "incident_key": 26,
+      "instance_key": 25
+    }
+  },
+  {
+    "OrphanStampSuperseded": {
+      "episode": 26,
+      "instance_key": 27
+    }
+  },
+  {
+    "ClusterVariableCreated": {
+      "kind": "JSON",
+      "metadata": {
+        "k": {
+          "Int": 1
+        }
+      },
+      "name": "region",
+      "tenant_id": null,
+      "value": {
+        "Str": "EMEA"
+      }
+    }
+  },
+  {
+    "ClusterVariableUpdated": {
+      "kind": "SECRET_REFERENCE",
+      "metadata": {
+        "k": {
+          "Int": 2
+        }
+      },
+      "name": "region",
+      "tenant_id": "t1",
+      "value": {
+        "Str": "APAC"
+      }
+    }
+  },
+  {
+    "ClusterVariableDeleted": {
+      "name": "region",
+      "tenant_id": "t1"
     }
   }
 ]

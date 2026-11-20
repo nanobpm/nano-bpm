@@ -21,7 +21,7 @@ fn variable_spill_excludes_instances_with_an_armed_boundary_timer() {
 
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(1));
     let events = engine
         .apply_command_at(Command::create_instance_with("guarded", vars), 1_000)
@@ -169,7 +169,7 @@ fn should_interrupt_an_activity_via_a_signal_boundary() {
 
     // Broadcasting the signal interrupts the task (cancels its job) and routes
     // along the boundary's outgoing flow, completing the instance.
-    let fired = engine.broadcast_signal("kill-switch", HashMap::new(), 0);
+    let fired = engine.broadcast_signal("kill-switch", BTreeMap::new(), 0);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::SignalCorrelated { .. })));
@@ -200,7 +200,7 @@ fn should_fire_an_interrupting_message_boundary_and_cancel_the_job() {
 
     // Correlating the boundary message interrupts the task: the job is
     // cancelled, the boundary's outgoing flow runs, the instance completes.
-    let fired = engine.correlate_message("order-cancelled", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("order-cancelled", "A", BTreeMap::new(), 0);
     assert_eq!(
         engine.state().jobs[&job_key].state,
         state::JobState::Canceled
@@ -247,7 +247,7 @@ fn should_cancel_a_message_boundary_subscription_when_the_job_completes_first() 
     );
 
     // A later message for the (now cancelled) subscription correlates nothing.
-    let fired = engine.correlate_message("order-cancelled", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("order-cancelled", "A", BTreeMap::new(), 0);
     assert!(!fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
@@ -314,7 +314,7 @@ fn should_fire_a_non_interrupting_message_boundary_for_every_matching_message() 
 
     // First message: spawns a parallel token to "notified" without cancelling
     // the job; the subscription stays open and the instance stays active.
-    let fired = engine.correlate_message("reminder", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("reminder", "A", BTreeMap::new(), 0);
     assert_eq!(
         engine.state().jobs[&job_key].state,
         state::JobState::Created
@@ -331,7 +331,7 @@ fn should_fire_a_non_interrupting_message_boundary_for_every_matching_message() 
     assert!(!engine.is_completed(instance_key));
 
     // A second matching message fires the boundary again (open subscription).
-    let fired = engine.correlate_message("reminder", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("reminder", "A", BTreeMap::new(), 0);
     assert!(fired.iter().any(|e| matches!(
         e,
         Event::SequenceFlowTaken { from, to, .. } if from == "notify" && to == "notified"
@@ -420,7 +420,9 @@ fn inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed() {
     );
     assert!(!engine.is_completed(instance_key));
     let instance = engine.instance(instance_key).unwrap();
-    assert!(instance.join_instances.contains_key("j"));
+    assert!(instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("j")));
 }
 
 /// Issue #1170 — regression guard, service-task multi-instance child.
@@ -833,11 +835,12 @@ fn should_route_to_an_error_boundary_when_a_job_throws_a_matching_error() {
         e,
         Event::SequenceFlowTaken { to, .. } if to == "done"
     )));
-    // and the job is consumed: it cannot be completed afterwards
+    // and the job is consumed: completing it afterwards is NOT_FOUND (Zeebe
+    // parity, #1401 — the entity is deleted with its terminal settlement).
     let err = engine
         .apply_command(Command::complete_job(job_key))
         .unwrap_err();
-    assert_eq!(err, EngineError::JobNotActive { job_key });
+    assert_eq!(err, EngineError::JobNotFound { job_key });
 }
 
 // zeebe-cells: element:SubProcess
@@ -875,11 +878,12 @@ fn should_interrupt_an_embedded_subprocess_via_its_error_boundary() {
         e,
         Event::SequenceFlowTaken { to, .. } if to == "done"
     )));
-    // The interrupted inner job is consumed and cannot be completed.
+    // The interrupted inner job is consumed: completing it is NOT_FOUND
+    // (Zeebe parity, #1401).
     let err = engine
         .apply_command(Command::complete_job(job_key))
         .unwrap_err();
-    assert_eq!(err, EngineError::JobNotActive { job_key });
+    assert_eq!(err, EngineError::JobNotFound { job_key });
 
     // The instance is not yet complete: it is parked on the sad-flow task.
     assert!(!engine.is_completed(instance_key));
@@ -1022,7 +1026,7 @@ fn should_interrupt_an_embedded_subprocess_via_a_message_boundary() {
     // Correlating the boundary message interrupts the whole sub-process: the
     // inner job is cancelled, the inner task and sub-process complete, and the
     // boundary routes to "aborted" instead of the normal flow.
-    let fired = engine.correlate_message("order-cancelled", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("order-cancelled", "A", BTreeMap::new(), 0);
     assert_eq!(
         engine.state().jobs[&job_key].state,
         state::JobState::Canceled
@@ -1133,7 +1137,7 @@ fn feel_boundary_timer_evaluates_variable() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("deadline".to_string(), Value::Str("PT5S".to_string()));
     engine
         .apply_command_at(Command::create_instance_with("feel-boundary", vars), 1_000)

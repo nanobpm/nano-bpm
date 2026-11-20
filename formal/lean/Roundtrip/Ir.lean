@@ -42,6 +42,7 @@ inductive Kind where
   | startEvent
   | endEvent
   | terminateEndEvent
+  | errorEndEvent
   | serviceTask
   | businessRuleTask
   | userTask
@@ -56,7 +57,9 @@ inductive Kind where
   | messageBoundaryEvent
   | messageStartEvent
   | timerStartEvent
+  | conditionalStartEvent
   | subProcess
+  | eventSubProcess
   | escalationThrowEvent
   | escalationBoundaryEvent
   | intermediateThrowEvent
@@ -76,11 +79,12 @@ inductive Kind where
 /-- Every `Kind`, in registry order. The `kinds_complete` theorem certifies this
 list omits nothing. -/
 def Kind.all : List Kind :=
-  [ .startEvent, .endEvent, .terminateEndEvent, .serviceTask, .businessRuleTask
+  [ .startEvent, .endEvent, .terminateEndEvent, .errorEndEvent, .serviceTask, .businessRuleTask
   , .userTask, .exclusiveGateway, .parallelGateway, .inclusiveGateway
   , .eventBasedGateway, .errorBoundaryEvent, .timerIntermediateCatchEvent
   , .timerBoundaryEvent, .messageIntermediateCatchEvent, .messageBoundaryEvent
-  , .messageStartEvent, .timerStartEvent, .subProcess, .escalationThrowEvent
+  , .messageStartEvent, .timerStartEvent, .conditionalStartEvent, .subProcess, .eventSubProcess
+  , .escalationThrowEvent
   , .escalationBoundaryEvent, .intermediateThrowEvent, .linkIntermediateThrowEvent
   , .linkIntermediateCatchEvent, .task, .scriptTask, .callActivity
   , .signalIntermediateCatchEvent, .signalBoundaryEvent
@@ -92,6 +96,7 @@ def Kind.keyword : Kind → String
   | .startEvent => "startEvent"
   | .endEvent => "endEvent"
   | .terminateEndEvent => "terminateEndEvent"
+  | .errorEndEvent => "errorEndEvent"
   | .serviceTask => "serviceTask"
   | .businessRuleTask => "businessRuleTask"
   | .userTask => "userTask"
@@ -106,7 +111,9 @@ def Kind.keyword : Kind → String
   | .messageBoundaryEvent => "messageBoundaryEvent"
   | .messageStartEvent => "messageStartEvent"
   | .timerStartEvent => "timerStartEvent"
+  | .conditionalStartEvent => "conditionalStartEvent"
   | .subProcess => "subProcess"
+  | .eventSubProcess => "eventSubProcess"
   | .escalationThrowEvent => "escalationThrowEvent"
   | .escalationBoundaryEvent => "escalationBoundaryEvent"
   | .intermediateThrowEvent => "intermediateThrowEvent"
@@ -130,6 +137,8 @@ def Kind.schema : Kind → List AttrDecl
   | .startEvent => []
   | .endEvent => []
   | .terminateEndEvent => []
+  | .errorEndEvent =>
+      [ { key := "errorCode", required := false, ty := .str } ]
   | .serviceTask =>
       [ { key := "jobType", required := true, ty := .str }
       , { key := "priority", required := false, ty := .str }
@@ -145,6 +154,8 @@ def Kind.schema : Kind → List AttrDecl
       , { key := "followUpDate", required := false, ty := .str }
       , { key := "priority", required := false, ty := .str }
       , { key := "formId", required := false, ty := .str }
+      , { key := "formBindingType", required := false, ty := .str }
+      , { key := "formVersionTag", required := false, ty := .str }
       , { key := "externalFormReference", required := false, ty := .str } ]
   | .exclusiveGateway => []
   | .parallelGateway => []
@@ -173,8 +184,14 @@ def Kind.schema : Kind → List AttrDecl
   | .timerStartEvent =>
       [ { key := "interval", required := true, ty := .duration }
       , { key := "repeating", required := true, ty := .bool } ]
+  | .conditionalStartEvent =>
+      [ { key := "condition", required := true, ty := .str } ]
   | .subProcess =>
       [ { key := "startEvent", required := true, ty := .id } ]
+  | .eventSubProcess =>
+      [ { key := "startEvent", required := true, ty := .id }
+      , { key := "trigger", required := true, ty := .str }
+      , { key := "interrupting", required := true, ty := .bool } ]
   | .escalationThrowEvent =>
       [ { key := "escalationCode", required := false, ty := .str } ]
   | .escalationBoundaryEvent =>

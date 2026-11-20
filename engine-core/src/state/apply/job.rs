@@ -14,6 +14,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             created_at,
             priority,
             retries,
+            secret_provenance,
         } => {
             state.jobs.insert(
                 *job_key,
@@ -38,8 +39,10 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_message: None,
                     error_code: None,
                     has_failed_with_retries_left: false,
+                    retry_backoff_until: None,
                     settled_tokens: Vec::new(),
                     terminal_end: None,
+                    secret_provenance: secret_provenance.clone(),
                 },
             );
             resync_job_index(state, *job_key);
@@ -89,8 +92,10 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_message: None,
                     error_code: None,
                     has_failed_with_retries_left: false,
+                    retry_backoff_until: None,
                     settled_tokens: Vec::new(),
                     terminal_end: None,
+                    secret_provenance: Vec::new(),
                 },
             );
             resync_job_index(state, *job_key);
@@ -140,8 +145,10 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_message: None,
                     error_code: None,
                     has_failed_with_retries_left: false,
+                    retry_backoff_until: None,
                     settled_tokens: Vec::new(),
                     terminal_end: None,
+                    secret_provenance: Vec::new(),
                 },
             );
             resync_job_index(state, *job_key);
@@ -184,6 +191,8 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 job.lease_token = lease_token.clone();
                 job.durable_activation |= *durable;
                 job.activated = true;
+                // An activation consumes any elapsed `retryBackOff` (#933).
+                job.retry_backoff_until = None;
             }
             resync_job_index(state, *job_key);
         }
@@ -206,10 +215,13 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             retries,
             worker,
             error_message,
+            retry_backoff_until,
             ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.retries = *retries;
+                // Only a fail with retries left can defer re-activation (#933).
+                job.retry_backoff_until = retry_backoff_until.filter(|_| *retries > 0);
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
@@ -436,6 +448,18 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             // reflects only open incidents.
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.incidents.retain(|k| k != incident_key);
+            }
+            // Resolving the incident a quarantine raised ends its loss episode
+            // (#1574): lift the dedup tombstone so a later, distinct loss is
+            // reported fresh. Keyed on the replicated incident key — NOT on the
+            // incident record, which is absent on a cold-tiered replica — so
+            // every replica lifts identically.
+            if state
+                .variables_lost_quarantined
+                .get(instance_key)
+                .is_some_and(|t| t.incident_key == *incident_key)
+            {
+                state.variables_lost_quarantined.remove(instance_key);
             }
             // A recoverable job-incident: return the parked job to the
             // activatable pool so a worker can pick it up again — but *only* if

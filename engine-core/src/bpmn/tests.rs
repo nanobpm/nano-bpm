@@ -940,6 +940,109 @@ fn should_parse_an_escalation_end_event() {
 }
 
 #[test]
+fn should_parse_an_error_end_event() {
+    // An error end event (#1592): an `endEvent` carrying an
+    // `errorEventDefinition` builds as an `ErrorEndEvent` whose code is
+    // resolved from the referenced `<error>`.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" name="Declined" errorCode="CARD_DECLINED" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="ErrEnd">
+      <bpmn:errorEventDefinition errorRef="Err" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="ErrEnd" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+    assert_eq!(
+        def.element("ErrEnd").unwrap().kind,
+        ElementKind::ErrorEndEvent {
+            error_code: "CARD_DECLINED".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_parse_an_error_end_event_without_a_ref_as_an_unnamed_throw() {
+    // An `errorEventDefinition` with no `errorRef` throws an unnamed error
+    // (empty code), matched by catch-alls only.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="ErrEnd">
+      <bpmn:errorEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="ErrEnd" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+    assert_eq!(
+        def.element("ErrEnd").unwrap().kind,
+        ElementKind::ErrorEndEvent {
+            error_code: String::new(),
+        }
+    );
+}
+
+#[test]
+fn should_reject_an_error_end_event_with_an_outgoing_flow() {
+    // An error `<endEvent>` is remapped to an `ErrorEndEvent`, so the
+    // model-level `end_events_have_no_outgoing` rule cannot see it — the
+    // end-event outgoing-flow guard in `build` covers every flavour (#1592,
+    // mirroring the #1173 escalation guard).
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" errorCode="E1" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="ErrEnd">
+      <bpmn:errorEventDefinition errorRef="Err" />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="after" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="ErrEnd" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ErrEnd" targetRef="after" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let err = parse_bpmn(xml).unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidEndEvent { .. }),
+        "expected InvalidEndEvent, got {err:?}"
+    );
+}
+
+#[test]
+fn should_reject_an_error_end_event_with_a_competing_definition() {
+    // An end event carrying BOTH an error and a terminate definition has no
+    // combined-semantics element in the supported subset: refuse the ambiguous
+    // model at deploy rather than pick one arm (#1173's multi-definition guard,
+    // now covering the error flavour).
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" errorCode="E1" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="Bad">
+      <bpmn:errorEventDefinition errorRef="Err" />
+      <bpmn:terminateEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    let err = parse_bpmn(xml).unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidEndEvent { .. }),
+        "expected InvalidEndEvent, got {err:?}"
+    );
+}
+
+#[test]
 fn should_reject_an_escalation_end_event_with_an_outgoing_flow() {
     // Regression (#1173): an escalation `<endEvent>` is remapped to an
     // `EscalationThrowEvent`, so the model-level `end_events_have_no_outgoing`
@@ -1271,6 +1374,40 @@ fn should_reject_an_end_event_with_escalation_and_terminate_definitions() {
 }
 
 #[test]
+fn should_reject_an_intermediate_throw_with_error_and_escalation_definitions() {
+    // Regression (#1592 review): an error definition on an
+    // `intermediateThrowEvent` (with or without an errorRef) must still count
+    // as a competing definition — otherwise the node deploys as a bare
+    // escalation throw and the error definition is silently discarded.
+    for error_def in [
+        r#"<bpmn:errorEventDefinition errorRef="Err" />"#,
+        r#"<bpmn:errorEventDefinition />"#,
+    ] {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:error id="Err" name="Boom" errorCode="BOOM" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:intermediateThrowEvent id="Bad">
+      {error_def}
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Bad" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#
+        );
+        assert!(
+            parse_bpmn(&xml).is_err(),
+            "{error_def}: an error+escalation intermediate throw must be rejected"
+        );
+    }
+}
+
+#[test]
 fn should_reject_an_intermediate_throw_with_competing_definitions() {
     // Regression (#1173): the throw form of the same class — an
     // `intermediateThrowEvent` carrying BOTH an escalation and a compensation
@@ -1383,6 +1520,45 @@ fn should_reject_a_duplicate_escalation_definition_on_a_throw() {
         ),
         "expected InvalidEndEvent for the duplicate-escalation end event Bad, got {err:?}"
     );
+}
+
+#[test]
+fn should_reject_a_duplicate_error_definition_on_an_end_event() {
+    // Regression (#1592 review): a SECOND `errorEventDefinition` on one end
+    // event silently overwrote `error_ref` (last-wins) while the presence flag
+    // stayed a single boolean, so the competing-definition guard accepted it.
+    // Covers named/named and named/unnamed pairs, both orders.
+    for (first, second) in [
+        (r#"errorRef="ErrA""#, r#"errorRef="ErrB""#),
+        (r#"errorRef="ErrA""#, ""),
+        ("", r#"errorRef="ErrA""#),
+    ] {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="ErrA" name="A" errorCode="A" />
+  <bpmn:error id="ErrB" name="B" errorCode="B" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="Bad">
+      <bpmn:errorEventDefinition {first} />
+      <bpmn:errorEventDefinition {second} />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+  </bpmn:process>
+</bpmn:definitions>"#
+        );
+        let err =
+            parse_bpmn(&xml).expect_err("two error definitions on one end event are rejected");
+        assert!(
+            matches!(
+                &err,
+                ParseError::InvalidEndEvent { element_id, reason, .. }
+                    if element_id == "Bad" && reason.contains("more than one errorEventDefinition")
+            ),
+            "expected InvalidEndEvent for ({first}, {second}), got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -2174,11 +2350,10 @@ fn should_accept_explicit_latest_binding_on_a_user_task_form() {
 }
 
 #[test]
-fn should_reject_deployment_binding_on_a_user_task_form() {
+fn should_parse_deployment_binding_on_a_user_task_form() {
     // given: a user-task formDefinition declaring `bindingType="deployment"`.
-    // The engine does not implement the `deployment` binding; degrading it to
-    // `latest` would silently mis-bind the form (#1190), so the deploy must
-    // be rejected loudly rather than parsed.
+    // The binding is implemented (#1193): it parses into the task's
+    // `form_binding_type` and dispatches at user-task creation.
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2196,22 +2371,26 @@ fn should_reject_deployment_binding_on_a_user_task_form() {
             </bpmn:process>
           </bpmn:definitions>"#;
 
-    // when / then
-    let err = parse_bpmn(xml).expect_err("a non-latest form binding is rejected");
+    // when
+    let def = &parse_bpmn(xml).expect("a deployment form binding parses")[0];
+
+    // then
+    let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+        panic!("expected a user task");
+    };
+    assert_eq!(props.form_id.as_deref(), Some("review-form"));
     assert_eq!(
-        err,
-        ParseError::UnsupportedUserTaskFormBinding {
-            task_id: "review".to_string(),
-            binding_type: "deployment".to_string(),
-        }
+        props.form_binding_type,
+        crate::model::BindingType::Deployment
     );
+    assert_eq!(props.form_version_tag, None);
 }
 
 #[test]
-fn should_reject_version_tag_binding_on_a_user_task_form() {
-    // given: a user-task formDefinition declaring `bindingType="versionTag"`.
-    // Like `deployment`, this binding is unimplemented and must fail the
-    // deploy loudly rather than degrade to `latest` (#1190).
+fn should_parse_version_tag_binding_on_a_user_task_form() {
+    // given: a user-task formDefinition declaring `bindingType="versionTag"`
+    // with its `versionTag`. Both attributes parse into the task's form
+    // binding (#1193).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2230,23 +2409,27 @@ fn should_reject_version_tag_binding_on_a_user_task_form() {
             </bpmn:process>
           </bpmn:definitions>"#;
 
-    // when / then
-    let err = parse_bpmn(xml).expect_err("a versionTag form binding is rejected");
+    // when
+    let def = &parse_bpmn(xml).expect("a versionTag form binding parses")[0];
+
+    // then
+    let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+        panic!("expected a user task");
+    };
+    assert_eq!(props.form_id.as_deref(), Some("review-form"));
     assert_eq!(
-        err,
-        ParseError::UnsupportedUserTaskFormBinding {
-            task_id: "review".to_string(),
-            binding_type: "versionTag".to_string(),
-        }
+        props.form_binding_type,
+        crate::model::BindingType::VersionTag
     );
+    assert_eq!(props.form_version_tag.as_deref(), Some("v2"));
 }
 
 #[test]
 fn should_ignore_non_latest_binding_on_an_external_reference_form() {
     // given: an externalReference form that also (redundantly) carries a
     // non-latest bindingType. The externalReference suppresses `formId` and
-    // no form version is resolved, so the unimplemented binding is moot and
-    // must not trip the interim guard.
+    // no form version is resolved, so the binding is moot and unrecorded
+    // (#1193).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2277,6 +2460,8 @@ fn should_ignore_non_latest_binding_on_an_external_reference_form() {
         props.external_form_reference.as_deref(),
         Some("https://forms.example/x")
     );
+    // The moot binding is not recorded: the task keeps the default `latest`.
+    assert_eq!(props.form_binding_type, crate::model::BindingType::Latest);
 }
 
 #[test]
@@ -2284,7 +2469,7 @@ fn should_reject_explicit_empty_binding_on_a_user_task_form() {
     // given: a user-task formDefinition declaring an explicitly *empty*
     // `bindingType=""`. An empty attribute is a present, explicit value — not
     // an absent one — so it must not be silently treated as the `latest`
-    // default (which would reopen the silent-degradation path #1190 closes).
+    // default (the #1190 fail-loud rule, kept for a value no binding maps to).
     // Only an omitted `bindingType` defaults.
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -2315,13 +2500,46 @@ fn should_reject_explicit_empty_binding_on_a_user_task_form() {
 }
 
 #[test]
-fn should_reject_non_latest_binding_when_form_id_is_absent() {
-    // given: a user-task formDefinition with an unimplemented
-    // `bindingType="deployment"` but no `formId` (and no `externalReference`).
-    // Keying the guard off the raw `externalReference` — not off a resolved
-    // `formId` — closes this path: a deployed (non-external) form must carry
-    // only the default binding regardless of whether a `formId` happens to be
-    // present, so this declaration is rejected rather than silently accepted.
+fn should_reject_an_unknown_binding_on_a_user_task_form() {
+    // given: a user-task formDefinition declaring a `bindingType` that is none
+    // of Camunda's three bindings. An unrecognised value is rejected loudly
+    // rather than silently treated as the `latest` default (#1190/#1193).
+    let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="review-form" bindingType="pinned" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when / then
+    let err = parse_bpmn(xml).expect_err("an unknown form binding is rejected");
+    assert_eq!(
+        err,
+        ParseError::UnsupportedUserTaskFormBinding {
+            task_id: "review".to_string(),
+            binding_type: "pinned".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_reject_a_form_definition_without_a_form_id_or_external_reference() {
+    // given: a user-task formDefinition carrying `bindingType="deployment"`
+    // but no `formId` (and no `externalReference`). With neither there is no
+    // form to resolve under any binding, so accepting it would create a
+    // form-less task with no incident — a silently dead declaration. Zeebe
+    // requires exactly one of the two and rejects the deployment; Nano
+    // surfaces the same hard parse error (#1193 review).
     let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -2340,13 +2558,81 @@ fn should_reject_non_latest_binding_when_form_id_is_absent() {
           </bpmn:definitions>"#;
 
     // when / then
-    let err = parse_bpmn(xml).expect_err("a non-latest binding without a formId is rejected");
+    let err = parse_bpmn(xml).expect_err("a form-less formDefinition is rejected");
     assert_eq!(
         err,
-        ParseError::UnsupportedUserTaskFormBinding {
+        ParseError::MissingUserTaskFormId {
             task_id: "review".to_string(),
-            binding_type: "deployment".to_string(),
         }
+    );
+}
+
+#[test]
+fn should_reject_an_empty_form_id_on_a_user_task_form() {
+    // given: the same defect class through an explicitly EMPTY `formId=""`
+    // (present but unusable) — rejected exactly like an absent one, on the
+    // default `latest` binding too: the rule is the missing form reference,
+    // not the binding type.
+    let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when / then
+    let err = parse_bpmn(xml).expect_err("an empty formId is rejected");
+    assert_eq!(
+        err,
+        ParseError::MissingUserTaskFormId {
+            task_id: "review".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_parse_an_external_form_reference_without_a_form_id() {
+    // given: a user-task formDefinition with an `externalReference` and no
+    // `formId` — the one legitimate form-id-less shape (the form is hosted
+    // externally, so no deployed version is resolved and the binding is moot).
+    let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition externalReference="https://forms.example/review" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when
+    let def = &parse_bpmn(xml).expect("an external form reference parses")[0];
+
+    // then
+    let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+        panic!("expected a user task");
+    };
+    assert_eq!(props.form_id, None);
+    assert_eq!(
+        props.external_form_reference.as_deref(),
+        Some("https://forms.example/review")
     );
 }
 
@@ -3010,6 +3296,127 @@ fn should_parse_multi_instance_loop_characteristics() {
 }
 
 #[test]
+fn should_parse_a_root_level_conditional_start_event() {
+    // given: a process whose only start is a root-level conditional start
+    // (#932), plus a second process mixing a none start with a conditional one.
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="cs">
+                <bpmn:conditionalEventDefinition>
+                  <bpmn:condition xsi:type="bpmn:tFormalExpression">=orderAmount &gt; 100</bpmn:condition>
+                </bpmn:conditionalEventDefinition>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="cs" targetRef="e" />
+            </bpmn:process>
+            <bpmn:process id="q">
+              <bpmn:startEvent id="none" />
+              <bpmn:startEvent id="cond">
+                <bpmn:conditionalEventDefinition>
+                  <bpmn:condition>=go = true</bpmn:condition>
+                </bpmn:conditionalEventDefinition>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e1" />
+              <bpmn:endEvent id="e2" />
+              <bpmn:sequenceFlow id="g0" sourceRef="none" targetRef="e1" />
+              <bpmn:sequenceFlow id="g1" sourceRef="cond" targetRef="e2" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    // when
+    let defs = parse_bpmn(xml).unwrap();
+
+    // then: the start is a typed conditional start, never a plain none start.
+    let p = defs.iter().find(|d| d.id == "p").unwrap();
+    assert_eq!(
+        p.element("cs").unwrap().kind,
+        ElementKind::ConditionalStartEvent {
+            condition: "=orderAmount > 100".to_string(),
+        }
+    );
+    assert_eq!(p.start_event, "cs");
+    // and a none start alongside it stays the CreateInstance entry point.
+    let q = defs.iter().find(|d| d.id == "q").unwrap();
+    assert_eq!(q.start_event, "none");
+    assert_eq!(q.element("none").unwrap().kind, ElementKind::StartEvent);
+    assert_eq!(
+        q.element("cond").unwrap().kind,
+        ElementKind::ConditionalStartEvent {
+            condition: "=go = true".to_string(),
+        }
+    );
+}
+
+#[test]
+fn should_reject_malformed_root_level_conditional_start_events() {
+    // given: every malformed root conditional-start shape (#932) — each must
+    // fail closed rather than deploy as a none start or a silently-picked
+    // single trigger.
+    let cases = [
+        ("missing condition", "<bpmn:conditionalEventDefinition />"),
+        (
+            "blank condition",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>   </bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "duplicate definitions",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>\
+             <bpmn:conditionalEventDefinition><bpmn:condition>=b</bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "mixed with a message definition",
+            "<bpmn:messageEventDefinition messageRef=\"m\" />\
+             <bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>",
+        ),
+        (
+            "mixed with a signal definition and an empty condition",
+            "<bpmn:signalEventDefinition signalRef=\"sig\" />\
+             <bpmn:conditionalEventDefinition />",
+        ),
+        (
+            "mixed with a timer definition",
+            "<bpmn:conditionalEventDefinition><bpmn:condition>=a</bpmn:condition></bpmn:conditionalEventDefinition>\
+             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1S</bpmn:timeDuration></bpmn:timerEventDefinition>",
+        ),
+    ];
+    for (label, defs) in cases {
+        let xml = format!(
+            r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+                <bpmn:message id="m" name="m" />
+                <bpmn:signal id="sig" name="sig" />
+                <bpmn:process id="p">
+                  <bpmn:startEvent id="cs">{defs}</bpmn:startEvent>
+                  <bpmn:endEvent id="e" />
+                  <bpmn:sequenceFlow id="f0" sourceRef="cs" targetRef="e" />
+                </bpmn:process>
+              </bpmn:definitions>"#
+        );
+        // The same shape alongside a separate none start: surplus-start
+        // demotion must not reclassify the malformed start (e.g. as a surplus
+        // signal start) before the conditional-start validation sees it.
+        let xml_with_none_start = xml.replace(
+            r#"<bpmn:endEvent id="e" />"#,
+            r#"<bpmn:startEvent id="a_none" />
+                  <bpmn:endEvent id="e" />
+                  <bpmn:sequenceFlow id="f1" sourceRef="a_none" targetRef="e" />"#,
+        );
+
+        for (variant, doc) in [("alone", &xml), ("with a none start", &xml_with_none_start)] {
+            // when
+            let result = parse_bpmn(doc);
+
+            // then
+            assert!(
+                matches!(result, Err(ParseError::InvalidProcess { .. })),
+                "{label} ({variant}): expected InvalidProcess, got {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn should_parse_conditional_intermediate_catch_and_boundary_events() {
     // given: a conditional intermediate catch and a conditional boundary
     // (one interrupting, one not) whose FEEL condition lives in the nested
@@ -3590,6 +3997,319 @@ fn should_parse_a_message_start_event() {
             message_name: "order-placed".to_string(),
         }
     );
+}
+
+#[test]
+fn should_parse_zeebe_properties_on_a_message_start_event() {
+    // Camunda marks a BPMN process as an MCP tool via `zeebe:properties` /
+    // `zeebe:property` extension elements on the message start event
+    // (`io.camunda.tool:name`, `io.camunda.tool:purpose`,
+    // `io.camunda.tool:input_N_*`, …). The parser must carry them onto the
+    // element (`Element::properties`) rather than dropping them, so the engine
+    // can project the tool metadata onto the message start subscription (#1499).
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="io.camunda.tool:name" value="searchFlights" />
+                    <zeebe:property name="io.camunda.tool:purpose" value="Search for flights" />
+                    <zeebe:property name="io.camunda.tool:input_1_name" value="destination" />
+                    <zeebe:property name="io.camunda.tool:input_1_type" value="string" />
+                    <zeebe:property name="io.camunda.tool:input_1_required" value="true" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:messageEventDefinition messageRef="Message_1" />
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+            <bpmn:message id="Message_1" name="search-flights" />
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let start = def.element("s").unwrap();
+    assert_eq!(
+        start.kind,
+        ElementKind::MessageStartEvent {
+            message_name: "search-flights".to_string(),
+        }
+    );
+    assert_eq!(
+        start
+            .properties
+            .get("io.camunda.tool:name")
+            .map(String::as_str),
+        Some("searchFlights")
+    );
+    assert_eq!(
+        start
+            .properties
+            .get("io.camunda.tool:purpose")
+            .map(String::as_str),
+        Some("Search for flights")
+    );
+    assert_eq!(
+        start
+            .properties
+            .get("io.camunda.tool:input_1_name")
+            .map(String::as_str),
+        Some("destination")
+    );
+    assert_eq!(
+        start
+            .properties
+            .get("io.camunda.tool:input_1_required")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(start.properties.len(), 5);
+    // An element without extension properties carries an empty map.
+    assert!(def.element("e").unwrap().properties.is_empty());
+}
+
+#[test]
+fn should_parse_zeebe_properties_on_a_service_task() {
+    // Extension properties are not start-event-specific: any element that
+    // carries `zeebe:properties` keeps them (the IR must not be lossy).
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="payment" />
+                  <zeebe:properties>
+                    <zeebe:property name="inbound.type" value="webhook" />
+                    <zeebe:property name="custom" value="" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="f2" sourceRef="charge" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let task = def.element("charge").unwrap();
+    assert!(matches!(task.kind, ElementKind::ServiceTask { .. }));
+    assert_eq!(
+        task.properties.get("inbound.type").map(String::as_str),
+        Some("webhook")
+    );
+    // A property with an empty value is retained (empty string, not dropped).
+    assert_eq!(task.properties.get("custom").map(String::as_str), Some(""));
+    assert_eq!(task.properties.len(), 2);
+}
+
+#[test]
+fn should_attach_zeebe_properties_to_a_top_level_boundary_event() {
+    // A boundary event is buffered outside the io_stack: its properties must
+    // land on the boundary itself, not be dropped (#1499).
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="t">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="work" />
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="task" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:boundaryEvent id="b" attachedToRef="t">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="boundary" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeDuration>PT1M</bpmn:timeDuration>
+                </bpmn:timerEventDefinition>
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:endEvent id="e2" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+              <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+              <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e2" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let boundary = def.element("b").unwrap();
+    assert_eq!(
+        boundary.properties.get("owner").map(String::as_str),
+        Some("boundary")
+    );
+    let task = def.element("t").unwrap();
+    assert_eq!(
+        task.properties.get("owner").map(String::as_str),
+        Some("task")
+    );
+}
+
+#[test]
+fn should_not_attach_nested_data_output_properties_to_a_boundary_event() {
+    // Properties inside a boundary's nested `dataOutput/extensionElements`
+    // belong to the data output, not the boundary (#1499).
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="t">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="work" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:boundaryEvent id="b" attachedToRef="t">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="boundary" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:dataOutput id="do">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="data-output" />
+                      <zeebe:property name="extra" value="x" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                </bpmn:dataOutput>
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeDuration>PT1M</bpmn:timeDuration>
+                </bpmn:timerEventDefinition>
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:endEvent id="e2" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+              <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+              <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e2" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+    let boundary = def.element("b").unwrap();
+    assert_eq!(
+        boundary.properties.get("owner").map(String::as_str),
+        Some("boundary")
+    );
+    assert!(!boundary.properties.contains_key("extra"));
+}
+
+#[test]
+fn should_not_attach_nested_boundary_event_properties_to_the_enclosing_subprocess() {
+    // A boundary nested in a subprocess: with the subprocess on the io_stack,
+    // its properties must not be attached to (and overwrite) the subprocess's.
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:subProcess id="sub">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="sub" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:startEvent id="ss" />
+                <bpmn:serviceTask id="t">
+                  <bpmn:extensionElements>
+                    <zeebe:taskDefinition type="work" />
+                  </bpmn:extensionElements>
+                </bpmn:serviceTask>
+                <bpmn:boundaryEvent id="b" attachedToRef="t">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="boundary" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                  <bpmn:timerEventDefinition>
+                    <bpmn:timeDuration>PT1M</bpmn:timeDuration>
+                  </bpmn:timerEventDefinition>
+                </bpmn:boundaryEvent>
+                <bpmn:endEvent id="se" />
+                <bpmn:endEvent id="se2" />
+                <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="t" />
+                <bpmn:sequenceFlow id="sf2" sourceRef="t" targetRef="se" />
+                <bpmn:sequenceFlow id="sf3" sourceRef="b" targetRef="se2" />
+              </bpmn:subProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let sub = def.element("sub").unwrap();
+    assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
+    let boundary = def.element("b").unwrap();
+    assert_eq!(
+        boundary.properties.get("owner").map(String::as_str),
+        Some("boundary")
+    );
+}
+
+#[test]
+fn should_parse_the_camunda_mcp_fixture_tool_markers() {
+    // Round-trip the vendored Camunda e2e fixture
+    // (`camunda/camunda` qa/c8-orchestration-cluster-e2e-test-suite): its tool
+    // markers must survive parsing onto the message start event.
+    let xml = include_str!("../../tests/fixtures/mcp-process-with-inputs.bpmn");
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    assert_eq!(def.id, "mcpProcessWithInputs");
+    let start = def.element("StartEvent_1").unwrap();
+    assert_eq!(
+        start.kind,
+        ElementKind::MessageStartEvent {
+            message_name: "mcp-process-with-inputs".to_string(),
+        }
+    );
+    let expected: [(&str, &str); 9] = [
+        ("io.camunda.tool:name", "mcp-process-with-inputs"),
+        (
+            "io.camunda.tool:purpose",
+            "Tool for executing a process with typed inputs triggered by MCP.",
+        ),
+        ("io.camunda.tool:input_1_name", "firstName"),
+        ("io.camunda.tool:input_1_type", "string"),
+        (
+            "io.camunda.tool:input_1_description",
+            "The first name of the person.",
+        ),
+        ("io.camunda.tool:input_2_name", "amount"),
+        ("io.camunda.tool:input_2_type", "integer"),
+        (
+            "io.camunda.tool:input_2_description",
+            "The amount to process.",
+        ),
+        ("io.camunda.tool:input_2_required", "true"),
+    ];
+    assert_eq!(start.properties.len(), expected.len());
+    for (key, value) in expected {
+        assert_eq!(
+            start.properties.get(key).map(String::as_str),
+            Some(value),
+            "tool property {key}"
+        );
+    }
 }
 
 #[test]
@@ -5613,4 +6333,570 @@ fn terminate_end_event_accepts_end_execution_listeners() {
     assert!(matches!(kill.kind, ElementKind::TerminateEndEvent));
     assert_eq!(kill.start_listeners.len(), 1, "{:?}", kill.start_listeners);
     assert_eq!(kill.end_listeners.len(), 1, "{:?}", kill.end_listeners);
+}
+
+// ---------------------------------------------------------------------------
+// Event sub-processes (`subProcess triggeredByEvent="true"`) — #1555.
+//
+// The wave-0 model slice: the parser must turn an event sub-process into an
+// `ElementKind::EventSubProcess` carrying its start event's trigger and
+// interruptingness. The runtime never triggers it yet (that is the follow-up
+// runtime slice), so these tests pin the *model* surface only.
+// ---------------------------------------------------------------------------
+
+/// Wraps `body` (the process-level flow plus any event sub-processes) in a
+/// `<definitions>` that declares the reusable message/signal/error/escalation
+/// the event sub-process start events reference.
+fn esp_wrap(body: &str) -> String {
+    format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+             <bpmn:message id="Msg" name="orderMsg">
+               <bpmn:extensionElements>
+                 <zeebe:subscription correlationKey="=orderId" />
+               </bpmn:extensionElements>
+             </bpmn:message>
+             <bpmn:signal id="Sig" name="abortSig" />
+             <bpmn:error id="Err" errorCode="E_FAIL" />
+             <bpmn:escalation id="Esc" escalationCode="ESC_UP" />
+             <bpmn:process id="p" isExecutable="true">{body}</bpmn:process>
+           </bpmn:definitions>"#
+    )
+}
+
+/// A minimal main flow: `s` (none start) -> `e` (end), with `extra` (the event
+/// sub-process under test) declared beside it.
+fn esp_process(extra: &str) -> String {
+    esp_wrap(&format!(
+        r#"<bpmn:startEvent id="s" />
+           <bpmn:endEvent id="e" />
+           <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
+           {extra}"#
+    ))
+}
+
+/// An event sub-process `esp` whose start event `esp_start` carries `def`
+/// (an event definition) and `interrupting_attr` (an optional
+/// `isInterrupting="…"` attribute string), with a single task inside.
+fn esp_decl(def: &str, interrupting_attr: &str) -> String {
+    format!(
+        r#"<bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:startEvent id="esp_start"{interrupting_attr}>{def}</bpmn:startEvent>
+             <bpmn:task id="esp_task" />
+             <bpmn:endEvent id="esp_end" />
+             <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_task" />
+             <bpmn:sequenceFlow id="ef2" sourceRef="esp_task" targetRef="esp_end" />
+           </bpmn:subProcess>"#
+    )
+}
+
+/// The same event sub-process, but nested inside an ordinary embedded
+/// sub-process `outer` that sits in the main flow.
+fn esp_nested_process(def: &str, interrupting_attr: &str) -> String {
+    esp_process(&format!(
+        r#"<bpmn:subProcess id="outer">
+             <bpmn:startEvent id="outer_start" />
+             <bpmn:task id="outer_task" />
+             <bpmn:endEvent id="outer_end" />
+             {}
+             <bpmn:sequenceFlow id="of1" sourceRef="outer_start" targetRef="outer_task" />
+             <bpmn:sequenceFlow id="of2" sourceRef="outer_task" targetRef="outer_end" />
+           </bpmn:subProcess>
+           <bpmn:sequenceFlow id="f2" sourceRef="outer" targetRef="e" />"#,
+        esp_decl(def, interrupting_attr)
+    ))
+    // `f1` from esp_process targets `e` directly; rewire the main flow through
+    // `outer` by replacing it.
+    .replace(
+        r#"<bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />"#,
+        r#"<bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="outer" />"#,
+    )
+}
+
+/// The six trigger definitions, one per supported event sub-process start type.
+const ESP_TRIGGER_DEFS: [(&str, &str); 6] = [
+    (
+        "message",
+        r#"<bpmn:messageEventDefinition messageRef="Msg" />"#,
+    ),
+    (
+        "timer-duration",
+        r#"<bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>"#,
+    ),
+    (
+        "timer-cycle",
+        r#"<bpmn:timerEventDefinition><bpmn:timeCycle>R3/PT1H</bpmn:timeCycle></bpmn:timerEventDefinition>"#,
+    ),
+    (
+        "timer-date",
+        r#"<bpmn:timerEventDefinition><bpmn:timeDate>2030-01-01T00:00:00Z</bpmn:timeDate></bpmn:timerEventDefinition>"#,
+    ),
+    (
+        "signal",
+        r#"<bpmn:signalEventDefinition signalRef="Sig" />"#,
+    ),
+    ("error", r#"<bpmn:errorEventDefinition errorRef="Err" />"#),
+];
+
+/// The escalation and conditional trigger definitions (kept separate so the
+/// interrupting/non-interrupting matrix can treat the always-interrupting
+/// error trigger differently).
+const ESP_ESCALATION_DEF: &str = r#"<bpmn:escalationEventDefinition escalationRef="Esc" />"#;
+const ESP_CONDITIONAL_DEF: &str = r#"<bpmn:conditionalEventDefinition><bpmn:condition>=x &gt; 5</bpmn:condition></bpmn:conditionalEventDefinition>"#;
+
+/// Parses `xml` and returns the `esp` element's kind, asserting it is an
+/// event sub-process.
+fn esp_kind(xml: &str) -> crate::model::EventSubProcessTrigger {
+    let def = &parse_bpmn(xml).unwrap()[0];
+    match &def.element("esp").unwrap().kind {
+        ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            ..
+        } => {
+            assert_eq!(start_event, "esp_start");
+            trigger.clone()
+        }
+        other => panic!("esp must be an EventSubProcess, got {other:?}"),
+    }
+}
+
+#[test]
+fn event_subprocess_parses_every_trigger_interrupting_by_default() {
+    // Every trigger type, no `isInterrupting` attribute -> interrupting (the
+    // BPMN/Zeebe default), at process level.
+    let expected: [(&str, crate::model::EventSubProcessTrigger); 8] = [
+        (
+            "message",
+            crate::model::EventSubProcessTrigger::Message {
+                message_name: "orderMsg".into(),
+                correlation_key: "orderId".into(),
+            },
+        ),
+        (
+            "timer-duration",
+            crate::model::EventSubProcessTrigger::Timer(crate::model::TimerDef {
+                kind: TimerDefKind::Duration,
+                expr: "PT5M".into(),
+            }),
+        ),
+        (
+            "timer-cycle",
+            crate::model::EventSubProcessTrigger::Timer(crate::model::TimerDef {
+                kind: TimerDefKind::Cycle,
+                expr: "R3/PT1H".into(),
+            }),
+        ),
+        (
+            "timer-date",
+            crate::model::EventSubProcessTrigger::Timer(crate::model::TimerDef {
+                kind: TimerDefKind::Date,
+                expr: "2030-01-01T00:00:00Z".into(),
+            }),
+        ),
+        (
+            "signal",
+            crate::model::EventSubProcessTrigger::Signal {
+                signal_name: "abortSig".into(),
+            },
+        ),
+        (
+            "error",
+            crate::model::EventSubProcessTrigger::Error {
+                error_code: Some("E_FAIL".into()),
+            },
+        ),
+        (
+            "escalation",
+            crate::model::EventSubProcessTrigger::Escalation {
+                escalation_code: Some("ESC_UP".into()),
+            },
+        ),
+        (
+            "conditional",
+            crate::model::EventSubProcessTrigger::Conditional {
+                condition: "=x > 5".into(),
+            },
+        ),
+    ];
+    for (name, want_trigger) in expected {
+        let def = match name {
+            "escalation" => ESP_ESCALATION_DEF,
+            "conditional" => ESP_CONDITIONAL_DEF,
+            _ => ESP_TRIGGER_DEFS.iter().find(|(n, _)| *n == name).unwrap().1,
+        };
+        let xml = esp_process(&esp_decl(def, ""));
+        let def =
+            &parse_bpmn(xml.as_str()).unwrap_or_else(|e| panic!("{name} trigger parses: {e:?}"))[0];
+        match &def.element("esp").unwrap().kind {
+            ElementKind::EventSubProcess {
+                start_event,
+                trigger,
+                interrupting,
+            } => {
+                assert_eq!(start_event, "esp_start", "{name}");
+                assert_eq!(*trigger, want_trigger, "{name}");
+                assert!(*interrupting, "{name} defaults to interrupting");
+            }
+            other => panic!("{name}: esp must be an EventSubProcess, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn event_subprocess_parses_non_interrupting_triggers() {
+    // `isInterrupting="false"` is honoured for every trigger that permits it
+    // (all but error, which Zeebe requires to be interrupting).
+    for (name, def) in ESP_TRIGGER_DEFS
+        .iter()
+        .filter(|(n, _)| *n != "error")
+        .map(|(n, d)| (*n, *d))
+        .chain([
+            ("escalation", ESP_ESCALATION_DEF),
+            ("conditional", ESP_CONDITIONAL_DEF),
+        ])
+    {
+        let xml = esp_process(&esp_decl(def, r#" isInterrupting="false""#));
+        let parsed = parse_bpmn(xml.as_str())
+            .unwrap_or_else(|e| panic!("non-interrupting {name} parses: {e:?}"));
+        match &parsed[0].element("esp").unwrap().kind {
+            ElementKind::EventSubProcess { interrupting, .. } => {
+                assert!(!interrupting, "{name} must be non-interrupting");
+            }
+            other => panic!("{name}: esp must be an EventSubProcess, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn event_subprocess_parses_inside_an_embedded_subprocess() {
+    // An event sub-process scoped to an embedded sub-process: contained in it
+    // (parent set), with its trigger and interruptingness intact, while the
+    // outer sub-process stays an ordinary embedded SubProcess.
+    for (name, def) in ESP_TRIGGER_DEFS.iter().map(|(n, d)| (*n, *d)).chain([
+        ("escalation", ESP_ESCALATION_DEF),
+        ("conditional", ESP_CONDITIONAL_DEF),
+    ]) {
+        for interrupting_attr in ["", r#" isInterrupting="false""#] {
+            if name == "error" && !interrupting_attr.is_empty() {
+                continue; // error start must stay interrupting (tested below)
+            }
+            let xml = esp_nested_process(def, interrupting_attr);
+            let parsed = parse_bpmn(xml.as_str())
+                .unwrap_or_else(|e| panic!("nested {name} ({interrupting_attr}) parses: {e:?}"));
+            let def = &parsed[0];
+            let esp = def.element("esp").unwrap();
+            assert_eq!(esp.parent.as_deref(), Some("outer"), "{name}");
+            match &esp.kind {
+                ElementKind::EventSubProcess {
+                    start_event,
+                    interrupting,
+                    ..
+                } => {
+                    assert_eq!(start_event, "esp_start", "{name}");
+                    assert_eq!(
+                        *interrupting,
+                        interrupting_attr.is_empty(),
+                        "{name} interrupting"
+                    );
+                }
+                other => panic!("{name}: esp must be an EventSubProcess, got {other:?}"),
+            }
+            assert!(
+                matches!(
+                    def.element("outer").unwrap().kind,
+                    ElementKind::SubProcess { .. }
+                ),
+                "{name}: outer stays an embedded sub-process"
+            );
+        }
+    }
+}
+
+#[test]
+fn event_subprocess_trigger_fields_are_resolved() {
+    // Spot-check the resolved fields of each trigger variant.
+    let xml = esp_process(&esp_decl(
+        r#"<bpmn:messageEventDefinition messageRef="Msg" />"#,
+        "",
+    ));
+    assert_eq!(
+        esp_kind(&xml),
+        crate::model::EventSubProcessTrigger::Message {
+            message_name: "orderMsg".into(),
+            correlation_key: "orderId".into(),
+        }
+    );
+    let xml = esp_process(&esp_decl(ESP_ESCALATION_DEF, ""));
+    assert_eq!(
+        esp_kind(&xml),
+        crate::model::EventSubProcessTrigger::Escalation {
+            escalation_code: Some("ESC_UP".into()),
+        }
+    );
+    let xml = esp_process(&esp_decl(ESP_CONDITIONAL_DEF, ""));
+    assert_eq!(
+        esp_kind(&xml),
+        crate::model::EventSubProcessTrigger::Conditional {
+            condition: "=x > 5".into(),
+        }
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_a_non_interrupting_error_start() {
+    // Zeebe: an error event sub-process start event is always interrupting
+    // (`EventSubProcessValidator`); `isInterrupting="false"` must be rejected
+    // at deploy rather than silently accepted.
+    let xml = esp_process(&esp_decl(
+        r#"<bpmn:errorEventDefinition errorRef="Err" />"#,
+        r#" isInterrupting="false""#,
+    ));
+    let err = parse_bpmn(&xml).expect_err("non-interrupting error start rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_a_none_start_event() {
+    // An event sub-process is triggered by its typed start event; a plain
+    // none start leaves it with no trigger (Zeebe rejects the model).
+    let xml = esp_process(&esp_decl("", ""));
+    let err = parse_bpmn(&xml).expect_err("none-start event sub-process rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_a_missing_start_event() {
+    // No start event at all: no trigger to arm (Zeebe rejects the model).
+    let xml = esp_process(
+        r#"<bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:task id="esp_task" />
+           </bpmn:subProcess>"#,
+    );
+    let err = parse_bpmn(&xml).expect_err("start-less event sub-process rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_multiple_start_events() {
+    // Two start events make the trigger ambiguous (Zeebe: exactly one).
+    let xml = esp_process(
+        r#"<bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:startEvent id="esp_start"><bpmn:signalEventDefinition signalRef="Sig" /></bpmn:startEvent>
+             <bpmn:startEvent id="esp_start2"><bpmn:signalEventDefinition signalRef="Sig" /></bpmn:startEvent>
+             <bpmn:task id="esp_task" />
+             <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_task" />
+           </bpmn:subProcess>"#,
+    );
+    let err = parse_bpmn(&xml).expect_err("multi-start event sub-process rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_an_unknown_message_ref() {
+    // The start event's messageRef must resolve against a declared <message>
+    // (same reference integrity as a message catch event).
+    let xml = esp_process(&esp_decl(
+        r#"<bpmn:messageEventDefinition messageRef="NoSuchMessage" />"#,
+        "",
+    ));
+    let err = parse_bpmn(&xml).expect_err("unknown messageRef rejected");
+    assert!(
+        matches!(
+            err,
+            ParseError::InvalidMessageEvent { .. } | ParseError::UnresolvedReference { .. }
+        ),
+        "expected a message reference error, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_a_start_event_with_multiple_definitions() {
+    // A start event carrying two event definitions has no single trigger.
+    let xml = esp_process(&esp_decl(
+        r#"<bpmn:signalEventDefinition signalRef="Sig" /><bpmn:timerEventDefinition><bpmn:timeDuration>PT5M</bpmn:timeDuration></bpmn:timerEventDefinition>"#,
+        "",
+    ));
+    let err = parse_bpmn(&xml).expect_err("multi-definition esp start rejected");
+    assert!(
+        matches!(err, ParseError::InvalidProcess { .. }),
+        "expected InvalidProcess, got {err:?}"
+    );
+}
+
+#[test]
+fn event_subprocess_rejects_repeated_same_type_definitions() {
+    // Two definitions of the SAME type would overwrite one field and look like
+    // a single trigger; definition occurrences, not types, must be counted.
+    for defs in [
+        r#"<bpmn:signalEventDefinition signalRef="Sig" /><bpmn:signalEventDefinition signalRef="Sig" />"#,
+        r#"<bpmn:errorEventDefinition /><bpmn:errorEventDefinition />"#,
+    ] {
+        let xml = esp_process(&esp_decl(defs, ""));
+        let err = parse_bpmn(&xml).expect_err("same-type duplicate definitions rejected");
+        assert!(
+            err.to_string().contains("more than one event definition"),
+            "{defs}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn event_subprocess_is_not_part_of_normal_flow() {
+    // The event sub-process and its inner elements stay out of the main
+    // token flow: no sequence flow may target or leave it, and the process
+    // entry start is unaffected.
+    let xml = esp_process(&esp_decl(ESP_ESCALATION_DEF, ""));
+    let def = &parse_bpmn(&xml).unwrap()[0];
+    assert_eq!(def.start_event, "s");
+    // The scope-enumeration seam: `esp` is directly contained in the process
+    // scope; nothing is contained in `esp` itself as an event sub-process.
+    let top: Vec<&str> = def
+        .event_subprocesses_in_scope(None)
+        .map(|(id, _, _, _)| id.as_str())
+        .collect();
+    assert_eq!(top, vec!["esp"]);
+    assert_eq!(def.event_subprocesses_in_scope(Some("esp")).count(), 0);
+    // Nested: `esp` is enumerated under `outer`, not at process level.
+    let xml = esp_nested_process(ESP_ESCALATION_DEF, "");
+    let def = &parse_bpmn(&xml).unwrap()[0];
+    assert_eq!(def.event_subprocesses_in_scope(None).count(), 0);
+    let inner: Vec<&str> = def
+        .event_subprocesses_in_scope(Some("outer"))
+        .map(|(id, _, _, _)| id.as_str())
+        .collect();
+    assert_eq!(inner, vec!["esp"]);
+}
+
+#[test]
+fn should_not_attach_nested_sequence_flow_properties_to_the_enclosing_subprocess() {
+    // A sequenceFlow never enters the io_stack, so properties declared on a
+    // flow inside a subprocess must not fall through to (and overwrite) the
+    // subprocess's own metadata. Flows carry no properties slot: ignore them.
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:subProcess id="sub">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="sub" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:startEvent id="ss" />
+                <bpmn:endEvent id="se" />
+                <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="se">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="edge" />
+                      <zeebe:property name="extra" value="edge" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                </bpmn:sequenceFlow>
+              </bpmn:subProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let sub = def.element("sub").unwrap();
+    assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
+    assert!(!sub.properties.contains_key("extra"));
+}
+
+#[test]
+fn should_not_attach_nested_data_object_properties_to_the_enclosing_subprocess() {
+    let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:subProcess id="sub">
+                <bpmn:extensionElements>
+                  <zeebe:properties>
+                    <zeebe:property name="owner" value="sub" />
+                  </zeebe:properties>
+                </bpmn:extensionElements>
+                <bpmn:dataObject id="d">
+                  <bpmn:extensionElements>
+                    <zeebe:properties>
+                      <zeebe:property name="owner" value="data" />
+                      <zeebe:property name="extra" value="data" />
+                    </zeebe:properties>
+                  </bpmn:extensionElements>
+                </bpmn:dataObject>
+                <bpmn:startEvent id="ss" />
+                <bpmn:endEvent id="se" />
+                <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="se" />
+              </bpmn:subProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+    let def = &parse_bpmn(xml).unwrap()[0];
+
+    let sub = def.element("sub").unwrap();
+    assert_eq!(sub.properties.get("owner").map(String::as_str), Some("sub"));
+    assert!(!sub.properties.contains_key("extra"));
+}
+
+#[test]
+fn should_reject_a_dangling_error_ref_on_a_start_event_outside_an_event_subprocess() {
+    // given: error start events whose `errorRef` dangles, placed where
+    // `resolve_esp_trigger` never looks — the process level and an ordinary
+    // embedded sub-process. The reference-integrity validator (#851) must still
+    // see the ref; it must not be silently lowered to a plain start (#1555).
+    let process_level = r#"
+          <definitions>
+            <process id="p">
+              <startEvent id="s"><errorEventDefinition errorRef="missing" /></startEvent>
+              <endEvent id="e" />
+              <sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+            </process>
+          </definitions>"#;
+    let in_subprocess = r#"
+          <definitions>
+            <process id="p">
+              <startEvent id="s" />
+              <subProcess id="sub">
+                <startEvent id="ss"><errorEventDefinition errorRef="missing" /></startEvent>
+                <endEvent id="se" />
+                <sequenceFlow id="sf" sourceRef="ss" targetRef="se" />
+              </subProcess>
+              <endEvent id="e" />
+              <sequenceFlow id="f0" sourceRef="s" targetRef="sub" />
+              <sequenceFlow id="f1" sourceRef="sub" targetRef="e" />
+            </process>
+          </definitions>"#;
+
+    for xml in [process_level, in_subprocess] {
+        // when
+        let err = parse_bpmn(xml).unwrap_err();
+
+        // then
+        assert!(
+            format!("{err:?}").contains("missing"),
+            "expected a dangling-errorRef rejection, got {err:?}"
+        );
+    }
 }

@@ -1,0 +1,86 @@
+{
+  "observational_variants": [
+    {
+      "variant": "GatewayRouteSelected",
+      "introduced_in": "v0.0.28",
+      "issue": "#1402",
+      "upgrade": "upgrade-boundary",
+      "rationale": "upgrade-boundary: not feature-gated. Journals the split gateway's activation-time flow selection so completion takes exactly those flows instead of re-evaluating FEEL. The state it writes (Instance::gateway_routes, serde(default)) is transient - cleared when the gateway completes - and a gateway completing without a recorded selection re-selects from the current variables exactly as the previous release does, so the routed flows (SequenceFlowTaken, compared unfiltered) agree on both builds. But Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C): a previous-release member neither emits this event nor can decode it, so a mixed-version cluster journals different events for the same command. The release therefore requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
+    }
+  ],
+  "divergences": [
+    {
+      "scenario": "messages-signals-conditional",
+      "expected": {
+        "reorder": true,
+        "remint_keys": true,
+        "only_in_prev": [
+          {
+            "variant": "ElementActivating",
+            "element_id": "join"
+          },
+          {
+            "variant": "ElementActivated",
+            "element_id": "join"
+          }
+        ],
+        "only_in_head": [
+          {
+            "variant": "ElementActivating",
+            "element_id": "join"
+          },
+          {
+            "variant": "ElementActivated",
+            "element_id": "join"
+          }
+        ]
+      },
+      "introduced_in": "v0.0.28",
+      "issue": "#1244",
+      "upgrade": "upgrade-boundary",
+      "rationale": "upgrade-boundary: not feature-gated. Zeebe execution order at forks and joins (#1244, PR #1428): a parallel fork now activates its branches in Zeebe's order, so the branch elements' keys are minted in a different order (reorder + remint_keys), and a parallel join activates its element instance when it FIRES rather than on the first arriving token (the join's ElementActivating/ElementActivated move from the first token's entry to the firing entry, which only_in_prev/only_in_head declare for element `join` alone). Every other event - flows taken, subscriptions, variables, completions - is unchanged. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C) rather than replay the leader's events, so previous-release and new members would mint different keys and journal different events for the same command. The new order is not gated on a cluster-wide capability, so the release requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
+    },
+    {
+      "scenario": "suspend-resume-cancel",
+      "expected": {
+        "reorder": true,
+        "remint_keys": true
+      },
+      "introduced_in": "v0.0.28",
+      "issue": "#1244",
+      "upgrade": "upgrade-boundary",
+      "rationale": "upgrade-boundary: not feature-gated. Zeebe execution order at forks and joins (#1244, PR #1428): a parallel fork now activates its branches in Zeebe's order, so the branch elements' keys are minted in a different order (reorder + remint_keys), and a parallel join activates its element instance when it FIRES rather than on the first arriving token (the join's ElementActivating/ElementActivated move from the first token's entry to the firing entry, which only_in_prev/only_in_head declare for element `join` alone). Every other event - flows taken, subscriptions, variables, completions - is unchanged. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C) rather than replay the leader's events, so previous-release and new members would mint different keys and journal different events for the same command. The new order is not gated on a cluster-wide capability, so the release requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
+    },
+    {
+      "scenario": "random-workload",
+      "expected": {
+        "reorder": true,
+        "remint_keys": true,
+        "only_in_prev": [
+          {
+            "variant": "ElementActivating",
+            "element_id": "join"
+          },
+          {
+            "variant": "ElementActivated",
+            "element_id": "join"
+          }
+        ],
+        "only_in_head": [
+          {
+            "variant": "ElementActivating",
+            "element_id": "join"
+          },
+          {
+            "variant": "ElementActivated",
+            "element_id": "join"
+          }
+        ]
+      },
+      "introduced_in": "v0.0.28",
+      "issue": "#1244",
+      "upgrade": "upgrade-boundary",
+      "rationale": "upgrade-boundary: not feature-gated. Zeebe execution order at forks and joins (#1244, PR #1428): a parallel fork now activates its branches in Zeebe's order, so the branch elements' keys are minted in a different order (reorder + remint_keys), and a parallel join activates its element instance when it FIRES rather than on the first arriving token (the join's ElementActivating/ElementActivated move from the first token's entry to the firing entry, which only_in_prev/only_in_head declare for element `join` alone). Every other event - flows taken, subscriptions, variables, completions - is unchanged. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C) rather than replay the leader's events, so previous-release and new members would mint different keys and journal different events for the same command. The new order is not gated on a cluster-wide capability, so the release requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
+    }
+  ]
+}

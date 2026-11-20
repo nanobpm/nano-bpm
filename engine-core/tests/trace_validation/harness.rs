@@ -180,6 +180,71 @@ pub trait TraceMapping {
     fn engine_milestones(&self, events: &[Event]) -> Vec<Milestone>;
 }
 
+/// The canonical engine-side construction for the shared spec graph vocabulary.
+///
+/// Every spec family whose graph uses the `start`/`end`/`task`/`and`/`or`/`xor`
+/// node kinds (TokenFlow, ZeebeTokenFlow, and any sibling) builds its engine
+/// process identically:
+///   * `start` → start event, `end` → end event
+///   * `task`  → **service task** (a wait state that creates a job; the harness
+///     drives it to completion), job type = the node id
+///   * `and`   → parallel gateway, `or` → inclusive gateway, `xor` → exclusive
+///     gateway
+///
+/// This is the single source of truth for that mapping (#1259): spec families
+/// delegate to it from their `TraceMapping::build_process` so a correction to
+/// the graph→engine binding lands in one place instead of drifting across
+/// per-spec copies.
+pub fn build_spec_process(fixture: &Fixture) -> ProcessDefinition {
+    let g = &fixture.graph;
+    let mut b = nanobpmn_engine_core::ProcessBuilder::new(fixture.model.clone());
+    for (id, kind) in &g.nodes {
+        b = match kind.as_str() {
+            "start" => b.start_event(id.clone()),
+            "end" => b.end_event(id.clone()),
+            "task" => b.service_task(id.clone(), id.clone()),
+            "and" => b.parallel_gateway(id.clone()),
+            "or" => b.inclusive_gateway(id.clone()),
+            "xor" => b.exclusive_gateway(id.clone()),
+            other => panic!("unmapped spec node kind {other:?}"),
+        };
+    }
+    for (_id, from, to) in &g.flows {
+        b = b.connect(from.clone(), to.clone());
+    }
+    b.build().expect("spec graph builds a valid process")
+}
+
+/// The canonical engine-side projection onto the shared milestone vocabulary.
+///
+/// The engine's `Event` stream carries the observable facts every token-flow
+/// spec family reasons about (`SequenceFlowTaken`, `JobCreated`,
+/// `ParallelJoinFired`, `ProcessInstanceCompleted`), so the projection is
+/// identical across families. This is the single source of truth for it
+/// (#1259): spec families delegate to it from their
+/// `TraceMapping::engine_milestones` so a correction to the event→milestone
+/// binding lands in one place instead of drifting across per-spec copies.
+pub fn spec_engine_milestones(events: &[Event]) -> Vec<Milestone> {
+    let mut out = Vec::new();
+    for e in events {
+        match e {
+            Event::SequenceFlowTaken { from, to, .. } => out.push(Milestone::Flow {
+                from: from.to_string(),
+                to: to.to_string(),
+            }),
+            Event::JobCreated { element_id, .. } => out.push(Milestone::Task {
+                node: element_id.to_string(),
+            }),
+            Event::ParallelJoinFired { element_id, .. } => out.push(Milestone::JoinFired {
+                node: element_id.to_string(),
+            }),
+            Event::ProcessInstanceCompleted { .. } => out.push(Milestone::Completed),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Deploy the mapped process, create one instance, drive every created job to
 /// completion until the instance quiesces, and return the full event stream.
 /// Spec-agnostic: the only spec input is the [`TraceMapping`]-built process.

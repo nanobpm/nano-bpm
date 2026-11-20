@@ -16,12 +16,14 @@ mod console_api;
 // that render the data stay feature-gated (issue #1294).
 mod consumers;
 mod falcon;
+mod mcp;
 #[cfg(feature = "console")]
 mod provisioning;
 mod query;
 #[cfg(test)]
 mod request_field_guard;
 mod response_contract;
+mod secrets;
 mod stub_impls;
 
 // Cross-crate peer-uplink integration tests. `peer` moved into
@@ -72,16 +74,15 @@ use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core as agent_model;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, AdHocActivateElement, AdHocJobResult, ClusterVariableSnapshot, ClusterVariables,
-    Command, EngineError, Event, IncidentKind, IncidentState, Key, MAX_PARTITION_ID,
-    ProcessBuilder, ProcessDefinition, ProcessInstanceState, TaskListenerJobResult,
-    UserTaskCorrections, Value, partition_of,
+    ActivatedJob, AdHocActivateElement, AdHocJobResult, Command, EngineError, Event, IncidentKind,
+    IncidentState, Key, MAX_PARTITION_ID, ProcessBuilder, ProcessDefinition, ProcessInstanceState,
+    TaskListenerJobResult, UserTaskCorrections, Value, partition_of,
 };
 
 use crate::backpressure::{
     AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, GlobalGuard,
     ProcGovConfig, ProcessGovernors, SharedSlaMode, SlaMode, Tier1Config,
-    parse_backpressure_setting, parse_sla_mode,
+    parse_backpressure_setting, parse_sla_mode, parse_tier2_enabled,
 };
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -377,36 +378,19 @@ impl BatchOperationStore {
     }
 }
 
-/// #906 cluster-variables state (epic #903).
+/// #906 cluster-variables REST surface (epic #903), backed by REPLICATED engine
+/// state since #1657 (ADR 0066 option C).
 ///
 /// A cluster variable is an operator-managed value resolvable from FEEL at
 /// runtime. It is either **global** (visible to every tenant) or bound to a
-/// specific **tenant**; a global and a tenant variable may share a name without
-/// clashing, so the store keys each entry by `(tenant, name)` where `tenant` is
-/// `None` for global scope.
-///
-/// The store is the source of truth for the v2 `/cluster-variables` REST
-/// surface. Every mutation also refreshes `runtime` — the shared
-/// [`ClusterVariables`] snapshot the embedded engine overlays *underneath*
-/// instance variables during FEEL evaluation (see `engine-core`
-/// `overlay_cluster_variables`) — so REST state and runtime resolution never
-/// drift. The value is stored as an engine [`Value`] (not the JSON wire string),
-/// which is exactly what both the FEEL overlay and the REST projection need.
-#[derive(Clone)]
-pub struct ClusterVariableStore {
-    entries: Arc<std::sync::RwLock<ClusterVariableEntries>>,
-    runtime: ClusterVariables,
-}
-
-/// The stored entries plus a monotonic id counter. `by_key` is keyed by
-/// `(tenant, name)` (`None` tenant = global); `next_id` hands each entry a
-/// unique, stable id used as the search pagination cursor.
-#[derive(Default)]
-struct ClusterVariableEntries {
-    by_key: std::collections::HashMap<(Option<String>, String), StoredClusterVariable>,
-    next_id: u64,
-}
-
+/// specific **tenant**. The single source of truth is the engine's
+/// [`nanobpmn_engine_core::ClusterVariableState`], mutated only by the
+/// replicated `Create`/`Update`/`DeleteClusterVariable` commands: partition 0
+/// is authoritative (it validates — 409 / 404) and the resulting record is then
+/// fanned out to every other partition as an idempotent `distributed` copy, so
+/// each partition's FEEL resolution reads its own log-derived state and every
+/// replica of a partition agrees at every log position. There is no host-side
+/// store; the REST reads below project the engine state.
 /// A cluster variable's Camunda 8.10 metadata bag: string/number values keyed by
 /// name. Opaque to the engine (never overlaid into FEEL); stored and projected
 /// verbatim for the REST surface.
@@ -420,140 +404,430 @@ const CLUSTER_VARIABLE_MAX_METADATA_BYTES: usize = 100 * (256 + 8192);
 
 /// One stored cluster variable. `value` is the engine [`Value`] (source of truth
 /// for both the FEEL overlay and the REST projection); `id` gives search a stable
-/// pagination cursor.
+/// pagination cursor. `kind` is the Camunda 8.10 `ClusterVariableKindEnum`:
+/// `JSON` (default) or `SECRET_REFERENCE` (#1296) — a SECRET_REFERENCE value is
+/// ordinary JSON that may carry `camunda.secrets.<name>` reference text, stored
+/// and returned verbatim; Nano never resolves it server-side (resolution happens
+/// at job activation, host-side).
 #[derive(Clone)]
 struct StoredClusterVariable {
     id: u64,
     name: String,
     tenant_id: Option<String>,
     value: Value,
+    kind: models::ClusterVariableKindEnum,
     metadata: ClusterVariableMetadata,
 }
 
-impl ClusterVariableStore {
-    /// Builds a store backed by the shared runtime snapshot the engine reads for
-    /// FEEL resolution. The two stay in lock-step: every mutation rebuilds the
-    /// snapshot from the current entries.
-    fn new(runtime: ClusterVariables) -> Self {
+impl StoredClusterVariable {
+    /// Projects one engine-state cluster variable into the REST record.
+    fn from_engine(
+        tenant_id: Option<&str>,
+        name: &str,
+        v: &nanobpmn_engine_core::ClusterVariable,
+    ) -> Self {
         Self {
-            entries: Arc::new(std::sync::RwLock::new(ClusterVariableEntries::default())),
-            runtime,
+            id: v.id,
+            name: name.to_string(),
+            tenant_id: tenant_id.map(str::to_string),
+            value: v.value.clone(),
+            kind: match v.kind {
+                nanobpmn_engine_core::ClusterVariableKind::Json => {
+                    models::ClusterVariableKindEnum::Json
+                }
+                nanobpmn_engine_core::ClusterVariableKind::SecretReference => {
+                    models::ClusterVariableKindEnum::SecretReference
+                }
+            },
+            metadata: v
+                .metadata
+                .iter()
+                .filter_map(|(k, val)| {
+                    serde_json::from_value(value_to_json(val))
+                        .ok()
+                        .map(|m| (k.clone(), m))
+                })
+                .collect(),
         }
     }
+}
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, ClusterVariableEntries> {
-        self.entries.read().unwrap_or_else(|p| p.into_inner())
+/// The engine kind for a REST kind (`JSON` when the request omits it — Camunda
+/// 8.10: "Defaults to JSON if not specified").
+fn cluster_variable_engine_kind(
+    kind: Option<models::ClusterVariableKindEnum>,
+) -> nanobpmn_engine_core::ClusterVariableKind {
+    match kind {
+        Some(models::ClusterVariableKindEnum::SecretReference) => {
+            nanobpmn_engine_core::ClusterVariableKind::SecretReference
+        }
+        _ => nanobpmn_engine_core::ClusterVariableKind::Json,
+    }
+}
+
+/// The engine metadata bag for a REST metadata bag (string/number scalars).
+fn cluster_variable_engine_metadata(
+    metadata: &ClusterVariableMetadata,
+) -> std::collections::BTreeMap<String, Value> {
+    metadata
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                json_to_value(&serde_json::to_value(v).unwrap_or(serde_json::Value::Null)),
+            )
+        })
+        .collect()
+}
+
+/// The `(tenant, name)` a cluster-variable command addresses.
+fn cluster_variable_target(command: &Command) -> Option<(Option<String>, String)> {
+    match command {
+        Command::CreateClusterVariable {
+            tenant_id, name, ..
+        }
+        | Command::UpdateClusterVariable {
+            tenant_id, name, ..
+        }
+        | Command::DeleteClusterVariable {
+            tenant_id, name, ..
+        } => Some((tenant_id.clone(), name.clone())),
+        _ => None,
+    }
+}
+
+impl ServerImpl {
+    /// The local engine actor whose replicated state serves cluster-variable
+    /// reads: the authoritative partition 0 when hosted here, else any local
+    /// partition (each holds the fanned-out copy).
+    fn cluster_variable_read_handle(&self) -> &DeepthiHandle {
+        self.engine
+            .local_for_partition(0)
+            .unwrap_or_else(|| &self.engine.all()[0])
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, ClusterVariableEntries> {
-        self.entries.write().unwrap_or_else(|p| p.into_inner())
+    /// A clone of the replicated cluster-variable state (the REST read source).
+    async fn cluster_variable_state(&self) -> nanobpmn_engine_core::ClusterVariableState {
+        self.cluster_variable_read_handle()
+            .with(|j| j.engine().cluster_variables().clone())
+            .await
     }
 
-    /// Returns the stored variable for `(tenant, name)`, if any.
-    fn get(&self, tenant: Option<&str>, name: &str) -> Option<StoredClusterVariable> {
-        self.read()
-            .by_key
-            .get(&(tenant.map(str::to_string), name.to_string()))
-            .cloned()
+    /// Returns the variable for `(tenant, name)`, if any. The lookup runs
+    /// INSIDE the engine actor turn and clones only the matching record —
+    /// cloning the whole state here would make a single-variable GET cost
+    /// grow with the entire configuration store and block the actor on the
+    /// copy (PR #1670 review). The full-state clone is reserved for search
+    /// and expression snapshots ([`Self::cluster_variable_state`]).
+    async fn cluster_variable_get(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+    ) -> Option<StoredClusterVariable> {
+        let (t, n) = (tenant.map(str::to_string), name.to_string());
+        self.cluster_variable_read_handle()
+            .with(move |j| {
+                j.engine()
+                    .cluster_variables()
+                    .get(t.as_deref(), &n)
+                    .map(|v| StoredClusterVariable::from_engine(t.as_deref(), &n, v))
+            })
+            .await
     }
 
-    /// Creates a new variable, returning a snapshot of the stored record taken
-    /// while the write lock is still held. Returns `None` (creating nothing)
-    /// when one already exists for `(tenant, name)` — the caller maps that to
-    /// 409. Returning the snapshot (rather than a separate post-mutation `get`)
-    /// is race-free: a concurrent DELETE cannot make the caller's response
-    /// construction observe a missing record.
-    fn create(
+    /// Every cluster variable (for search).
+    async fn cluster_variable_all(&self) -> Vec<StoredClusterVariable> {
+        let state = self.cluster_variable_state().await;
+        state
+            .iter()
+            .map(|(t, n, v)| StoredClusterVariable::from_engine(t, n, v))
+            .collect()
+    }
+
+    /// Creates a variable: 409 when `(tenant, name)` already exists.
+    async fn cluster_variable_create(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+        value: Value,
+        kind: Option<models::ClusterVariableKindEnum>,
+        metadata: ClusterVariableMetadata,
+    ) -> Result<StoredClusterVariable, (u16, String)> {
+        self.cluster_variable_mutate(Command::CreateClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            value,
+            kind: cluster_variable_engine_kind(kind),
+            metadata: cluster_variable_engine_metadata(&metadata),
+            distributed: false,
+        })
+        .await?
+        .ok_or_else(|| (500, "cluster variable vanished after create".to_string()))
+    }
+
+    /// Replaces a variable's value and metadata (id and kind preserved): 404
+    /// when absent. An omitted metadata bag clears it (Camunda parity).
+    async fn cluster_variable_update(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
         metadata: ClusterVariableMetadata,
-    ) -> Option<StoredClusterVariable> {
-        let key = (tenant.map(str::to_string), name.to_string());
-        let stored = {
-            let mut e = self.write();
-            if e.by_key.contains_key(&key) {
-                return None;
-            }
-            e.next_id += 1;
-            let id = e.next_id;
-            let stored = StoredClusterVariable {
-                id,
-                name: name.to_string(),
-                tenant_id: tenant.map(str::to_string),
-                value,
-                metadata,
-            };
-            e.by_key.insert(key, stored.clone());
-            stored
-        };
-        self.sync_runtime();
-        Some(stored)
+    ) -> Result<StoredClusterVariable, (u16, String)> {
+        self.cluster_variable_mutate(Command::UpdateClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            value,
+            metadata: cluster_variable_engine_metadata(&metadata),
+        })
+        .await?
+        .ok_or_else(|| (500, "cluster variable vanished after update".to_string()))
     }
 
-    /// Updates an existing variable's value and metadata in place, preserving
-    /// its id, and returns a snapshot of the updated record taken while the
-    /// write lock is still held. The metadata bag is REPLACED, not merged
-    /// (Camunda: an update that omits it clears it). Returns `None` when none
-    /// exists for `(tenant, name)` — the caller maps that to 404. Returning the
-    /// snapshot (rather than a separate post-mutation `get`) is race-free: a
-    /// concurrent DELETE cannot make the caller's response construction observe
-    /// a missing record.
-    fn update(
+    /// Deletes a variable: 404 when absent.
+    async fn cluster_variable_delete(
         &self,
         tenant: Option<&str>,
         name: &str,
-        value: Value,
-        metadata: ClusterVariableMetadata,
-    ) -> Option<StoredClusterVariable> {
-        let key = (tenant.map(str::to_string), name.to_string());
-        let stored = {
-            let mut e = self.write();
-            let entry = e.by_key.get_mut(&key)?;
-            entry.value = value;
-            entry.metadata = metadata;
-            entry.clone()
-        };
-        self.sync_runtime();
-        Some(stored)
+    ) -> Result<(), (u16, String)> {
+        self.cluster_variable_mutate(Command::DeleteClusterVariable {
+            tenant_id: tenant.map(str::to_string),
+            name: name.to_string(),
+            distributed: false,
+        })
+        .await
+        .map(|_| ())
     }
 
-    /// Deletes a variable. Returns `false` when none exists — the caller maps
-    /// that to 404.
-    fn delete(&self, tenant: Option<&str>, name: &str) -> bool {
-        let key = (tenant.map(str::to_string), name.to_string());
-        let removed = self.write().by_key.remove(&key).is_some();
-        if removed {
-            self.sync_runtime();
-        }
-        removed
-    }
-
-    /// Snapshots every stored variable (for search).
-    fn all(&self) -> Vec<StoredClusterVariable> {
-        self.read().by_key.values().cloned().collect()
-    }
-
-    /// Rebuilds the shared runtime snapshot from the current entries so the
-    /// engine's FEEL overlay reflects the latest state after every mutation.
-    fn sync_runtime(&self) {
-        let mut snap = ClusterVariableSnapshot::default();
-        for entry in self.read().by_key.values() {
-            match &entry.tenant_id {
-                None => {
-                    snap.global.insert(entry.name.clone(), entry.value.clone());
-                }
-                Some(tenant) => {
-                    snap.tenants
-                        .entry(tenant.clone())
-                        .or_default()
-                        .insert(entry.name.clone(), entry.value.clone());
-                }
+    /// The single cluster-variable write funnel (#1657). Applies `command` on
+    /// the authoritative partition 0 (which validates), then fans the
+    /// resulting record out to every other partition as an idempotent
+    /// `distributed` upsert / delete, each through that partition's replicated
+    /// command path. Returns the post-apply record (`None` once deleted).
+    ///
+    /// Rolling-upgrade gate (ADR 0066): the new command variants are Raft
+    /// entries an older binary cannot decode, so nothing is emitted unless
+    /// every peer advertises [`falcon::cluster_join::FEATURE_CLUSTER_VARIABLES`]
+    /// on its `/cluster` join handshake (#1661); otherwise
+    /// the write fails closed with 503 and no partition is touched. Writes from
+    /// this gateway are serialized so its fan-outs never interleave.
+    ///
+    /// Consistency contract (slice 1 — Zeebe parity): partition 0 is the sole
+    /// authority — every mutation validates and commits there first, and the
+    /// fan-out copies carry the full resulting record, so concurrent writes
+    /// (possibly through different gateways) converge **last-writer-wins by
+    /// authoritative commit order**: a stale copy can only overwrite a newer
+    /// value on a follower partition when its own authoritative commit was
+    /// later, in which case it IS the newest value. Revisions/tombstones and a
+    /// durable, restart-resuming distributor (so a fan-out interrupted by a
+    /// gateway failure is retried to completion independently of the REST
+    /// request) are follow-up slices; an interrupted fan-out surfaces as the
+    /// request's error and is logged (`cluster variable fan-out incomplete`)
+    /// so an operator can re-issue the write — a create retries as 409 and a
+    /// delete as 404, so the recovery write is an UPDATE (or a re-create after
+    /// a delete).
+    ///
+    /// Untagged legacy journal (ADR 0066): with `NANOBPMN_JOURNAL_SEGMENTED=0`
+    /// and more than one partition the journal records no producing
+    /// partition, so an interrupted fan-out could not be told apart on restart
+    /// (broadcasting would install a copy that never committed; key routing
+    /// would lose it). There the rule is FAIL CLOSED, not "re-issue the write":
+    /// every create/update/delete is rejected with 503 before any partition is
+    /// touched ([`check_cluster_variable_journal_mode`], warned once at
+    /// startup), and recovery refuses any such record
+    /// ([`seglog::check_cluster_variable_attribution`]). Remedy: segmented
+    /// journals, or a single partition.
+    async fn cluster_variable_mutate(
+        &self,
+        command: Command,
+    ) -> Result<Option<StoredClusterVariable>, (u16, String)> {
+        let _serialized = self.cluster_variable_writes.lock().await;
+        check_cluster_variable_journal_mode(
+            legacy_journal_in_use(),
+            self.engine.partition_count() as u64,
+        )?;
+        for node in self.engine.peer_nodes() {
+            let link = self.peer_link(node).await.map_err(|(_, m)| {
+                (
+                    503,
+                    format!("cluster variables unavailable: peer {node} unreachable: {m}"),
+                )
+            })?;
+            if !link.supports(falcon::cluster_join::FEATURE_CLUSTER_VARIABLES) {
+                return Err((
+                    503,
+                    format!(
+                        "cluster variables unavailable: peer {node} does not support \
+                         replicated cluster variables yet (rolling upgrade in progress)"
+                    ),
+                ));
             }
         }
-        let mut guard = self.runtime.write().unwrap_or_else(|p| p.into_inner());
-        *guard = snap;
+        let (tenant, name) = cluster_variable_target(&command)
+            .ok_or_else(|| (500, "not a cluster-variable command".to_string()))?;
+        let record = self.apply_cluster_variable_on(0, command).await?;
+        let copy = match &record {
+            Some(v) => Command::CreateClusterVariable {
+                tenant_id: tenant.clone(),
+                name: name.clone(),
+                value: v.value.clone(),
+                kind: v.kind,
+                metadata: v.metadata.clone(),
+                distributed: true,
+            },
+            None => Command::DeleteClusterVariable {
+                tenant_id: tenant.clone(),
+                name: name.clone(),
+                distributed: true,
+            },
+        };
+        let partition_count = self.engine.partition_count() as u64;
+        for p in 1..partition_count {
+            if let Err(e) = self.apply_cluster_variable_on(p, copy.clone()).await {
+                // Partition 0 has already committed; the remaining copies are
+                // best-effort (slice 1 — see the consistency contract above).
+                // Log loudly so an interrupted fan-out is diagnosable, then
+                // surface the failure to the caller.
+                tracing::error!(
+                    partition = p,
+                    error = %e.1,
+                    "cluster variable fan-out incomplete: partition {p} did not receive \
+                     the copy of {tenant:?}/{name}; re-issue the write to converge it \
+                     (a create retries as 409, a delete as 404 — re-issue as an update)"
+                );
+                return Err(e);
+            }
+        }
+        Ok(record.map(|v| StoredClusterVariable::from_engine(tenant.as_deref(), &name, &v)))
+    }
+
+    /// Applies a cluster-variable command on global partition `p`: locally
+    /// when this node leads it, else forwarded to the leader.
+    async fn apply_cluster_variable_on(
+        &self,
+        p: u64,
+        command: Command,
+    ) -> Result<Option<nanobpmn_engine_core::ClusterVariable>, (u16, String)> {
+        let key = nanobpmn_engine_core::compose_key(p, 0);
+        let Some(node) = self.route_by_leader(key) else {
+            return self.apply_cluster_variable_local(p, command).await;
+        };
+        let link = self.peer_link(node).await?;
+        match link.apply_cluster_variable(p, command).await {
+            Ok(r) if r.status == 200 => serde_json::from_value(r.body.unwrap_or_default())
+                .map_err(|e| (502, format!("malformed cluster-variable reply: {e}"))),
+            Ok(r) => Err((r.status, peer_detail(&r))),
+            Err(e) => Err((503, e.to_string())),
+        }
+    }
+
+    /// Applies a cluster-variable command on local partition `p` through its
+    /// replicated funnel and returns the post-apply record. Also the handler
+    /// behind the intra-cluster `ApplyClusterVariable` frame.
+    ///
+    /// The returned record is the one THIS proposal committed: it is derived
+    /// from the proposal's own events (a create/update event carries the full
+    /// post-mutation record — value, kind, and metadata; a delete event
+    /// carries none), never from a re-read of live state — a re-read runs in
+    /// a separate actor turn, so a concurrent mutation from another gateway
+    /// could land in between and the response (and the fan-out copy built
+    /// from it) would carry the OTHER write's value, or combine this write's
+    /// value with a delete/recreate's replacement kind (PR #1670 review). The
+    /// record's `id` is the one field the events do not carry; it is read
+    /// back best-effort through [`Self::engine_handle_for`] — which also
+    /// reaches a partition this node only LEADS after a failover (its Raft
+    /// replica actor), where `local_for_partition` would report the committed
+    /// write as an error — and defaults to `0` when the partition is not
+    /// hosted here (the fan-out copy does not use the id; the REST `id` is a
+    /// search-pagination cursor only).
+    pub(crate) async fn apply_cluster_variable_local(
+        &self,
+        p: u64,
+        command: Command,
+    ) -> Result<Option<nanobpmn_engine_core::ClusterVariable>, (u16, String)> {
+        let (tenant, name) = cluster_variable_target(&command)
+            .ok_or_else(|| (400, "not a cluster-variable command".to_string()))?;
+        // The journal-mode guard must hold on the node that PERSISTS the
+        // record, not only on the originating gateway: a forwarded
+        // `ApplyClusterVariable` from a segmented peer lands here, and a
+        // legacy multi-partition node must refuse it rather than journal an
+        // untagged record it could never recover (PR #1670 review). This is
+        // the single funnel for local and forwarded applies.
+        check_cluster_variable_journal_mode(
+            legacy_journal_in_use(),
+            self.engine.partition_count() as u64,
+        )?;
+        let key = nanobpmn_engine_core::compose_key(p, 0);
+        let (events, _commit) = self.apply_partition_command(key, command).await?;
+        // At most one lifecycle event per applied command (an idempotent
+        // distributed delete of an already-absent variable emits none). Both
+        // create and update events carry the complete post-mutation record
+        // (an update's `kind` is the preserved kind, captured by the engine
+        // in the committing turn), so the response record below is exactly
+        // what THIS proposal committed.
+        let mut applied: Option<nanobpmn_engine_core::ClusterVariable> = None;
+        let mut deleted = false;
+        for e in events.iter() {
+            match e {
+                Event::ClusterVariableCreated {
+                    value,
+                    kind,
+                    metadata,
+                    ..
+                }
+                | Event::ClusterVariableUpdated {
+                    value,
+                    kind,
+                    metadata,
+                    ..
+                } => {
+                    applied = Some(nanobpmn_engine_core::ClusterVariable {
+                        id: 0,
+                        value: value.clone(),
+                        kind: *kind,
+                        metadata: metadata.clone(),
+                    });
+                }
+                Event::ClusterVariableDeleted { .. } => deleted = true,
+                _ => {}
+            }
+        }
+        if deleted {
+            return Ok(None);
+        }
+        let Some(mut record) = applied else {
+            return Ok(None);
+        };
+        // Fill in the id — the one field the events do not carry — from the
+        // applying partition's state. Reaching that state must use
+        // [`Self::engine_handle_for`] — which also reaches a partition this
+        // node only LEADS after a failover (its Raft replica actor) — never
+        // `local_for_partition`, which returns `None` for a promoted partition
+        // and would report the committed write as an error (PR #1670 review).
+        // A partition this node neither owns nor replicates is unreachable:
+        // fail the read-back rather than return a placeholder id. A concurrent
+        // delete landing before this turn only loses the (cursor-only) id —
+        // the record's value/kind/metadata above are already the committed
+        // ones, never re-read.
+        let Some(handle) = self.engine_handle_for(p) else {
+            return Err((
+                503,
+                format!("partition {p} committed but is not hosted here for the read-back"),
+            ));
+        };
+        let (t, n) = (tenant.clone(), name.clone());
+        let id = handle
+            .with(move |j| {
+                j.engine()
+                    .cluster_variables()
+                    .get(t.as_deref(), &n)
+                    .map(|v| v.id)
+            })
+            .await;
+        if let Some(id) = id {
+            record.id = id;
+        }
+        Ok(Some(record))
     }
 }
 
@@ -612,10 +886,25 @@ fn cluster_variable_search_result(
 }
 
 /// A stored variable's kind: the single source for the results' `kind` and the
-/// search `kind` filter. Always `JSON` — [`reject_unsupported_cluster_variable_kind`]
-/// refuses anything else at create time.
-fn cluster_variable_kind(_v: &StoredClusterVariable) -> models::ClusterVariableKindEnum {
-    models::ClusterVariableKindEnum::Json
+/// search `kind` filter. Camunda 8.10 `ClusterVariableKindEnum`: `JSON` (the
+/// default) or `SECRET_REFERENCE` (#1296) — a SECRET_REFERENCE value is ordinary
+/// JSON that may carry `camunda.secrets.<name>` reference text. It is stored and
+/// returned verbatim (never resolved server-side), so a GET/search response can
+/// never contain a secret value.
+fn cluster_variable_kind(v: &StoredClusterVariable) -> models::ClusterVariableKindEnum {
+    v.kind
+}
+
+/// The 500 `ProblemDetail` for a cluster-variable write that failed for a
+/// reason other than its documented 404 / 409 (e.g. a peer that cannot yet take
+/// the replicated commands during a rolling upgrade, or a quorum loss). The
+/// underlying status is kept in the detail.
+fn cluster_variable_internal((status, detail): (u16, String)) -> models::ProblemDetail {
+    problem(
+        "Cluster variable write failed",
+        500,
+        format!("({status}) {detail}"),
+    )
 }
 
 /// Validates a create/update metadata bag against the serialized-size cap
@@ -640,24 +929,12 @@ fn cluster_variable_metadata(
     Ok(metadata)
 }
 
-/// Nano stores cluster variables as plain JSON values only (Camunda 8.10
-/// `kind: JSON`). It has
-/// no secret stores, so a `SECRET_REFERENCE` variable is rejected rather than
-/// silently stored as JSON — which would hand the reference string to FEEL as a
-/// literal value.
-fn reject_unsupported_cluster_variable_kind(
-    kind: Option<&models::ClusterVariableKindEnum>,
-) -> Option<models::ProblemDetail> {
-    match kind {
-        None | Some(models::ClusterVariableKindEnum::Json) => None,
-        Some(other) => Some(problem(
-            "Unsupported cluster variable kind",
-            400,
-            format!("Cluster variable kind '{other}' is not supported by Nano; only JSON is."),
-        )),
-    }
-}
-
+// Nano accepts both Camunda 8.10 cluster-variable kinds (#1296). A
+// `SECRET_REFERENCE` variable's value is ordinary JSON that may carry
+// `camunda.secrets.<name>` reference text; it is stored and returned verbatim
+// and never resolved server-side — resolution happens at job activation,
+// host-side (upstream: the value "contain[s] camunda.secrets.X references that
+// are resolved at job activation time", `ClusterVariableKindEnum`).
 impl ServerImpl {
     /// POST /v2/cluster-variables/global — create a global-scoped cluster
     /// variable. 200 with the created resource, or 409 when one already exists.
@@ -666,23 +943,19 @@ impl ServerImpl {
         body: &models::CreateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::CreateGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::CreateGlobalClusterVariableResponse as Resp;
-        if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
-        }
         let metadata = match cluster_variable_metadata(&body.metadata) {
             Ok(m) => m,
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if let Some(stored) = self
-            .cluster_variables
-            .create(None, &body.name, value, metadata)
+        match self
+            .cluster_variable_create(None, &body.name, value, body.kind, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableCreated(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(Resp::Status409_AClusterVariableWithThisNameAlreadyExists(
+            )),
+            Err((409, _)) => Ok(Resp::Status409_AClusterVariableWithThisNameAlreadyExists(
                 problem(
                     "Cluster variable already exists",
                     409,
@@ -691,7 +964,12 @@ impl ServerImpl {
                         body.name
                     ),
                 ),
-            ))
+            )),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -704,24 +982,20 @@ impl ServerImpl {
         body: &models::CreateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::CreateTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::CreateTenantClusterVariableResponse as Resp;
-        if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
-        }
         let metadata = match cluster_variable_metadata(&body.metadata) {
             Ok(m) => m,
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if let Some(stored) =
-            self.cluster_variables
-                .create(Some(tenant), &body.name, value, metadata)
+        match self
+            .cluster_variable_create(Some(tenant), &body.name, value, body.kind, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableCreated(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(
+            )),
+            Err((409, _)) => Ok(
                 Resp::Status409_AClusterVariableWithThisNameAlreadyExistsForTheGivenTenant(
                     problem(
                         "Cluster variable already exists",
@@ -732,7 +1006,12 @@ impl ServerImpl {
                         ),
                     ),
                 ),
-            )
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -749,19 +1028,23 @@ impl ServerImpl {
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if let Some(stored) =
-            self.cluster_variables
-                .update(None, &path_params.name, value, metadata)
+        match self
+            .cluster_variable_update(None, &path_params.name, value, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+            )),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!("No global cluster variable named '{}'.", path_params.name),
-            )))
+            ))),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -780,22 +1063,26 @@ impl ServerImpl {
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if let Some(stored) =
-            self.cluster_variables
-                .update(Some(tenant), &path_params.name, value, metadata)
+        match self
+            .cluster_variable_update(Some(tenant), &path_params.name, value, metadata)
+            .await
         {
-            Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
+            Ok(stored) => Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
-            ))
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+            )),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!(
                     "No cluster variable named '{}' for tenant '{tenant}'.",
                     path_params.name
                 ),
-            )))
+            ))),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -806,7 +1093,7 @@ impl ServerImpl {
         path_params: &models::GetGlobalClusterVariablePathParams,
     ) -> Result<apis::cluster_variable::GetGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::GetGlobalClusterVariableResponse as Resp;
-        match self.cluster_variables.get(None, &path_params.name) {
+        match self.cluster_variable_get(None, &path_params.name).await {
             Some(v) => Ok(Resp::Status200_ClusterVariableFound(
                 cluster_variable_result(&v),
             )),
@@ -826,7 +1113,10 @@ impl ServerImpl {
     ) -> Result<apis::cluster_variable::GetTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::GetTenantClusterVariableResponse as Resp;
         let tenant = path_params.tenant_id.as_str();
-        match self.cluster_variables.get(Some(tenant), &path_params.name) {
+        match self
+            .cluster_variable_get(Some(tenant), &path_params.name)
+            .await
+        {
             Some(v) => Ok(Resp::Status200_ClusterVariableFound(
                 cluster_variable_result(&v),
             )),
@@ -848,14 +1138,18 @@ impl ServerImpl {
         path_params: &models::DeleteGlobalClusterVariablePathParams,
     ) -> Result<apis::cluster_variable::DeleteGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::DeleteGlobalClusterVariableResponse as Resp;
-        if self.cluster_variables.delete(None, &path_params.name) {
-            Ok(Resp::Status204_ClusterVariableDeletedSuccessfully)
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+        match self.cluster_variable_delete(None, &path_params.name).await {
+            Ok(()) => Ok(Resp::Status204_ClusterVariableDeletedSuccessfully),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!("No global cluster variable named '{}'.", path_params.name),
-            )))
+            ))),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -867,20 +1161,24 @@ impl ServerImpl {
     ) -> Result<apis::cluster_variable::DeleteTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::DeleteTenantClusterVariableResponse as Resp;
         let tenant = path_params.tenant_id.as_str();
-        if self
-            .cluster_variables
-            .delete(Some(tenant), &path_params.name)
+        match self
+            .cluster_variable_delete(Some(tenant), &path_params.name)
+            .await
         {
-            Ok(Resp::Status204_ClusterVariableDeletedSuccessfully)
-        } else {
-            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+            Ok(()) => Ok(Resp::Status204_ClusterVariableDeletedSuccessfully),
+            Err((404, _)) => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
                 format!(
                     "No cluster variable named '{}' for tenant '{tenant}'.",
                     path_params.name
                 ),
-            )))
+            ))),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                    cluster_variable_internal(e),
+                ),
+            ),
         }
     }
 
@@ -901,8 +1199,8 @@ impl ServerImpl {
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
 
         let mut matched: Vec<StoredClusterVariable> = self
-            .cluster_variables
-            .all()
+            .cluster_variable_all()
+            .await
             .into_iter()
             .filter(|v| match filter {
                 None => true,
@@ -934,12 +1232,12 @@ impl ServerImpl {
             |v, field| match field {
                 "name" => query::SortVal::Str(v.name.clone()),
                 "value" => query::SortVal::Str(cluster_variable_value_string(&v.value)),
-                "tenantId" => query::SortVal::Str(v.tenant_id.clone().unwrap_or_default()),
+                "tenantId" => query::opt_str_sort_val(v.tenant_id.as_deref()),
                 "scope" => {
                     let (scope_enum, _) = cluster_variable_scope(&v.tenant_id);
                     query::SortVal::Str(scope_enum.to_string())
                 }
-                _ => query::SortVal::Num(v.id as i64),
+                _ => query::SortVal::Num(v.id as i128),
             },
             |v| v.id,
         );
@@ -966,45 +1264,53 @@ mod cluster_variable_tests {
 
     use super::*;
 
-    fn store() -> ClusterVariableStore {
-        ClusterVariableStore::new(ClusterVariables::default())
+    fn store() -> ServerImpl {
+        ServerImpl::default()
     }
 
     fn val(j: serde_json::Value) -> Value {
         json_to_value(&j)
     }
 
-    #[test]
-    fn create_rejects_a_duplicate_scope_and_name() {
+    #[tokio::test]
+    async fn create_rejects_a_duplicate_scope_and_name() {
         let s = store();
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "region",
                 val(json!("EMEA")),
+                None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
         // Same (scope, name) again -> false, which the handler maps to 409.
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "region",
                 val(json!("APAC")),
+                None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_none()
         );
         // The rejected create left the stored value untouched.
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "region").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "region").await.unwrap().value
+            ),
             "\"EMEA\""
         );
     }
 
-    #[test]
-    fn create_and_update_return_a_race_free_snapshot() {
+    #[tokio::test]
+    async fn create_and_update_return_a_race_free_snapshot() {
         // Regression: the create/update handlers used to re-`get` the record
         // after releasing the mutation lock, so a concurrent DELETE between the
         // mutation and the lookup made `expect("just created"/"just updated")`
@@ -1014,12 +1320,14 @@ mod cluster_variable_tests {
         let s = store();
 
         let created = s
-            .create(
+            .cluster_variable_create(
                 Some("acme"),
                 "region",
                 val(json!("EMEA")),
+                None,
                 ClusterVariableMetadata::new(),
             )
+            .await
             .expect("create of a fresh (scope, name) returns the stored snapshot");
         assert_eq!(created.name, "region");
         assert_eq!(created.tenant_id.as_deref(), Some("acme"));
@@ -1027,177 +1335,317 @@ mod cluster_variable_tests {
 
         // A delete landing right after the mutation cannot invalidate the
         // snapshot already returned to the handler.
-        assert!(s.delete(Some("acme"), "region"));
-        assert!(s.get(Some("acme"), "region").is_none());
+        assert!(
+            s.cluster_variable_delete(Some("acme"), "region")
+                .await
+                .is_ok()
+        );
+        assert!(
+            s.cluster_variable_get(Some("acme"), "region")
+                .await
+                .is_none()
+        );
         assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
 
         // Update returns its own post-mutation snapshot the same way.
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "flag",
                 val(json!(false)),
+                None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
         let updated = s
-            .update(
+            .cluster_variable_update(
                 None,
                 "flag",
                 val(json!(true)),
                 ClusterVariableMetadata::new(),
             )
+            .await
             .expect("update of an existing (scope, name) returns the stored snapshot");
         assert_eq!(cluster_variable_value_string(&updated.value), "true");
-        assert!(s.delete(None, "flag"));
+        assert!(s.cluster_variable_delete(None, "flag").await.is_ok());
         assert_eq!(cluster_variable_value_string(&updated.value), "true");
     }
 
-    #[test]
-    fn global_and_tenant_scopes_are_isolated() {
+    #[tokio::test]
+    async fn global_and_tenant_scopes_are_isolated() {
         let s = store();
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "region",
                 val(json!("global")),
+                None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 Some("acme"),
                 "region",
                 val(json!("acme")),
+                None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
-        assert_eq!(s.all().len(), 2);
+        assert_eq!(s.cluster_variable_all().await.len(), 2);
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "region").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "region").await.unwrap().value
+            ),
             "\"global\""
         );
         assert_eq!(
-            cluster_variable_value_string(&s.get(Some("acme"), "region").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(Some("acme"), "region")
+                    .await
+                    .unwrap()
+                    .value
+            ),
             "\"acme\""
         );
         // A lookup never crosses scopes.
-        assert!(s.get(Some("other"), "region").is_none());
+        assert!(
+            s.cluster_variable_get(Some("other"), "region")
+                .await
+                .is_none()
+        );
     }
 
-    #[test]
-    fn update_requires_an_existing_entry() {
+    #[tokio::test]
+    async fn update_requires_an_existing_entry() {
         let s = store();
         // Update of a missing var -> false, which the handler maps to 404.
         assert!(
-            s.update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+            s.cluster_variable_update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+                .await
+                .ok()
                 .is_none()
         );
         assert!(
-            s.create(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
-                .is_some()
+            s.cluster_variable_create(
+                None,
+                "ghost",
+                val(json!(1)),
+                None,
+                ClusterVariableMetadata::new()
+            )
+            .await
+            .ok()
+            .is_some()
         );
         assert!(
-            s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new())
+            s.cluster_variable_update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new())
+                .await
+                .ok()
                 .is_some()
         );
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "ghost").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "ghost").await.unwrap().value
+            ),
             "2"
         );
     }
 
-    #[test]
-    fn delete_reports_absence() {
+    #[tokio::test]
+    async fn delete_reports_absence() {
         let s = store();
-        assert!(!s.delete(None, "nope"));
+        assert!(!s.cluster_variable_delete(None, "nope").await.is_ok());
         assert!(
-            s.create(
+            s.cluster_variable_create(
                 None,
                 "nope",
                 val(json!(true)),
+                None,
                 ClusterVariableMetadata::new()
             )
+            .await
+            .ok()
             .is_some()
         );
-        assert!(s.delete(None, "nope"));
-        assert!(s.get(None, "nope").is_none());
+        assert!(s.cluster_variable_delete(None, "nope").await.is_ok());
+        assert!(s.cluster_variable_get(None, "nope").await.is_none());
     }
 
-    #[test]
-    fn empty_object_value_round_trips() {
+    #[tokio::test]
+    async fn empty_object_value_round_trips() {
         let s = store();
         assert!(
-            s.create(None, "cfg", val(json!({})), ClusterVariableMetadata::new())
-                .is_some()
+            s.cluster_variable_create(
+                None,
+                "cfg",
+                val(json!({})),
+                None,
+                ClusterVariableMetadata::new()
+            )
+            .await
+            .ok()
+            .is_some()
         );
         assert_eq!(
-            cluster_variable_value_string(&s.get(None, "cfg").unwrap().value),
+            cluster_variable_value_string(
+                &s.cluster_variable_get(None, "cfg").await.unwrap().value
+            ),
             "{}"
         );
     }
 
-    #[test]
-    fn mutations_sync_the_shared_runtime_snapshot() {
-        let runtime = ClusterVariables::default();
-        let s = ClusterVariableStore::new(runtime.clone());
-        s.create(
-            None,
-            "region",
-            val(json!("EMEA")),
-            ClusterVariableMetadata::new(),
+    /// #1657: a REST mutation is a replicated command on EVERY partition —
+    /// the authoritative partition 0 plus an idempotent copy on each other one
+    /// — so each partition's FEEL resolution reads the same log-derived state
+    /// (no node-local host store), and a delete clears every copy.
+    #[tokio::test]
+    async fn mutations_land_in_every_partition_engine_state() {
+        let s = build_server_in_memory(
+            vec![
+                Journal::in_memory_partition(0),
+                Journal::in_memory_partition(1),
+            ],
+            cluster::Topology::single(2),
         );
-        s.create(
-            Some(DEFAULT_TENANT),
-            "tier",
-            val(json!(2)),
-            ClusterVariableMetadata::new(),
+        assert!(
+            s.cluster_variable_create(
+                None,
+                "region",
+                val(json!("EMEA")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .is_ok()
         );
-        {
-            let snap = runtime.read().unwrap();
-            assert_eq!(snap.global.get("region"), Some(&val(json!("EMEA"))));
+        assert!(
+            s.cluster_variable_create(
+                Some(DEFAULT_TENANT),
+                "tier",
+                val(json!(2)),
+                Some(models::ClusterVariableKindEnum::SecretReference),
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            s.cluster_variable_update(
+                None,
+                "region",
+                val(json!("APAC")),
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .is_ok()
+        );
+        let states: Vec<_> = futures_util::future::join_all(
+            s.engine
+                .all()
+                .iter()
+                .map(|h| h.with(|j| j.engine().cluster_variables().clone())),
+        )
+        .await;
+        assert_eq!(states.len(), 2);
+        for state in &states {
             assert_eq!(
-                snap.tenants.get(DEFAULT_TENANT).and_then(|m| m.get("tier")),
-                Some(&val(json!(2)))
+                state.get(None, "region").map(|v| v.value.clone()),
+                Some(val(json!("APAC")))
+            );
+            let tier = state.get(Some(DEFAULT_TENANT), "tier").expect("fanned out");
+            assert_eq!(tier.value, val(json!(2)));
+            assert_eq!(
+                tier.kind,
+                nanobpmn_engine_core::ClusterVariableKind::SecretReference,
+                "the kind is replicated with the value"
             );
         }
-        s.delete(None, "region");
-        assert!(!runtime.read().unwrap().global.contains_key("region"));
+        // The fanned-out copy is never a 409 source: a second create is
+        // validated only on the authoritative partition.
+        assert_eq!(
+            s.cluster_variable_create(
+                None,
+                "region",
+                val(json!("x")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .0,
+            409
+        );
+        assert!(s.cluster_variable_delete(None, "region").await.is_ok());
+        for h in s.engine.all() {
+            assert!(
+                h.with(|j| j.engine().cluster_variables().get(None, "region").is_none())
+                    .await
+            );
+        }
+        assert_eq!(
+            s.cluster_variable_delete(None, "region")
+                .await
+                .unwrap_err()
+                .0,
+            404
+        );
     }
 
-    #[test]
-    fn result_projection_reports_scope_and_tenant() {
+    #[tokio::test]
+    async fn result_projection_reports_scope_and_tenant() {
         let s = store();
-        s.create(None, "g", val(json!("x")), ClusterVariableMetadata::new());
-        s.create(
+        s.cluster_variable_create(
+            None,
+            "g",
+            val(json!("x")),
+            None,
+            ClusterVariableMetadata::new(),
+        )
+        .await
+        .ok();
+        s.cluster_variable_create(
             Some("acme"),
             "t",
             val(json!("y")),
+            None,
             ClusterVariableMetadata::new(),
-        );
-        let g = cluster_variable_result(&s.get(None, "g").unwrap());
+        )
+        .await
+        .ok();
+        let g = cluster_variable_result(&s.cluster_variable_get(None, "g").await.unwrap());
         assert_eq!(g.scope, models::ClusterVariableScopeEnum::Global);
         assert_eq!(g.tenant_id, types::Nullable::Null);
         assert_eq!(g.value, "\"x\"");
-        let t = cluster_variable_result(&s.get(Some("acme"), "t").unwrap());
+        let t = cluster_variable_result(&s.cluster_variable_get(Some("acme"), "t").await.unwrap());
         assert_eq!(t.scope, models::ClusterVariableScopeEnum::Tenant);
         assert_eq!(t.tenant_id, types::Nullable::Present("acme".to_string()));
     }
 
-    #[test]
-    fn search_result_truncates_long_values() {
+    #[tokio::test]
+    async fn search_result_truncates_long_values() {
         let s = store();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        s.create(
+        s.cluster_variable_create(
             None,
             "big",
             val(json!(long)),
+            None,
             ClusterVariableMetadata::new(),
-        );
-        let stored = s.get(None, "big").unwrap();
+        )
+        .await
+        .ok();
+        let stored = s.cluster_variable_get(None, "big").await.unwrap();
         assert!(cluster_variable_search_result(&stored, true).is_truncated);
         assert!(!cluster_variable_search_result(&stored, false).is_truncated);
     }
@@ -1342,7 +1790,7 @@ mod cluster_variable_tests {
             Create::Status400_TheProvidedDataIsNotValid(_)
         ));
         assert!(
-            server.cluster_variables.get(None, "big").is_none(),
+            server.cluster_variable_get(None, "big").await.is_none(),
             "nothing stored"
         );
         assert!(matches!(
@@ -1364,31 +1812,464 @@ mod cluster_variable_tests {
         ));
         assert_eq!(
             cluster_variable_value_string(
-                &server.cluster_variables.get(None, "small").unwrap().value
+                &server
+                    .cluster_variable_get(None, "small")
+                    .await
+                    .unwrap()
+                    .value
             ),
             "\"v\"",
             "a rejected update leaves the variable untouched"
         );
     }
 
+    /// #1296: a `kind: SECRET_REFERENCE` create is ACCEPTED (Camunda 8.10
+    /// `ClusterVariableKindEnum`), its value stored verbatim — the
+    /// `camunda.secrets.<name>` reference text round-trips through create, get
+    /// and search untouched (Nano never resolves it server-side), and the
+    /// stored `kind` is projected on every result.
+    #[tokio::test]
+    async fn secret_reference_kind_round_trips_verbatim() {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Create;
+        use apis::cluster_variable::CreateTenantClusterVariableResponse as CreateTenant;
+        use apis::cluster_variable::GetGlobalClusterVariableResponse as Get;
+        let server = ServerImpl::default();
+        let mut req = create_req("api_token", None);
+        req.value = types::Object(json!("camunda.secrets.API_TOKEN"));
+        req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
+        let Create::Status200_ClusterVariableCreated(created) = server
+            .create_global_cluster_variable_impl(&req)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for a SECRET_REFERENCE create");
+        };
+        assert_eq!(
+            created.kind,
+            models::ClusterVariableKindEnum::SecretReference
+        );
+        assert_eq!(
+            created.value, "\"camunda.secrets.API_TOKEN\"",
+            "the reference text is stored and returned verbatim, never resolved"
+        );
+        let path = models::GetGlobalClusterVariablePathParams {
+            name: "api_token".to_string(),
+        };
+        let Get::Status200_ClusterVariableFound(got) = server
+            .get_global_cluster_variable_impl(&path)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(got.kind, models::ClusterVariableKindEnum::SecretReference);
+        assert_eq!(got.value, "\"camunda.secrets.API_TOKEN\"");
+
+        // Tenant-scoped create accepts the kind too.
+        let tenant_path = models::CreateTenantClusterVariablePathParams {
+            tenant_id: "acme".to_string(),
+        };
+        let CreateTenant::Status200_ClusterVariableCreated(created) = server
+            .create_tenant_cluster_variable_impl(&tenant_path, &req)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for a tenant-scoped SECRET_REFERENCE create");
+        };
+        assert_eq!(
+            created.kind,
+            models::ClusterVariableKindEnum::SecretReference
+        );
+
+        // The replicated engine state carries the reference text through
+        // unchanged — nothing resolved is ever handed to the engine.
+        let state = server.cluster_variable_state().await;
+        assert_eq!(
+            state.get(None, "api_token").map(|v| v.value.clone()),
+            Some(val(json!("camunda.secrets.API_TOKEN"))),
+            "the engine state sees the reference text verbatim"
+        );
+    }
+
+    /// PR #1670 review: an update's response (and the fan-out copy built from
+    /// it) must carry the variable's PRESERVED kind from the proposal's own
+    /// commit — never a live-state re-read, which a concurrent delete/recreate
+    /// could swap under it (combining the new value with a replacement's
+    /// kind). Pin the observable contract: updating a SECRET_REFERENCE
+    /// variable returns `kind: SECRET_REFERENCE` with the new value, and a
+    /// delete-then-recreate as JSON leaves the PRIOR update's response kind
+    /// untouched.
+    #[tokio::test]
+    async fn update_response_preserves_the_committed_kind() {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Create;
+        use apis::cluster_variable::DeleteGlobalClusterVariableResponse as Delete;
+        use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Update;
+        let server = ServerImpl::default();
+        let mut req = create_req("api_token", None);
+        req.value = types::Object(json!("camunda.secrets.API_TOKEN"));
+        req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
+        let Create::Status200_ClusterVariableCreated(_) = server
+            .create_global_cluster_variable_impl(&req)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for a SECRET_REFERENCE create");
+        };
+
+        // The update response carries the preserved SECRET_REFERENCE kind with
+        // the new value — derived from the update's own commit, not re-read.
+        let upd = models::UpdateGlobalClusterVariablePathParams {
+            name: "api_token".to_string(),
+        };
+        let mut update = update_req(None);
+        update.value = types::Object(json!("camunda.secrets.ROTATED"));
+        let Update::Status200_ClusterVariableUpdatedSuccessfully(r) = server
+            .update_global_cluster_variable_impl(&upd, &update)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for the update");
+        };
+        assert_eq!(
+            r.kind,
+            models::ClusterVariableKindEnum::SecretReference,
+            "an update preserves the stored kind"
+        );
+        assert_eq!(r.value, "\"camunda.secrets.ROTATED\"");
+
+        // A delete/recreate as JSON changes the STORED kind, but the already
+        // returned update response above is immutable — and the new state is
+        // what later reads see.
+        let del = models::DeleteGlobalClusterVariablePathParams {
+            name: "api_token".to_string(),
+        };
+        let Delete::Status204_ClusterVariableDeletedSuccessfully = server
+            .delete_global_cluster_variable_impl(&del)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 204 for the delete");
+        };
+        let mut recreate = create_req("api_token", None);
+        recreate.value = types::Object(json!({"endpoint": "https://api"}));
+        let Create::Status200_ClusterVariableCreated(r) = server
+            .create_global_cluster_variable_impl(&recreate)
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200 for the recreate");
+        };
+        assert_eq!(r.kind, models::ClusterVariableKindEnum::Json);
+        assert_eq!(r.value, "{\"endpoint\":\"https://api\"}");
+    }
+
+    /// #1640 harness: a server with an in-memory secret store, a
+    /// SECRET_REFERENCE cluster variable `apiCfg` and a JSON-kind `jsonCfg`
+    /// (both holding `camunda.secrets.TOKEN`), and a deployed service task
+    /// whose input mappings read them, a literal `camunda.secrets.<direct>`
+    /// path, and a process variable carrying reference text.
+    async fn secret_job_server(direct: &str) -> ServerImpl {
+        secret_job_server_with(direct, Vec::new()).await
+    }
+
+    /// [`secret_job_server`] with extra process variables layered over the
+    /// default `bodyRef` request-body variable.
+    async fn secret_job_server_with(
+        direct: &str,
+        extra_vars: Vec<(&str, serde_json::Value)>,
+    ) -> ServerImpl {
+        use nanobpmn_engine_core::{IoMapping, Mapping};
+        let server = ServerImpl {
+            secret_store: Arc::new(crate::secrets::MapSecretStore(
+                std::collections::BTreeMap::from([
+                    ("TOKEN".to_string(), "s3cr3t".to_string()),
+                    ("DIRECT".to_string(), "direct-value".to_string()),
+                ]),
+            )),
+            ..ServerImpl::default()
+        };
+        for (name, kind) in [
+            ("apiCfg", models::ClusterVariableKindEnum::SecretReference),
+            ("jsonCfg", models::ClusterVariableKindEnum::Json),
+        ] {
+            let mut req = create_req(name, None);
+            req.value = types::Object(json!("camunda.secrets.TOKEN"));
+            req.kind = Some(kind);
+            assert!(matches!(
+                server
+                    .create_global_cluster_variable_impl(&req)
+                    .await
+                    .unwrap(),
+                apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+            ));
+        }
+        let m = |source: &str, target: &str| Mapping {
+            source: source.to_string(),
+            target: target.to_string(),
+        };
+        let process = ProcessBuilder::new("secrets")
+            .start_event("s")
+            .service_task("call", "call-api")
+            .end_event("e")
+            .connect("s", "call")
+            .connect("call", "e")
+            .with_io(
+                "call",
+                IoMapping {
+                    inputs: vec![
+                        m("=apiCfg", "token"),
+                        m(&format!("=camunda.secrets.{direct}"), "direct"),
+                        m("=jsonCfg", "fromJson"),
+                        m("=bodyRef", "fromBody"),
+                        m("=apiCfg", "payload.auth"),
+                        m("=bodyRef", "payload.other"),
+                        m("=apiCfg", "overwritten"),
+                        m("=bodyRef", "overwritten"),
+                    ],
+                    outputs: Vec::new(),
+                },
+            )
+            .build()
+            .unwrap();
+        let names =
+            std::collections::HashMap::from([("secrets".to_string(), "secrets.bpmn".to_string())]);
+        server
+            .deploy_resources_locally(
+                vec![process],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .unwrap();
+        server
+            .create_for_stream(
+                Some("secrets".into()),
+                None,
+                std::iter::once(("bodyRef", json!("camunda.secrets.TOKEN")))
+                    .chain(extra_vars)
+                    .map(|(name, value)| (name.to_string(), val(value)))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        server
+    }
+
+    async fn activate_secret_jobs(server: &ServerImpl) -> Vec<models::ActivatedJobResult> {
+        use apis::job::ActivateJobsResponse as ActR;
+        let mut req = models::JobActivationRequest::new("call-api".into(), 60_000, 10);
+        req.request_timeout = Some(-1);
+        match server.activate_jobs_impl(&req).await.unwrap() {
+            ActR::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200, got {other:?}"),
+        }
+    }
+
+    /// #1640: at job activation, trusted references (a SECRET_REFERENCE
+    /// cluster variable read by an input mapping, a literal
+    /// `camunda.secrets.<name>` path) are resolved into the worker payload;
+    /// untrusted ones (a JSON-kind cluster variable, a process variable) keep
+    /// their reference text; and nothing resolved reaches engine state.
+    #[tokio::test]
+    async fn job_activation_resolves_only_trusted_secret_references() {
+        let server = secret_job_server("DIRECT").await;
+        let jobs = activate_secret_jobs(&server).await;
+        assert_eq!(jobs.len(), 1);
+        let vars = &jobs[0].variables;
+        assert_eq!(vars["token"].0, json!("s3cr3t"));
+        assert_eq!(vars["direct"].0, json!("direct-value"));
+        assert_eq!(vars["fromJson"].0, json!("camunda.secrets.TOKEN"));
+        assert_eq!(vars["fromBody"].0, json!("camunda.secrets.TOKEN"));
+        assert_eq!(
+            vars["payload"].0,
+            json!({"auth": "s3cr3t", "other": "camunda.secrets.TOKEN"}),
+            "only the trusted path resolves — never a sibling holding equal text"
+        );
+        assert_eq!(
+            vars["overwritten"].0,
+            json!("camunda.secrets.TOKEN"),
+            "a trusted target overwritten by a later untrusted mapping stays unresolved"
+        );
+        assert_eq!(
+            vars["apiCfg"].0,
+            json!("camunda.secrets.TOKEN"),
+            "the bare cluster-variable overlay is not an input mapping: never resolved"
+        );
+
+        // Engine state (and so the journal/snapshot) still holds only the
+        // reference text — the plaintext lives in the worker payload alone.
+        let leaked = server.engine.all()[0]
+            .with(|j| {
+                format!(
+                    "{:?}",
+                    j.state()
+                        .instances
+                        .values()
+                        .map(|i| (i.variables.clone(), i.scope_variables.clone()))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .await;
+        assert!(leaked.contains("camunda.secrets.TOKEN"));
+        assert!(
+            !leaked.contains("s3cr3t") && !leaked.contains("direct-value"),
+            "a resolved secret must never be persisted in engine state: {leaked}"
+        );
+    }
+
+    /// #1640: trust is fixed when the input mappings run. Deleting the
+    /// SECRET_REFERENCE cluster variable afterwards neither withholds the job
+    /// nor raises an incident; recreating a deleted root as JSON-kind cannot
+    /// retroactively distrust or trust anything either.
+    #[tokio::test]
+    async fn job_activation_uses_mapping_time_provenance_not_live_cluster_variables() {
+        let server = secret_job_server("DIRECT").await;
+        assert!(server.cluster_variable_delete(None, "apiCfg").await.is_ok());
+        let jobs = activate_secret_jobs(&server).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].variables["token"].0, json!("s3cr3t"));
+    }
+
+    /// #1640: a process variable shadowing the trusted cluster root (same
+    /// name, same reference text) is untrusted — the mapping read the
+    /// caller-supplied value, so it is never resolved.
+    #[tokio::test]
+    async fn job_activation_does_not_resolve_a_shadowing_process_variable() {
+        let server =
+            secret_job_server_with("DIRECT", vec![("apiCfg", json!("camunda.secrets.TOKEN"))])
+                .await;
+        let jobs = activate_secret_jobs(&server).await;
+        assert_eq!(jobs.len(), 1);
+        let vars = &jobs[0].variables;
+        assert_eq!(vars["token"].0, json!("camunda.secrets.TOKEN"));
+        assert_eq!(vars["payload"].0["auth"], json!("camunda.secrets.TOKEN"));
+        assert_eq!(
+            vars["direct"].0,
+            json!("direct-value"),
+            "a literal camunda.secrets path is unaffected by the shadow"
+        );
+    }
+
+    /// #1640: an unresolvable trusted secret raises an incident on the element
+    /// with Zeebe's message instead of handing the worker the literal.
+    #[tokio::test]
+    async fn job_activation_with_missing_secret_raises_an_incident() {
+        let server = secret_job_server("MISSING").await;
+        let jobs = activate_secret_jobs(&server).await;
+        assert!(jobs.is_empty(), "the job is withheld from the worker");
+        let incidents = server.engine.all()[0]
+            .with(|j| {
+                j.state()
+                    .incidents
+                    .values()
+                    .map(|i| (i.element_id.clone(), i.reason.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        assert_eq!(
+            incidents,
+            vec![(
+                "call".to_string(),
+                "Failed to resolve secret 'MISSING' from default. Ensure the secret exists and the store is available, then resolve the incident to retry.".to_string()
+            )]
+        );
+        assert!(
+            activate_secret_jobs(&server).await.is_empty(),
+            "the failed job is no longer activatable"
+        );
+    }
+
+    /// #1296: the `kind` search filter distinguishes the two kinds once
+    /// SECRET_REFERENCE variables exist (previously every variable was JSON, so
+    /// the SECRET_REFERENCE filter trivially matched nothing).
+    #[tokio::test]
+    async fn search_kind_filter_distinguishes_secret_references() {
+        let server = ServerImpl::default();
+        server
+            .cluster_variable_create(
+                None,
+                "plain",
+                val(json!(1)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        let mut req = create_req("token", None);
+        req.value = types::Object(json!("camunda.secrets.TOKEN"));
+        req.kind = Some(models::ClusterVariableKindEnum::SecretReference);
+        assert!(matches!(
+            server
+                .create_global_cluster_variable_impl(&req)
+                .await
+                .unwrap(),
+            apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+
+        let kind =
+            |k: models::ClusterVariableKindEnum| models::ClusterVariableSearchQueryFilterRequest {
+                kind: Some(models::ClusterVariableKindFilterProperty::ClusterVariableKindEnum(k)),
+                ..models::ClusterVariableSearchQueryFilterRequest::new()
+            };
+        let r = run_search(
+            &server,
+            None,
+            Some(kind(models::ClusterVariableKindEnum::Json)),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(names(&r), vec!["plain"]);
+        let r = run_search(
+            &server,
+            None,
+            Some(kind(models::ClusterVariableKindEnum::SecretReference)),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(names(&r), vec!["token"]);
+        assert_eq!(
+            r.items[0].value, "\"camunda.secrets.TOKEN\"",
+            "search returns the reference text verbatim"
+        );
+    }
+
     #[tokio::test]
     async fn search_filters_by_kind_and_metadata() {
         let server = ServerImpl::default();
-        server.cluster_variables.create(
-            None,
-            "a",
-            val(json!(1)),
-            meta(json!({"owner": "team-a", "ttl": 30})),
-        );
-        server.cluster_variables.create(
-            None,
-            "b",
-            val(json!(2)),
-            meta(json!({"owner": "team-b", "ttl": "30"})),
-        );
         server
-            .cluster_variables
-            .create(None, "c", val(json!(3)), ClusterVariableMetadata::new());
+            .cluster_variable_create(
+                None,
+                "a",
+                val(json!(1)),
+                None,
+                meta(json!({"owner": "team-a", "ttl": 30})),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                None,
+                "b",
+                val(json!(2)),
+                None,
+                meta(json!({"owner": "team-b", "ttl": "30"})),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                None,
+                "c",
+                val(json!(3)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
 
         let kind =
             |k: models::ClusterVariableKindEnum| models::ClusterVariableSearchQueryFilterRequest {
@@ -1456,24 +2337,36 @@ mod cluster_variable_tests {
     #[tokio::test]
     async fn search_filters_by_scope_and_tenant() {
         let server = ServerImpl::default();
-        server.cluster_variables.create(
-            None,
-            "region",
-            val(json!("global")),
-            ClusterVariableMetadata::new(),
-        );
-        server.cluster_variables.create(
-            Some("acme"),
-            "region",
-            val(json!("acme")),
-            ClusterVariableMetadata::new(),
-        );
-        server.cluster_variables.create(
-            Some("beta"),
-            "tier",
-            val(json!(2)),
-            ClusterVariableMetadata::new(),
-        );
+        server
+            .cluster_variable_create(
+                None,
+                "region",
+                val(json!("global")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                Some("acme"),
+                "region",
+                val(json!("acme")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                Some("beta"),
+                "tier",
+                val(json!(2)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
 
         // scope = GLOBAL matches only the global-scoped variable.
         let global_only = models::ClusterVariableSearchQueryFilterRequest {
@@ -1522,18 +2415,26 @@ mod cluster_variable_tests {
     async fn search_is_truncated_filter_is_independent_of_truncate_values() {
         let server = ServerImpl::default();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        server.cluster_variables.create(
-            None,
-            "big",
-            val(json!(long)),
-            ClusterVariableMetadata::new(),
-        );
-        server.cluster_variables.create(
-            None,
-            "small",
-            val(json!("x")),
-            ClusterVariableMetadata::new(),
-        );
+        server
+            .cluster_variable_create(
+                None,
+                "big",
+                val(json!(long)),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
+        server
+            .cluster_variable_create(
+                None,
+                "small",
+                val(json!("x")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .ok();
 
         // The `isTruncated` filter is a *storage* characteristic (spec), so it
         // must not depend on the response-only `truncateValues`. This in-memory
@@ -1582,8 +2483,15 @@ mod cluster_variable_tests {
         let server = ServerImpl::default();
         for n in ["charlie", "alpha", "bravo"] {
             server
-                .cluster_variables
-                .create(None, n, val(json!(n)), ClusterVariableMetadata::new());
+                .cluster_variable_create(
+                    None,
+                    n,
+                    val(json!(n)),
+                    None,
+                    ClusterVariableMetadata::new(),
+                )
+                .await
+                .ok();
         }
 
         let sort_by_name_asc = vec![models::ClusterVariableSearchQuerySortRequest {
@@ -1641,6 +2549,125 @@ mod cluster_variable_tests {
         )
         .await;
         assert_eq!(names(&page2_again), names(&page2));
+    }
+
+    /// PR #1670 review: the mutation response must be the record THIS command
+    /// committed, derived from its own events — not a re-read of live state a
+    /// concurrent mutation could have changed in between.
+    #[tokio::test]
+    async fn mutation_returns_the_committed_record_from_its_own_events() {
+        let s = store();
+        let created = s
+            .cluster_variable_create(
+                None,
+                "region",
+                val(json!("EMEA")),
+                None,
+                ClusterVariableMetadata::new(),
+            )
+            .await
+            .expect("create succeeds");
+        assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
+        assert_eq!(created.kind, models::ClusterVariableKindEnum::Json);
+        assert_ne!(created.id, 0, "the id is filled in from the apply");
+
+        let mut metadata = ClusterVariableMetadata::new();
+        metadata.insert(
+            "owner".to_string(),
+            models::ClusterVariableResultBaseMetadataValue::String("ops".to_string()),
+        );
+        let updated = s
+            .cluster_variable_update(None, "region", val(json!("APAC")), metadata)
+            .await
+            .expect("update succeeds");
+        assert_eq!(cluster_variable_value_string(&updated.value), "\"APAC\"");
+        assert_eq!(
+            updated.id, created.id,
+            "an update preserves the id (and the response carries it)"
+        );
+
+        // A delete commits and reports `None` without any post-commit lookup.
+        s.cluster_variable_delete(None, "region")
+            .await
+            .expect("delete succeeds");
+        assert!(s.cluster_variable_get(None, "region").await.is_none());
+    }
+
+    /// PR #1670 review: after a failover this node can LEAD a partition it does
+    /// not statically own, and the post-apply read-back must reach that
+    /// partition's Raft replica actor via `engine_handle_for` — not
+    /// `local_for_partition`, which returns `None` for a promoted partition and
+    /// would report the committed write as an error. The non-Raft apply funnel
+    /// cannot target a non-owned partition in a test (its `by_key` falls back to
+    /// an owned actor), so this pins the accessor contract the fix relies on:
+    /// `engine_handle_for` serves a led-but-not-owned partition from its replica
+    /// actor where `local_for_partition` does not.
+    #[tokio::test]
+    async fn engine_handle_for_reaches_a_promoted_partitions_replica_actor() {
+        // This node owns partition 0 and merely REPLICATES partition 1.
+        let owned = Journal::in_memory_partition(0);
+        let mut replica = Journal::in_memory_partition(1);
+        // Seed the replica (as its replicated apply would) with the variable the
+        // promoted partition holds, so the read-back has something to find.
+        let (_events, seed_commit) = replica
+            .apply_command_at(
+                Command::CreateClusterVariable {
+                    tenant_id: None,
+                    name: "promoted".to_string(),
+                    value: val(json!(42)),
+                    kind: nanobpmn_engine_core::ClusterVariableKind::Json,
+                    metadata: Default::default(),
+                    distributed: true,
+                },
+                1,
+            )
+            .expect("seed the replica's cluster variable");
+        seed_commit.blocking_wait();
+        let replica_id = replica
+            .engine()
+            .cluster_variables()
+            .get(None, "promoted")
+            .map(|v| v.id);
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 2,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![owned], topology);
+        // As raft_bootstrap would: host the follower replica engine for p1.
+        let replica_handle = DeepthiHandle::spawn(replica, 1, None);
+        server
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(1, replica_handle);
+
+        // The pre-fix accessor finds nothing for the non-owned partition…
+        assert!(
+            server.engine.local_for_partition(1).is_none(),
+            "partition 1 is not statically owned here"
+        );
+        // …but the F5 accessor reaches its replica actor and reads the value.
+        let handle = server
+            .engine_handle_for(1)
+            .expect("engine_handle_for serves a led-but-not-owned partition");
+        let read = handle
+            .with(|j| {
+                j.engine()
+                    .cluster_variables()
+                    .get(None, "promoted")
+                    .map(|v| (v.id, cluster_variable_value_string(&v.value)))
+            })
+            .await;
+        assert_eq!(
+            read,
+            replica_id.map(|id| (id, "42".to_string())),
+            "the replica actor serves partition 1's cluster variable"
+        );
     }
 }
 
@@ -1902,6 +2929,82 @@ enum RoutedApply {
     Failed(u16, String),
 }
 
+/// Classified outcome of ONE delivery attempt of a routed cross-partition
+/// follow-up (#1582) — the decision [`ServerImpl::route_with_redrive`] retries on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteAttempt {
+    /// Applied by the target partition's writer.
+    Delivered,
+    /// Permanently rejected (a 4xx): retrying cannot help, so the re-drive stops.
+    Rejected(u16, String),
+    /// Not delivered for a reason a later attempt can overcome — no reachable
+    /// leader, link down / timeout, a 503 leader race, any 5xx. Retried.
+    Transient(String),
+}
+
+impl RouteAttempt {
+    /// Classifies a write-path status: 2xx delivered, 4xx permanent, anything
+    /// else (5xx, incl. the 503 leader race) transient.
+    fn from_status(status: u16, message: String) -> Self {
+        match status {
+            200..=299 => RouteAttempt::Delivered,
+            400..=499 => RouteAttempt::Rejected(status, message),
+            _ => RouteAttempt::Transient(format!("status {status}: {message}")),
+        }
+    }
+
+    /// Classifies a forwarded attempt's peer reply; every transport failure
+    /// (connect, link closed, per-attempt timeout) is transient.
+    fn from_peer(
+        result: Result<nano_server_raft::peer::PeerResult, nano_server_raft::peer::PeerError>,
+    ) -> Self {
+        match result {
+            Ok(reply) => {
+                let message = reply
+                    .body
+                    .as_ref()
+                    .map(|b| b.as_str().map_or_else(|| b.to_string(), str::to_owned))
+                    .unwrap_or_default();
+                Self::from_status(reply.status, message)
+            }
+            Err(e) => RouteAttempt::Transient(e.to_string()),
+        }
+    }
+}
+
+/// Bounded re-drive budget for routed cross-partition follow-ups (#1582):
+/// exponential backoff from `base` capped at `cap`, at most `max_attempts`
+/// deliveries — long enough to ride out a Raft leader election, bounded so a
+/// permanently unreachable partition cannot pin the pump forever.
+struct RouteRedrive {
+    max_attempts: u32,
+    base: std::time::Duration,
+    cap: std::time::Duration,
+}
+
+impl RouteRedrive {
+    /// The sleep before attempt number `attempt` (`attempt >= 1`).
+    fn backoff(&self, attempt: u32) -> std::time::Duration {
+        let factor = 1u32 << attempt.saturating_sub(1).min(16);
+        self.base.saturating_mul(factor).min(self.cap)
+    }
+}
+
+const ROUTE_REDRIVE: RouteRedrive = RouteRedrive {
+    max_attempts: 16,
+    base: std::time::Duration::from_millis(50),
+    cap: std::time::Duration::from_secs(1),
+};
+
+/// How long ONE routing attempt observes a LOCAL Raft proposal before giving
+/// up and letting the re-drive retry (#1582). Detached from the write itself —
+/// the proposal still completes (or is answered by the batcher on a leadership
+/// change) on its own; this only bounds how long the routing pump (and through
+/// it the clock loop) waits on a leader that may have silently lost quorum.
+/// Sized with the write-forward fast deadline (2.5s) so one attempt rides out a
+/// healthy commit round-trip yet fails fast enough for the bounded re-drive.
+const ROUTE_ATTEMPT_OBSERVE: std::time::Duration = std::time::Duration::from_millis(2500);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobMetricStatus {
     Completed,
@@ -1942,10 +3045,32 @@ struct JobErrorEntry {
 /// errors). `created` counts come from the read model. Shared across
 /// `ServerImpl` clones via `Arc`, like the other interior-mutable state on the
 /// struct.
-#[derive(Clone, Default)]
+///
+/// The logs are ephemeral (lost on restart) and bounded (oldest evicted past
+/// `capacity`), so an aggregation can under-report. `isIncomplete` (#934) is
+/// derived from two boundaries tracked here: `recording_since_ms` (when this
+/// process began recording — anything earlier was never seen by this log) and
+/// the eviction high-water mark (the latest `at_ms` ever evicted). A window
+/// `[from, to]` is complete iff `from` is at/after the recording start and
+/// strictly after every evicted entry.
+#[derive(Clone)]
 pub struct JobStatisticsState {
     metrics: Arc<std::sync::Mutex<std::collections::VecDeque<JobMetricEntry>>>,
     errors: Arc<std::sync::Mutex<std::collections::VecDeque<JobErrorEntry>>>,
+    /// Epoch ms this process started recording (restart boundary).
+    recording_since_ms: u64,
+    /// Latest `at_ms` evicted from `metrics`, `None` if nothing was evicted.
+    metrics_evicted_through_ms: Arc<std::sync::Mutex<Option<u64>>>,
+    /// Latest `at_ms` evicted from `errors`, `None` if nothing was evicted.
+    errors_evicted_through_ms: Arc<std::sync::Mutex<Option<u64>>>,
+    /// Per-log entry ceiling (`MAX_JOB_STAT_ENTRIES` in production).
+    capacity: usize,
+}
+
+impl Default for JobStatisticsState {
+    fn default() -> Self {
+        Self::with_limits(now_millis(), MAX_JOB_STAT_ENTRIES)
+    }
 }
 
 /// Safety ceiling on each in-memory job-statistics log so a long-running gateway
@@ -1969,11 +3094,48 @@ impl JobStatisticsState {
         self.errors.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn with_limits(recording_since_ms: u64, capacity: usize) -> Self {
+        Self {
+            metrics: Arc::default(),
+            errors: Arc::default(),
+            recording_since_ms,
+            metrics_evicted_through_ms: Arc::default(),
+            errors_evicted_through_ms: Arc::default(),
+            capacity,
+        }
+    }
+
+    /// Raise an eviction high-water mark to cover an evicted entry at `at_ms`.
+    fn note_evicted(mark: &std::sync::Mutex<Option<u64>>, at_ms: u64) {
+        let mut m = mark.lock().unwrap_or_else(|e| e.into_inner());
+        *m = Some(m.map_or(at_ms, |prev| prev.max(at_ms)));
+    }
+
+    /// Whether a `[from_ms, ..]` window may be missing entries given the
+    /// restart boundary and an eviction high-water mark (#934).
+    fn window_truncated(&self, mark: &std::sync::Mutex<Option<u64>>, from_ms: u64) -> bool {
+        let evicted = *mark.lock().unwrap_or_else(|e| e.into_inner());
+        from_ms < self.recording_since_ms || evicted.is_some_and(|m| from_ms <= m)
+    }
+
+    /// `isIncomplete` for a completed/failed aggregation starting at `from_ms`.
+    fn metrics_incomplete(&self, from_ms: u64) -> bool {
+        self.window_truncated(&self.metrics_evicted_through_ms, from_ms)
+    }
+
+    /// `isIncomplete` for an error aggregation starting at `from_ms`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn errors_incomplete(&self, from_ms: u64) -> bool {
+        self.window_truncated(&self.errors_evicted_through_ms, from_ms)
+    }
+
     fn record(&self, entry: JobMetricEntry) {
         let mut g = self.lock_metrics();
         g.push_back(entry);
-        while g.len() > MAX_JOB_STAT_ENTRIES {
-            g.pop_front();
+        while g.len() > self.capacity {
+            if let Some(old) = g.pop_front() {
+                Self::note_evicted(&self.metrics_evicted_through_ms, old.at_ms);
+            }
         }
     }
 
@@ -2011,8 +3173,10 @@ impl JobStatisticsState {
             error_code,
             error_message,
         });
-        while g.len() > MAX_JOB_STAT_ENTRIES {
-            g.pop_front();
+        while g.len() > self.capacity {
+            if let Some(old) = g.pop_front() {
+                Self::note_evicted(&self.errors_evicted_through_ms, old.at_ms);
+            }
         }
     }
 
@@ -2347,7 +3511,8 @@ pub struct ServerImpl {
     /// congested job type. Stepped each ~1 Hz monitor tick from the cross-partition
     /// `backlog_by_process` snapshot; consulted per `createProcessInstance`.
     /// Actuates only in [`SlaMode::Latency`]. Always present (the signals stay
-    /// populated for monitoring); `NANOBPMN_TIER2` (default on) gates actuation.
+    /// populated for monitoring); `NANOBPMN_TIER2` (default **observe-only**, per
+    /// ADR-0021's latency-causal blocker and issue #1532) gates actuation.
     procgov: Arc<ProcessGovernors>,
     /// Whether Tier-2 per-definition admission actuates (else it observes only).
     tier2_enabled: bool,
@@ -2482,6 +3647,13 @@ pub struct ServerImpl {
     // (s1-broadcast / s1-bykey-forward); constructed and tested now.
     #[allow(dead_code)]
     peers: peer::PeerSet,
+    /// Whether this node's `/cluster` handshake response advertises its
+    /// replicated-command features (#1661). Always `true` in production; a
+    /// mixed-version test clears it to model a pre-#1661 binary, which sends
+    /// no feature header at all and never proposes `SetLenientCompletion`
+    /// (`reconcile_lenient_completion_via_raft` honours it as the leader's own
+    /// feature support).
+    advertise_cluster_features: Arc<std::sync::atomic::AtomicBool>,
     /// The Raft groups this node hosts (one per partition it replicates), empty
     /// unless per-partition Raft is enabled. The falcon handler dispatches
     /// inbound RPCs through it; the write path proposes through it. An empty
@@ -2520,9 +3692,12 @@ pub struct ServerImpl {
     /// do NOT propose `ActivateJobs`: the leader
     /// locks jobs in its own engine actor only and lock-expiry stays local, so each
     /// job costs 2 quorum commits and per-worker activation stops fragmenting the
-    /// commit budget. Replicas then run with lenient completion (see
-    /// [`Engine::set_lenient_completion`]) so a replicated completion applies even
-    /// though they never saw the activation.
+    /// commit budget. Replicas then run with lenient completion — replicated
+    /// engine state set by `Command::SetLenientCompletion` at one log index on
+    /// every replica (#1661, see [`Self::reconcile_lenient_completion_via_raft`])
+    /// — so a replicated completion applies even though they never saw the
+    /// activation. Until that flag is committed (the ADR 0066 rolling-upgrade
+    /// window), every node runs the pre-#1661 LEGACY host flag from this policy.
     ///
     /// No effect on a single node / RF=1 (no Raft). DURABILITY TRADE-OFF in the
     /// leader-local variants: the lease is leader-RAM-only and does NOT survive
@@ -2613,6 +3788,11 @@ pub struct ServerImpl {
     /// in flight so the two paths can't race into competing groups. See
     /// [`HandoffPending`].
     handoff_pending: Arc<std::sync::Mutex<std::collections::HashMap<u64, HandoffPending>>>,
+    /// Re-drive attempts (beyond the first) the cross-partition routing pump
+    /// made for transiently undelivered follow-ups (#1582). Observability for
+    /// the bounded re-drive; lets the RF=3 leader-change tests prove the retry
+    /// path was actually exercised.
+    route_redrives: Arc<AtomicU64>,
     /// Per-partition lock serializing a core REBUILD (promote / rebuild-as-receiver /
     /// shutdown auto-recovery): the old core is fully shut down and awaited, then the
     /// new core is constructed and registered, all under the partition's lock. Without
@@ -2658,9 +3838,13 @@ pub struct ServerImpl {
     /// Batch-operations read model (#905). Empty until that slice fills it.
     #[allow(dead_code)]
     batch_operations: BatchOperationStore,
-    /// Cluster-variables store, global + per-tenant (#906). Empty until that slice fills it.
-    #[allow(dead_code)]
-    cluster_variables: ClusterVariableStore,
+    /// Serializes this gateway's cluster-variable writes (#1657) so the
+    /// authoritative apply and its per-partition fan-out of one write never
+    /// interleave with another's. The state itself lives in the engine.
+    cluster_variable_writes: Arc<tokio::sync::Mutex<()>>,
+    /// The secret provider trusted `camunda.secrets.<name>` references resolve
+    /// against at job activation (#1640, env-pointer store — ADR 0027 §5).
+    secret_store: Arc<dyn secrets::SecretStore>,
     /// Job-statistics aggregation state (#907). Empty until that slice fills it.
     #[allow(dead_code)]
     job_statistics: JobStatisticsState,
@@ -2673,17 +3857,22 @@ pub struct ServerImpl {
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
 /// entry and restores it on drop, so every exit path (success, error, or a
-/// dropped/cancelled request future) releases its slot exactly once.
-struct ProcessingGuard<'a>(&'a AtomicUsize);
+/// dropped/cancelled request future) releases its slot exactly once. Owned (it
+/// holds an `Arc` clone of the gauge) so the accounting can be TRANSFERRED into
+/// the detached create owner (#1582): a cancelled caller's dropped future must
+/// not release the slot while the create it submitted is still queued on the
+/// engine actor — otherwise the gauge undercounts in-flight creates and repeated
+/// cancelled requests bypass the concurrency rail.
+struct ProcessingGuard(Arc<AtomicUsize>);
 
-impl<'a> ProcessingGuard<'a> {
-    fn enter(gauge: &'a AtomicUsize) -> Self {
+impl ProcessingGuard {
+    fn enter(gauge: &Arc<AtomicUsize>) -> Self {
         gauge.fetch_add(1, Ordering::Relaxed);
-        ProcessingGuard(gauge)
+        ProcessingGuard(gauge.clone())
     }
 }
 
-impl Drop for ProcessingGuard<'_> {
+impl Drop for ProcessingGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
@@ -2694,19 +3883,42 @@ impl Drop for ProcessingGuard<'_> {
 /// dropped/cancelled request future) releases its bytes exactly once. Held across
 /// the same submit→apply window as [`ProcessingGuard`], so the gauge measures the
 /// payload bytes resident in the engine's creation mailbox rather than how long a
-/// client blocks for completion.
-struct ByteGuard<'a>(&'a AtomicU64, u64);
+/// client blocks for completion. Owned (an `Arc` clone of the gauge) for the same
+/// transfer-into-the-detached-owner reason as [`ProcessingGuard`] (#1582).
+struct ByteGuard(Arc<AtomicU64>, u64);
 
-impl<'a> ByteGuard<'a> {
-    fn enter(gauge: &'a AtomicU64, bytes: u64) -> Self {
+impl ByteGuard {
+    fn enter(gauge: &Arc<AtomicU64>, bytes: u64) -> Self {
         gauge.fetch_add(bytes, Ordering::Relaxed);
-        ByteGuard(gauge, bytes)
+        ByteGuard(gauge.clone(), bytes)
     }
 }
 
-impl Drop for ByteGuard<'_> {
+impl Drop for ByteGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(self.1, Ordering::Relaxed);
+    }
+}
+
+/// The create-path admission accounting a detached create owner must keep
+/// charged until the engine actor has finished the create (#1582): one
+/// processing-concurrency slot plus the payload bytes. Entered on the caller
+/// (so the sheds see the charge from the moment the request arrives), then
+/// MOVED into [`ServerImpl::submit_create_detached`]'s task, which drops it only
+/// after the actor round-trip resolves — a cancelled caller can no longer
+/// release the charge early and let repeated cancelled requests slip past the
+/// `admission_shed` watermarks.
+struct CreateAccounting {
+    _processing: ProcessingGuard,
+    _bytes: ByteGuard,
+}
+
+impl CreateAccounting {
+    fn enter(server: &ServerImpl, payload_bytes: u64) -> Self {
+        CreateAccounting {
+            _processing: ProcessingGuard::enter(&server.processing),
+            _bytes: ByteGuard::enter(&server.pipeline_bytes, payload_bytes),
+        }
     }
 }
 
@@ -2739,13 +3951,34 @@ impl ServerImpl {
         let lease_digest = activation_policy.broadcasts_lease_digest();
         for journal in journals.iter_mut() {
             journal.set_num_partitions(topology.num_partitions);
-            // Leader-local activation (any policy that can lock leader-only): replicas
-            // must accept a replicated completion for a job they never saw activated
-            // (the lock is not replicated). Harmless on a single node (no follower
-            // ever applies a completion for an un-activated job in practice, but the
-            // relaxed check is still correct there).
-            if activation_policy.may_be_leader_local() {
-                journal.set_lenient_completion(true);
+            // Leader-local activation (any policy that can lock leader-only) needs
+            // lenient completion: a completion for a job whose (unreplicated) lock
+            // was lost must still apply. It is replicated engine state (#1661), so
+            // it is set by a journaled command — directly here on a single node
+            // (no Raft log can exist), through the Raft log on a cluster
+            // (`reconcile_lenient_completion_via_raft`), never as host config.
+            //
+            // ROLLING UPGRADE (ADR 0066): until the replicated flag is committed,
+            // every node keeps today's behaviour — the LEGACY host flag from the
+            // activation policy, set identically on every node at startup.
+            journal.set_legacy_lenient_completion(activation_policy.may_be_leader_local());
+            // One-way (ADR 0002 notes): once replicated state is lenient it
+            // stays lenient — state wins over config.
+            if journal.engine().replicated_lenient_completion()
+                && !activation_policy.may_be_leader_local()
+            {
+                tracing::warn!(
+                    "partition state has replicated lenient completion enabled, but the \
+                     activation policy {activation_policy:?} does not need it; lenient \
+                     completion is one-way and stays on (replicated state wins over config)"
+                );
+            }
+            if topology.is_single_node() {
+                reconcile_lenient_completion_local(
+                    journal,
+                    activation_policy.may_be_leader_local(),
+                    now_millis(),
+                );
             }
         }
         // The deployment partition (id 0) is the only one that seeds the demo
@@ -2797,7 +4030,7 @@ impl ServerImpl {
         // set (hot ∪ cold across every replayed partition) and mark every Active
         // read row absent from it as Completed, then seed the gauge from the
         // reconciled (true) count.
-        let mut live_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut live_keys: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
         for journal in journals.iter() {
             journal.collect_live_instance_keys(&mut live_keys);
         }
@@ -2928,16 +4161,11 @@ impl ServerImpl {
         };
         // ADR-0020 Tier-2: per-process-definition admission compressors. Always
         // built (the per-definition backlog/pressure signals are a monitoring
-        // surface in both SLA modes); NANOBPMN_TIER2 (default on) gates whether it
+        // surface in both SLA modes); NANOBPMN_TIER2 (default **observe-only**,
+        // per ADR-0021's latency-causal blocker and issue #1532) gates whether it
         // actuates admission — and it only actuates in latency mode regardless.
         let procgov = Arc::new(ProcessGovernors::new(ProcGovConfig::from_env()));
-        let tier2_enabled = !matches!(
-            std::env::var("NANOBPMN_TIER2")
-                .ok()
-                .map(|v| v.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("0" | "off" | "false" | "no" | "disabled")
-        );
+        let tier2_enabled = parse_tier2_enabled(std::env::var("NANOBPMN_TIER2").ok().as_deref());
         tracing::info!(
             "ADR-0020 Tier-2 per-definition admission: {} (config {:?})",
             if tier2_enabled { "on" } else { "observe-only" },
@@ -3097,18 +4325,12 @@ impl ServerImpl {
         // command latency — a representative single sample of engine load that
         // sizes the create-admission watermark applied across all partitions.
         let owned_count = journals.len();
-        // Shared cluster-variable handle: one snapshot the gateway's REST layer
-        // mutates and every owned engine reads while resolving FEEL expressions.
-        // Installed on each journal before it is moved onto its engine thread; the
-        // same handle backs `ServerImpl.cluster_variables` below.
-        let cluster_variables = ClusterVariables::default();
         let handles: Vec<DeepthiHandle> = journals
             .into_iter()
             .enumerate()
-            .map(|(i, mut journal)| {
+            .map(|(i, journal)| {
                 let ctrl = if i == 0 { controller.take() } else { None };
                 let partition = journal.partition_id();
-                journal.set_cluster_variables(cluster_variables.clone());
                 DeepthiHandle::spawn(journal, partition, ctrl)
             })
             .collect();
@@ -3169,6 +4391,7 @@ impl ServerImpl {
             mem_pressure_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes_watermark,
+            advertise_cluster_features: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             drain_guard: Arc::new(crate::drain_guard::DrainGuard::new(
                 crate::drain_guard::DrainGuardCfg::from_env(),
             )),
@@ -3197,6 +4420,7 @@ impl ServerImpl {
                 handoff_catchup_ceiling_from_env().as_millis() as u64,
             )),
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            route_redrives: Arc::new(AtomicU64::new(0)),
             partition_rebuild_locks: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -3206,7 +4430,8 @@ impl ServerImpl {
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
             batch_operations: BatchOperationStore::default(),
-            cluster_variables: ClusterVariableStore::new(cluster_variables),
+            cluster_variable_writes: Arc::new(tokio::sync::Mutex::new(())),
+            secret_store: Arc::new(secrets::EnvSecretStore::from_env()),
             job_statistics: JobStatisticsState::default(),
             #[cfg(feature = "console")]
             trace_store: Arc::new(nano_trace_store::TraceStore::from_env()),
@@ -3241,8 +4466,8 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
 /// definitions through the index fallback, so the seed must include them too
 /// (otherwise a freshly-seeded peer cannot resolve what the owner can).
 fn seed_versions<'a, T>(
-    versions: &'a std::collections::HashMap<Key, T>,
-    latest: &'a std::collections::HashMap<String, T>,
+    versions: &'a std::collections::BTreeMap<Key, T>,
+    latest: &'a std::collections::BTreeMap<String, T>,
     key: impl Fn(&T) -> Key,
 ) -> std::collections::BTreeMap<Key, &'a T> {
     let mut all: std::collections::BTreeMap<Key, &'a T> =
@@ -3290,9 +4515,9 @@ fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State)
         seed_versions(&state.process_versions, &state.processes, |d| d.key)
             .into_values()
             .map(|deployed| Event::ProcessDeployed {
-                // The deployment key is not used by the applier (definitions are
-                // keyed by processDefinitionKey); 0 is a harmless placeholder.
-                deployment_key: 0,
+                // The deployment key anchors `deployment`-bound form/resource
+                // resolution (#1193), so it must replicate faithfully.
+                deployment_key: deployed.deployment_key,
                 process_definition_key: deployed.key,
                 version: deployed.version,
                 process: deployed.definition.clone(),
@@ -3340,29 +4565,35 @@ fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State)
         }
     }
     // Re-emit each deployed form version so a freshly seeded replica can serve
-    // it via GetFormByKey. Forms are independent (no sub-resources).
+    // it via GetFormByKey. Forms are independent (no sub-resources). The
+    // deployment key and version tag anchor `deployment`/`versionTag`-bound
+    // user-task form resolution (#1193), so they replicate faithfully.
     for form in seed_versions(&state.form_versions, &state.forms, |f| f.key).into_values() {
         events.push(Event::FormDeployed {
-            deployment_key: 0,
+            deployment_key: form.deployment_key,
             form_key: form.key,
             version: form.version,
             form_id: form.form_id.clone(),
             resource_name: form.resource_name.clone(),
             schema: form.schema.clone(),
+            version_tag: form.version_tag.clone(),
         });
     }
     // Re-emit each deployed generic-resource version so a freshly seeded
-    // replica can serve it via GetResourceByKey / searchResources.
+    // replica can serve it via GetResourceByKey / searchResources. The
+    // deployment key and version tag anchor `deployment`/`versionTag`-bound
+    // linked-resource resolution (#1193), so they replicate faithfully.
     for resource in
         seed_versions(&state.resource_versions, &state.resources, |r| r.key).into_values()
     {
         events.push(Event::GenericResourceDeployed {
-            deployment_key: 0,
+            deployment_key: resource.deployment_key,
             resource_key: resource.key,
             version: resource.version,
             resource_id: resource.resource_id.clone(),
             resource_name: resource.resource_name.clone(),
             content: resource.content.clone(),
+            version_tag: resource.version_tag.clone(),
         });
     }
     events
@@ -3435,6 +4666,9 @@ fn parse_deploy_resources(
                     id,
                     resource_name: resource_name.clone(),
                     schema: xml.clone(),
+                    // The form-js document's optional `versionTag` is matched by
+                    // a `versionTag`-bound user-task form (#1193).
+                    version_tag: nanobpmn_engine_core::form_version_tag_of(xml),
                 }),
                 None => {
                     return Err((
@@ -3488,6 +4722,10 @@ fn parse_deploy_resources(
             resource_id: resource_name.clone(),
             resource_name: resource_name.clone(),
             content: xml.clone(),
+            // The HTTP deploy envelope carries no per-resource `versionTag`
+            // metadata yet, so a generic resource deploys untagged (#1193
+            // wires the engine-side tag storage a future API field populates).
+            version_tag: None,
         });
     }
     Ok(ParsedDeploy {
@@ -3520,6 +4758,17 @@ impl ServerImpl {
         Arc::new(crate::raft_net::PeerTransport::new(self.peers.clone()))
     }
 
+    /// [`Self::raft_transport`] for a Raft group about to START replicating
+    /// (#1661): first installs the outbound feature requirement derived from
+    /// this node's recovered / snapshot-restored state, so a restarted leader
+    /// whose enabling `SetLenientCompletion` entry was compacted into a snapshot
+    /// can never stream that snapshot to a legacy peer before the periodic
+    /// requirement sync. Every production Raft start path goes through here.
+    async fn raft_transport_for_start(&self) -> Arc<dyn crate::raft_net::RaftTransport> {
+        let _required = self.required_cluster_features().await;
+        self.raft_transport()
+    }
+
     /// Peer-side of the Raft network: decode an inbound RPC, feed it to the local
     /// replica of `partition`, and return its serialized response. `Err((status,
     /// message))` maps to the falcon `CommandResult` status (400 malformed,
@@ -3542,9 +4791,22 @@ impl ServerImpl {
                 format!("no raft group for partition {partition} on this node"),
             )
         })?;
+        // #1661: lenient state can reach this node over the wire, and a later
+        // leadership change could ship it onward (AppendEntries or, once the
+        // enabling entry is compacted, InstallSnapshot) before the periodic
+        // requirement sync. Record the requirement on receipt: inbound entries
+        // by their payload, an inbound snapshot by the state it restored.
+        let inbound_requirements = crate::raft_net::required_features_for(&req);
+        let is_snapshot = matches!(req, crate::raft_net::RaftRpcRequest::InstallSnapshot(_));
+        for feature in inbound_requirements {
+            self.peers.require_feature(feature).await;
+        }
         let resp = crate::raft_net::dispatch(&part.raft, req)
             .await
             .map_err(|e| (500u16, format!("raft dispatch failed: {e}")))?;
+        if is_snapshot {
+            let _required = self.required_cluster_features().await;
+        }
         serde_json::to_value(resp).map_err(|e| (500u16, format!("encode raft response: {e}")))
     }
 }
@@ -3593,6 +4855,207 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
         // loudly rather than serve a stale read model.
         if let Err(e) = seglog::catch_up_shard(shard, base_p, &p_events, reseed_state) {
             panic!("failed to catch up read-model shard {pid} from the segmented journal: {e}");
+        }
+    }
+}
+
+/// Demultiplexes a legacy (non-segmented, untagged) shared journal into the
+/// events each of `owned` partitions replays on recovery — the single canonical
+/// demux for every legacy multi-partition boot path (single-node, where `owned`
+/// is every partition, and clustered, where it is this node's subset).
+///
+/// Routing contract:
+///
+/// * A **partition-agnostic definition** event (`ProcessDeployed` and the other
+///   resource deployments) mints no instance state and its key belongs to the
+///   deployment partition (0), which a clustered peer may not own — so it is
+///   replayed into *every* owned partition, reconstructing the definition
+///   cluster-wide from a single durable copy (see
+///   `Journal::install_deployment_durable`). Start subscriptions / timers keep
+///   their partition-0 keys and demux normally.
+/// * A **cluster-variable lifecycle** event ([`Event::is_cluster_variable_lifecycle`])
+///   is NEVER routed: the legacy format records no producing partition, so a
+///   broadcast would install a value into partitions whose fan-out copy never
+///   committed, and a key route would lose it everywhere but partition 0. With
+///   more than one partition the demux fails closed with the typed
+///   [`seglog::UnattributedClusterVariableError`] (#1657, ADR 0066 — the
+///   #1473 rule); writes are refused in that mode
+///   ([`check_cluster_variable_journal_mode`]), so such a record only exists if
+///   an unguarded build wrote it. Single-partition journals are unaffected.
+/// * Every other event goes to its [`Event::owning_partition`]. A key whose
+///   partition is out of range (e.g. a log from a larger partition layout)
+///   falls back to the lowest owned partition so replay never panics and no
+///   durable record is dropped; in the clustered layout a partition id this
+///   node does not own is dropped — its owner replays it from its own journal.
+fn demux_legacy_shared_log(
+    events: Vec<Event>,
+    owned: Vec<u64>,
+    partitions: u64,
+) -> std::io::Result<std::collections::HashMap<u64, Vec<Event>>> {
+    let mut per_partition: std::collections::HashMap<u64, Vec<Event>> =
+        owned.iter().map(|p| (*p, Vec::new())).collect();
+    let fallback = owned.first().copied();
+    for event in events {
+        seglog::check_cluster_variable_attribution(&event, false, partitions as usize)?;
+        if matches!(
+            event,
+            Event::ProcessDeployed { .. }
+                | Event::DecisionRequirementsDeployed { .. }
+                | Event::DecisionDeployed { .. }
+                | Event::FormDeployed { .. }
+                | Event::GenericResourceDeployed { .. }
+        ) {
+            for bucket in per_partition.values_mut() {
+                bucket.push(event.clone());
+            }
+            continue;
+        }
+        let p = event.owning_partition();
+        if let Some(bucket) = per_partition.get_mut(&p) {
+            bucket.push(event);
+        } else if p >= partitions
+            && let Some(fallback) = fallback
+            && let Some(bucket) = per_partition.get_mut(&fallback)
+        {
+            // Genuinely out of range (a log from a larger partition layout):
+            // keep the record on the lowest owned partition rather than
+            // dropping durable state.
+            bucket.push(event);
+        }
+        // else: a valid partition this node does not own — dropped; its owner
+        // replays it from its own journal.
+    }
+    Ok(per_partition)
+}
+
+#[cfg(test)]
+mod legacy_demux_tests {
+    use super::*;
+
+    fn cv_created(name: &str) -> Event {
+        Event::ClusterVariableCreated {
+            tenant_id: None,
+            name: name.to_string(),
+            value: Value::Int(1),
+            kind: nanobpmn_engine_core::ClusterVariableKind::Json,
+            metadata: Default::default(),
+        }
+    }
+
+    fn is_unattributed(err: &std::io::Error) -> bool {
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<seglog::UnattributedClusterVariableError>())
+            .is_some()
+    }
+
+    /// PR #1670 review (#1657, ADR 0066): an untagged cluster-variable record
+    /// in a multi-partition legacy journal has no producing partition. The
+    /// demux must fail closed with the typed error — never broadcast it into
+    /// partitions whose fan-out copy may never have committed — in BOTH the
+    /// single-node (every partition owned) and clustered (subset) layouts.
+    #[test]
+    fn legacy_demux_fails_closed_on_multi_partition_cluster_variables() {
+        for owned in [vec![0, 1, 2], vec![0, 2]] {
+            let err = demux_legacy_shared_log(vec![cv_created("x")], owned, 3)
+                .expect_err("unattributable cluster-variable record must fail closed");
+            assert!(is_unattributed(&err), "{err}");
+        }
+    }
+
+    /// Single-partition legacy is unaffected: every record is partition 0's.
+    #[test]
+    fn legacy_demux_single_partition_keeps_cluster_variables() {
+        let demuxed = demux_legacy_shared_log(vec![cv_created("x")], vec![0], 1)
+            .expect("single-partition legacy is attributable");
+        assert_eq!(demuxed[&0].len(), 1);
+    }
+
+    /// An instance-keyed event routes to its owning partition only.
+    #[test]
+    fn legacy_demux_routes_keyed_events_to_their_owning_partition() {
+        let keyed = Event::ProcessInstanceCreated {
+            instance_key: nanobpmn_engine_core::compose_key(2, 9),
+            process_id: "p".to_string(),
+            variables: Default::default(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let demuxed = demux_legacy_shared_log(vec![keyed], vec![0, 1, 2], 3).expect("demux");
+        assert!(demuxed[&0].is_empty() && demuxed[&1].is_empty());
+        assert_eq!(demuxed[&2].len(), 1);
+    }
+
+    /// Clustered layout: a keyed event for a partition this node does not own
+    /// is dropped (its owner replays it from its own journal).
+    #[test]
+    fn legacy_demux_clustered_drops_unowned() {
+        let keyed_unowned = Event::ProcessInstanceCreated {
+            instance_key: nanobpmn_engine_core::compose_key(1, 9),
+            process_id: "p".to_string(),
+            variables: Default::default(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let demuxed = demux_legacy_shared_log(vec![keyed_unowned], vec![0, 2], 3).expect("demux");
+        assert!(
+            demuxed.values().all(Vec::is_empty),
+            "the unowned partition's keyed event is dropped"
+        );
+    }
+
+    /// PR #1670 review (journal ordering): the legacy single-node
+    /// multi-partition boot must emit its journals in ASCENDING partition-id
+    /// order — `Partitions::new` requires `handles[i]` to own partition `i`,
+    /// and the engine actors spawn from that vector in order. Collecting the
+    /// demux HashMap directly orders the journals arbitrarily, so a restart
+    /// could route every keyed command to the wrong engine. This pins the
+    /// ordering contract the boot loop relies on: mapping partition ids
+    /// `0..partitions` through the demuxed map yields each partition's own
+    /// events at its own index, for every partition, regardless of map
+    /// iteration order.
+    #[test]
+    fn legacy_recovery_journals_are_indexed_by_partition_id() {
+        let keyed = |p: u64| Event::ProcessInstanceCreated {
+            instance_key: nanobpmn_engine_core::compose_key(p, 9),
+            process_id: "p".to_string(),
+            variables: Default::default(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let partitions = 4u64;
+        let events = vec![keyed(3), keyed(0), keyed(2), keyed(1)];
+        let mut per_partition =
+            demux_legacy_shared_log(events, (0..partitions).collect(), partitions).expect("demux");
+        // The exact construction the boot path performs: index i must hold
+        // partition i's events.
+        let journals: Vec<(u64, Vec<Event>)> = (0..partitions)
+            .map(|p| (p, per_partition.remove(&p).unwrap_or_default()))
+            .collect();
+        for (i, (p, evs)) in journals.iter().enumerate() {
+            assert_eq!(*p, i as u64, "handles[{i}] must own partition {i}");
+            let keyed_count = evs
+                .iter()
+                .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+                .count();
+            assert_eq!(
+                keyed_count, 1,
+                "partition {i} replays exactly its own keyed event"
+            );
         }
     }
 }
@@ -4688,7 +6151,7 @@ fn check_legacy_recovery_attribution(p: u64, num_partitions: usize) -> std::io::
 /// How a rebuild reconstructs an engine that is dead or fenced (#1473): a
 /// PROMOTION needs an authoritative durable baseline (never an empty replica),
 /// while a RECEIVER can start from a fresh replica the leader backfills.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RebuildEngineMode {
     Promote,
     Receiver,
@@ -5922,9 +7385,11 @@ impl SpillConfig {
     /// Installs the configured spill tiers onto `journal`. Idempotent per
     /// journal; call once per engine actor at construction.
     fn apply(&self, journal: &mut Journal) {
-        // #1384: under Raft, command-path orphan quarantines run inside
-        // state-machine application and must not raise a non-deterministic
-        // incident — observe only.
+        // #1384/#1447: under Raft, command-path orphan quarantines run inside
+        // state-machine application and never raise a non-deterministic
+        // incident inline — they are handed to the leader-propose channel the
+        // replication layer wires (`set_orphan_sink`) so the leader re-proposes
+        // them with a replicated timestamp.
         journal.set_replicated_apply(raft_enabled());
         if let Some(cfg) = &self.var {
             match cfg {
@@ -6256,6 +7721,33 @@ struct CreatedInstanceDirect {
     commit: Commit,
 }
 
+/// What a detached create owner needs from a successfully applied create: the
+/// cross-partition follow-ups to route and the commit that gates them (#1582).
+/// Implemented by every create-path outcome type so
+/// [`ServerImpl::submit_create_detached`] can own submission → durability →
+/// routing for all of them. The commit is CONSUMED (it is a single-use
+/// durability handle, not `Clone`), so the outcome is returned with the commit
+/// taken out — after the owner has waited on it, only the already-durable
+/// projection remains for the caller.
+trait CreateOutcome {
+    fn take_routing_parts(&mut self) -> (Vec<Event>, Commit);
+}
+
+impl CreateOutcome for CreatedInstanceDirect {
+    fn take_routing_parts(&mut self) -> (Vec<Event>, Commit) {
+        (
+            std::mem::take(&mut self.routable),
+            std::mem::replace(&mut self.commit, Commit::ready()),
+        )
+    }
+}
+
+impl CreateOutcome for (String, CreatedInstanceDirect) {
+    fn take_routing_parts(&mut self) -> (Vec<Event>, Commit) {
+        self.1.take_routing_parts()
+    }
+}
+
 /// The ONE place the non-Raft (single-node) instance-creation handlers may apply
 /// a `CreateInstance` command directly on the engine: apply `command` on the
 /// create actor's `journal` and project the common post-apply fields. Confining
@@ -6322,7 +7814,7 @@ fn apply_create_instance_direct(
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
-    async fn create_process_instance_impl(
+    pub(crate) async fn create_process_instance_impl(
         &self,
         body: &models::ProcessInstanceCreationInstruction,
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
@@ -6354,26 +7846,11 @@ impl ServerImpl {
         // and a ~40% tighter p90 tail vs suppressing it, at no cost (GCP 3-node
         // fresh-journal A/B; see PERFORMANCE.md 2026-07-10 / ADR 0013 Addendum). So
         // `admission` relaxes only the proactive backlog governor, not this guard.
-        if let Some(limit) = self.backpressure.current_limit() {
-            let processing = self.processing.load(Ordering::Relaxed);
-            if self.backpressure.should_shed(processing) {
-                return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
-                    "RESOURCE_EXHAUSTED",
-                    503,
-                    format!(
-                        "Backpressure: {processing} creates in flight at or above the \
-                         configured limit of {limit}. Retry after a backoff."
-                    ),
-                )));
-            }
-        }
-
-        // Active-backlog admission control: independently of the concurrency gate
-        // above, shed once the standing backlog of active instances reaches the
-        // configured limit, so end-to-end latency and memory stay bounded under
-        // sustained overload instead of the create queue growing unboundedly. Off
-        // by default; a shed create is never journaled, so durability is untouched.
-        if let Some(message) = self.admission_shed() {
+        //
+        // Then the active-backlog admission control (`admission_shed`). Both
+        // rails live in [`Self::create_admission_shed`], the single create
+        // admission policy every instance-creating endpoint shares.
+        if let Some(message) = self.create_admission_shed() {
             return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
                 "RESOURCE_EXHAUSTED",
                 503,
@@ -6563,7 +8040,6 @@ impl ServerImpl {
         // → applied), not the later `awaitCompletion` wait, so the backpressure
         // gauge measures command-processing concurrency rather than how long a
         // client chooses to block for completion.
-        type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
 
         // Cluster-wide create placement (stage 1): round-robin across EVERY
         // partition in the cluster so a single gateway drives the whole cluster.
@@ -6637,84 +8113,83 @@ impl ServerImpl {
         // command completes (the closure moves them).
         let tags_for_response = tags_vec.clone();
         let business_id_for_response = business_id_str.clone();
-        let outcome: Result<CreateOk, Box<Resp>> = {
+        // The actor round-trip, commit wait, and commit-gated routing all run
+        // inside ONE detached owner task (#1582): the engine actor executes a
+        // queued command even after its reply receiver is dropped, so awaiting
+        // the actor inline left a window where a cancelled caller persisted an
+        // instance whose cross-partition follow-ups nobody routed. The detached
+        // task owns the outcome end to end; awaiting the receiver here only
+        // OBSERVES it.
+        let created = {
             let payload_bytes = engine_vars_bytes(&variables);
-            let _processing = ProcessingGuard::enter(&self.processing);
-            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            self.engine
-                .for_create()
-                .with_low(move |engine| {
-                    // Resolve the version selector to a concrete process id +
-                    // (key | version). A by-key request is matched across all
-                    // retained versions; an unknown key is a 400 (the create
-                    // endpoint has no 404 variant).
-                    let (process_id, sel_key, sel_ver) =
-                        match resolve_create_selector(engine.state(), by_id, by_key, by_version) {
-                            Ok(t) => t,
-                            Err((code, detail)) => {
-                                return Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(
-                                    problem("Process not found", code, detail),
-                                )));
-                            }
-                        };
-
-                    match apply_create_instance_direct(
-                        engine,
-                        Command::create_instance_versioned(
-                            process_id.clone(),
-                            variables,
-                            tags_vec,
-                            business_id_str,
-                            sel_key,
-                            sel_ver,
-                        ),
-                        &process_id,
-                    ) {
-                        Ok(created) => Ok((
-                            process_id,
-                            created.version,
-                            created.definition_key,
-                            created.instance_key,
-                            created.sync_completed,
-                            created.routable,
-                            created.commit,
-                        )),
-                        Err(EngineError::ProcessNotFound { process_id }) => Err(Box::new(
-                            Resp::Status400_TheProvidedDataIsNotValid(problem(
-                                "Process not found",
-                                400,
-                                format!("No deployed process with id '{process_id}'."),
-                            )),
-                        )),
-                        Err(e) => Err(Box::new(
-                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                                problem("Internal error", 500, e.to_string()),
-                            ),
-                        )),
+            // The admission charge is TRANSFERRED into the detached owner
+            // (#1582): it stays charged until the actor finishes the create,
+            // even if this caller is cancelled first.
+            let accounting = CreateAccounting::enter(self, payload_bytes);
+            let rx = self.submit_create_detached(accounting, move |engine| {
+                // Resolve the version selector to a concrete process id +
+                // (key | version). A by-key request is matched across all
+                // retained versions; an unknown key is a 400 (the create
+                // endpoint has no 404 variant).
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), by_id, by_key, by_version)?;
+                let created = apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        tags_vec,
+                        business_id_str,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| match e {
+                    EngineError::ProcessNotFound { process_id } => {
+                        (400, format!("No deployed process with id '{process_id}'."))
                     }
-                })
-                .await
+                    other => (500, other.to_string()),
+                })?;
+                Ok((process_id, created))
+            });
+            Self::observe_create(rx).await
         };
 
-        let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
-            match outcome {
-                Ok(fields) => fields,
-                Err(resp) => return Ok(*resp),
-            };
+        let (process_id, created) = match created {
+            Ok(fields) => fields,
+            Err((code, detail)) => {
+                return Ok(if code == 400 {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Process not found",
+                        code,
+                        detail,
+                    ))
+                } else {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        code,
+                        detail,
+                    ))
+                });
+            }
+        };
+        let CreatedInstanceDirect {
+            instance_key,
+            definition_key,
+            version,
+            sync_completed,
+            ..
+        } = created;
 
         // Record REST create
         crate::metrics::record_create("rest");
 
-        // Block on durability before acknowledging: a returned 200 means the
-        // create is fsynced.
-        commit.wait().await;
-        // The instance may have parked on an off-partition message catch: route
-        // the subscription open to its canonical partition (no-op single-node).
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
-        // Starting an instance parks it on its first service task, so new jobs
-        // may now be activatable: wake any long-pollers.
+        // The detached owner blocked on durability AND drove the cross-partition
+        // routing pump before answering (#1582): a returned 200 means the create
+        // is fsynced and a publish issued now finds the subscription open (the
+        // create-then-publish ordering clients rely on); cancelling this handler
+        // at any point strands nothing.
         self.signal_jobs_available();
 
         // Resolve the final response. Without awaitCompletion we report whatever
@@ -7308,7 +8783,7 @@ impl ServerImpl {
             );
         }
         let (engine_meta, result) = self
-            .apply_job_command_direct_with(job_key, command, move |engine| {
+            .apply_job_command_direct_with(job_key, command, None, move |engine| {
                 // Capture the job's type/worker authoritatively from engine state
                 // *before* the completion drops the activation, so the
                 // job-statistics attribution is race-free (the read model is
@@ -7345,7 +8820,9 @@ impl ServerImpl {
                 commit.wait().await;
                 // Completing a job may advance the token into an off-partition
                 // message catch: route the resulting subscription open/correlate.
-                self.spawn_routing_if_needed(&events);
+                // The completion request carries no `operationReference` in the
+                // synced spec, so the routed follow-ups are unreferenced too.
+                self.spawn_routing_if_needed(&events, None);
                 self.observe_job_sojourn(&events, now_millis());
                 self.record_adhoc_events(&events);
                 // Completing a job may advance the token onto a following service
@@ -7453,16 +8930,26 @@ impl ServerImpl {
             .as_ref()
             .and_then(|b| b.error_message.clone())
             .unwrap_or_default();
+        // Camunda 8 v2 `retryBackOff` (#933): absent = 0 (retryable now);
+        // negatives are clamped to 0 by `Command::fail_job_with_backoff`.
+        let retry_back_off = body.as_ref().and_then(|b| b.retry_back_off).unwrap_or(0);
 
         if let Some(node) = self.route_by_leader(job_key) {
             return Ok(self
-                .forward_fail_job(node, job_key, lease_token, retries, error_message)
+                .forward_fail_job(
+                    node,
+                    job_key,
+                    lease_token,
+                    retries,
+                    error_message,
+                    retry_back_off,
+                )
                 .await);
         }
         if !self.raft.is_empty() {
             let metadata = self.job_worker_metadata(job_key).await;
             let command = job_command_with_lease(
-                Command::fail_job(job_key, retries, error_message),
+                Command::fail_job_with_backoff(job_key, retries, error_message, retry_back_off),
                 lease_token,
             );
             // REST fail is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
@@ -7482,6 +8969,7 @@ impl ServerImpl {
                                 .record_failed(job_type, worker, now_millis());
                         }
                         self.signal_jobs_available();
+                        self.signal_jobs_available_after_backoff(retries, retry_back_off);
                         Resp::Status204_TheJobIsFailed
                     }
                     Err((404, detail)) => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(
@@ -7510,9 +8998,10 @@ impl ServerImpl {
             .apply_job_command_direct_with(
                 job_key,
                 job_command_with_lease(
-                    Command::fail_job(job_key, retries, error_message),
+                    Command::fail_job_with_backoff(job_key, retries, error_message, retry_back_off),
                     lease_token,
                 ),
+                None,
                 move |engine| {
                     engine
                         .state()
@@ -7543,8 +9032,10 @@ impl ServerImpl {
                 }
                 commit.wait().await;
                 // Failing with retries left returns the job to the activatable
-                // pool, so wake any long-pollers.
+                // pool, so wake any long-pollers — again once a `retryBackOff`
+                // has elapsed (#933).
                 self.signal_jobs_available();
+                self.signal_jobs_available_after_backoff(retries, retry_back_off);
                 Ok(Resp::Status204_TheJobIsFailed)
             }
             Err(EngineError::JobNotFound { job_key }) => {
@@ -7625,7 +9116,7 @@ impl ServerImpl {
         // error-throw, keeping that path unchanged.
         let variables = match body.variables.as_ref() {
             Some(types::Nullable::Present(map)) => from_object_map(map),
-            _ => std::collections::HashMap::new(),
+            _ => std::collections::BTreeMap::new(),
         };
 
         if let Some(node) = self.route_by_leader(job_key) {
@@ -7718,6 +9209,7 @@ impl ServerImpl {
                     ),
                     lease_token,
                 ),
+                None,
                 move |engine| {
                     engine
                         .state()
@@ -7921,7 +9413,7 @@ impl ServerImpl {
                 status_metric(created),
                 status_metric(completed),
                 status_metric(failed),
-                false,
+                self.job_statistics.metrics_incomplete(from_ms),
             ),
         ))
     }
@@ -8342,15 +9834,17 @@ impl ServerImpl {
             job_key,
             retries,
             timeout,
-            operation_reference,
             lease_token,
         };
         let commit = if self.raft.is_empty() {
-            let result = self.apply_job_command_direct(job_key, command).await;
+            let result = self
+                .apply_job_command_direct_ref(job_key, command, operation_reference)
+                .await;
             Self::map_job_events(result)?.1
         } else {
             // REST job path, not stream CompleteJob: no stream diagnostic. #1306.
-            self.propose_job_for_stream(job_key, command, false).await?
+            self.propose_job_for_stream(job_key, command, false, operation_reference)
+                .await?
         };
         commit.wait().await;
         self.signal_jobs_available();
@@ -8649,11 +10143,14 @@ impl ServerImpl {
             };
         }
 
-        let command = Command::ResolveIncident {
-            incident_key,
-            operation_reference,
-        };
-        match self.apply_partition_command(incident_key, command).await {
+        match self
+            .apply_partition_command_ref(
+                incident_key,
+                Command::resolve_incident(incident_key),
+                operation_reference,
+            )
+            .await
+        {
             Ok(_) => {
                 // Resolving a job-incident returns the job to the activatable
                 // pool, so wake any long-pollers.
@@ -8775,7 +10272,7 @@ impl ServerImpl {
             };
         }
 
-        let engine_vars: std::collections::HashMap<String, Value> = variables
+        let engine_vars: std::collections::BTreeMap<String, Value> = variables
             .iter()
             .map(|(name, v)| (name.clone(), json_to_value(v)))
             .collect();
@@ -8793,7 +10290,7 @@ impl ServerImpl {
         }
     }
 
-    async fn resolve_incident_impl(
+    pub(crate) async fn resolve_incident_impl(
         &self,
         path_params: &models::ResolveIncidentPathParams,
         body: &Option<models::IncidentResolutionRequest>,
@@ -8915,7 +10412,7 @@ impl ServerImpl {
         )
     }
 
-    async fn get_process_instance_impl(
+    pub(crate) async fn get_process_instance_impl(
         &self,
         path_params: &models::GetProcessInstancePathParams,
     ) -> Result<apis::process_instance::GetProcessInstanceResponse, ()> {
@@ -8988,7 +10485,7 @@ impl ServerImpl {
     /// on every node). Only the latest version per process id is retained, so an
     /// older version's key yields 404. A definition built programmatically (no
     /// source XML) is reported as 204.
-    async fn get_process_definition_xml_impl(
+    pub(crate) async fn get_process_definition_xml_impl(
         &self,
         path_params: &models::GetProcessDefinitionXmlPathParams,
     ) -> Result<apis::process_definition::GetProcessDefinitionXmlResponse, ()> {
@@ -9035,7 +10532,7 @@ impl ServerImpl {
     /// RF>1 are reported as `follower`. `replication_factor` is the cluster's
     /// `effective_rf()`. A single-node cluster reports one broker leading every
     /// partition at RF=1.
-    async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
+    pub(crate) async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
         use apis::cluster::GetTopologyResponse as Resp;
 
         let version = env!("NANOBPM_VERSION").to_string();
@@ -9144,13 +10641,19 @@ impl ServerImpl {
     /// on one node is never re-evaluated (and re-committed) on another when its
     /// leadership moves mid-publish (#1307). `None` applies every local target —
     /// the legacy behaviour for a peer frame predating the field.
+    ///
+    /// `operation_reference` is the publishing request's `operationReference`
+    /// (#1556 step 4, #1600): stamped on every record each per-partition apply
+    /// produces, and carried onward on the routed follow-ups those records
+    /// drive (the routing pump below).
     async fn correlate_message_everywhere(
         &self,
         name: String,
         correlation_key: String,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<&[u64]>,
+        operation_reference: Option<i64>,
     ) -> Result<Vec<Event>, EngineError> {
         // Reject an out-of-range business id before touching any partition, with
         // the engine's own rule: one partition must not apply the publish while
@@ -9184,7 +10687,10 @@ impl ServerImpl {
                 variables: variables.clone(),
                 business_id: business_id.clone(),
             };
-            match self.apply_routed_command(target, command).await {
+            match self
+                .apply_routed_command(target, command, operation_reference)
+                .await
+            {
                 RoutedApply::Applied(events) => all_events.extend(events),
                 RoutedApply::NotHere => {}
                 RoutedApply::Failed(status, message) => {
@@ -9199,8 +10705,11 @@ impl ServerImpl {
         // `RemoteMessageCorrelation`), plus any start-instance dispatch a
         // message-start fan-out produced. A no-op single-partition.
         if Self::has_routable_subscription_events(&all_events) {
-            self.drive_subscription_routing(Self::routable_events(&all_events))
-                .await;
+            self.drive_subscription_routing(
+                Self::routable_events(&all_events),
+                operation_reference,
+            )
+            .await;
         }
         Ok(all_events)
     }
@@ -9214,14 +10723,17 @@ impl ServerImpl {
     /// The local building block for both the gateway fan-out and the peer-side
     /// `PublishMessage` handler. `only_partitions`, when set, restricts the apply
     /// to the listed target partitions (a scoped fan-out send); `None` applies
-    /// every local target (the legacy behaviour).
+    /// every local target (the legacy behaviour). `operation_reference` is the
+    /// publishing request's `operationReference` (#1600), threaded through to
+    /// every record the publish produces here.
     pub(crate) async fn correlate_message_local(
         &self,
         name: String,
         correlation_key: String,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         business_id: Option<String>,
         only_partitions: Option<Vec<u64>>,
+        operation_reference: Option<i64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let events = self
             .correlate_message_everywhere(
@@ -9230,6 +10742,7 @@ impl ServerImpl {
                 variables,
                 business_id,
                 only_partitions.as_deref(),
+                operation_reference,
             )
             .await?;
         let message_key = message_key_of(&events);
@@ -9258,14 +10771,20 @@ impl ServerImpl {
     /// peer that is unreachable is logged and skipped (best-effort, matching the
     /// no-buffer correlate-and-drop model). A single-node cluster fans only
     /// locally — byte-identical to the pre-cluster path.
+    ///
+    /// `operation_reference` is the publishing request's `operationReference`
+    /// (#1600): threaded through the local apply AND carried on every peer
+    /// fan-out frame, so the records a publish produces on ANY node's
+    /// partitions carry it.
     async fn correlate_message_cluster(
         &self,
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         business_id: Option<String>,
+        operation_reference: Option<i64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
-        let engine_vars: std::collections::HashMap<String, Value> = variables
+        let engine_vars: std::collections::BTreeMap<String, Value> = variables
             .as_ref()
             .map(|m| {
                 m.iter()
@@ -9280,6 +10799,7 @@ impl ServerImpl {
                 engine_vars,
                 business_id.clone(),
                 None,
+                operation_reference,
             )
             .await?;
 
@@ -9366,6 +10886,7 @@ impl ServerImpl {
                                 variables.clone(),
                                 business_id.clone(),
                                 Some(partitions.clone()),
+                                operation_reference,
                             )
                             .await
                         {
@@ -9505,30 +11026,140 @@ impl ServerImpl {
     /// **peer**, the source event is forwarded over the Falcon protocol and the
     /// owning node drives its own pump (so the recursion continues there). A
     /// no-op single-partition.
-    async fn drive_subscription_routing(&self, events: Vec<Event>) {
-        let num_partitions = self.engine.topology().num_partitions;
-        if num_partitions <= 1 {
+    ///
+    /// **Uncancellable (#1582).** Every caller reaches this only AFTER the source
+    /// command committed, so the routing it performs is post-commit work that a
+    /// caller-side timeout / dropped request future must never abort — a lost
+    /// follow-up would otherwise be unrecoverable (the retried parent is deduped
+    /// to a no-op). The pump therefore runs as a detached task; awaiting it only
+    /// observes completion, and dropping the await leaves it running.
+    ///
+    /// `operation_reference` is the `operationReference` of the request whose
+    /// committed records produced these follow-ups (#1556 step 4, #1600): it is
+    /// stamped on every record each routed command produces, on every partition
+    /// it routes to, and carried onward on any follow-ups those records route
+    /// in turn — so a caller's reference reaches the whole routed cascade.
+    async fn drive_subscription_routing(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) {
+        if self.engine.topology().num_partitions <= 1 {
             return;
         }
+        let server = self.clone();
+        let pump = tokio::spawn(async move {
+            server
+                .drive_subscription_routing_now(events, operation_reference)
+                .await
+        });
+        if let Err(e) = pump.await {
+            tracing::warn!("subscription routing pump task failed: {e}");
+        }
+    }
+
+    /// Routes follow-ups of a routed apply that committed AFTER its observer
+    /// gave up (#1582). A plain fn returning a boxed `dyn Send` future (not an
+    /// `async fn`) so the recursion pump → apply funnel → pump has a concrete
+    /// type and does not form an opaque-type cycle.
+    fn route_late_follow_ups(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        let server = self.clone();
+        Box::pin(async move {
+            server
+                .drive_subscription_routing(events, operation_reference)
+                .await
+        })
+    }
+
+    /// The routing pump body behind [`Self::drive_subscription_routing`]; only
+    /// ever run inside that detached task.
+    async fn drive_subscription_routing_now(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) {
+        let num_partitions = self.engine.topology().num_partitions;
         let mut work = events;
         while let Some(event) = work.pop() {
             let Some((target, command)) = Self::route_event(&event, num_partitions) else {
                 continue;
             };
-            match self.apply_routed_command(target, command).await {
-                RoutedApply::Applied(produced) => work.extend(produced),
-                RoutedApply::NotHere => {
-                    // The target partition is owned (led, under Raft) by a peer:
-                    // forward the source event so that node applies it (and
-                    // drives any further routing) through its own write path.
-                    self.forward_route_subscription(target, event).await;
-                }
-                RoutedApply::Failed(status, message) => {
-                    tracing::warn!(
-                        "subscription routing on partition {target} failed ({status}): {message}"
-                    );
-                }
+            work.extend(
+                self.route_with_redrive(target, command, event, operation_reference)
+                    .await,
+            );
+        }
+    }
+
+    /// Delivers one routed follow-up to partition `target` with a **bounded
+    /// re-drive** (#1582): each attempt re-resolves the writer — applying
+    /// locally when this node leads `target` (the produced follow-ups are
+    /// returned for the pump to continue), or forwarding the source `event` to
+    /// the current leader otherwise. A transient non-delivery (no reachable
+    /// leader, link down, timeout, a 503 leader race, any 5xx) is retried with
+    /// backoff per [`ROUTE_REDRIVE`]; a 4xx is a permanent rejection and stops.
+    /// Re-delivery is safe: routed deliveries carry stable source-minted keys the
+    /// recipient dedups on (#1568), so a retry of an attempt whose reply was lost
+    /// is a no-op. `operation_reference` rides every delivery (local apply and
+    /// peer forward alike) so the follow-up's records carry it (#1600).
+    async fn route_with_redrive(
+        &self,
+        target: u64,
+        command: Command,
+        event: Event,
+        operation_reference: Option<i64>,
+    ) -> Vec<Event> {
+        let mut last = String::new();
+        // An unkeyed (zero / legacy) routed command has no dedup, so a retry
+        // after an ambiguous outcome could apply it twice: deliver it at most
+        // once (#1582).
+        let max_attempts = Self::redrive_attempts(&command);
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                self.route_redrives.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(ROUTE_REDRIVE.backoff(attempt)).await;
             }
+            let outcome = match self
+                .apply_routed_command(target, command.clone(), operation_reference)
+                .await
+            {
+                RoutedApply::Applied(produced) => return produced,
+                RoutedApply::Failed(status, message) => RouteAttempt::from_status(status, message),
+                // Led by a peer (or a leadership gap): forward to the current
+                // writer, re-resolved on every attempt.
+                RoutedApply::NotHere => {
+                    self.forward_route_subscription(target, &event, attempt, operation_reference)
+                        .await
+                }
+            };
+            match outcome {
+                RouteAttempt::Delivered => return Vec::new(),
+                RouteAttempt::Rejected(status, message) => {
+                    tracing::warn!(
+                        "subscription routing on partition {target} rejected ({status}): {message}"
+                    );
+                    return Vec::new();
+                }
+                RouteAttempt::Transient(reason) => last = reason,
+            }
+        }
+        tracing::warn!(
+            "subscription routing on partition {target} not delivered after {max_attempts} attempts: {last}"
+        );
+        Vec::new()
+    }
+
+    /// How many delivery attempts the re-drive may make for `command`: the
+    /// bounded budget for keyed (deduped) commands, exactly one otherwise.
+    fn redrive_attempts(command: &Command) -> u32 {
+        if Self::routed_command_is_idempotent(command) {
+            ROUTE_REDRIVE.max_attempts
+        } else {
+            1
         }
     }
 
@@ -9644,6 +11275,68 @@ impl ServerImpl {
             .unwrap_or_else(|| topology.owner_of(p))
     }
 
+    /// The node a routed-forward `attempt` addresses for partition `p` (#1582).
+    /// When this node hosts a replica of `p` it knows the elected leader, so that
+    /// is used ([`Self::partition_write_node`]). A source hosting NO replica of
+    /// `p` has no leadership view and would otherwise only ever retry the static
+    /// owner — a dead or former leader after failover — so it rotates through
+    /// `p`'s replica set across attempts instead: a non-leader replica answers
+    /// `503` and the next attempt tries the next replica, reaching the
+    /// replacement leader within one pass of the set.
+    fn route_forward_candidate(&self, p: u64, attempt: u32) -> u32 {
+        if self.raft.is_empty() || self.raft.get(p).is_some() {
+            return self.partition_write_node(p);
+        }
+        let topology = self.engine.topology();
+        Self::rotate_replica(&topology.replicas_of(p), topology.node_id, attempt)
+            .unwrap_or_else(|| topology.owner_of(p))
+    }
+
+    /// Pure rotation behind [`Self::route_forward_candidate`]: the
+    /// `attempt`-th replica (mod the set), skipping `self_id`.
+    fn rotate_replica(replicas: &[u32], self_id: u32, attempt: u32) -> Option<u32> {
+        let others: Vec<u32> = replicas.iter().copied().filter(|n| *n != self_id).collect();
+        if others.is_empty() {
+            return None;
+        }
+        others.get(attempt as usize % others.len()).copied()
+    }
+
+    /// Whether a routed command dedups on a source-minted key, so a retry after
+    /// an unobserved commit is an exactly-once no-op (#1568). Only such
+    /// commands may have their proposal observation time out (#1582).
+    /// A zero key is the legacy "no dedup" sentinel the engine skips, so it
+    /// is NOT idempotent — the single source of truth is
+    /// [`Command::routed_delivery_key`].
+    fn routed_command_is_idempotent(command: &Command) -> bool {
+        command.routed_delivery_key().is_some()
+    }
+
+    /// Removes the routable follow-ups from a proposal result whose detached
+    /// proposer owns their routing (#1582), so the observer never re-routes them.
+    fn strip_routable(
+        result: Result<crate::raft::ReplicatedItem, crate::raft::ProposeError>,
+    ) -> Result<crate::raft::ReplicatedItem, crate::raft::ProposeError> {
+        result.map(|mut item| {
+            item.events.retain(|e| !Self::is_routable_event(e));
+            item
+        })
+    }
+
+    /// Classifies a Raft proposal result into a [`RoutedApply`].
+    fn classify_proposal(
+        result: Result<crate::raft::ReplicatedItem, crate::raft::ProposeError>,
+    ) -> RoutedApply {
+        match result {
+            Ok(item) => match item.error {
+                Some((status, message)) => RoutedApply::Failed(status, message),
+                None => RoutedApply::Applied(item.events),
+            },
+            Err(crate::raft::ProposeError::Leader) => RoutedApply::NotHere,
+            Err(other) => RoutedApply::Failed(500, other.to_string()),
+        }
+    }
+
     /// THE single apply funnel for the cross-partition routing pump
     /// (`correlate_message_everywhere`, `drive_subscription_routing`): applies a
     /// routing-computed `command` on partition `target` — the partition-indexed
@@ -9655,7 +11348,17 @@ impl ServerImpl {
     /// forwards to the leader instead of applying on a local replica, which
     /// would diverge from the log (#1307). Without Raft it applies directly on
     /// the locally owned engine and awaits durability.
-    async fn apply_routed_command(&self, target: u64, command: Command) -> RoutedApply {
+    ///
+    /// `operation_reference` is the `operationReference` of the request whose
+    /// records produced the follow-up being applied (#1600): it rides the
+    /// replicated command envelope (Raft) or the journal apply (direct), so
+    /// every record the routed command produces on `target` carries it.
+    async fn apply_routed_command(
+        &self,
+        target: u64,
+        command: Command,
+        operation_reference: Option<i64>,
+    ) -> RoutedApply {
         if !self.raft.is_empty() {
             let Some(part) = self.raft.get(target) else {
                 return RoutedApply::NotHere;
@@ -9664,27 +11367,89 @@ impl ServerImpl {
             if part.raft.metrics().borrow().current_leader != Some(node_id) {
                 return RoutedApply::NotHere;
             }
-            return match part.propose_result(command, now_millis()).await {
-                Ok(item) => match item.error {
-                    Some((status, message)) => RoutedApply::Failed(status, message),
-                    None => RoutedApply::Applied(item.events),
-                },
-                Err(crate::raft::ProposeError::Leader) => RoutedApply::NotHere,
-                Err(other) => RoutedApply::Failed(500, other.to_string()),
+            // Bound OBSERVATION of the local proposal (#1582): a node that still
+            // reports itself leader but has lost quorum can keep `client_write`
+            // pending indefinitely, and the routing pump's callers include the
+            // clock loop — an unbounded await there blocks later timer and
+            // lease sweeps. The proposal is detached so the write itself keeps
+            // its apply result and completes independently; only this attempt's
+            // OBSERVATION times out. A timeout is transient (the re-drive
+            // retries), and the routed command carries a source-minted delivery
+            // key the apply dedups on (#1568), so a retry after the write in
+            // fact committed is an exactly-once no-op — timing out can never
+            // discard the follow-ups of a later-committed apply.
+            // An unkeyed publish (`CorrelateMessage`) has no dedup: a retry
+            // after a late commit would mint a second message key / start a
+            // duplicate instance, so its outcome must be observed, never
+            // timed out into a retryable non-delivery (#1582).
+            if !Self::routed_command_is_idempotent(&command) {
+                return Self::classify_proposal(
+                    part.propose_result_ref(command, now_millis(), operation_reference)
+                        .await,
+                );
+            }
+            // Exactly ONE routing owner for the produced follow-ups: the
+            // detached task ALWAYS routes them itself, whether or not the
+            // observer is still listening — a send that races the observer's
+            // timeout can otherwise be dropped unread with its follow-ups
+            // (#1582).
+            //
+            // The observer is answered FIRST (with the routable follow-ups
+            // stripped, so it never re-routes them), and ONLY THEN does this task
+            // drive the routing pump. Routing-before-answer would self-deadlock:
+            // a routed correlation can advance the instance to ANOTHER catch whose
+            // open routes BACK to this same partition/leader, and that re-entrant
+            // `apply_routed_command` cannot commit while this proposal's detached
+            // task is still parked awaiting the routing it is part of. Answering
+            // first frees the proposal, so the chained open commits and the pump
+            // completes (#1582). A routed follow-up is keyed and deduped (#1568),
+            // so a later publish re-driving it is an exactly-once no-op.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let server = self.clone();
+            tokio::spawn(async move {
+                let result = part
+                    .propose_result_ref(command, now_millis(), operation_reference)
+                    .await;
+                let follow_ups = match &result {
+                    Ok(item) if item.error.is_none() => Self::routable_events(&item.events),
+                    _ => Vec::new(),
+                };
+                let _ = tx.send(Self::strip_routable(result));
+                if !follow_ups.is_empty() {
+                    server
+                        .route_late_follow_ups(follow_ups, operation_reference)
+                        .await;
+                    server.signal_jobs_available();
+                }
+            });
+            return match tokio::time::timeout(ROUTE_ATTEMPT_OBSERVE, rx).await {
+                Ok(Ok(result)) => Self::classify_proposal(result),
+                Ok(Err(_)) => RoutedApply::Failed(500, "raft proposal task ended".into()),
+                Err(_) => RoutedApply::Failed(
+                    503,
+                    format!(
+                        "partition {target} local proposal not observed within {:?}",
+                        ROUTE_ATTEMPT_OBSERVE
+                    ),
+                ),
             };
         }
         let Some(handle) = self.engine.local_for_partition(target) else {
             return RoutedApply::NotHere;
         };
         let (result, commit) = handle
-            .with(
-                move |journal| match journal.apply_command_at(command, now_millis()) {
+            .with(move |journal| {
+                match journal.apply_command_ref_at(command, now_millis(), operation_reference) {
                     Ok((events, commit)) => (Ok(events), commit),
                     Err(error) => (Err(error), Commit::ready()),
-                },
-            )
+                }
+            })
             .await;
-        commit.wait().await;
+        // Only a durable apply counts as delivered: its follow-ups are routed
+        // onward with keys peers dedup on, so they must never outrun it (#1582).
+        if !commit.wait_durable().await {
+            return RoutedApply::Failed(503, format!("partition {target} write not durable"));
+        }
         match result {
             Ok(events) => RoutedApply::Applied(events.iter().cloned().collect()),
             Err(error) => {
@@ -9694,44 +11459,102 @@ impl ServerImpl {
         }
     }
 
-    /// Forwards a cross-partition subscription follow-up `event` to the peer that
-    /// owns `target_partition`, over the Falcon protocol. The owner applies it and
-    /// drives its own pump for any further follow-ups. Best-effort: a delivery
-    /// failure is logged and dropped (idempotent — the source command re-emits the
-    /// event on replay; at RF=1 a lost open just leaves the instance parked until
-    /// a retry/restart re-routes it).
-    async fn forward_route_subscription(&self, target_partition: u64, event: Event) {
-        let owner = self.partition_write_node(target_partition);
+    /// ONE forwarding attempt of a cross-partition subscription follow-up
+    /// `event` to the node currently writing `target_partition`, over the Falcon
+    /// protocol, classified for [`Self::route_with_redrive`]. The owner applies
+    /// it and drives its own pump for any further follow-ups.
+    /// `operation_reference` rides the frame so the records the follow-up
+    /// produces on the peer carry the originating request's reference (#1600).
+    async fn forward_route_subscription(
+        &self,
+        target_partition: u64,
+        event: &Event,
+        attempt: u32,
+        operation_reference: Option<i64>,
+    ) -> RouteAttempt {
+        let owner = self.route_forward_candidate(target_partition, attempt);
         if owner == self.engine.topology().node_id {
             // No peer to hand it to: this node is the best-known writer but does
             // not lead the partition right now (a leadership gap). Never apply
-            // around the log; the source command re-emits the event on replay.
-            tracing::warn!(
-                "subscription routing: partition {target_partition} has no reachable leader; dropped"
-            );
-            return;
+            // around the log — wait for an election and re-resolve.
+            return RouteAttempt::Transient(format!(
+                "partition {target_partition} has no reachable leader"
+            ));
         }
-        match self.peers.link(owner).await {
-            Ok(link) => {
-                if let Err(e) = link.route_subscription(event).await {
-                    tracing::warn!(
-                        "subscription routing to node {owner} (partition {target_partition}) failed: {e}"
-                    );
+        // ONE absolute deadline covers link acquisition (dial lock + connect)
+        // AND the request, so a stalled dial can never stretch an attempt past
+        // the fast write-forward budget and stall the re-drive / clock loop.
+        // The link this attempt used, recorded so an OUTER-deadline expiry can
+        // evict exactly it: the outer timeout can cancel a stalled request
+        // before its own error branch runs, and a connected-but-stalled link
+        // left cached would be reused by every remaining attempt.
+        let mut used: Option<nano_server_raft::peer::PeerLink> = None;
+        let attempt = async {
+            let link = match self.peers.link(owner).await {
+                Ok(link) => link,
+                Err(e) => {
+                    return RouteAttempt::Transient(format!(
+                        "node {owner} (partition {target_partition}) unreachable: {e}"
+                    ));
                 }
+            };
+            used = Some(link.clone());
+            let result = link
+                .route_subscription(event.clone(), operation_reference)
+                .await;
+            if result.is_err() {
+                // A dead/stalled link: drop it so the next attempt redials.
+                self.peers.drop_link_if_same(owner, &link).await;
             }
-            Err(e) => tracing::warn!(
-                "subscription routing: node {owner} (partition {target_partition}) unreachable: {e}"
-            ),
+            RouteAttempt::from_peer(result)
+        };
+        let outcome = tokio::time::timeout(write_forward_timeout(), attempt).await;
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                if let Some(link) = used.as_ref() {
+                    self.peers.drop_link_if_same(owner, link).await;
+                }
+                RouteAttempt::Transient(format!(
+                    "node {owner} (partition {target_partition}) forward attempt exceeded {:?}",
+                    write_forward_timeout()
+                ))
+            }
         }
     }
 
-    /// Peer-side handler for a forwarded subscription follow-up: the owning node
-    /// drives its own pump for `event` (it now owns the target partition, so the
-    /// apply is local), recursing into any further cross-node follow-ups. Wakes
-    /// pollers in case the correlation advanced a token onto a service task.
-    pub(crate) async fn apply_routed_subscription_remote(&self, event: Event) {
-        self.drive_subscription_routing(vec![event]).await;
-        self.signal_jobs_available();
+    /// Peer-side handler for a forwarded subscription follow-up: applies the
+    /// routed command on `event`'s target partition **once** (no re-forward — a
+    /// node that does not lead the target answers `503` and the source re-drives
+    /// against the re-resolved leader, #1582), then drives its own pump for any
+    /// follow-ups the apply produced. Returns the status the source classifies
+    /// (`200` delivered, `503` not the leader, otherwise the apply's status).
+    /// Wakes pollers in case the correlation advanced a token onto a service task.
+    /// `operation_reference` is the originating request's `operationReference`
+    /// (#1600), stamped on every record the routed apply produces here and
+    /// carried onward on any follow-ups they route.
+    pub(crate) async fn apply_routed_subscription_remote(
+        &self,
+        event: Event,
+        operation_reference: Option<i64>,
+    ) -> (u16, String) {
+        let num_partitions = self.engine.topology().num_partitions;
+        let Some((target, command)) = Self::route_event(&event, num_partitions) else {
+            return (400, "event is not a routable subscription follow-up".into());
+        };
+        match self
+            .apply_routed_command(target, command, operation_reference)
+            .await
+        {
+            RoutedApply::Applied(produced) => {
+                self.drive_subscription_routing(produced, operation_reference)
+                    .await;
+                self.signal_jobs_available();
+                (200, String::new())
+            }
+            RoutedApply::NotHere => (503, format!("not the leader of partition {target}; retry")),
+            RoutedApply::Failed(status, message) => (status, message),
+        }
     }
 
     /// Spawns cross-partition subscription routing for the follow-ups carried in
@@ -9742,7 +11565,9 @@ impl ServerImpl {
     /// (`OpenMessageSubscription` keys on the subscription), so fire-and-forget is
     /// safe even if the instance partition has not yet fsynced — a crash re-emits
     /// the Opening on replay and re-routes. A no-op single-partition.
-    fn spawn_routing_if_needed(&self, events: &[Event]) {
+    /// `operation_reference` is the source command's `operationReference` (#1600),
+    /// carried onto every record the routed follow-ups produce.
+    fn spawn_routing_if_needed(&self, events: &[Event], operation_reference: Option<i64>) {
         if self.engine.topology().num_partitions <= 1 {
             return;
         }
@@ -9764,8 +11589,177 @@ impl ServerImpl {
             .collect();
         let server = self.clone();
         tokio::spawn(async move {
-            server.drive_subscription_routing(routable).await;
+            server
+                .drive_subscription_routing(routable, operation_reference)
+                .await;
         });
+    }
+
+    /// Like [`Self::spawn_routing_if_needed`] but for a source write that is NOT
+    /// yet durable (the pipelined non-Raft stream path acks before fsync):
+    /// routing is gated on the source commit becoming durable (#1582). Routed
+    /// deliveries carry source-minted keys the peer durably dedups on, so
+    /// forwarding before the source persisted could let a peer record a close
+    /// identity the source then loses in a crash — after restart the key is
+    /// reused and the real delivery silently deduped away. Returns the commit the
+    /// caller awaits (same outcome as `commit`) plus the gated routing task,
+    /// which resolves to whether routing ran.
+    fn route_after_durable(
+        &self,
+        events: &[Event],
+        commit: Commit,
+        operation_reference: Option<i64>,
+    ) -> (Commit, Option<tokio::task::JoinHandle<bool>>) {
+        if self.engine.topology().num_partitions <= 1
+            || !Self::has_routable_subscription_events(events)
+        {
+            return (commit, None);
+        }
+        let routable = Self::routable_events(events);
+        let (caller, gate) = commit.tee();
+        let server = self.clone();
+        let task = tokio::spawn(async move {
+            if !gate.wait_durable().await {
+                tracing::warn!(
+                    "subscription routing withheld: the source write never became durable"
+                );
+                return false;
+            }
+            server
+                .drive_subscription_routing(routable, operation_reference)
+                .await;
+            true
+        });
+        (caller, Some(task))
+    }
+
+    /// Cancellation-safe create submission (#1582): the create command's actor
+    /// round-trip, commit wait, and commit-gated routing all run inside ONE
+    /// detached owner task. The engine actor executes a queued command even
+    /// after its reply receiver is dropped, so awaiting the actor inline left a
+    /// window where a cancelled caller could persist an instance whose
+    /// cross-partition follow-ups nobody ever routed. Here the detached task
+    /// owns the outcome end to end: it submits `apply` at create priority,
+    /// gates routing on durability exactly as [`Self::route_after_durable`]
+    /// does (a write that never persists routes nothing), drives the routing
+    /// pump, and only then delivers the projected outcome over the returned
+    /// oneshot. The caller merely OBSERVES the outcome; cancelling that
+    /// observation strands nothing.
+    ///
+    /// The answer is sent only AFTER the routing pump has driven the
+    /// cross-partition subscription follow-ups: clients rely on the
+    /// create-then-publish ordering `main` has always given — a publish issued
+    /// the moment the create returns must find the subscription already open,
+    /// or the unmatched message is discarded and the instance stays parked
+    /// (#1582). The cost of that guarantee is bounded: a stalled subscription
+    /// target can delay the create response by at most the bounded re-drive
+    /// budget ([`ROUTE_REDRIVE`]: 16 attempts of exponential backoff capped at
+    /// 1s, plus the per-attempt forward deadline), never indefinitely. Routing
+    /// still completes when the caller has gone away: a dropped receiver
+    /// (caller cancelled) leaves this task running to completion, exactly as
+    /// [`Self::raft_create_core`] routes after Raft commit. The latency-optimal
+    /// alternative — answer at commit and gate publications on pending
+    /// subscription opens — is tracked as #1604.
+    ///
+    /// `accounting` is the admission charge (processing slot + payload bytes)
+    /// entered on the caller before submission; it is MOVED in here and held
+    /// until the actor round-trip resolves, so a cancelled caller cannot
+    /// release the charge while its create is still queued on the actor —
+    /// otherwise repeated cancelled requests would undercount the
+    /// `admission_shed` watermarks and bypass the memory limit (#1582).
+    ///
+    /// The pre-checks (shed gates, selector resolution) run on the caller
+    /// before submission, so a rejected create is never queued; a dead engine
+    /// actor answers the receiver with `None` (the closed mailbox drops the
+    /// job's reply sender), which the caller maps to a 500 instead of hanging.
+    /// A create whose write never became durable is answered as a 500 too:
+    /// acknowledging it would hand back an instance that disappears on restart.
+    fn submit_create_detached<F, T>(
+        &self,
+        accounting: CreateAccounting,
+        apply: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>
+    where
+        F: FnOnce(&mut Journal) -> Result<T, (u16, String)> + Send + 'static,
+        T: CreateOutcome + Send + 'static,
+    {
+        let engine = self.engine.for_create().clone();
+        self.submit_create_detached_on(accounting, engine, apply)
+    }
+
+    /// [`Self::submit_create_detached`] onto a caller-chosen create actor.
+    /// Production picks the actor via `for_create()` (round-robin); the
+    /// partition-pinned form exists so a test can park a barrier on the SAME
+    /// partition the create will land on, deterministically ordering the create
+    /// behind the barrier on that actor's queue.
+    fn submit_create_detached_on<F, T>(
+        &self,
+        accounting: CreateAccounting,
+        engine: DeepthiHandle,
+        apply: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>
+    where
+        F: FnOnce(&mut Journal) -> Result<T, (u16, String)> + Send + 'static,
+        T: CreateOutcome + Send + 'static,
+    {
+        let server = self.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut outcome = engine.with_low(apply).await;
+            // The actor has finished with the create (applied or rejected), so
+            // its payload is no longer resident in the creation mailbox: the
+            // admission charge is released here, not when the caller leaves.
+            drop(accounting);
+            if let Ok(created) = &mut outcome {
+                let (routable, commit) = created.take_routing_parts();
+                if !commit.wait_durable().await {
+                    // The write never persisted (writer gone unacked): route
+                    // nothing — the peer would durably record a delivery
+                    // identity the source then loses (#1582) — and do NOT
+                    // acknowledge the create: the instance would disappear on
+                    // restart, so the caller must see a retryable error.
+                    tracing::warn!(
+                        "create not acknowledged: the source write never became durable"
+                    );
+                    let _ = tx.send(Err((
+                        500,
+                        "the create was not persisted durably; retry".to_string(),
+                    )));
+                    return;
+                }
+                // Route the follow-ups FIRST, then answer: a publish issued the
+                // moment the create returns must find the subscription already
+                // open (the create-then-publish ordering clients rely on,
+                // #1582). The wait is bounded by the re-drive budget, and a
+                // dropped receiver (caller cancelled) is fine: routing already
+                // ran to completion inside this detached task. The create path
+                // maps no `operationReference` yet (#1602) — `None`.
+                server.drive_subscription_routing(routable, None).await;
+                server.signal_jobs_available();
+                let _ = tx.send(outcome);
+                return;
+            }
+            // A dropped receiver (caller cancelled) is fine; the apply already
+            // ran to completion inside this task.
+            let _ = tx.send(outcome);
+        });
+        rx
+    }
+
+    /// Observes a [`Self::submit_create_detached`] outcome, mapping a dead
+    /// engine actor (the oneshot resolves to `Err`) to a 500 rather than
+    /// hanging or panicking. Cancelling this await leaves the detached owner
+    /// running.
+    async fn observe_create<T>(
+        rx: tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>,
+    ) -> Result<T, (u16, String)> {
+        match rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err((
+                500,
+                "engine actor died while applying the create".to_string(),
+            )),
+        }
     }
 
     // ---- By-key forwarding (stage 1) -------------------------------------
@@ -9812,19 +11806,19 @@ impl ServerImpl {
         retries: i32,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = job_command_with_lease(
-            Command::update_job_retries_with_ref(job_key, retries, operation_reference),
-            lease_token,
-        );
+        let command =
+            job_command_with_lease(Command::update_job_retries(job_key, retries), lease_token);
         if !self.raft.is_empty() {
             // REST job-retries update, not stream CompleteJob: no stream diagnostic. #1306.
-            self.propose_job_for_stream(job_key, command, false)
+            self.propose_job_for_stream(job_key, command, false, operation_reference)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self.apply_job_command_direct(job_key, command).await;
+        let result = self
+            .apply_job_command_direct_ref(job_key, command, operation_reference)
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -9864,19 +11858,19 @@ impl ServerImpl {
         timeout: i64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = job_command_with_lease(
-            Command::update_job_timeout_with_ref(job_key, timeout, operation_reference),
-            lease_token,
-        );
+        let command =
+            job_command_with_lease(Command::update_job_timeout(job_key, timeout), lease_token);
         if !self.raft.is_empty() {
             // REST job-timeout update, not stream CompleteJob: no stream diagnostic. #1306.
-            self.propose_job_for_stream(job_key, command, false)
+            self.propose_job_for_stream(job_key, command, false, operation_reference)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self.apply_job_command_direct(job_key, command).await;
+        let result = self
+            .apply_job_command_direct_ref(job_key, command, operation_reference)
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -9901,11 +11895,10 @@ impl ServerImpl {
         incident_key: u64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let command = Command::ResolveIncident {
-            incident_key,
-            operation_reference,
-        };
-        let _ = self.apply_partition_command(incident_key, command).await?;
+        let command = Command::resolve_incident(incident_key);
+        let _ = self
+            .apply_partition_command_ref(incident_key, command, operation_reference)
+            .await?;
         self.signal_jobs_available();
         Ok(())
     }
@@ -9914,7 +11907,7 @@ impl ServerImpl {
     pub(crate) async fn set_variables_local(
         &self,
         scope_key: u64,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         local: bool,
     ) -> Result<(), (u16, String)> {
         self.apply_partition_command(
@@ -10445,13 +12438,20 @@ impl ServerImpl {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        retry_back_off: i64,
     ) -> apis::job::FailJobResponse {
         use apis::job::FailJobResponse as Resp;
         let res =
             match self.peer_link(node).await {
                 Ok(link) => {
-                    link.fail_job(job_key.to_string(), lease_token, retries, error_message)
-                        .await
+                    link.fail_job(
+                        job_key.to_string(),
+                        lease_token,
+                        retries,
+                        error_message,
+                        retry_back_off,
+                    )
+                    .await
                 }
                 Err((s, m)) => {
                     return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
@@ -10599,10 +12599,17 @@ impl ServerImpl {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        retry_back_off: i64,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
             Ok(link) => match link
-                .fail_job(job_key.to_string(), lease_token, retries, error_message)
+                .fail_job(
+                    job_key.to_string(),
+                    lease_token,
+                    retries,
+                    error_message,
+                    retry_back_off,
+                )
                 .await
             {
                 Ok(r) => (r.status, r.body),
@@ -10736,7 +12743,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         await_completion: bool,
@@ -10766,78 +12773,68 @@ impl ServerImpl {
         }
         let tags_for_response = tags.clone();
         let business_id_for_response = business_id.clone();
-        type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
         // Under Raft, a forwarded create must be REPLICATED through this node's
         // Raft log, not applied directly to the local engine — otherwise the
         // instance would not survive this node's failure. Route it through the
         // shared Raft create core (durability is awaited inside the propose, so
         // the returned commit is already ready).
-        let outcome: Result<CreateOk, (u16, String)> = if !self.raft.is_empty() {
-            self.raft_create_core(by_id, by_key, None, variables, tags, business_id)
-                .await
-                .map(
-                    |(
-                        process_id,
-                        version,
-                        definition_key,
-                        instance_key,
-                        sync_completed,
-                        routable,
-                    )| {
-                        (
-                            process_id,
-                            version,
-                            definition_key,
-                            instance_key,
-                            sync_completed,
-                            routable,
-                            Commit::ready(),
-                        )
-                    },
-                )
+        let (process_id, created) = if !self.raft.is_empty() {
+            let (process_id, version, definition_key, instance_key, sync_completed, routable) =
+                self.raft_create_core(by_id, by_key, None, variables, tags, business_id)
+                    .await?;
+            (
+                process_id,
+                CreatedInstanceDirect {
+                    instance_key,
+                    definition_key,
+                    version,
+                    sync_completed,
+                    routable,
+                    commit: Commit::ready(),
+                },
+            )
         } else {
+            // The actor round-trip, commit wait, and commit-gated routing run
+            // inside ONE detached owner task (#1582): a caller cancelled while
+            // the actor still has the command queued must not strand a
+            // persisted create without its cross-partition routing. Awaiting
+            // the receiver here only OBSERVES the outcome.
             let payload_bytes = engine_vars_bytes(&variables);
-            let _processing = ProcessingGuard::enter(&self.processing);
-            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            self.engine
-                .for_create()
-                .with_low(move |engine| {
-                    let (process_id, sel_key, sel_ver) =
-                        match resolve_create_selector(engine.state(), by_id, by_key, None) {
-                            Ok(t) => t,
-                            Err(e) => return Err(e),
-                        };
-                    match apply_create_instance_direct(
-                        engine,
-                        Command::create_instance_versioned(
-                            process_id.clone(),
-                            variables,
-                            tags,
-                            business_id,
-                            sel_key,
-                            sel_ver,
-                        ),
-                        &process_id,
-                    ) {
-                        Ok(created) => Ok((
-                            process_id,
-                            created.version,
-                            created.definition_key,
-                            created.instance_key,
-                            created.sync_completed,
-                            created.routable,
-                            created.commit,
-                        )),
-                        Err(EngineError::ProcessNotFound { process_id }) => {
-                            Err((400, format!("No deployed process with id '{process_id}'.")))
-                        }
-                        Err(e) => Err((500, e.to_string())),
+            // The admission charge is TRANSFERRED into the detached owner
+            // (#1582), held until the actor finishes the create.
+            let accounting = CreateAccounting::enter(self, payload_bytes);
+            let rx = self.submit_create_detached(accounting, move |engine| {
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), by_id, by_key, None)?;
+                let created = apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        tags,
+                        business_id,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| match e {
+                    EngineError::ProcessNotFound { process_id } => {
+                        (400, format!("No deployed process with id '{process_id}'."))
                     }
-                })
-                .await
+                    other => (500, other.to_string()),
+                })?;
+                Ok((process_id, created))
+            });
+            Self::observe_create(rx).await?
         };
-        let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
-            outcome?;
+        let CreatedInstanceDirect {
+            instance_key,
+            definition_key,
+            version,
+            sync_completed,
+            ..
+        } = created;
         // Count the forwarded create exactly once, here at the committing owner,
         // under the ORIGINAL client transport (`origin_protocol`) rather than a
         // hardcoded "rest". The forwarding node deliberately does NOT record a
@@ -10845,10 +12842,12 @@ impl ServerImpl {
         // `nanobpm_creates_total` reflects real instances 1:1 instead of
         // double-counting every forwarded create (once at ingress, once here).
         crate::metrics::record_create(origin_protocol);
-        commit.wait().await;
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        // The non-Raft branch's detached owner awaited durability AND drove the
+        // cross-partition routing pump before answering (#1582); under Raft the
+        // proposal is durable at commit and `raft_create_core` routes before
+        // answering too. Either way the create is committed and its
+        // subscriptions routed by the time we answer, so a publish issued right
+        // after finds them open.
         self.signal_jobs_available();
         let (variables_out, process_completed) = if await_completion {
             self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
@@ -11219,8 +13218,43 @@ impl ServerImpl {
                         problem("Conflict", 409, peer_detail(&r)),
                     );
                 }
-                // Transient (peer 5xx, timeout, closed): re-resolve leader & retry.
+                // The link closed (or was retired after an unrelated routing
+                // timeout) AFTER the create was sent: the peer may already have
+                // committed it. Without a business id a retry is not
+                // idempotent and could mint a duplicate instance, so surface
+                // the ambiguous outcome instead of re-driving (#1582).
+                Ok(r)
+                    if business_id.is_none()
+                        && nano_server_raft::peer::is_link_closed_result(&r) =>
+                {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Peer error",
+                        500,
+                        "the peer link closed before the forwarded create was acknowledged; its outcome is unknown, so it was not retried".into(),
+                    ));
+                }
+                // Transient peer 5xx (not link-closed, handled above): re-resolve
+                // the leader & retry.
                 Ok(r) => last_detail = peer_detail(&r),
+                // A transport error (timeout / closed) AFTER the create may have
+                // been sent is ambiguous — the peer may already have committed it.
+                // Without a business id a retry is not idempotent and could mint a
+                // duplicate instance, so surface the ambiguous outcome instead of
+                // re-driving (#1582). This mirrors the link-closed guard above and
+                // the REST path ([`forward_create_once`]), which already refuses to
+                // reroute a transport-errored create. A create WITH a business id
+                // dedups on retry, so it stays retryable.
+                Err(e) if business_id.is_none() => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem(
+                            "Peer error",
+                            500,
+                            format!(
+                                "the forwarded create's outcome is unknown ({e}); it was not retried, so no duplicate instance is minted"
+                            ),
+                        ),
+                    );
+                }
                 Err(e) => last_detail = e.to_string(),
             }
 
@@ -11251,12 +13285,16 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
+        // The synced spec's `MessagePublicationRequest` has no
+        // `operationReference` yet (it arrives with the camunda#67491
+        // re-sync); the request-mapping seam passes `None` until then.
         let (message_key, _instance) = match self
             .correlate_message_cluster(
                 body_name,
                 correlation_key,
                 variables,
                 body.business_id.clone(),
+                None,
             )
             .await
         {
@@ -11307,12 +13345,15 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
+        // `MessageCorrelationRequest` has no `operationReference` in the synced
+        // spec yet (it arrives with the camunda#67491 re-sync) — `None` here.
         let (message_key, correlated_instance) = match self
             .correlate_message_cluster(
                 body_name,
                 correlation_key,
                 variables,
                 body.business_id.clone(),
+                None,
             )
             .await
         {
@@ -11365,7 +13406,7 @@ impl ServerImpl {
         }
     }
 
-    async fn get_incident_impl(
+    pub(crate) async fn get_incident_impl(
         &self,
         path_params: &models::GetIncidentPathParams,
     ) -> Result<apis::incident::GetIncidentResponse, ()> {
@@ -11429,7 +13470,7 @@ impl ServerImpl {
         }
     }
 
-    async fn search_incidents_impl(
+    pub(crate) async fn search_incidents_impl(
         &self,
         body: &Option<models::IncidentSearchQuery>,
     ) -> Result<apis::incident::SearchIncidentsResponse, ()> {
@@ -11445,35 +13486,7 @@ impl ServerImpl {
             .iter()
             .filter(|inc| match filter {
                 None => true,
-                Some(f) => {
-                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &inc.instance_key.to_string(),
-                        )
-                        && query::match_element_instance_key(
-                            &f.element_instance_key,
-                            &inc.element_instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &inc.process_definition_key,
-                        )
-                        && query::match_job_key_opt(
-                            &f.job_key,
-                            inc.job_key.map(|k| k.to_string()).as_deref(),
-                        )
-                        && query::match_incident_state(
-                            &f.state,
-                            &incident_state_enum(inc.state).to_string(),
-                        )
-                        && query::match_incident_error_type(
-                            &f.error_type,
-                            &incident_error_type_enum(inc.kind).to_string(),
-                        )
-                        && query::match_string(&f.element_id, &inc.element_id)
-                        && query::match_string(&f.error_message, &inc.reason)
-                }
+                Some(f) => match_incident_filter(inc, f),
             })
             .collect();
 
@@ -11486,12 +13499,18 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i64),
+                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
                 "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
                 "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
                 "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                _ => query::SortVal::Num(inc.key as i64),
+                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
+                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
+                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
+                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
+                "incidentKey" => query::SortVal::Num(inc.key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(inc.key as i128),
             },
             |inc| inc.key,
         );
@@ -11589,35 +13608,7 @@ impl ServerImpl {
             .filter(|inc| contained.contains(&inc.element_instance_key))
             .filter(|inc| match filter {
                 None => true,
-                Some(f) => {
-                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &inc.instance_key.to_string(),
-                        )
-                        && query::match_element_instance_key(
-                            &f.element_instance_key,
-                            &inc.element_instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &inc.process_definition_key,
-                        )
-                        && query::match_job_key_opt(
-                            &f.job_key,
-                            inc.job_key.map(|k| k.to_string()).as_deref(),
-                        )
-                        && query::match_incident_state(
-                            &f.state,
-                            &incident_state_enum(inc.state).to_string(),
-                        )
-                        && query::match_incident_error_type(
-                            &f.error_type,
-                            &incident_error_type_enum(inc.kind).to_string(),
-                        )
-                        && query::match_string(&f.element_id, &inc.element_id)
-                        && query::match_string(&f.error_message, &inc.reason)
-                }
+                Some(f) => match_incident_filter(inc, f),
             })
             .collect();
 
@@ -11629,12 +13620,18 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i64),
+                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
                 "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
                 "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
                 "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                _ => query::SortVal::Num(inc.key as i64),
+                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
+                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
+                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
+                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
+                "incidentKey" => query::SortVal::Num(inc.key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(inc.key as i128),
             },
             |inc| inc.key,
         );
@@ -11938,12 +13935,13 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |ws, field| match field {
-                "processInstanceKey" => query::SortVal::Num(ws.process_instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(ws.process_instance_key as i128),
                 "rootProcessInstanceKey" => query::SortVal::Num(
-                    roots.root_process_instance_key(ws.process_instance_key) as i64,
+                    roots.root_process_instance_key(ws.process_instance_key) as i128,
                 ),
                 "elementId" => query::SortVal::Str(ws.element_id.clone()),
-                _ => query::SortVal::Num(ws.element_instance_key as i64),
+                "elementInstanceKey" => query::SortVal::Num(ws.element_instance_key as i128),
+                _ => query::SortVal::Num(ws.element_instance_key as i128),
             },
             |ws| (ws.element_instance_key, ws.source_key),
         );
@@ -12176,22 +14174,27 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |row, field| match field {
-                "evaluationDate" => query::SortVal::Num(row.evaluation_date_ms as i64),
+                "evaluationDate" => query::SortVal::Num(row.evaluation_date_ms as i128),
                 "decisionDefinitionId" => query::SortVal::Str(row.decision_id.clone()),
                 "decisionDefinitionName" => query::SortVal::Str(row.decision_name.clone()),
-                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i64),
-                "decisionDefinitionVersion" => query::SortVal::Num(row.version as i64),
+                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i128),
+                "decisionDefinitionVersion" => query::SortVal::Num(row.version as i128),
                 "decisionDefinitionType" => query::SortVal::Str(row.decision_type.clone()),
-                "processInstanceKey" => query::SortVal::Num(row.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(row.instance_key as i128),
                 "state" => query::SortVal::Str(row.state.clone()),
                 "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
                 "decisionEvaluationInstanceKey" => {
                     query::SortVal::Str(row.eval_instance_key.clone())
                 }
-                "businessId" => query::SortVal::Str(row.business_id.clone().unwrap_or_default()),
+                "businessId" => query::opt_str_sort_val(row.business_id.as_deref()),
+                "decisionEvaluationKey" => query::SortVal::Num(row.decision_evaluation_key as i128),
+                "elementInstanceKey" => query::SortVal::Num(row.element_instance_key as i128),
+                "evaluationFailure" => query::opt_str_sort_val(row.evaluation_failure.as_deref()),
+                "processDefinitionKey" => query::key_sort_val(&row.process_definition_key),
+                "rootDecisionDefinitionKey" => query::SortVal::Num(row.root_decision_key as i128),
                 // Default (key) sort: by evaluation key, then the within-
                 // evaluation index via the composite tiebreak below.
-                _ => query::SortVal::Num(row.decision_evaluation_key as i64),
+                _ => query::SortVal::Num(row.decision_evaluation_key as i128),
             },
             |row| entity_key(row),
         );
@@ -12360,23 +14363,23 @@ impl ServerImpl {
             &sort,
             |row, field| match field {
                 "decisionDefinitionId" => query::SortVal::Str(row.decision_id.clone()),
-                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i64),
+                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i128),
                 "name" => query::SortVal::Str(row.name.clone()),
-                "version" => query::SortVal::Num(row.version as i64),
+                "version" => query::SortVal::Num(row.version as i128),
                 "decisionRequirementsId" => {
                     query::SortVal::Str(row.decision_requirements_id.clone())
                 }
                 "decisionRequirementsKey" => {
-                    query::SortVal::Num(row.decision_requirements_key as i64)
+                    query::SortVal::Num(row.decision_requirements_key as i128)
                 }
                 "decisionRequirementsName" => {
                     query::SortVal::Str(row.decision_requirements_name.clone())
                 }
                 "decisionRequirementsVersion" => {
-                    query::SortVal::Num(row.decision_requirements_version as i64)
+                    query::SortVal::Num(row.decision_requirements_version as i128)
                 }
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(row.decision_key as i64),
+                _ => query::SortVal::Num(row.decision_key as i128),
             },
             |row| row.decision_key,
         );
@@ -12508,12 +14511,12 @@ impl ServerImpl {
             &sort,
             |row, field| match field {
                 "decisionRequirementsId" => query::SortVal::Str(row.drg_id.clone()),
-                "decisionRequirementsKey" => query::SortVal::Num(row.drg_key as i64),
+                "decisionRequirementsKey" => query::SortVal::Num(row.drg_key as i128),
                 "decisionRequirementsName" => query::SortVal::Str(row.name.clone()),
-                "version" => query::SortVal::Num(row.version as i64),
+                "version" => query::SortVal::Num(row.version as i128),
                 "resourceName" => query::SortVal::Str(row.resource_name.clone()),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(row.drg_key as i64),
+                _ => query::SortVal::Num(row.drg_key as i128),
             },
             |row| row.drg_key,
         );
@@ -12678,18 +14681,7 @@ impl ServerImpl {
         query::sort_items(
             &mut matched,
             &sort,
-            |row, field| match field {
-                "resourceId" => query::SortVal::Str(row.resource_id.clone()),
-                "resourceName" => query::SortVal::Str(row.resource_name.clone()),
-                "version" => query::SortVal::Num(row.version as i64),
-                // `versionTag` is nullable; a null tag sorts as the empty string
-                // (before any present tag ascending), matching how the read model
-                // projects `versionTag: null`.
-                "versionTag" => query::SortVal::Str(row.version_tag.clone().unwrap_or_default()),
-                "resourceKey" => query::SortVal::Num(row.resource_key as i64),
-                "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
-                _ => query::SortVal::Num(row.resource_key as i64),
-            },
+            |row, field| resource_sort_val(row, field),
             |row| row.resource_key,
         );
 
@@ -12706,7 +14698,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn search_process_instances_impl(
+    pub(crate) async fn search_process_instances_impl(
         &self,
         body: &Option<models::ProcessInstanceSearchQuery>,
     ) -> Result<apis::process_instance::SearchProcessInstancesResponse, ()> {
@@ -12714,127 +14706,19 @@ impl ServerImpl {
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let instances = self.store.process_instances();
 
-        // The `variables` filter constrains results to instances whose
-        // process-scoped (root) variables match. Pre-index those variables by
-        // instance only when a variable filter is actually present, so the
-        // common (no variable-filter) path pays nothing for the extra scan.
-        let variables_index: std::collections::HashMap<
-            u64,
-            std::collections::HashMap<String, String>,
-        > = match filter {
-            Some(f) if f.variables.as_ref().is_some_and(|v| !v.is_empty()) => {
-                // Only the variable names referenced by the filter can affect
-                // the match, so restrict the index to that set. This keeps the
-                // scan a single pass while avoiding HashMap churn for unrelated
-                // variable names in a large store.
-                let requested: std::collections::HashSet<&str> = f
-                    .variables
-                    .as_ref()
-                    .map(|v| v.iter().map(|entry| entry.name.as_str()).collect())
-                    .unwrap_or_default();
-                let mut idx: std::collections::HashMap<
-                    u64,
-                    std::collections::HashMap<String, String>,
-                > = std::collections::HashMap::new();
-                for v in self.store.variables() {
-                    // Root-scope (process-instance) variables only: a variable
-                    // held under a nested scope has `scope_key != instance_key`
-                    // and is not a process-instance-level variable.
-                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
-                        idx.entry(v.instance_key)
-                            .or_default()
-                            .insert(v.name, v.value);
-                    }
-                }
-                idx
-            }
-            _ => std::collections::HashMap::new(),
-        };
-
-        // Pre-index the instance's element-instance / job / incident child rows
-        // only when an inherited cross-entity filter is actually present (same
-        // lazy construction as `variables_index`), loading only the child-row
-        // sources the supplied predicates read.
-        let cross_index = match filter {
-            Some(f) if InstanceCrossEntityIndex::is_needed(f) => InstanceCrossEntityIndex::new(
-                f,
-                &InstanceCrossEntityIndex::sources_for(f, &self.store),
-            ),
-            _ => InstanceCrossEntityIndex::default(),
-        };
-
+        // One shared matcher (the same algebra the batch-selection path uses),
+        // honouring every top-level field AND the `$or` clause list (#1293).
+        let matcher = filter.map(|f| ProcessInstanceMatcher::new(f, &self.store));
         let mut matched: Vec<&readstore::ProcessInstanceRow> = instances
             .iter()
-            .filter(|inst| match filter {
-                None => true,
-                Some(f) => {
-                    let state_str = process_instance_state_enum(inst.state).to_string();
-                    query::match_process_instance_key(
-                        &f.process_instance_key,
-                        &inst.key.to_string(),
-                    ) && query::match_process_definition_key(
-                        &f.process_definition_key,
-                        &inst.process_definition_key,
-                    ) && query::match_string(&f.process_definition_id, &inst.process_definition_id)
-                        && query::match_integer(
-                            &f.process_definition_version,
-                            Some(i64::from(inst.version)),
-                        )
-                        && query::match_process_instance_state(&f.state, &state_str)
-                        && f.has_incident.is_none_or(|want| want == inst.has_incident)
-                        && query::match_date_time_ms(&f.start_date, Some(inst.start_date_ms as i64))
-                        // Nano does not yet project a process-instance completion
-                        // timestamp, so an `endDate` filter matches against an
-                        // absent value: range/equality operators correctly exclude
-                        // (honest, not silently ignored) while `$exists: false`
-                        // still matches.
-                        && query::match_date_time_ms(&f.end_date, None)
-                        && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
-                        // `suspendedDate`: read straight from the read-model's
-                        // `suspended_date_ms` (the single source of truth for
-                        // suspension) — a datetime while suspended, absent otherwise.
-                        && query::match_date_time_ms(
-                            &f.suspended_date,
-                            inst.suspended_date_ms.map(|ms| ms as i64),
-                        )
-                        // Nano is single-tenant: every instance's `tenantId` is the
-                        // `<default>` constant, so honour the filter against it.
-                        && query::match_string(&f.tenant_id, "<default>")
-                        // `processDefinitionName` / `processDefinitionVersionTag` are
-                        // never projected (always null in `process_instance_result`),
-                        // so match against an absent value: equality / `$like` /
-                        // `$in` / `$exists: true` correctly exclude, `$exists: false`
-                        // matches.
-                        && query::match_string_opt(&f.process_definition_name, None)
-                        && query::match_string_opt(&f.process_definition_version_tag, None)
-                        // Call-activity hierarchy filters (C8 parity, issue
-                        // #977): a bare parent key enumerates the direct children
-                        // of that instance; `$exists:false` selects top-level
-                        // instances. A top-level instance carries no parent, so
-                        // its parent keys match against an absent value.
-                        && query::match_process_instance_key_opt(
-                            &f.parent_process_instance_key,
-                            inst.parent_process_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        )
-                        && query::match_element_instance_key_opt(
-                            &f.parent_element_instance_key,
-                            inst.parent_element_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        )
-                        && match_instance_variables(
-                            &f.variables,
-                            variables_index.get(&inst.key),
-                        )
-                        && match_instance_tags(&f.tags, &inst.tags)
-                        // Inherited element / job / incident / batch-operation
-                        // filters (C8 parity): existential predicates over the
-                        // instance's child rows, evaluated against the
-                        // pre-indexed cross-entity index.
-                        && match_instance_cross_entity_filters(f, inst.key, &cross_index)
-                }
+            .filter(|inst| {
+                matcher.as_ref().is_none_or(|m| {
+                    m.matches(
+                        inst,
+                        ProcessInstanceStatePolicy::HonourFilter,
+                        BatchHierarchyPolicy::HonourFilters,
+                    )
+                })
             })
             .collect();
 
@@ -12847,12 +14731,30 @@ impl ServerImpl {
             &sort,
             |inst, field| match field {
                 "processDefinitionId" => query::SortVal::Str(inst.process_definition_id.clone()),
-                "processDefinitionKey" => {
-                    query::SortVal::Num(inst.process_definition_key.parse().unwrap_or(0))
-                }
+                "processDefinitionKey" => query::key_sort_val(&inst.process_definition_key),
                 "state" => query::SortVal::Str(process_instance_state_enum(inst.state).to_string()),
-                "businessId" => query::SortVal::Str(inst.business_id.clone().unwrap_or_default()),
-                _ => query::SortVal::Num(inst.key as i64),
+                "businessId" => query::opt_str_sort_val(inst.business_id.as_deref()),
+                "startDate" => query::SortVal::Num(inst.start_date_ms as i128),
+                "suspendedDate" => {
+                    query::opt_num_sort_val(inst.suspended_date_ms.map(|ms| ms as i128))
+                }
+                "hasIncident" => query::SortVal::Num(i128::from(inst.has_incident)),
+                "parentProcessInstanceKey" => {
+                    query::opt_num_sort_val(inst.parent_process_instance_key.map(|k| k as i128))
+                }
+                "parentElementInstanceKey" => {
+                    query::opt_num_sort_val(inst.parent_element_instance_key.map(|k| k as i128))
+                }
+                "processDefinitionVersion" => query::SortVal::Num(i128::from(inst.version)),
+                // Constant in Nano: the result always projects these as null
+                // (`process_instance_result`), so every row ties and the
+                // entity-key tiebreak orders them.
+                "endDate" | "processDefinitionName" | "processDefinitionVersionTag" => {
+                    query::SortVal::Num(0)
+                }
+                "processInstanceKey" => query::SortVal::Num(inst.key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(inst.key as i128),
             },
             |inst| inst.key,
         );
@@ -12877,48 +14779,83 @@ impl ServerImpl {
 
     /// Searches open message subscriptions (Zeebe `searchMessageSubscriptions`).
     ///
-    /// Backed by the `message_subscriptions` read-model table, which retains only
-    /// *open*, instance-scoped subscriptions (a running element instance parked on
-    /// a message catch), dropped on correlate/cancel/terminate. Every retained row
-    /// therefore surfaces with `state = CREATED` and `type = PROCESS_EVENT`;
-    /// settled subscriptions and message-*start* (`START_EVENT`) subscriptions are
-    /// not materialised and so are not returned. Process-definition attributes are
-    /// resolved by joining each subscription's instance to `process_instances`.
+    /// Backed by two read-model tables:
+    /// * `message_subscriptions` retains only *open*, instance-scoped
+    ///   subscriptions (a running element instance parked on a message catch),
+    ///   dropped on correlate/cancel/terminate. Every retained row surfaces with
+    ///   `state = CREATED` and `type = PROCESS_EVENT`; settled subscriptions are
+    ///   not materialised and so are not returned. Process-definition attributes
+    ///   are resolved by joining each subscription's instance to
+    ///   `process_instances`.
+    /// * `message_start_subscriptions` (#1499) retains the definition-scoped
+    ///   message *start event* subscriptions, one per deployed start message.
+    ///   These surface with `type = START_EVENT`, a null `processInstanceKey` /
+    ///   `elementInstanceKey` / `correlationKey` (they are not bound to an
+    ///   instance), and the MCP tool metadata (`toolName` / `toolProperties`)
+    ///   the start event declared via `zeebe:properties` (`io.camunda.tool:*`).
     async fn search_message_subscriptions_impl(
         &self,
         body: &Option<models::MessageSubscriptionSearchQuery>,
     ) -> Result<apis::message_subscription::SearchMessageSubscriptionsResponse, ()> {
         use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
 
-        // Every open read-model subscription is a created, process-event catch.
         let state_str = models::MessageSubscriptionStateEnum::Created.to_string();
-        let type_str = models::MessageSubscriptionTypeEnum::ProcessEvent.to_string();
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let subs = self.store.message_subscriptions();
+        let start_subs = self.store.message_start_subscriptions();
 
-        // Resolve process-definition attributes by joining to the owning instance.
+        // Resolve process-definition attributes by joining to the owning instance
+        // (PROCESS_EVENT rows) or directly to the deployed definition
+        // (START_EVENT rows).
         let instances = self.store.process_instances();
         let by_instance: std::collections::HashMap<u64, &readstore::ProcessInstanceRow> =
             instances.iter().map(|inst| (inst.key, inst)).collect();
+        let definitions = self.store.process_definitions();
+        let by_definition_key: std::collections::HashMap<u64, &readstore::ProcessDefinitionRow> =
+            definitions.iter().map(|d| (d.key, d)).collect();
 
         struct MsgSubEntry {
             subscription_key: u64,
             process_definition_id: String,
             process_definition_key: Option<String>,
-            process_instance_key: u64,
+            /// `Some` for instance-scoped (`PROCESS_EVENT`) subscriptions; `None`
+            /// for definition-scoped (`START_EVENT`) ones.
+            process_instance_key: Option<u64>,
             element_id: String,
-            element_instance_key: u64,
+            /// `Some` for `PROCESS_EVENT`; `None` for `START_EVENT`.
+            element_instance_key: Option<u64>,
             last_updated_ms: u64,
             message_name: String,
-            correlation_key: String,
+            /// `Some` for `PROCESS_EVENT`; `None` for `START_EVENT` (a start
+            /// subscription correlates by message name only).
+            correlation_key: Option<String>,
             process_definition_version: Option<i32>,
             /// The owning instance's business id (joined, like the definition
             /// attributes): the single source for both filter and result.
+            /// `None` for `START_EVENT` rows (not bound to an instance).
             business_id: Option<String>,
+            /// The MCP tool name from the start event's `io.camunda.tool:name`
+            /// zeebe:property (#1499). `None` when the property is absent and on
+            /// `PROCESS_EVENT` rows.
+            tool_name: Option<String>,
+            /// The start event's `io.camunda.tool:*` zeebe:properties subset.
+            /// Empty when none and on `PROCESS_EVENT` rows.
+            tool_properties: std::collections::HashMap<String, String>,
+            /// The Zeebe `messageSubscriptionType` of this row.
+            is_start_event: bool,
         }
+        // The Zeebe `messageSubscriptionType` string of a row: the single
+        // source for the filter and the sort.
+        let type_str = |e: &MsgSubEntry| {
+            if e.is_start_event {
+                models::MessageSubscriptionTypeEnum::StartEvent.to_string()
+            } else {
+                models::MessageSubscriptionTypeEnum::ProcessEvent.to_string()
+            }
+        };
 
-        let entries: Vec<MsgSubEntry> = subs
+        let mut entries: Vec<MsgSubEntry> = subs
             .into_iter()
             .filter_map(|sub| {
                 // Skip subscriptions whose owning instance is not yet projected
@@ -12933,20 +14870,51 @@ impl ServerImpl {
                     subscription_key: sub.subscription_key,
                     process_definition_id: inst.process_definition_id.clone(),
                     process_definition_key: Some(inst.process_definition_key.clone()),
-                    process_instance_key: sub.instance_key,
+                    process_instance_key: Some(sub.instance_key),
                     element_id: sub.element_id,
-                    element_instance_key: sub.element_instance_key,
+                    element_instance_key: Some(sub.element_instance_key),
                     last_updated_ms: sub.created_at_ms,
                     message_name: sub.message_name,
-                    correlation_key: sub.correlation_key,
+                    correlation_key: Some(sub.correlation_key),
                     process_definition_version: Some(inst.version),
                     business_id: sub.business_id,
+                    tool_name: None,
+                    tool_properties: std::collections::HashMap::new(),
+                    is_start_event: false,
                 })
             })
             .collect();
 
-        // All Zeebe `MessageSubscriptionFilter` fields are honoured. Fields Nano
-        // does not yet project (`processDefinitionName`, `toolName`,
+        // Definition-scoped message start event subscriptions (#1499). The
+        // subscription key is the read model's canonical derived key
+        // (`message_start_subscription_key`), unique per start event even when
+        // one definition declares several message starts.
+        entries.extend(start_subs.into_iter().filter_map(|sub| {
+            let def = by_definition_key.get(&sub.process_definition_key)?;
+            Some(MsgSubEntry {
+                subscription_key: sub.subscription_key,
+                process_definition_id: def.process_id.clone(),
+                process_definition_key: Some(sub.process_definition_key.to_string()),
+                process_instance_key: None,
+                element_id: sub.start_element_id,
+                element_instance_key: None,
+                last_updated_ms: sub.created_at_ms,
+                message_name: sub.message_name,
+                correlation_key: None,
+                process_definition_version: Some(def.version),
+                business_id: None,
+                tool_name: sub.tool_name,
+                tool_properties: serde_json::from_str(&sub.tool_properties).unwrap_or_default(),
+                is_start_event: true,
+            })
+        }));
+
+        // All Zeebe `MessageSubscriptionFilter` fields are honoured. `toolName`
+        // is projected for START_EVENT rows (the start event's
+        // `io.camunda.tool:name` zeebe:property, #1499) and absent elsewhere, so
+        // an equality/`$like` filter matches only tool-marked start
+        // subscriptions while `$exists: false` matches every row without a tool
+        // name. Fields Nano does not yet project (`processDefinitionName`,
         // `inboundConnectorType`) are matched against an absent value, so an
         // equality/`$like` filter on them correctly yields no rows (rather than
         // being silently ignored) while `$exists: false` still matches.
@@ -12955,6 +14923,7 @@ impl ServerImpl {
             .filter(|e| match filter {
                 None => true,
                 Some(f) => {
+                    let type_str = type_str(e);
                     query::match_message_subscription_key(
                         &f.message_subscription_key,
                         &e.subscription_key.to_string(),
@@ -12962,17 +14931,17 @@ impl ServerImpl {
                         &f.process_definition_key,
                         e.process_definition_key.as_deref().unwrap_or(""),
                     ) && query::match_string(&f.process_definition_id, &e.process_definition_id)
-                        && query::match_process_instance_key(
+                        && query::match_process_instance_key_opt(
                             &f.process_instance_key,
-                            &e.process_instance_key.to_string(),
+                            e.process_instance_key.map(|k| k.to_string()).as_deref(),
                         )
                         && query::match_string(&f.element_id, &e.element_id)
-                        && query::match_element_instance_key(
+                        && query::match_element_instance_key_opt(
                             &f.element_instance_key,
-                            &e.element_instance_key.to_string(),
+                            e.element_instance_key.map(|k| k.to_string()).as_deref(),
                         )
                         && query::match_string(&f.message_name, &e.message_name)
-                        && query::match_string(&f.correlation_key, &e.correlation_key)
+                        && query::match_string_opt(&f.correlation_key, e.correlation_key.as_deref())
                         && query::match_message_subscription_state(
                             &f.message_subscription_state,
                             &state_str,
@@ -12991,7 +14960,7 @@ impl ServerImpl {
                             Some(e.last_updated_ms as i64),
                         )
                         && query::match_string_opt(&f.process_definition_name, None)
-                        && query::match_string_opt(&f.tool_name, None)
+                        && query::match_string_opt(&f.tool_name, e.tool_name.as_deref())
                         && query::match_string_opt(&f.inbound_connector_type, None)
                         && query::match_string_opt(&f.business_id, e.business_id.as_deref())
                 }
@@ -13007,23 +14976,34 @@ impl ServerImpl {
             &sort,
             |e, field| match field {
                 "processDefinitionId" => query::SortVal::Str(e.process_definition_id.clone()),
-                "processDefinitionKey" => query::SortVal::Num(
-                    e.process_definition_key
-                        .as_deref()
-                        .and_then(|k| k.parse().ok())
-                        .unwrap_or(0),
-                ),
-                "processDefinitionVersion" => {
-                    query::SortVal::Num(e.process_definition_version.unwrap_or(0) as i64)
+                "processDefinitionKey" => {
+                    query::key_sort_val(e.process_definition_key.as_deref().unwrap_or(""))
                 }
-                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
+                "processDefinitionVersion" => {
+                    query::opt_num_sort_val(e.process_definition_version.map(|v| v as i128))
+                }
+                "processInstanceKey" => {
+                    query::opt_num_sort_val(e.process_instance_key.map(|v| v as i128))
+                }
                 "elementId" => query::SortVal::Str(e.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i64),
+                "elementInstanceKey" => {
+                    query::opt_num_sort_val(e.element_instance_key.map(|v| v as i128))
+                }
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
-                "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
-                "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
-                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
-                _ => query::SortVal::Num(e.subscription_key as i64),
+                "correlationKey" => query::opt_str_sort_val(e.correlation_key.as_deref()),
+                "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i128),
+                "businessId" => query::opt_str_sort_val(e.business_id.as_deref()),
+                "toolName" => query::opt_str_sort_val(e.tool_name.as_deref()),
+                "messageSubscriptionType" => query::SortVal::Str(type_str(e)),
+                // Constant in Nano: every retained subscription is `CREATED`
+                // (`state_str`), and `processDefinitionName` /
+                // `inboundConnectorType` are never projected (null), so all
+                // rows tie and the subscription-key tiebreak orders them.
+                "messageSubscriptionState" => query::SortVal::Str(state_str.clone()),
+                "processDefinitionName" | "inboundConnectorType" => query::SortVal::Num(0),
+                "messageSubscriptionKey" => query::SortVal::Num(e.subscription_key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(e.subscription_key as i128),
             },
             |e| e.subscription_key,
         );
@@ -13054,26 +15034,42 @@ impl ServerImpl {
                         Some(k) => types::Nullable::Present(models::ProcessDefinitionKey(k)),
                         None => types::Nullable::Null,
                     },
-                    process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
-                        e.process_instance_key.to_string(),
-                    )),
+                    process_instance_key: match e.process_instance_key {
+                        Some(k) => {
+                            types::Nullable::Present(models::ProcessInstanceKey(k.to_string()))
+                        }
+                        None => types::Nullable::Null,
+                    },
                     root_process_instance_key: types::Nullable::Null,
                     element_id: e.element_id,
-                    element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
-                        e.element_instance_key.to_string(),
-                    )),
+                    element_instance_key: match e.element_instance_key {
+                        Some(k) => {
+                            types::Nullable::Present(models::ElementInstanceKey(k.to_string()))
+                        }
+                        None => types::Nullable::Null,
+                    },
                     message_subscription_state: models::MessageSubscriptionStateEnum::Created,
                     last_updated_date: last_updated,
                     message_name: e.message_name,
-                    correlation_key: types::Nullable::Present(e.correlation_key),
-                    message_subscription_type: models::MessageSubscriptionTypeEnum::ProcessEvent,
-                    tool_properties: std::collections::HashMap::new(),
+                    correlation_key: match e.correlation_key {
+                        Some(k) => types::Nullable::Present(k),
+                        None => types::Nullable::Null,
+                    },
+                    message_subscription_type: if e.is_start_event {
+                        models::MessageSubscriptionTypeEnum::StartEvent
+                    } else {
+                        models::MessageSubscriptionTypeEnum::ProcessEvent
+                    },
+                    tool_properties: e.tool_properties,
                     process_definition_name: types::Nullable::Null,
                     process_definition_version: match e.process_definition_version {
                         Some(v) => types::Nullable::Present(v),
                         None => types::Nullable::Null,
                     },
-                    tool_name: types::Nullable::Null,
+                    tool_name: match e.tool_name {
+                        Some(name) => types::Nullable::Present(name),
+                        None => types::Nullable::Null,
+                    },
                     inbound_connector_type: types::Nullable::Null,
                     tenant_id: "<default>".to_string(),
                 }
@@ -13208,23 +15204,21 @@ impl ServerImpl {
             &sort,
             |e, field| match field {
                 "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
-                "correlationTime" => query::SortVal::Num(e.correlation_time_ms as i64),
+                "correlationTime" => query::SortVal::Num(e.correlation_time_ms as i128),
                 "elementId" => query::SortVal::Str(e.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i64),
+                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i128),
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
-                "partitionId" => query::SortVal::Num(e.partition_id as i64),
+                "partitionId" => query::SortVal::Num(e.partition_id as i128),
                 "processDefinitionId" => query::SortVal::Str(e.process_definition_id.clone()),
-                "processDefinitionKey" => query::SortVal::Num(
-                    e.process_definition_key
-                        .as_deref()
-                        .and_then(|k| k.parse().ok())
-                        .unwrap_or(0),
-                ),
-                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
-                "subscriptionKey" => query::SortVal::Num(e.subscription_key as i64),
+                "processDefinitionKey" => {
+                    query::key_sort_val(e.process_definition_key.as_deref().unwrap_or(""))
+                }
+                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i128),
+                "subscriptionKey" => query::SortVal::Num(e.subscription_key as i128),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
-                _ => query::SortVal::Num(e.message_key as i64),
+                "businessId" => query::opt_str_sort_val(e.business_id.as_deref()),
+                "messageKey" => query::SortVal::Num(e.message_key as i128),
+                _ => query::SortVal::Num(e.message_key as i128),
             },
             // A single published message can fan out to multiple subscriptions,
             // and a non-interrupting boundary subscription correlates repeatedly,
@@ -13410,10 +15404,8 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |ei, field| match field {
-                "processInstanceKey" => query::SortVal::Num(ei.instance_key as i64),
-                "processDefinitionKey" => {
-                    query::SortVal::Num(ei.process_definition_key.parse().unwrap_or(0))
-                }
+                "processInstanceKey" => query::SortVal::Num(ei.instance_key as i128),
+                "processDefinitionKey" => query::key_sort_val(&ei.process_definition_key),
                 "processDefinitionId" => query::SortVal::Str(ei.process_definition_id.clone()),
                 "elementId" => query::SortVal::Str(ei.element_id.clone()),
                 "elementName" => query::SortVal::Str(
@@ -13423,9 +15415,12 @@ impl ServerImpl {
                 ),
                 "type" => query::SortVal::Str(ei.element_type.clone()),
                 "state" => query::SortVal::Str(element_instance_state_enum(ei.state).to_string()),
-                "startDate" => query::SortVal::Num(ei.start_date_ms as i64),
-                "endDate" => query::SortVal::Num(ei.end_date_ms.unwrap_or(0) as i64),
-                _ => query::SortVal::Num(ei.element_instance_key as i64),
+                "startDate" => query::SortVal::Num(ei.start_date_ms as i128),
+                "endDate" => query::opt_num_sort_val(ei.end_date_ms.map(|v| v as i128)),
+                "incidentKey" => query::opt_num_sort_val(ei.incident_key.map(|k| k as i128)),
+                "elementInstanceKey" => query::SortVal::Num(ei.element_instance_key as i128),
+                "tenantId" => query::SortVal::Str(ei.tenant_id.clone()),
+                _ => query::SortVal::Num(ei.element_instance_key as i128),
             },
             |ei| ei.element_instance_key,
         );
@@ -13930,11 +15925,29 @@ impl ServerImpl {
             let Some(handle) = self.engine.try_for_create() else {
                 return Err((500, "this node hosts no engine partition".to_string()));
             };
+            // Creation intake (e.g. conditional-start evaluation, #932) yields
+            // to the drain path on the engine mailbox, mirroring the Raft
+            // batcher's lane choice from the same predicate.
+            let priority = if crate::raft::is_creation_intake(&command) {
+                crate::deepthi::Priority::Low
+            } else {
+                crate::deepthi::Priority::High
+            };
             let (events, commit) = handle
-                .with(move |journal| journal.apply_command_at(command, now_millis()))
+                .with_priority(priority, move |journal| {
+                    journal.apply_command_at(command, now_millis())
+                })
                 .await
                 .map_err(|error| crate::raft::engine_error_status(&error))?;
-            commit.wait().await;
+            // `wait()` also resolves when the journal writer dies unacked;
+            // only a durable write may be acknowledged (or have its
+            // follow-ups routed), else the result vanishes on restart (#932).
+            if !commit.wait_durable().await {
+                return Err((
+                    500,
+                    "the write was not persisted durably; retry".to_string(),
+                ));
+            }
             return Ok(events);
         }
         let led: Vec<u64> = self
@@ -13983,17 +15996,34 @@ impl ServerImpl {
         key: Key,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
+        self.apply_partition_command_ref(key, command, None).await
+    }
+
+    /// [`apply_partition_command`](Self::apply_partition_command) carrying the
+    /// caller's `operationReference` (#1556): the ONE by-key funnel through
+    /// which a REST request's reference reaches the engine seam, under Raft or
+    /// direct.
+    async fn apply_partition_command_ref(
+        &self,
+        key: Key,
+        command: Command,
+        operation_reference: Option<i64>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         if !self.raft.is_empty() {
             // `propose_partition_command` already awaits the durable barrier and
             // drives routing / job-sojourn / ad-hoc side effects on the replicated
             // events, so callers must NOT repeat them. `false`: this generic funnel
             // must not record the stream-completion diagnostic (#1306).
-            return self.propose_partition_command(key, command, false).await;
+            return self
+                .propose_partition_command_ref(key, command, false, operation_reference)
+                .await;
         }
         let (events, commit) = self
             .engine
             .by_key(key)
-            .with(move |journal| journal.apply_command_at(command, now_millis()))
+            .with(move |journal| {
+                journal.apply_command_ref_at(command, now_millis(), operation_reference)
+            })
             .await
             .map_err(|error| crate::raft::engine_error_status(&error))?;
         // Mirror the Raft path: wait for durability, then route any
@@ -14006,7 +16036,7 @@ impl ServerImpl {
         // barrier is handed back and a caller's own `commit.wait()` is a harmless
         // no-op.
         commit.wait().await;
-        self.spawn_routing_if_needed(&events);
+        self.spawn_routing_if_needed(&events, operation_reference);
         self.observe_job_sojourn(&events, now_millis());
         self.record_adhoc_events(&events);
         Ok((events, Commit::ready()))
@@ -14030,7 +16060,19 @@ impl ServerImpl {
         job_key: Key,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
-        self.apply_job_command_direct_with(job_key, command, |_| ())
+        self.apply_job_command_direct_ref(job_key, command, None)
+            .await
+    }
+
+    /// [`apply_job_command_direct`](Self::apply_job_command_direct) carrying
+    /// the caller's `operationReference` (#1556).
+    async fn apply_job_command_direct_ref(
+        &self,
+        job_key: Key,
+        command: Command,
+        operation_reference: Option<i64>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
+        self.apply_job_command_direct_with(job_key, command, operation_reference, |_| ())
             .await
             .1
     }
@@ -14046,6 +16088,7 @@ impl ServerImpl {
         &self,
         job_key: Key,
         command: Command,
+        operation_reference: Option<i64>,
         pre_apply: impl FnOnce(&mut Journal) -> M + Send + 'static,
     ) -> (
         M,
@@ -14058,7 +16101,10 @@ impl ServerImpl {
             .by_key(job_key)
             .with(move |journal| {
                 let meta = pre_apply(journal);
-                (meta, journal.apply_command_at(command, now_millis()))
+                (
+                    meta,
+                    journal.apply_command_ref_at(command, now_millis(), operation_reference),
+                )
             })
             .await
     }
@@ -14259,7 +16305,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn search_user_tasks_impl(
+    pub(crate) async fn search_user_tasks_impl(
         &self,
         body: &Option<models::UserTaskSearchQuery>,
     ) -> Result<apis::user_task::SearchUserTasksResponse, ()> {
@@ -14267,10 +16313,15 @@ impl ServerImpl {
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let tasks = self.store.user_tasks();
+        // Variable-store join for `processInstanceVariables` / `localVariables`
+        // (#1293), built only for the names the filter references.
+        let variables = filter
+            .map(|f| UserTaskVariableIndex::new(f, &self.store))
+            .unwrap_or_default();
 
         let mut matched: Vec<&readstore::UserTaskRow> = tasks
             .iter()
-            .filter(|task| filter.is_none_or(|f| match_user_task_filter(task, f)))
+            .filter(|task| filter.is_none_or(|f| match_user_task_filter(task, f, &variables)))
             .collect();
 
         let sort = query::sort_keys(
@@ -14281,12 +16332,25 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |task, field| match field {
-                "processInstanceKey" => query::SortVal::Num(task.instance_key as i64),
+                "processInstanceKey" => query::SortVal::Num(task.instance_key as i128),
                 "elementId" => query::SortVal::Str(task.element_id.clone()),
                 "state" => query::SortVal::Str(user_task_state_enum(task.state).to_string()),
-                "creationDate" => query::SortVal::Num(task.created_at_ms as i64),
-                "businessId" => query::SortVal::Str(task.business_id.clone().unwrap_or_default()),
-                _ => query::SortVal::Num(task.key as i64),
+                "creationDate" => query::SortVal::Num(task.created_at_ms as i128),
+                "businessId" => query::opt_str_sort_val(task.business_id.as_deref()),
+                // Sort on the value `user_task_result` returns (clamped to
+                // 0..=100) so rows reporting equal priorities tie.
+                "priority" => query::SortVal::Num(i128::from(user_task_priority(task.priority))),
+                // Sort on the instant, not the stored string, so differing
+                // offsets/precision still order chronologically.
+                "dueDate" => query::opt_num_sort_val(rfc3339_ns(task.due_date.as_deref())),
+                "followUpDate" => {
+                    query::opt_num_sort_val(rfc3339_ns(task.follow_up_date.as_deref()))
+                }
+                // Constant in Nano: `user_task_result` always projects `name` and
+                // `completionDate` as null, so every row ties and the task-key
+                // tiebreak orders them.
+                "name" | "completionDate" => query::SortVal::Num(0),
+                _ => query::SortVal::Num(task.key as i128),
             },
             |task| task.key,
         );
@@ -14308,7 +16372,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn assign_user_task_impl(
+    pub(crate) async fn assign_user_task_impl(
         &self,
         path_params: &models::AssignUserTaskPathParams,
         body: &models::UserTaskAssignmentRequest,
@@ -14406,7 +16470,7 @@ impl ServerImpl {
         }
     }
 
-    async fn complete_user_task_impl(
+    pub(crate) async fn complete_user_task_impl(
         &self,
         path_params: &models::CompleteUserTaskPathParams,
         body: &Option<models::UserTaskCompletionRequest>,
@@ -14510,7 +16574,7 @@ impl ServerImpl {
     }
 
     /// Returns a single user task from the read model by key.
-    async fn get_user_task_impl(
+    pub(crate) async fn get_user_task_impl(
         &self,
         path_params: &models::GetUserTaskPathParams,
     ) -> Result<apis::user_task::GetUserTaskResponse, ()> {
@@ -14741,7 +16805,7 @@ impl ServerImpl {
     }
 
     /// Clears a user task's assignee.
-    async fn unassign_user_task_impl(
+    pub(crate) async fn unassign_user_task_impl(
         &self,
         path_params: &models::UnassignUserTaskPathParams,
     ) -> Result<apis::user_task::UnassignUserTaskResponse, ()> {
@@ -14957,7 +17021,7 @@ impl ServerImpl {
     /// `scopeKey` of the scope that holds it — the process instance for root-scope
     /// variables, or a sub-process / multi-instance body / child element instance
     /// for a nested scope (Part C hierarchical scoping).
-    async fn search_variables_impl(
+    pub(crate) async fn search_variables_impl(
         &self,
         query_params: &models::SearchVariablesQueryParams,
         body: &Option<models::VariableSearchQuery>,
@@ -15002,9 +17066,10 @@ impl ServerImpl {
                 "name" => query::SortVal::Str(v.name.clone()),
                 "value" => query::SortVal::Str(v.value.clone()),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
-                "scopeKey" => query::SortVal::Num(v.scope_key as i64),
-                "processInstanceKey" => query::SortVal::Num(v.instance_key as i64),
-                _ => query::SortVal::Num(v.key as i64),
+                "scopeKey" => query::SortVal::Num(v.scope_key as i128),
+                "processInstanceKey" => query::SortVal::Num(v.instance_key as i128),
+                "variableKey" => query::SortVal::Num(v.key as i128),
+                _ => query::SortVal::Num(v.key as i128),
             },
             |v| v.key,
         );
@@ -15025,7 +17090,7 @@ impl ServerImpl {
 
     /// Returns a single variable by its (read-model assigned) key, with its full
     /// untruncated value.
-    async fn get_variable_impl(
+    pub(crate) async fn get_variable_impl(
         &self,
         path_params: &models::GetVariablePathParams,
     ) -> Result<apis::variable::GetVariableResponse, ()> {
@@ -15090,7 +17155,7 @@ impl ServerImpl {
     /// process id is retained and searchable (Camunda/Zeebe parity); the
     /// `isLatestVersion` filter narrows to the highest version per id via the
     /// `is_latest` discriminator computed by the read store.
-    async fn search_process_definitions_impl(
+    pub(crate) async fn search_process_definitions_impl(
         &self,
         body: &Option<models::ProcessDefinitionSearchQuery>,
     ) -> Result<apis::process_definition::SearchProcessDefinitionsResponse, ()> {
@@ -15156,8 +17221,15 @@ impl ServerImpl {
                 "name" => {
                     query::SortVal::Str(d.name.clone().unwrap_or_else(|| d.process_id.clone()))
                 }
-                "version" => query::SortVal::Num(d.version as i64),
-                _ => query::SortVal::Num(d.key as i64),
+                "version" => query::SortVal::Num(d.version as i128),
+                // Derived exactly as `process_definition_result` projects it.
+                "resourceName" => query::SortVal::Str(resource_name(&d.process_id)),
+                // Constant in Nano: `versionTag` is always projected null, so
+                // every row ties and the definition-key tiebreak orders them.
+                "versionTag" => query::SortVal::Num(0),
+                "processDefinitionKey" => query::SortVal::Num(d.key as i128),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(d.key as i128),
             },
             |d| d.key,
         );
@@ -15180,7 +17252,7 @@ impl ServerImpl {
     /// (Camunda `getProcessDefinition`). Resolves any deployed version — not just
     /// the latest — since every version is retained and independently
     /// addressable by key. A malformed or unknown key yields 404.
-    async fn get_process_definition_impl(
+    pub(crate) async fn get_process_definition_impl(
         &self,
         path_params: &models::GetProcessDefinitionPathParams,
     ) -> Result<apis::process_definition::GetProcessDefinitionResponse, ()> {
@@ -15312,7 +17384,9 @@ impl ServerImpl {
                 .await
             {
                 Ok((result, events)) => {
-                    self.broadcast_deployment(&events).await;
+                    // The synced spec's deployment request has no
+                    // `operationReference` yet (camunda#67491 re-sync) — `None`.
+                    self.broadcast_deployment(&events, None).await;
                     Ok(Resp::Status200_TheResourcesAreDeployed(result))
                 }
                 Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
@@ -15566,7 +17640,7 @@ impl ServerImpl {
     /// minted deployment events (for cross-node broadcast). The caller must be the
     /// partition-0 owner. `Err` carries `(title, detail)` for a 400.
     #[cfg(test)]
-    async fn deploy_resources_locally(
+    pub(crate) async fn deploy_resources_locally(
         &self,
         processes: Vec<ProcessDefinition>,
         resource_names: &std::collections::HashMap<String, String>,
@@ -15634,37 +17708,21 @@ impl ServerImpl {
             self.engine
                 .deploy_partition()
                 .with(move |engine| {
+                    // One mixed deployment = ONE command = ONE deployment key
+                    // shared by every co-deployed resource, so
+                    // `bindingType: deployment` forms / linked resources resolve
+                    // (#1193). Never split it into per-kind commands.
                     let (events, commit) = engine
-                        .apply_command(Command::DeployResources(processes))
+                        .apply_command(Command::DeployBundle(
+                            nanobpmn_engine_core::DeploymentBundle {
+                                processes,
+                                decisions,
+                                forms,
+                                resources: generic_resources,
+                            },
+                        ))
                         .map_err(|e| e.to_string())?;
-                    // Deploy any DMN decisions in the same durable batch. Their events
-                    // are appended so the whole deployment broadcasts/replicates as one.
-                    let mut all_events = (*events).clone();
-                    let mut commit = commit;
-                    if !decisions.is_empty() {
-                        let (dec_events, dec_commit) = engine
-                            .apply_command(Command::DeployDecisionRequirements(decisions))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*dec_events).iter().cloned());
-                        commit = dec_commit;
-                    }
-                    // Deploy any forms in the same durable batch so the whole
-                    // deployment broadcasts/replicates as one.
-                    if !forms.is_empty() {
-                        let (form_events, form_commit) = engine
-                            .apply_command(Command::DeployForms(forms))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*form_events).iter().cloned());
-                        commit = form_commit;
-                    }
-                    // Deploy any generic resources in the same durable batch.
-                    if !generic_resources.is_empty() {
-                        let (res_events, res_commit) = engine
-                            .apply_command(Command::DeployGenericResources(generic_resources))
-                            .map_err(|e| e.to_string())?;
-                        all_events.extend((*res_events).iter().cloned());
-                        commit = res_commit;
-                    }
+                    let all_events = (*events).clone();
                     let events = Arc::new(all_events);
                     let resolved: Resolved = requested_ids
                         .iter()
@@ -15898,7 +17956,9 @@ impl ServerImpl {
             )
             .await
             .map_err(|(_, detail)| (400u16, detail))?;
-        self.broadcast_deployment(&events).await;
+        // The synced spec's deployment request carries no `operationReference`
+        // yet (it arrives with the camunda#67491 re-sync) — `None` here.
+        self.broadcast_deployment(&events, None).await;
         Ok(serde_json::to_value(result).expect("deployment result serializes"))
     }
 
@@ -15916,7 +17976,15 @@ impl ServerImpl {
     /// definition. The durable owner's guard is released BEFORE the sibling
     /// fan-out (the durable commit is the serialized part; the in-memory
     /// sibling copies need no mutual ordering against each other).
-    pub async fn install_replicated_deployment(&self, events: Vec<Event>) {
+    ///
+    /// `operation_reference` is the deploying request's `operationReference`
+    /// (#1556 step 4, #1600), stamped on the durable copies of the deployment
+    /// records this node journals.
+    pub async fn install_replicated_deployment(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) {
         let handles = self.engine.all();
         let events = Arc::new(events);
         let durable = {
@@ -15924,7 +17992,9 @@ impl ServerImpl {
             // Owner's durable commit under its shared guard.
             let _lifecycle = handles[0].lifecycle_shared().await;
             handles[0]
-                .with(move |journal| journal.install_deployment_durable(&events))
+                .with(move |journal| {
+                    journal.install_deployment_durable_ref(&events, operation_reference)
+                })
                 .await
         };
         for handle in handles.iter().skip(1) {
@@ -15978,7 +18048,14 @@ impl ServerImpl {
     /// that is briefly unreachable is logged and skipped (a runtime deploy assumes
     /// the cluster is up; the startup seed broadcast retries until acknowledged).
     /// A no-op for a single-node cluster.
-    async fn broadcast_deployment(&self, events: &Arc<Vec<Event>>) {
+    /// `operation_reference` is the deploying request's `operationReference`
+    /// (#1600): it rides the `InstallDeployment` frame so each peer's durable
+    /// copies of the deployment records carry it.
+    async fn broadcast_deployment(
+        &self,
+        events: &Arc<Vec<Event>>,
+        operation_reference: Option<i64>,
+    ) {
         if !self.peers.has_peers() {
             return;
         }
@@ -16006,7 +18083,10 @@ impl ServerImpl {
             }
             match self.peers.link(node).await {
                 Ok(link) => {
-                    if let Err(e) = link.install_deployment(deployed.clone()).await {
+                    if let Err(e) = link
+                        .install_deployment(deployed.clone(), operation_reference)
+                        .await
+                    {
                         tracing::warn!("deploy broadcast to node {node} failed: {e}");
                     }
                 }
@@ -16048,8 +18128,13 @@ impl ServerImpl {
                 // not resent (install is idempotent per key either way).
                 let mut batch_idx = 0;
                 while batch_idx < batches.len() {
+                    // The startup seed replays RECOVERED definitions, not one
+                    // caller's deploy: there is no originating request whose
+                    // `operationReference` could stamp them (#1600) — `None`.
                     match server.peers.link(node).await {
-                        Ok(link) => match link.install_deployment(batches[batch_idx].clone()).await
+                        Ok(link) => match link
+                            .install_deployment(batches[batch_idx].clone(), None)
+                            .await
                         {
                             Ok(_) => {
                                 batch_idx += 1;
@@ -16111,7 +18196,7 @@ impl ServerImpl {
         tokio::task::spawn_blocking(crate::raft::sweep_orphaned_snapshot_dirs);
         {
             let topology = server.engine.topology().clone();
-            let transport = server.raft_transport();
+            let transport = server.raft_transport_for_start().await;
             // ADR 0003 replication tier: in `leader-durable` mode a non-owned
             // replica is a NON-VOTING async learner (the leader's on-disk log is
             // the sole durability point); in `quorum` mode it is a voter whose
@@ -16493,6 +18578,12 @@ impl ServerImpl {
             // reaped mid-`put` — and the whole sweep skips itself when any
             // member failed to host (its live set would not be authoritative).
             server.gc_offheap_orphans_once().await;
+
+            // #933: re-arm the process-local `retryBackOff` wakes only NOW,
+            // after every hosted member restored its durable Raft snapshot — a
+            // scan at spawn time races this bootstrap and would miss deadlines
+            // the snapshot restore introduces (see `boot_backoff_rearm_at_spawn`).
+            server.reschedule_backoff_wakes().await;
         }
     }
 
@@ -17159,7 +19250,7 @@ impl ServerImpl {
         // own journal remains the local durability source). Initialize with this
         // node as the sole voter so it elects itself immediately, then add the
         // reachable survivors as learners so new writes ship to them.
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // No local exporter unless this node statically owns `p`; a promoted
         // replica must evict terminal shells itself (see bootstrap_member).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
@@ -18030,6 +20121,22 @@ impl ServerImpl {
         p: u64,
         mode: RebuildEngineMode,
     ) -> Option<DeepthiHandle> {
+        // A member latched on a replica DIVERGENCE (ADR 0066 slice 5, #1664)
+        // must never be PROMOTED: its engine and journal are its own diverged
+        // lineage, and reconstructing from them would clear the fence and lead
+        // without the fail-stop latch. Only an authoritative resync (the
+        // Receiver path, which rebuilds as a fresh learner of the leader) may
+        // replace it. Refuse BEFORE retiring so the latched core stays in place.
+        if mode == RebuildEngineMode::Promote
+            && let Some(d) = self.raft.get(p).and_then(|old| old.divergence())
+        {
+            tracing::error!(
+                partition = p,
+                "raft partition DIVERGED ({d}) — refusing to PROMOTE it from its own diverged \
+                 lineage; it stays fail-stopped until resynced from an authoritative leader"
+            );
+            return None;
+        }
         let mut guards = Vec::with_capacity(2);
         let mut retired_engine: Option<DeepthiHandle> = None;
         if let Some(old) = self.raft.get(p) {
@@ -18316,10 +20423,8 @@ impl ServerImpl {
             // Legacy single-partition: every record (deployments and
             // `RaftEntryApplied` included) belongs to `p`.
             let events = Journal::read_events(&journal_path)?;
-            return Ok((
-                nanobpmn_engine_core::Engine::replay_partition(p, events),
-                Vec::new(),
-            ));
+            // Verified replay (#1664 review): never skip the chain check.
+            return Ok((Journal::replay_verified(p, events)?, Vec::new()));
         }
         // Segmented (either layout): read the recovery metadata from `p`'s
         // actor (BOUNDED — it may be the dead or wedged one the health probe
@@ -18454,7 +20559,7 @@ impl ServerImpl {
             );
             return false;
         };
-        let transport = self.raft_transport();
+        let transport = self.raft_transport_for_start().await;
         // Rejoining as a follower/receiver of the new leader: evict terminal
         // shells locally unless this node statically owns `p` (has an exporter).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
@@ -18542,7 +20647,27 @@ impl ServerImpl {
             return false;
         }
 
-        let transport = self.raft_transport();
+        // A member that fail-stopped on a replica DIVERGENCE (ADR 0066 slice 5,
+        // #1664) must never resume its own state: neither its engine (fenced,
+        // so reconstructed below) nor its local log/snapshot lineage. It is
+        // rebuilt as a FRESH receiver so the leader resyncs it (snapshot
+        // install or full backfill) — the purge-hole precedent (#111). An
+        // OWNED partition's only reconstruction baseline is its own (diverged)
+        // journal, so it is left down for the operator rather than resumed.
+        let divergence = self.raft.get(p).and_then(|old| old.divergence());
+        if let Some(d) = &divergence
+            && self.engine.local_for_partition(p).is_some()
+        {
+            tracing::error!(
+                partition = p,
+                "raft partition DIVERGED ({d}) on an owned partition whose only local baseline \
+                 is its own diverged journal — NOT auto-recovering; restore this node's \
+                 partition from the leader (wipe its data dir and rejoin)"
+            );
+            return false;
+        }
+
+        let transport = self.raft_transport_for_start().await;
         // A partition this node does not statically own has no exporter, so its
         // state machine must evict terminal shells itself (the RF>1 hot-state
         // leak guard); an owned partition keeps shells for its read path.
@@ -18567,7 +20692,21 @@ impl ServerImpl {
         // `leader-durable` mode is a follower a disposable non-voting learner
         // whose sole durability point is the leader, safe to rebuild fresh.
         let voter_must_resume = self.replication_mode == ReplicationMode::Quorum;
-        let log_dir = if fresh_receiver && !voter_must_resume {
+        // A DIVERGED quorum voter cannot be resynced in place: the fresh-receiver
+        // path rebuilds its voting identity on an empty volatile log, discarding
+        // its persisted vote/log (the amnesiac-voter hazard above), and resuming
+        // its durable log resumes the diverged lineage. Fail closed; only a
+        // disposable leader-durable learner is resynced fresh (#1664 review).
+        if divergence.is_some() && voter_must_resume {
+            tracing::error!(
+                partition = p,
+                "raft partition DIVERGED on a quorum VOTER — NOT auto-recovering: rebuilding \
+                 it on an empty log would make it an amnesiac voter; remove and re-add it \
+                 through a membership change (or wipe its data dir and rejoin)"
+            );
+            return false;
+        }
+        let log_dir = if divergence.is_some() || (fresh_receiver && !voter_must_resume) {
             None
         } else {
             raft_log_dir_for(p)
@@ -18579,7 +20718,7 @@ impl ServerImpl {
         // review). Refuse, loudly, and leave the partition down for an operator
         // restart. Only leader-durable learners (non-voting, the leader is their
         // sole durability point) and durable voters are rebuilt in place.
-        if voter_must_resume && log_dir.is_none() {
+        if voter_must_resume && log_dir.is_none() && divergence.is_none() {
             tracing::error!(
                 partition = p,
                 "raft partition core is SHUTDOWN on an in-memory quorum voter; \
@@ -18630,7 +20769,9 @@ impl ServerImpl {
                 self.raft.insert(Arc::new(part));
                 tracing::info!(
                     "raft: node {me} auto-recovered shutdown partition {p} ({})",
-                    if rebuilt_fresh {
+                    if divergence.is_some() {
+                        "DIVERGED: resyncing from the leader as a fresh receiver (#1664)"
+                    } else if rebuilt_fresh {
                         "fresh receiver; the leader will backfill/snapshot it"
                     } else {
                         "resumed its durable on-disk lineage"
@@ -18737,6 +20878,127 @@ impl ServerImpl {
         }
     }
 
+    /// The replicated-command features this node's replicated state already
+    /// depends on (#1661): a `/cluster` join from a binary lacking any of them is
+    /// refused, and (via [`peer::PeerSet::require_feature`]) so is every
+    /// OUTBOUND dial to such a binary. Lenient completion becomes a requirement
+    /// as soon as any hosted partition (owned or replica) has applied the
+    /// REPLICATED `LenientCompletionSet` — an older binary could not decode that
+    /// command in the log. One-way, like the flag itself (the legacy host flag
+    /// never counts: it is what a pre-#1661 cluster already runs). Likewise
+    /// `cluster-variables-v1` (#1657) once any hosted partition has EVER applied
+    /// a cluster-variable create — sticky even after every variable is deleted,
+    /// because the retained log/snapshot still carries those records.
+    ///
+    /// `None` = UNKNOWN: some partition's engine actor is dead or did not answer
+    /// within [`ENGINE_HEALTH_PROBE_BOUND`]. The probe is bounded and uses
+    /// `try_with` (never the panicking `with`), because it runs on the
+    /// partition-recovery path (`raft_transport_for_start`) BEFORE a failed
+    /// actor is replaced — a panic there would unwind the recovery supervisor,
+    /// a wedged actor would block it. Callers that admit peers must fail closed
+    /// on `None`; best-effort syncs simply retry on the next tick.
+    async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
+        use nano_falcon_protocol::cluster_join::{
+            FEATURE_CLUSTER_VARIABLES as CV, FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
+        };
+        // A single node never replicates its log to anyone, so its local state
+        // places no requirement on a peer.
+        if self.engine.topology().is_single_node() {
+            return Some(Vec::new());
+        }
+        // Every feature the recovered/replicated state can depend on, each
+        // with its one-way state predicate (sticky once observed).
+        const FEATURES: [&str; 2] = [LC, CV];
+        let mut required: Vec<&'static str> = FEATURES
+            .into_iter()
+            .filter(|f| self.peers.requires_feature(f))
+            .collect();
+        if required.len() == FEATURES.len() {
+            return Some(required);
+        }
+        let mut unknown = false;
+        for p in 0..self.engine.topology().num_partitions {
+            let Some(handle) = self.engine_handle_for(p) else {
+                continue;
+            };
+            if !handle.is_alive() {
+                unknown = true;
+                continue;
+            }
+            match tokio::time::timeout(
+                ENGINE_HEALTH_PROBE_BOUND,
+                handle.try_with(|journal| {
+                    let engine = journal.engine();
+                    [
+                        engine.replicated_lenient_completion(),
+                        engine.cluster_variables_ever_used(),
+                    ]
+                }),
+            )
+            .await
+            {
+                Ok(Some(flags)) => {
+                    for (feature, set) in FEATURES.into_iter().zip(flags) {
+                        if set && !required.contains(&feature) {
+                            self.peers.require_feature(feature).await;
+                            required.push(feature);
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => unknown = true,
+            }
+        }
+        // The order is canonical (FEATURES order) regardless of discovery order.
+        required.sort_by_key(|f| FEATURES.iter().position(|g| g == f));
+        if unknown { None } else { Some(required) }
+    }
+
+    /// Leader-side reconciliation of partition `p`'s replicated lenient-completion
+    /// flag with this node's activation policy (#1661). When the policy needs
+    /// lenience and the replicated flag is not yet set, the leader proposes
+    /// `Command::SetLenientCompletion { lenient: true }` through the Raft log, so
+    /// every replica flips the flag at the same log index — never as a per-node
+    /// host config that a racing policy change could apply between a completion's
+    /// commit and its apply. ROLLING UPGRADE (ADR 0066): the command is proposed
+    /// only once every cluster member advertised the feature on its join
+    /// handshake; until then the flag stays put and activation stays replicated
+    /// (`prepare_activation` only grants a leader-local lock under a committed
+    /// lenient flag), which is correct, just slower.
+    ///
+    /// ONE-WAY (ADR 0002 notes): the flag is never proposed back to `false` — a
+    /// replica may hold a leader-local activation its peers never saw, so
+    /// clearing lenience would make them reject its completion. Until the
+    /// cutover, the legacy host flag keeps today's (pre-#1661) behaviour.
+    async fn reconcile_lenient_completion_via_raft(
+        &self,
+        part: &crate::raft::RaftPartition,
+        replicated_lenient: bool,
+        now: u64,
+    ) {
+        if replicated_lenient
+            || !self.activation_policy.may_be_leader_local()
+            || !self
+                .advertise_cluster_features
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || !self
+                .peers
+                .all_peers_support(
+                    nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION,
+                )
+                .await
+        {
+            return;
+        }
+        if let Err(e) = part
+            .propose_result(Command::SetLenientCompletion { lenient: true }, now)
+            .await
+        {
+            tracing::warn!(
+                "raft: proposing SetLenientCompletion {{ lenient: true }} failed: {e}; retrying next tick"
+            );
+        }
+    }
+
     /// Returns (building if necessary) the dedicated engine actor for a partition
     /// this node **replicates but does not own**. The Raft state machine drives it
     /// to apply the replicated log on a follower; it is not part of the read-model
@@ -18766,9 +21028,11 @@ impl ServerImpl {
         };
         let mut journal = Journal::in_memory_partition(p);
         journal.set_num_partitions(self.engine.topology().num_partitions);
-        if self.activation_policy.may_be_leader_local() {
-            journal.set_lenient_completion(true);
-        }
+        // The REPLICATED lenient flag is not configured here (#1661): this
+        // replica learns it from the Raft log / snapshot at exactly the index
+        // the leader committed it. Only the pre-cutover LEGACY host flag (ADR
+        // 0066 rolling upgrade: today's behaviour, identical on every node) is.
+        journal.set_legacy_lenient_completion(self.activation_policy.may_be_leader_local());
         // Wire the same spill tiers the owned engines got, so this follower
         // replica reclaims hot RAM under pressure instead of pinning the whole
         // replicated working set resident. Spill is local memory management (no
@@ -18908,14 +21172,14 @@ impl ServerImpl {
             return 0;
         }
         let num = self.engine.topology().num_partitions;
-        let mut live: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut live: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
         for p in 0..num {
             let Some(handle) = self.engine_handle_for(p) else {
                 continue;
             };
             let keys = handle
                 .with(|journal| {
-                    let mut s = std::collections::HashSet::new();
+                    let mut s = std::collections::BTreeSet::new();
                     journal.collect_live_instance_keys(&mut s);
                     s
                 })
@@ -19460,6 +21724,7 @@ impl ServerImpl {
                 .into_iter()
                 .flatten()
                 .collect();
+            let activated = self.resolve_activated_secrets(activated).await;
             return activated
                 .into_iter()
                 .map(|activated| activated_job_result(activated, fetch_variable))
@@ -19519,10 +21784,63 @@ impl ServerImpl {
                 .collect()
         };
 
-        activated
+        self.resolve_activated_secrets(activated)
+            .await
             .into_iter()
             .map(|activated| activated_job_result(activated, fetch_variable))
             .collect()
+    }
+
+    /// Activation-time resolution of trusted `camunda.secrets.<name>`
+    /// references (#1640) — the single choke point every activation path (REST,
+    /// stream, Raft, peer-served) funnels through. Substitutes into each job's
+    /// worker-facing variable copy only; engine state, the journal and
+    /// snapshots keep the reference text. A job whose trusted secret cannot be
+    /// resolved is failed with no retries — an incident on the element with
+    /// Zeebe's message — and withheld from the worker.
+    async fn resolve_activated_secrets(
+        &self,
+        activated: Vec<ActivatedJobWithIdentity>,
+    ) -> Vec<ActivatedJobWithIdentity> {
+        if activated.iter().all(|a| a.secret_provenance.is_empty()) {
+            return activated;
+        }
+        let mut out = Vec::with_capacity(activated.len());
+        for mut a in activated {
+            if a.secret_provenance.is_empty() {
+                out.push(a);
+                continue;
+            }
+            match secrets::resolve_job_variables(
+                &a.job.variables,
+                &a.secret_provenance,
+                self.secret_store.as_ref(),
+            ) {
+                Ok(None) => out.push(a),
+                Ok(Some(resolved)) => {
+                    a.job.variables = Arc::new(resolved);
+                    out.push(a);
+                }
+                Err(missing) => {
+                    // Best-effort: if the fail is rejected (e.g. the lease
+                    // already moved on), the job is still withheld — it never
+                    // reaches a worker with the reference unresolved.
+                    if let Ok((_, commit)) = self
+                        .fail_job_for_stream_with_lease(
+                            a.job.key,
+                            a.job.lease_token.clone(),
+                            0,
+                            missing.incident_message(),
+                            0,
+                        )
+                        .await
+                    {
+                        commit.wait().await;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Activates up to `want` jobs of `job_type` on a single partition's engine
@@ -19729,9 +22047,19 @@ impl ServerImpl {
         let Some(handle) = self.engine_handle_for(p) else {
             return (false, Vec::new());
         };
+        // Drain any off-heap orphans parked while this replica was a follower
+        // (#1447): each is re-proposed as a leader-stamped
+        // `QuarantineOffheapOrphan`, so a loss detected before promotion (or
+        // before the orphan sink was wired) still becomes a durable, replicated
+        // `VariablesLost` incident.
+        handle
+            .with(|journal| {
+                journal.drain_orphan_backlog();
+            })
+            .await;
         // One read on the leader: variable/cold spill + what (if anything) is due
         // now. Only the leader runs this gate; followers never propose, so safe.
-        let (timers_due, jobs_due) = handle
+        let (timers_due, jobs_due, lenient_now) = handle
             .with(move |journal| {
                 // The tick pre-check gate runs on the single-writer engine actor
                 // every tick per led partition; profiled here to attribute its
@@ -19763,8 +22091,14 @@ impl ServerImpl {
                         .is_some_and(|d| d <= now)
                 });
                 cmd_profile::finish(timer, "tick_precheck");
-                (timers_due, jobs_due)
+                (
+                    timers_due,
+                    jobs_due,
+                    journal.engine().replicated_lenient_completion(),
+                )
             })
+            .await;
+        self.reconcile_lenient_completion_via_raft(&part, lenient_now, now)
             .await;
 
         let mut produced = false;
@@ -19869,7 +22203,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         // ADR-0020 Tier-1: shed if the engine's shared write path (raft-log fsync)
         // is saturated — the global bottleneck that hits every definition at once.
@@ -19899,55 +22233,47 @@ impl ServerImpl {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
         }
-        #[allow(clippy::type_complexity)]
-        let outcome: Result<
-            (nanobpmn_engine_core::Key, bool, Vec<Event>, Commit),
-            (u16, String),
-        > = {
+        // The actor round-trip, commit wait, and commit-gated routing run
+        // inside ONE detached owner task (#1582): a stream connection cancelled
+        // while the actor still has the create queued must not strand a
+        // persisted instance without its cross-partition routing. Awaiting the
+        // receiver here only OBSERVES the outcome.
+        let created = {
             let payload_bytes = engine_vars_bytes(&variables);
-            let _processing = ProcessingGuard::enter(&self.processing);
-            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
-            self.engine
-                .for_create()
-                .with_low(move |engine| {
-                    let (process_id, sel_key, sel_ver) =
-                        match resolve_create_selector(engine.state(), by_id, by_key, None) {
-                            Ok(t) => t,
-                            Err(e) => return Err(e),
-                        };
-                    match apply_create_instance_direct(
-                        engine,
-                        Command::create_instance_versioned(
-                            process_id.clone(),
-                            variables,
-                            Vec::new(),
-                            None,
-                            sel_key,
-                            sel_ver,
-                        ),
-                        &process_id,
-                    ) {
-                        // The stream create reports only the key + completion; the
-                        // projected definition key/version are unused here.
-                        Ok(created) => Ok((
-                            created.instance_key,
-                            created.sync_completed,
-                            created.routable,
-                            created.commit,
-                        )),
-                        Err(EngineError::ProcessNotFound { process_id }) => {
-                            Err((400, format!("No deployed process with id '{process_id}'.")))
-                        }
-                        Err(e) => Err((500, e.to_string())),
+            // The admission charge is TRANSFERRED into the detached owner
+            // (#1582), held until the actor finishes the create.
+            let accounting = CreateAccounting::enter(self, payload_bytes);
+            let rx = self.submit_create_detached(accounting, move |engine| {
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), by_id, by_key, None)?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| match e {
+                    EngineError::ProcessNotFound { process_id } => {
+                        (400, format!("No deployed process with id '{process_id}'."))
                     }
+                    other => (500, other.to_string()),
                 })
-                .await
+            });
+            Self::observe_create(rx).await?
         };
-        let (instance_key, sync_completed, routable, commit) = outcome?;
-        commit.wait().await;
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        // The stream create reports only the key + completion; the projected
+        // definition key/version are unused here.
+        let instance_key = created.instance_key;
+        let sync_completed = created.sync_completed;
+        // The detached owner already awaited durability and drove the
+        // cross-partition routing pump before answering (#1582), so a publish
+        // issued now finds the subscription open.
         self.signal_jobs_available();
         // Non-Raft local commit for a stream create: count it once, here at the
         // node that mints the instance. (Under Raft this function returns early
@@ -20132,7 +22458,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
@@ -20199,11 +22525,11 @@ impl ServerImpl {
                 _definition_key,
                 instance_key,
                 sync_completed,
-                routable,
+                // Routing ran inside `raft_create_core`'s detached task BEFORE
+                // the answer (#1582 cancellation safety + create-then-publish
+                // ordering); the events are only reported.
+                _routable,
             )) => {
-                if !routable.is_empty() {
-                    self.drive_subscription_routing(routable).await;
-                }
                 self.signal_jobs_available();
                 // Local commit on a partition THIS node leads: count the stream
                 // create once, here. The forward branches below deliberately do
@@ -20314,7 +22640,7 @@ impl ServerImpl {
         by_id: Option<String>,
         by_key: Option<String>,
         by_version: Option<i32>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         wire_vars: Option<serde_json::Map<String, serde_json::Value>>,
         tags: Vec<String>,
         business_id: Option<String>,
@@ -20350,7 +22676,7 @@ impl ServerImpl {
                 business_id.clone(),
             )
             .await;
-        let (process_id, version, definition_key, instance_key, sync_completed, routable) =
+        let (process_id, version, definition_key, instance_key, sync_completed, _routable) =
             match core {
                 Ok(fields) => fields,
                 // Stale leadership / leads-nothing-now: forward to the current
@@ -20389,9 +22715,9 @@ impl ServerImpl {
             };
 
         crate::metrics::record_create("rest");
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
-        }
+        // Routing ran inside `raft_create_core`'s detached task BEFORE the
+        // answer (#1582 cancellation safety + create-then-publish ordering);
+        // nothing further to route here.
         self.signal_jobs_available();
 
         let (variables_out, process_completed) = if await_completion {
@@ -20430,7 +22756,7 @@ impl ServerImpl {
         by_id: Option<String>,
         by_key: Option<String>,
         by_version: Option<i32>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
     ) -> Result<
@@ -20472,38 +22798,105 @@ impl ServerImpl {
         let Some(part) = self.raft.get(p) else {
             return Err((500, format!("partition {p} has no Raft group")));
         };
-        let response = part
-            .propose_result(
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    variables,
-                    tags,
-                    business_id,
-                    sel_key,
-                    sel_ver,
-                ),
-                now_millis(),
-            )
-            .await
-            .map_err(|e| match e {
-                // Leadership race on the batched write is retryable, not 500. #1306.
-                crate::raft::ProposeError::Leader => {
-                    (503, format!("partition {p} leader unavailable; retry"))
+        // The propose + post-commit routing run DETACHED (#1582): a caller
+        // cancelled while awaiting the Raft commit must not strand a committed
+        // create without its cross-partition routing — the Raft batcher keeps
+        // running past the cancellation, and the detached task still observes
+        // the proposal outcome and routes. The result is handed back over a
+        // oneshot only AFTER the routing re-drive has driven the
+        // cross-partition subscription follow-ups: clients rely on the
+        // create-then-publish ordering `main` has always given — a publish
+        // issued the moment the create returns must find the subscription
+        // already open, or the unmatched message is discarded and the instance
+        // stays parked (#1582). The cost is bounded: a stalled subscription
+        // target can delay the create response by at most the bounded re-drive
+        // budget ([`ROUTE_REDRIVE`]), never indefinitely. Awaiting the receiver
+        // only OBSERVES the outcome; dropping it leaves the work running. The
+        // latency-optimal alternative — answer at commit and gate publications
+        // on pending subscription opens — is tracked as #1604.
+        let server = self.clone();
+        let process_id_for_propose = process_id.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let proposed = part
+                .propose_result(
+                    Command::create_instance_versioned(
+                        process_id_for_propose,
+                        variables,
+                        tags,
+                        business_id,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    now_millis(),
+                )
+                .await
+                .map_err(|e| match e {
+                    // Leadership race on the batched write is retryable, not 500. #1306.
+                    crate::raft::ProposeError::Leader => {
+                        (503, format!("partition {p} leader unavailable; retry"))
+                    }
+                    other => (500, other.to_string()),
+                })
+                .and_then(|response| {
+                    if let Some((status, message)) = response.error {
+                        return Err((status, message));
+                    }
+                    let events = response.events;
+                    let instance_key = events
+                        .iter()
+                        .find_map(Event::instance_key)
+                        .ok_or((500, "raft create produced no instance key".to_string()))?;
+                    let sync_completed = events.iter().any(|e| {
+                        matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
+                    });
+                    let routable: Vec<Event> = events
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e,
+                                Event::MessageSubscriptionOpening { .. }
+                                    | Event::RemoteMessageCorrelation { .. }
+                                    | Event::MessageSubscriptionClosing { .. }
+                                    | Event::StartInstanceDispatched { .. }
+                            )
+                        })
+                        .cloned()
+                        .collect();
+                    Ok((instance_key, sync_completed, routable))
+                });
+            match proposed {
+                Ok((instance_key, sync_completed, routable)) => {
+                    // Route the follow-ups FIRST, then answer: a publish issued
+                    // the moment the create returns must find the subscription
+                    // already open (the create-then-publish ordering clients
+                    // rely on, #1582). The wait is bounded by the re-drive
+                    // budget, and a dropped receiver (caller cancelled) is fine:
+                    // routing already ran to completion inside this task.
+                    if !routable.is_empty() {
+                        // The synced spec's create-request instruction carries
+                        // `operationReference` on the *instruction*, but the
+                        // create path does not map it yet (#1602) — `None`.
+                        server
+                            .drive_subscription_routing(routable.clone(), None)
+                            .await;
+                    }
+                    server.signal_jobs_available();
+                    let _ = result_tx.send(Ok((instance_key, sync_completed, routable)));
                 }
-                other => (500, other.to_string()),
-            })?;
-        if let Some((status, message)) = response.error {
-            return Err((status, message));
-        }
-        let events = response.events;
-
-        let instance_key = events
-            .iter()
-            .find_map(Event::instance_key)
-            .ok_or((500, "raft create produced no instance key".to_string()))?;
-        let sync_completed = events.iter().any(|e| {
-            matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
+                Err(err) => {
+                    let _ = result_tx.send(Err(err));
+                }
+            }
         });
+        // Observe the detached proposal; a dropped sender (task panicked) is a
+        // 500, never a hang.
+        let (instance_key, sync_completed, routable) = match result_rx.await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err((500, "raft create task ended without a result".to_string()));
+            }
+        };
         // Project the deployed key + version of the version the instance was
         // pinned to (not the latest), so by-id and by-key creates agree.
         let pid_for_read = process_id.clone();
@@ -20518,18 +22911,6 @@ impl ServerImpl {
                     .unwrap_or((pid_for_read, 1))
             })
             .await;
-        let routable: Vec<Event> = events
-            .into_iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Event::MessageSubscriptionOpening { .. }
-                        | Event::RemoteMessageCorrelation { .. }
-                        | Event::MessageSubscriptionClosing { .. }
-                        | Event::StartInstanceDispatched { .. }
-                )
-            })
-            .collect();
         Ok((
             process_id,
             version,
@@ -20568,7 +22949,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         use apis::process_instance::CreateProcessInstanceResponse as R;
         let wire_vars = if variables.is_empty() {
@@ -20610,15 +22991,24 @@ impl ServerImpl {
     /// diagnostic and is `true` ONLY for the stream `CompleteJob` path — the REST
     /// complete/fail/throw callers pass `false` so a failed REST mutation never
     /// inflates the stream-completion counters (see [`propose_partition_command`]). #1306.
+    ///
+    /// Carries the caller's `operationReference` (#1556) on the replicated
+    /// command envelope.
     async fn propose_job_for_stream(
         &self,
         job_key: u64,
         command: Command,
         record_stream_outcome: bool,
+        operation_reference: Option<i64>,
     ) -> Result<Commit, (u16, String)> {
-        self.propose_partition_command(job_key, command, record_stream_outcome)
-            .await
-            .map(|(_, commit)| commit)
+        self.propose_partition_command_ref(
+            job_key,
+            command,
+            record_stream_outcome,
+            operation_reference,
+        )
+        .await
+        .map(|(_, commit)| commit)
     }
 
     /// `record_stream_outcome` gates the `stream_complete_outcome_total`
@@ -20633,6 +23023,20 @@ impl ServerImpl {
         key: Key,
         command: Command,
         record_stream_outcome: bool,
+    ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
+        self.propose_partition_command_ref(key, command, record_stream_outcome, None)
+            .await
+    }
+
+    /// [`propose_partition_command`](Self::propose_partition_command) carrying
+    /// the caller's `operationReference` (#1556) on the replicated command
+    /// envelope, so every record the command produces is stamped with it.
+    async fn propose_partition_command_ref(
+        &self,
+        key: Key,
+        command: Command,
+        record_stream_outcome: bool,
+        operation_reference: Option<i64>,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         let p = partition_of(key);
         // Bounded completion write-pause (ADR 0019): while this node is handing
@@ -20656,7 +23060,7 @@ impl ServerImpl {
             return Err((503, format!("partition {p} leader unavailable; retry")));
         }
         let response = part
-            .propose_result(command, now_millis())
+            .propose_result_ref(command, now_millis(), operation_reference)
             .await
             .map_err(|e| {
                 if record_stream_outcome {
@@ -20679,7 +23083,7 @@ impl ServerImpl {
             }
             return Err((status, message));
         }
-        self.spawn_routing_if_needed(&response.events);
+        self.spawn_routing_if_needed(&response.events, operation_reference);
         self.observe_job_sojourn(&response.events, now_millis());
         self.record_adhoc_events(&response.events);
         Ok((Arc::new(response.events), Commit::ready()))
@@ -20717,7 +23121,7 @@ impl ServerImpl {
     pub(crate) async fn complete_job_for_stream(
         &self,
         job_key: u64,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
     ) -> Result<Commit, (u16, String)> {
@@ -20737,7 +23141,7 @@ impl ServerImpl {
         &self,
         job_key: u64,
         lease_token: Option<String>,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
         business_id: Option<String>,
@@ -20762,12 +23166,29 @@ impl ServerImpl {
             return self.propose_partition_command(job_key, command, true).await;
         }
         let result = self.apply_job_command_direct(job_key, command).await;
+        let result = self.gate_stream_routing(result);
         if let Ok((events, _)) = &result {
-            self.spawn_routing_if_needed(events);
             self.observe_job_sojourn(events, now_millis());
             self.record_adhoc_events(events);
         }
         Self::map_job_events(result)
+    }
+
+    /// Routes the cross-partition follow-ups of a pipelined (ack-before-fsync)
+    /// non-Raft stream job command only once its source write is durable
+    /// (#1582), handing back the commit the pipelined caller still awaits. See
+    /// [`Self::route_after_durable`].
+    fn gate_stream_routing(
+        &self,
+        result: Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
+        result.map(|(events, commit)| {
+            // Stream job commands carry no `operationReference` (the synced
+            // spec's job-completion requests have none), so their routed
+            // follow-ups are unreferenced too.
+            let (commit, _routing) = self.route_after_durable(&events, commit, None);
+            (events, commit)
+        })
     }
 
     /// Stream `FailJob`. Returns the [`Commit`] for off-path pipelining; see
@@ -20779,7 +23200,7 @@ impl ServerImpl {
         retries: i32,
         error_message: String,
     ) -> Result<Commit, (u16, String)> {
-        self.fail_job_for_stream_with_lease(job_key, None, retries, error_message)
+        self.fail_job_for_stream_with_lease(job_key, None, retries, error_message, 0)
             .await
             .map(|(_, commit)| commit)
     }
@@ -20790,35 +23211,29 @@ impl ServerImpl {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        retry_back_off: i64,
     ) -> JobStreamOutcome {
-        if !self.raft.is_empty() {
-            return self
-                .propose_partition_command(
-                    job_key,
-                    job_command_with_lease(
-                        Command::fail_job(job_key, retries, error_message),
-                        lease_token,
-                    ),
-                    // `stream_complete_outcome_total` is a CompleteJob-only
-                    // diagnostic (metrics.rs); a FailJob outcome must not be
-                    // recorded as a CompleteJob outcome. #1306.
-                    false,
-                )
-                .await;
-        }
-        let result = self
-            .apply_job_command_direct(
-                job_key,
-                job_command_with_lease(
-                    Command::fail_job(job_key, retries, error_message),
-                    lease_token,
-                ),
+        let command = job_command_with_lease(
+            Command::fail_job_with_backoff(job_key, retries, error_message, retry_back_off),
+            lease_token,
+        );
+        let outcome = if !self.raft.is_empty() {
+            self.propose_partition_command(
+                job_key, command,
+                // `stream_complete_outcome_total` is a CompleteJob-only
+                // diagnostic (metrics.rs); a FailJob outcome must not be
+                // recorded as a CompleteJob outcome. #1306.
+                false,
             )
-            .await;
-        if let Ok((events, _)) = &result {
-            self.spawn_routing_if_needed(events);
+            .await
+        } else {
+            let result = self.apply_job_command_direct(job_key, command).await;
+            Self::map_job_events(self.gate_stream_routing(result))
+        };
+        if outcome.is_ok() {
+            self.signal_jobs_available_after_backoff(retries, retry_back_off);
         }
-        Self::map_job_events(result)
+        outcome
     }
 
     /// Stream `ThrowError`. Returns the [`Commit`] for off-path pipelining; see
@@ -20829,7 +23244,7 @@ impl ServerImpl {
         lease_token: Option<String>,
         error_code: String,
         error_message: String,
-        variables: std::collections::HashMap<String, Value>,
+        variables: std::collections::BTreeMap<String, Value>,
     ) -> JobStreamOutcome {
         if !self.raft.is_empty() {
             return self
@@ -20860,10 +23275,7 @@ impl ServerImpl {
                 ),
             )
             .await;
-        if let Ok((events, _)) = &result {
-            self.spawn_routing_if_needed(events);
-        }
-        Self::map_job_events(result)
+        Self::map_job_events(self.gate_stream_routing(result))
     }
 
     /// Activates up to `max_jobs` of `job_type` for `worker` and returns the
@@ -21166,6 +23578,24 @@ impl ServerImpl {
              for a fixed cap, or NANOBPMN_SLA_MODE=admission to accept latency instead \
              of shedding."
         )
+    }
+
+    /// The shared create admission policy (#932): the backpressure
+    /// concurrency gate followed by the active-backlog [`Self::admission_shed`]
+    /// rails. Every endpoint that creates process instances must consult this
+    /// before submitting, so no create path bypasses overload or drain-stall
+    /// shedding. `Some(message)` means shed with a `RESOURCE_EXHAUSTED` 503.
+    pub(crate) fn create_admission_shed(&self) -> Option<String> {
+        if let Some(limit) = self.backpressure.current_limit() {
+            let processing = self.processing.load(Ordering::Relaxed);
+            if self.backpressure.should_shed(processing) {
+                return Some(format!(
+                    "Backpressure: {processing} creates in flight at or above the \
+                     configured limit of {limit}. Retry after a backoff."
+                ));
+            }
+        }
+        self.admission_shed()
     }
 
     /// Admission gate combining several signals. Returns `Some(reason)` once any
@@ -21618,6 +24048,65 @@ impl ServerImpl {
         self.dispatch_wake.notify_one();
     }
 
+    /// Re-signals job availability once a failed job's Camunda 8 v2
+    /// `retryBackOff` (#933) has elapsed. The engine defers re-activation by the
+    /// backoff, but nothing journals a "backoff elapsed" event, so a long-poller
+    /// parked on [`jobs_available`](Self::jobs_available) would otherwise sleep
+    /// past it. A no-op when no backoff applies (no retries left, or a
+    /// non-positive backoff — those were already signalled immediately).
+    pub(crate) fn signal_jobs_available_after_backoff(&self, retries: i32, retry_back_off: i64) {
+        let Some(delay) = backoff_wake_delay(retries, retry_back_off) else {
+            return;
+        };
+        self.signal_jobs_available_in(delay);
+    }
+
+    /// Schedules one job-availability re-signal `delay` from now (the wake half
+    /// of [`signal_jobs_available_after_backoff`](Self::signal_jobs_available_after_backoff),
+    /// split out so boot recovery can re-arm a persisted backoff deadline).
+    fn signal_jobs_available_in(&self, delay: Duration) {
+        let jobs_available = self.jobs_available.clone();
+        let dispatch_wake = self.dispatch_wake.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            jobs_available.notify_waiters();
+            dispatch_wake.notify_one();
+        });
+    }
+
+    /// Re-arms the process-local backoff wakes a restart dropped (#933 review):
+    /// a `retryBackOff` deadline is journaled on the `JobFailed` event, so it
+    /// survives replay, but the `tokio` wake task scheduled when the fail was
+    /// applied does not. Without this, a long-poll parked across a restart
+    /// during a backoff sleeps until its request timeout even though the
+    /// restored deadline has elapsed. Already-elapsed deadlines re-signal
+    /// immediately. Runs once after boot recovery, off the request path.
+    pub(crate) async fn reschedule_backoff_wakes(&self) {
+        let now = now_millis();
+        for handle in self.engine.all() {
+            let delays = handle
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .jobs
+                        .values()
+                        .filter(|job| {
+                            job.state == nanobpmn_engine_core::JobState::Created && job.retries > 0
+                        })
+                        .filter_map(|job| job.retry_backoff_until)
+                        .map(|until| {
+                            Duration::from_millis(until.saturating_sub(now).saturating_add(1))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            for delay in delays {
+                self.signal_jobs_available_in(delay);
+            }
+        }
+    }
+
     /// Handle to the permit-storing dispatcher wake, so the Falcon protocol can
     /// wake the dispatcher after a new subscription or credit grant without the
     /// signal being lost mid-pass.
@@ -21698,127 +24187,20 @@ impl ServerImpl {
         filter: &models::ProcessInstanceFilter,
         honour_hierarchy: BatchHierarchyPolicy,
     ) -> Vec<u64> {
-        // Pre-index root-scope variables by instance only when the filter
-        // actually constrains on them, restricted to the variable names the
-        // filter references (same construction as `search_process_instances_impl`).
-        let variables_index: std::collections::HashMap<
-            u64,
-            std::collections::HashMap<String, String>,
-        > = match &filter.variables {
-            Some(entries) if !entries.is_empty() => {
-                let requested: std::collections::HashSet<&str> =
-                    entries.iter().map(|entry| entry.name.as_str()).collect();
-                let mut idx: std::collections::HashMap<
-                    u64,
-                    std::collections::HashMap<String, String>,
-                > = std::collections::HashMap::new();
-                for v in self.store.variables() {
-                    // Root-scope (process-instance) variables only: a variable
-                    // held under a nested scope has `scope_key != instance_key`
-                    // and is not a process-instance-level variable.
-                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
-                        idx.entry(v.instance_key)
-                            .or_default()
-                            .insert(v.name, v.value);
-                    }
-                }
-                idx
-            }
-            _ => std::collections::HashMap::new(),
-        };
-        // Pre-index the instance's element-instance / job / incident child rows
-        // only when an inherited cross-entity filter is actually present (same
-        // lazy construction as `variables_index`), loading only the child-row
-        // sources the supplied predicates read.
-        let cross_index = if InstanceCrossEntityIndex::is_needed(filter) {
-            InstanceCrossEntityIndex::new(
-                filter,
-                &InstanceCrossEntityIndex::sources_for(filter, &self.store),
-            )
-        } else {
-            InstanceCrossEntityIndex::default()
-        };
+        // The same matcher `search_process_instances_impl` uses (one algebra,
+        // including `$or` — #1293: an ignored `$or` here would silently broaden
+        // a mutating batch), with the batch-specific state/hierarchy overrides.
+        let matcher = ProcessInstanceMatcher::new(filter, &self.store);
         let mut keys: Vec<u64> = self
             .store
             .process_instances()
             .into_iter()
             .filter(|inst| {
-                // Batch operations are ACTIVE-only by contract; `filter.state` is
-                // ignored and overridden to ACTIVE (see the doc comment above).
-                let state_matches = matches!(inst.state, ProcessInstanceState::Active);
-                let hierarchy_matches = match honour_hierarchy {
-                    // Incident-resolution / search: honour the supplied
-                    // call-activity hierarchy predicates verbatim.
-                    BatchHierarchyPolicy::HonourFilters => {
-                        query::match_process_instance_key_opt(
-                            &filter.parent_process_instance_key,
-                            inst.parent_process_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        ) && query::match_element_instance_key_opt(
-                            &filter.parent_element_instance_key,
-                            inst.parent_element_instance_key
-                                .map(|k| k.to_string())
-                                .as_deref(),
-                        )
-                    }
-                    // Cancellation: ignore the supplied parent filters and target
-                    // only root instances (spec §371-375) — never active children.
-                    BatchHierarchyPolicy::RootOnly => inst.parent_process_instance_key.is_none(),
-                };
-                query::match_process_instance_key(
-                    &filter.process_instance_key,
-                    &inst.key.to_string(),
-                ) && query::match_process_definition_key(
-                    &filter.process_definition_key,
-                    &inst.process_definition_key,
-                ) && query::match_string(&filter.process_definition_id, &inst.process_definition_id)
-                    && query::match_integer(
-                        &filter.process_definition_version,
-                        Some(i64::from(inst.version)),
-                    )
-                    && state_matches
-                    && filter
-                        .has_incident
-                        .is_none_or(|want| want == inst.has_incident)
-                    && query::match_date_time_ms(
-                        &filter.start_date,
-                        Some(inst.start_date_ms as i64),
-                    )
-                    && query::match_date_time_ms(&filter.end_date, None)
-                    && query::match_string_opt(&filter.business_id, inst.business_id.as_deref())
-                    // `suspendedDate`: the read-model's `suspended_date_ms` is the
-                    // single source of truth. A batch is ACTIVE-only, so a matched
-                    // instance is never suspended and the value is always absent —
-                    // `$exists: true` / value operators then correctly exclude
-                    // every candidate (fail closed) instead of silently broadening.
-                    && query::match_date_time_ms(
-                        &filter.suspended_date,
-                        inst.suspended_date_ms.map(|ms| ms as i64),
-                    )
-                    // Nano is single-tenant: every instance's `tenantId` is the
-                    // `<default>` constant, so honour the filter against it.
-                    && query::match_string(&filter.tenant_id, "<default>")
-                    // `processDefinitionName` / `processDefinitionVersionTag` are
-                    // never projected (always null in `process_instance_result`), so
-                    // match against an absent value: equality / `$like` / `$in` /
-                    // `$exists: true` correctly exclude, `$exists: false` matches.
-                    && query::match_string_opt(&filter.process_definition_name, None)
-                    && query::match_string_opt(&filter.process_definition_version_tag, None)
-                    // Call-activity hierarchy filters (C8 parity, issue #977),
-                    // gated per the per-operation contract above.
-                    && hierarchy_matches
-                    && match_instance_variables(
-                        &filter.variables,
-                        variables_index.get(&inst.key),
-                    )
-                    && match_instance_tags(&filter.tags, &inst.tags)
-                    // Inherited element / job / incident / batch-operation
-                    // filters (C8 parity): existential predicates over the
-                    // instance's child rows, evaluated against the pre-indexed
-                    // cross-entity index so a nonmatching instance is excluded
-                    // from the batch instead of silently broadening it.
-                    && match_instance_cross_entity_filters(filter, inst.key, &cross_index)
+                matcher.matches(
+                    inst,
+                    ProcessInstanceStatePolicy::ActiveOnly,
+                    honour_hierarchy,
+                )
             })
             .map(|inst| inst.key)
             .collect();
@@ -22153,9 +24535,14 @@ impl ServerImpl {
             |rec, field| match field {
                 "state" => query::SortVal::Str(rec.state.to_string()),
                 "operationType" => query::SortVal::Str(rec.op_type.to_string()),
-                "startDate" => query::SortVal::Num(rec.start_date_ms as i64),
-                "endDate" => query::SortVal::Num(rec.end_date_ms.unwrap_or(0) as i64),
-                _ => query::SortVal::Num(rec.key as i64),
+                "startDate" => query::SortVal::Num(rec.start_date_ms as i128),
+                "endDate" => query::opt_num_sort_val(rec.end_date_ms.map(|v| v as i128)),
+                // Constant in Nano: `batch_operation_response` always projects
+                // `actorId` / `actorType` as null (no identity layer), so every
+                // row ties and the batch-key tiebreak orders them.
+                "actorId" | "actorType" => query::SortVal::Num(0),
+                "batchOperationKey" => query::SortVal::Num(rec.key as i128),
+                _ => query::SortVal::Num(rec.key as i128),
             },
             |rec| rec.key,
         );
@@ -22223,13 +24610,18 @@ impl ServerImpl {
         query::sort_items(
             &mut matched,
             &sort,
-            |(_, op_type, item), field| match field {
+            |(batch_key, op_type, item), field| match field {
                 "state" => query::SortVal::Str(item.state.to_string()),
+                "batchOperationKey" => query::SortVal::Num(*batch_key as i128),
+                "processedDate" => {
+                    query::opt_num_sort_val(item.processed_date_ms.map(|ms| ms as i128))
+                }
                 "operationType" => query::SortVal::Str(op_type.to_string()),
                 "processInstanceKey" => {
-                    query::SortVal::Num(item.process_instance_key.unwrap_or(0) as i64)
+                    query::opt_num_sort_val(item.process_instance_key.map(|v| v as i128))
                 }
-                _ => query::SortVal::Num(item.item_key as i64),
+                "itemKey" => query::SortVal::Num(item.item_key as i128),
+                _ => query::SortVal::Num(item.item_key as i128),
             },
             // No single column is unique (the same instance can appear in two
             // batches), so the cursor key is the composite (batchKey, itemKey).
@@ -22457,6 +24849,43 @@ fn next_stateless_key() -> u64 {
 /// the embedded FEEL engine ([`nanobpmn_engine_core::feel`]) and never mint
 /// durable keys.
 impl ServerImpl {
+    /// One immutable snapshot of every cluster variable, read from the
+    /// replicated engine state in a single actor turn (#1657), so the values an
+    /// expression evaluates against and the kinds its provenance is derived
+    /// from are always consistent (#1296). The overlay for a tenant layers
+    /// globals first, then that tenant's variables (which shadow a same-named
+    /// global), matching the engine's resolution.
+    #[allow(clippy::type_complexity)]
+    async fn cluster_variable_snapshot(
+        &self,
+    ) -> (
+        std::collections::BTreeMap<String, Value>,
+        std::collections::HashMap<String, models::ClusterVariableKindEnum>,
+        std::collections::HashMap<String, Vec<(String, Value, models::ClusterVariableKindEnum)>>,
+    ) {
+        let mut globals: std::collections::BTreeMap<String, Value> = Default::default();
+        let mut kinds: std::collections::HashMap<String, models::ClusterVariableKindEnum> =
+            Default::default();
+        let mut tenants: std::collections::HashMap<
+            String,
+            Vec<(String, Value, models::ClusterVariableKindEnum)>,
+        > = Default::default();
+        for v in self.cluster_variable_all().await {
+            match &v.tenant_id {
+                None => {
+                    globals.insert(v.name.clone(), v.value.clone());
+                    kinds.insert(v.name.clone(), v.kind);
+                }
+                Some(t) => tenants.entry(t.clone()).or_default().push((
+                    v.name.clone(),
+                    v.value.clone(),
+                    v.kind,
+                )),
+            }
+        }
+        (globals, kinds, tenants)
+    }
+
     /// `POST /v2/expression/evaluation` — evaluate a FEEL expression against the
     /// request-body variable context and return its result. An unparseable or
     /// otherwise invalid expression maps to a `400` invalid-argument
@@ -22467,24 +24896,90 @@ impl ServerImpl {
     ) -> Result<apis::expression::EvaluateExpressionResponse, ()> {
         use apis::expression::EvaluateExpressionResponse as Resp;
 
-        // The request body's `variables` are the only context: these endpoints
-        // are stateless, so no process-instance / element-instance scope is
-        // resolved here. `Nullable::Null` (an explicit `"variables": null`) and
-        // an omitted map both mean "no variables".
-        let ctx: std::collections::HashMap<String, Value> = match body.variables.as_ref() {
+        // Capture ONE immutable snapshot of the cluster variables (values and
+        // kinds together, under a single lock) so the evaluated values and the
+        // provenance derived from them can never race a concurrent
+        // create/update/delete (#1296).
+        let (globals, mut kinds, tenants) = self.cluster_variable_snapshot().await;
+
+        // The request body's `variables` are the topmost context: these
+        // endpoints are stateless, so no process-instance / element-instance
+        // scope is resolved here. `Nullable::Null` (an explicit `"variables":
+        // null`) and an omitted map both mean "no variables".
+        let mut ctx: std::collections::BTreeMap<String, Value> = match body.variables.as_ref() {
             Some(types::Nullable::Present(map)) => from_object_map(map),
-            _ => std::collections::HashMap::new(),
+            _ => std::collections::BTreeMap::new(),
         };
 
-        match nanobpmn_engine_core::feel::eval(&body.expression, &ctx) {
-            Ok(value) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
+        // Layer the cluster variables UNDERNEATH the request-body variables (a
+        // body variable shadows a same-named cluster variable, matching the
+        // engine's instance-shadows-cluster rule): globals first, then the
+        // requested tenant's overlay over them (tenant shadows global). The
+        // values pass through verbatim — a SECRET_REFERENCE variable's
+        // reference text is never resolved here (#1296). The default tenant
+        // applies when the request omits `tenantId`.
+        let tenant = body
+            .tenant_id
+            .clone()
+            .unwrap_or_else(|| nanobpmn_engine_core::DEFAULT_TENANT.to_string());
+        // Which names a request-body variable binds (those shadow any cluster
+        // variable and are never trusted carriers).
+        let body_bound: std::collections::HashSet<String> = ctx.keys().cloned().collect();
+        for (k, v) in &globals {
+            ctx.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if let Some(overlay) = tenants.get(&tenant) {
+            for (name, value, kind) in overlay {
+                // A tenant variable shadows a same-named global for both the
+                // value and its kind — unless a body variable already shadows
+                // both (a body binding is never a trusted carrier).
+                if !body_bound.contains(name.as_str()) {
+                    ctx.insert(name.clone(), value.clone());
+                    kinds.insert(name.clone(), *kind);
+                }
+            }
+        }
+
+        // The trusted provenance roots are exactly the SECRET_REFERENCE-kind
+        // cluster variables visible in this context AND NOT shadowed by a
+        // request-body binding (a body variable is never a trusted carrier, even
+        // when it shares a name with a SECRET_REFERENCE cluster variable).
+        // Provenance is structural and fail-closed (see
+        // `eval_with_provenance`): a reference is reported only when the
+        // expression's result is structurally a trusted reference — a bare
+        // literal path, a direct read of a trusted root, or a list/context
+        // literal composed of those.
+        let trusted_roots: Vec<String> = kinds
+            .iter()
+            .filter(|(name, kind)| {
+                **kind == models::ClusterVariableKindEnum::SecretReference
+                    && ctx.contains_key(*name)
+                    && !body_bound.contains(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        // Ad-hoc evaluation is off the replicated apply path, so it opts into
+        // the host clock/entropy explicitly (#1663); the builtins fail closed
+        // without an installed environment.
+        match nanobpmn_engine_core::feel::with_host_env(|| {
+            nanobpmn_engine_core::feel::eval_with_provenance(&body.expression, &ctx, trusted_roots)
+        }) {
+            Ok(evaluated) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
                 models::ExpressionEvaluationResult {
                     expression: body.expression.clone(),
-                    result: types::Nullable::Present(types::Object(value_to_json(&value))),
+                    result: types::Nullable::Present(types::Object(value_to_json(
+                        &evaluated.value,
+                    ))),
                     warnings: Vec::new(),
-                    // Nano has no secret stores, so no `camunda.secrets.*`
-                    // reference can ever resolve from a trusted source.
-                    referenced_secrets: Vec::new(),
+                    referenced_secrets: evaluated
+                        .referenced_secrets
+                        .into_iter()
+                        .map(|secret_name| models::ExpressionSecretReferenceItem {
+                            store_id: "default".to_string(),
+                            secret_name,
+                        })
+                        .collect(),
                 },
             )),
             Err(err) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
@@ -22499,24 +24994,38 @@ impl ServerImpl {
     }
 
     /// `POST /v2/conditionals/evaluation` — evaluate root-level conditional start
-    /// events for the (optionally tenant-/definition-scoped) supplied variable
-    /// context. Nano's engine models conditional intermediate-catch and boundary
-    /// events but not root-level conditional *start* events, so no deployed
-    /// definition can be triggered by this evaluation: the result is always a
-    /// well-formed, spec-conformant empty `processInstances` list ("If no
-    /// root-level conditional start events evaluated to true, the list will be
-    /// empty") with a fresh evaluation key. A `processDefinitionKey` that does
-    /// not resolve to a deployed definition maps to a `404`.
+    /// events against the supplied variable context (#932). The engine command
+    /// [`Command::EvaluateConditionalStartEvents`] considers the latest version
+    /// of every deployed process (or exactly the version named by
+    /// `processDefinitionKey`) and creates one process instance — seeded with
+    /// the variables — per root-level conditional start event whose condition
+    /// evaluates to `true`. Each created instance is reported in
+    /// `processInstances`; the list is empty when no condition is satisfied. A
+    /// `processDefinitionKey` that does not resolve to a deployed definition
+    /// maps to a `404`.
     async fn evaluate_conditionals_impl(
         &self,
         body: &models::ConditionalEvaluationInstruction,
     ) -> Result<apis::conditional::EvaluateConditionalsResponse, ()> {
         use apis::conditional::EvaluateConditionalsResponse as Resp;
 
-        let tenant_id = body
-            .tenant_id
-            .clone()
-            .unwrap_or_else(|| "<default>".to_string());
+        // Nano is single-tenant: every definition and instance belongs to
+        // `<default>`. A request scoped to any other tenant cannot be honoured,
+        // so reject it rather than execute an unscoped create that would start
+        // instances outside the requested tenant (spec/conditionals.yaml).
+        let tenant_id = match body.tenant_id.as_deref() {
+            None | Some("<default>") => "<default>".to_string(),
+            Some(other) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    format!(
+                        "Tenant '{other}' is not supported: this engine is single-tenant \
+                         and only evaluates conditional start events for tenant '<default>'."
+                    ),
+                )));
+            }
+        };
 
         if let Some(pdk) = body.process_definition_key.as_ref() {
             // Distinguish a malformed (non-numeric) key from a well-formed but
@@ -22541,14 +25050,109 @@ impl ServerImpl {
             }
         }
 
+        // An evaluation may create instances, so it is subject to the same
+        // create admission policy as `createProcessInstance`: shed under
+        // backpressure, backlog overload or a drain halt.
+        if let Some(message) = self.create_admission_shed() {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "RESOURCE_EXHAUSTED",
+                503,
+                message,
+            )));
+        }
+
+        let variables = from_object_map(&body.variables);
+        // Charge the create accounting from admission until the write has been
+        // applied, and run apply + follow-up routing in a detached owner task
+        // (#1582): a cancelled caller must neither release the charge early nor
+        // leave a persisted instance whose cross-partition follow-ups nobody
+        // routes.
+        let accounting = CreateAccounting::enter(self, engine_vars_bytes(&variables));
+        let command = Command::EvaluateConditionalStartEvents {
+            variables,
+            process_definition_key: body
+                .process_definition_key
+                .as_ref()
+                .and_then(|pdk| pdk.0.parse::<u64>().ok()),
+        };
+        let server = self.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let outcome = server.apply_create_command(command).await;
+            drop(accounting);
+            if let Ok(events) = &outcome {
+                // A created instance may advance straight into an
+                // off-partition message catch or an activatable job: route
+                // follow-ups and wake long-pollers, exactly as every other
+                // instance-creating write does.
+                // Route BEFORE answering so a publish issued the moment the
+                // evaluation returns finds the subscription open (the
+                // create-then-publish ordering, #1582); a cancelled caller is
+                // fine because routing completes inside this detached task.
+                server
+                    .drive_subscription_routing(Self::routable_events(events), None)
+                    .await;
+                server.signal_jobs_available();
+            }
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx
+            .await
+            .unwrap_or_else(|_| Err((500, "conditional evaluation task aborted".to_string())));
+        let events = match outcome {
+            Ok(events) => events,
+            Err((status, detail)) => {
+                return Ok(match status {
+                    404 => Resp::Status404_TheProcessDefinitionWasNotFoundForTheGivenProcessDefinitionKey(
+                        problem("Process definition not found", 404, detail),
+                    ),
+                    400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "INVALID_ARGUMENT",
+                        400,
+                        detail,
+                    )),
+                    503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
+                        detail,
+                    )),
+                    _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Internal error", 500, detail),
+                    ),
+                });
+            }
+        };
+        let process_instances = conditional_start_instances(&events);
+
         Ok(Resp::Status200_SuccessfullyEvaluatedRoot(
             models::EvaluateConditionalResult::new(
                 models::ConditionalEvaluationKey(next_stateless_key().to_string()),
                 tenant_id,
-                Vec::new(),
+                process_instances,
             ),
         ))
     }
+}
+
+/// The `processInstances` of a `/v2/conditionals/evaluation` response: one
+/// reference per root process instance the evaluation created (#932), in the
+/// engine's deterministic creation order.
+fn conditional_start_instances(events: &[Event]) -> Vec<models::ProcessInstanceReference> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_definition_key,
+                parent_process_instance_key: None,
+                ..
+            } => Some(models::ProcessInstanceReference::new(
+                models::ProcessDefinitionKey(process_definition_key.to_string()),
+                models::ProcessInstanceKey(instance_key.to_string()),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch. The engine is
@@ -22738,6 +25342,26 @@ fn decision_requirements_result(
     )
 }
 
+/// The `searchResources` sort projection: every spec sort field explicitly
+/// (#1298). Shared by the handler and its regression tests.
+fn resource_sort_val(row: &readstore::ResourceMetaRow, field: &str) -> query::SortVal {
+    match field {
+        "resourceId" => query::SortVal::Str(row.resource_id.clone()),
+        "resourceName" => query::SortVal::Str(row.resource_name.clone()),
+        "version" => query::SortVal::Num(row.version as i128),
+        // `versionTag` is nullable; a null tag is absent (sorts before
+        // every present tag ascending).
+        "versionTag" => query::opt_str_sort_val(row.version_tag.as_deref()),
+        "resourceKey" => query::SortVal::Num(row.resource_key as i128),
+        "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
+        // The creating deployment's key, projected from the event:
+        // resources of one deployment genuinely tie here, so a
+        // secondary sort (or the resource-key tiebreak) orders them.
+        "deploymentKey" => query::opt_num_sort_val(row.deployment_key),
+        _ => query::SortVal::Num(row.resource_key as i128),
+    }
+}
+
 fn resource_result(row: &readstore::ResourceMetaRow) -> models::ResourceResult {
     let version_tag = match &row.version_tag {
         Some(t) => types::Nullable::Present(t.clone()),
@@ -22874,8 +25498,8 @@ fn decision_instance_get_result(
 ///
 /// Built lazily via [`InstanceCrossEntityIndex::new`]; each child-row source
 /// (element instances, jobs, incidents) is scanned only when a filter that
-/// reads it is supplied, mirroring the `variables_index` construction in
-/// `search_process_instances_impl`.
+/// reads it is supplied — at the top level or in any `$or` clause — mirroring
+/// the `variables_index` construction in `search_process_instances_impl`.
 #[derive(Default)]
 struct InstanceCrossEntityIndex {
     /// `instance_key → its element instances` (for the element predicates).
@@ -22918,15 +25542,16 @@ struct CrossEntitySources {
 }
 
 impl InstanceCrossEntityIndex {
-    /// Builds the index, populating only the maps the supplied `filter`
-    /// actually constrains on and reading only the sources in `sources`.
+    /// Builds the index, populating only the maps the supplied `filters`
+    /// (the base filter plus every `$or` clause) actually constrain on and
+    /// reading only the sources in `sources`.
     #[allow(
         clippy::expect_used,
-        reason = "construction invariant: sources_for loads exactly the sources the supplied filter reads, so a missing source here is a wiring bug between the two, not a runtime condition"
+        reason = "construction invariant: sources_for loads exactly the sources the supplied filters read, so a missing source here is a wiring bug between the two, not a runtime condition"
     )]
-    fn new(filter: &models::ProcessInstanceFilter, sources: &CrossEntitySources) -> Self {
+    fn new(filters: &[&models::ProcessInstanceFilter], sources: &CrossEntitySources) -> Self {
         let mut idx = InstanceCrossEntityIndex::default();
-        if Self::needs_elements(filter) {
+        if Self::needs_elements_any(filters) {
             let rows = sources
                 .element_instances
                 .as_deref()
@@ -22942,7 +25567,7 @@ impl InstanceCrossEntityIndex {
                     });
             }
         }
-        if filter.error_message.is_some() {
+        if filters.iter().any(|f| f.error_message.is_some()) {
             for j in sources
                 .jobs
                 .as_deref()
@@ -22966,7 +25591,7 @@ impl InstanceCrossEntityIndex {
                     .push(i.reason.clone());
             }
         }
-        if filter.has_retries_left.is_some() {
+        if filters.iter().any(|f| f.has_retries_left.is_some()) {
             for j in sources
                 .jobs
                 .as_deref()
@@ -22989,15 +25614,31 @@ impl InstanceCrossEntityIndex {
             || filter.has_element_instance_incident.is_some()
     }
 
+    /// [`Self::needs_elements`] over every group of one query (base + `$or`
+    /// clauses).
+    fn needs_elements_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
+        filters.iter().any(|f| Self::needs_elements(f))
+    }
+
     /// Whether any job-reading predicate (`errorMessage` / `hasRetriesLeft`)
     /// is present.
     fn needs_jobs(filter: &models::ProcessInstanceFilter) -> bool {
         filter.error_message.is_some() || filter.has_retries_left.is_some()
     }
 
+    /// [`Self::needs_jobs`] over every group of one query.
+    fn needs_jobs_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
+        filters.iter().any(|f| Self::needs_jobs(f))
+    }
+
     /// Whether any incident-reading predicate (`errorMessage`) is present.
     fn needs_incidents(filter: &models::ProcessInstanceFilter) -> bool {
         filter.error_message.is_some()
+    }
+
+    /// [`Self::needs_incidents`] over every group of one query.
+    fn needs_incidents_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
+        filters.iter().any(|f| Self::needs_incidents(f))
     }
 
     /// Whether any cross-entity filter is present (so the caller can skip
@@ -23006,20 +25647,21 @@ impl InstanceCrossEntityIndex {
         Self::needs_elements(filter) || Self::needs_jobs(filter) || Self::needs_incidents(filter)
     }
 
-    /// Loads exactly the child-row sources `filter` reads: the element-instance
-    /// table only when an element predicate is present, jobs only for
-    /// `errorMessage` / `hasRetriesLeft`, incidents only for `errorMessage` —
-    /// so an `elementId`-only query never scans the job or incident tables.
-    /// Shared by the search and batch-selection paths so both honour the same
+    /// Loads exactly the child-row sources the supplied `filters` (the base
+    /// filter plus every `$or` clause) read: the element-instance table only
+    /// when an element predicate is present, jobs only for `errorMessage` /
+    /// `hasRetriesLeft`, incidents only for `errorMessage` — so an
+    /// `elementId`-only query never scans the job or incident tables. Shared
+    /// by the search and batch-selection paths so both honour the same
     /// lazy-source contract.
     fn sources_for(
-        filter: &models::ProcessInstanceFilter,
+        filters: &[&models::ProcessInstanceFilter],
         store: &readstore::ReadModel,
     ) -> CrossEntitySources {
         CrossEntitySources {
-            element_instances: Self::needs_elements(filter).then(|| store.element_instances()),
-            jobs: Self::needs_jobs(filter).then(|| store.jobs()),
-            incidents: Self::needs_incidents(filter).then(|| store.incidents()),
+            element_instances: Self::needs_elements_any(filters).then(|| store.element_instances()),
+            jobs: Self::needs_jobs_any(filters).then(|| store.jobs()),
+            incidents: Self::needs_incidents_any(filters).then(|| store.incidents()),
         }
     }
 }
@@ -23160,6 +25802,281 @@ fn match_instance_variables(
             query::match_string_property(&entry.value, value)
         }),
     }
+}
+
+/// How a [`ProcessInstanceMatcher`] treats the filter's `state` field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProcessInstanceStatePolicy {
+    /// Search: honour the supplied `state` predicate.
+    HonourFilter,
+    /// Process-instance batch operations: `state` is ignored and overridden to
+    /// ACTIVE (`spec/process-instances.yaml:371-375`, `416-418`).
+    ActiveOnly,
+}
+
+/// One AND-group of a process-instance filter (the top-level fields, or one
+/// `$or` clause). Indexes are NOT per-group: they live once on the
+/// [`ProcessInstanceMatcher`] so N `$or` clauses never build N copies.
+struct ProcessInstanceFilterGroup {
+    filter: models::ProcessInstanceFilter,
+}
+
+/// Query-level indexes shared by every group of one [`ProcessInstanceMatcher`].
+struct ProcessInstanceIndexes {
+    /// Root variables for the UNION of variable names referenced by the base
+    /// filter and every `$or` clause — one scan, one map.
+    variables: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    /// Cross-entity (element / job / incident) index, built from the UNION of
+    /// the base filter and every `$or` clause: the clause shape
+    /// (`ProcessInstanceFilterFields`) carries the same cross-entity fields the
+    /// top-level filter does, so a clause-only `elementId` / `hasRetriesLeft` /
+    /// `errorMessage` must populate the index too — otherwise it matches
+    /// against an empty index (missed matches, or overbroad `false` matches).
+    cross: InstanceCrossEntityIndex,
+}
+
+/// The single process-instance filter predicate, shared by
+/// `searchProcessInstances` and every process-instance batch creator so the
+/// two can never drift. Honours every top-level field AND, when a non-empty
+/// `$or` list is present, requires at least one clause to match (each clause an
+/// AND of its own fields) — #1293.
+struct ProcessInstanceMatcher {
+    base: ProcessInstanceFilterGroup,
+    or_clauses: Vec<ProcessInstanceFilterGroup>,
+    indexes: ProcessInstanceIndexes,
+}
+
+impl ProcessInstanceMatcher {
+    fn new(filter: &models::ProcessInstanceFilter, store: &readstore::ReadModel) -> Self {
+        let mut base = filter.clone();
+        let clauses: Vec<models::ProcessInstanceFilter> = base
+            .dollar_or
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(process_instance_or_clause)
+            .collect();
+        let variable_names: std::collections::HashSet<String> = std::iter::once(&base)
+            .chain(clauses.iter())
+            .filter_map(|f| f.variables.as_ref())
+            .flatten()
+            .map(|e| e.name.clone())
+            .collect();
+        // One cross-entity index for the whole query, built from every group
+        // that can carry element / job / incident predicates: the base filter
+        // AND each `$or` clause (the clause schema carries the same fields).
+        // `needs_elements` / `needs_jobs` / `needs_incidents` keep the build
+        // lazy — a source table is loaded only when some group reads it.
+        let index_groups: Vec<&models::ProcessInstanceFilter> =
+            std::iter::once(&base).chain(clauses.iter()).collect();
+        let indexes = ProcessInstanceIndexes {
+            variables: root_variables_index(&variable_names, store),
+            cross: if index_groups
+                .iter()
+                .any(|f| InstanceCrossEntityIndex::is_needed(f))
+            {
+                InstanceCrossEntityIndex::new(
+                    &index_groups,
+                    &InstanceCrossEntityIndex::sources_for(&index_groups, store),
+                )
+            } else {
+                InstanceCrossEntityIndex::default()
+            },
+        };
+        ProcessInstanceMatcher {
+            base: ProcessInstanceFilterGroup { filter: base },
+            or_clauses: clauses
+                .into_iter()
+                .map(|filter| ProcessInstanceFilterGroup { filter })
+                .collect(),
+            indexes,
+        }
+    }
+
+    fn matches(
+        &self,
+        inst: &readstore::ProcessInstanceRow,
+        state_policy: ProcessInstanceStatePolicy,
+        hierarchy: BatchHierarchyPolicy,
+    ) -> bool {
+        let state_ok = match state_policy {
+            ProcessInstanceStatePolicy::HonourFilter => true,
+            ProcessInstanceStatePolicy::ActiveOnly => {
+                matches!(inst.state, ProcessInstanceState::Active)
+            }
+        };
+        let root_ok = match hierarchy {
+            BatchHierarchyPolicy::HonourFilters => true,
+            // Cancellation: only root instances, never active children.
+            BatchHierarchyPolicy::RootOnly => inst.parent_process_instance_key.is_none(),
+        };
+        state_ok
+            && root_ok
+            && match_process_instance_group(
+                inst,
+                &self.base,
+                &self.indexes,
+                state_policy,
+                hierarchy,
+            )
+            && (self.or_clauses.is_empty()
+                || self.or_clauses.iter().any(|g| {
+                    match_process_instance_group(inst, g, &self.indexes, state_policy, hierarchy)
+                }))
+    }
+}
+
+/// Lifts one `$or` clause into a `ProcessInstanceFilter` (no nested `$or`).
+/// Exhaustive destructuring: a field added to the clause schema fails to
+/// compile here instead of being silently dropped.
+fn process_instance_or_clause(
+    c: models::ProcessInstanceFilterFields,
+) -> models::ProcessInstanceFilter {
+    let models::ProcessInstanceFilterFields {
+        start_date,
+        end_date,
+        state,
+        has_incident,
+        suspended_date,
+        tenant_id,
+        variables,
+        process_instance_key,
+        parent_process_instance_key,
+        parent_element_instance_key,
+        batch_operation_id,
+        batch_operation_key,
+        error_message,
+        has_retries_left,
+        element_instance_state,
+        element_id,
+        has_element_instance_incident,
+        incident_error_hash_code,
+        tags,
+        business_id,
+        process_definition_id,
+        process_definition_name,
+        process_definition_version,
+        process_definition_version_tag,
+        process_definition_key,
+    } = c;
+    models::ProcessInstanceFilter {
+        start_date,
+        end_date,
+        state,
+        has_incident,
+        suspended_date,
+        tenant_id,
+        variables,
+        process_instance_key,
+        parent_process_instance_key,
+        parent_element_instance_key,
+        batch_operation_id,
+        batch_operation_key,
+        error_message,
+        has_retries_left,
+        element_instance_state,
+        element_id,
+        has_element_instance_incident,
+        incident_error_hash_code,
+        tags,
+        business_id,
+        process_definition_id,
+        process_definition_name,
+        process_definition_version,
+        process_definition_version_tag,
+        process_definition_key,
+        dollar_or: None,
+    }
+}
+
+/// Indexes process-scoped (root) variables by instance, restricted to the
+/// `requested` variable names; empty (no scan) when none are requested.
+fn root_variables_index(
+    requested: &std::collections::HashSet<String>,
+    store: &readstore::ReadModel,
+) -> std::collections::HashMap<u64, std::collections::HashMap<String, String>> {
+    let mut idx: std::collections::HashMap<u64, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    if requested.is_empty() {
+        return idx;
+    }
+    for v in store.variables() {
+        // Root-scope only: a nested-scope variable has `scope_key != instance_key`.
+        if v.scope_key == v.instance_key && requested.contains(&v.name) {
+            idx.entry(v.instance_key)
+                .or_default()
+                .insert(v.name, v.value);
+        }
+    }
+    idx
+}
+
+/// Evaluates one AND-group of process-instance filter fields.
+fn match_process_instance_group(
+    inst: &readstore::ProcessInstanceRow,
+    g: &ProcessInstanceFilterGroup,
+    idx: &ProcessInstanceIndexes,
+    state_policy: ProcessInstanceStatePolicy,
+    hierarchy: BatchHierarchyPolicy,
+) -> bool {
+    let f = &g.filter;
+    let state_ok = match state_policy {
+        ProcessInstanceStatePolicy::HonourFilter => query::match_process_instance_state(
+            &f.state,
+            &process_instance_state_enum(inst.state).to_string(),
+        ),
+        // Overridden to ACTIVE by the caller; the supplied `state` is ignored.
+        ProcessInstanceStatePolicy::ActiveOnly => true,
+    };
+    // Call-activity hierarchy filters (C8 parity, #977): a bare parent key
+    // enumerates direct children; `$exists:false` selects top-level instances.
+    // Cancellation (`RootOnly`) ignores them (the caller enforces root-only).
+    let hierarchy_ok = match hierarchy {
+        BatchHierarchyPolicy::HonourFilters => {
+            query::match_process_instance_key_opt(
+                &f.parent_process_instance_key,
+                inst.parent_process_instance_key
+                    .map(|k| k.to_string())
+                    .as_deref(),
+            ) && query::match_element_instance_key_opt(
+                &f.parent_element_instance_key,
+                inst.parent_element_instance_key
+                    .map(|k| k.to_string())
+                    .as_deref(),
+            )
+        }
+        BatchHierarchyPolicy::RootOnly => true,
+    };
+    state_ok
+        && hierarchy_ok
+        && query::match_process_instance_key(&f.process_instance_key, &inst.key.to_string())
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &inst.process_definition_key,
+        )
+        && query::match_string(&f.process_definition_id, &inst.process_definition_id)
+        && query::match_integer(&f.process_definition_version, Some(i64::from(inst.version)))
+        && f.has_incident.is_none_or(|want| want == inst.has_incident)
+        && query::match_date_time_ms(&f.start_date, Some(inst.start_date_ms as i64))
+        // No projected completion timestamp: `endDate` matches an absent value
+        // (value operators exclude, `$exists: false` matches).
+        && query::match_date_time_ms(&f.end_date, None)
+        && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
+        // `suspended_date_ms` is the single source of truth for suspension.
+        && query::match_date_time_ms(
+            &f.suspended_date,
+            inst.suspended_date_ms.map(|ms| ms as i64),
+        )
+        // Single-tenant: every instance's `tenantId` is `<default>`.
+        && query::match_string(&f.tenant_id, "<default>")
+        // Never projected (always null in `process_instance_result`): matched
+        // against an absent value.
+        && query::match_string_opt(&f.process_definition_name, None)
+        && query::match_string_opt(&f.process_definition_version_tag, None)
+        && match_instance_variables(&f.variables, idx.variables.get(&inst.key))
+        && match_instance_tags(&f.tags, &inst.tags)
+        // Inherited element / job / incident / batch-operation filters.
+        && match_instance_cross_entity_filters(f, inst.key, &idx.cross)
 }
 
 /// Matches the `tags` filter against an instance's carried tags. Every
@@ -23416,13 +26333,69 @@ fn match_element_instance_fields(
         })
 }
 
+/// The incident filter predicate, shared by `searchIncidents` and the
+/// element-instance-scoped incident search so the two cannot drift. Every
+/// declared `IncidentFilter` field is matched: the process-definition identity
+/// is denormalized onto the row at projection time (no cross-entity lookup),
+/// and single-tenant Nano stores no tenant on incidents, so `tenantId` matches
+/// against an absent value — value operators exclude the row (honest, never
+/// silently widening the search) while `$exists: false` still matches.
+fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilter) -> bool {
+    query::match_basic_string(&f.incident_key, &inc.key.to_string())
+        && query::match_process_instance_key(&f.process_instance_key, &inc.instance_key.to_string())
+        && query::match_element_instance_key(
+            &f.element_instance_key,
+            &inc.element_instance_key.to_string(),
+        )
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &inc.process_definition_key,
+        )
+        && query::match_string(&f.process_definition_id, &inc.process_definition_id)
+        && query::match_job_key_opt(&f.job_key, inc.job_key.map(|k| k.to_string()).as_deref())
+        && query::match_incident_state(&f.state, &incident_state_enum(inc.state).to_string())
+        && query::match_incident_error_type(
+            &f.error_type,
+            &incident_error_type_enum(inc.kind).to_string(),
+        )
+        && query::match_string(&f.element_id, &inc.element_id)
+        && query::match_string(&f.error_message, &inc.reason)
+        && query::match_date_time_ms(&f.creation_time, Some(inc.created_at_ms as i64))
+        && query::match_string_opt(&f.tenant_id, None)
+}
+
 /// The user-task filter predicate over one AND-group of fields, shared by the
 /// top-level filter and each `$or` clause so the two cannot drift.
-fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFilterFields) -> bool {
+///
+/// Every advertised field is matched against what the row actually projects.
+/// Fields Nano never projects onto a user task — `name` (the result's `name`
+/// is always null), `completionDate` (always null), `tags` (always empty), and
+/// `tenantId` (single-tenant Nano stores no tenant on tasks) — match against an
+/// absent value: value operators exclude the row (honest, never silently
+/// widening the search) while `$exists: false` still matches. The variable
+/// filters match through `vars` (#1293): `processInstanceVariables` against
+/// the owning instance's root-scope variables, `localVariables` against the
+/// variables held at the task's element-instance scope.
+fn match_user_task_fields(
+    task: &readstore::UserTaskRow,
+    f: &models::UserTaskFilterFields,
+    vars: &UserTaskVariableIndex,
+) -> bool {
     let assignee = task.assignee.clone().unwrap_or_default();
+    // The task's due/follow-up dates are stored as RFC 3339 strings; project
+    // them to epoch millis for the date-time filter algebra. An unparseable or
+    // absent stored date is an absent value (value operators exclude it).
+    let parse_ms = |d: &Option<String>| {
+        d.as_deref()
+            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .map(|dt| dt.timestamp_millis())
+    };
     f.user_task_key
         .as_ref()
         .is_none_or(|k| k.0 == task.key.to_string())
+        && f.element_instance_key
+            .as_ref()
+            .is_none_or(|k| k.0 == task.element_instance_key.to_string())
         && query::match_process_instance_key(
             &f.process_instance_key,
             &task.instance_key.to_string(),
@@ -23431,9 +26404,95 @@ fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFil
             &f.process_definition_key,
             &task.process_definition_key,
         )
+        && query::match_process_definition_id(
+            &f.process_definition_id,
+            Some(&task.process_definition_id),
+        )
         && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
         && query::match_string(&f.assignee, &assignee)
         && query::match_user_task_state(&f.state, &user_task_state_enum(task.state).to_string())
+        && query::match_string_opt(&f.business_id, task.business_id.as_deref())
+        && query::match_integer(&f.priority, Some(i64::from(task.priority)))
+        && f.candidate_group.as_ref().is_none_or(|g| match g {
+            models::StringFilterProperty::String(s) => task.candidate_groups.contains(s),
+            models::StringFilterProperty::AdvancedStringFilter(_) => task
+                .candidate_groups
+                .iter()
+                .any(|cg| query::match_string_property(g, Some(cg))),
+        })
+        && f.candidate_user.as_ref().is_none_or(|u| match u {
+            models::StringFilterProperty::String(s) => task.candidate_users.contains(s),
+            models::StringFilterProperty::AdvancedStringFilter(_) => task
+                .candidate_users
+                .iter()
+                .any(|cu| query::match_string_property(u, Some(cu))),
+        })
+        && query::match_date_time_ms(&f.creation_date, Some(task.created_at_ms as i64))
+        && query::match_date_time_ms(&f.due_date, parse_ms(&task.due_date))
+        && query::match_date_time_ms(&f.follow_up_date, parse_ms(&task.follow_up_date))
+        // Never projected: completion date (result is always null).
+        && query::match_date_time_ms(&f.completion_date, None)
+        // Never projected: task name (result is always null).
+        && query::match_string_opt(&f.name, None)
+        // Never projected: task tags (result is always empty), so any listed
+        // tag excludes the row.
+        && f.tags.as_ref().is_none_or(|tags| tags.is_empty())
+        && query::match_string_opt(&f.tenant_id, None)
+        && match_instance_variables(
+            &f.process_instance_variables,
+            vars.process_instance.get(&task.instance_key),
+        )
+        && match_instance_variables(
+            &f.local_variables,
+            vars.local.get(&task.element_instance_key),
+        )
+}
+
+/// `name -> serialized value` maps keyed by instance (root scope) and by
+/// element-instance scope, restricted to the variable names a user-task filter
+/// references (empty — no scan — when it references none).
+#[derive(Default)]
+struct UserTaskVariableIndex {
+    process_instance: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    local: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+}
+
+impl UserTaskVariableIndex {
+    fn new(f: &models::UserTaskFilter, store: &readstore::ReadModel) -> Self {
+        let mut groups = vec![user_task_filter_base(f)];
+        groups.extend(f.dollar_or.iter().flatten().cloned());
+        let names = |pick: fn(
+            &models::UserTaskFilterFields,
+        ) -> &Option<Vec<models::VariableValueFilterProperty>>| {
+            groups
+                .iter()
+                .filter_map(|g| pick(g).as_ref())
+                .flatten()
+                .map(|e| e.name.clone())
+                .collect::<std::collections::HashSet<String>>()
+        };
+        let root_names = names(|g| &g.process_instance_variables);
+        let local_names = names(|g| &g.local_variables);
+        let mut idx = UserTaskVariableIndex::default();
+        if root_names.is_empty() && local_names.is_empty() {
+            return idx;
+        }
+        for v in store.variables() {
+            if v.scope_key == v.instance_key && root_names.contains(&v.name) {
+                idx.process_instance
+                    .entry(v.instance_key)
+                    .or_default()
+                    .insert(v.name.clone(), v.value.clone());
+            }
+            if local_names.contains(&v.name) {
+                idx.local
+                    .entry(v.scope_key)
+                    .or_default()
+                    .insert(v.name, v.value);
+            }
+        }
+        idx
+    }
 }
 
 /// Copies every field of a top-level `UserTaskFilter` except `$or` into a
@@ -23490,12 +26549,16 @@ fn user_task_filter_base(f: &models::UserTaskFilter) -> models::UserTaskFilterFi
 
 /// Full user-task filter match: every top-level field AND, when a non-empty
 /// `$or` list is present, at least one clause (each an AND of its fields).
-fn match_user_task_filter(task: &readstore::UserTaskRow, f: &models::UserTaskFilter) -> bool {
-    match_user_task_fields(task, &user_task_filter_base(f))
+fn match_user_task_filter(
+    task: &readstore::UserTaskRow,
+    f: &models::UserTaskFilter,
+    vars: &UserTaskVariableIndex,
+) -> bool {
+    match_user_task_fields(task, &user_task_filter_base(f), vars)
         && match &f.dollar_or {
-            Some(clauses) if !clauses.is_empty() => {
-                clauses.iter().any(|c| match_user_task_fields(task, c))
-            }
+            Some(clauses) if !clauses.is_empty() => clauses
+                .iter()
+                .any(|c| match_user_task_fields(task, c, vars)),
             _ => true,
         }
 }
@@ -24236,26 +27299,28 @@ fn validate_agent_history(items: &[models::AgentInstanceHistoryItem]) -> Result<
 /// The [`query::SortVal`] for an agent-instance row on the given REST sort field.
 fn agent_instance_sort_val(row: &readstore::AgentInstanceRow, field: &str) -> query::SortVal {
     match field {
-        "agentDefinitionKey" => query::SortVal::Num(row.agent_definition_key as i64),
+        "agentDefinitionKey" => query::SortVal::Num(row.agent_definition_key as i128),
         "status" => query::SortVal::Str(row.status.as_str().to_string()),
         "elementId" => query::SortVal::Str(row.element_id.clone()),
-        "processInstanceKey" => query::SortVal::Num(row.process_instance_key as i64),
-        "rootProcessInstanceKey" => query::SortVal::Num(row.root_process_instance_key as i64),
-        "processDefinitionKey" => query::SortVal::Num(row.process_definition_key as i64),
+        "processInstanceKey" => query::SortVal::Num(row.process_instance_key as i128),
+        "rootProcessInstanceKey" => query::SortVal::Num(row.root_process_instance_key as i128),
+        "processDefinitionKey" => query::SortVal::Num(row.process_definition_key as i128),
         "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
-        "creationDate" => query::SortVal::Num(row.creation_date_ms as i64),
-        "lastUpdatedDate" => query::SortVal::Num(row.last_updated_date_ms as i64),
-        "completionDate" => query::SortVal::Num(row.completion_date_ms.unwrap_or(0) as i64),
-        _ => query::SortVal::Num(row.agent_instance_key as i64),
+        "creationDate" => query::SortVal::Num(row.creation_date_ms as i128),
+        "lastUpdatedDate" => query::SortVal::Num(row.last_updated_date_ms as i128),
+        "completionDate" => query::opt_num_sort_val(row.completion_date_ms.map(|v| v as i128)),
+        "agentInstanceKey" => query::SortVal::Num(row.agent_instance_key as i128),
+        _ => query::SortVal::Num(row.agent_instance_key as i128),
     }
 }
 
 /// The [`query::SortVal`] for an agent-history row on the given REST sort field.
 fn agent_history_sort_val(row: &readstore::AgentHistoryRow, field: &str) -> query::SortVal {
     match field {
-        "producedAt" => query::SortVal::Num(row.produced_at_ms as i64),
-        "loopIteration" => query::SortVal::Num(row.loop_iteration as i64),
-        _ => query::SortVal::Num(row.agent_history_key as i64),
+        "producedAt" => query::SortVal::Num(row.produced_at_ms as i128),
+        "loopIteration" => query::SortVal::Num(row.loop_iteration as i128),
+        "historyItemKey" => query::SortVal::Num(row.agent_history_key as i128),
+        _ => query::SortVal::Num(row.agent_history_key as i128),
     }
 }
 
@@ -24492,37 +27557,103 @@ fn job_kind_enums(
     }
 }
 
-/// Maps a [`JobRow`] field name to its sort key for `/v2/jobs/search`. Numeric
-/// keys (including `processDefinitionKey`, a numeric key stored as its decimal
-/// string) sort as [`query::SortVal::Num`] so `"2"` precedes `"10"` instead of
-/// lexicographically; timing fields project their millisecond columns with a
-/// missing value sorting as `0` (#1344). Unknown fields fall back to the stable
-/// `job.key` tiebreak. Extracted from the handler so the ordering contract is
-/// unit-testable without a full deploy (the search harness can only mint
-/// same-length definition keys, which hide the numeric-vs-lexicographic bug).
+/// Epoch nanoseconds of an optional RFC 3339 timestamp string (`None` when
+/// absent or unparseable) — the sort projection for string-stored dates. Full
+/// precision (not millis) so sub-millisecond instants the REST surface
+/// returns verbatim still order correctly; `i128` cannot overflow.
+fn rfc3339_ns(s: Option<&str>) -> Option<i128> {
+    s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| i128::from(d.timestamp()) * 1_000_000_000 + i128::from(d.timestamp_subsec_nanos()))
+}
+
+/// The user-task priority as exposed by REST (clamped to `0..=100`): the single
+/// source for both the response projection and the sort projection.
+fn user_task_priority(stored: i32) -> u8 {
+    stored.clamp(0, 100) as u8
+}
+
+#[cfg(test)]
+mod sort_projection_tests {
+    use super::{rfc3339_ns, user_task_priority};
+
+    #[test]
+    fn priority_sort_projection_matches_the_returned_clamped_value() {
+        // Stored 100 and 101 both return priority 100, so they must tie in
+        // the sort (letting the secondary sort / key tiebreak decide).
+        assert_eq!(user_task_priority(100), user_task_priority(101));
+        assert_eq!(user_task_priority(i32::MAX), 100);
+        assert_eq!(user_task_priority(-5), 0);
+        assert_eq!(user_task_priority(42), 42);
+    }
+
+    #[test]
+    fn rfc3339_ns_orders_by_instant_not_string() {
+        // Lexicographically "…T10:00:00+02:00" > "…T09:00:00Z", but it is the
+        // earlier instant; sorting must follow the instant (#1298).
+        let a = rfc3339_ns(Some("2026-01-01T10:00:00+02:00"));
+        let b = rfc3339_ns(Some("2026-01-01T09:00:00Z"));
+        assert!(a < b);
+        assert_eq!(rfc3339_ns(None), None);
+        assert_eq!(rfc3339_ns(Some("garbage")), None);
+    }
+
+    #[test]
+    fn rfc3339_ns_keeps_sub_millisecond_precision() {
+        let early = rfc3339_ns(Some("2026-01-01T00:00:00.000100Z"));
+        let late = rfc3339_ns(Some("2026-01-01T00:00:00.000900Z"));
+        assert!(early < late, "same-millisecond instants must not tie");
+        // Pre-epoch instants stay ordered too.
+        assert!(
+            rfc3339_ns(Some("1969-12-31T23:59:59.5Z")) < rfc3339_ns(Some("1970-01-01T00:00:00Z"))
+        );
+    }
+}
+
+/// Sort projection for job search: string-encoded definition keys sort
+/// numerically (so `"2"` precedes `"10"`), optional fields sort as
+/// [`query::SortVal::Null`] (before every present value), and unknown fields
+/// fall back to the stable `job.key` tiebreak (#1344). Extracted from the
+/// handler so the ordering contract is unit-testable without a full deploy.
 fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
     match field {
-        "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
+        "processInstanceKey" => query::SortVal::Num(job.instance_key as i128),
         "elementId" => query::SortVal::Str(job.element_id.clone()),
-        "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i64),
+        "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i128),
         "type" => query::SortVal::Str(job.job_type.clone()),
         "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
-        "retries" => query::SortVal::Num(job.retries as i64),
-        "worker" => query::SortVal::Str(job.worker.clone().unwrap_or_default()),
+        "retries" => query::SortVal::Num(job.retries as i128),
+        // Sort the projected response value: `job_search_result` returns `""`
+        // for both `None` and a legacy `Some("")`, so they must tie here too.
+        "worker" => query::SortVal::Str(job_worker(job)),
         "processDefinitionId" => query::SortVal::Str(job.process_definition_id.clone()),
-        "processDefinitionKey" => {
-            query::SortVal::Num(job.process_definition_key.parse().unwrap_or(0))
+        "processDefinitionKey" => query::key_sort_val(&job.process_definition_key),
+        "errorCode" => query::opt_str_sort_val(job.error_code.as_deref()),
+        "errorMessage" => query::opt_str_sort_val(job.error_message.as_deref()),
+        // Camunda-parity timing sort fields (#1344). Missing values sort as
+        // `SortVal::Null`, before every present timestamp ascending.
+        "creationTime" => query::SortVal::Num(job.created_at_ms as i128),
+        "lastUpdateTime" => query::opt_num_sort_val(job.last_update_ms.map(|v| v as i128)),
+        "endTime" => query::opt_num_sort_val(job.end_ms.map(|v| v as i128)),
+        "deadline" => query::opt_num_sort_val(job.deadline_ms.map(|v| v as i128)),
+        "hasFailedWithRetriesLeft" => {
+            query::SortVal::Num(i128::from(job.has_failed_with_retries_left))
         }
-        "errorCode" => query::SortVal::Str(job.error_code.clone().unwrap_or_default()),
-        "errorMessage" => query::SortVal::Str(job.error_message.clone().unwrap_or_default()),
-        // Camunda-parity timing sort fields (#1344). Missing values sort as 0
-        // (epoch), so jobs lacking a timestamp group first ascending.
-        "creationTime" => query::SortVal::Num(job.created_at_ms as i64),
-        "lastUpdateTime" => query::SortVal::Num(job.last_update_ms.unwrap_or(0) as i64),
-        "endTime" => query::SortVal::Num(job.end_ms.unwrap_or(0) as i64),
-        "deadline" => query::SortVal::Num(job.deadline_ms.unwrap_or(0) as i64),
-        _ => query::SortVal::Num(job.key as i64),
+        "kind" => query::SortVal::Str(job_kind_enums(&job.kind).0.to_string()),
+        "listenerEventType" => query::SortVal::Str(job_kind_enums(&job.kind).1.to_string()),
+        // Constant in Nano: `job_search_result` always projects `priority: 0`
+        // and null `isDenied` / `deniedReason`, so every row ties and the
+        // job-key tiebreak orders them.
+        "priority" | "isDenied" | "deniedReason" => query::SortVal::Num(0),
+        "jobKey" => query::SortVal::Num(job.key as i128),
+        "tenantId" => query::SortVal::Str("<default>".to_string()),
+        _ => query::SortVal::Num(job.key as i128),
     }
+}
+
+/// The `worker` value REST returns for a job: absent and legacy-empty both
+/// project as `""`. Single source for the response and the sort projection.
+fn job_worker(job: &readstore::JobRow) -> String {
+    job.worker.clone().unwrap_or_default()
 }
 
 /// Projects a [`JobRow`] into the generated `JobSearchResult`. The
@@ -24589,7 +27720,7 @@ fn job_search_result(
         state: job_state_enum(job.state),
         tenant_id: "<default>".to_string(),
         r_type: job.job_type.clone(),
-        worker: job.worker.clone().unwrap_or_default(),
+        worker: job_worker(job),
         creation_time,
         last_update_time,
         priority: 0,
@@ -24665,7 +27796,7 @@ fn user_task_result(
         },
         process_definition_version: task.process_definition_version,
         custom_headers: std::collections::HashMap::new(),
-        priority: task.priority.clamp(0, 100) as u8,
+        priority: user_task_priority(task.priority),
         user_task_key: models::UserTaskKey(task.key.to_string()),
         element_instance_key: models::ElementInstanceKey(task.element_instance_key.to_string()),
         process_name: types::Nullable::Null,
@@ -24698,11 +27829,38 @@ struct ActivatedJobWithIdentity {
     process_id: String,
     version: i32,
     process_definition_key: String,
+    /// The job's mapping-time secret-reference provenance (#1640), read from
+    /// engine state on the engine thread: the only input activation-time
+    /// secret resolution trusts.
+    secret_provenance: Vec<nanobpmn_engine_core::SecretProvenance>,
 }
 
 enum PreparedActivation {
     Durable(Box<Command>),
     Soft(Vec<ActivatedJobWithIdentity>),
+}
+
+/// Brings a journal that is its partition's ONLY replica (no Raft log: a single
+/// node, or the non-Raft tick) to the activation policy's lenient-completion
+/// flag by applying the journaled `Command::SetLenientCompletion` (#1661). A
+/// no-op once the replicated flag is set, so it journals at most one event.
+/// ONE-WAY: a policy that does not need lenience never clears it.
+/// Whether the non-Raft tick may journal the irreversible replicated lenient
+/// flag directly (#1661). Only a genuinely single-node deployment: an empty
+/// Raft registry is also what a multi-node node looks like mid-bootstrap, and
+/// a multi-node non-Raft deployment has no peer-compatibility gate on that
+/// path — both keep the per-node legacy host flag instead.
+fn local_lenient_reconcile(topology: &cluster::Topology, policy: ActivationPolicy) -> bool {
+    topology.is_single_node() && policy.may_be_leader_local()
+}
+
+fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now: u64) {
+    if !lenient || journal.engine().replicated_lenient_completion() {
+        return;
+    }
+    if let Err(e) = journal.apply_command_at(Command::SetLenientCompletion { lenient }, now) {
+        tracing::error!("applying SetLenientCompletion {{ lenient: {lenient} }} failed: {e}");
+    }
 }
 
 fn prepare_activation(
@@ -24726,7 +27884,13 @@ fn prepare_activation(
     if job_keys.is_empty() {
         return PreparedActivation::Soft(Vec::new());
     }
+    // A leader-local (soft, unreplicated) lock is only safe while every replica
+    // will accept its completion: the partition's REPLICATED lenient flag
+    // (#1661, committed before the lock, one-way), or — before the ADR 0066
+    // cutover — the legacy host flag every node sets identically from the
+    // activation policy. Otherwise the activation must go through the log.
     if force_durable
+        || !journal.engine().lenient_completion()
         || with_lease
         || job_keys
             .iter()
@@ -24772,11 +27936,20 @@ fn activated_jobs_with_identity(
                     )
                 })
                 .unwrap_or_else(|| (String::new(), 1, String::new()));
+            // Mapping-time secret provenance journaled on `JobCreated`
+            // (#1640) — never re-derived from the live cluster variables.
+            let secret_provenance = journal
+                .state()
+                .jobs
+                .get(&job.key)
+                .map(|j| j.secret_provenance.clone())
+                .unwrap_or_default();
             ActivatedJobWithIdentity {
                 job,
                 process_id,
                 version,
                 process_definition_key,
+                secret_provenance,
             }
         })
         .collect()
@@ -24787,6 +27960,15 @@ fn optional_lease_token(token: &Option<types::Nullable<String>>) -> Option<Strin
         Some(types::Nullable::Present(token)) => Some(token.clone()),
         _ => None,
     }
+}
+
+/// When a failed job's `retryBackOff` (#933) defers its re-activation, the
+/// delay after which job availability must be re-signalled. `None` when the
+/// job is retryable immediately (non-positive backoff) or parks (no retries).
+fn backoff_wake_delay(retries: i32, retry_back_off: i64) -> Option<Duration> {
+    let ms = u64::try_from(retry_back_off).ok().filter(|&ms| ms > 0)?;
+    // A millisecond of slack so the woken poll's clock is past the deadline.
+    (retries > 0).then(|| Duration::from_millis(ms.saturating_add(1)))
 }
 
 fn job_command_with_lease(command: Command, lease_token: Option<String>) -> Command {
@@ -24812,7 +27994,7 @@ pub(crate) struct JobCompletion {
 
 fn completion_command(
     job_key: u64,
-    variables: std::collections::HashMap<String, Value>,
+    variables: std::collections::BTreeMap<String, Value>,
     adhoc_result: Option<AdHocJobResult>,
     task_result: Option<TaskListenerJobResult>,
     lease_token: Option<String>,
@@ -24961,6 +28143,7 @@ fn activated_job_result(
         process_id,
         version,
         process_definition_key,
+        secret_provenance: _,
     } = activated;
 
     // Project the job's variables into the REST object map off the engine
@@ -24968,7 +28151,7 @@ fn activated_job_result(
     // here neither blocks the command thread nor deep-clones the value tree.
     let variables = match fetch_variable {
         Some(names) => {
-            let filtered: std::collections::HashMap<String, Value> = job
+            let filtered: std::collections::BTreeMap<String, Value> = job
                 .variables
                 .iter()
                 .filter(|(name, _)| names.iter().any(|n| n == *name))
@@ -25037,7 +28220,7 @@ fn activated_job_result(
 /// Converts engine variables into the generated `Object` (JSON) map used by the
 /// REST models.
 fn to_object_map(
-    variables: &std::collections::HashMap<String, Value>,
+    variables: &std::collections::BTreeMap<String, Value>,
 ) -> std::collections::HashMap<String, types::Object> {
     variables
         .iter()
@@ -25069,7 +28252,7 @@ fn adhoc_result_from_completion(
                     element_id: el.element_id.clone().unwrap_or_default(),
                     variables: match el.variables.as_ref() {
                         Some(types::Nullable::Present(map)) => from_object_map(map),
-                        _ => std::collections::HashMap::new(),
+                        _ => std::collections::BTreeMap::new(),
                     },
                 })
                 .collect()
@@ -25122,7 +28305,7 @@ fn adhoc_activation_command(
 /// the drop. Returns `Some((400, detail))` to reject, `None` to allow.
 fn reject_task_result_with_variables(
     task_result: &Option<TaskListenerJobResult>,
-    variables: &std::collections::HashMap<String, Value>,
+    variables: &std::collections::BTreeMap<String, Value>,
 ) -> Option<(u16, String)> {
     if task_result.is_some() && !variables.is_empty() {
         Some((
@@ -25231,7 +28414,7 @@ fn user_task_corrections_from_model(c: &models::JobResultCorrections) -> UserTas
 
 fn from_object_map(
     variables: &std::collections::HashMap<String, types::Object>,
-) -> std::collections::HashMap<String, Value> {
+) -> std::collections::BTreeMap<String, Value> {
     variables
         .iter()
         .map(|(name, object)| (name.clone(), json_to_value(&object.0)))
@@ -25289,7 +28472,7 @@ enum ForwardCreateOutcome {
 /// Cheap O(n) byte-size proxy for a create's engine-`Value` variable map, used to
 /// meter in-flight create payloads for byte-aware admission control. Sums each
 /// key's length plus its value's [`Value::approx_bytes`].
-fn engine_vars_bytes(vars: &std::collections::HashMap<String, Value>) -> u64 {
+fn engine_vars_bytes(vars: &std::collections::BTreeMap<String, Value>) -> u64 {
     vars.iter()
         .map(|(k, v)| k.len() as u64 + v.approx_bytes())
         .sum()
@@ -25437,7 +28620,7 @@ fn modify_instructions_from_rest(
         };
         out.activate_instructions.push(ActivateElementInstruction {
             element_id: a.element_id.clone(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             ancestor_element_instance_key,
             variable_instructions: variable_instructions_from_rest(
                 a.variable_instructions.as_ref(),
@@ -26520,6 +29703,14 @@ fn boot_offheap_reconcile_allowed(raft: bool) -> bool {
     !raft
 }
 
+/// Whether the #933 `retryBackOff` wake re-arm runs at server spawn. Only on the
+/// non-Raft path, where the owned journals are fully recovered before their
+/// actors spawn; under Raft, `raft_bootstrap` restores durable snapshots
+/// asynchronously, so the re-arm runs at the end of the bootstrap instead.
+fn boot_backoff_rearm_at_spawn(raft: bool) -> bool {
+    !raft
+}
+
 /// Refuses a Raft-backed node over the legacy unsegmented journal
 /// (`NANOBPMN_JOURNAL_SEGMENTED=0`, #1405). Raft apply journals each committed
 /// entry as one atomic frame ending in a keyless `RaftEntryApplied` record; the
@@ -26527,6 +29718,47 @@ fn boot_offheap_reconcile_allowed(raft: bool) -> bool {
 /// (`partition_of(max_key)`) and cannot attribute that record to its
 /// partition, so a Raft node on them would lose or cross-apply its applied
 /// index. Fail at startup with an operator-actionable error instead.
+/// Logs and exits with an operator-actionable message when boot-time recovery
+/// fails closed (e.g. [`seglog::UnattributedClusterVariableError`]).
+fn refuse_to_start(e: &dyn std::fmt::Display) -> ! {
+    tracing::error!("{e}");
+    eprintln!("nanobpm: refusing to start: {e}");
+    std::process::exit(2);
+}
+
+/// `true` when this process persists to the untagged legacy journal: a
+/// durable journal is configured AND `NANOBPMN_JOURNAL_SEGMENTED=0`.
+fn legacy_journal_in_use() -> bool {
+    resolve_data_paths().0.is_some() && !seglog::segmented_enabled()
+}
+
+/// Cluster variables are unavailable on the untagged legacy journal
+/// (`NANOBPMN_JOURNAL_SEGMENTED=0`) with more than one partition (#1657, ADR
+/// 0066): that format records no producing partition, so recovery could not
+/// tell which partitions committed an (possibly interrupted) fan-out copy.
+/// Writes fail closed with 503 naming the mode and the remedy (the same status
+/// as the other "cluster variables unavailable" gates); recovery fails closed
+/// via [`seglog::check_cluster_variable_attribution`]. Single-partition legacy,
+/// segmented and in-memory runs are unaffected.
+fn check_cluster_variable_journal_mode(
+    legacy_journal: bool,
+    partitions: u64,
+) -> Result<(), (u16, String)> {
+    if legacy_journal && partitions > 1 {
+        return Err((
+            503,
+            format!(
+                "cluster variables unavailable: the journal is unsegmented \
+                 (NANOBPMN_JOURNAL_SEGMENTED=0) with {partitions} partitions, and that legacy \
+                 format cannot attribute a replicated cluster-variable record to the partition \
+                 that committed it — enable segmented journals (unset \
+                 NANOBPMN_JOURNAL_SEGMENTED or set it to 1) or run single-partition"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn check_raft_journal_mode(raft: bool, segmented: bool) -> Result<(), String> {
     if raft && !segmented {
         return Err("NANOBPMN_RAFT is enabled but the journal is unsegmented \
@@ -27209,6 +30441,11 @@ mod snapshot_health_tick_tests {
         .await;
         let tiny_budget = snapshot_health::HealthThresholds {
             uncompacted_bytes_max: 1,
+            // This tick samples the REAL host volume, so a disk floor would
+            // make the exact-causes assertion below depend on the machine's
+            // free space (`disk_low` on a >90%-full dev disk). The disk guard
+            // has its own synthetic-input tests; isolate this one from it.
+            disk_free_min_percent: 0.0,
             ..thresholds()
         };
         let r = h.report(Instant::now(), &tiny_budget);
@@ -27723,6 +30960,11 @@ async fn main() {
             // serving. Each branch opens its shards (file-backed under `db_path`)
             // and yields the assembled `ReadModel`.
             let partitions = partition_count_from_env();
+            if let Err((_, msg)) =
+                check_cluster_variable_journal_mode(legacy_journal_in_use(), partitions as u64)
+            {
+                tracing::warn!("{msg}");
+            }
             let topology = cluster::Topology::from_env(partitions as u64);
             let mut seg_shared: Option<Arc<seglog::SegShared>> = None;
             // Bounded-disk state for the single-node multi-partition segmented
@@ -27806,30 +31048,19 @@ async fn main() {
                     let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to read journal {}: {e}", journal_path.display())
                     });
-                    let mut pos = shard.exported_position();
-                    if pos > events.len() {
-                        // The store is ahead of the log (truncated/corrupt journal):
-                        // rebuild from scratch.
-                        #[allow(
-                            clippy::expect_used,
-                            reason = "startup/boot recovery: resets the read store during a truncated/corrupt-journal rebuild; failure aborts boot deliberately"
-                        )]
-                        shard.reset().expect("reset read store");
-                        pos = 0;
-                    }
-                    if pos < events.len() {
-                        let refs: Vec<&Event> = events[pos..].iter().collect();
-                        #[allow(
-                            clippy::expect_used,
-                            reason = "startup/boot recovery: catches the read model up from the journal during boot; failure aborts boot deliberately"
-                        )]
-                        shard
-                            .export(&refs)
-                            .expect("catch up read model from journal");
-                    }
+                    // Open the journal (rebuilding the engine from the full log)
+                    // BEFORE the read-model catch-up, so a store migrated from an
+                    // older schema backfills its pending projections from the
+                    // recovered engine state first — the same rule the segmented
+                    // path applies in `catch_up_shard`.
                     let journal = Journal::open(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to open journal {}: {e}", journal_path.display())
                     });
+                    if let Err(e) =
+                        seglog::catch_up_shard_legacy(&shard, &events, journal.engine_state())
+                    {
+                        panic!("failed to catch up the read model from the legacy journal: {e}");
+                    }
                     let recovered = !journal.is_fresh();
                     (vec![journal], recovered, read_model)
                 }
@@ -27900,16 +31131,14 @@ async fn main() {
                         open_sharded_read_model(db_path.as_deref(), &owned, false);
                     rebuild_read_model_legacy(&shards, &events, partitions);
 
-                    // Split the shared log into each partition's own events by the
-                    // owning partition encoded in every event's key. A key whose
-                    // partition is out of range (e.g. a log from a larger partition
-                    // layout) falls back to partition 0 so replay never panics.
-                    let mut per_partition: Vec<Vec<Event>> =
-                        (0..partitions).map(|_| Vec::new()).collect();
-                    for event in events {
-                        let p = event.owning_partition() as usize;
-                        per_partition[p.min(partitions - 1)].push(event);
-                    }
+                    // Split the shared log into each partition's own events (see
+                    // [`demux_legacy_shared_log`] for the routing contract).
+                    let mut per_partition = demux_legacy_shared_log(
+                        events,
+                        (0..partitions as u64).collect(),
+                        partitions as u64,
+                    )
+                    .unwrap_or_else(|e| refuse_to_start(&e));
 
                     let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
                         panic!(
@@ -27917,11 +31146,20 @@ async fn main() {
                             journal_path.display()
                         )
                     });
-                    let recovered = per_partition.iter().any(|evs| !evs.is_empty());
-                    let journals: Vec<Journal> = per_partition
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, evs)| Journal::from_events_shared(i as u64, evs, &shared))
+                    let recovered = per_partition.values().any(|evs| !evs.is_empty());
+                    // Emit the journals in ASCENDING partition-id order:
+                    // `Partitions::new` requires `handles[i]` to own partition
+                    // `i` (`partition.rs`), and the engine actors are spawned
+                    // from this vector in order. Collecting the demux HashMap
+                    // directly would order the journals arbitrarily and route
+                    // every keyed command to the wrong engine (PR #1670
+                    // review).
+                    let journals: Vec<Journal> = (0..partitions as u64)
+                        .map(|p| {
+                            let evs = per_partition.remove(&p).unwrap_or_default();
+                            Journal::from_events_shared(p, evs, &shared)
+                                .unwrap_or_else(|e| refuse_to_start(&e))
+                        })
                         .collect();
                     (journals, recovered, read_model)
                 }
@@ -28002,41 +31240,14 @@ async fn main() {
                     // partition a peer may not own) into every owned shard; other
                     // events to `partition_of(key)`'s shard.
                     rebuild_read_model_legacy(&shards, &events, partitions);
-                    // Demultiplex the node's log into its owned partitions by the
-                    // partition id encoded in every key. Any event for a partition
-                    // this node does not own (a stray from a re-sharded layout) is
-                    // dropped — its owner replays it from its own journal.
-                    //
-                    // `ProcessDeployed` is the exception: a deployment definition is
-                    // partition-agnostic (it mints no instance state and arms no
-                    // subscriptions) and its key belongs to the deployment partition
-                    // (0), which a peer node does not own. So every `ProcessDeployed`
-                    // is replayed into *every* owned partition, reconstructing the
-                    // definition cluster-wide from a single durable copy (see
-                    // `Journal::install_deployment_durable`). Start subscriptions /
-                    // timers keep their partition-0 keys and demux normally, so they
-                    // are only ever rebuilt on the deployment partition's owner.
-                    let mut per_owned: std::collections::HashMap<u64, Vec<Event>> =
-                        owned.iter().map(|p| (*p, Vec::new())).collect();
-                    for event in events {
-                        if matches!(
-                            event,
-                            Event::ProcessDeployed { .. }
-                                | Event::DecisionRequirementsDeployed { .. }
-                                | Event::DecisionDeployed { .. }
-                                | Event::FormDeployed { .. }
-                                | Event::GenericResourceDeployed { .. }
-                        ) {
-                            for bucket in per_owned.values_mut() {
-                                bucket.push(event.clone());
-                            }
-                            continue;
-                        }
-                        let p = event.owning_partition();
-                        if let Some(bucket) = per_owned.get_mut(&p) {
-                            bucket.push(event);
-                        }
-                    }
+                    // Demultiplex the node's log into its owned partitions (see
+                    // [`demux_legacy_shared_log`] for the routing contract; an
+                    // event for a partition this node does not own — a stray from
+                    // a re-sharded layout — is dropped: its owner replays it from
+                    // its own journal).
+                    let mut per_owned =
+                        demux_legacy_shared_log(events, owned.clone(), partitions as u64)
+                            .unwrap_or_else(|e| refuse_to_start(&e));
                     let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
                         panic!(
                             "failed to open shared journal {}: {e}",
@@ -28049,6 +31260,7 @@ async fn main() {
                         .map(|p| {
                             let evs = per_owned.remove(p).unwrap_or_default();
                             Journal::from_events_shared(*p, evs, &shared)
+                                .unwrap_or_else(|e| refuse_to_start(&e))
                         })
                         .collect();
                     (journals, recovered, read_model)
@@ -28567,6 +31779,22 @@ async fn main() {
     // over the Falcon protocol and form the ones it leads. No-op by default.
     server.spawn_raft_bootstrap();
 
+    // #933: re-arm the process-local `retryBackOff` wakes a restart dropped.
+    // The deadline is journaled on the `JobFailed` event (so replay restores
+    // it), but the wake task scheduled when the fail was applied is not — a
+    // long-poll parked across a restart would otherwise sleep until its
+    // request timeout. The owned journals were recovered before their actors
+    // spawned, so their engine state is already authoritative here.
+    // Under Raft the re-arm runs at the END of `raft_bootstrap` instead, after
+    // every hosted member's durable snapshot is restored (a scan here would race
+    // that restore and miss the deadlines it introduces).
+    if boot_backoff_rearm_at_spawn(raft_enabled()) {
+        let server = server.clone();
+        tokio::spawn(async move {
+            server.reschedule_backoff_wakes().await;
+        });
+    }
+
     // #1338: post-recovery GC of orphaned cold/spill rows. Under Raft the sweep
     // runs at the END of `raft_bootstrap` (after every hosted member's durable
     // snapshot is restored — see there). On the non-Raft path there is no
@@ -28706,6 +31934,18 @@ async fn main() {
             }
         });
     }
+
+    // MCP gateway (Camunda parity, issue #1499): a stateless streamable-HTTP
+    // MCP server at `/mcp/cluster` (slice 2; `/mcp/processes` lands in slice 3
+    // on the same seam). On by default; `NANOBPM_MCP_ENABLED=false/0/off/no`
+    // opts out. The mount is a single call so sibling slices extend it without
+    // touching dispatch.
+    // Built before `server` is moved into the REST router below.
+    let mcp_server = server.clone();
+    // The console's read-only MCP processes view (issue #1612) reads the same
+    // tool catalog the `/mcp/processes` server lists.
+    #[cfg(feature = "console")]
+    let mcp_catalog_server = server.clone();
 
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
@@ -28847,6 +32087,26 @@ async fn main() {
             // thresholds are computed once (never in TypeScript). A GET
             // observability read, served in observe (read-only) mode too, gated by
             // the console feature + `console_enabled()` like the other reads.
+            // Processes exposed as MCP tools (issue #1612): the console view of
+            // what `/mcp/processes` offers an AI agent. Built by the MCP module
+            // from the same resolver/descriptor `tools/list` uses (never
+            // re-derived in TypeScript), plus the `NANOBPM_MCP_ENABLED` state.
+            // A GET observability read, served in observe mode too.
+            {
+                let srv = mcp_catalog_server.clone();
+                console = console.route(
+                    "/console/api/mcp/processes",
+                    axum::routing::get(move || {
+                        let srv = srv.clone();
+                        async move {
+                            axum::Json(mcp::processes_tools::console_catalog(
+                                &srv,
+                                mcp::mcp_enabled(),
+                            ))
+                        }
+                    }),
+                );
+            }
             console = console.route(
                 "/console/api/provisioning",
                 axum::routing::get(|| async { axum::Json(crate::provisioning::latest()) }),
@@ -28883,6 +32143,20 @@ async fn main() {
     // secret. Merge it here so `/cluster` is reachable alongside `/falcon`.
     if let Some(cluster_router) = public_cluster_router {
         app = app.merge(cluster_router);
+    }
+
+    // MCP gateway (issue #1499 slice 2). On by default (operator decision,
+    // epic #1499); mounted unless `NANOBPM_MCP_ENABLED` is explicitly falsy
+    // (`false`/`0`/`off`/`no`). The endpoints sit behind the same auth check
+    // as the REST API: `mcp::mcp_router` layers every `/mcp/*` route in
+    // `mcp_auth`, which applies the shared `ApiAuthBasic` credential
+    // extraction the generated `/v2` handlers use (see server/src/mcp/mod.rs).
+    if mcp::mcp_enabled() {
+        app = app.merge(mcp::mcp_router(mcp_server));
+        tracing::info!(
+            "MCP gateway enabled: {}",
+            mcp::mcp_endpoint_paths().join(", ")
+        );
     }
 
     if debug_rest_enabled() {
@@ -28965,14 +32239,32 @@ async fn main() {
                         })
                     }))
                     .await;
+                    // Keep the outbound-dial feature requirement in step with
+                    // replicated state on EVERY node (#1661) — leader or
+                    // follower — so no link opens to an older binary once the
+                    // log carries an entry it cannot decode. One-way, so a
+                    // single cheap check per tick after it first fires.
+                    let _required = tick_server.required_cluster_features().await;
                     futures_util::future::join_all(
                         led.iter()
                             .map(|&p| tick_server.tick_partition_via_raft(p, now, multi_partition)),
                     )
                     .await
                 } else {
+                    // Only a genuinely single-node deployment may journal the
+                    // irreversible flag locally (#1661): an empty Raft registry
+                    // is also what a multi-node node looks like mid-bootstrap,
+                    // and a multi-node non-Raft deployment has no compatibility
+                    // gate here — both keep the legacy host flag instead.
+                    let lenient = local_lenient_reconcile(
+                        tick_server.engine.topology(),
+                        tick_server.activation_policy,
+                    );
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
+                            // Without Raft this journal is the partition's only
+                            // replica: reconcile the lenient flag directly (#1661).
+                            reconcile_lenient_completion_local(journal, lenient, now);
                             let (fired, _commit) = journal.trigger_timers(now);
                             #[allow(
                                 clippy::expect_used,
@@ -29030,7 +32322,9 @@ async fn main() {
                     routable.append(&mut r);
                 }
                 if !routable.is_empty() {
-                    tick_server.drive_subscription_routing(routable).await;
+                    // Clock-tick follow-ups originate from no caller request, so
+                    // there is no `operationReference` to carry (#1600) — `None`.
+                    tick_server.drive_subscription_routing(routable, None).await;
                 }
                 if produced {
                     jobs_available.notify_waiters();
@@ -29771,6 +33065,9 @@ async fn main() {
         println!("  API reference  {base}/swagger");
         println!("  REST API       {base}{}", nanobpm_gateway_rest::BASE_PATH);
         println!("  Metrics        {base}/metrics");
+        for line in mcp::mcp_banner_lines(&base, mcp::mcp_enabled()) {
+            println!("{line}");
+        }
         println!();
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
@@ -30144,6 +33441,7 @@ mod clustered_startup_tests {
             id: "versioned-form".to_string(),
             resource_name: "versioned.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
         let form_v1 = form(r#"{"id":"versioned-form","type":"default","components":[]}"#);
         let form_v2 = form(
@@ -30153,6 +33451,7 @@ mod clustered_startup_tests {
             resource_id: "versioned.md".to_string(),
             resource_name: "versioned.md".to_string(),
             content: content.to_string(),
+            version_tag: None,
         };
         let resource_v1 = resource("# v1");
         let resource_v2 = resource("# v2");
@@ -30263,7 +33562,7 @@ mod clustered_startup_tests {
             .deploy_partition()
             .with(|journal| deployment_replication_events(journal))
             .await;
-        node1.install_replicated_deployment(events).await;
+        node1.install_replicated_deployment(events, None).await;
 
         // Every historical key resolves on EVERY partition the peer owns — the
         // same resolution the deployment partition offers.
@@ -30317,6 +33616,7 @@ mod clustered_startup_tests {
                 resource_id: "r.md".into(),
                 resource_name: "r.md".into(),
                 content: mib.clone(),
+                version_tag: None,
             })
             .collect();
         let total: usize = events
@@ -30377,11 +33677,13 @@ mod clustered_startup_tests {
             id: "legacy-form".to_string(),
             resource_name: "legacy.form".to_string(),
             schema: r#"{"id":"legacy-form","type":"default","components":[]}"#.to_string(),
+            version_tag: None,
         };
         let resource = nanobpmn_engine_core::GenericResource {
             resource_id: "legacy.md".to_string(),
             resource_name: "legacy.md".to_string(),
             content: "# legacy".to_string(),
+            version_tag: None,
         };
         let mut state = node0
             .engine
@@ -30578,6 +33880,117 @@ mod clustered_startup_tests {
             store.try_get_cold(replica_live).unwrap().is_some(),
             "the replica partition's live row survives (the sweep ran after its engine was hosted)"
         );
+    }
+
+    /// #1661: a restarted multi-node leader whose enabling `SetLenientCompletion`
+    /// entry was compacted into its snapshot holds the replicated flag ONLY in
+    /// recovered state. Starting Raft must install the outbound requirement from
+    /// that state before any transfer, so the snapshot can never be streamed to
+    /// a legacy peer ahead of the periodic requirement sync.
+    #[tokio::test]
+    async fn raft_start_installs_feature_requirement_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+        let mut journal = Journal::in_memory();
+        let _applied = journal
+            .apply_command_at(Command::SetLenientCompletion { lenient: true }, 1)
+            .expect("apply");
+        assert!(journal.engine().replicated_lenient_completion());
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(
+            !server.peers.requires_feature(F),
+            "precondition: no tick has synced the requirement yet"
+        );
+        let _transport = server.raft_transport_for_start().await;
+        assert!(
+            server.peers.requires_feature(F),
+            "Raft start must derive the requirement from recovered state"
+        );
+    }
+
+    /// PR #1670 review: a node whose recovered state holds (or ever held) a
+    /// cluster variable must require `cluster-variables-v1` from every peer,
+    /// even after every variable was deleted, so an incompatible binary can
+    /// neither join nor be streamed the retained log/snapshot.
+    #[tokio::test]
+    async fn raft_start_requires_cluster_variables_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_VARIABLES as F;
+        let mut journal = Journal::in_memory();
+        let _ = journal
+            .apply_command_at(
+                Command::CreateClusterVariable {
+                    tenant_id: None,
+                    name: "x".into(),
+                    value: nanobpmn_engine_core::Value::Int(1),
+                    kind: Default::default(),
+                    metadata: Default::default(),
+                    distributed: false,
+                },
+                1,
+            )
+            .expect("create");
+        let _ = journal
+            .apply_command_at(
+                Command::DeleteClusterVariable {
+                    tenant_id: None,
+                    name: "x".into(),
+                    distributed: false,
+                },
+                2,
+            )
+            .expect("delete");
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(!server.peers.requires_feature(F), "precondition");
+        let _transport = server.raft_transport_for_start().await;
+        assert!(server.peers.requires_feature(F));
+        assert_eq!(server.required_cluster_features().await, Some(vec![F]));
+    }
+
+    /// #1661 review finding: the requirement probe runs on the partition-recovery
+    /// path BEFORE a failed actor is replaced, so a DEAD engine actor must yield
+    /// `None` (unknown — join admission fails closed) instead of panicking the
+    /// recovery supervisor via `with()`; and Raft start must not panic either.
+    #[tokio::test]
+    async fn required_features_probe_is_unknown_not_panic_on_a_dead_actor() {
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![Journal::in_memory()], topology);
+        assert_eq!(server.required_cluster_features().await, Some(Vec::new()));
+        let handle = server.engine_handle_for(0).expect("partition 0 hosted");
+        handle.spawn_job(|_journal| panic!("kill the engine actor"));
+        for _ in 0..200 {
+            if !handle.is_alive() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!handle.is_alive(), "precondition: actor is dead");
+        assert_eq!(server.required_cluster_features().await, None);
+        let _transport = server.raft_transport_for_start().await;
     }
 
     /// #1479 review finding: when a hosted partition's recovery FAILS at boot
@@ -31114,7 +34527,7 @@ mod clustered_startup_tests {
 
         // The install cannot complete its durable commit while the rebuild
         // holds the lock: poll it in-line and assert it is still pending.
-        let mut install = Box::pin(node1.install_replicated_deployment(events));
+        let mut install = Box::pin(node1.install_replicated_deployment(events, None));
         use std::future::Future;
         use std::task::Poll;
         let pending =
@@ -31191,7 +34604,7 @@ mod clustered_startup_tests {
         // Installing the broadcast deployment makes the peer able to create.
         let events = demo_deployment_events().await;
         assert!(!events.is_empty());
-        node1.install_replicated_deployment(events).await;
+        node1.install_replicated_deployment(events, None).await;
 
         let (key, completed) = node1
             .create_for_stream(Some("demo".into()), None, Default::default())
@@ -31252,7 +34665,7 @@ mod clustered_startup_tests {
             .deploy_partition()
             .with(|journal| deployment_replication_events(journal))
             .await;
-        node0.broadcast_deployment(&Arc::new(events)).await;
+        node0.broadcast_deployment(&Arc::new(events), None).await;
 
         // The peer can now create the demo (the install rode the wire end-to-end).
         let (_, completed) = node1
@@ -31791,6 +35204,7 @@ mod clustered_startup_tests {
                 String::new(),
                 None,
                 Some("order-7".into()),
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -31896,7 +35310,7 @@ mod clustered_startup_tests {
         );
 
         let (message_key, instance) = node2
-            .correlate_message_cluster("order-placed".into(), String::new(), None, None)
+            .correlate_message_cluster("order-placed".into(), String::new(), None, None, None)
             .await
             .expect("correlation with a valid business id never panics on a no-local-target node");
         assert!(
@@ -31975,7 +35389,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         // Serve both nodes' falcon endpoints on their pre-bound ports.
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
@@ -31999,7 +35415,7 @@ mod clustered_startup_tests {
 
         // Create the instance via node 0; it lands on a node-0 partition (0 or 2)
         // and parks at the catch. The create path routes the Opening to node 1.
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
         let (instance_key, completed) = node0
             .create_for_stream(Some("await-payment".into()), None, variables)
@@ -32016,7 +35432,7 @@ mod clustered_startup_tests {
         // 1), so the publish fans to node 1, which correlates and routes the
         // continuation back to node 0 to advance the parked token.
         let (_message_key, correlated) = node0
-            .correlate_message_cluster("payment-received".into(), order.clone(), None, None)
+            .correlate_message_cluster("payment-received".into(), order.clone(), None, None, None)
             .await
             .expect("correlation with a valid business id");
         assert_eq!(
@@ -32104,7 +35520,7 @@ mod clustered_startup_tests {
 
         // Creating an instance evaluates the decision synchronously: the
         // businessRuleTask has no job to wait on, so the instance completes.
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("lang".to_string(), Value::Str("de".into()));
         let (_instance_key, completed) = server
             .create_for_stream(Some("greeter".into()), None, variables)
@@ -32942,7 +36358,7 @@ mod clustered_startup_tests {
             .await
             .expect("mixed dmn+bpmn deploy succeeds");
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("lang".to_string(), Value::Str("de".into()));
         let (instance_key, completed) = server
             .create_for_stream(Some("greeter".into()), None, variables)
@@ -33039,7 +36455,7 @@ mod clustered_startup_tests {
                 "hallo",
             )]))
             .expect("deploy the DRG");
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert(
             "lang".to_string(),
             nanobpmn_engine_core::Value::Str("de".into()),
@@ -33148,7 +36564,7 @@ mod clustered_startup_tests {
 
     /// Starts a `greeter` instance with `lang`, returning its key.
     async fn start_greeter(server: &ServerImpl, lang: &str) -> u64 {
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("lang".to_string(), Value::Str(lang.into()));
         server
             .create_for_stream(Some("greeter".into()), None, variables)
@@ -33818,6 +37234,405 @@ mod clustered_startup_tests {
         assert_eq!(empty.len(), 3);
     }
 
+    /// Deploys a one-user-task process and starts one instance per `tier`
+    /// value (root variable `tier`), waiting until the read model has
+    /// projected every task and root variable. Returns the instance keys.
+    async fn deploy_tiered_user_task_instances(server: &ServerImpl, tiers: &[&str]) -> Vec<u64> {
+        let def = ProcessBuilder::new("tiered")
+            .start_event("s")
+            .user_task("review")
+            // A same-named task-LOCAL shadow (`tier = "local-<tier>"`) via an
+            // input mapping, so `localVariables` vs `processInstanceVariables`
+            // filters are distinguishable per scope.
+            .with_io(
+                "review",
+                nanobpmn_engine_core::IoMapping {
+                    inputs: vec![nanobpmn_engine_core::Mapping {
+                        source: "=\"local-\" + tier".into(),
+                        target: "tier".into(),
+                    }],
+                    outputs: Vec::new(),
+                },
+            )
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("valid user-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("tiered".to_string(), "tiered.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![def],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let mut instances = Vec::new();
+        for tier in tiers {
+            let mut vars = std::collections::BTreeMap::new();
+            vars.insert(
+                "tier".to_string(),
+                nanobpmn_engine_core::Value::Str((*tier).into()),
+            );
+            let (k, _) = server
+                .create_for_stream(Some("tiered".into()), None, vars)
+                .await
+                .expect("create instance");
+            instances.push(k);
+        }
+        for _ in 0..500 {
+            let root_vars = server
+                .store
+                .variables()
+                .into_iter()
+                .filter(|v| v.name == "tier" && v.scope_key == v.instance_key)
+                .count();
+            let local_vars = server
+                .store
+                .variables()
+                .into_iter()
+                .filter(|v| v.name == "tier" && v.scope_key != v.instance_key)
+                .count();
+            if server.store.user_tasks().len() == tiers.len()
+                && root_vars == tiers.len()
+                && local_vars == tiers.len()
+            {
+                return instances;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("read model never projected the tiered instances");
+    }
+
+    fn tier_filter(tier: &str) -> Option<Vec<models::VariableValueFilterProperty>> {
+        Some(vec![models::VariableValueFilterProperty::new(
+            "tier".to_string(),
+            models::StringFilterProperty::String(format!("\"{tier}\"")),
+        )])
+    }
+
+    /// `ProcessInstanceFilter.$or` (#1293): top-level fields AND any one clause.
+    /// Previously the clause list was silently ignored, so the search — and,
+    /// worse, a mutating batch selection sharing the same filter — returned a
+    /// superset.
+    #[tokio::test]
+    async fn process_instance_search_and_batch_honour_or_clauses() {
+        use apis::process_instance::SearchProcessInstancesResponse as Search;
+        let server = ServerImpl::default();
+        let instances = deploy_tiered_user_task_instances(&server, &["a", "b", "c"]).await;
+        let pik = |k: u64| {
+            Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(k.to_string()),
+                ),
+            )
+        };
+        let by_key = |k: u64| {
+            let mut c = models::ProcessInstanceFilterFields::new();
+            c.process_instance_key = pik(k);
+            c
+        };
+        let by_tier = |t: &str| {
+            let mut c = models::ProcessInstanceFilterFields::new();
+            c.variables = tier_filter(t);
+            c
+        };
+        let or_filter = |top: Option<u64>, clauses: Vec<models::ProcessInstanceFilterFields>| {
+            let mut f = models::ProcessInstanceFilter::new();
+            f.process_instance_key = top.and_then(pik);
+            f.dollar_or = Some(clauses);
+            f
+        };
+        let search = |filter: models::ProcessInstanceFilter| {
+            let server = &server;
+            async move {
+                let q = models::ProcessInstanceSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                };
+                let Search::Status200_TheProcessInstanceSearchResult(r) = server
+                    .search_process_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                let mut ks: Vec<u64> = r
+                    .items
+                    .iter()
+                    .map(|i| i.process_instance_key.0.parse().unwrap())
+                    .collect();
+                ks.sort_unstable();
+                ks
+            }
+        };
+
+        // Any one clause (a key clause, or a variable clause) → the union.
+        let either = or_filter(None, vec![by_key(instances[0]), by_tier("b")]);
+        assert_eq!(
+            search(either.clone()).await,
+            vec![instances[0], instances[1]]
+        );
+        // The batch-selection path shares the matcher: same union, never all.
+        assert_eq!(
+            server.batch_matched_process_instances(&either, BatchHierarchyPolicy::HonourFilters),
+            vec![instances[0], instances[1]]
+        );
+        assert_eq!(
+            server.batch_matched_process_instances(&either, BatchHierarchyPolicy::RootOnly),
+            vec![instances[0], instances[1]]
+        );
+
+        // Top-level fields AND the $or: only the overlap survives.
+        let overlap = or_filter(Some(instances[1]), vec![by_key(instances[0]), by_tier("b")]);
+        assert_eq!(search(overlap).await, vec![instances[1]]);
+
+        // No clause matches → nothing (not the unfiltered superset).
+        assert!(
+            search(or_filter(None, vec![by_tier("zzz")]))
+                .await
+                .is_empty()
+        );
+
+        // An empty $or list places no constraint.
+        assert_eq!(search(or_filter(None, vec![])).await.len(), 3);
+    }
+
+    /// Clause-only cross-entity predicates (#1293 review): the `$or` clause
+    /// schema carries the same element / job / incident fields as the top-level
+    /// filter, so the shared cross-entity index must be built from the UNION of
+    /// the base filter and every clause. A clause-only `elementId` must find
+    /// its instances (an index built from the base alone is empty, so the
+    /// clause misses them); a clause-only `hasRetriesLeft: false` must still
+    /// EXCLUDE instances whose failed jobs have retries (against an empty index
+    /// every instance reads `false`, silently broadening a mutating batch).
+    #[tokio::test]
+    async fn process_instance_search_and_batch_honour_clause_only_cross_entity_predicates() {
+        use apis::process_instance::SearchProcessInstancesResponse as Search;
+        use nanobpmn_engine_core::Event;
+        let created = |instance_key: u64| Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::BTreeMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let activated =
+            |instance_key: u64, element_instance_key: u64, id: &str| Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id: id.into(),
+                scope: 0,
+            };
+        let job_created = |job_key: u64, instance_key: u64| Event::JobCreated {
+            job_key,
+            instance_key,
+            element_instance_key: job_key + 1,
+            element_id: "work".to_string(),
+            job_type: "t".to_string(),
+            created_at: 1,
+            priority: 0,
+            retries: 3,
+            secret_provenance: Vec::new(),
+        };
+        let job_failed = |job_key: u64, instance_key: u64, retries: i32| Event::JobFailed {
+            job_key,
+            instance_key,
+            retries,
+            worker: None,
+            error_message: Some("boom".to_string()),
+            retry_backoff_until: None,
+        };
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1),
+                &created(2),
+                &created(3),
+                &activated(1, 11, "review"),
+                &activated(2, 21, "approve"),
+                // Instance 1 has a failed job WITH retries left; instance 2's
+                // failed job is terminal.
+                &job_created(111, 1),
+                &job_failed(111, 1, 2),
+                &job_created(222, 2),
+                &job_failed(222, 2, 0),
+            ])
+            .unwrap();
+        let s = |v: &str| models::StringFilterProperty::String(v.to_string());
+        let search = |filter: models::ProcessInstanceFilter| {
+            let server = &server;
+            async move {
+                let q = models::ProcessInstanceSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                };
+                let Search::Status200_TheProcessInstanceSearchResult(r) = server
+                    .search_process_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                let mut ks: Vec<u64> = r
+                    .items
+                    .iter()
+                    .map(|i| i.process_instance_key.0.parse().unwrap())
+                    .collect();
+                ks.sort_unstable();
+                ks
+            }
+        };
+        let clause = |build: &dyn Fn(&mut models::ProcessInstanceFilterFields)| {
+            let mut c = models::ProcessInstanceFilterFields::new();
+            build(&mut c);
+            c
+        };
+        let or_filter = |clauses: Vec<models::ProcessInstanceFilterFields>| {
+            let mut f = models::ProcessInstanceFilter::new();
+            f.dollar_or = Some(clauses);
+            f
+        };
+
+        // Clause-only `elementId`: the clause matches only the instance
+        // carrying that element — on the search path AND the batch path.
+        let by_element = or_filter(vec![
+            clause(&|c| c.element_id = Some(s("review"))),
+            clause(&|c| c.element_id = Some(s("approve"))),
+        ]);
+        assert_eq!(search(by_element.clone()).await, vec![1, 2]);
+        for policy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
+            assert_eq!(
+                server.batch_matched_process_instances(&by_element, policy),
+                vec![1, 2],
+                "clause-only elementId narrows the batch ({policy:?})"
+            );
+        }
+        // A single clause-only `elementId` finds its one instance (never the
+        // empty-index miss).
+        let one = or_filter(vec![clause(&|c| c.element_id = Some(s("review")))]);
+        assert_eq!(search(one.clone()).await, vec![1]);
+        assert_eq!(
+            server.batch_matched_process_instances(&one, BatchHierarchyPolicy::HonourFilters),
+            vec![1]
+        );
+
+        // Clause-only `hasRetriesLeft`: `true` selects only instance 1...
+        let retries = or_filter(vec![clause(&|c| c.has_retries_left = Some(true))]);
+        assert_eq!(search(retries.clone()).await, vec![1]);
+        assert_eq!(
+            server.batch_matched_process_instances(&retries, BatchHierarchyPolicy::HonourFilters),
+            vec![1]
+        );
+        // ...and `false` must EXCLUDE instance 1 (its failed job still has
+        // retries) rather than matching every instance against an empty index.
+        let no_retries = or_filter(vec![clause(&|c| c.has_retries_left = Some(false))]);
+        assert_eq!(search(no_retries.clone()).await, vec![2, 3]);
+        assert_eq!(
+            server
+                .batch_matched_process_instances(&no_retries, BatchHierarchyPolicy::HonourFilters),
+            vec![2, 3],
+            "clause-only hasRetriesLeft=false must not broaden the batch"
+        );
+
+        // Clause-only `errorMessage`: existential over job/incident messages.
+        let errored = or_filter(vec![clause(&|c| c.error_message = Some(s("boom")))]);
+        assert_eq!(search(errored.clone()).await, vec![1, 2]);
+        assert_eq!(
+            server.batch_matched_process_instances(&errored, BatchHierarchyPolicy::HonourFilters),
+            vec![1, 2]
+        );
+    }
+
+    /// `UserTaskFilter.processInstanceVariables` / `localVariables` (#1293):
+    /// matched via a variable-store join, at top level and inside `$or`.
+    #[tokio::test]
+    async fn user_task_search_honours_variable_filters() {
+        use apis::user_task::SearchUserTasksResponse as Search;
+        let server = ServerImpl::default();
+        let instances = deploy_tiered_user_task_instances(&server, &["a", "b", "c"]).await;
+        let search = |filter: models::UserTaskFilter| {
+            let server = &server;
+            async move {
+                let q = models::UserTaskSearchQuery {
+                    sort: None,
+                    page: None,
+                    filter: Some(filter),
+                };
+                let Search::Status200_TheUserTaskSearchResult(r) =
+                    server.search_user_tasks_impl(&Some(q)).await.unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                let mut ks: Vec<u64> = r
+                    .items
+                    .iter()
+                    .map(|t| t.process_instance_key.0.parse().unwrap())
+                    .collect();
+                ks.sort_unstable();
+                ks
+            }
+        };
+
+        let mut top = models::UserTaskFilter::new();
+        top.process_instance_variables = tier_filter("b");
+        assert_eq!(search(top).await, vec![instances[1]]);
+
+        let clause = |t: &str| {
+            let mut c = models::UserTaskFilterFields::new();
+            c.process_instance_variables = tier_filter(t);
+            c
+        };
+        let mut either = models::UserTaskFilter::new();
+        either.dollar_or = Some(vec![clause("a"), clause("c")]);
+        assert_eq!(search(either).await, vec![instances[0], instances[2]]);
+
+        // The root `tier` value is not a task-local value (the local scope holds
+        // `"local-<tier>"`), so a `localVariables` filter on it excludes every
+        // task instead of being ignored.
+        let mut local = models::UserTaskFilter::new();
+        local.local_variables = tier_filter("a");
+        assert!(search(local).await.is_empty());
+
+        // Positive case: each task carries a task-LOCAL `tier = "local-<tier>"`
+        // (input mapping) shadowing its root `tier`, so only the owning task
+        // matches — at top level and inside `$or`.
+        let mut local_top = models::UserTaskFilter::new();
+        local_top.local_variables = tier_filter("local-b");
+        assert_eq!(search(local_top).await, vec![instances[1]]);
+        // The root value is NOT visible through localVariables...
+        let mut local_root = models::UserTaskFilter::new();
+        local_root.local_variables = tier_filter("b");
+        assert!(search(local_root).await.is_empty());
+        // ...and the local value is NOT visible through processInstanceVariables.
+        let mut root_local = models::UserTaskFilter::new();
+        root_local.process_instance_variables = tier_filter("local-b");
+        assert!(search(root_local).await.is_empty());
+        let local_clause = |t: &str| {
+            let mut c = models::UserTaskFilterFields::new();
+            c.local_variables = tier_filter(t);
+            c
+        };
+        let mut local_or = models::UserTaskFilter::new();
+        local_or.dollar_or = Some(vec![local_clause("zzz"), local_clause("local-b")]);
+        assert_eq!(search(local_or).await, vec![instances[1]]);
+    }
+
     #[tokio::test]
     async fn user_task_element_instance_is_queryable_via_search_and_get() {
         // Element-instance parity: the engine's per-element lifecycle events are
@@ -33855,7 +37670,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("approval".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the approval instance");
@@ -33967,7 +37782,7 @@ mod clustered_startup_tests {
                 .await
                 .expect("create charger");
         }
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -34069,11 +37884,11 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("charger".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create charger");
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         let (waiter_key, _) = server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -34308,7 +38123,7 @@ mod clustered_startup_tests {
         let mut keys = std::collections::HashMap::new();
         for id in ["timed", "signalled", "gated"] {
             // `approved = false` keeps the conditional catch parked.
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert("approved".to_string(), Value::Bool(false));
             let (key, _) = server
                 .create_for_stream(Some(id.into()), None, vars)
@@ -34412,7 +38227,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("approval".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create approval");
@@ -34572,7 +38387,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("charger".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create charger");
@@ -34649,7 +38464,7 @@ mod clustered_startup_tests {
             .await
             .expect("deploy succeeds");
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         let (waiter_key, _) = server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -34837,9 +38652,13 @@ mod clustered_startup_tests {
             "lastUpdatedDate after 2100 excludes"
         );
 
-        // Fields Nano does not project (processDefinitionName / toolName /
+        // Fields Nano does not project (processDefinitionName /
         // inboundConnectorType) are treated as absent: an equality filter yields
         // no rows (not silently ignored) while `$exists: false` matches.
+        // (`toolName` is no longer in this list — it is projected for
+        // START_EVENT subscriptions, #1499; this process deploys no message
+        // start event, so its PROCESS_EVENT row still carries no tool name and
+        // behaves like an absent field here.)
         for field_setter in [
             |f: &mut models::MessageSubscriptionFilter, v: models::StringFilterProperty| {
                 f.process_definition_name = Some(v)
@@ -34876,6 +38695,415 @@ mod clustered_startup_tests {
                 "$exists:false matches an unprojected field"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn search_message_start_subscriptions_have_unique_keys_and_sort_by_tool_name() {
+        // #1499: a definition with several message start events yields one
+        // START_EVENT row per start event, each with its own
+        // `messageSubscriptionKey` (cursor pagination must not loop), and the
+        // advertised `toolName` sort orders by tool name, not by key.
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+        let multi = ProcessBuilder::new("multi")
+            .message_start_event("s1", "m1")
+            .message_start_event("s2", "m2")
+            .end_event("e")
+            .connect("s1", "e")
+            .connect("s2", "e")
+            .build()
+            .expect("valid two-start process");
+        let tool = |id: &str, name: &str| {
+            let mut props = std::collections::BTreeMap::new();
+            props.insert("io.camunda.tool:name".to_string(), name.to_string());
+            ProcessBuilder::new(id)
+                .message_start_event("s", format!("{id}-msg"))
+                .end_event("e")
+                .connect("s", "e")
+                .with_properties("s", props)
+                .build()
+                .expect("valid tool process")
+        };
+        let mut names = std::collections::HashMap::new();
+        for id in ["multi", "zeta-proc", "alpha-proc"] {
+            names.insert(id.to_string(), format!("{id}.bpmn"));
+        }
+        // `zeta` deploys before `alpha`, so key order differs from name order.
+        server
+            .deploy_resources_locally(
+                vec![
+                    multi,
+                    tool("zeta-proc", "zeta"),
+                    tool("alpha-proc", "alpha"),
+                ],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let search = |q: models::MessageSubscriptionSearchQuery| {
+            let server = &server;
+            async move {
+                let Resp::Status200_TheMessageSubscriptionSearchResult(r) = server
+                    .search_message_subscriptions_impl(&Some(q))
+                    .await
+                    .expect("search returns")
+                else {
+                    panic!("expected a 200 result");
+                };
+                r
+            }
+        };
+        let all = || models::MessageSubscriptionSearchQuery {
+            page: None,
+            sort: None,
+            filter: None,
+        };
+        for _ in 0..200 {
+            if search(all()).await.items.len() == 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(search(all()).await.items.len(), 4);
+
+        // Page the two `multi` start subscriptions one at a time.
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..4 {
+            let r = search(models::MessageSubscriptionSearchQuery {
+                page: Some(models::SearchQueryPageRequest::CursorForwardPagination(
+                    models::CursorForwardPagination {
+                        after: after.take(),
+                        limit: Some(1),
+                    },
+                )),
+                sort: None,
+                filter: Some(models::MessageSubscriptionFilter {
+                    process_definition_id: Some(models::StringFilterProperty::String(
+                        "multi".to_string(),
+                    )),
+                    ..models::MessageSubscriptionFilter::new()
+                }),
+            })
+            .await;
+            if r.items.is_empty() {
+                break;
+            }
+            seen.extend(r.items.iter().map(|i| i.message_name.clone()));
+            after = match r.page.end_cursor {
+                types::Nullable::Present(c) => Some(c),
+                types::Nullable::Null => None,
+            };
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["m1".to_string(), "m2".to_string()]);
+
+        // Sort by toolName ascending: alpha before zeta despite key order.
+        let r = search(models::MessageSubscriptionSearchQuery {
+            page: None,
+            sort: Some(vec![models::MessageSubscriptionSearchQuerySortRequest {
+                field: "toolName".to_string(),
+                order: Some(models::SortOrderEnum::Asc),
+            }]),
+            filter: None,
+        })
+        .await;
+        let tools: Vec<String> = r
+            .items
+            .into_iter()
+            .filter_map(|i| match i.tool_name {
+                types::Nullable::Present(t) => Some(t),
+                types::Nullable::Null => None,
+            })
+            .collect();
+        assert_eq!(tools, vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn search_message_subscriptions_projects_tool_name_on_start_events() {
+        // MCP gateway parity (#1499): a process whose message start event
+        // carries `zeebe:properties` tool markers deploys a definition-scoped
+        // START_EVENT subscription whose `toolName` / `toolProperties` are
+        // projected from `io.camunda.tool:*`, and the `toolName` filter honours
+        // the Zeebe semantics (equality / `$like` on an absent value match no
+        // rows; `$exists: false` matches rows with no tool name; `$exists: true`
+        // matches rows that have one).
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+
+        // A tool-marked message start process (the vendored Camunda e2e
+        // fixture), a plain message start process (no tool markers), and an
+        // instance-scoped catch process (a PROCESS_EVENT row once running).
+        let tool_xml =
+            include_str!("../../engine-core/tests/fixtures/mcp-process-with-inputs.bpmn");
+        let tool = parse_bpmn(tool_xml).expect("tool fixture parses");
+        let plain = ProcessBuilder::new("plain-start")
+            .message_start_event("s", "plain-message")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid plain message-start process");
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("mcpProcessWithInputs".to_string(), "mcp.bpmn".to_string());
+        names.insert("plain-start".to_string(), "plain.bpmn".to_string());
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        let mut defs = tool;
+        defs.push(plain);
+        defs.push(waiter);
+        server
+            .deploy_resources_locally(
+                defs,
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        // Start an instance of the waiter so a PROCESS_EVENT row exists too.
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
+        server
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("create waiter");
+
+        // Poll until all three rows are projected (two START_EVENT + one
+        // PROCESS_EVENT).
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            let resp = server
+                .search_message_subscriptions_impl(&None)
+                .await
+                .expect("search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            if result.items.len() == 3 {
+                items = result.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            items.len(),
+            3,
+            "two START_EVENT rows plus one PROCESS_EVENT row are projected"
+        );
+
+        // The tool-marked START_EVENT row carries the full tool metadata.
+        let tool_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "mcpProcessWithInputs")
+            .expect("the tool process's start subscription is projected");
+        assert_eq!(
+            tool_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::StartEvent
+        );
+        assert_eq!(tool_row.element_id, "StartEvent_1");
+        assert_eq!(tool_row.message_name, "mcp-process-with-inputs");
+        assert_eq!(
+            tool_row.tool_name,
+            types::Nullable::Present("mcp-process-with-inputs".to_string())
+        );
+        assert_eq!(
+            tool_row.tool_properties.get("io.camunda.tool:input_1_name"),
+            Some(&"firstName".to_string())
+        );
+        assert_eq!(tool_row.tool_properties.len(), 9);
+        // A definition-scoped subscription is not bound to an instance.
+        assert_eq!(tool_row.process_instance_key, types::Nullable::Null);
+        assert_eq!(tool_row.element_instance_key, types::Nullable::Null);
+        assert_eq!(tool_row.correlation_key, types::Nullable::Null);
+        assert_eq!(
+            tool_row.message_subscription_state,
+            models::MessageSubscriptionStateEnum::Created
+        );
+        assert_eq!(
+            tool_row.process_definition_version,
+            types::Nullable::Present(1)
+        );
+
+        // The plain message start row is a START_EVENT with no tool metadata.
+        let plain_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "plain-start")
+            .expect("the plain process's start subscription is projected");
+        assert_eq!(
+            plain_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::StartEvent
+        );
+        assert_eq!(plain_row.tool_name, types::Nullable::Null);
+        assert!(plain_row.tool_properties.is_empty());
+
+        // The instance-scoped catch row is a PROCESS_EVENT with no tool metadata.
+        let catch_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "waiter")
+            .expect("the waiter's catch subscription is projected");
+        assert_eq!(
+            catch_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::ProcessEvent
+        );
+        assert_eq!(catch_row.tool_name, types::Nullable::Null);
+        assert!(matches!(
+            catch_row.process_instance_key,
+            types::Nullable::Present(_)
+        ));
+
+        // Helper: run one filter and return the matched processDefinitionIds.
+        async fn matched_ids(
+            server: &ServerImpl,
+            filter: models::MessageSubscriptionFilter,
+        ) -> Vec<String> {
+            let resp = server
+                .search_message_subscriptions_impl(&Some(models::MessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                }))
+                .await
+                .expect("filtered search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            let mut ids: Vec<String> = result
+                .items
+                .into_iter()
+                .map(|i| i.process_definition_id)
+                .collect();
+            ids.sort();
+            ids
+        }
+        let tool_filter = |v: models::StringFilterProperty| models::MessageSubscriptionFilter {
+            tool_name: Some(v),
+            ..models::MessageSubscriptionFilter::new()
+        };
+
+        // toolName equality matches only the tool-marked START_EVENT row.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::String(
+                    "mcp-process-with-inputs".to_string()
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // Equality on a value no row carries matches nothing.
+        assert!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::String("nope".to_string()))
+            )
+            .await
+            .is_empty(),
+            "equality on an absent tool name matches no rows"
+        );
+        // `$like` behaves like equality w.r.t. absent values.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_like: Some("mcp-process-*".to_string()),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // `$exists: true` matches only the row that has a tool name.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(true),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // `$exists: false` matches every row without a tool name.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["plain-start".to_string(), "waiter".to_string()]
+        );
+
+        // messageSubscriptionType filters select each side.
+        let type_filter =
+            |t: models::MessageSubscriptionTypeEnum| models::MessageSubscriptionFilter {
+                message_subscription_type: Some(
+                    models::MessageSubscriptionTypeFilterProperty::MessageSubscriptionTypeEnum(t),
+                ),
+                ..models::MessageSubscriptionFilter::new()
+            };
+        assert_eq!(
+            matched_ids(
+                &server,
+                type_filter(models::MessageSubscriptionTypeEnum::StartEvent)
+            )
+            .await,
+            vec![
+                "mcpProcessWithInputs".to_string(),
+                "plain-start".to_string()
+            ]
+        );
+        assert_eq!(
+            matched_ids(
+                &server,
+                type_filter(models::MessageSubscriptionTypeEnum::ProcessEvent)
+            )
+            .await,
+            vec!["waiter".to_string()]
+        );
+
+        // Correlating the tool message starts a new instance of the tool
+        // process (the subscription mints instances; the START_EVENT row stays).
+        let correlate = server
+            .correlate_message_impl(&models::MessageCorrelationRequest {
+                business_id: None,
+                name: "mcp-process-with-inputs".to_string(),
+                correlation_key: None,
+                variables: None,
+                tenant_id: None,
+            })
+            .await
+            .expect("correlate returns");
+        assert!(
+            matches!(
+                correlate,
+                apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(_)
+            ),
+            "the tool message starts an instance"
+        );
     }
 
     #[tokio::test]
@@ -34917,7 +39145,7 @@ mod clustered_startup_tests {
             .await
             .expect("deploy succeeds");
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
         let (waiter_key, _) = server
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -35229,7 +39457,7 @@ mod clustered_startup_tests {
             .await
             .expect("deploy succeeds");
         let (instance_key, _) = server
-            .create_for_stream(Some("fork".into()), None, std::collections::HashMap::new())
+            .create_for_stream(Some("fork".into()), None, std::collections::BTreeMap::new())
             .await
             .expect("create the fork instance");
 
@@ -35367,7 +39595,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("failer".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the failer instance");
@@ -35508,7 +39736,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("scripted-fail".into()),
                 None,
-                std::collections::HashMap::from([("n".to_string(), Value::Str("oops".into()))]),
+                std::collections::BTreeMap::from([("n".to_string(), Value::Str("oops".into()))]),
             )
             .await
             .expect("create the instance");
@@ -35617,7 +39845,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("job-failer".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -35745,7 +39973,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("waits-forever".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -35864,7 +40092,7 @@ mod clustered_startup_tests {
         let mut ineligible = 0u64;
         for id in ["order-v1", "order-v1", "audit-v1"] {
             let (key, _) = server
-                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .create_for_stream(Some(id.into()), None, std::collections::BTreeMap::new())
                 .await
                 .expect("create instance");
             if id == "audit-v1" {
@@ -36093,7 +40321,7 @@ mod clustered_startup_tests {
         let mut ineligible = 0u64;
         for id in ["move-me", "move-me", "other"] {
             let (key, _) = server
-                .create_for_stream(Some(id.into()), None, std::collections::HashMap::new())
+                .create_for_stream(Some(id.into()), None, std::collections::BTreeMap::new())
                 .await
                 .expect("create instance");
             if id == "other" {
@@ -36382,7 +40610,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("order-v1".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -36500,7 +40728,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("modify-me".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -37055,6 +41283,7 @@ mod clustered_startup_tests {
                             resource_id: "agent-prompt.md".to_string(),
                             resource_name: "agent-prompt.md".to_string(),
                             content: content.to_string(),
+                            version_tag: None,
                         }],
                         "<default>",
                     )
@@ -37242,6 +41471,7 @@ mod clustered_startup_tests {
             id: "greeting-form".to_string(),
             resource_name: "greeting.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
         let (result, _events) = server
             .deploy_resources_locally_with_forms(
@@ -37305,6 +41535,7 @@ mod clustered_startup_tests {
                     id: "greeting-form".to_string(),
                     resource_name: "greeting.form".to_string(),
                     schema: schema_v2.to_string(),
+                    version_tag: None,
                 }],
                 Vec::new(),
                 "<default>",
@@ -37380,6 +41611,80 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test]
+    async fn a_mixed_deployment_stamps_one_deployment_key_on_every_resource() {
+        // #1193 review: one HTTP deployment (process + form + generic resource)
+        // must be ONE engine deployment. The mixed path used to issue a
+        // command per kind, each minting its own deployment key, so a
+        // co-deployed `bindingType: deployment` form incidented and a
+        // co-deployed linked resource vanished from the worker header.
+        let server = ServerImpl::default();
+        let bpmn = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bundle" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="bundle-form" bindingType="deployment" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let proc = parse_bpmn(bpmn).expect("valid BPMN").remove(0);
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("bundle".to_string(), "bundle.bpmn".to_string());
+        let (_result, events) = server
+            .deploy_resources_locally_with_forms(
+                vec![proc],
+                &proc_names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![nanobpmn_engine_core::FormResource {
+                    id: "bundle-form".to_string(),
+                    resource_name: "bundle-form.form".to_string(),
+                    schema: r#"{"id":"bundle-form","components":[]}"#.to_string(),
+                    version_tag: None,
+                }],
+                vec![nanobpmn_engine_core::GenericResource {
+                    resource_id: "policy.md".to_string(),
+                    resource_name: "policy.md".to_string(),
+                    content: "# policy".to_string(),
+                    version_tag: None,
+                }],
+                "<default>",
+            )
+            .await
+            .expect("mixed deploy succeeds");
+        let keys: std::collections::BTreeSet<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::DeploymentCreated { deployment_key }
+                | Event::ProcessDeployed { deployment_key, .. }
+                | Event::FormDeployed { deployment_key, .. }
+                | Event::GenericResourceDeployed { deployment_key, .. } => Some(*deployment_key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "every co-deployed resource shares one deployment key: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::DeploymentCreated { .. }))
+                .count(),
+            1,
+            "one deployment, one DeploymentCreated"
+        );
+    }
+
+    #[tokio::test]
     async fn a_user_task_form_definition_surfaces_form_key_and_external_reference_in_v2_search() {
         // End-to-end form linkage (issue #795): a `userTask` declaring a
         // `<zeebe:formDefinition formId="…"/>` must resolve that id to the
@@ -37395,6 +41700,7 @@ mod clustered_startup_tests {
             id: "feature-escalation".to_string(),
             resource_name: "feature-escalation.form".to_string(),
             schema: schema.to_string(),
+            version_tag: None,
         };
 
         // A process with two user tasks: one bound to the embedded form by id,
@@ -37455,7 +41761,7 @@ mod clustered_startup_tests {
             .create_for_stream(
                 Some("feature".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the feature instance");
@@ -37605,6 +41911,7 @@ mod clustered_startup_tests {
             id: id.to_string(),
             resource_name: format!("{id}.form"),
             schema: format!(r#"{{"id":"{id}","type":"default","components":[]}}"#),
+            version_tag: None,
         };
 
         server
@@ -37795,7 +42102,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         // Serve both nodes' falcon endpoints on their pre-bound ports.
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
@@ -37812,7 +42121,13 @@ mod clustered_startup_tests {
         // instance round-robin across all four partitions (1 & 3 on node 1).
         for i in 0..16u32 {
             node0
-                .correlate_message_cluster("order-placed".into(), format!("order-{i}"), None, None)
+                .correlate_message_cluster(
+                    "order-placed".into(),
+                    format!("order-{i}"),
+                    None,
+                    None,
+                    None,
+                )
                 .await
                 .expect("correlation with a valid business id");
         }
@@ -38544,7 +42859,7 @@ mod clustered_startup_tests {
         // node 1 owns no deployment partition, so install the demo over the wire
         // path (mirrors the centralized broadcast) before it can create.
         node1
-            .install_replicated_deployment(demo_deployment_events().await)
+            .install_replicated_deployment(demo_deployment_events().await, None)
             .await;
         let node1_url = serve_node(&node1).await;
 
@@ -39101,6 +43416,255 @@ mod clustered_startup_tests {
         part0.raft.shutdown().await.ok();
     }
 
+    /// Serializes the tests that raise `nanobpm_raft_divergence_total` for
+    /// (p0, node 1) — see `a_diverged_follower_fail_stops_and_resyncs_from_the_leader`.
+    static DIVERGENCE_METRIC_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// ADR 0066 slice 5 (#1664) false-positive guard: no hosted member of
+    /// partitions `0..partitions` on `nodes` fail-stopped on a divergence, and
+    /// every two members that applied the same index carry the same chain.
+    fn assert_no_divergence(nodes: &[&ServerImpl], partitions: u64) {
+        for p in 0..partitions {
+            let mut by_index: std::collections::BTreeMap<u64, crate::raft::DigestClaim> =
+                std::collections::BTreeMap::new();
+            for (n, node) in nodes.iter().enumerate() {
+                let Some(part) = node.raft_registry().get(p) else {
+                    continue;
+                };
+                assert!(
+                    part.divergence().is_none(),
+                    "false-positive divergence on node {n} p{p}: {:?}",
+                    part.divergence()
+                );
+                if let Some(claim) = part.digest_claim() {
+                    let seen = by_index.entry(claim.index).or_insert(claim);
+                    if seen.chain.comparable(&claim.chain) {
+                        assert_eq!(
+                            *seen, claim,
+                            "node {n} p{p} chain disagrees at {}",
+                            claim.index
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Waits (bounded) until node's p0 member has applied at least the
+    /// leader's current applied index; returns whether it did.
+    async fn wait_follower_applied(node: &ServerImpl, leader: &crate::raft::RaftPartition) -> bool {
+        let target = leader
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        for _ in 0..500 {
+            let idx = node
+                .raft_registry()
+                .get(0)
+                .and_then(|p| p.raft.metrics().borrow().last_applied.map(|l| l.index))
+                .unwrap_or(0);
+            if idx >= target {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn deploy_cmd(id: &str) -> Command {
+        Command::DeployProcess(
+            ProcessBuilder::new(id)
+                .start_event("s")
+                .end_event("e")
+                .connect("s", "e")
+                .build()
+                .expect("valid process"),
+        )
+    }
+
+    /// ADR 0066 slice 5 (#1664): a follower whose state DIVERGES from the
+    /// leader's is detected at the next digest point, fail-stops its apply
+    /// (never continuing on the diverged state), raises the operator metric,
+    /// and — via the recovery supervisor — resyncs from the leader as a fresh
+    /// receiver, after which its chain matches the leader's again (no false
+    /// positive after the resync).
+    #[tokio::test]
+    async fn a_diverged_follower_fail_stops_and_resyncs_from_the_leader() {
+        // The divergence metric is process-global per (partition, node):
+        // serialize every test that trips it so the exact-delta assertion
+        // never counts a concurrent test's increment.
+        let _metric = DIVERGENCE_METRIC_TESTS.lock().await;
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
+        part0
+            .propose(deploy_cmd("d-1"), 1_000)
+            .await
+            .expect("deploy 1");
+        assert!(
+            wait_follower_applied(&node1, &part0).await,
+            "follower catches up"
+        );
+        // Healthy replicas agree on the chain: no false positive so far.
+        assert!(part1.divergence().is_none());
+        assert_eq!(part0.digest_claim(), part1.digest_claim(), "chains agree");
+        let before = nano_server_storage::metrics::raft_divergence_count(0, 1);
+
+        // Inject the divergence on the FOLLOWER only (test hook): its chain
+        // now differs from the leader's from the next entry on.
+        part1
+            .sm_engine()
+            .with(|journal| journal.perturb_chain_for_test())
+            .await;
+        // Entry A folds from the perturbed chain on the follower; entry B
+        // carries the leader's claim for A, so the follower detects it there.
+        part0
+            .propose(deploy_cmd("d-2"), 2_000)
+            .await
+            .expect("deploy A");
+        part0
+            .propose(deploy_cmd("d-3"), 3_000)
+            .await
+            .expect("deploy B");
+
+        let mut stopped = false;
+        for _ in 0..500 {
+            if part1.is_shutdown() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "the diverged follower must fail-stop its apply");
+        let d = part1.divergence().expect("divergence latched");
+        assert!(d.detected_at > d.index, "detected at a later entry: {d}");
+        assert_ne!(d.leader, d.local);
+        assert_eq!(
+            nano_server_storage::metrics::raft_divergence_count(0, 1),
+            before + 1,
+            "the operator-visible divergence metric is raised"
+        );
+        assert!(
+            part0.divergence().is_none(),
+            "the leader never diverges on its own claims"
+        );
+
+        // Resync: the supervisor rebuilds the member fresh from the leader.
+        let recovered = node1.recover_shutdown_partitions_once().await;
+        assert!(
+            recovered.contains(&0),
+            "diverged partition is resynced: {recovered:?}"
+        );
+        let rebuilt = node1.raft_registry().get(0).expect("node 1 hosts p0");
+        assert!(!rebuilt.is_shutdown());
+        assert!(
+            rebuilt.divergence().is_none(),
+            "the resynced member starts clean"
+        );
+
+        part0
+            .propose(deploy_cmd("d-4"), 4_000)
+            .await
+            .expect("deploy after resync");
+        part0
+            .propose(deploy_cmd("d-5"), 5_000)
+            .await
+            .expect("deploy after resync");
+        assert!(
+            wait_follower_applied(&node1, &part0).await,
+            "resynced follower catches up"
+        );
+        let rebuilt = node1.raft_registry().get(0).expect("node 1 hosts p0");
+        assert!(!rebuilt.is_shutdown(), "no false positive after the resync");
+        assert!(rebuilt.divergence().is_none());
+        assert_eq!(
+            part0.digest_claim(),
+            rebuilt.digest_claim(),
+            "the resynced follower's chain matches the leader's"
+        );
+
+        part0.raft.shutdown().await.ok();
+        rebuilt.raft.shutdown().await.ok();
+    }
+
+    /// #1664 review: a diverged follower is never PROMOTED (e.g. by the
+    /// leader-durable recovery tick after its incumbent vanishes) — promotion
+    /// would rebuild from its own diverged lineage and drop the latch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_diverged_follower_is_never_promoted() {
+        // Latch a divergence on the OWNING node's member with a still-healthy
+        // engine: without the promotion guard, `retire_and_resolve_engine`
+        // would carry that engine into a fresh leader with no latch.
+        let (node0, _node1, part0, _part1) =
+            two_node_p0_group(ReplicationMode::LeaderDurable).await;
+        part0
+            .propose(deploy_cmd("d-1"), 1_000)
+            .await
+            .expect("deploy 1");
+        let chain = nano_server_storage::digest::ChainDigest::genesis(0);
+        part0.latch_divergence_for_test(crate::raft::Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain,
+        });
+        part0.raft.shutdown().await.ok();
+
+        node0.promote_partition(0, 1).await;
+
+        let cur = node0
+            .raft_registry()
+            .get(0)
+            .expect("partition still registered");
+        assert!(
+            Arc::ptr_eq(&cur, &part0) && cur.divergence().is_some(),
+            "promotion must not replace the latched, fail-stopped core"
+        );
+        assert!(!node0.i_lead_raft(0), "a diverged member must never lead");
+    }
+
+    /// #1664 review: a diverged quorum VOTER is never resynced onto an empty
+    /// volatile log (that would hand the group an amnesiac voter that lost its
+    /// persisted vote/log); recovery fails closed and leaves it down.
+    #[tokio::test]
+    async fn a_diverged_quorum_voter_is_not_rebuilt_empty() {
+        // The divergence metric is process-global per (partition, node):
+        // serialize every test that trips it so the exact-delta assertion
+        // never counts a concurrent test's increment.
+        let _metric = DIVERGENCE_METRIC_TESTS.lock().await;
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::Quorum).await;
+        part0
+            .propose(deploy_cmd("q-1"), 1_000)
+            .await
+            .expect("deploy 1");
+        assert!(wait_follower_applied(&node1, &part0).await, "caught up");
+        part1
+            .sm_engine()
+            .with(|journal| journal.perturb_chain_for_test())
+            .await;
+        part0.propose(deploy_cmd("q-2"), 2_000).await.ok();
+        part0.propose(deploy_cmd("q-3"), 3_000).await.ok();
+        let mut stopped = false;
+        for _ in 0..500 {
+            if part1.is_shutdown() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "the diverged voter must fail-stop");
+        assert!(part1.divergence().is_some());
+        let recovered = node1.recover_shutdown_partitions_once().await;
+        assert!(
+            !recovered.contains(&0),
+            "a diverged quorum voter must not be rebuilt empty: {recovered:?}"
+        );
+        let still = node1.raft_registry().get(0).expect("node 1 hosts p0");
+        assert!(still.is_shutdown(), "left down for the operator");
+        part0.raft.shutdown().await.ok();
+    }
+
     /// Issue #53: a partition whose Raft core enters `Shutdown` must be
     /// auto-recovered in place (rebuilt in the registry so it rejoins its group),
     /// not left dead until a manual process restart.
@@ -39535,6 +44099,20 @@ mod clustered_startup_tests {
         }
     }
 
+    /// #1657 / ADR 0066: cluster-variable writes fail closed on the untagged
+    /// multi-partition legacy journal with a 503 naming the mode and remedy;
+    /// single-partition legacy, segmented and in-memory runs are unaffected.
+    #[test]
+    fn cluster_variable_writes_refused_on_untagged_multi_partition_journal() {
+        let (status, msg) = check_cluster_variable_journal_mode(true, 3)
+            .expect_err("untagged multi-partition refused");
+        assert_eq!(status, 503);
+        assert!(msg.contains("NANOBPMN_JOURNAL_SEGMENTED=0"), "{msg}");
+        assert!(msg.contains("single-partition"), "{msg}");
+        check_cluster_variable_journal_mode(true, 1).expect("single-partition legacy ok");
+        check_cluster_variable_journal_mode(false, 3).expect("segmented / in-memory ok");
+    }
+
     #[test]
     fn raft_refuses_unsegmented_journal() {
         // #1405: a Raft node on the legacy unsegmented journal fails at startup.
@@ -39550,6 +44128,14 @@ mod clustered_startup_tests {
         // #1387: Raft startup must leave unresolved spilled orphans flagged.
         assert!(!boot_offheap_reconcile_allowed(true));
         assert!(boot_offheap_reconcile_allowed(false));
+    }
+
+    #[test]
+    fn boot_backoff_rearm_waits_for_raft_recovery() {
+        // #933 review: under Raft the spawn-time scan would race the snapshot
+        // restore in `raft_bootstrap`, which re-arms the wakes itself instead.
+        assert!(!boot_backoff_rearm_at_spawn(true));
+        assert!(boot_backoff_rearm_at_spawn(false));
     }
 
     #[tokio::test]
@@ -39709,7 +44295,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
@@ -39923,7 +44511,9 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
@@ -40316,8 +44906,12 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
-        node2.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
+        node2
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         let served = [
             (node0.clone(), listeners.remove(0)),
@@ -40455,6 +45049,8 @@ mod clustered_startup_tests {
             completed,
             "the instance completes on the NEW leader after the original leader was killed"
         );
+        // #1664: no false-positive divergence across the leader failover.
+        assert_no_divergence(&[&node1, &node2], 3);
 
         for node in [&node1, &node2] {
             for p in 0..3u64 {
@@ -40565,19 +45161,12 @@ mod clustered_startup_tests {
 
         // Digest mode = leader-local activation PLUS the soft lease broadcast.
         // Configure the policy directly (the env reader can't be used safely under
-        // parallel tests) and relax the completion check on every owned engine
-        // actor, exactly as `ServerImpl::new` would have for a leader-local policy.
-        // The follower replica engines built during `raft_bootstrap` then pick up
-        // lenient completion automatically (they read the now-leader-local policy).
+        // parallel tests). Lenient completion is replicated engine state (#1661):
+        // each partition leader proposes it through the Raft log on its tick.
         if digest {
             for node in [&mut node0, &mut node1, &mut node2] {
                 node.activation_policy = ActivationPolicy::Digest;
                 node.lease_digest = true;
-                for handle in node.engine.all() {
-                    handle
-                        .with(|journal| journal.set_lenient_completion(true))
-                        .await;
-                }
             }
         }
 
@@ -40596,12 +45185,6 @@ mod clustered_startup_tests {
             for node in [&mut node0, &mut node1, &mut node2] {
                 node.activation_policy = policy;
                 node.lease_digest = policy.broadcasts_lease_digest();
-                let lenient = policy.may_be_leader_local();
-                for handle in node.engine.all() {
-                    handle
-                        .with(move |journal| journal.set_lenient_completion(lenient))
-                        .await;
-                }
             }
         }
 
@@ -40653,8 +45236,12 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
-        node2.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
+        node2
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         let served = [
             (node0.clone(), listeners.remove(0)),
@@ -40703,6 +45290,22 @@ mod clustered_startup_tests {
             ok,
             "every partition must have its owning node as leader before creates"
         );
+        // A leader-local policy needs the partition's REPLICATED lenient flag
+        // before any leader-local lock is granted (#1661). In production the
+        // first clock tick proposes it; run that tick here so the cluster starts
+        // in the steady state the activation-policy tests exercise.
+        if node0.activation_policy.may_be_leader_local() {
+            for node in nodes {
+                for p in 0..3u64 {
+                    node.tick_partition_via_raft(p, now_millis(), true).await;
+                }
+            }
+            let flags = await_lenient_flags(nodes, true).await;
+            assert!(
+                flags.iter().all(|f| *f),
+                "every replica applied the replicated lenient flag: {flags:?}"
+            );
+        }
         (node0, node1, node2, serve_handles)
     }
 
@@ -40761,6 +45364,242 @@ mod clustered_startup_tests {
             vec![parity_timed_process()],
         )
         .await
+    }
+
+    /// Every hosted engine's (owned + replica) replicated lenient flag, per node.
+    async fn lenient_flags(nodes: [&ServerImpl; 3]) -> Vec<bool> {
+        let mut flags = Vec::new();
+        for node in nodes {
+            for p in 0..3u64 {
+                if let Some(h) = node.engine_handle_for(p) {
+                    flags.push(h.with(|j| j.engine().replicated_lenient_completion()).await);
+                }
+            }
+        }
+        flags
+    }
+
+    /// Polls until every hosted replica reports `want` (followers apply the
+    /// committed entry asynchronously). Returns the final flags.
+    async fn await_lenient_flags(nodes: [&ServerImpl; 3], want: bool) -> Vec<bool> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let flags = lenient_flags(nodes).await;
+            if flags.iter().all(|f| *f == want) || std::time::Instant::now() > deadline {
+                return flags;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #1661: lenient completion is replicated engine state, not host config.
+    /// No replica is lenient until the partition leader commits
+    /// `SetLenientCompletion` through the Raft log (so a leader-local lock is
+    /// never granted before every replica will accept its completion), after
+    /// which EVERY replica — leader and followers — holds the flag; a policy
+    /// flip back never clears it (one-way).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rf3_lenient_completion_is_replicated_through_the_log() {
+        let (mut n0, mut n1, mut n2, _serve) = boot_rf3_intake_cluster_with(
+            false,
+            false,
+            Some(ActivationPolicy::Always),
+            None,
+            Vec::new(),
+        )
+        .await;
+        let before = lenient_flags([&n0, &n1, &n2]).await;
+        assert_eq!(before.len(), 9, "3 partitions x RF3 replicas");
+        assert!(
+            before.iter().all(|f| !f),
+            "strict under `always`: {before:?}"
+        );
+
+        // Switching to a leader-local policy configures nothing locally: the
+        // flag only arrives through the log, proposed by each partition leader
+        // on its tick, and then holds on EVERY replica.
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::LeaderLocal;
+        }
+        assert!(lenient_flags([&n0, &n1, &n2]).await.iter().all(|f| !f));
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        let after = await_lenient_flags([&n0, &n1, &n2], true).await;
+        assert!(
+            after.iter().all(|f| *f),
+            "every replica applied the flag: {after:?}"
+        );
+
+        // One-way (ADR 0002 notes): flipping the policy back never clears the
+        // flag — a replica may hold a leader-local activation its peers never
+        // saw. Nothing is proposed; every replica stays lenient.
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::Always;
+        }
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let kept = lenient_flags([&n0, &n1, &n2]).await;
+        assert!(
+            kept.iter().all(|f| *f),
+            "lenience is one-way on every replica: {kept:?}"
+        );
+    }
+
+    /// #1661 rolling upgrade (ADR 0066): with ONE pre-#1661 member (it
+    /// advertises no features), the leader never emits `SetLenientCompletion`
+    /// — every node runs today's legacy lenient flag from its policy, and
+    /// leader-local completions still apply. Once every member advertises the
+    /// feature, the command is emitted and lenience becomes log-derived on every
+    /// replica; from then on a featureless (old) binary is refused at join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rf3_mixed_version_cutover_gates_replicated_lenience() {
+        use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+        let (mut n0, mut n1, mut n2, _serve) = boot_rf3_intake_cluster_with(
+            false,
+            false,
+            Some(ActivationPolicy::Always),
+            None,
+            Vec::new(),
+        )
+        .await;
+        // Re-dial every link so the handshakes observe the current advertisement.
+        async fn redial(nodes: [&ServerImpl; 3]) {
+            for (i, node) in nodes.iter().enumerate() {
+                for peer in 0..3u32 {
+                    if peer as usize != i {
+                        node.peers.fail_node(peer).await;
+                        node.peers.heal_node(peer).await;
+                    }
+                }
+            }
+        }
+
+        // Node 2 is an old binary. Every node starts under a leader-local policy
+        // with the legacy host flag, exactly as `ServerImpl::new` sets it.
+        n2.advertise_cluster_features
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for node in [&mut n0, &mut n1, &mut n2] {
+            node.activation_policy = ActivationPolicy::LeaderLocal;
+            for p in 0..3u64 {
+                if let Some(h) = node.engine_handle_for(p) {
+                    h.with(|j| j.set_legacy_lenient_completion(true)).await;
+                }
+            }
+        }
+        redial([&n0, &n1, &n2]).await;
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mixed = lenient_flags([&n0, &n1, &n2]).await;
+        assert!(
+            mixed.iter().all(|f| !f),
+            "no SetLenientCompletion while an old member is present: {mixed:?}"
+        );
+        assert!(!n0.peers.requires_feature(F));
+        // Leader-local completions still apply under the legacy flag.
+        for node in [&n0, &n1, &n2] {
+            node.create_for_stream(Some("intake".into()), None, Default::default())
+                .await
+                .expect("create commits");
+        }
+        let mut completed = 0;
+        for node in [&n0, &n1, &n2] {
+            completed += parity_activate_complete(node, "do-work", 4).await;
+        }
+        assert!(completed >= 1, "completions apply in the mixed cluster");
+
+        // Every member upgraded: the leader emits the command; lenience is now
+        // log-derived on every replica.
+        n2.advertise_cluster_features
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        redial([&n0, &n1, &n2]).await;
+        parity_tick([&n0, &n1, &n2], now_millis()).await;
+        let upgraded = await_lenient_flags([&n0, &n1, &n2], true).await;
+        assert!(
+            upgraded.iter().all(|f| *f),
+            "every replica holds the replicated flag: {upgraded:?}"
+        );
+
+        // A featureless (pre-#1661) binary is now refused at join.
+        assert_eq!(n0.required_cluster_features().await, Some(vec![F]));
+        assert!(
+            n0.peers.requires_feature(F),
+            "outbound dials require it too"
+        );
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let url = format!(
+            "{}/cluster",
+            n0.engine.topology().peers[0].replacen("http://", "ws://", 1)
+        );
+        let err =
+            match tokio_tungstenite::connect_async(url.into_client_request().expect("req")).await {
+                Ok(_) => panic!("an old binary must be refused once the feature is in use"),
+                Err(e) => e,
+            };
+        assert!(format!("{err:?}").contains("409"), "got {err:?}");
+    }
+
+    /// #1661: `prepare_activation` grants a leader-local (soft, unjournaled)
+    /// lock only once the partition's REPLICATED state is lenient; before that
+    /// the activation is forced through the log even under a leader-local policy.
+    /// #1661: the non-Raft tick may journal the irreversible replicated flag
+    /// only on a genuinely single-node deployment — never on a multi-node node
+    /// (mid-bootstrap with an empty Raft registry, or explicit non-Raft), where
+    /// it would diverge replicas / bypass the peer-compatibility gate.
+    #[test]
+    fn local_lenient_reconcile_only_on_single_node() {
+        let multi = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://a".into(), "http://b".into()],
+            num_partitions: 2,
+            replication_factor: 1,
+        };
+        for policy in [
+            ActivationPolicy::LeaderLocal,
+            ActivationPolicy::Digest,
+            ActivationPolicy::Auto,
+            ActivationPolicy::Always,
+        ] {
+            assert!(!local_lenient_reconcile(&multi, policy), "{policy:?}");
+            assert_eq!(
+                local_lenient_reconcile(&cluster::Topology::single(1), policy),
+                policy.may_be_leader_local()
+            );
+        }
+    }
+
+    #[test]
+    fn soft_activation_requires_replicated_lenient_completion() {
+        let mut journal = Journal::in_memory();
+        let process = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("t", "soft")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid");
+        let (_, _commit) = journal
+            .apply_command_at(Command::DeployProcess(process), 1)
+            .expect("deploy");
+        let (_, _commit) = journal
+            .apply_command_at(Command::create_instance("p"), 1)
+            .expect("create");
+        let activate = || Command::activate_jobs("soft", "w", 1, 60_000, 2);
+        assert!(
+            matches!(
+                prepare_activation(&mut journal, activate(), false),
+                PreparedActivation::Durable(_)
+            ),
+            "strict replicated state forces a journaled activation"
+        );
+        reconcile_lenient_completion_local(&mut journal, true, 2);
+        assert!(journal.engine().lenient_completion());
+        assert!(
+            matches!(
+                prepare_activation(&mut journal, activate(), false),
+                PreparedActivation::Soft(ref jobs) if jobs.len() == 1
+            ),
+            "a committed lenient flag permits the leader-local lock"
+        );
     }
 
     /// Spill tally for one [`parity_force_spill`] sweep: the per-command
@@ -40824,7 +45663,7 @@ mod clustered_startup_tests {
         let n = jobs.len();
         for job in jobs {
             let key = job.job_key.0.parse::<u64>().expect("numeric job key");
-            let mut vars = std::collections::HashMap::new();
+            let mut vars = std::collections::BTreeMap::new();
             vars.insert("result".to_string(), Value::Str("r".repeat(512)));
             node.complete_job_for_stream(key, vars, None, None)
                 .await
@@ -40855,7 +45694,7 @@ mod clustered_startup_tests {
     async fn parity_workload_round(nodes: [&ServerImpl; 3], tally: &mut ParityTally) {
         for node in nodes {
             for i in 0..6 {
-                let mut vars = std::collections::HashMap::new();
+                let mut vars = std::collections::BTreeMap::new();
                 vars.insert(
                     "payload".to_string(),
                     Value::Str(format!("{i}").repeat(256)),
@@ -40958,7 +45797,7 @@ mod clustered_startup_tests {
         node.engine_handle_for(p)
             .expect("replica engine exists")
             .with(|journal| {
-                let mut live = std::collections::HashSet::new();
+                let mut live = std::collections::BTreeSet::new();
                 journal.collect_live_instance_keys(&mut live);
                 let (_restored, unreadable) = journal.rehydrate_all_cold();
                 let state = journal.engine().state();
@@ -40994,6 +45833,9 @@ mod clustered_startup_tests {
     /// diverging keys. Returns the total number of Active instances (so callers
     /// can prove the comparison is non-vacuous).
     async fn assert_replica_parity(nodes: [&ServerImpl; 3]) -> usize {
+        // #1664: parity also means no replica fail-stopped on a (false)
+        // divergence, and replicas at the same applied index agree on the chain.
+        assert_no_divergence(&nodes, 3);
         let mut total_active = 0;
         for p in 0..3u64 {
             let leader = replica_view(nodes[p as usize], p).await;
@@ -41215,6 +46057,28 @@ mod clustered_startup_tests {
             installed.is_some_and(|i| i >= snap),
             "the rebuilt learner caught up by snapshot install (installed {installed:?}, purged to {snap})"
         );
+        // #1664 review: the installed snapshot carried the leader's chain, so
+        // the learner's claims are NOT silently disabled (a lost digest reads
+        // as `None` / a different base, which `assert_no_divergence` skips):
+        // at a common applied index both claims are present and equal.
+        let mut common = None;
+        for _ in 0..500 {
+            let lead = node0.raft_registry().get(0).and_then(|p| p.digest_claim());
+            let learner = node1.raft_registry().get(0).and_then(|p| p.digest_claim());
+            if let (Some(l), Some(r)) = (lead, learner)
+                && l.index == r.index
+            {
+                common = Some((l, r));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (lead, learner) =
+            common.expect("leader and learner both claim a digest at a common applied index");
+        assert_eq!(
+            lead, learner,
+            "the learner continues the leader's chain after the snapshot install"
+        );
         assert!(
             tally.shed > 0
                 && tally.var_shed > 0
@@ -41298,7 +46162,7 @@ mod clustered_startup_tests {
         } else {
             let still_live = follower
                 .with(move |j| {
-                    let mut live = std::collections::HashSet::new();
+                    let mut live = std::collections::BTreeSet::new();
                     j.collect_live_instance_keys(&mut live);
                     live.contains(&instance_key)
                 })
@@ -41961,8 +46825,12 @@ mod clustered_startup_tests {
             )
             .await
             .expect("deploy the DRG on the owner");
-        node1.install_replicated_deployment(events.to_vec()).await;
-        node2.install_replicated_deployment(events.to_vec()).await;
+        node1
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
+        node2
+            .install_replicated_deployment(events.to_vec(), None)
+            .await;
 
         let before = raft_applied_total(&node0);
         let mut variables = std::collections::HashMap::new();
@@ -42070,7 +46938,7 @@ mod clustered_startup_tests {
         let p1_before =
             leader_applied(&all, sub_partition).expect("partition 1 has a leader at boot");
 
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         vars.insert("orderId".to_string(), Value::Str(order_id.clone()));
         let (instance_key, _) = node0
             .create_for_stream(Some("waiter".into()), None, vars)
@@ -42170,7 +47038,7 @@ mod clustered_startup_tests {
         // the NEW partition-1 leader, and the routed continuation advances the
         // instance through partition 0's log.
         let (message_key, _) = node0
-            .correlate_message_cluster("go".into(), order_id, None, None)
+            .correlate_message_cluster("go".into(), order_id, None, None, None)
             .await
             .expect("publish succeeds");
         assert!(message_key.is_some(), "the new leader minted a message key");
@@ -42201,6 +47069,188 @@ mod clustered_startup_tests {
         );
 
         for node in survivors {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    /// #1582: bounded re-drive of a routed forward across an RF=3 leader change.
+    /// Deterministic fixture: the FIRST forward of the routed subscription open
+    /// is forced to fail with a test barrier — the source's peer view of the
+    /// subscription partition's owner (node 1) is fault-injected unreachable for
+    /// exactly the first attempt, then healed — so the re-drive path is
+    /// exercised by construction, not by racing an election. Node 1 is then
+    /// stopped (a real leader change), and the re-drive must re-resolve the new
+    /// leader and deliver, with exactly-once effects: one instance, exactly one
+    /// armed subscription on every surviving replica, one completion — and no
+    /// resurrection of the subscription after the correlation closes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn routed_forward_is_redriven_across_a_leader_change() {
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("start")
+            .message_intermediate_catch_event("catch", "go", "orderId")
+            .end_event("end")
+            .connect("start", "catch")
+            .connect("catch", "end")
+            .build()
+            .expect("valid waiter process");
+        let (node0, node1, node2, handles) =
+            boot_rf3_intake_cluster_with(false, false, None, None, vec![waiter]).await;
+        let sub_partition = 1u64;
+        let order_id = (0..)
+            .map(|i| format!("redrive-{i}"))
+            .find(|k| nanobpmn_engine_core::subscription_partition(k, 3) == sub_partition)
+            .expect("some key hashes to partition 1");
+
+        // Force the FIRST forward to fail deterministically: from node 0's peer
+        // view, node 1 (partition 1's current leader) is unreachable. `fail_node`
+        // drops the cached link and fails the dial, so attempt 0 is a transient
+        // transport failure regardless of election timing. `PeerSet` is `Clone`
+        // over shared state, so healing through this handle lifts the barrier.
+        let node0_peers = node0.peers.clone();
+        node0_peers.fail_node(1).await;
+
+        let create = {
+            let node = node0.clone();
+            let order = order_id.clone();
+            tokio::spawn(async move {
+                let mut vars = std::collections::BTreeMap::new();
+                vars.insert("orderId".to_string(), Value::Str(order));
+                node.create_for_stream(Some("waiter".into()), None, vars)
+                    .await
+            })
+        };
+        // Wait until the re-drive has actually retried once — proof the first
+        // forward failed — then heal the link so the NEXT attempt can deliver.
+        let mut retried = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if node0.route_redrives.load(Ordering::Relaxed) > 0 {
+                retried = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            retried,
+            "the first forward must fail under the injected partition, forcing a re-drive"
+        );
+        // Now stop node 1 for real (the leader change) and heal the source's
+        // peer view so the re-drive re-resolves and reaches the NEW leader.
+        for p in 0..3u64 {
+            if let Some(part) = node1.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        handles[1].abort();
+        node0_peers.heal_node(1).await;
+
+        let (instance_key, _) = create
+            .await
+            .expect("create task")
+            .expect("create commits on partition 0 (quorum node0+node2)");
+        assert_ne!(partition_of(instance_key), sub_partition);
+
+        let sub_count = |node: &ServerImpl| {
+            let node = node.clone();
+            async move {
+                let Some(handle) = node.engine_handle_for(sub_partition) else {
+                    return 0usize;
+                };
+                handle
+                    .with(move |j| {
+                        j.state()
+                            .message_subscriptions
+                            .values()
+                            .filter(|s| {
+                                s.instance_key == instance_key
+                                    && s.state
+                                        == nanobpmn_engine_core::MessageSubscriptionState::Open
+                            })
+                            .count()
+                    })
+                    .await
+            }
+        };
+        let mut delivered = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if sub_count(&node0).await == 1 && sub_count(&node2).await == 1 {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            delivered,
+            "the re-drive must deliver the routed open to the new partition-1 leader"
+        );
+        // The re-drive was already proven above (the test waited for the first
+        // retry before healing the barrier), so no second timing-dependent
+        // assertion on `route_redrives` is needed here.
+        let instances = node0
+            .engine_handle_for(partition_of(instance_key))
+            .expect("instance partition")
+            .with(|j| j.state().instances.len())
+            .await;
+        assert_eq!(instances, 1, "exactly one instance");
+
+        let taps = [
+            tap_replica_events(&node0, partition_of(instance_key)).await,
+            tap_replica_events(&node2, partition_of(instance_key)).await,
+        ];
+        let (message_key, _) = node0
+            .correlate_message_cluster("go".into(), order_id.clone(), None, None, None)
+            .await
+            .expect("publish succeeds");
+        assert!(message_key.is_some());
+        let mut completions = [0usize, 0usize];
+        for _ in 0..250 {
+            for (n, tap) in completions.iter_mut().zip(&taps) {
+                while let Ok(batch) = tap.try_recv() {
+                    *n += batch
+                        .events
+                        .iter()
+                        .filter(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key))
+                        .count();
+                }
+            }
+            if completions.iter().all(|n| *n >= 1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            completions,
+            [1, 1],
+            "exactly one completion per surviving replica"
+        );
+
+        // No resurrection: the correlated subscription is no longer open and
+        // stays so (a late re-delivery of the open is deduped), and a second
+        // publish correlates nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            sub_count(&node0).await,
+            0,
+            "no resurrected subscription (node0)"
+        );
+        assert_eq!(
+            sub_count(&node2).await,
+            0,
+            "no resurrected subscription (node2)"
+        );
+        let (_, correlated) = node0
+            .correlate_message_cluster("go".into(), order_id, None, None, None)
+            .await
+            .expect("second publish succeeds");
+        assert_eq!(correlated, None, "nothing left to correlate");
+
+        for node in [&node0, &node2] {
             for p in 0..3u64 {
                 if let Some(part) = node.raft_registry().get(p) {
                     part.raft.shutdown().await.ok();
@@ -42714,7 +47764,7 @@ mod clustered_startup_tests {
                 }
                 "fail" => {
                     node0
-                        .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+                        .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into(), 0)
                         .await
                 }
                 _ => {
@@ -42818,7 +47868,7 @@ mod clustered_startup_tests {
         new_leader.run_lease_digest(recover_now).await;
 
         let (leader_events, _) = new_leader
-            .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+            .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into(), 0)
             .await
             .expect("the fail commits on the new leader");
         let on_leader =
@@ -45159,6 +50209,105 @@ mod clustered_startup_tests {
         );
     }
 
+    /// #934: forcing eviction past the ring capacity must surface
+    /// `isIncomplete == true` for any window reaching back into the evicted
+    /// range, while a window strictly after the eviction high-water mark (and
+    /// after the recording start) stays complete.
+    #[tokio::test]
+    async fn rest_job_statistics_is_incomplete_after_eviction() {
+        let server = ServerImpl {
+            job_statistics: JobStatisticsState::with_limits(1_000_000_000_000, 2),
+            ..Default::default()
+        };
+        let base: u64 = 1_000_000_000_000;
+        let global = |from_ms: u64| models::GetGlobalJobStatisticsQueryParams {
+            from: ms_to_dt(from_ms).unwrap(),
+            to: ms_to_dt(base + 10_000).unwrap(),
+            job_type: None,
+        };
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        let incomplete = |r: GResp| match r {
+            GResp::Status200_GlobalJobMetrics(g) => g.is_incomplete,
+            _ => panic!("expected 200 from global stats"),
+        };
+
+        server
+            .job_statistics
+            .record_completed("t".into(), None, base + 1_000);
+        server
+            .job_statistics
+            .record_failed("t".into(), None, base + 2_000);
+        let r = server
+            .get_global_job_statistics_impl(&global(base))
+            .await
+            .unwrap();
+        assert!(!incomplete(r), "nothing evicted yet: complete");
+
+        // Third entry overflows capacity 2 → evicts the entry at base+1000.
+        server
+            .job_statistics
+            .record_completed("t".into(), None, base + 3_000);
+        let r = server
+            .get_global_job_statistics_impl(&global(base))
+            .await
+            .unwrap();
+        assert!(
+            incomplete(r),
+            "window covering an evicted entry is incomplete"
+        );
+        let r = server
+            .get_global_job_statistics_impl(&global(base + 1_000))
+            .await
+            .unwrap();
+        assert!(incomplete(r), "eviction high-water mark is inclusive");
+        let r = server
+            .get_global_job_statistics_impl(&global(base + 1_001))
+            .await
+            .unwrap();
+        assert!(
+            !incomplete(r),
+            "window after every evicted entry is complete"
+        );
+    }
+
+    /// #934: a window that starts before this process began recording reaches
+    /// across the restart boundary (the ephemeral log lost that history).
+    #[tokio::test]
+    async fn rest_job_statistics_is_incomplete_across_restart_boundary() {
+        let since: u64 = 1_000_000_000_000;
+        let server = ServerImpl {
+            job_statistics: JobStatisticsState::with_limits(since, 10),
+            ..Default::default()
+        };
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        for (from_ms, want) in [(since - 1, true), (since, false)] {
+            let r = server
+                .get_global_job_statistics_impl(&models::GetGlobalJobStatisticsQueryParams {
+                    from: ms_to_dt(from_ms).unwrap(),
+                    to: ms_to_dt(since + 1).unwrap(),
+                    job_type: None,
+                })
+                .await
+                .unwrap();
+            let GResp::Status200_GlobalJobMetrics(g) = r else {
+                panic!("expected 200");
+            };
+            assert_eq!(g.is_incomplete, want, "from={from_ms}");
+        }
+    }
+
+    /// #934: the error log tracks its own eviction high-water mark.
+    #[test]
+    fn job_error_log_eviction_marks_incomplete() {
+        let s = JobStatisticsState::with_limits(0, 1);
+        s.record_error("t".into(), None, "E".into(), "m".into(), 5);
+        assert!(!s.errors_incomplete(0));
+        s.record_error("t".into(), None, "E".into(), "m".into(), 9);
+        assert!(s.errors_incomplete(5));
+        assert!(!s.errors_incomplete(6));
+        assert!(!s.metrics_incomplete(0), "metrics log is independent");
+    }
+
     #[tokio::test]
     async fn rest_job_statistics_count_a_completed_job() {
         let server = ServerImpl::default();
@@ -45327,6 +50476,188 @@ mod clustered_startup_tests {
             panic!("expected 200 from global stats");
         };
         assert_eq!(g.failed.count, 1, "one failed job recorded");
+    }
+
+    /// #933 — Camunda 8 v2 `retryBackOff`: a REST fail with retries left and
+    /// a backoff is NOT immediately re-activatable, and a long-poll parked on
+    /// the job type is woken and served once the backoff elapses (there is no
+    /// journaled "backoff elapsed" event to wake it otherwise).
+    #[tokio::test]
+    async fn rest_fail_job_retry_backoff_delays_reactivation_and_wakes_long_poll() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+        server
+            .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+            .await;
+
+        use apis::job::FailJobResponse as FResp;
+        let backoff_ms: u64 = 1_500;
+        let mut fail = models::JobFailRequest::new();
+        fail.retries = Some(2);
+        fail.retry_back_off = Some(backoff_ms as i64);
+        let failed_at = std::time::Instant::now();
+        // Lower bound on the persisted deadline: the server stamps
+        // `retry_backoff_until` no earlier than this wall-clock instant plus
+        // the backoff, so a serve at/after the deadline is at/after this too.
+        let backoff_until = now_millis() + backoff_ms;
+        let failed = server
+            .fail_job_impl(
+                &models::FailJobPathParams {
+                    job_key: job_key.to_string(),
+                },
+                &Some(fail),
+            )
+            .await
+            .expect("failure runs");
+        assert!(matches!(failed, FResp::Status204_TheJobIsFailed));
+
+        let immediate = server
+            .activate_for_stream("demo-work", "worker-g", 10, 60_000, None)
+            .await;
+        assert!(
+            immediate.is_empty(),
+            "a backed-off job must not be re-served before retryBackOff elapses"
+        );
+
+        let mut req = models::JobActivationRequest::new("demo-work".into(), 60_000, 10);
+        req.request_timeout = Some(10_000);
+        use apis::job::ActivateJobsResponse as ActR;
+        let jobs = match server.activate_jobs_impl(&req).await.expect("activate ok") {
+            ActR::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200 list, got {other:?}"),
+        };
+        let waited = failed_at.elapsed();
+        assert_eq!(jobs.len(), 1, "the job is re-served after its backoff");
+        assert_eq!(jobs[0].job_key.0, job_key.to_string());
+        let served_at = now_millis();
+        assert!(
+            served_at >= backoff_until,
+            "re-served at {served_at}, before the backoff deadline lower bound {backoff_until}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(9_000),
+            "the long-poll must be woken by the backoff expiry, not its timeout ({waited:?})"
+        );
+    }
+
+    /// #933 — zero / negative / absent `retryBackOff` are retryable at once.
+    #[tokio::test]
+    async fn rest_fail_job_non_positive_retry_backoff_is_immediately_retryable() {
+        for backoff in [None, Some(0_i64), Some(-1_000)] {
+            let server = ServerImpl::default();
+            server
+                .create_for_stream(Some("demo".into()), None, Default::default())
+                .await
+                .expect("create the demo instance");
+            let job_key = await_job_key(&server, "demo-work").await;
+            server
+                .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+                .await;
+            let mut fail = models::JobFailRequest::new();
+            fail.retries = Some(2);
+            fail.retry_back_off = backoff;
+            let failed = server
+                .fail_job_impl(
+                    &models::FailJobPathParams {
+                        job_key: job_key.to_string(),
+                    },
+                    &Some(fail),
+                )
+                .await
+                .expect("failure runs");
+            assert!(matches!(
+                failed,
+                apis::job::FailJobResponse::Status204_TheJobIsFailed
+            ));
+            let again = server
+                .activate_for_stream("demo-work", "worker-g", 10, 60_000, None)
+                .await;
+            assert_eq!(again.len(), 1, "retryBackOff {backoff:?} is immediate");
+        }
+    }
+
+    #[test]
+    fn backoff_wake_delay_only_for_positive_backoff_with_retries_left() {
+        assert_eq!(backoff_wake_delay(1, 0), None);
+        assert_eq!(backoff_wake_delay(1, -5), None);
+        assert_eq!(backoff_wake_delay(0, 5_000), None);
+        assert_eq!(
+            backoff_wake_delay(2, 5_000),
+            Some(std::time::Duration::from_millis(5_001))
+        );
+    }
+
+    /// #933 (review) — a restart during a persisted backoff restores the
+    /// deadline but drops the process-local wake task. `reschedule_backoff_wakes`
+    /// re-arms it from the replayed engine state, so a long-poll parked across
+    /// the restart is still woken when the backoff elapses (not at its request
+    /// timeout). This drives the same recovery the boot path runs, without a
+    /// real process bounce: fail with a backoff, drop the implicit wake (no
+    /// `signal_jobs_available_after_backoff` on this path), then reschedule.
+    #[tokio::test]
+    async fn restart_during_backoff_rearms_the_wake_and_serves_the_long_poll() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+        server
+            .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+            .await;
+
+        // Fail with a backoff applied DIRECTLY on the engine actor — the
+        // restart analogue: the deadline is persisted on the event, but no
+        // process-local wake task is scheduled (that is what a bounce drops).
+        let backoff_ms: u64 = 1_500;
+        let (events, _commit) = server
+            .apply_job_command_direct(
+                job_key,
+                Command::fail_job_with_backoff(job_key, 2, "flaky upstream", backoff_ms as i64),
+            )
+            .await
+            .expect("the fail applies");
+        let backoff_until = events
+            .iter()
+            .find_map(|e| match e {
+                Event::JobFailed {
+                    retry_backoff_until: Some(until),
+                    ..
+                } => Some(*until),
+                _ => None,
+            })
+            .expect("the fail persists a backoff deadline");
+
+        let parked_at = std::time::Instant::now();
+        // Boot recovery: re-arm the wake from the replayed deadline.
+        server.reschedule_backoff_wakes().await;
+
+        let mut req = models::JobActivationRequest::new("demo-work".into(), 60_000, 10);
+        req.request_timeout = Some(10_000);
+        use apis::job::ActivateJobsResponse as ActR;
+        let jobs = match server.activate_jobs_impl(&req).await.expect("activate ok") {
+            ActR::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200 list, got {other:?}"),
+        };
+        let waited = parked_at.elapsed();
+        assert_eq!(jobs.len(), 1, "the job is re-served after its backoff");
+        assert_eq!(jobs[0].job_key.0, job_key.to_string());
+        // Compare the server clock against the PERSISTED deadline: the backoff
+        // began inside `apply_job_command_direct`, before `parked_at`, so the
+        // wait measured from `parked_at` may legitimately be shorter.
+        let served_at = now_millis();
+        assert!(
+            served_at >= backoff_until,
+            "re-served at {served_at}, before the persisted deadline {backoff_until}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(9_000),
+            "the re-armed wake must serve the long-poll, not its timeout ({waited:?})"
+        );
     }
 
     /// #1327 — Zeebe parity: a fail with retries LEFT records the worker's
@@ -45619,6 +50950,29 @@ mod clustered_startup_tests {
             }
         }
 
+        // Worker sorts on the projected response value: `None` and a legacy
+        // `Some("")` both return `""`, so they tie and the key tiebreak orders them.
+        let mut no_worker = job_row_with_def_key(300, "1");
+        no_worker.worker = None;
+        let mut empty_worker = job_row_with_def_key(301, "1");
+        empty_worker.worker = Some(String::new());
+        for descending in [false, true] {
+            let mut rows: Vec<&readstore::JobRow> = vec![&empty_worker, &no_worker];
+            query::sort_items(
+                &mut rows,
+                &[query::SortKey {
+                    field: "worker".to_string(),
+                    descending,
+                }],
+                |job, field| job_sort_val(job, field),
+                |job| job.key,
+            );
+            assert_eq!(
+                rows.iter().map(|j| j.key).collect::<Vec<_>>(),
+                vec![300, 301]
+            );
+        }
+
         let two = job_row_with_def_key(100, "2");
         let ten = job_row_with_def_key(200, "10");
 
@@ -45656,6 +51010,60 @@ mod clustered_startup_tests {
             sorted(true),
             vec![200, 100],
             "descending numeric sort: processDefinitionKey 10 before 2"
+        );
+    }
+
+    /// #1298 — `searchResources` sorts `deploymentKey` on the creating
+    /// deployment's key, not the per-resource key: resources of one deployment
+    /// tie, so a secondary sort orders them, and DESC reverses deployments
+    /// while keeping the ascending resource-key tiebreak within one.
+    #[test]
+    fn resource_sort_deployment_key_ties_within_a_deployment() {
+        fn row(
+            resource_key: u64,
+            deployment_key: Option<u64>,
+            name: &str,
+        ) -> readstore::ResourceMetaRow {
+            readstore::ResourceMetaRow {
+                resource_key,
+                resource_id: name.to_string(),
+                resource_name: name.to_string(),
+                version: 1,
+                version_tag: None,
+                tenant_id: "<default>".to_string(),
+                deployment_key,
+            }
+        }
+        // Deployment 10 owns resources 11 ("z") and 12 ("a"); deployment 20
+        // owns 21 ("m"); 5 is a legacy row with no recorded deployment.
+        let rows = [
+            row(11, Some(10), "z"),
+            row(12, Some(10), "a"),
+            row(21, Some(20), "m"),
+            row(5, None, "legacy"),
+        ];
+        let sorted = |keys: &[(&str, bool)]| {
+            let mut refs: Vec<&readstore::ResourceMetaRow> = rows.iter().collect();
+            let keys: Vec<query::SortKey> = keys
+                .iter()
+                .map(|(f, d)| query::SortKey {
+                    field: (*f).to_string(),
+                    descending: *d,
+                })
+                .collect();
+            query::sort_items(
+                &mut refs,
+                &keys,
+                |r, f| resource_sort_val(r, f),
+                |r| r.resource_key,
+            );
+            refs.iter().map(|r| r.resource_key).collect::<Vec<_>>()
+        };
+        assert_eq!(sorted(&[("deploymentKey", false)]), vec![5, 11, 12, 21]);
+        assert_eq!(sorted(&[("deploymentKey", true)]), vec![21, 11, 12, 5]);
+        assert_eq!(
+            sorted(&[("deploymentKey", false), ("resourceName", false)]),
+            vec![5, 12, 11, 21]
         );
     }
 
@@ -46546,7 +51954,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("order-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -46571,7 +51979,8 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
+                None,
                 None,
                 None,
             )
@@ -46592,6 +52001,182 @@ mod subscription_placement_tests {
         );
     }
 
+    /// #1600 (#1556 step 4, red-first): a publish carrying an
+    /// `operationReference` stamps it on EVERY record the publish produces —
+    /// including the records produced on OTHER partitions by the routed
+    /// follow-up commands (the canonical subscription open on the hash
+    /// partition, the routed correlation back on the instance partition).
+    /// Upstream Zeebe leaves those cross-partition records unreferenced
+    /// (camunda/camunda#67542); Nano carries the reference end to end.
+    ///
+    /// Disk-backed (segmented shared writer): the assertion reads the journaled
+    /// record envelopes, not just the in-memory engine output, so it proves the
+    /// reference survives persistence on every partition the cascade touched.
+    #[tokio::test]
+    async fn cross_partition_publish_stamps_operation_reference_on_every_partition() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-1600-routed-ref-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+        let varstore = Arc::new(varstore::VarStore::open(None).unwrap());
+        let (writer, recovery) =
+            SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore)).unwrap();
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|&p| {
+                let engine = engines
+                    .remove(&p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                Journal::from_engine_shared(p, engine, true, &writer)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the message-catch process deploys onto every partition");
+
+        // Park an instance whose canonical subscription lives on a DIFFERENT
+        // partition: the Opening is routed there (a cross-partition follow-up).
+        let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("order-{i}");
+            let mut variables = std::collections::BTreeMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, completed) = server
+                .create_for_stream(Some("await-payment".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            assert!(!completed, "the instance parks at the message catch");
+            let p_inst = nanobpmn_engine_core::partition_of(key);
+            let p_sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+            if p_sub != p_inst {
+                chosen = Some((order, key));
+                break;
+            }
+        }
+        let (order, instance_key) =
+            chosen.expect("a cross-partition placement appears within 64 creates");
+        let p_inst = nanobpmn_engine_core::partition_of(instance_key);
+        let p_sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+
+        // Publish WITH an operationReference: the local apply on the
+        // subscription partition, the routed correlation back on the instance
+        // partition — every record, everywhere — must carry it.
+        const REF: i64 = 0x1600;
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".into(),
+                order.clone(),
+                std::collections::BTreeMap::new(),
+                None,
+                None,
+                Some(REF),
+            )
+            .await
+            .expect("correlation with a valid business id");
+        assert_eq!(correlated, Some(instance_key));
+        let (_vars, completed) = server
+            .await_completion_for_stream(instance_key, None, Some(2000))
+            .await;
+        assert!(completed, "the routed correlation completes the instance");
+
+        // Every journaled record of the publish cascade carries REF. The
+        // publish's own records (`MessagePublished` + the match record on the
+        // subscription partition) and the routed `CorrelateMessageSubscription`
+        // records on the instance partition are disjoint from the deploy and
+        // create records, which carry NO reference.
+        drop(server);
+        let records: Vec<nanobpmn_engine_core::Record> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| seglog::read_segment_records(&p).unwrap())
+            .collect();
+
+        let publish_records: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.event, Event::MessagePublished { .. }))
+            .collect();
+        assert!(
+            !publish_records.is_empty(),
+            "the publish mints a MessagePublished record"
+        );
+        for record in &publish_records {
+            assert_eq!(
+                record.operation_reference,
+                Some(REF),
+                "MessagePublished on the publishing partition carries the reference: {record:?}"
+            );
+        }
+
+        // The routed correlation's records on the INSTANCE partition: the
+        // token advance + completion produced by the routed
+        // `CorrelateMessageSubscription` follow-up.
+        let instance_partition_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.event.instance_key() == Some(instance_key))
+            .collect();
+        let completion = instance_partition_records
+            .iter()
+            .find(|r| matches!(r.event, Event::ProcessInstanceCompleted { .. }))
+            .expect("the routed correlation completes the instance");
+        assert_eq!(
+            completion.operation_reference,
+            Some(REF),
+            "the completion produced by the ROUTED follow-up carries the reference: {completion:?}"
+        );
+        // The create's own records (parked at the catch) predate the publish:
+        // they carry NO reference — proving the stamp is the publish's, not a
+        // blanket partition-wide tag.
+        let created = instance_partition_records
+            .iter()
+            .find(|r| matches!(r.event, Event::ProcessInstanceCreated { .. }))
+            .expect("the create produced the instance");
+        assert_eq!(
+            created.operation_reference, None,
+            "the create's records are unreferenced: {created:?}"
+        );
+        assert!(
+            instance_partition_records
+                .iter()
+                .any(|r| r.operation_reference == Some(REF)),
+            "partition {p_inst} journaled referenced records from the routed follow-up"
+        );
+        // And the subscription partition journaled the publish's own records
+        // with the reference too.
+        assert!(
+            records.iter().any(|r| r.operation_reference == Some(REF)
+                && matches!(
+                    r.event,
+                    Event::MessageCorrelated { .. } | Event::RemoteMessageCorrelation { .. }
+                )),
+            "partition {p_sub} journaled the referenced match record"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn cross_partition_cancel_disarms_the_canonical_subscription() {
         // Cancelling an instance whose catch subscription is canonically placed
@@ -46610,7 +52195,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("cancel-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("await-payment".into()), None, variables)
@@ -46638,14 +52223,17 @@ mod subscription_placement_tests {
             .await
             .expect("cancel succeeds");
         commit.wait().await;
-        server.drive_subscription_routing(events.to_vec()).await;
+        server
+            .drive_subscription_routing(events.to_vec(), None)
+            .await;
 
         // The canonical subscription is gone, so the publish finds no match.
         let (_message_key, correlated) = server
             .correlate_message_local(
                 "payment-received".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
+                None,
                 None,
                 None,
             )
@@ -46655,6 +52243,711 @@ mod subscription_placement_tests {
             correlated, None,
             "the publish correlates nothing after the remote subscription is disarmed"
         );
+    }
+
+    /// #1582 (crash window): the pipelined non-Raft stream path acks before
+    /// fsync, so its cross-partition routing must wait for the SOURCE write to
+    /// become durable. A source that never persists (writer gone unacked — the
+    /// crash case) must route nothing, otherwise a peer durably records a close
+    /// identity the source then loses and a reused delivery key is silently
+    /// deduped. Once durable, the same follow-up routes.
+    #[tokio::test]
+    async fn pipelined_routing_is_gated_on_source_durability() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let mut chosen: Option<(u64, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("gate-{i}");
+            let mut variables = std::collections::BTreeMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, _) = server
+                .create_for_stream(Some("await-payment".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            let sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+            if sub != nanobpmn_engine_core::partition_of(key) {
+                chosen = Some((sub, key));
+                break;
+            }
+        }
+        let (sub_partition, instance_key) =
+            chosen.expect("a cross-partition placement appears within 64 creates");
+        let armed = || {
+            let handle = server
+                .engine_handle_for(sub_partition)
+                .expect("subscription partition is local");
+            async move {
+                handle
+                    .with(move |j| {
+                        j.state().message_subscriptions.values().any(|s| {
+                            s.instance_key == instance_key
+                                && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                        })
+                    })
+                    .await
+            }
+        };
+        // `create_for_stream` answers at source durability, before its detached
+        // routing task opens the subscription: wait (bounded) for it to arm.
+        let mut is_armed = false;
+        for _ in 0..200 {
+            if armed().await {
+                is_armed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(is_armed, "the routed subscription is armed");
+
+        let (events, commit) = server
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
+            })
+            .await
+            .expect("cancel succeeds");
+        commit.wait().await;
+
+        // The source write never becomes durable: nothing may be routed.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx), None);
+        drop(tx);
+        let routed = routing.expect("cancel emits a routable close").await;
+        assert!(!routed.expect("gate task"), "no routing before durability");
+        assert!(
+            !caller.wait_durable().await,
+            "the caller sees the same outcome"
+        );
+        assert!(
+            armed().await,
+            "the close was withheld from the peer partition"
+        );
+
+        // The same follow-up routes once the source is durable.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (caller, routing) = server.route_after_durable(&events, Commit::from_ack(rx), None);
+        tx.send(()).expect("gate listening");
+        assert!(routing.expect("routable").await.expect("gate task"));
+        assert!(caller.wait_durable().await);
+        assert!(
+            !armed().await,
+            "the durable close disarmed the subscription"
+        );
+    }
+
+    /// #1582 (cancellation window): the create's actor round-trip, commit wait,
+    /// and post-commit routing all run inside ONE detached owner task
+    /// ([`ServerImpl::submit_create_detached`]), so a caller that is cancelled
+    /// (drops its observation) at ANY point — even while the command is still
+    /// queued on the engine actor, whose dropped reply receiver does NOT stop
+    /// the queued apply — cannot strand a persisted create without its routing.
+    /// Model the cancelled caller by dropping the observation receiver before
+    /// the create is submitted: the instance must still be created and its
+    /// cross-partition subscription still routed open.
+    #[tokio::test]
+    async fn create_routing_survives_cancellation_before_submission() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+
+        // Find a correlation key whose canonical subscription partition differs
+        // from the partition the create will land on, so the opening follow-up
+        // is genuinely routable.
+        let create_partition = server.engine.for_create().stats().partition;
+        let mut chosen: Option<String> = None;
+        for i in 0..256u32 {
+            let order = format!("orphan-{i}");
+            if nanobpmn_engine_core::subscription_partition(&order, 4) != create_partition {
+                chosen = Some(order);
+                break;
+            }
+        }
+        let order = chosen.expect("a cross-partition correlation key exists");
+
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+        // The caller is CANCELLED immediately: it never observes the outcome.
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    variables,
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        drop(rx);
+
+        // The detached owner still applied the create, awaited durability, and
+        // routed the subscription open to its canonical partition.
+        let sub_partition = nanobpmn_engine_core::subscription_partition(&order, 4);
+        let handle = server
+            .engine_handle_for(sub_partition)
+            .expect("subscription partition is local");
+        let mut armed = false;
+        for _ in 0..100 {
+            let found = handle
+                .with({
+                    let order = order.clone();
+                    move |j| {
+                        j.state().message_subscriptions.values().any(|s| {
+                            s.correlation_key == order
+                                && s.state == nanobpmn_engine_core::MessageSubscriptionState::Open
+                        })
+                    }
+                })
+                .await;
+            if found {
+                armed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            armed,
+            "the detached owner routed the subscription open after the caller was cancelled"
+        );
+    }
+
+    /// #1582: a detached create whose apply FAILS still answers its observer
+    /// with the error (nothing was written, so nothing routes) — the detached
+    /// owner must not swallow rejections.
+    #[tokio::test]
+    async fn detached_create_reports_apply_errors() {
+        let server = single_node_multi_partition();
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("not-deployed".into()), None, None)?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    std::collections::BTreeMap::new(),
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        let err = match ServerImpl::observe_create(rx).await {
+            Ok(_) => panic!("an unknown process id is rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, 500, "the apply error reaches the observer");
+        assert!(
+            err.1.contains("not-deployed"),
+            "the error names the missing process: {}",
+            err.1
+        );
+    }
+
+    /// #1582: a create whose write never becomes durable (the writer went away
+    /// without acking) must NOT be acknowledged — the instance would disappear
+    /// on restart. The detached owner answers a retryable 500 and routes
+    /// nothing. Model the dead writer by forcing the create's commit to
+    /// [`Commit::failed`].
+    #[tokio::test]
+    async fn detached_create_reports_durable_failure() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            let mut created = apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    std::collections::BTreeMap::new(),
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))?;
+            // Simulate the writer dying before it could persist the create.
+            created.commit = Commit::failed();
+            Ok(created)
+        });
+        let err = match ServerImpl::observe_create(rx).await {
+            Ok(_) => panic!("a create that never persisted must not be acknowledged"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, 500, "a non-durable create is a retryable 500");
+        assert!(
+            err.1.contains("not persisted durably"),
+            "the error says the write was not durable: {}",
+            err.1
+        );
+    }
+
+    /// #1582: the admission accounting (processing slot + payload bytes) is
+    /// TRANSFERRED into the detached create owner and released only when the
+    /// actor finishes — a caller that is cancelled (drops its observation)
+    /// while the create is still queued must NOT release the charge early, or
+    /// repeated cancelled requests would undercount the watermarks.
+    ///
+    /// Deterministic: a FIFO barrier job at the same (Low/create) priority is
+    /// queued ahead of the create and parked on a oneshot, so the create is
+    /// guaranteed to still be QUEUED on the engine actor when the caller is
+    /// cancelled. The charge must stay entered across the cancellation and only
+    /// drain once the barrier is released and the actor finishes the create —
+    /// an implementation that released accounting on cancellation would fail
+    /// the "still charged while queued" assertion.
+    #[tokio::test]
+    async fn cancelled_create_holds_admission_charge_until_actor_finishes() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let payload_bytes = 128u64;
+        let processing_before = server.processing.load(Ordering::Relaxed);
+        let bytes_before = server.pipeline_bytes.load(Ordering::Relaxed);
+
+        // Park the create-priority queue on ONE chosen partition: a barrier job
+        // at Low priority runs FIRST (FIFO within a priority) and blocks until
+        // released, so the create queued behind it stays pending on the actor.
+        // `for_create()` round-robins across partitions, so the create is
+        // submitted through the partition-pinned `submit_create_detached_on`
+        // onto the SAME actor the barrier parks — otherwise the two could land
+        // on different partitions and the barrier would not order the create.
+        let create_partition = server.engine.for_create().stats().partition;
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+        let barrier_engine = create_engine.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = tokio::spawn(async move {
+            barrier_engine
+                .with_low(move |_journal| {
+                    // Signal the barrier holds the actor, then park until released.
+                    let _ = parked_tx.send(());
+                    release_rx.blocking_recv().ok();
+                })
+                .await;
+        });
+        parked_rx
+            .await
+            .expect("the barrier job is running on the actor");
+
+        let accounting = CreateAccounting::enter(&server, payload_bytes);
+        // The charge is visible from the moment the request arrives.
+        assert_eq!(
+            server.processing.load(Ordering::Relaxed),
+            processing_before + 1
+        );
+        assert_eq!(
+            server.pipeline_bytes.load(Ordering::Relaxed),
+            bytes_before + payload_bytes
+        );
+        let rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    std::collections::BTreeMap::new(),
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        // Cancel the caller while its create is still QUEUED behind the barrier.
+        drop(rx);
+
+        // Give the detached owner every chance to (wrongly) release the charge
+        // on cancellation: while the barrier holds the actor the create cannot
+        // finish, so the charge MUST remain entered.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            server.processing.load(Ordering::Relaxed),
+            processing_before + 1,
+            "the processing slot stays charged while the cancelled create is still queued"
+        );
+        assert_eq!(
+            server.pipeline_bytes.load(Ordering::Relaxed),
+            bytes_before + payload_bytes,
+            "the payload bytes stay charged while the cancelled create is still queued"
+        );
+
+        // Release the barrier: the create now runs to completion and the
+        // detached owner releases the charge once the actor finishes.
+        release_tx.send(()).expect("the barrier is parked");
+        barrier.await.expect("the barrier job completes");
+        let mut released = false;
+        for _ in 0..100 {
+            if server.processing.load(Ordering::Relaxed) == processing_before
+                && server.pipeline_bytes.load(Ordering::Relaxed) == bytes_before
+            {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "the detached owner released the admission charge after the actor finished"
+        );
+    }
+
+    /// #1582: the non-Raft detached create owner drives the cross-partition
+    /// routing pump BEFORE answering its observer, so a client that publishes a
+    /// message the moment the create returns finds the subscription already
+    /// open — the create-then-publish ordering `main` has always given. An
+    /// answer-before-routing implementation lets that immediate publish
+    /// overtake the subscription open; the unmatched message is discarded and
+    /// the instance stays parked.
+    ///
+    /// Deterministic: the create's `Commit` is replaced by a
+    /// [`Commit::from_ack`] the test holds open, so the owner provably parks in
+    /// `wait_durable()` (with routing not yet started) until the gate opens.
+    /// After the gate opens the observer must resolve only because routing
+    /// already ran: the publish right after the answer MUST correlate, with no
+    /// wait for the subscription to arm.
+    #[tokio::test]
+    async fn detached_create_publish_right_after_answer_correlates() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+
+        // A correlation key whose canonical subscription partition differs from
+        // the create's partition, so the opening follow-up is genuinely routed.
+        let create_partition = server.engine.for_create().stats().partition;
+        let mut chosen: Option<String> = None;
+        for i in 0..256u32 {
+            let order = format!("stall-{i}");
+            if nanobpmn_engine_core::subscription_partition(&order, 4) != create_partition {
+                chosen = Some(order);
+                break;
+            }
+        }
+        let order = chosen.expect("a cross-partition correlation key exists");
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+
+        // The durability gate the test holds open: the create's commit is
+        // replaced by this ack, so the owner blocks in `wait_durable()` until
+        // the test releases it — the stand-in for a slow routing target.
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached(accounting, move |engine| {
+            let (process_id, sel_key, sel_ver) =
+                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
+            let mut created = apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    variables,
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))?;
+            created.commit = Commit::from_ack(ack_rx);
+            Ok(created)
+        });
+
+        // While the durability gate is shut the observer must be UNANSWERED —
+        // the reply is gated on durability, and routing has not even started.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut rx = rx;
+        assert!(
+            rx.try_recv().is_err(),
+            "no answer before the create is durable"
+        );
+
+        // Open the gate: the write is now durable. The owner drives the routing
+        // pump FIRST and answers only once the cross-partition subscription is
+        // open, so the observer resolves with routing already complete.
+        ack_tx.send(()).expect("the durability gate is held");
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the create is answered once routing has run")
+            .expect("the detached owner is alive")
+            .expect("the create applied");
+        assert!(created.instance_key > 0, "a real instance key");
+
+        // The guarantee the ordering buys: a publish issued the MOMENT the
+        // create returns correlates — the subscription is already open on its
+        // canonical partition, so the message is not discarded as unmatched.
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".to_string(),
+                order.clone(),
+                std::collections::BTreeMap::new(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the publish applies");
+        assert_eq!(
+            correlated,
+            Some(created.instance_key),
+            "a publish right after the create answer correlates to the new instance"
+        );
+    }
+
+    /// #1582: a source with no replica of the target rotates its forwards
+    /// through the target's replica set (never pinned to the static owner,
+    /// which may be a dead former leader), skipping itself.
+    #[test]
+    fn forward_candidate_rotates_through_the_replica_set() {
+        let picks: Vec<u32> = (0..6)
+            .filter_map(|a| ServerImpl::rotate_replica(&[1, 2, 3], 0, a))
+            .collect();
+        assert_eq!(picks, vec![1, 2, 3, 1, 2, 3]);
+        // Self is skipped (a replica host normally uses its leader view, but
+        // the rotation itself must never address this node).
+        let picks: Vec<u32> = (0..4)
+            .filter_map(|a| ServerImpl::rotate_replica(&[1, 2, 3], 2, a))
+            .collect();
+        assert_eq!(picks, vec![1, 3, 1, 3]);
+        assert_eq!(ServerImpl::rotate_replica(&[2], 2, 0), None);
+    }
+
+    /// #1582: only keyed (deduped) routed commands may have their proposal
+    /// observation time out; an unkeyed publish must not, or a late commit
+    /// plus a republish would create duplicate message-start instances.
+    #[test]
+    fn only_keyed_routed_commands_are_observation_bounded() {
+        let publish = Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            variables: Default::default(),
+            business_id: None,
+        };
+        assert!(!ServerImpl::routed_command_is_idempotent(&publish));
+        let num_partitions = 4;
+        let opening = Event::MessageSubscriptionOpening {
+            subscription_key: 1,
+            instance_key: 2,
+            element_instance_key: 3,
+            element_id: "c".into(),
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            delivery_key: Default::default(),
+        };
+        let (_, routed) =
+            ServerImpl::route_event(&opening, num_partitions).expect("opening is routable");
+        // A zero (legacy) delivery key is the engine's no-dedup sentinel.
+        assert!(!ServerImpl::routed_command_is_idempotent(&routed));
+        assert_eq!(ServerImpl::redrive_attempts(&routed), 1);
+        assert_eq!(ServerImpl::redrive_attempts(&publish), 1);
+        let keyed_opening = match opening {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                ..
+            } => Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                delivery_key: 7,
+            },
+            other => other,
+        };
+        let (_, keyed) =
+            ServerImpl::route_event(&keyed_opening, num_partitions).expect("opening is routable");
+        assert!(ServerImpl::routed_command_is_idempotent(&keyed));
+        assert_eq!(
+            ServerImpl::redrive_attempts(&keyed),
+            ROUTE_REDRIVE.max_attempts
+        );
+    }
+
+    /// #1582: the observer of a detached proposal never sees routable
+    /// follow-ups — the proposer task alone routes them, so a result that
+    /// races the observer's timeout cannot drop them nor route them twice.
+    #[test]
+    fn observed_proposal_result_excludes_routable_follow_ups() {
+        let opening = Event::MessageSubscriptionOpening {
+            subscription_key: 1,
+            instance_key: 2,
+            element_instance_key: 3,
+            element_id: "c".into(),
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            delivery_key: 9,
+        };
+        let other = Event::DecisionInstanceDeleted {
+            instance_key: 2,
+            decision_evaluation_key: 4,
+        };
+        assert!(ServerImpl::is_routable_event(&opening));
+        let item = crate::raft::ReplicatedItem {
+            events: vec![opening, other.clone()],
+            error: None,
+        };
+        let stripped = ServerImpl::strip_routable(Ok(item)).expect("ok preserved");
+        assert_eq!(stripped.events, vec![other]);
+    }
+
+    /// #1582: transient non-delivery (5xx, the 503 leader race, transport
+    /// failures) is retried; a 4xx is permanent; the backoff is bounded.
+    #[test]
+    fn route_attempt_classification_and_backoff_are_bounded() {
+        use nano_server_raft::peer::{PeerError, PeerResult};
+        assert_eq!(
+            RouteAttempt::from_status(200, String::new()),
+            RouteAttempt::Delivered
+        );
+        assert!(matches!(
+            RouteAttempt::from_status(404, "x".into()),
+            RouteAttempt::Rejected(404, _)
+        ));
+        assert!(matches!(
+            RouteAttempt::from_status(503, "x".into()),
+            RouteAttempt::Transient(_)
+        ));
+        assert!(matches!(
+            RouteAttempt::from_status(500, "x".into()),
+            RouteAttempt::Transient(_)
+        ));
+        for e in [
+            PeerError::Closed,
+            PeerError::Timeout,
+            PeerError::Connect("refused".into()),
+        ] {
+            assert!(matches!(
+                RouteAttempt::from_peer(Err(e)),
+                RouteAttempt::Transient(_)
+            ));
+        }
+        let reply = PeerResult {
+            status: 409,
+            body: Some(serde_json::Value::String("conflict".into())),
+        };
+        assert_eq!(
+            RouteAttempt::from_peer(Ok(reply)),
+            RouteAttempt::Rejected(409, "conflict".into())
+        );
+        assert_eq!(
+            ROUTE_REDRIVE.backoff(1),
+            std::time::Duration::from_millis(50)
+        );
+        assert_eq!(
+            ROUTE_REDRIVE.backoff(2),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(ROUTE_REDRIVE.backoff(40), ROUTE_REDRIVE.cap);
+        let total: std::time::Duration = (1..ROUTE_REDRIVE.max_attempts)
+            .map(|a| ROUTE_REDRIVE.backoff(a))
+            .sum();
+        assert!(
+            total >= std::time::Duration::from_secs(5),
+            "rides out an election: {total:?}"
+        );
+        assert!(
+            total <= std::time::Duration::from_secs(30),
+            "bounded: {total:?}"
+        );
+    }
+
+    /// #1582: a forwarded create whose transport outcome is AMBIGUOUS — the peer
+    /// link closed, or the request timed out, after the create may have been sent
+    /// — must NOT be retried when the create carries no business id, because the
+    /// peer may already have committed it and a blind retry mints a duplicate
+    /// instance. The bounded forward loop (`forward_create_bounded`) surfaces such
+    /// an outcome as a retryable-via-client 500 instead of re-driving, mirroring
+    /// the REST path (`forward_create_once`), which already maps any transport
+    /// `Err` to a non-rerouted 502. A create WITH a business id dedups on retry,
+    /// so only the unkeyed case is guarded.
+    ///
+    /// This pins the *classification* the guard relies on: a link-closed reply is
+    /// distinguishable from a timeout, and BOTH are ambiguous for an unkeyed
+    /// create (unlike a deterministic 400/409 rejection, which is safe to surface
+    /// directly, or a clean 200, which is a committed success).
+    #[test]
+    fn unkeyed_create_ambiguous_outcomes_are_not_retried() {
+        use nano_server_raft::peer::{PeerResult, is_link_closed_result};
+        // The two ambiguous outcomes the guard must catch for an unkeyed create:
+        // a synthetic link-closed reply (status 502 + LINK_CLOSED_BODY) ...
+        let link_closed = PeerResult {
+            status: 502,
+            body: Some(serde_json::Value::String(
+                nano_server_raft::peer::LINK_CLOSED_BODY.into(),
+            )),
+        };
+        assert!(is_link_closed_result(&link_closed));
+        // ... and a transport timeout, which surfaces as `Err(PeerError::Timeout)`
+        // (distinct from a link-closed `Ok` reply) and is matched by the
+        // `Err(e) if business_id.is_none()` guard arm.
+        // A deterministic rejection is NOT ambiguous and must keep surfacing
+        // directly (the 400/409 short-circuit arms precede the guard).
+        let conflict = PeerResult {
+            status: 409,
+            body: Some(serde_json::Value::String("conflict".into())),
+        };
+        assert!(!is_link_closed_result(&conflict));
+        // A clean success is likewise unambiguous.
+        let ok = PeerResult {
+            status: 200,
+            body: None,
+        };
+        assert!(!is_link_closed_result(&ok) && is_ok_status(ok.status));
     }
 
     /// start -> serviceTask "work" with an interrupting message boundary keyed on
@@ -46694,7 +52987,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("abort-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, completed) = server
                 .create_for_stream(Some("guarded".into()), None, variables)
@@ -46719,7 +53012,8 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "abort-order".into(),
                 order.clone(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
+                None,
                 None,
                 None,
             )
@@ -46776,7 +53070,8 @@ mod subscription_placement_tests {
                 .correlate_message_everywhere(
                     "order-placed".into(),
                     format!("order-{i}"),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
+                    None,
                     None,
                     None,
                 )
@@ -46850,7 +53145,7 @@ mod subscription_placement_tests {
         let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
         for i in 0..64u32 {
             let order = format!("svc-order-{i}");
-            let mut variables = std::collections::HashMap::new();
+            let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let (key, _completed) = server
                 .create_for_stream(Some("work-then-wait".into()), None, variables)
@@ -46877,7 +53172,7 @@ mod subscription_placement_tests {
             .find(|k| nanobpmn_engine_core::partition_of(*k) == p_inst)
             .expect("our instance's job is activatable");
         server
-            .complete_job_for_stream(job_key, std::collections::HashMap::new(), None, None)
+            .complete_job_for_stream(job_key, std::collections::BTreeMap::new(), None, None)
             .await
             .expect("complete succeeds")
             .wait()
@@ -46892,7 +53187,8 @@ mod subscription_placement_tests {
                 .correlate_message_local(
                     "payment-received".into(),
                     order.clone(),
-                    std::collections::HashMap::new(),
+                    std::collections::BTreeMap::new(),
+                    None,
                     None,
                     None,
                 )
@@ -46958,7 +53254,8 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "order-placed".into(),
                 key,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
+                None,
                 None,
                 None,
             )
@@ -46986,7 +53283,7 @@ mod subscription_placement_tests {
             .await
             .expect("deploy succeeds");
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str("order-x".into()));
         let (instance_key, completed) = server
             .create_for_stream(Some("await-payment".into()), None, variables)
@@ -46998,7 +53295,8 @@ mod subscription_placement_tests {
             .correlate_message_local(
                 "payment-received".into(),
                 "order-x".into(),
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
+                None,
                 None,
                 None,
             )
@@ -47506,7 +53804,7 @@ mod task_result_mapping_tests {
             denied_reason: Some("needs manager".to_string()),
             corrections: UserTaskCorrections::default(),
         });
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("amount".to_string(), Value::Int(42));
 
         let rejection = reject_task_result_with_variables(&task_result, &variables)
@@ -47525,10 +53823,10 @@ mod task_result_mapping_tests {
             denied_reason: Some("needs manager".to_string()),
             corrections: UserTaskCorrections::default(),
         });
-        let empty = std::collections::HashMap::new();
+        let empty = std::collections::BTreeMap::new();
         assert!(reject_task_result_with_variables(&task_result, &empty).is_none());
 
-        let mut variables = std::collections::HashMap::new();
+        let mut variables = std::collections::BTreeMap::new();
         variables.insert("amount".to_string(), Value::Int(42));
         assert!(reject_task_result_with_variables(&None, &variables).is_none());
     }
@@ -47714,6 +54012,252 @@ mod expression_conditional_tests {
         }
     }
 
+    /// #1296 / Camunda 8.10 `referencedSecrets`: the trusted secret references
+    /// an evaluation surfaced — a literal `camunda.secrets.<name>` path used in
+    /// the expression itself, plus any reference carried by a
+    /// `SECRET_REFERENCE`-kind cluster variable the expression READ. References
+    /// appearing only in request-body variables or JSON-kind cluster variables
+    /// are untrusted and excluded.
+    #[tokio::test]
+    async fn expression_evaluation_reports_trusted_referenced_secrets() {
+        use apis::expression::EvaluateExpressionResponse as Resp;
+
+        let srv = server();
+        // A JSON-kind cluster variable carrying a reference-shaped string is
+        // NOT a trusted source.
+        srv.cluster_variable_create(
+            None,
+            "plain_ref",
+            super::json_to_value(&serde_json::json!("camunda.secrets.UNTRUSTED")),
+            None,
+            super::ClusterVariableMetadata::new(),
+        )
+        .await
+        .expect("create plain_ref");
+        // A SECRET_REFERENCE-kind cluster variable IS trusted when read.
+        let mut req = models::CreateClusterVariableRequest {
+            name: "token_ref".to_string(),
+            value: types::Object(serde_json::json!("camunda.secrets.TOKEN")),
+            metadata: None,
+            kind: Some(models::ClusterVariableKindEnum::SecretReference),
+        };
+        assert!(matches!(
+            srv.create_global_cluster_variable_impl(&req).await.unwrap(),
+            apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+        req.name = "unused_ref".to_string();
+        req.value = types::Object(serde_json::json!("camunda.secrets.UNUSED"));
+        assert!(matches!(
+            srv.create_global_cluster_variable_impl(&req).await.unwrap(),
+            apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+
+        async fn eval(
+            srv: &ServerImpl,
+            expr: &str,
+            variables: Option<types::Nullable<std::collections::HashMap<String, types::Object>>>,
+        ) -> models::ExpressionEvaluationResult {
+            let body = models::ExpressionEvaluationRequest {
+                expression: expr.to_string(),
+                tenant_id: None,
+                scope_key: None,
+                variables,
+            };
+            match srv.evaluate_expression_impl(&body).await.unwrap() {
+                Resp::Status200_ExpressionEvaluatedSuccessfully(r) => r,
+                other => panic!("expected 200 for '{expr}', got {other:?}"),
+            }
+        }
+        let secret_names = |r: &models::ExpressionEvaluationResult| {
+            let mut names: Vec<String> = r
+                .referenced_secrets
+                .iter()
+                .map(|s| s.secret_name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+
+        // A literal `camunda.secrets.<name>` path in the expression is trusted.
+        // The reference evaluates to its own text (Nano never resolves it).
+        let r = eval(&srv, "camunda.secrets.DIRECT", None).await;
+        assert_eq!(secret_names(&r), vec!["DIRECT"]);
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::json!("camunda.secrets.DIRECT"),
+            "a trusted reference passes through as its own text, never resolved"
+        );
+
+        // Reading a SECRET_REFERENCE cluster variable surfaces its reference.
+        let r = eval(&srv, "token_ref", None).await;
+        assert_eq!(secret_names(&r), vec!["TOKEN"]);
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::json!("camunda.secrets.TOKEN"),
+            "the cluster variable's reference text is returned verbatim"
+        );
+
+        // A JSON-kind cluster variable's reference-shaped value is untrusted,
+        // and an unread SECRET_REFERENCE variable contributes nothing.
+        let r = eval(&srv, "plain_ref", None).await;
+        assert!(
+            r.referenced_secrets.is_empty(),
+            "a JSON-kind variable is never a trusted source: {:?}",
+            r.referenced_secrets
+        );
+
+        // A request-body variable's reference-shaped value is untrusted too.
+        let r = eval(
+            &srv,
+            "body_ref",
+            vars(&[("body_ref", serde_json::json!("camunda.secrets.BODY"))]),
+        )
+        .await;
+        assert!(
+            r.referenced_secrets.is_empty(),
+            "request-body variables are never a trusted source: {:?}",
+            r.referenced_secrets
+        );
+    }
+
+    /// #1296 review findings: provenance is STRUCTURAL (fail-closed) and
+    /// tenant-aware, derived from one immutable snapshot. These regressions pin
+    /// the defect class a purely syntactic scan got wrong: (a) a shadowed
+    /// binding, skipped branch, or short-circuited operand never surfaces a
+    /// reference; (b) a reference nested in a STRUCTURED SECRET_REFERENCE value
+    /// is surfaced by a direct member-path read; (c) the requested tenant's
+    /// overlay (not just globals) is applied and its kind drives provenance.
+    #[tokio::test]
+    async fn expression_evaluation_provenance_is_evaluation_driven_and_tenant_aware() {
+        let srv = server();
+        // A SECRET_REFERENCE global carrying a STRUCTURED value (reference text
+        // nested in an object) — finding: provenance must survive projection.
+        let mut cfg = models::CreateClusterVariableRequest {
+            name: "cfg".to_string(),
+            value: types::Object(serde_json::json!({"token": "camunda.secrets.NESTED"})),
+            metadata: None,
+            kind: Some(models::ClusterVariableKindEnum::SecretReference),
+        };
+        assert!(matches!(
+            srv.create_global_cluster_variable_impl(&cfg).await.unwrap(),
+            apis::cluster_variable::CreateGlobalClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+        // A tenant-scoped SECRET_REFERENCE shadowing nothing globally.
+        cfg.name = "tenant_ref".to_string();
+        cfg.value = types::Object(serde_json::json!("camunda.secrets.ACME"));
+        let tenant_path = models::CreateTenantClusterVariablePathParams {
+            tenant_id: "acme".to_string(),
+        };
+        assert!(matches!(
+            srv.create_tenant_cluster_variable_impl(&tenant_path, &cfg)
+                .await
+                .unwrap(),
+            apis::cluster_variable::CreateTenantClusterVariableResponse::Status200_ClusterVariableCreated(_)
+        ));
+
+        async fn eval_t(
+            srv: &ServerImpl,
+            expr: &str,
+            tenant_id: Option<&str>,
+            variables: Option<types::Nullable<std::collections::HashMap<String, types::Object>>>,
+        ) -> models::ExpressionEvaluationResult {
+            use apis::expression::EvaluateExpressionResponse as Resp;
+            let body = models::ExpressionEvaluationRequest {
+                expression: expr.to_string(),
+                tenant_id: tenant_id.map(str::to_string),
+                scope_key: None,
+                variables,
+            };
+            match srv.evaluate_expression_impl(&body).await.unwrap() {
+                Resp::Status200_ExpressionEvaluatedSuccessfully(r) => r,
+                other => panic!("expected 200 for '{expr}', got {other:?}"),
+            }
+        }
+        let names = |r: &models::ExpressionEvaluationResult| {
+            let mut n: Vec<String> = r
+                .referenced_secrets
+                .iter()
+                .map(|s| s.secret_name.clone())
+                .collect();
+            n.sort();
+            n
+        };
+
+        // (b) A member access into a structured SECRET_REFERENCE value surfaces
+        // the nested reference.
+        let r = eval_t(&srv, "cfg.token", None, None).await;
+        assert_eq!(names(&r), vec!["NESTED"]);
+
+        // (a) Fail-closed (PR #1636 round-8): a conditional is never a
+        // structural trusted-reference shape, so even the TAKEN branch's
+        // literal is not reported — post-hoc attribution across control flow
+        // is exactly the leak this guards (a condition on a trusted variable
+        // can launder an untrusted branch value).
+        let r = eval_t(
+            &srv,
+            "if false then camunda.secrets.SKIPPED else camunda.secrets.TAKEN",
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            names(&r).is_empty(),
+            "a conditional reports nothing under fail-closed provenance: {:?}",
+            r.referenced_secrets
+        );
+        // Short-circuited `or` never surfaces the right operand's reference.
+        let r = eval_t(&srv, "true or camunda.secrets.SKIPPED", None, None).await;
+        assert!(names(&r).is_empty());
+
+        // (a) A request-body variable SHADOWING a trusted cluster variable is
+        // untrusted: the body value (not the cluster variable's) is returned,
+        // and because the body binding is never a trusted carrier the shadowed
+        // cluster variable's NESTED reference is NOT surfaced.
+        let r = eval_t(
+            &srv,
+            "cfg",
+            None,
+            vars(&[("cfg", serde_json::json!("camunda.secrets.BODY"))]),
+        )
+        .await;
+        assert!(
+            names(&r).is_empty(),
+            "a body binding shadows the trusted cluster variable and is itself untrusted: {:?}",
+            r.referenced_secrets
+        );
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::json!("camunda.secrets.BODY"),
+            "the shadowing body value is returned, not the cluster variable's"
+        );
+
+        // (c) The requested tenant's overlay is applied: evaluating the
+        // tenant-scoped variable under tenant `acme` surfaces its reference…
+        let r = eval_t(&srv, "tenant_ref", Some("acme"), None).await;
+        assert_eq!(names(&r), vec!["ACME"]);
+        // …but under another tenant (or none) the variable is invisible, so the
+        // expression evaluates to null with no provenance.
+        let r = eval_t(&srv, "tenant_ref", None, None).await;
+        assert!(names(&r).is_empty());
+        assert_eq!(
+            match r.result {
+                types::Nullable::Present(o) => o.0,
+                types::Nullable::Null => serde_json::Value::Null,
+            },
+            serde_json::Value::Null,
+            "a tenant-scoped variable is invisible to other tenants"
+        );
+    }
+
     /// `next_stateless_key` must be strictly increasing and collision-free across
     /// a burst issued within the same millisecond — the defect class the previous
     /// `seq % 1_000` implementation reintroduced (keys wrapped and collided after
@@ -47742,15 +54286,93 @@ mod expression_conditional_tests {
         );
     }
 
+    /// Nano is single-tenant: a conditional evaluation scoped to any tenant
+    /// other than `<default>` is rejected with a `400` instead of running an
+    /// unscoped evaluation that would create instances outside that tenant —
+    /// both keyed and unkeyed (#932).
+    #[tokio::test]
+    async fn conditional_evaluation_rejects_a_non_default_tenant() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-tenant-proc")
+            .conditional_start_event("start", "=true")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        let definition_key = deploy_and_await_definition(&srv, proc).await;
+        for targeted in [false, true] {
+            let body = models::ConditionalEvaluationInstruction {
+                tenant_id: Some("tenant-a".to_string()),
+                process_definition_key: targeted
+                    .then(|| models::ProcessDefinitionKey(definition_key.to_string())),
+                variables: std::collections::HashMap::new(),
+            };
+            match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+                Resp::Status400_TheProvidedDataIsNotValid(p) => assert_eq!(p.status, 400),
+                other => panic!("expected 400 (targeted={targeted}), got {other:?}"),
+            }
+        }
+        // An explicit `<default>` tenant is the engine's own tenant: accepted.
+        let body = models::ConditionalEvaluationInstruction {
+            tenant_id: Some("<default>".to_string()),
+            process_definition_key: None,
+            variables: std::collections::HashMap::new(),
+        };
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                assert_eq!(r.tenant_id, "<default>");
+                assert_eq!(r.process_instances.len(), 1);
+            }
+            other => panic!("expected 200, got {other:?}"),
+        }
+    }
+
+    /// A conditional evaluation creates instances, so it obeys the shared create
+    /// admission policy: with the drain-stall hard valve engaged it is shed with
+    /// a `503` and creates nothing (#932).
+    #[tokio::test]
+    async fn conditional_evaluation_is_shed_by_create_admission() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-shed-proc")
+            .conditional_start_event("start", "=true")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        deploy_and_await_definition(&srv, proc).await;
+        srv.drain_guard().publish(true, true);
+        let body = models::ConditionalEvaluationInstruction {
+            tenant_id: None,
+            process_definition_key: None,
+            variables: std::collections::HashMap::new(),
+        };
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status503_TheServiceIsCurrentlyUnavailable(p) => {
+                assert_eq!(p.status, 503);
+            }
+            other => panic!("expected 503 while halted, got {other:?}"),
+        }
+        // and once the valve releases, the same evaluation proceeds.
+        srv.drain_guard().publish(false, false);
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                assert_eq!(r.process_instances.len(), 1);
+            }
+            other => panic!("expected 200 after release, got {other:?}"),
+        }
+    }
+
     /// A conditional evaluation with no targeted definition succeeds with a fresh
     /// evaluation key, the resolved tenant, and an empty `processInstances` list
-    /// (Nano has no root-level conditional start events to trigger).
+    /// when nothing deployed has a root-level conditional start event.
     #[tokio::test]
     async fn conditional_evaluation_returns_empty_result() {
         use apis::conditional::EvaluateConditionalsResponse as Resp;
         let srv = server();
         let body = models::ConditionalEvaluationInstruction {
-            tenant_id: Some("tenant-a".to_string()),
+            tenant_id: None,
             process_definition_key: None,
             variables: [(
                 "orderAmount".to_string(),
@@ -47761,7 +54383,7 @@ mod expression_conditional_tests {
         };
         match srv.evaluate_conditionals_impl(&body).await.unwrap() {
             Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
-                assert_eq!(r.tenant_id, "tenant-a");
+                assert_eq!(r.tenant_id, "<default>");
                 assert!(r.process_instances.is_empty());
                 assert!(
                     r.conditional_evaluation_key.0.parse::<u64>().is_ok(),
@@ -47818,32 +54440,7 @@ mod expression_conditional_tests {
             .connect("start", "end")
             .build()
             .expect("valid process");
-        let mut names = std::collections::HashMap::new();
-        names.insert("cond-proc".to_string(), "cond.bpmn".to_string());
-        srv.deploy_resources_locally(
-            vec![proc],
-            &names,
-            Vec::new(),
-            &std::collections::HashMap::new(),
-            "<default>",
-        )
-        .await
-        .expect("deploy cond-proc");
-
-        // The read-model projection is asynchronous; poll for the definition key.
-        let mut key = None;
-        for _ in 0..300 {
-            for pd in srv.store.process_definitions() {
-                if pd.process_id == "cond-proc" {
-                    key = Some(pd.key);
-                }
-            }
-            if key.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        let key = key.expect("cond-proc definition is projected");
+        let key = deploy_and_await_definition(&srv, proc).await;
 
         let body = models::ConditionalEvaluationInstruction {
             tenant_id: None,
@@ -47856,6 +54453,93 @@ mod expression_conditional_tests {
                 assert!(r.process_instances.is_empty());
             }
             other => panic!("expected 200 for a deployed definition, got {other:?}"),
+        }
+    }
+
+    /// Deploys `proc` locally and polls the (asynchronous) read-model
+    /// projection until its definition key is visible.
+    async fn deploy_and_await_definition(
+        srv: &ServerImpl,
+        proc: nanobpmn_engine_core::ProcessDefinition,
+    ) -> u64 {
+        let process_id = proc.id.clone();
+        let mut names = std::collections::HashMap::new();
+        names.insert(process_id.clone(), format!("{process_id}.bpmn"));
+        srv.deploy_resources_locally(
+            vec![proc],
+            &names,
+            Vec::new(),
+            &std::collections::HashMap::new(),
+            "<default>",
+        )
+        .await
+        .expect("deploy process");
+        for _ in 0..300 {
+            if let Some(pd) = srv
+                .store
+                .process_definitions()
+                .into_iter()
+                .find(|pd| pd.process_id == process_id)
+            {
+                return pd.key;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{process_id} definition is never projected");
+    }
+
+    /// A deployed process whose root-level conditional start event condition
+    /// is satisfied by the supplied variables is started by the evaluation
+    /// (#932): the created instance is reported in `processInstances`, and an
+    /// unsatisfied condition starts nothing.
+    #[tokio::test]
+    async fn conditional_evaluation_starts_a_satisfied_conditional_start_event() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-start-proc")
+            .conditional_start_event("start", "=orderAmount > 100")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        let definition_key = deploy_and_await_definition(&srv, proc).await;
+
+        let evaluate = |amount: i64, targeted: bool| models::ConditionalEvaluationInstruction {
+            tenant_id: None,
+            process_definition_key: targeted
+                .then(|| models::ProcessDefinitionKey(definition_key.to_string())),
+            variables: [(
+                "orderAmount".to_string(),
+                types::Object(serde_json::json!(amount)),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        for targeted in [false, true] {
+            match srv
+                .evaluate_conditionals_impl(&evaluate(1000, targeted))
+                .await
+                .unwrap()
+            {
+                Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                    assert_eq!(r.process_instances.len(), 1, "targeted={targeted}");
+                    let created = &r.process_instances[0];
+                    assert_eq!(created.process_definition_key.0, definition_key.to_string());
+                    assert!(created.process_instance_key.0.parse::<u64>().is_ok());
+                }
+                other => panic!("expected 200, got {other:?}"),
+            }
+            match srv
+                .evaluate_conditionals_impl(&evaluate(50, targeted))
+                .await
+                .unwrap()
+            {
+                Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                    assert!(r.process_instances.is_empty(), "targeted={targeted}");
+                }
+                other => panic!("expected 200, got {other:?}"),
+            }
         }
     }
 }
@@ -47912,7 +54596,7 @@ mod batch_operation_tests {
             .create_for_stream(
                 Some("to-cancel".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create the instance");
@@ -48528,7 +55212,7 @@ mod search_process_instances_tags_filter_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             business_id: None,
@@ -48637,7 +55321,7 @@ mod search_process_instances_tenant_suspended_unprojected_filter_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -48803,7 +55487,7 @@ mod search_process_instances_suspend_resume_tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 1_700_000_000_000,
             tags: Vec::new(),
             business_id: None,
@@ -48961,6 +55645,444 @@ mod search_process_instances_suspend_resume_tests {
             ),
             "an unparseable key is a 400 on resumption"
         );
+    }
+}
+
+#[cfg(test)]
+mod search_filter_honesty_tests {
+    //! Regression coverage for the "silently ignored filter" defect class
+    //! (PR #1586 review): a filter field the API advertises but the predicate
+    //! never evaluates *widens* the caller's restriction while looking like a
+    //! match — the worst failure mode for a search API. Every field the
+    //! incident / process-instance / user-task predicates declare must either
+    //! narrow the result set or honestly exclude (matching against an absent
+    //! value, so `$exists: false` still works). These tests seed the read model
+    //! directly and drive the real `*_impl` handlers.
+
+    use nanobpmn_engine_core::{Event, IncidentKind};
+
+    use super::*;
+
+    /// Seed two process instances on *different* process definitions (so a
+    /// processDefinitionId filter can tell them apart), each with tags and a
+    /// business id.
+    fn seed_instances(server: &ServerImpl) {
+        let created = |key: u64, process_id: &str, tags: &[&str], business_id: Option<&str>| {
+            Event::ProcessInstanceCreated {
+                instance_key: key,
+                process_id: process_id.to_string(),
+                variables: std::collections::BTreeMap::new(),
+                created_at: 1_700_000_000_000,
+                tags: tags.iter().map(|t| (*t).to_string()).collect(),
+                business_id: business_id.map(str::to_string),
+                process_definition_key: 0,
+                version: 1,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+            }
+        };
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1, "order-process", &["blue"], Some("order-7")),
+                &created(2, "returns-process", &["red"], Some("return-3")),
+            ])
+            .unwrap();
+    }
+
+    async fn search_instances(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_instance_search_honours_tags_suspended_date_and_definition_metadata() {
+        let server = ServerImpl::default();
+        seed_instances(&server);
+        // Suspend instance 1 at a known instant so suspendedDate can select it.
+        server.store.shards()[0]
+            .1
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 1,
+                at: 1_700_000_500_000,
+            }])
+            .unwrap();
+
+        // Baseline: both instances.
+        let all = search_instances(&server, models::ProcessInstanceFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both instances");
+
+        // `tags` narrows to the instance carrying every listed tag.
+        let tagged = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                tags: Some(vec![models::Tag("blue".to_string())]),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(tagged.page.total_items, 1);
+        assert_eq!(tagged.items[0].process_instance_key.0, "1");
+        let no_tag = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                tags: Some(vec![models::Tag("no-such-tag".to_string())]),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            no_tag.page.total_items, 0,
+            "a tag nothing carries must match nothing — not widen to all rows"
+        );
+
+        // `suspendedDate` narrows to the instance suspended in the range.
+        let suspended = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                suspended_date: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_gte: Some(
+                            chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(suspended.page.total_items, 1);
+        assert_eq!(suspended.items[0].process_instance_key.0, "1");
+
+        // `processDefinitionName` / `processDefinitionVersionTag` are not
+        // projected onto the instance row: a value filter honestly matches
+        // nothing (never widens), while `$exists: false` matches both.
+        let by_name = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                process_definition_name: Some(models::StringFilterProperty::String(
+                    "Order Process".to_string(),
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            by_name.page.total_items, 0,
+            "an unprojected name filter must exclude, not widen"
+        );
+        let name_absent = search_instances(
+            &server,
+            models::ProcessInstanceFilter {
+                process_definition_name: Some(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedStringFilter::new()
+                    },
+                )),
+                ..models::ProcessInstanceFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            name_absent.page.total_items, 2,
+            "$exists: false on an unprojected field matches every row"
+        );
+    }
+
+    /// Seed one incident per process instance (different definitions).
+    fn seed_incidents(server: &ServerImpl) {
+        seed_instances(server);
+        let raised = |key: u64, instance: u64, reason: &str, at: u64| Event::IncidentRaised {
+            incident_key: key,
+            instance_key: instance,
+            element_instance_key: 100 + instance,
+            element_id: "task".to_string(),
+            kind: IncidentKind::JobNoRetries,
+            reason: reason.to_string(),
+            job_key: Some(200 + instance),
+            created_at: at,
+            redrive: None,
+        };
+        server.store.shards()[0]
+            .1
+            .export(&[
+                &raised(11, 1, "order failed", 1_700_000_100_000),
+                &raised(22, 2, "return failed", 1_700_000_200_000),
+            ])
+            .unwrap();
+    }
+
+    async fn search_incidents(
+        server: &ServerImpl,
+        filter: models::IncidentFilter,
+    ) -> models::IncidentSearchQueryResult {
+        let body = Some(models::IncidentSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_incidents_impl(&body).await {
+            Ok(apis::incident::SearchIncidentsResponse::Status200_TheIncidentSearchResult(r)) => r,
+            other => panic!("expected a 200 incident search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incident_search_honours_process_definition_id_and_creation_time() {
+        let server = ServerImpl::default();
+        seed_incidents(&server);
+
+        let all = search_incidents(&server, models::IncidentFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both incidents");
+
+        // `processDefinitionId` narrows to the incident of that definition's
+        // instance — the field the PR #1586 review caught being ignored.
+        let narrowed = search_incidents(
+            &server,
+            models::IncidentFilter {
+                process_definition_id: Some(models::StringFilterProperty::String(
+                    "order-process".to_string(),
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(narrowed.page.total_items, 1);
+        assert_eq!(narrowed.items[0].incident_key.0, "11");
+        let widened = search_incidents(
+            &server,
+            models::IncidentFilter {
+                process_definition_id: Some(models::StringFilterProperty::String(
+                    "no-such-process".to_string(),
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            widened.page.total_items, 0,
+            "a non-matching processDefinitionId must exclude, not widen"
+        );
+
+        // `creationTime` narrows by the incident's creation timestamp.
+        let recent = search_incidents(
+            &server,
+            models::IncidentFilter {
+                creation_time: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_gte: Some(
+                            chrono::DateTime::from_timestamp_millis(1_700_000_150_000).unwrap(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::IncidentFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(recent.page.total_items, 1);
+        assert_eq!(recent.items[0].incident_key.0, "22");
+    }
+
+    /// Seed one user task per instance with distinct business ids, priorities
+    /// and candidate assignments.
+    fn seed_user_tasks(server: &ServerImpl) {
+        seed_instances(server);
+        let task = |key: u64,
+                    instance: u64,
+                    assignee: Option<&str>,
+                    groups: &[&str],
+                    priority: i32,
+                    due: Option<&str>| Event::UserTaskCreated {
+            user_task_key: key,
+            instance_key: instance,
+            element_instance_key: 300 + instance,
+            element_id: "review".to_string(),
+            created_at: 1_700_000_300_000 + key,
+            assignee: assignee.map(str::to_string),
+            candidate_groups: groups.iter().map(|g| (*g).to_string()).collect(),
+            candidate_users: Vec::new(),
+            due_date: due.map(str::to_string),
+            follow_up_date: None,
+            priority,
+            form_key: None,
+            external_form_reference: None,
+        };
+        server.store.shards()[0]
+            .1
+            .export(&[
+                &task(
+                    31,
+                    1,
+                    Some("alice"),
+                    &["ops"],
+                    50,
+                    Some("2024-01-01T00:00:00Z"),
+                ),
+                &task(32, 2, None, &["finance"], 80, None),
+            ])
+            .unwrap();
+    }
+
+    async fn search_tasks(
+        server: &ServerImpl,
+        filter: models::UserTaskFilter,
+    ) -> models::UserTaskSearchQueryResult {
+        let body = Some(models::UserTaskSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_user_tasks_impl(&body).await {
+            Ok(apis::user_task::SearchUserTasksResponse::Status200_TheUserTaskSearchResult(r)) => r,
+            other => panic!("expected a 200 user-task search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_task_search_honours_the_advertised_filters() {
+        let server = ServerImpl::default();
+        seed_user_tasks(&server);
+
+        let all = search_tasks(&server, models::UserTaskFilter::new()).await;
+        assert_eq!(all.page.total_items, 2, "baseline sees both tasks");
+
+        // `businessId` narrows to the task of the instance carrying it — the
+        // exact case the PR #1586 review cited.
+        let by_business = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                business_id: Some(models::StringFilterProperty::String("order-7".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_business.page.total_items, 1);
+        assert_eq!(by_business.items[0].user_task_key.0, "31");
+        let no_business = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                business_id: Some(models::StringFilterProperty::String(
+                    "no-such-order".to_string(),
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            no_business.page.total_items, 0,
+            "a non-matching businessId must exclude, not widen"
+        );
+
+        // `priority` narrows numerically.
+        let by_priority = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                priority: Some(models::IntegerFilterProperty::I32(80)),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_priority.page.total_items, 1);
+        assert_eq!(by_priority.items[0].user_task_key.0, "32");
+
+        // `processDefinitionId` narrows to the task of that definition.
+        let by_pd = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                process_definition_id: Some(models::ProcessDefinitionIdFilterProperty::String(
+                    "returns-process".to_string(),
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_pd.page.total_items, 1);
+        assert_eq!(by_pd.items[0].user_task_key.0, "32");
+
+        // `elementInstanceKey` narrows to the task with that element instance.
+        let by_eik = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                element_instance_key: Some(models::ElementInstanceKey("302".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_eik.page.total_items, 1);
+        assert_eq!(by_eik.items[0].user_task_key.0, "32");
+
+        // `candidateGroup` narrows to the tasks listing the group.
+        let by_group = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                candidate_group: Some(models::StringFilterProperty::String("ops".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_group.page.total_items, 1);
+        assert_eq!(by_group.items[0].user_task_key.0, "31");
+
+        // `dueDate` narrows by the parsed stored date; the task without a due
+        // date is excluded by a range operator (honest absent-value semantics).
+        let by_due = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                due_date: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                    models::AdvancedDateTimeFilter {
+                        dollar_lte: Some(
+                            chrono::DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                                .unwrap()
+                                .to_utc(),
+                        ),
+                        ..models::AdvancedDateTimeFilter::new()
+                    },
+                )),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_due.page.total_items, 1);
+        assert_eq!(by_due.items[0].user_task_key.0, "31");
+
+        // `name` is never projected (the result's name is always null): a
+        // value filter honestly matches nothing instead of widening.
+        let by_name = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                name: Some(models::StringFilterProperty::String("Review".to_string())),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(
+            by_name.page.total_items, 0,
+            "an unprojected name filter must exclude, not widen"
+        );
+
+        // `tags` is always empty on Nano tasks: any listed tag excludes.
+        let by_tags = search_tasks(
+            &server,
+            models::UserTaskFilter {
+                tags: Some(vec![models::Tag("blue".to_string())]),
+                ..models::UserTaskFilter::new()
+            },
+        )
+        .await;
+        assert_eq!(by_tags.page.total_items, 0);
     }
 }
 
@@ -50853,7 +57975,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("ca-top".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create ca-top");
@@ -51023,7 +58145,7 @@ mod call_activity_hierarchy_read_model_tests {
         let server = ServerImpl::default();
         deploy(&server, vec![parking_process("solo", "work")]).await;
         let (solo_key, _) = server
-            .create_for_stream(Some("solo".into()), None, std::collections::HashMap::new())
+            .create_for_stream(Some("solo".into()), None, std::collections::BTreeMap::new())
             .await
             .expect("create solo");
 
@@ -51100,7 +58222,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("ut-parent".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create ut-parent");
@@ -51108,7 +58230,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("ut-solo".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create ut-solo");
@@ -51176,7 +58298,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("bm-parent".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create bm-parent");
@@ -51255,7 +58377,7 @@ mod call_activity_hierarchy_read_model_tests {
             .create_for_stream(
                 Some("bm-state".into()),
                 None,
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
             )
             .await
             .expect("create bm-state");
@@ -51385,7 +58507,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created_with_tags = |instance_key: u64, tags: &[&str]| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             business_id: None,
@@ -51468,7 +58590,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -51585,7 +58707,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -51696,7 +58818,7 @@ mod call_activity_hierarchy_read_model_tests {
         let created = |instance_key: u64| Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -51951,7 +59073,12 @@ mod no_direct_engine_apply_guard {
     /// it was written for.
     const ALLOWED: &[&str] = &[
         // The canonical Raft-aware funnels themselves.
-        "ServerImpl::apply_partition_command",
+        "ServerImpl::apply_partition_command_ref",
+        // #1661: reconciles the lenient-completion flag on a journal that is its
+        // partition's ONLY replica — called solely on a single node (boot) and
+        // from the non-Raft tick branch; the Raft path proposes the same command
+        // through the log (`reconcile_lenient_completion_via_raft`).
+        "reconcile_lenient_completion_local",
         "ServerImpl::apply_create_command",
         // The single non-Raft fallback every job/stream mutation handler routes
         // its direct apply through (confining the apply to this one small helper,
@@ -52042,7 +59169,9 @@ mod no_direct_engine_apply_guard {
     /// runs first and `apply_command` only matches when not already part of an
     /// `apply_command_at` token.
     fn is_direct_apply_call(line: &str) -> bool {
-        contains_call_token(line, "apply_command_at") || contains_call_token(line, "apply_command")
+        contains_call_token(line, "apply_command_at")
+            || contains_call_token(line, "apply_command_ref_at")
+            || contains_call_token(line, "apply_command")
     }
 
     /// True when `line` contains a call to `token` used as either
@@ -52213,7 +59342,11 @@ mod no_direct_engine_apply_guard {
         // `ClusterVariableStore::new` from inheriting the `ServerImpl::new`
         // exemption. Keep this set of bare-name free functions explicit so a new
         // *method* entry cannot silently slip in unscoped.
-        const BARE_FREE_FNS: &[&str] = &["main", "apply_create_instance_direct"];
+        const BARE_FREE_FNS: &[&str] = &[
+            "main",
+            "apply_create_instance_direct",
+            "reconcile_lenient_completion_local",
+        ];
         for entry in ALLOWED {
             if BARE_FREE_FNS.contains(entry) {
                 continue;
@@ -52270,3 +59403,60 @@ mod publish_fanout_retry_tests {
         assert!(!retry(1, false, false, 8, 8), "bounded");
     }
 }
+
+/// Sort fields the shared REST sorters project (keep in lockstep with the
+/// `sort_items` match arms in the `search_*_impl` handlers; every other field
+/// falls back to entity-key order). The MCP adapter rejects anything outside
+/// these lists instead of silently mis-ordering.
+pub(crate) const INCIDENT_SORT_FIELDS: &[&str] = &[
+    "incidentKey",
+    "creationTime",
+    "state",
+    "errorType",
+    "processInstanceKey",
+    "elementId",
+    "elementInstanceKey",
+    "jobKey",
+    "processDefinitionId",
+    "processDefinitionKey",
+    "tenantId",
+];
+pub(crate) const PROCESS_INSTANCE_SORT_FIELDS: &[&str] = &[
+    "processInstanceKey",
+    "processDefinitionId",
+    "processDefinitionKey",
+    "state",
+    "businessId",
+    "startDate",
+    "suspendedDate",
+    "hasIncident",
+    "parentProcessInstanceKey",
+    "parentElementInstanceKey",
+    "processDefinitionVersion",
+    "endDate",
+    "processDefinitionName",
+    "processDefinitionVersionTag",
+    "tenantId",
+];
+pub(crate) const USER_TASK_SORT_FIELDS: &[&str] = &[
+    "userTaskKey",
+    "processInstanceKey",
+    "elementId",
+    "state",
+    "creationDate",
+    "businessId",
+    "priority",
+    "dueDate",
+    "followUpDate",
+    "name",
+    "completionDate",
+];
+pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
+    "processDefinitionKey",
+    "processDefinitionId",
+    "name",
+    "version",
+    "resourceName",
+    "versionTag",
+    "tenantId",
+];

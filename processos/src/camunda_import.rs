@@ -48,7 +48,7 @@
 //!   Other external inputs (messages, timers, user tasks) are **not** captured, so a
 //!   model that consumes them is only partially replayable — see `stimuli_truncated`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
@@ -221,8 +221,8 @@ struct InstAcc {
     outcome: Option<String>,
     /// element-instance-key → element accumulator (insertion order preserved).
     elem_order: Vec<i64>,
-    elems: HashMap<i64, ElemAcc>,
-    jobs: HashMap<i64, JobAcc>,
+    elems: BTreeMap<i64, ElemAcc>,
+    jobs: BTreeMap<i64, JobAcc>,
     incidents: Vec<IncidentOut>,
     creation_vars: Option<Json>,
     stimuli: Vec<StimulusOut>,
@@ -234,7 +234,7 @@ struct InstAcc {
 
 impl InstAcc {
     fn elem_mut(&mut self, key: i64, element_id: &str, bpmn_type: &str, ts: u64) -> &mut ElemAcc {
-        use std::collections::hash_map::Entry;
+        use std::collections::btree_map::Entry;
         match self.elems.entry(key) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
@@ -325,7 +325,7 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
     /// Returns the live `&mut InstAcc`, so callers never need a follow-up
     /// `get_mut().unwrap()` — the key is present by construction.
     fn touch<'a>(
-        insts: &'a mut HashMap<i64, InstAcc>,
+        insts: &'a mut BTreeMap<i64, InstAcc>,
         inst_order: &mut Vec<i64>,
         pik: i64,
     ) -> &'a mut InstAcc {
@@ -338,15 +338,15 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
     let mut order: Vec<usize> = (0..records.len()).collect();
     order.sort_by_key(|&i| (records[i].timestamp, records[i].position));
 
-    let mut insts: HashMap<i64, InstAcc> = HashMap::new();
+    let mut insts: BTreeMap<i64, InstAcc> = BTreeMap::new();
     let mut inst_order: Vec<i64> = Vec::new();
     // jobKey → processInstanceKey, so a JOB_BATCH ACTIVATED (which spans
     // instances and carries no processInstanceKey) can route activation back.
-    let mut job_to_inst: HashMap<i64, i64> = HashMap::new();
+    let mut job_to_inst: BTreeMap<i64, i64> = BTreeMap::new();
     // elementInstanceKey → processInstanceKey, so a SIGNAL_SUBSCRIPTION
     // correlation (which is keyed by its catch-event instance, not the process
     // instance) can route back to the instance that consumed the signal.
-    let mut eik_to_inst: HashMap<i64, i64> = HashMap::new();
+    let mut eik_to_inst: BTreeMap<i64, i64> = BTreeMap::new();
 
     for &i in &order {
         let r = &records[i];

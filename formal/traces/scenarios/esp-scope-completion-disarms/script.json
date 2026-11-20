@@ -1,0 +1,24 @@
+{
+  "description": "Completing the process instance closes the message event sub-process subscription; a later message correlates nowhere.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "esp-scope-completion-disarms",
+      "variables": {
+        "orderId": "order-1"
+      }
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    },
+    {
+      "op": "publishMessage",
+      "name": "cancel",
+      "correlationKey": "order-1",
+      "variables": {
+        "reason": "customer"
+      }
+    }
+  ]
+}

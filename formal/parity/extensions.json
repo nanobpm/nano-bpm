@@ -1,0 +1,61 @@
+{
+  "$comment": "The Nano-only EXTENSION register (#1261, slice 6 of #1240). Nano is a strict superset of Camunda 8: anything Camunda supports must behave EXACTLY as Zeebe does, so the ONLY surface allowed to differ is what Camunda rejects or does not have \u2014 a Nano-only EXTENSION. This register is that surface's single source of truth. RULES (enforced by formal/parity/extensions.mjs, the CI guard): (1) every entry names an element/attribute/API Camunda REJECTS or LACKS, with a filed `issue`; (2) parity checks SKIP a model that uses a registered extension \u2014 an extension is out of the parity oracle's scope BY DEFINITION; (3) the register NEVER lists a Camunda-surface behavioural difference \u2014 a difference on Camunda's surface is a Nano DEFECT (tracked in formal/traces/allowlist.json or formal/corpus/divergences.json), never an extension; (4) a registered extension that Camunda is found to ACCEPT is not an extension and must be removed (the guard fails). This is the Nano-only counterpart of the coverage matrix's `out-of-scope` cells (formal/parity/coverage.json): those are Zeebe cells with no Nano meaning; these are Nano behaviours with no Zeebe meaning. Keep the two \u2014 and the allowlist \u2014 as THREE separate lists: out-of-scope = Zeebe surface Nano does not implement; extensions = Nano surface Zeebe does not have; allowlist = a DEFECT on the shared surface.",
+  "extensions": [
+    {
+      "id": "bpmn:nano:cost",
+      "kind": "bpmn-attribute",
+      "issue": 1240,
+      "note": "Per-element cost annotation (`<nano:cost value=\u2026 currency=\u2026 per=\u2026/>` inside `<bpmn:extensionElements>`), read by processos' what-if annotation survey. Camunda 8 has no cost semantics; the tag is inert metadata to the engine (it deploys clean and never changes token flow), so it is a Nano-only extension, not a behavioural difference.",
+      "match": {
+        "xmlLocalName": "cost",
+        "xmlNamespace": "http://nano.camunda.io/schema/semantic/1.0"
+      },
+      "inert": true
+    },
+    {
+      "id": "bpmn:nano:time",
+      "kind": "bpmn-attribute",
+      "issue": 1240,
+      "note": "Per-element timing annotation (`<nano:time p50=\u2026 p99=\u2026/>`), the duration counterpart of `nano:cost`. Inert to the engine; Camunda 8 lacks it.",
+      "match": {
+        "xmlLocalName": "time",
+        "xmlNamespace": "http://nano.camunda.io/schema/semantic/1.0"
+      },
+      "inert": true
+    },
+    {
+      "id": "bpmn:nano:role",
+      "kind": "bpmn-attribute",
+      "issue": 1240,
+      "note": "Per-element role annotation (`<nano:role>\u2026</nano:role>`), a processos what-if label. Inert to the engine; Camunda 8 lacks it.",
+      "match": {
+        "xmlLocalName": "role",
+        "xmlNamespace": "http://nano.camunda.io/schema/semantic/1.0"
+      },
+      "inert": true
+    },
+    {
+      "id": "bpmn:nano:sla",
+      "kind": "bpmn-attribute",
+      "issue": 1240,
+      "note": "Per-element service-level annotation (`<nano:sla>\u2026</nano:sla>`). Inert to the engine; Camunda 8 lacks it. Stands in for the open-ended `nano:*` semantic-annotation family processos round-trips.",
+      "match": {
+        "xmlLocalName": "sla",
+        "xmlNamespace": "http://nano.camunda.io/schema/semantic/1.0"
+      },
+      "inert": true
+    },
+    {
+      "id": "bpmn:nano:flowClass",
+      "kind": "bpmn-attribute",
+      "issue": 1240,
+      "note": "Sequence-flow classification annotation (`<nano:flowClass>…</nano:flowClass>`), the fourth type of the nano-moddle descriptor (processos/assets/bpmn/nano-moddle.json) — its descriptor restricts it to `bpmn:SequenceFlow`, so the acceptance probe carries it on a flow, not a task (`match.on: \"sequenceFlow\"`). Inert to the engine; Camunda 8 lacks it.",
+      "match": {
+        "xmlLocalName": "flowClass",
+        "xmlNamespace": "http://nano.camunda.io/schema/semantic/1.0",
+        "on": "sequenceFlow"
+      },
+      "inert": true
+    }
+  ]
+}

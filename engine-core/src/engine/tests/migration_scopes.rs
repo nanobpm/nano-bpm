@@ -1222,7 +1222,7 @@ fn off_partition_boundary_correlates_onto_migrated_target_boundary() {
             element_instance_key: eik,
             element_id: stale_eid,
             kind: stale_kind,
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             delivery_key: 0,
         })
         .unwrap();
@@ -1485,16 +1485,12 @@ fn assert_loop_kind_change_rejected(source_sequential: bool, target_sequential: 
             pairs(&[("sub", "sub2"), ("a", "b")]),
         ))
         .unwrap_err();
-    // Today an active MI source is rejected wholesale before the loop-kind
-    // guard runs; once MI migration lands, the guard must take over. Either
-    // way a parallel <-> sequential change must never be accepted.
+    // A parallel <-> sequential change is never accepted (Zeebe
+    // `requireSameMultiInstanceLoopCharacteristics`).
     assert!(
         matches!(
             err,
-            EngineError::UnsupportedMigration { ref element_id, .. } if element_id == "a"
-        ) || matches!(
-            err,
-            EngineError::MigrationMultiInstanceMismatch { ref source_element_id, ref target_element_id, .. }
+            EngineError::MigrationLoopCharacteristicsChanged { ref source_element_id, ref target_element_id, .. }
                 if source_element_id == "a" && target_element_id == "b"
         ),
         "{err:?}"
@@ -1574,7 +1570,7 @@ fn gateway_paused_on_listener(gateway: SplitGw) -> (Engine, Key, Key) {
     let inst = engine
         .apply_command(Command::create_instance_with(
             "source",
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap()
         .iter()
@@ -1694,7 +1690,7 @@ fn assert_migration_rejects_a_missing_carried_route(gateway: SplitGw) {
     let inst = engine
         .apply_command(Command::create_instance_with(
             "source",
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap()
         .iter()
@@ -1785,7 +1781,7 @@ fn exclusive_gateway_migration_rejects_a_reordered_carried_route() {
     let inst = engine
         .apply_command(Command::create_instance_with(
             "source",
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap()
         .iter()

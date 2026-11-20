@@ -228,6 +228,8 @@ served set below is the `OVERRIDES` map; the cited line numbers are the checked-
 | **Element instances** | `getElementInstance`, `searchElementInstances` (incl. `$or`), `searchElementInstanceIncidents`, `searchElementInstanceWaitStates`, set/create variables, `getVariable`, `searchVariables` | `main.rs` `get_element_instance_impl` / `search_element_instances_impl` / `search_element_instance_incidents_impl` / `search_element_instance_wait_states_impl`. Element instances are projected into the read model from the engine's per-element lifecycle events (`ElementActivating`/`ElementActivated`/`ElementCompleted`; process-scope `ProcessInstanceTerminated` terminates still-active elements). Wait states are derived from the jobs read model (`JOB`, an activatable job) and a dedicated message-subscription read model (`MESSAGE`, an open message catch). `searchElementInstanceIncidents` returns incidents of the element instance and its scope-subtree descendants (transitive `scope_key` closure). `rootProcessInstanceKey` equals `processInstanceKey`: Nano expands call activities inline at deploy time (`inline_call_activities`) and never spawns a separate child process instance, so every element instance is self-rooted (matching Camunda's `root == self` for a top-level instance). **Deviations:** `startDate`/`endDate` are stamped at projection time (the lifecycle events carry no engine-authored timestamp, so a full read-model rebuild re-dates them); the `type = UNKNOWN` fallback is defensive only (unreachable at runtime — every runtime element id is in the deployed model); `startDate`/`endDate` filters are not yet honoured. |
 | **User tasks** | get, search, `assign`, `unassign`, `complete`, `update` | `main.rs:7523`+. |
 | **Cluster** | `getTopology` | `get_topology_impl` (`OVERRIDES` module `cluster`). |
+| **Cluster variables** | create / update / get / delete / search (global and tenant-scoped), incl. the `SECRET_REFERENCE` kind | `main.rs` `*_cluster_variable_impl` (#1296). A `SECRET_REFERENCE` value is stored and returned as its `camunda.secrets.<name>` reference text — create/get/search never resolve it, and nothing resolved is ever written to the journal, a snapshot, events or instance variables. **Job activation (#1640):** trusted references are resolved into the activated-job payload only (`server/src/secrets.rs`, one choke point for REST, stream, Raft and peer activation). Trusted = a job element's `zeebe:input` mapping whose FEEL source is structurally a `camunda.secrets.<name>` literal path or a direct read of a `SECRET_REFERENCE` cluster variable (the same fail-closed attribution as `referencedSecrets`). Trust is captured **when the input mappings run** and journaled on `JobCreated` as `secret_provenance` (target path + secret names, never plaintext); activation never re-derives it from the live cluster variables. Resolution happens only at that exact target path. References from process/request variables, a process or parent-scope variable shadowing a `SECRET_REFERENCE` root, JSON-kind cluster variables (including a JSON-kind tenant variable shadowing a trusted global), static (non-`=`) mapping literals, the bare cluster-variable overlay, a sibling path holding equal text, or a target overwritten by a later untrusted mapping stay reference text. Jobs created on a deferred path (start execution listeners, incident re-drive, multi-instance / ad-hoc children) and jobs journaled before #1640 carry no provenance and resolve nothing (fail closed). Secret store: env-pointer (ADR 0027 §5) — secret `<name>` is env var `NANOBPMN_SECRET_<name>` (prefix overridable via `NANOBPMN_SECRET_ENV_PREFIX`), store id `default`. A missing secret raises an incident on the element (job failed with no retries) with Zeebe's message: *Failed to resolve secret '<name>' from default. Ensure the secret exists and the store is available, then resolve the incident to retry.* |
+| **Expression** | `evaluateExpression` (`POST /v2/expression/evaluation`) | `main.rs` `evaluate_expression_impl` (#908, #1296). Stateless FEEL evaluation against the request-body variables layered over the cluster variables. **`referencedSecrets` semantics are deliberately conservative (fail-closed, PR #1636 round-8):** a secret is reported only when the expression's result is *structurally* a trusted reference — (1) a bare `camunda.secrets.<name>` literal path as the whole result, (2) a direct read (name, member path, or numeric index) of a `SECRET_REFERENCE`-kind cluster variable whose selected value carries the reference, or (3) a list/context literal composed of those. Anything else — a conditional, a call, an operator, a filter, a concatenation — reports nothing, even when its result happens to be a trusted reference's text. This chooses false negatives over false positives: an unreported reference stays unresolved (visible and safe), while an untrusted request-body value reported as trusted would let caller-side secret resolution be steered by attacker-controlled input (an exfiltration vector). A reference string arriving via a request-body or JSON-kind variable is never trusted, even when its text matches a trusted reference. |
 
 ### Stubbed (501) or absent
 
@@ -271,6 +273,25 @@ It is switchable at runtime, cluster-wide. [ADR 0021](adr/0021-process-sla-as-a-
 tracks unifying this with `zeebe:priorityDefinition` job priority into a declared
 per-process SLA.
 
+### Per-definition admission (Tier-2) is observe-only by default
+
+ADR-0020's Tier-2 compressor can shed `createProcessInstance` for a *specific*
+process definition whose in-flight backlog outgrows its end-to-end latency budget
+(`503 RESOURCE_EXHAUSTED`, per process definition). **It is observe-only by
+default** (`NANOBPMN_TIER2` unset): the per-definition pressure is always computed
+and exported as `nanobpm_tier2_pressure{proc}`, but no create is rejected unless
+the operator opts in with `NANOBPMN_TIER2=on`.
+
+This matters for C8 parity: a **backlog with no workers draining** (a batch
+pre-create, workers deployed after the process starts receiving instances, a
+worker outage) is a legitimate pattern Camunda 8 accepts, and it cannot meet any
+latency budget however slowly instances arrive — so an on-by-default Tier-2
+rejected it and never recovered (issue #1532). The exporter memory-safety
+rails still shed genuine overload in every mode, and the Tier-1 engine-saturation
+guard sheds on its raft-log fsync-latency input only in latency SLA mode (that
+input is disabled in admission mode); only the per-definition latency-SLA shed is opt-in, pending ADR-0021's
+latency-causal shed predicate.
+
 ### Durability tiers
 
 Two orthogonal, explicit durability choices ([ADR 0003](adr/0003-write-path-durability-tiers.md)):
@@ -287,6 +308,25 @@ sections cover the trade in depth.
 The search/read endpoints are served from a read model that is **eventually
 consistent** with the write path; a create followed immediately by a search may not
 yet reflect the new instance. See [README "Read model and consistency"](../README.md#read-model-and-consistency).
+
+### `operationReference` on cross-partition records — Nano is correct where Zeebe is not
+
+A command's `operationReference` is stamped on **every** record it produces
+(#1556, #1603) — including the records its **routed cross-partition follow-ups**
+produce on *other* partitions and nodes (#1600): the canonical
+message-subscription open/close on the correlation-key hash partition, the
+routed correlation that advances a parked token on the instance's partition, a
+message-start dispatch, the peer-side apply of a fanned-out publish, and the
+durable deployment copies a peer journals from an `InstallDeployment`
+broadcast. Zeebe does **not** propagate the reference across its partition
+boundary (camunda/camunda#67542: `MESSAGE_CORRELATION:CORRELATED` on a remote
+partition, distributed `SIGNAL:BROADCASTED` / `DEPLOYMENT:CREATED` carry none),
+so on this point Nano deliberately diverges from Zeebe's *observable* output —
+a client correlating by `operationReference` sees the whole cascade, not just
+the owning partition's records. The reference rides the intra-cluster Falcon
+frames (`PublishMessage` / `RouteSubscription` / `InstallDeployment`) as an
+additive field, so a mixed-version cluster during a rolling upgrade simply
+decodes it as absent (the legacy unreferenced behaviour) on older peers.
 
 ---
 

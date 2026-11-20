@@ -75,12 +75,13 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
         }
 
         Event::FormDeployed {
+            deployment_key,
             form_key,
             version,
             form_id,
             resource_name,
             schema,
-            ..
+            version_tag,
         } => {
             let deployed = DeployedForm {
                 key: *form_key,
@@ -88,6 +89,8 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
                 form_id: form_id.clone(),
                 resource_name: resource_name.clone(),
                 schema: schema.clone(),
+                deployment_key: *deployment_key,
+                version_tag: version_tag.clone(),
             };
             // Retain every version by its unique key so a form binding pinned to
             // a specific version resolves.
@@ -103,12 +106,13 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
         }
 
         Event::GenericResourceDeployed {
+            deployment_key,
             resource_key,
             version,
             resource_id,
             resource_name,
             content,
-            ..
+            version_tag,
         } => {
             let deployed = DeployedResource {
                 key: *resource_key,
@@ -116,6 +120,8 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
                 resource_id: resource_id.clone(),
                 resource_name: resource_name.clone(),
                 content: content.clone(),
+                deployment_key: *deployment_key,
+                version_tag: version_tag.clone(),
             };
             // Retain every version by its unique key so a linked-resource binding
             // pinned to a specific version (or an older key) resolves.
@@ -141,6 +147,40 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
         Event::DecisionInstanceDeleted { .. } => {
             // Audit/projection-only: the read model deletes the retracted decision
             // instance rows. No core engine state to mutate.
+        }
+
+        // Cluster variables (#1657): replicated configuration state, folded
+        // from the log so every replica and every replay reads the same set.
+        Event::ClusterVariableCreated {
+            tenant_id,
+            name,
+            value,
+            kind,
+            metadata,
+        } => state.cluster_variables.insert(
+            tenant_id.as_deref(),
+            name,
+            value.clone(),
+            *kind,
+            metadata.clone(),
+        ),
+        Event::ClusterVariableUpdated {
+            tenant_id,
+            name,
+            value,
+            metadata,
+            // The kind is preserved by an update (it is fixed at creation);
+            // the event carries it for the response/fan-out projection, but
+            // the state fold leaves the stored kind untouched.
+            kind: _,
+        } => state.cluster_variables.update(
+            tenant_id.as_deref(),
+            name,
+            value.clone(),
+            metadata.clone(),
+        ),
+        Event::ClusterVariableDeleted { tenant_id, name } => {
+            state.cluster_variables.remove(tenant_id.as_deref(), name)
         }
         _ => unreachable!(),
     }

@@ -15,7 +15,7 @@
 //!   [`ReadStore`] itself but are compiled only under the shared crate's `native`
 //!   feature (which this crate always enables).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use nanobpmn_engine_core::{Event, Key, ReadQuery, partition_of};
@@ -141,7 +141,7 @@ pub struct ReadModel {
     /// Shards indexed positionally; `slot_by_partition` maps a global partition
     /// id to its index here.
     shards: Vec<Arc<ReadStore>>,
-    slot_by_partition: HashMap<u64, usize>,
+    slot_by_partition: BTreeMap<u64, usize>,
 }
 
 impl ReadModel {
@@ -149,7 +149,7 @@ impl ReadModel {
     /// least one shard (a node always owns at least one partition).
     pub fn from_shards(shards: Vec<(u64, Arc<ReadStore>)>) -> Self {
         assert!(!shards.is_empty(), "read model needs at least one shard");
-        let mut slot_by_partition = HashMap::with_capacity(shards.len());
+        let mut slot_by_partition = BTreeMap::new();
         let mut list = Vec::with_capacity(shards.len());
         for (pid, store) in shards {
             let prev = slot_by_partition.insert(pid, list.len());
@@ -536,6 +536,16 @@ impl ReadModel {
             .collect()
     }
 
+    /// Every message **start event** subscription across all shards (the
+    /// definition-scoped `START_EVENT` subscriptions carrying MCP tool metadata,
+    /// #1499).
+    pub fn message_start_subscriptions(&self) -> Vec<MessageStartSubscriptionRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.message_start_subscriptions())
+            .collect()
+    }
+
     /// Every open timer / signal / conditional wait across all shards
     /// (TIMER / SIGNAL / CONDITION wait states).
     pub fn event_waits(&self) -> Vec<EventWaitRow> {
@@ -603,7 +613,7 @@ impl ReadModel {
     /// never reconciled. Returns the total rows reconciled — the amount by which
     /// the in-flight gauge was over-counting. See
     /// [`ReadStore::reconcile_orphaned_active`].
-    pub fn reconcile_orphaned_active(&self, live: &std::collections::HashSet<Key>) -> usize {
+    pub fn reconcile_orphaned_active(&self, live: &std::collections::BTreeSet<Key>) -> usize {
         self.shards
             .iter()
             .map(|s| s.reconcile_orphaned_active(live))
@@ -766,7 +776,7 @@ mod tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
@@ -901,7 +911,7 @@ mod tests {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id: "p".to_string(),
-            variables: std::collections::HashMap::new(),
+            variables: std::collections::BTreeMap::new(),
             created_at: 0,
             tags: Vec::new(),
             business_id: None,

@@ -15,7 +15,7 @@
 //! single human-readable turns, because the model transcript is rewritten in full each
 //! turn.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,7 +133,7 @@ struct LegacyChatFile {
 /// Each key owns a list of [`ChatSession`]s persisted together (overwrite-on-save).
 pub struct ChatStore {
     dir: PathBuf,
-    mem: RwLock<HashMap<String, Vec<ChatSession>>>,
+    mem: RwLock<BTreeMap<String, Vec<ChatSession>>>,
 }
 
 impl ChatStore {
@@ -146,7 +146,7 @@ impl ChatStore {
         }
         Self {
             dir,
-            mem: RwLock::new(HashMap::new()),
+            mem: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -531,7 +531,7 @@ impl ChatStore {
 /// server restart, so the operator can still inspect what was sent after ProcessOS bounces.
 pub struct DebugStore {
     dir: PathBuf,
-    mem: RwLock<HashMap<String, Vec<serde_json::Value>>>,
+    mem: RwLock<BTreeMap<String, Vec<serde_json::Value>>>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -550,7 +550,7 @@ impl DebugStore {
         }
         Self {
             dir,
-            mem: RwLock::new(HashMap::new()),
+            mem: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -800,9 +800,9 @@ fn split_thinking(text: &str) -> (String, String) {
 /// returned run carries the raw tool `arguments` (which include the candidate BPMN XML) and the
 /// parsed `result` (the fidelity scorecard / ranking), in transcript order.
 pub fn extract_simulations(messages: &[Msg]) -> Vec<serde_json::Value> {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     // Tool results, by the call_id they answer.
-    let mut results: HashMap<&str, &str> = HashMap::new();
+    let mut results: BTreeMap<&str, &str> = BTreeMap::new();
     for m in messages {
         if let Msg::Tool { call_id, content } = m {
             results.insert(call_id.as_str(), content.as_str());

@@ -1,7 +1,7 @@
 //! The FEEL evaluator: walks an [`ast::Node`] tree producing a [`FeelVal`].
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::ast::{BinOp, CallArgs, Node, Quantifier, RangeNode};
@@ -13,12 +13,12 @@ use crate::model::Value;
 
 /// A lexical scope: a stack of frames over the engine's base variable map.
 pub struct Ctx<'a> {
-    base: &'a HashMap<String, Value>,
+    base: &'a BTreeMap<String, Value>,
     scopes: Vec<BTreeMap<String, FeelVal>>,
 }
 
 impl<'a> Ctx<'a> {
-    pub fn new(base: &'a HashMap<String, Value>) -> Ctx<'a> {
+    pub fn new(base: &'a BTreeMap<String, Value>) -> Ctx<'a> {
         Ctx {
             base,
             scopes: Vec::new(),
@@ -44,7 +44,7 @@ impl<'a> Ctx<'a> {
 }
 
 /// Evaluates a parsed expression against the engine's variables.
-pub fn evaluate(node: &Node, base: &HashMap<String, Value>) -> Result<FeelVal, FeelError> {
+pub fn evaluate(node: &Node, base: &BTreeMap<String, Value>) -> Result<FeelVal, FeelError> {
     let mut ctx = Ctx::new(base);
     eval_node(node, &mut ctx)
 }
@@ -62,7 +62,20 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
         Node::AtLit(s) => builtins::parse_temporal(s)
             .ok_or_else(|| FeelError(format!("invalid temporal literal @\"{s}\""))),
         Node::Var(name) => Ok(ctx.lookup(name).unwrap_or_else(|| {
-            if builtins::is_builtin(name) {
+            if name == "camunda" {
+                // #1296 / Camunda 8.10: a `camunda.secrets.<name>` reference
+                // is a TRUSTED secret pointer. It is never resolved during
+                // FEEL evaluation (upstream resolves it at job activation);
+                // instead the path evaluates to its own reference text,
+                // mirroring Zeebe's `SecretReferenceEvaluationContext`, so
+                // the reference string — never a secret value — is what
+                // travels onward. The `secrets` member is a sentinel builtin
+                // marker that `member` maps to the reference text.
+                FeelVal::Context(BTreeMap::from([(
+                    "secrets".to_string(),
+                    FeelVal::Function(Func::Builtin("camunda.secrets")),
+                )]))
+            } else if builtins::is_builtin(name) {
                 FeelVal::Function(Func::Builtin(builtins::canonical(name)))
             } else {
                 FeelVal::Null
@@ -246,7 +259,9 @@ fn eval_index(obj: &Node, idx: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelErro
         other => vec![other.clone()],
     };
     // An index expression that resolves to a number in the current scope selects
-    // a 1-based element (negative counts from the end).
+    // a 1-based element (negative counts from the end). Otherwise it is a
+    // boolean filter evaluated per element, with the item's own bindings in
+    // scope.
     if let Ok(n) = eval_node(idx, ctx) {
         if let Some(f) = n.as_f64() {
             let len = list.len() as i64;
@@ -264,7 +279,7 @@ fn eval_index(obj: &Node, idx: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelErro
             return Ok(list[resolved as usize].clone());
         }
     }
-    // Otherwise it is a boolean filter evaluated per element.
+    // A boolean filter, evaluated per element.
     let mut out = Vec::new();
     for item in list {
         let mut frame = BTreeMap::new();
@@ -331,30 +346,26 @@ fn eval_call(callee: &Node, args: &CallArgs, ctx: &mut Ctx) -> Result<FeelVal, F
             .collect::<Result<Vec<_>, _>>()?,
     };
 
-    apply(&func, positional, ctx.base)
+    apply(&func, positional, ctx)
 }
 
 /// Invokes a function value with already-evaluated positional arguments.
-pub fn apply(
-    func: &Func,
-    args: Vec<FeelVal>,
-    base: &HashMap<String, Value>,
-) -> Result<FeelVal, FeelError> {
+pub fn apply(func: &Func, args: Vec<FeelVal>, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
     match func {
-        Func::Builtin(name) => builtins::call(name, args, base),
+        Func::Builtin(name) => builtins::call(name, args, ctx),
         Func::Lambda {
             params,
             body,
             closure,
         } => {
-            let mut ctx = Ctx::new(base);
-            ctx.push((**closure).clone());
+            let mut body_ctx = Ctx::new(ctx.base);
+            body_ctx.push((**closure).clone());
             let mut frame = BTreeMap::new();
             for (i, p) in params.iter().enumerate() {
                 frame.insert(p.clone(), args.get(i).cloned().unwrap_or(FeelVal::Null));
             }
-            ctx.push(frame);
-            eval_node(body, &mut ctx)
+            body_ctx.push(frame);
+            eval_node(body, &mut body_ctx)
         }
     }
 }
@@ -364,6 +375,14 @@ pub fn apply(
 fn member(v: &FeelVal, name: &str) -> FeelVal {
     match v {
         FeelVal::Context(entries) => entries.get(name).cloned().unwrap_or(FeelVal::Null),
+        // #1296: `camunda.secrets.<name>` — the sentinel builtin marker the
+        // `camunda` variable's `secrets` member carries — evaluates to its own
+        // reference text (never resolved here; see the `Node::Var` arm). This
+        // arm fires both for a direct access and for each element of a list
+        // projection (`[camunda.secrets].NAME`).
+        FeelVal::Function(Func::Builtin("camunda.secrets")) => {
+            FeelVal::Str(format!("camunda.secrets.{name}"))
+        }
         // Projection: `list.field` maps the access over each element.
         FeelVal::List(items) => FeelVal::List(items.iter().map(|i| member(i, name)).collect()),
         FeelVal::Date(d) => date_member(d, name),
@@ -520,7 +539,7 @@ fn eval_binary(op: BinOp, lhs: &Node, rhs: &Node, ctx: &mut Ctx) -> Result<FeelV
         BinOp::Mul => mul(&l, &r),
         BinOp::Div => div(&l, &r),
         BinOp::Exp => match (l.as_f64(), r.as_f64()) {
-            (Some(a), Some(b)) => Some(FeelVal::num(a.powf(b))),
+            (Some(a), Some(b)) => Some(FeelVal::num(libm::pow(a, b))),
             _ => None,
         },
         BinOp::Eq => Some(eq_op(&l, &r)),

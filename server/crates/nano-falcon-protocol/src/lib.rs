@@ -14,6 +14,8 @@
 //! here (`pub(crate) use nano_falcon_protocol::*;`) so its handler code keeps
 //! its unqualified `ClientFrame`/`ServerFrame` paths unchanged.
 
+pub mod cluster_join;
+
 use nanobpmn_engine_core::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -76,6 +78,103 @@ mod lease_contract_tests {
             panic!("decodes as a publish message");
         };
         assert_eq!(*only_partitions, Some(vec![1]));
+    }
+
+    /// #1600 (#1556 step 4): `PublishMessage`, `RouteSubscription` and
+    /// `InstallDeployment` gained an additive `operationReference`. A frame
+    /// from an older node (no `operationReference`) still decodes — as `None`,
+    /// the legacy unreferenced behaviour — so a mixed-version cluster keeps
+    /// working during a rolling upgrade.
+    #[test]
+    fn routed_frames_operation_reference_is_additive_on_the_wire() {
+        let old_publish = serde_json::json!({
+            "type": "publishMessage", "corr": 1, "name": "m", "correlationKey": "k"
+        });
+        let frame: ClientFrame = serde_json::from_value(old_publish).unwrap();
+        let ClientFrame::PublishMessage {
+            operation_reference,
+            ..
+        } = &frame
+        else {
+            panic!("decodes as a publish message");
+        };
+        assert_eq!(*operation_reference, None);
+
+        let new_publish = serde_json::json!({
+            "type": "publishMessage", "corr": 2, "name": "m", "correlationKey": "k",
+            "operationReference": 77
+        });
+        let frame: ClientFrame = serde_json::from_value(new_publish).unwrap();
+        let ClientFrame::PublishMessage {
+            operation_reference,
+            ..
+        } = &frame
+        else {
+            panic!("decodes as a publish message");
+        };
+        assert_eq!(*operation_reference, Some(77));
+
+        let old_route = serde_json::json!({
+            "type": "routeSubscription", "corr": 3,
+            "event": {"MessageSubscriptionClosing": {
+                "subscription_key": 1, "instance_key": 2, "element_instance_key": 3,
+                "element_id": "e", "message_name": "m", "correlation_key": "k",
+                "delivery_key": 0
+            }}
+        });
+        let frame: ClientFrame = serde_json::from_value(old_route).unwrap();
+        let ClientFrame::RouteSubscription {
+            operation_reference,
+            ..
+        } = &frame
+        else {
+            panic!("decodes as a routed subscription");
+        };
+        assert_eq!(*operation_reference, None);
+
+        let new_route = serde_json::json!({
+            "type": "routeSubscription", "corr": 4, "operationReference": -5,
+            "event": {"MessageSubscriptionClosing": {
+                "subscription_key": 1, "instance_key": 2, "element_instance_key": 3,
+                "element_id": "e", "message_name": "m", "correlation_key": "k",
+                "delivery_key": 0
+            }}
+        });
+        let frame: ClientFrame = serde_json::from_value(new_route).unwrap();
+        let ClientFrame::RouteSubscription {
+            operation_reference,
+            ..
+        } = &frame
+        else {
+            panic!("decodes as a routed subscription");
+        };
+        assert_eq!(*operation_reference, Some(-5));
+
+        let old_install = serde_json::json!({
+            "type": "installDeployment", "corr": 5, "events": []
+        });
+        let frame: ClientFrame = serde_json::from_value(old_install).unwrap();
+        let ClientFrame::InstallDeployment {
+            operation_reference,
+            ..
+        } = &frame
+        else {
+            panic!("decodes as an install deployment");
+        };
+        assert_eq!(*operation_reference, None);
+
+        let new_install = serde_json::json!({
+            "type": "installDeployment", "corr": 6, "events": [], "operationReference": 9
+        });
+        let frame: ClientFrame = serde_json::from_value(new_install).unwrap();
+        let ClientFrame::InstallDeployment {
+            operation_reference,
+            ..
+        } = &frame
+        else {
+            panic!("decodes as an install deployment");
+        };
+        assert_eq!(*operation_reference, Some(9));
     }
 
     #[test]
@@ -281,6 +380,11 @@ pub enum ClientFrame {
         retries: Option<i32>,
         #[serde(default)]
         error_message: Option<String>,
+        /// Camunda 8 v2 `retryBackOff` in ms (#933): the job is not
+        /// re-activatable before now + this. Absent/`0`/negative = immediately.
+        /// Skipped when absent so backoff-less frames stay byte-identical.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_back_off: Option<i64>,
     },
     /// Throw a BPMN error from an activated job (unmetered drain).
     #[serde(rename_all = "camelCase")]
@@ -345,6 +449,12 @@ pub enum ClientFrame {
     InstallDeployment {
         corr: u64,
         events: Vec<Event>,
+        /// The deploying request's `operationReference` (#1556 step 4, #1600):
+        /// the peer stamps it on the durable copies of the deployment records
+        /// it journals. Additive: a frame from a peer predating the field
+        /// decodes as `None` (the legacy unreferenced behaviour).
+        #[serde(default)]
+        operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway fans a published message out to this peer
     /// so it correlates the message against the subscriptions on *its* owned
@@ -376,6 +486,13 @@ pub enum ClientFrame {
         /// instances for one request (#1307).
         #[serde(default)]
         only_partitions: Option<Vec<u64>>,
+        /// The publishing request's `operationReference` (#1556 step 4, #1600):
+        /// stamped on every record the publish produces on THIS node's
+        /// partitions, and carried onward on any routed follow-ups they emit.
+        /// Additive: a frame from a peer predating the field decodes as `None`
+        /// (the legacy unreferenced behaviour).
+        #[serde(default)]
+        operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key process-instance
     /// cancellation to the peer that owns the instance's partition. Answered by a
@@ -436,6 +553,13 @@ pub enum ClientFrame {
     RouteSubscription {
         corr: u64,
         event: Event,
+        /// The `operationReference` of the request whose records produced this
+        /// follow-up (#1556 step 4, #1600): stamped on every record the routed
+        /// command produces here, and carried onward on any follow-ups THEY
+        /// route. Additive: a frame from a peer predating the field decodes as
+        /// `None` (the legacy unreferenced behaviour).
+        #[serde(default)]
+        operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key job-retries update to
     /// the peer that owns the job's partition. Answered by a `CommandResult`.
@@ -822,6 +946,19 @@ pub enum ClientFrame {
         partition: u64,
         joint_suspected: bool,
         reason: String,
+    },
+    /// **Intra-cluster only.** Applies a cluster-variable command (#1657 —
+    /// `Create`/`Update`/`DeleteClusterVariable`) on global partition
+    /// `partition`, which the receiving node leads, through its replicated
+    /// funnel. Sent only once every peer advertises
+    /// [`cluster_join::FEATURE_CLUSTER_VARIABLES`] (ADR 0066 rolling-upgrade gate). Answered
+    /// by a `CommandResult`: 200 carrying the post-apply variable record (JSON,
+    /// or `null` once deleted), or the engine rejection's status (409 / 404).
+    #[serde(rename_all = "camelCase")]
+    ApplyClusterVariable {
+        corr: u64,
+        partition: u64,
+        command: nanobpmn_engine_core::Command,
     },
 }
 

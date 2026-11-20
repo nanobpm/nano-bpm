@@ -37,7 +37,7 @@
 // those call sites land.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -57,7 +57,7 @@ pub struct VarStore {
     /// [`mark_capture`](VarStore::mark_capture) when a lean checkpoint captures
     /// its control-only snapshot, and consumed by the following
     /// [`checkpoint`](VarStore::checkpoint) (#1487).
-    captured: Mutex<HashMap<u64, i64>>,
+    captured: Mutex<BTreeMap<u64, i64>>,
 }
 
 /// Whether lean (control-only) snapshots backed by the authoritative
@@ -147,7 +147,7 @@ impl VarStore {
         }
         Ok(Self {
             conn: Mutex::new(conn),
-            captured: Mutex::new(HashMap::new()),
+            captured: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -161,7 +161,7 @@ impl VarStore {
         &self,
         partition: u64,
         position: u64,
-        upserts: &[(Key, &HashMap<String, Value>)],
+        upserts: &[(Key, &BTreeMap<String, Value>)],
         forgets: &[Key],
     ) -> rusqlite::Result<()> {
         let watermark = self
@@ -231,7 +231,7 @@ impl VarStore {
         &self,
         partition: u64,
         key: Key,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> rusqlite::Result<()> {
         let json = serde_json::to_string(vars)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -288,7 +288,7 @@ impl VarStore {
     /// is authoritative, so rehydrating a spilled instance must leave the durable
     /// row in place. `Ok(None)` is a definitive absence (no row), `Err` an
     /// unreadable store or row (#1383); there is no infallible form (#1388).
-    pub fn try_get(&self, key: Key) -> rusqlite::Result<Option<HashMap<String, Value>>> {
+    pub fn try_get(&self, key: Key) -> rusqlite::Result<Option<BTreeMap<String, Value>>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // The newest pending spill row (if any) is the latest state; otherwise
         // the checkpointed row (#1487).
@@ -334,22 +334,22 @@ impl VarStore {
     /// rehydrate the instances a lean snapshot restored with empty variables.
     /// Rows that fail to deserialize are skipped (the journal tail can still
     /// re-create them), keeping a partially-corrupt store non-fatal.
-    pub fn load_all(&self) -> HashMap<Key, HashMap<String, Value>> {
+    pub fn load_all(&self) -> BTreeMap<Key, BTreeMap<String, Value>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = match conn.prepare("SELECT key, vars FROM vars") {
             Ok(s) => s,
-            Err(_) => return HashMap::new(),
+            Err(_) => return BTreeMap::new(),
         };
         let rows = match stmt.query_map([], |r| {
             Ok((r.get::<_, i64>(0)? as Key, r.get::<_, String>(1)?))
         }) {
             Ok(rows) => rows,
-            Err(_) => return HashMap::new(),
+            Err(_) => return BTreeMap::new(),
         };
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         for row in rows.flatten() {
             let (key, json) = row;
-            if let Ok(vars) = serde_json::from_str::<HashMap<String, Value>>(&json) {
+            if let Ok(vars) = serde_json::from_str::<BTreeMap<String, Value>>(&json) {
                 out.insert(key, vars);
             }
         }
@@ -398,8 +398,8 @@ impl VarStore {
 mod tests {
     use super::*;
 
-    fn vars(payload: &str) -> HashMap<String, Value> {
-        let mut m = HashMap::new();
+    fn vars(payload: &str) -> BTreeMap<String, Value> {
+        let mut m = BTreeMap::new();
         m.insert("data".to_string(), Value::Str(payload.to_string()));
         m
     }

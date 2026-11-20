@@ -14,9 +14,13 @@
 //! ## Supported subset
 //!
 //! * `process` (one or more per file) with its `id`.
-//! * Flow nodes: `startEvent`, `endEvent` (plain none end, or — with a nested
+//! * Flow nodes: `startEvent`, `endEvent` (plain none end; with a nested
 //!   `terminateEventDefinition` — a terminate end that kills the remaining
-//!   tokens in its enclosing scope), `task`/`manualTask` (abstract
+//!   tokens in its enclosing scope; or with a nested `errorEventDefinition`
+//!   `errorRef` — an **error end event** that throws the referenced error code
+//!   on completion, caught exactly like a job-thrown error by a matching error
+//!   boundary or error event sub-process, else an `UNHANDLED_ERROR` incident,
+//!   #1592), `task`/`manualTask` (abstract
 //!   pass-through), `serviceTask`, `sendTask` (a job-based service task — its
 //!   throwing cousin of `receiveTask`; a message `intermediateThrowEvent` /
 //!   `endEvent` carrying a `zeebe:taskDefinition` is the same job worker),
@@ -25,6 +29,24 @@
 //! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
 //!   a `boundaryEvent` with an `errorEventDefinition` attached to it becomes an
 //!   interrupting error boundary on the sub-process.
+//! * `subProcess triggeredByEvent="true"` (an **event sub-process**, #1555): a
+//!   container never entered by token flow, activated when its single typed
+//!   start event's trigger fires while the enclosing scope (the process, or an
+//!   embedded sub-process) is active. The start event must carry exactly one of
+//!   `messageEventDefinition`, `timerEventDefinition`, `signalEventDefinition`,
+//!   `errorEventDefinition`, `escalationEventDefinition` or
+//!   `conditionalEventDefinition`; `isInterrupting="false"` marks it
+//!   non-interrupting (the default is interrupting; an error start is always
+//!   interrupting). It is modelled as
+//!   [`ElementKind::EventSubProcess`](crate::model::ElementKind::EventSubProcess)
+//!   carrying its trigger; the engine arms the trigger while the enclosing
+//!   scope is active (see the engine-core README for the runtime semantics).
+//! * A process-level `startEvent` with a nested `conditionalEventDefinition`/
+//!   `condition` (a **root-level conditional start event**, #932): modelled as
+//!   [`ElementKind::ConditionalStartEvent`](crate::model::ElementKind::ConditionalStartEvent).
+//!   It opens no subscription; a conditional evaluation
+//!   (`Command::EvaluateConditionalStartEvents`, `POST /v2/conditionals/evaluation`)
+//!   creates an instance for each such start whose condition holds.
 //! * `intermediateCatchEvent` with a nested `timerEventDefinition`/`timeDuration`
 //!   (timer catch) or a nested `messageEventDefinition` (message catch).
 //! * Link events: an `intermediateThrowEvent` with a `linkEventDefinition name`
@@ -63,6 +85,14 @@
 //! * Definitions-level `message` elements (`<message id="…" name="…">`) with a
 //!   nested `zeebe:subscription correlationKey="=var"`, referenced by message
 //!   catch/boundary events via `messageRef`.
+//! * `zeebe:properties` / nested `zeebe:property name="…" value="…"` on any flow
+//!   node (#1499): generic vendor extension metadata, carried verbatim onto the
+//!   element's [`Element::properties`](crate::model::Element::properties). This
+//!   is the channel Camunda uses to mark a process as an MCP tool
+//!   (`io.camunda.tool:name` / `:purpose` / `:input_N_*` on a message start
+//!   event) or an inbound connector (`inbound.type`); the engine projects the
+//!   tool markers onto the message start subscription (`toolName` /
+//!   `toolProperties` on `searchMessageSubscriptions`).
 //! * A service task's job type is taken from a nested
 //!   `zeebe:taskDefinition type="…"`; if absent it defaults to the task id. A
 //!   FEEL expression (`type="=jobType"`, `type='="worker-" + region'`) is
@@ -120,7 +150,7 @@
 //!   a non-user-task element is likewise rejected (`UnsupportedTaskListener`),
 //!   since task-listener jobs only run on the user-task path.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::model::{ProcessBuilder, ProcessDefinition};
 /// The BPMN parse-error type, owned by [`crate::validate::error`] (the
@@ -299,8 +329,9 @@ pub(crate) fn parse_iso8601_duration(raw: &str) -> Option<u64> {
 
 /// Parses an ISO-8601 repeating interval (a BPMN `timeCycle`, e.g. `R/PT1H` or
 /// `R5/PT1H`) into the interval in milliseconds. Thin wrapper over the canonical
-/// [`crate::temporal`] leaf. The `Rn` repetition-count prefix is accepted but
-/// ignored (the engine repeats unboundedly). A bare duration without the
+/// [`crate::temporal`] leaf. The `Rn` repetition count is not part of the
+/// interval: the parser retains the literal as the element's `TimerDef`, and
+/// the engine bounds the cycle to `n` fires at runtime (#1596). A bare duration without the
 /// `R[n]/` prefix is also accepted. Returns `None` if the interval portion is
 /// not a recognisable duration.
 pub(crate) fn parse_iso8601_cycle(raw: &str) -> Option<u64> {
@@ -310,7 +341,11 @@ pub(crate) fn parse_iso8601_cycle(raw: &str) -> Option<u64> {
 /// Parses a `zeebe:subscription correlationKey` expression into the name of an
 /// instance variable: strips the leading FEEL `=` marker and trims. Returns
 /// `None` if the result is empty.
-fn parse_correlation_key(raw: &str) -> Option<String> {
+///
+/// This marker-free form is the canonical model representation of every
+/// `correlation_key`; emitters normalize through this same function (so a
+/// caller-supplied `"= key"` serializes as exactly one `=` marker).
+pub fn parse_correlation_key(raw: &str) -> Option<String> {
     let expr = raw.trim();
     let expr = expr.strip_prefix('=').unwrap_or(expr).trim();
     if expr.is_empty() {

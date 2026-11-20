@@ -14,7 +14,7 @@
 //! a direct command by key) is matched here first and the owning instance
 //! rehydrated on demand before the engine processes it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use nanobpmn_engine_core::{
     InstanceSnapshot, JobState, Key, MessageSubscriptionState, TimerState, UserTaskState,
@@ -53,14 +53,14 @@ pub struct ColdIndex {
     /// strictly below the low-water mark in O(log n + victims) instead of scanning
     /// the whole index every retirement tick (see that method's note).
     instances: BTreeMap<Key, ColdFacets>,
-    by_job: HashMap<Key, Key>,
-    by_job_type: HashMap<String, BTreeSet<Key>>,
-    by_message: HashMap<(String, String), HashSet<Key>>,
-    by_timer: BTreeMap<u64, HashSet<Key>>,
-    by_user_task: HashMap<Key, Key>,
-    by_incident: HashMap<Key, Key>,
-    by_scope: HashMap<Key, Key>,
-    by_parent: HashMap<Key, BTreeSet<Key>>,
+    by_job: BTreeMap<Key, Key>,
+    by_job_type: BTreeMap<String, BTreeSet<Key>>,
+    by_message: BTreeMap<(String, String), BTreeSet<Key>>,
+    by_timer: BTreeMap<u64, BTreeSet<Key>>,
+    by_user_task: BTreeMap<Key, Key>,
+    by_incident: BTreeMap<Key, Key>,
+    by_scope: BTreeMap<Key, Key>,
+    by_parent: BTreeMap<Key, BTreeSet<Key>>,
 }
 
 impl ColdIndex {
@@ -297,7 +297,7 @@ impl ColdIndex {
     /// Cold instances holding an armed timer due at or before `now` — the ones a
     /// `TriggerTimers(now)` must rehydrate so the tick can fire them.
     pub fn instances_due(&self, now: u64) -> Vec<Key> {
-        let mut due = HashSet::new();
+        let mut due = BTreeSet::new();
         for (_, set) in self.by_timer.range(..=now) {
             due.extend(set.iter().copied());
         }
@@ -338,25 +338,27 @@ mod tests {
             parent_process_instance_key: None,
             parent_element_instance_key: None,
             suspended_at: None,
-            active: HashMap::new(),
-            scopes: HashMap::new(),
-            variables: Arc::new(HashMap::new()),
-            join_counts: HashMap::new(),
-            join_flow_arrivals: HashMap::new(),
-            join_instances: HashMap::new(),
+            terminated_epoch: 0,
+            active: BTreeMap::new(),
+            scopes: BTreeMap::new(),
+            variables: Arc::new(BTreeMap::new()),
+            join_counts: BTreeMap::new(),
+            join_flow_arrivals: BTreeMap::new(),
+            join_instances: BTreeMap::new(),
             parked_joins: Default::default(),
             activating: Default::default(),
-            gateway_routes: HashMap::new(),
+            gateway_routes: BTreeMap::new(),
             incidents: Vec::new(),
             variables_spilled: false,
-            multi_instances: HashMap::new(),
-            adhoc_instances: HashMap::new(),
-            scope_parents: HashMap::new(),
-            scope_variables: HashMap::new(),
+            multi_instances: BTreeMap::new(),
+            adhoc_instances: BTreeMap::new(),
+            scope_parents: BTreeMap::new(),
+            scope_variables: BTreeMap::new(),
+            esp_held_payloads: BTreeMap::new(),
             compensable: Default::default(),
-            compensation_waits: HashMap::new(),
-            agent_instances: HashMap::new(),
-            agent_history: HashMap::new(),
+            compensation_waits: BTreeMap::new(),
+            agent_instances: BTreeMap::new(),
+            agent_history: BTreeMap::new(),
         }
     }
 
@@ -382,8 +384,10 @@ mod tests {
             error_message: None,
             error_code: None,
             has_failed_with_retries_left: false,
+            retry_backoff_until: None,
             settled_tokens: Vec::new(),
             terminal_end: None,
+            secret_provenance: Vec::new(),
         }
     }
 
@@ -456,6 +460,7 @@ mod tests {
             correlation_key: "A".into(),
             state: MessageSubscriptionState::Open,
             kind: MessageSubscriptionKind::IntermediateCatch,
+            correlated_message_keys: Default::default(),
         });
         snap.timers.push(Timer {
             key: 320,
@@ -465,6 +470,7 @@ mod tests {
             due_at: 5_000,
             state: TimerState::Created,
             kind: TimerKind::IntermediateCatch,
+            repetitions: None,
         });
         idx.insert(&snap);
 

@@ -97,13 +97,13 @@ fn forked_two_tasks() -> ProcessDefinition {
 }
 
 fn start_instance(engine: &mut Engine, def: ProcessDefinition) -> Key {
-    start_instance_with(engine, def, HashMap::new())
+    start_instance_with(engine, def, BTreeMap::new())
 }
 
 fn start_instance_with(
     engine: &mut Engine,
     def: ProcessDefinition,
-    vars: HashMap<String, Value>,
+    vars: BTreeMap<String, Value>,
 ) -> Key {
     let id = def.id.clone();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
@@ -501,7 +501,7 @@ fn move_applies_its_variable_instructions_with_the_activation() {
 
     let mut m = move_by_id("a", "b");
     m.variable_instructions = vec![crate::command::VariableInstruction {
-        variables: HashMap::from([("moved".to_string(), Value::Bool(true))]),
+        variables: BTreeMap::from([("moved".to_string(), Value::Bool(true))]),
         scope_id: None,
     }];
     engine.apply_command(move_cmd(inst, vec![m])).unwrap();
@@ -543,7 +543,7 @@ fn move_of_a_multi_instance_source_moves_the_body() {
     let inst = start_instance_with(
         &mut engine,
         def,
-        HashMap::from([(
+        BTreeMap::from([(
             "items".to_string(),
             Value::List(vec![Value::Int(1), Value::Int(2)]),
         )]),
@@ -609,7 +609,7 @@ fn activate_second_sub(engine: &mut Engine, inst: Key) {
             instance_key: inst,
             activate_instructions: vec![crate::command::ActivateElementInstruction {
                 element_id: "sub".to_string(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 ancestor_element_instance_key: None,
                 variable_instructions: vec![],
             }],

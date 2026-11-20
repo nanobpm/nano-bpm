@@ -349,6 +349,9 @@ renaming the reference never touches your external checkout.
 - Console REST API (OpenAPI): `{base_url}/swagger`
 - Command stream (AsyncAPI): `{base_url}/asyncapi`
 - Human docs: `{base_url}/docs`
+- MCP servers (Camunda's MCP gateway contract, see the user guide's "Use the
+  MCP gateway" section): `{base_url}/mcp/cluster` and `{base_url}/mcp/processes`
+  — on by default; off when the node runs with `NANOBPM_MCP_ENABLED=false`
 - This brief (always current for this node): `{base_url}/agent`
 "#,
     ));
@@ -373,7 +376,8 @@ App on disk and link it into this running node, and how the engine works.\n\n\
 ## Specs\n\n\
 - [App manifest JSON Schema]({APP_SCHEMA_URL}): schema for `nano.app.json`.\n\
 - [Console REST API (OpenAPI)]({base_url}/swagger): every console endpoint.\n\
-- [Command stream (AsyncAPI)]({base_url}/asyncapi): the instance command stream.\n\n\
+- [Command stream (AsyncAPI)]({base_url}/asyncapi): the instance command stream.\n\
+- [MCP cluster server]({base_url}/mcp/cluster) and [MCP processes server]({base_url}/mcp/processes): Camunda-compatible streamable-HTTP MCP endpoints (on unless NANOBPM_MCP_ENABLED=false).\n\n\
 ## Docs\n\n\
 - [Human documentation]({base_url}/docs): the console's built-in docs.\n"
     )
@@ -394,6 +398,9 @@ mod tests {
         assert!(md.contains("## Author an app"));
         assert!(md.contains("## Link it in"));
         assert!(md.contains("## How Nano works"));
+        // The MCP gateway pointer (issue #1499) names both endpoints.
+        assert!(md.contains("https://nano.example.test/mcp/cluster"));
+        assert!(md.contains("https://nano.example.test/mcp/processes"));
         // The blessed scaffold + validate loop: create-urban-app and the urban CLI.
         assert!(md.contains("npm create urban-app@latest"));
         assert!(md.contains("--code-first"));

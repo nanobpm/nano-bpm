@@ -51,7 +51,7 @@
 // in a plain `cargo build`, so dead-code is allowed at the module level.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Write as _;
 use std::ops::RangeBounds;
@@ -61,6 +61,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use nano_server_storage::digest::{ChainDigest, EntryDigest, entry_digest_of};
 use nanobpmn_engine_core::{Command, Event};
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::storage::{
@@ -73,7 +74,6 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 use crate::deepthi::{DeepthiHandle, LifecycleExclusive, LifecycleShared, SnapshotPublishGuard};
-#[cfg(test)]
 use crate::journal::Journal;
 use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport, SnapshotSendProgress};
 
@@ -93,10 +93,83 @@ openraft::declare_raft_types!(
 /// wall-clock `now` the leader stamped it with. Carrying `now` keeps `apply`
 /// deterministic across replicas (the engine's time-dependent logic replays
 /// identically), so re-applying the log on any replica yields identical state.
+///
+/// `operation_reference` is the caller's Camunda `operationReference` (#1556):
+/// command-envelope metadata the engine stamps on EVERY record the command
+/// produces ([`Journal::apply_command_ref_at`](nano_server_storage::journal::Journal::apply_command_ref_at)).
+/// Additive on the wire: absent decodes as `None`. A pre-#1556 entry carried
+/// the reference NESTED inside the job-mutation / incident-resolution command
+/// body (`{"UpdateJobRetries":{…,"operation_reference":N}}`); deserialization
+/// promotes that legacy nested value to this envelope field (outer wins) so a
+/// retained historical entry re-applied after upgrade keeps its reference.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(from = "ReplicatedCommandWire")]
 pub struct ReplicatedCommand {
     pub command: Command,
     pub now: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_reference: Option<i64>,
+}
+
+/// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
+/// `operation_reference` out of the command body (see the type docs).
+#[derive(Deserialize)]
+struct ReplicatedCommandWire {
+    command: LegacyCommand,
+    now: u64,
+    #[serde(default)]
+    operation_reference: Option<i64>,
+}
+
+/// A [`Command`] plus any legacy (pre-#1556) `operation_reference` that was
+/// nested inside its variant body. Deserialized via a JSON value so the nested
+/// key can be inspected for EVERY variant (fail-safe: any variant that ever
+/// carried the field is promoted, not just a hand-maintained list).
+struct LegacyCommand {
+    command: Command,
+    nested_reference: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for LegacyCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let nested_reference = match value
+            .as_object_mut()
+            .and_then(|tagged| tagged.values_mut().next())
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|body| body.remove("operation_reference"))
+        {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(serde_json::from_value::<i64>(v).map_err(D::Error::custom)?),
+        };
+        let command = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            command,
+            nested_reference,
+        })
+    }
+}
+
+impl From<ReplicatedCommandWire> for ReplicatedCommand {
+    fn from(wire: ReplicatedCommandWire) -> Self {
+        Self {
+            command: wire.command.command,
+            now: wire.now,
+            operation_reference: wire.operation_reference.or(wire.command.nested_reference),
+        }
+    }
+}
+
+impl ReplicatedCommand {
+    /// A replicated command without an `operationReference`.
+    pub fn new(command: Command, now: u64) -> Self {
+        Self {
+            command,
+            now,
+            operation_reference: None,
+        }
+    }
 }
 
 /// Process-global net-live count of [`ReplicatedBatch`] instances. Every batch
@@ -213,6 +286,13 @@ impl Drop for BatchLiveGuard {
 #[derive(Clone, Debug, Serialize)]
 pub struct ReplicatedBatch {
     pub items: Vec<ReplicatedCommand>,
+    /// The proposing leader's chain digest (ADR 0066 slice 5, #1664), which
+    /// followers compare with their own at the same index. Additive on the
+    /// wire: absent (a pre-#1664 proposer, or a leader with no digest yet)
+    /// decodes as `None` and is not compared, and a pre-#1664 follower ignores
+    /// the unknown field — so mixed-version clusters keep replicating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<DigestClaim>,
     /// Live-count/-bytes guard (see [`LIVE_BATCHES`]/[`LIVE_BATCH_BYTES`]).
     /// Skipped on the wire (reconstructed on deserialize), so the replicated
     /// bytes are unchanged.
@@ -232,9 +312,11 @@ impl<'de> serde::Deserialize<'de> for ReplicatedBatch {
         #[derive(serde::Deserialize)]
         struct Wire {
             items: Vec<ReplicatedCommand>,
+            #[serde(default)]
+            digest: Option<DigestClaim>,
         }
-        let Wire { items } = Wire::deserialize(deserializer)?;
-        Ok(ReplicatedBatch::new(items))
+        let Wire { items, digest } = Wire::deserialize(deserializer)?;
+        Ok(ReplicatedBatch::new(items).with_digest(digest))
     }
 }
 
@@ -244,13 +326,20 @@ impl ReplicatedBatch {
         let bytes = serialized_len(&items);
         Self {
             items,
+            digest: None,
             _live: BatchLiveGuard::with_bytes(bytes),
         }
     }
 
+    /// Stamps the proposing leader's chain digest claim (#1664).
+    pub fn with_digest(mut self, digest: Option<DigestClaim>) -> Self {
+        self.digest = digest;
+        self
+    }
+
     /// A single-command batch (the convenience path for `propose`).
     pub fn single(command: Command, now: u64) -> Self {
-        Self::new(vec![ReplicatedCommand { command, now }])
+        Self::new(vec![ReplicatedCommand::new(command, now)])
     }
 }
 
@@ -374,7 +463,9 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         E::TargetProcessDefinitionNotFound { .. } => (404, e.to_string()),
         E::DuplicateMappingSourceElement { .. }
         | E::MappingSourceElementNotFound { .. }
-        | E::MappingTargetElementNotFound { .. } => (400, e.to_string()),
+        | E::MappingTargetElementNotFound { .. }
+        // Zeebe INVALID_ARGUMENT (#1631).
+        | E::MigrationCompensationBoundaryTypeChanged { .. } => (400, e.to_string()),
         E::UnmappedActiveElement { .. }
         | E::MappedElementTypeChanged { .. }
         | E::MigratedParallelJoinArityChanged { .. }
@@ -397,14 +488,22 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         E::InstanceNotActive { .. }
         | E::MigrationFlowScopeChanged { .. }
         | E::MigrationMultiInstanceMismatch { .. }
+        | E::MigrationLoopCharacteristicsChanged { .. }
         | E::MigrationCatchEventDetached { .. }
         | E::MigrationCatchEventsMerged { .. }
+        // Zeebe INVALID_STATE (#1631).
+        | E::MigrationCompensationFlowScopeChanged { .. }
         // A target catch event whose subscription expression fails to evaluate
         // (Zeebe `ProcessInstanceMigrationCatchEventBehaviour`, INVALID_STATE).
         | E::MigrationCatchEventSubscriptionFailed { .. } => (409, e.to_string()),
         // A start event whose message-name / timer expression cannot be
         // evaluated at deploy time (Zeebe INVALID_ARGUMENT, #1398).
         E::StartEventExpressionInvalid { .. } => (400, e.to_string()),
+        // A structurally invalid process handed straight to deploy.
+        E::InvalidProcessModel { .. } => (400, e.to_string()),
+        // Replicated cluster-variable mutations (#1657).
+        E::ClusterVariableAlreadyExists { .. } => (409, e.to_string()),
+        E::ClusterVariableNotFound { .. } => (404, e.to_string()),
         other => (500, other.to_string()),
     }
 }
@@ -703,6 +802,254 @@ fn snapshot_ptr_path(dir: &Path) -> PathBuf {
     dir.join("current-snapshot.json")
 }
 
+/// Moves a diverged replica's snapshot aside (#1664) so a rebuild cannot
+/// restore its possibly diverged state, while keeping it for forensics: BOTH
+/// the pointer and the `.bin` body it names are renamed under a
+/// `diverged-<index>-` prefix. Every reclamation path (the constructor sweep,
+/// [`reap_superseded_snapshots`], the `incoming-*` sweep) only touches
+/// `snap-*` / `incoming-*` / the live pointer, so quarantined artifacts are
+/// never reclaimed in a durable snapshot dir. (A VOLATILE member's whole dir is
+/// throwaway by definition and is removed on retirement; forensics retention
+/// is a durable-dir guarantee.)
+fn quarantine_snapshot_ptr(dir: &Path, index: u64) {
+    let ptr = snapshot_ptr_path(dir);
+    if !ptr.is_file() {
+        return;
+    }
+    // Body first: once the pointer is gone a sweep may treat the body as an
+    // unreferenced `snap-*` file.
+    if let Some(stored) = read_snapshot_ptr(dir)
+        && let Some(name) = stored.path.file_name().and_then(|n| n.to_str())
+    {
+        let aside = dir.join(quarantined_name(index, name));
+        if let Err(e) = std::fs::rename(&stored.path, &aside) {
+            tracing::error!(path = ?stored.path, error = %e, "could not quarantine a diverged snapshot body");
+        }
+    }
+    let aside = dir.join(quarantined_name(index, "current-snapshot.json"));
+    if let Err(e) = std::fs::rename(&ptr, &aside) {
+        tracing::error!(?ptr, error = %e, "could not quarantine a diverged snapshot pointer");
+    }
+}
+
+/// The ONE canonical location of a partition's crash-durable divergence
+/// marker (#1691). Every bootstrap constructor resolves it through this
+/// function, so a fresh receiver, a durable member and a single-voter durable
+/// boot of the same partition all publish, look up and clear the SAME file:
+///
+/// - anchored at the engine journal's durable segmented-log directory
+///   (`journal_durable_dir`) when it has one — stable per partition across
+///   boots regardless of whether this boot's RAFT log is durable — else at
+///   the member's snapshot directory (a volatile journal has no durable state
+///   to fence);
+/// - namespaced by `partition_id`, because owned journals opened from one
+///   `SharedWriter` share a single directory: an un-namespaced marker would
+///   let one partition's resync clear a sibling's fence, or a sibling's
+///   divergence refuse a healthy partition's boot.
+///
+/// Its name matches no reclamation sweep (`snap-*` / `incoming-*` / the live
+/// pointer), so it survives every reap until an authoritative leader resync
+/// is durably installed.
+fn divergence_marker_path(
+    journal_durable_dir: Option<&Path>,
+    snapshot_dir: &Path,
+    partition_id: u64,
+) -> PathBuf {
+    journal_durable_dir
+        .unwrap_or(snapshot_dir)
+        .join(format!("divergence-marker-p{partition_id}.json"))
+}
+
+/// The marker's directory (for creation and the dir fsync that makes a
+/// rename/unlink durable).
+fn marker_parent(marker: &Path) -> std::io::Result<&Path> {
+    marker.parent().ok_or_else(|| {
+        std::io::Error::other(format!("divergence marker {marker:?} has no parent dir"))
+    })
+}
+
+/// Durably records `d` at `marker` (#1691): tmp write + fsync + rename + dir
+/// fsync, so a crash after the fail-stop can never resume the diverged
+/// journal. The staging file is derived from the (partition-namespaced)
+/// marker name, so sibling partitions sharing a directory never collide.
+fn write_divergence_marker(marker: &Path, d: &Divergence) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(d)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let dir = marker_parent(marker)?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = divergence_marker_staging_path(marker);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, marker)?;
+    sync_dir(dir)
+}
+
+/// The staging file a marker publication writes before its atomic rename:
+/// derived from the partition-namespaced marker path (plus the process id).
+fn divergence_marker_staging_path(marker: &Path) -> PathBuf {
+    let mut name = marker.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}", std::process::id()));
+    marker.with_file_name(name)
+}
+
+/// Fsyncs `dir` so a rename/unlink in it is durable; failures propagate (a
+/// swallowed directory fsync would report a non-durable fence as durable).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Establishes the boot-time divergence fence (#1691), failing closed: when
+/// the detailed marker cannot be published (e.g. a full disk), it falls back
+/// to an EMPTY marker file at the marker path — a create needs no data
+/// blocks — which [`read_divergence_marker`] reads as an undecodable marker
+/// and therefore still refuses the boot.
+fn persist_divergence_fence(marker: &Path, d: &Divergence) -> std::io::Result<()> {
+    let Err(detailed) = write_divergence_marker(marker, d) else {
+        return Ok(());
+    };
+    let fallback = (|| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(marker)?
+            .sync_all()?;
+        sync_dir(marker_parent(marker)?)
+    })();
+    match fallback {
+        Ok(()) => Err(std::io::Error::other(format!(
+            "detailed divergence marker failed ({detailed}); an empty fail-closed marker was \
+             published instead"
+        ))),
+        Err(e) => Err(std::io::Error::other(format!(
+            "divergence marker failed ({detailed}) and so did the fallback fence ({e})"
+        ))),
+    }
+}
+
+/// Reads the durable divergence marker (#1691). An unreadable/undecodable
+/// marker still means "diverged": it fails closed as a marker of unknown
+/// detail rather than being ignored.
+fn read_divergence_marker(marker: &Path) -> Option<Result<Divergence, String>> {
+    // `symlink_metadata`, not `exists()`: a lookup error other than NotFound
+    // must fail closed rather than read as "no marker".
+    match std::fs::symlink_metadata(marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Err(format!("marker lookup failed: {e}"))),
+        Ok(_) => {}
+    }
+    Some(
+        std::fs::read(marker)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())),
+    )
+}
+
+/// Clears the divergence marker (#1691) once an authoritative leader snapshot
+/// is durably installed, fsyncing the directory so the unlink is durable.
+fn clear_divergence_marker(marker: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(marker) {
+        Ok(()) => {}
+        // Still sync below: a retry must complete an earlier failed barrier.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    sync_dir(marker_parent(marker)?)
+}
+
+/// A boot REFUSED because the partition's crash-durable divergence marker
+/// (#1691) is present: its local journal/snapshot is known to have diverged
+/// from the replicated history, so the replica must not start as a voter or
+/// state machine over it. Typed (downcast it from the bootstrap's
+/// `anyhow::Error`) and operator-actionable: [`Display`](std::fmt::Display)
+/// names the partition, the marker and the remedy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivergedBootRefused {
+    /// The refused partition.
+    pub partition_id: u64,
+    /// The canonical marker file that refused the boot.
+    pub marker: PathBuf,
+    /// The recorded divergence, or why the marker could not be decoded (an
+    /// undecodable marker still refuses — it fails closed).
+    pub divergence: Result<Divergence, String>,
+}
+
+impl std::fmt::Display for DivergedBootRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "partition {}: refusing to boot from known-diverged local state (",
+            self.partition_id
+        )?;
+        match &self.divergence {
+            Ok(d) => write!(f, "{d}")?,
+            Err(e) => write!(f, "unreadable divergence marker: {e}")?,
+        }
+        write!(
+            f,
+            "; marker {:?}). Remedy: wipe this partition's local data (journal and Raft \
+             state) and rejoin the group, or resync it from the leader's snapshot; the \
+             marker is cleared only by an authoritative resync (#1691)",
+            self.marker
+        )
+    }
+}
+
+impl std::error::Error for DivergedBootRefused {}
+
+/// The engine journal's durable dir every bootstrap constructor feeds to
+/// [`divergence_marker_path`] (#1691): the single input that makes all of
+/// them resolve the same marker for a partition.
+async fn journal_durable_dir(engine: &DeepthiHandle) -> Option<PathBuf> {
+    engine
+        .with(|j| j.durable_dir().map(Path::to_path_buf))
+        .await
+}
+
+/// The boot-time divergence gate (#1691), run by EVERY bootstrap constructor
+/// BEFORE any fallible setup (snapshot-dir creation, log-store open): a setup
+/// failure must never abort construction before a known-diverged journal is
+/// fenced. Resolves the partition's canonical marker
+/// ([`divergence_marker_path`]) and, when it is present, fences the engine
+/// (`abort_raft_entry`) and fails closed with a typed [`DivergedBootRefused`]
+/// — a refused member is never hosted, and with no Raft member registered the
+/// server's direct (non-Raft) write paths would otherwise append to the very
+/// known-diverged journal this refusal protects. The journal's fence fails
+/// every command closed until the operator remedy (wipe + rejoin, or a leader
+/// resync). No marker → `Ok(())` and construction proceeds.
+///
+/// This is the pre-construction half of the gate; [`PartitionStateMachine`]'s
+/// own `refuse_diverged_boot` re-checks the same marker at boot-state restore
+/// (a no-op by then), so the gate also holds for any construction path that
+/// does not call here first.
+async fn refuse_diverged_boot_before_setup(
+    engine: &DeepthiHandle,
+    journal_durable_dir: Option<&Path>,
+    snapshot_dir: &Path,
+    partition_id: u64,
+) -> anyhow::Result<()> {
+    let marker = divergence_marker_path(journal_durable_dir, snapshot_dir, partition_id);
+    if let Some(divergence) = read_divergence_marker(&marker) {
+        engine.with(|journal| journal.abort_raft_entry()).await;
+        return Err(DivergedBootRefused {
+            partition_id,
+            marker,
+            divergence,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The name a diverged snapshot artifact is quarantined under (#1664): a
+/// prefix no reclamation sweep matches.
+fn quarantined_name(index: u64, original: &str) -> String {
+    format!("diverged-{index}-{original}")
+}
+
 /// The generation a snapshot file name belongs to (#1473): the `g<N>` infix a
 /// member stamps into every artifact it publishes (`snap-g<N>-<idx>.bin` /
 /// `snap-installed-g<N>-<idx>.bin`). A member reopening a durable snapshot dir
@@ -831,22 +1178,153 @@ pub fn durable_log_has_purge_hole(log_dir: &Path) -> bool {
 /// The replication state journaled in each [`Event::RaftEntryApplied`] record
 /// (#1405): the applied log id and the membership in effect after it. Opaque to
 /// engine-core (carried as a JSON string), decoded only here.
+///
+/// `digest` (ADR 0066 slice 5, #1664) is this replica's chain digest AFTER the
+/// entry. Additive on the wire: a pre-#1664 record decodes with `None` (the
+/// chain re-bases at the next entry), and a pre-#1664 reader ignores it.
 #[derive(Serialize, Deserialize)]
 struct JournaledRaftState {
     log_id: LogId<NodeId>,
     membership: StoredMembership<NodeId, BasicNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    digest: Option<EntryDigest>,
 }
 
-/// Serializes the [`JournaledRaftState`] for `log_id` + `membership`.
+/// Serializes the [`JournaledRaftState`] for `log_id` + `membership` (+ the
+/// entry's chain digest, when the replica computed one).
 fn journaled_raft_state(
     log_id: LogId<NodeId>,
     membership: &StoredMembership<NodeId, BasicNode>,
+    digest: Option<EntryDigest>,
 ) -> std::io::Result<String> {
     serde_json::to_string(&JournaledRaftState {
         log_id,
         membership: membership.clone(),
+        digest,
     })
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// How many recent `(log index -> chain digest)` pairs a replica keeps to
+/// answer the leader's digest claims (#1664). A claim names the leader's last
+/// applied index at propose time, which a follower applying in order has
+/// applied just before — so a small window suffices; a claim older than the
+/// window is simply not compared (never a false positive).
+const DIGEST_WINDOW: usize = 4096;
+
+/// The leader's chain digest carried additively in a replicated entry (ADR
+/// 0066 slice 5, #1664): its chain after applying log index `index`, which
+/// always precedes the entry carrying it, so the digest never delays the entry
+/// it covers. Followers compare it with their own chain at `index`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigestClaim {
+    pub index: u64,
+    pub chain: ChainDigest,
+}
+
+/// A detected replica divergence (#1664): the follower's chain at `index`
+/// disagreed with the leader's claim, so it fail-stopped its apply.
+/// Serializable: persisted as the crash-durable divergence marker (#1691).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Divergence {
+    /// The log index whose chains disagreed.
+    pub index: u64,
+    /// The entry carrying the leader's claim (where the follower stopped).
+    pub detected_at: u64,
+    pub leader: ChainDigest,
+    pub local: ChainDigest,
+}
+
+impl std::fmt::Display for Divergence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "replica divergence at raft index {} (detected applying {}): leader chain {}, \
+             local chain {}",
+            self.index, self.detected_at, self.leader, self.local
+        )
+    }
+}
+
+#[derive(Default)]
+struct DigestLedgerInner {
+    /// Recent `(index -> chain)` pairs, oldest evicted past [`DIGEST_WINDOW`].
+    recent: BTreeMap<u64, ChainDigest>,
+    /// Sticky once set: this member fail-stopped on a divergence.
+    diverged: Option<Divergence>,
+}
+
+/// One replica's recent chain digests (#1664), shared by its state machine
+/// (which records every applied entry and compares claims) and its batcher
+/// (which stamps the leader's latest digest into every proposed entry).
+#[derive(Clone, Default)]
+pub struct DigestLedger(Arc<Mutex<DigestLedgerInner>>);
+
+impl DigestLedger {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DigestLedgerInner> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records this replica's chain after applying `index`.
+    fn record(&self, index: u64, chain: ChainDigest) {
+        let mut g = self.lock();
+        g.recent.insert(index, chain);
+        while g.recent.len() > DIGEST_WINDOW {
+            g.recent.pop_first();
+        }
+    }
+
+    /// Records a Blank entry, which journals nothing and so leaves the chain
+    /// unchanged — only when the chain at the previous index is known.
+    fn record_unchanged(&self, index: u64) {
+        let prev = self
+            .lock()
+            .recent
+            .last_key_value()
+            .filter(|(i, _)| **i + 1 == index)
+            .map(|(_, c)| *c);
+        if let Some(chain) = prev {
+            self.record(index, chain);
+        }
+    }
+
+    /// Forgets every recorded digest (a snapshot install replaced the state
+    /// the chain described).
+    fn reset(&self) {
+        self.lock().recent.clear();
+    }
+
+    /// The latest recorded chain, as the claim the leader stamps into the next
+    /// proposed entry.
+    pub fn latest_claim(&self) -> Option<DigestClaim> {
+        self.lock()
+            .recent
+            .last_key_value()
+            .map(|(index, chain)| DigestClaim {
+                index: *index,
+                chain: *chain,
+            })
+    }
+
+    /// Compares a leader claim with this replica's chain at the same index.
+    /// `Some(local)` only for a REAL divergence: the index is recorded here,
+    /// the two chains are comparable (same version and base) and they differ.
+    fn check(&self, claim: &DigestClaim) -> Option<ChainDigest> {
+        self.lock()
+            .recent
+            .get(&claim.index)
+            .filter(|local| local.comparable(&claim.chain) && local.hash != claim.chain.hash)
+            .copied()
+    }
+
+    fn set_diverged(&self, d: Divergence) {
+        self.lock().diverged.get_or_insert(d);
+    }
+
+    /// The divergence this member fail-stopped on, if any (sticky).
+    pub fn divergence(&self) -> Option<Divergence> {
+        self.lock().diverged.clone()
+    }
 }
 
 /// Metadata held by the Raft state machine: the last applied log id and
@@ -882,10 +1360,16 @@ pub struct PartitionStateMachine {
     /// concurrent DETACHED `build_snapshot` is mid-writing (or an install's
     /// promoted-but-unpublished file) out from under it. Registered via
     /// [`InFlightSnapshot`] BEFORE the file exists, removed on drop.
-    in_flight_snapshots: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    in_flight_snapshots: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
     /// Directory holding this partition's snapshot files (both the current cached
     /// snapshot and transient incoming ones). Created on construction.
     snapshot_dir: PathBuf,
+    /// This partition's crash-durable divergence marker (#1691), resolved once
+    /// at construction by the canonical [`divergence_marker_path`].
+    marker: PathBuf,
+    /// The engine journal's durable dir the marker was resolved from (kept so
+    /// a continuation member re-resolves the identical path).
+    journal_durable_dir: Option<PathBuf>,
     /// This node's id, compared against [`leader`](Self::leader) so `apply` can
     /// tell whether it is currently the leader of this partition.
     node_id: NodeId,
@@ -919,6 +1403,8 @@ pub struct PartitionStateMachine {
     /// of "predecessor work races retirement / engine reuse", instead of a
     /// bespoke fence per operation.
     epoch: u64,
+    /// Recent chain digests + divergence latch (ADR 0066 slice 5, #1664).
+    digest: DigestLedger,
     /// Monotonic generation of this state machine's snapshot file names
     /// (#1473). Derived from the durable snapshot pointer's file name at
     /// construction, so a member that REOPENS a durable snapshot directory
@@ -933,6 +1419,7 @@ impl PartitionStateMachine {
         engine: DeepthiHandle,
         partition_id: u64,
         snapshot_dir: PathBuf,
+        journal_durable_dir: Option<PathBuf>,
         node_id: NodeId,
         evict_eligible: bool,
         leader: Arc<AtomicU64>,
@@ -1003,6 +1490,12 @@ impl PartitionStateMachine {
             recv_idx: AtomicU64::new(0),
             current_snapshot: Mutex::new(restored),
             in_flight_snapshots: Arc::default(),
+            marker: divergence_marker_path(
+                journal_durable_dir.as_deref(),
+                &snapshot_dir,
+                partition_id,
+            ),
+            journal_durable_dir,
             snapshot_dir,
             node_id,
             evict_eligible,
@@ -1011,6 +1504,7 @@ impl PartitionStateMachine {
             adoption_permit_waiting: Arc::default(),
             epoch,
             generation,
+            digest: DigestLedger::default(),
         })
     }
 
@@ -1020,6 +1514,11 @@ impl PartitionStateMachine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .partition_id
+    }
+
+    /// This partition's crash-durable divergence marker (#1691).
+    fn marker(&self) -> &Path {
+        &self.marker
     }
 
     /// A unique per-process, per-partition snapshot directory under the system
@@ -1077,11 +1576,13 @@ impl PartitionStateMachine {
     /// [`new`](Self::new) with a fresh temp snapshot directory. Used by the
     /// in-memory (volatile-log) bootstraps and the unit tests. Never eligible to
     /// evict (owned/serving semantics), so the leader flag is inert.
+    #[cfg(test)]
     fn new_temp(engine: DeepthiHandle, partition_id: u64) -> std::io::Result<Self> {
         Self::new(
             engine,
             partition_id,
             Self::temp_snapshot_dir(partition_id),
+            None,
             0,
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
@@ -1101,6 +1602,7 @@ impl PartitionStateMachine {
             engine,
             self.partition_id(),
             self.snapshot_dir.clone(),
+            self.journal_durable_dir.clone(),
             self.node_id,
             false,
             Arc::clone(&self.leader),
@@ -1118,7 +1620,14 @@ impl PartitionStateMachine {
     /// and openraft only has to replay the post-snapshot log tail on top. A no-op
     /// when there is no durable snapshot (the unpurged log replays in full, the
     /// original recovery path).
+    ///
+    /// A VOLATILE-log member (a fresh receiver) boots through here. It has no
+    /// durable snapshot of its own, but its engine journal may still be durable
+    /// (an owned partition), so the crash-durable divergence marker (#1691) is
+    /// checked here too — a refused boot fences the engine exactly like the
+    /// durable path ([`restore_newest_boot_state`](Self::restore_newest_boot_state)).
     async fn restore_from_current_snapshot(&self) -> anyhow::Result<()> {
+        self.refuse_diverged_boot().await?;
         let path = {
             let guard = self
                 .current_snapshot
@@ -1160,10 +1669,20 @@ impl PartitionStateMachine {
         mut captured: nanobpmn_engine_core::EngineSnapshot,
         meta: &SnapshotMeta<NodeId, BasicNode>,
     ) -> anyhow::Result<()> {
+        // Carry the snapshot's chain digest (#1664) across the re-derivation:
+        // the body's last applied record holds the chain at the snapshot's
+        // index (only Blank entries, which leave the chain unchanged, can lie
+        // between that record and `meta`), so the installed replica resumes
+        // the SAME chain — base included — as the replica that built it.
+        let carried_digest = captured
+            .raft_applied
+            .as_ref()
+            .filter(|(index, _)| meta.last_log_id.is_some_and(|l| *index <= l.index))
+            .and_then(|(_, state)| entry_digest_of(state));
         captured.raft_applied = match meta.last_log_id {
             Some(log_id) => Some((
                 log_id.index,
-                journaled_raft_state(log_id, &meta.last_membership)?,
+                journaled_raft_state(log_id, &meta.last_membership, carried_digest)?,
             )),
             None => None,
         };
@@ -1175,12 +1694,81 @@ impl PartitionStateMachine {
         // paired with adopted variables.
         let permit = self.adoption_checkpoint_permit().await;
         self.engine
-            .with(move |journal| {
-                journal.restore_engine_from_snapshot(captured);
-                journal.checkpoint_base(permit.as_ref())
-            })
+            .with(move |journal| journal.adopt_snapshot_as_base(captured, permit.as_ref()))
             .await
             .map_err(|e| anyhow::anyhow!("checkpointing the adopted Raft snapshot failed: {e}"))
+    }
+
+    /// Re-seeds the digest ledger (#1664) from the journal's last applied
+    /// record — after a snapshot install or a boot restore replaced the state
+    /// the previously recorded chains described.
+    async fn reseed_digest_from_journal(&self) {
+        self.digest.reset();
+        let recorded = self.engine.with(|journal| journal.raft_applied()).await;
+        if let Some((index, state)) = recorded
+            && let Some(chain) = nano_server_storage::digest::chain_of_raft_state(&state)
+        {
+            self.digest.record(index, chain);
+        }
+    }
+
+    /// Fail-stops this replica on a detected divergence (ADR 0066 slice 5,
+    /// #1664) and returns the `StorageError` that shuts its Raft core down:
+    ///
+    /// - raises the operator alert (`nanobpm_raft_divergence_total` + an error
+    ///   log naming the index and both digests) and latches the divergence
+    ///   ([`RaftPartition::divergence`]);
+    /// - FENCES the journal (as an aborted entry does, #1405), so nothing more
+    ///   is applied, snapshotted or served from the diverged state and the
+    ///   rebuild reconstructs the engine instead of reusing it;
+    /// - quarantines (renames, never deletes — kept for forensics) the local
+    ///   snapshot pointer, so the rebuild cannot restore a possibly diverged
+    ///   local snapshot and instead resyncs from the leader's snapshot.
+    ///
+    /// The divergent journal is left untouched for forensics. A leader never
+    /// adopts a follower's state: only followers compare.
+    async fn fail_stop_divergence(&self, divergence: Divergence) -> StorageError<NodeId> {
+        let partition_id = self.partition_id();
+        crate::metrics::inc_raft_divergence(partition_id, self.node_id);
+        tracing::error!(
+            partition = partition_id,
+            node = self.node_id,
+            index = divergence.index,
+            detected_at = divergence.detected_at,
+            leader_digest = %divergence.leader,
+            local_digest = %divergence.local,
+            "REPLICA DIVERGENCE (ADR 0066 #1664): this follower's chain digest disagrees with the \
+             leader's at the same index — fail-stopping apply; the partition resyncs from the \
+             leader's snapshot"
+        );
+        // Latch + quarantine under the snapshot publication lock (#1664
+        // review): an in-flight build/install that publishes afterwards sees
+        // the latch under that same lock and refuses, so a diverged state can
+        // never become the durable boot baseline again after the quarantine.
+        {
+            let _publish = self.engine.snapshot_publish_lock().await;
+            self.digest.set_diverged(divergence.clone());
+            // Crash-durable marker (#1691) BEFORE the quarantine: a restart
+            // must never resume the diverged journal, and a self-consistent
+            // diverged chain passes replay verification on its own. Anchored
+            // at the engine journal's durable dir when it has one, so a
+            // volatile-LOG member over a durable journal (a fresh receiver)
+            // is still fenced at its stable per-partition location.
+            if let Err(e) = persist_divergence_fence(self.marker(), &divergence) {
+                tracing::error!(
+                    marker = ?self.marker(),
+                    error = %e,
+                    "could not persist the divergence marker (#1691)"
+                );
+            }
+            quarantine_snapshot_ptr(&self.snapshot_dir, divergence.detected_at);
+        }
+        self.engine.with(|journal| journal.abort_raft_entry()).await;
+        StorageError::from_io_error(
+            ErrorSubject::StateMachine,
+            ErrorVerb::Write,
+            std::io::Error::other(divergence.to_string()),
+        )
     }
 
     /// Selects the NEWEST consistent boot state for a durable member (#1405):
@@ -1194,7 +1782,13 @@ impl PartitionStateMachine {
     /// Only a snapshot strictly ahead of the journal (or a journal with no
     /// applied-entry record at all) is restored. The single canonical boot-state
     /// rule for every durable bootstrap path.
+    ///
+    /// Fails closed when the crash-durable divergence marker (#1691) is
+    /// present: the local journal/snapshot is known-diverged and must not be
+    /// adopted — the member resyncs from the leader (fresh receiver, or an
+    /// installed leader snapshot, which clears the marker).
     async fn restore_newest_boot_state(&self) -> anyhow::Result<()> {
+        self.refuse_diverged_boot().await?;
         let journaled = self.journaled_applied().await?;
         let snapshot = self
             .current_snapshot
@@ -1211,6 +1805,40 @@ impl PartitionStateMachine {
             (Some(_), _) => self.seed_last_applied_from_journal().await,
             (None, Some(_)) => self.restore_from_current_snapshot().await,
             (None, None) => Ok(()),
+        }?;
+        self.reseed_digest_from_journal().await;
+        Ok(())
+    }
+
+    /// Refuses to adopt local state when the durable divergence marker
+    /// (#1691) is present. It does not re-latch in memory: the refused member
+    /// never runs, and a latch would refuse the very leader install that
+    /// clears the marker.
+    /// The single boot-time divergence gate (#1691), run by EVERY bootstrap
+    /// constructor before the member is created: when the partition's marker is
+    /// present the boot fails closed with a typed [`DivergedBootRefused`] and
+    /// the engine is fenced — a refused member is never hosted, and with no
+    /// Raft member registered the server's direct (non-Raft) write paths would
+    /// otherwise append to the very known-diverged journal this refusal
+    /// protects. The journal's fence fails every command closed until the
+    /// operator remedy (wipe + rejoin, or a leader resync).
+    async fn refuse_diverged_boot(&self) -> anyhow::Result<()> {
+        if let Err(refused) = self.refuse_diverged_local_state() {
+            self.engine.with(|journal| journal.abort_raft_entry()).await;
+            return Err(refused);
+        }
+        Ok(())
+    }
+
+    fn refuse_diverged_local_state(&self) -> anyhow::Result<()> {
+        match read_divergence_marker(self.marker()) {
+            None => Ok(()),
+            Some(divergence) => Err(DivergedBootRefused {
+                partition_id: self.partition_id(),
+                marker: self.marker().to_path_buf(),
+                divergence,
+            }
+            .into()),
         }
     }
 
@@ -1382,6 +2010,16 @@ impl PartitionStateMachine {
         // permit, a different lock domain that must never be held together
         // with the publication lock.
         let publish_guard: SnapshotPublishGuard = self.engine.snapshot_publish_lock().await;
+        // A latched divergence (#1664 review) refuses publication under the
+        // lock the latch is set under: never publish onto a diverged member.
+        if let Some(d) = self.digest.divergence() {
+            let _ = std::fs::remove_file(&current_path);
+            return Err(StorageIOError::write_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(d.to_string()),
+            )
+            .into());
+        }
         // Never regress the published snapshot (#1488 review): if a newer
         // snapshot is already published, this install is stale — discard its
         // file and leave the pointer, cache and engine untouched.
@@ -1449,6 +2087,28 @@ impl PartitionStateMachine {
                 })?;
         }
 
+        if adopt {
+            // The installed state carries the snapshot's chain (#1664).
+            self.reseed_digest_from_journal().await;
+            // Only NOW — the leader's state adopted AND checkpointed as the
+            // journal's recovery base — is the divergent local state gone, so
+            // only now may the crash-durable marker (#1691) be cleared. A
+            // crash or adoption/checkpoint failure before this point keeps the
+            // marker and the next boot still refuses the diverged journal.
+            // Cleared under the publication lock the divergence latch +
+            // marker are published under, so a divergence detected
+            // concurrently is never erased.
+            let _publish = self.engine.snapshot_publish_lock().await;
+            if let Some(d) = self.digest.divergence() {
+                return Err(StorageIOError::write_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(d.to_string()),
+                )
+                .into());
+            }
+            clear_divergence_marker(self.marker())
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        }
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.last_applied = meta.last_log_id;
@@ -1743,6 +2403,17 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             barrier.wait().await;
         }
         let _publish = self.sm.engine.snapshot_publish_lock().await;
+        // A latched divergence (#1664 review) refuses publication under the
+        // lock the latch is set under: an already-captured build must never
+        // republish the diverged state as the boot baseline.
+        if let Some(d) = self.sm.digest.divergence() {
+            let _ = std::fs::remove_file(&path);
+            return Err(StorageIOError::write_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(d.to_string()),
+            )
+            .into());
+        }
         // Never regress the published snapshot (#1488 review): a build
         // captured at index N that reaches publication after a concurrent
         // install already published M > N must not replace the pointer/cache
@@ -1853,6 +2524,8 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             let log_id = entry.log_id;
             match entry.payload {
                 EntryPayload::Blank => {
+                    // A Blank entry journals nothing, so the chain is unchanged.
+                    self.digest.record_unchanged(log_id.index);
                     self.inner
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1890,26 +2563,50 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     // error-mapping phase below can apply the command-specific HTTP
                     // status contract (`engine_error_status_for`).
                     type ApplyOutcome = Result<Arc<Vec<Event>>, nanobpmn_engine_core::EngineError>;
-                    let raft_state = {
-                        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                        journaled_raft_state(log_id, &inner.last_membership)
+                    // Divergence digest (ADR 0066 slice 5, #1664): compare the
+                    // leader's claimed chain with ours at the same index BEFORE
+                    // applying anything more — never continue on diverged state.
+                    if let Some(claim) = batch.digest
+                        && let Some(local) = self.digest.check(&claim)
+                    {
+                        return Err(self
+                            .fail_stop_divergence(Divergence {
+                                index: claim.index,
+                                detected_at: log_id.index,
+                                leader: claim.chain,
+                                local,
+                            })
+                            .await);
                     }
-                    .map_err(|e| {
-                        StorageError::from_io_error(ErrorSubject::StateMachine, ErrorVerb::Write, e)
-                    })?;
+                    let membership = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .last_membership
+                        .clone();
                     type EntryOutcomes = Vec<(&'static str, ApplyOutcome)>;
-                    let applied: std::io::Result<(EntryOutcomes, crate::journal::Commit)> = self
+                    let applied: std::io::Result<(
+                        EntryOutcomes,
+                        crate::journal::Commit,
+                        EntryDigest,
+                    )> = self
                         .engine
                         .with(move |journal| {
                             journal.begin_raft_entry();
                             let mut outcomes = Vec::with_capacity(batch.items.len());
-                            for ReplicatedCommand { command, now } in batch.items {
+                            for ReplicatedCommand {
+                                command,
+                                now,
+                                operation_reference,
+                            } in batch.items
+                            {
                                 // Per-command actor profiling (off unless
                                 // NANOBPM_CMD_PROFILE): time + allocated-byte
                                 // delta by command kind, on the engine thread.
                                 let timer = crate::cmd_profile::start();
                                 let kind = command.kind();
-                                let outcome = journal.apply_command_at(command, now);
+                                let outcome =
+                                    journal.apply_command_ref_at(command, now, operation_reference);
                                 crate::cmd_profile::finish(timer, kind);
                                 match outcome {
                                     Err(e) if e.is_environmental() => {
@@ -1922,13 +2619,19 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                     outcome => outcomes.push((kind, outcome.map(|(ev, _)| ev))),
                                 }
                             }
+                            // Fold exactly the events this entry journals
+                            // into the chain and record it in the same frame.
+                            let digest = journal.raft_entry_digest(log_id.index);
+                            let raft_state =
+                                journaled_raft_state(log_id, &membership, Some(digest))
+                                    .inspect_err(|_| journal.abort_raft_entry())?;
                             let (_, commit) = journal
                                 .commit_raft_entry(log_id.index, raft_state)
                                 .inspect_err(|_| journal.abort_raft_entry())?;
-                            Ok((outcomes, commit))
+                            Ok((outcomes, commit, digest))
                         })
                         .await;
-                    let (outcomes, commit) = match applied {
+                    let (outcomes, commit, digest) = match applied {
                         Ok(ok) => ok,
                         Err(e) => {
                             tracing::error!(
@@ -1946,6 +2649,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     };
                     // The entry's single durability barrier.
                     commit.wait().await;
+                    self.digest.record(log_id.index, digest.chain);
 
                     // Build the per-command responses.
                     let mut items = Vec::with_capacity(outcomes.len());
@@ -2003,16 +2707,20 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     // `last_applied` from the journal also recovers the
                     // membership the skipped log prefix established.
                     let membership = StoredMembership::new(Some(log_id), mem);
-                    let raft_state = journaled_raft_state(log_id, &membership).map_err(|e| {
-                        StorageError::from_io_error(ErrorSubject::StateMachine, ErrorVerb::Write, e)
-                    })?;
-                    let commit = self
+                    let journaled_membership = membership.clone();
+                    let (commit, digest) = self
                         .engine
                         .with(move |journal| {
                             journal.begin_raft_entry();
+                            // A membership entry journals no command events,
+                            // but still advances the chain (#1664).
+                            let digest = journal.raft_entry_digest(log_id.index);
+                            let raft_state =
+                                journaled_raft_state(log_id, &journaled_membership, Some(digest))
+                                    .inspect_err(|_| journal.abort_raft_entry())?;
                             journal
                                 .commit_raft_entry(log_id.index, raft_state)
-                                .map(|(_, commit)| commit)
+                                .map(|(_, commit)| (commit, digest))
                                 .inspect_err(|_| journal.abort_raft_entry())
                         })
                         .await
@@ -2024,6 +2732,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                             )
                         })?;
                     commit.wait().await;
+                    self.digest.record(log_id.index, digest.chain);
                     let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     inner.last_applied = Some(log_id);
                     inner.last_membership = membership;
@@ -2275,7 +2984,7 @@ fn published_snapshot_supersedes(
 fn reap_superseded_snapshots(
     snapshot_dir: &Path,
     keep: &Path,
-    in_flight: &Mutex<std::collections::HashSet<PathBuf>>,
+    in_flight: &Mutex<std::collections::BTreeSet<PathBuf>>,
     partition_id: u64,
     node_id: NodeId,
 ) {
@@ -2339,12 +3048,12 @@ fn reap_superseded_snapshots(
 /// (#1488): while alive, [`reap_superseded_snapshots`] skips the path. Dropped
 /// on every exit path (success or error), so a failed build never pins a path.
 struct InFlightSnapshot {
-    set: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    set: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
     path: PathBuf,
 }
 
 impl InFlightSnapshot {
-    fn register(set: &Arc<Mutex<std::collections::HashSet<PathBuf>>>, path: &Path) -> Self {
+    fn register(set: &Arc<Mutex<std::collections::BTreeSet<PathBuf>>>, path: &Path) -> Self {
         set.lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(path.to_path_buf());
@@ -2612,12 +3321,18 @@ struct Submission {
 ///
 /// It matches the engine actor's High/Low mailbox (`deepthi::Priority`) one layer
 /// down, so the two agree end to end.
-fn is_creation_intake(command: &Command) -> bool {
+///
+/// `EvaluateConditionalStartEvents` (#932) is creation intake too: every
+/// instance it starts is fresh demand, so it must yield to the drain path
+/// exactly like `CreateInstance`. The non-Raft path derives its engine-mailbox
+/// priority from this same predicate (`apply_create_command`).
+pub fn is_creation_intake(command: &Command) -> bool {
     matches!(
         command,
         Command::CreateInstance { .. }
             | Command::ActivateJobs { .. }
             | Command::DispatchStartInstance { .. }
+            | Command::EvaluateConditionalStartEvents { .. }
     )
 }
 
@@ -2637,6 +3352,7 @@ fn is_creation_intake(command: &Command) -> bool {
 /// capacity the drain path leaves — the log-layer analogue of Zeebe's
 /// `WhiteListedCommands`, and the fix for the credit-starvation latch where a
 /// create flood at the single FIFO starved job completion.
+#[derive(Clone)]
 struct Batcher {
     hi_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
     lo_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
@@ -2645,8 +3361,41 @@ struct Batcher {
     engine: DeepthiHandle,
 }
 
+/// Whether every member of `raft`'s current membership other than itself is
+/// known (via `transport`) to support `feature` (#1664). Unknown counts as
+/// unsupported.
+async fn all_members_support(
+    raft: &openraft::Raft<RaftConfig>,
+    transport: &dyn RaftTransport,
+    feature: &'static str,
+) -> bool {
+    let (me, members): (NodeId, Vec<NodeId>) = {
+        let m = raft.metrics();
+        let m = m.borrow();
+        (
+            m.id,
+            m.membership_config
+                .membership()
+                .nodes()
+                .map(|(id, _)| *id)
+                .collect(),
+        )
+    };
+    for id in members.into_iter().filter(|id| *id != me) {
+        if !transport.peer_supports(id, feature).await {
+            return false;
+        }
+    }
+    true
+}
+
 impl Batcher {
-    fn spawn(raft: openraft::Raft<RaftConfig>, engine: DeepthiHandle) -> Self {
+    fn spawn(
+        raft: openraft::Raft<RaftConfig>,
+        engine: DeepthiHandle,
+        digest: DigestLedger,
+        transport: Arc<dyn RaftTransport>,
+    ) -> Self {
         let (hi_tx, mut hi_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
         let (lo_tx, mut lo_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
         let max_bytes = max_entry_bytes();
@@ -2699,7 +3448,24 @@ impl Batcher {
                 }
                 let items: Vec<ReplicatedCommand> = subs.iter().map(|s| s.item.clone()).collect();
                 let n = items.len();
-                match raft.client_write(ReplicatedBatch::new(items)).await {
+                // Carry this (leader) replica's latest chain digest so
+                // followers can compare at that index (#1664).
+                // Rolling-upgrade gate (#1664 / #1661): stamp only while
+                // every other member advertises the digest capability, so a
+                // mixed-version group never compares (never false-positives).
+                let claim = if all_members_support(
+                    &raft,
+                    transport.as_ref(),
+                    nano_falcon_protocol::cluster_join::FEATURE_REPLICA_DIGEST,
+                )
+                .await
+                {
+                    digest.latest_claim()
+                } else {
+                    None
+                };
+                let batch = ReplicatedBatch::new(items).with_digest(claim);
+                match raft.client_write(batch).await {
                     Ok(res) => {
                         let mut out = res.data.items;
                         if out.len() == n {
@@ -2737,7 +3503,12 @@ impl Batcher {
         }
     }
 
-    async fn submit(&self, command: Command, now: u64) -> Result<ReplicatedItem, ProposeError> {
+    async fn submit(
+        &self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<ReplicatedItem, ProposeError> {
         let command = stamp_for_proposal(&self.engine, command).await;
         let (resp, rx) = tokio::sync::oneshot::channel();
         // Route fresh creation intake to the low-priority lane; the drain path
@@ -2749,7 +3520,11 @@ impl Batcher {
             &self.hi_tx
         };
         tx.send(Submission {
-            item: ReplicatedCommand { command, now },
+            item: ReplicatedCommand {
+                command,
+                now,
+                operation_reference,
+            },
             resp,
         })
         .map_err(|_| ProposeError::Other("raft propose batcher stopped".to_string()))?;
@@ -2784,6 +3559,273 @@ async fn stamp_for_proposal(engine: &DeepthiHandle, command: Command) -> Command
         .await
 }
 
+/// The engine-actor → Raft-leader propose channel for off-heap orphans
+/// (#1447): an orphan detected inside replicated state-machine application is
+/// handed to this queue (via [`OrphanQueueSink`]) and proposed by the
+/// partition LEADER as a STAMPED `Command::QuarantineOffheapOrphan` — the
+/// leader resolves the incident metadata from its own state, so every replica
+/// applies the identical incident whatever its local residency. Unbounded:
+/// orphan detection is rare (a lost spill row) and each item is tiny; the
+/// journal's in-flight set keeps a key from being queued twice.
+type OrphanQueue = tokio::sync::mpsc::UnboundedSender<(
+    nanobpmn_engine_core::Key,
+    nanobpmn_engine_core::OrphanKind,
+)>;
+
+/// The journal-facing half of the orphan propose channel (#1447): implements
+/// the storage layer's `OrphanSink` trait so the engine actor can hand an
+/// orphan key off without blocking.
+#[derive(Debug)]
+struct OrphanQueueSink {
+    tx: OrphanQueue,
+}
+
+impl nano_server_storage::journal::OrphanSink for OrphanQueueSink {
+    fn enqueue_orphan(
+        &self,
+        instance_key: nanobpmn_engine_core::Key,
+        kind: nanobpmn_engine_core::OrphanKind,
+    ) -> bool {
+        self.tx.send((instance_key, kind)).is_ok()
+    }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for the leader's replicated
+/// `now` stamp on a proposed quarantine command (#1447).
+fn orphan_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Runs `f` on the engine actor under this member's lifecycle epoch (#1473):
+/// `None` (and nothing runs) once the member is retired, so a delayed task of a
+/// retired predecessor can never touch the successor's journal state.
+///
+/// The shared lifecycle guard is moved INTO the queued actor closure, not held
+/// by this future (#1574 review): the orphan drainer/watcher run under a
+/// shutdown `select!`, so this future can be CANCELLED after the callback was
+/// queued — a future-held guard would drop with it, letting retirement's
+/// exclusive lock advance the epoch while the queued update still runs. Owned
+/// by the closure, the guard is released only when the job has finished (or
+/// when the actor drains it on death), so the epoch cannot advance underneath
+/// a pending update.
+async fn with_member_engine<R: Send + 'static>(
+    engine: &DeepthiHandle,
+    epoch: u64,
+    f: impl FnOnce(&mut Journal) -> R + Send + 'static,
+) -> Option<R> {
+    let lifecycle = engine.lifecycle_enter(epoch).await?;
+    Some(
+        engine
+            .with(move |journal| {
+                let _lifecycle = lifecycle;
+                f(journal)
+            })
+            .await,
+    )
+}
+
+/// [`with_member_engine`] with a probe fired once the shared lifecycle guard
+/// is held, before the actor callback is queued — so the cancellation test can
+/// drop the calling future at the exact point the #1574-review race needs.
+#[cfg(test)]
+async fn with_member_engine_observed<R: Send + 'static>(
+    engine: &DeepthiHandle,
+    epoch: u64,
+    f: impl FnOnce(&mut Journal) -> R + Send + 'static,
+    on_guard: impl FnOnce() + Send,
+) -> Option<R> {
+    let lifecycle = engine.lifecycle_enter(epoch).await?;
+    on_guard();
+    Some(
+        engine
+            .with(move |journal| {
+                let _lifecycle = lifecycle;
+                f(journal)
+            })
+            .await,
+    )
+}
+
+/// Proposes one orphan report as a leader-STAMPED quarantine (#1447). The
+/// report stays in the journal's backlog until the command applies: a stamp of
+/// `None` (the leader already holds the incident, or the instance is terminal
+/// here) settles it; a failed or rejected proposal returns it to the backlog
+/// for the next drain. Returns `false` once the member is retired.
+async fn propose_orphan(
+    batcher: &Batcher,
+    engine: &DeepthiHandle,
+    epoch: u64,
+    key: nanobpmn_engine_core::Key,
+    kind: nanobpmn_engine_core::OrphanKind,
+) -> bool {
+    let Some(pending) = with_member_engine(engine, epoch, move |journal| {
+        journal.orphan_pending_stamp(key, kind)
+    })
+    .await
+    else {
+        return false;
+    };
+    // Stale queued item (#1574 review): the report was settled or discarded on
+    // engine adoption (a healthy snapshot install) — never propose it.
+    let Some(stamp) = pending else {
+        return true;
+    };
+    let Some(stamp) = stamp else {
+        return with_member_engine(engine, epoch, move |j| j.orphan_proposal_settled(key))
+            .await
+            .is_some();
+    };
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    // No caller operationReference for an internal quarantine proposal (#1556).
+    let failure = match batcher.submit(command, orphan_now_millis(), None).await {
+        Ok(item) => item
+            .error
+            .map(|(status, message)| format!("{status}: {message}")),
+        Err(err) => Some(err.to_string()),
+    };
+    if let Some(error) = failure {
+        tracing::error!(
+            instance_key = key,
+            %error,
+            "orphan quarantine proposal failed (#1447); the report stays in the \
+             backlog and is re-proposed by the next drain"
+        );
+        return with_member_engine(engine, epoch, move |j| j.orphan_proposal_failed(key))
+            .await
+            .is_some();
+    }
+    true
+}
+
+/// Stop handle for the orphan propose tasks of one partition member (#1574
+/// review). The drainer task holds the engine handle and a [`Batcher`] (which
+/// holds the Raft), while the channel's sender lives inside that same engine's
+/// journal — an ownership cycle in which `rx.recv()` alone never returns
+/// `None`. The tasks therefore also exit on an EXPLICIT stop: when this handle
+/// is [stopped](Self::stop) or dropped (it is owned by [`RaftPartition`]), or
+/// when the Raft core has shut down. Exiting drops their engine/Batcher/Raft
+/// clones, breaking the cycle.
+struct OrphanProposeStop {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl OrphanProposeStop {
+    fn stop(&self) {
+        self.tx.send_replace(true);
+    }
+}
+
+impl Drop for OrphanProposeStop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Resolves once the orphan propose tasks must exit (#1574 review): the stop
+/// handle fired or was dropped, or the Raft core shut down (its metrics report
+/// `Shutdown`, or the metrics channel closed with the core).
+async fn orphan_propose_stopped(
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut metrics: tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, BasicNode>>,
+) {
+    let stop_fired = async move {
+        // `wait_for` errs when the sender is dropped — also a stop.
+        let _ = stop.wait_for(|stopped| *stopped).await;
+    };
+    let raft_down = async move {
+        let _ = metrics
+            .wait_for(|m| m.state == openraft::ServerState::Shutdown)
+            .await;
+    };
+    tokio::select! {
+        () = stop_fired => {}
+        () = raft_down => {}
+    }
+}
+
+/// Wires the orphan propose channel for one partition member (#1447). Every
+/// task is bound to the member's lifecycle `epoch` (#1473) and stops once it is
+/// retired, so a rebuilt successor sharing the engine actor cannot have its
+/// sink or leadership flag overwritten by a delayed predecessor. Both tasks
+/// also exit when the returned [`OrphanProposeStop`] fires / drops or the Raft
+/// core shuts down (#1574 review), so the drainer ⇄ journal ownership cycle
+/// cannot keep them (and the Raft they hold) alive past shutdown:
+///
+/// 1. The journal gets an [`OrphanQueueSink`] plus the member's CURRENT
+///    leadership (wiring drains anything parked before it).
+/// 2. A drainer proposes each queued orphan through the partition's
+///    [`Batcher`] as a leader-stamped quarantine ([`propose_orphan`]).
+/// 3. A metrics watcher keeps the journal's leadership flag fresh, draining the
+///    parked backlog on promotion.
+fn wire_orphan_propose(
+    raft: &openraft::Raft<RaftConfig>,
+    batcher: &Batcher,
+    engine: &DeepthiHandle,
+    epoch: u64,
+) -> (
+    OrphanProposeStop,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink: Arc<dyn nano_server_storage::journal::OrphanSink> = Arc::new(OrphanQueueSink { tx });
+    let node_id = raft.metrics().borrow().id;
+    let mut metrics = raft.metrics();
+    let engine_for_watch = engine.clone();
+    let watch_stopped = orphan_propose_stopped(stop_rx.clone(), raft.metrics());
+    // Seed the sink first, then keep the leadership flag fresh — one task, so
+    // the seed is ordered before the first leadership publish.
+    let watcher = tokio::spawn(async move {
+        let work = async move {
+            let seeded = with_member_engine(&engine_for_watch, epoch, move |journal| {
+                journal.set_orphan_sink(sink);
+            })
+            .await;
+            if seeded.is_none() {
+                return; // retired before wiring
+            }
+            loop {
+                let is_leader = metrics.borrow().current_leader == Some(node_id);
+                let published = with_member_engine(&engine_for_watch, epoch, move |journal| {
+                    journal.set_orphan_leadership(is_leader)
+                })
+                .await;
+                if published.is_none() || metrics.changed().await.is_err() {
+                    break; // retired, or Raft dropped
+                }
+            }
+        };
+        tokio::select! {
+            () = work => {}
+            () = watch_stopped => {}
+        }
+    });
+    let batcher = batcher.clone();
+    let engine = engine.clone();
+    let drain_stopped = orphan_propose_stopped(stop_rx, raft.metrics());
+    let drainer = tokio::spawn(async move {
+        let work = async move {
+            while let Some((key, kind)) = rx.recv().await {
+                if !propose_orphan(&batcher, &engine, epoch, key, kind).await {
+                    break; // retired: the successor wires its own channel
+                }
+            }
+        };
+        tokio::select! {
+            () = work => {}
+            () = drain_stopped => {}
+        }
+    });
+    (OrphanProposeStop { tx: stop_tx }, watcher, drainer)
+}
+
 /// A Raft-managed partition: the openraft instance plus handles to its stores.
 pub struct RaftPartition {
     pub raft: openraft::Raft<RaftConfig>,
@@ -2815,6 +3857,16 @@ pub struct RaftPartition {
     /// dir). Only a volatile dir is reclaimed on retire; a durable recovery
     /// directory is never touched.
     sm_volatile_snap: bool,
+    /// Stops this member's orphan propose tasks on retire / drop (#1574
+    /// review), breaking the drainer ⇄ journal ownership cycle.
+    orphan_stop: OrphanProposeStop,
+    /// The orphan watcher + drainer task handles (#1574 review), kept so tests
+    /// can assert they exit on shutdown.
+    #[cfg_attr(not(test), allow(dead_code))]
+    orphan_tasks: [tokio::task::JoinHandle<()>; 2],
+    /// This member's recent chain digests and divergence latch (#1664),
+    /// shared with its state machine and batcher.
+    digest: DigestLedger,
 }
 
 impl RaftPartition {
@@ -2831,25 +3883,50 @@ impl RaftPartition {
         // promptly (no peers means no real heartbeating), and the shared config
         // also carries the (jittered) snapshot policy so a solo replica compacts
         // its log on the same env-tunable cadence as a group member.
-        let config = Arc::new(raft_config(partition_id).validate()?);
-
         let log_store = MemLogStore::default();
         let stamp_engine = engine.clone();
-        let state_machine = Arc::new(PartitionStateMachine::new_temp(engine, partition_id)?);
-        let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
-        let snapshot_progress = Arc::new(SnapshotSendProgress::default());
-        let network = PartitionNetwork::new(
-            Arc::new(NullTransport),
+        let engine_for_orphans = engine.clone();
+        let journal_durable_dir = journal_durable_dir(&engine).await;
+        let snapshot_dir = PartitionStateMachine::temp_snapshot_dir(partition_id);
+        // The divergence gate runs BEFORE the fallible state-machine
+        // construction below: a snapshot-setup failure must not abort the boot
+        // before a known-diverged journal is fenced (#1691).
+        refuse_diverged_boot_before_setup(
+            &engine,
+            journal_durable_dir.as_deref(),
+            &snapshot_dir,
             partition_id,
-            snapshot_progress.clone(),
-        );
+        )
+        .await?;
+        // Config validation is fallible too, so it also runs after the gate.
+        let config = Arc::new(raft_config(partition_id).validate()?);
+        let state_machine = Arc::new(PartitionStateMachine::new(
+            engine,
+            partition_id,
+            snapshot_dir,
+            journal_durable_dir,
+            0,
+            false,
+            Arc::new(AtomicU64::new(u64::MAX)),
+        )?);
+        // Volatile log, but the engine journal may be durable: the same
+        // boot-time divergence gate as every other constructor (#1691).
+        state_machine.refuse_diverged_boot().await?;
+        let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
+        let digest = state_machine.digest.clone();
+        let snapshot_progress = Arc::new(SnapshotSendProgress::default());
+        let transport: Arc<dyn RaftTransport> = Arc::new(NullTransport);
+        let network =
+            PartitionNetwork::new(transport.clone(), partition_id, snapshot_progress.clone());
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         let mut members = BTreeMap::new();
         members.insert(node_id, BasicNode::new(addr));
         raft.initialize(members).await?;
 
-        let batcher = Batcher::spawn(raft.clone(), stamp_engine);
+        let batcher = Batcher::spawn(raft.clone(), stamp_engine, digest.clone(), transport);
+        let (orphan_stop, orphan_watcher, orphan_drainer) =
+            wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
             raft,
             node_id,
@@ -2862,6 +3939,9 @@ impl RaftPartition {
             sm_snapshot_dir,
             // A single in-memory voter anchors its snapshots in a temp dir.
             sm_volatile_snap: true,
+            orphan_stop,
+            orphan_tasks: [orphan_watcher, orphan_drainer],
+            digest,
         })
     }
 
@@ -2878,31 +3958,44 @@ impl RaftPartition {
         engine: DeepthiHandle,
         log_dir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Self> {
-        let config = Arc::new(raft_config(partition_id).validate()?);
-
         let log_dir = log_dir.as_ref().to_path_buf();
+        let snapshot_dir = log_dir.join("snapshots");
+        let journal_durable_dir = journal_durable_dir(&engine).await;
+        // The divergence gate runs BEFORE the fallible log-store open and
+        // state-machine construction below: a setup failure must not abort the
+        // boot before a known-diverged journal is fenced (#1691).
+        refuse_diverged_boot_before_setup(
+            &engine,
+            journal_durable_dir.as_deref(),
+            &snapshot_dir,
+            partition_id,
+        )
+        .await?;
+        // Config validation is fallible too, so it also runs after the gate.
+        let config = Arc::new(raft_config(partition_id).validate()?);
         let log_store = crate::raft_logstore::RaftLogStore::open(&log_dir)?;
         let log_bytes = log_store.bytes_handle();
         let stamp_engine = engine.clone();
+        let engine_for_orphans = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
-            log_dir.join("snapshots"),
+            snapshot_dir,
+            journal_durable_dir,
             node_id,
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
         )?);
         let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
+        let digest = state_machine.digest.clone();
         // A durable journal-backed engine already holds every entry its journal
         // recorded: boot from the newer of journal and snapshot so openraft
         // re-applies neither's entries (#1405).
         state_machine.restore_newest_boot_state().await?;
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
-        let network = PartitionNetwork::new(
-            Arc::new(NullTransport),
-            partition_id,
-            snapshot_progress.clone(),
-        );
+        let transport: Arc<dyn RaftTransport> = Arc::new(NullTransport);
+        let network =
+            PartitionNetwork::new(transport.clone(), partition_id, snapshot_progress.clone());
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         // A fresh log needs the one-shot membership bootstrap; a recovered log
@@ -2913,7 +4006,9 @@ impl RaftPartition {
             raft.initialize(members).await?;
         }
 
-        let batcher = Batcher::spawn(raft.clone(), stamp_engine);
+        let batcher = Batcher::spawn(raft.clone(), stamp_engine, digest.clone(), transport);
+        let (orphan_stop, orphan_watcher, orphan_drainer) =
+            wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         Ok(Self {
             raft,
             node_id,
@@ -2926,6 +4021,9 @@ impl RaftPartition {
             sm_snapshot_dir,
             // Snapshots anchor next to the durable log — never reclaimed on retire.
             sm_volatile_snap: false,
+            orphan_stop,
+            orphan_tasks: [orphan_watcher, orphan_drainer],
+            digest,
         })
     }
 
@@ -2952,7 +4050,7 @@ impl RaftPartition {
         log_dir: Option<std::path::PathBuf>,
         evict_eligible: bool,
     ) -> anyhow::Result<Self> {
-        let config = Arc::new(raft_config(partition_id).validate()?);
+        let journal_durable_dir = journal_durable_dir(&engine).await;
         // Anchor snapshots next to the durable log when there is one, else a temp
         // dir for the volatile (in-memory-log) deployments.
         let volatile_snap = log_dir.is_none();
@@ -2965,15 +4063,30 @@ impl RaftPartition {
         // metrics watcher spawned below once the Raft handle exists.
         let leader = Arc::new(AtomicU64::new(u64::MAX));
         let stamp_engine = engine.clone();
+        let engine_for_orphans = engine.clone();
+        // The divergence gate runs BEFORE the fallible state-machine
+        // construction below: a snapshot-setup failure must not abort the boot
+        // before a known-diverged journal is fenced (#1691).
+        refuse_diverged_boot_before_setup(
+            &engine,
+            journal_durable_dir.as_deref(),
+            &snapshot_dir,
+            partition_id,
+        )
+        .await?;
+        // Config validation is fallible too, so it also runs after the gate.
+        let config = Arc::new(raft_config(partition_id).validate()?);
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
             snapshot_dir,
+            journal_durable_dir,
             node_id,
             evict_eligible,
             leader.clone(),
         )?);
         let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
+        let digest = state_machine.digest.clone();
         // Restore the engine from the durable current snapshot (if any) BEFORE
         // openraft is constructed: with a compacted log the snapshot holds the
         // purged prefix, and the state machine already carries its applied
@@ -2992,7 +4105,8 @@ impl RaftPartition {
             state_machine.restore_from_current_snapshot().await?;
         }
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
-        let network = PartitionNetwork::new(transport, partition_id, snapshot_progress.clone());
+        let network =
+            PartitionNetwork::new(transport.clone(), partition_id, snapshot_progress.clone());
         // One `Raft` handle, two possible log stores. The handle erases the log
         // storage type, so both arms yield the same `RaftPartition`; building the
         // `Raft` inside each arm avoids needing a common concrete store type. The
@@ -3013,7 +4127,9 @@ impl RaftPartition {
                 (raft, Arc::new(AtomicI64::new(0)))
             }
         };
-        let batcher = Batcher::spawn(raft.clone(), stamp_engine);
+        let batcher = Batcher::spawn(raft.clone(), stamp_engine, digest.clone(), transport);
+        let (orphan_stop, orphan_watcher, orphan_drainer) =
+            wire_orphan_propose(&raft, &batcher, &engine_for_orphans, sm_epoch);
         // Keep the state machine's leader signal fresh so its terminal-eviction
         // gate flips off the instant this member wins leadership. Only needed for
         // an evict-eligible follower; an owned member never evicts in `apply`.
@@ -3040,6 +4156,9 @@ impl RaftPartition {
             sm_epoch,
             sm_snapshot_dir,
             sm_volatile_snap: volatile_snap,
+            orphan_stop,
+            orphan_tasks: [orphan_watcher, orphan_drainer],
+            digest,
         })
     }
 
@@ -3076,6 +4195,9 @@ impl RaftPartition {
         // No durable log dir: a receiver never resumes an on-disk lineage, and a
         // volatile member anchors its snapshots in a fresh per-boot temp dir, so
         // no prior snapshot can seed its applied state either.
+        // The divergence marker (#1691) is still resolved at the ENGINE
+        // journal's stable durable dir (`bootstrap_member`), so a marked
+        // journal refuses this receiver too ([`DivergedBootRefused`]).
         let part = Self::bootstrap_member(
             node_id,
             partition_id,
@@ -3267,7 +4389,7 @@ impl RaftPartition {
     /// [`Batcher`], so a flood of concurrent proposes coalesces into batched
     /// entries; a lone proposer forms a batch of one.
     pub async fn propose(&self, command: Command, now: u64) -> anyhow::Result<Vec<Event>> {
-        Ok(self.batcher.submit(command, now).await?.events)
+        Ok(self.batcher.submit(command, now, None).await?.events)
     }
 
     /// Like [`propose`](Self::propose) but returns the full per-command
@@ -3279,7 +4401,18 @@ impl RaftPartition {
         command: Command,
         now: u64,
     ) -> Result<ReplicatedItem, ProposeError> {
-        self.batcher.submit(command, now).await
+        self.propose_result_ref(command, now, None).await
+    }
+
+    /// [`propose_result`](Self::propose_result) for a command carrying a
+    /// caller `operationReference` (#1556), replicated on the command envelope.
+    pub async fn propose_result_ref(
+        &self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<ReplicatedItem, ProposeError> {
+        self.batcher.submit(command, now, operation_reference).await
     }
 
     /// Whether this partition's Raft core has entered `Shutdown` — it has
@@ -3289,6 +4422,29 @@ impl RaftPartition {
     /// `Shutdown`. Read on-demand from the openraft metrics watch (cheap borrow).
     pub fn is_shutdown(&self) -> bool {
         self.raft.metrics().borrow().state == openraft::ServerState::Shutdown
+    }
+
+    /// The replica divergence this member fail-stopped on (ADR 0066 slice 5,
+    /// #1664), if any. Sticky for the member's life: a diverged member is
+    /// `Shutdown` and must be rebuilt — resynced from the leader's snapshot,
+    /// never resumed on its own (diverged) state.
+    pub fn divergence(&self) -> Option<Divergence> {
+        self.digest.divergence()
+    }
+
+    /// TEST-ONLY (#1664): latch a divergence on this member without the
+    /// apply-path fail-stop, so a test can drive the rebuild/promotion paths
+    /// against a diverged member whose engine is otherwise healthy.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn latch_divergence_for_test(&self, d: Divergence) {
+        self.digest.set_diverged(d);
+    }
+
+    /// This member's latest recorded chain digest claim (#1664): the chain
+    /// after its last applied entry. Two replicas that applied the same log
+    /// prefix report equal claims.
+    pub fn digest_claim(&self) -> Option<DigestClaim> {
+        self.digest.latest_claim()
     }
 
     /// Fully retires this member (#1473) and returns the engine's lifecycle
@@ -3328,6 +4484,7 @@ impl RaftPartition {
         &self,
         bound: std::time::Duration,
     ) -> std::io::Result<LifecycleExclusive> {
+        self.orphan_stop.stop();
         self.raft.shutdown().await.ok();
         let Ok(exclusive) = tokio::time::timeout(bound, self.sm_engine.lifecycle_exclusive()).await
         else {
@@ -3414,7 +4571,7 @@ impl RaftPartition {
 /// untouched.
 #[derive(Default)]
 pub struct RaftRegistry {
-    partitions: Mutex<HashMap<u64, Arc<RaftPartition>>>,
+    partitions: Mutex<BTreeMap<u64, Arc<RaftPartition>>>,
 }
 
 impl RaftRegistry {
@@ -3517,7 +4674,7 @@ pub fn spawn_compaction_governor(registry: Arc<RaftRegistry>) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Per-partition `last_applied` observed on the previous tick, to detect
         // quiescence (a partition that applied nothing since last tick).
-        let mut prev_applied: HashMap<u64, u64> = HashMap::new();
+        let mut prev_applied: BTreeMap<u64, u64> = BTreeMap::new();
         loop {
             interval.tick().await;
             for part in registry.all() {
@@ -3556,6 +4713,42 @@ mod tests {
             .build()
             .expect("valid process");
         Command::DeployProcess(proc)
+    }
+
+    /// #1556: a retained pre-#1556 Raft entry carried `operation_reference`
+    /// NESTED in the command body. Every such historical variant must promote
+    /// it to the envelope field on decode (else re-applying the entry after
+    /// upgrade silently loses the reference), the outer field wins when both
+    /// are present, and the round trip uses the current (outer) form.
+    #[test]
+    fn legacy_nested_operation_reference_is_promoted_on_decode() {
+        let legacy = [
+            r#"{"UpdateJobRetries":{"job_key":7,"retries":3,"operation_reference":11}}"#,
+            r#"{"UpdateJobTimeout":{"job_key":7,"timeout":5,"operation_reference":11}}"#,
+            r#"{"UpdateJob":{"job_key":7,"retries":2,"operation_reference":11}}"#,
+            r#"{"ResolveIncident":{"incident_key":7,"operation_reference":11}}"#,
+        ];
+        for command in legacy {
+            let line = format!(r#"{{"command":{command},"now":1}}"#);
+            let decoded: ReplicatedCommand = serde_json::from_str(&line).expect(&line);
+            assert_eq!(decoded.operation_reference, Some(11), "{line}");
+            let reencoded = serde_json::to_string(&decoded).unwrap();
+            let again: ReplicatedCommand = serde_json::from_str(&reencoded).unwrap();
+            assert_eq!(again.operation_reference, Some(11), "{reencoded}");
+            assert!(
+                !serde_json::to_string(&again.command)
+                    .unwrap()
+                    .contains("operation_reference")
+            );
+
+            let line = format!(r#"{{"command":{command},"now":1,"operation_reference":22}}"#);
+            let decoded: ReplicatedCommand = serde_json::from_str(&line).unwrap();
+            assert_eq!(decoded.operation_reference, Some(22), "outer wins: {line}");
+        }
+        let plain: ReplicatedCommand =
+            serde_json::from_str(r#"{"command":{"ResolveIncident":{"incident_key":7}},"now":1}"#)
+                .unwrap();
+        assert_eq!(plain.operation_reference, None);
     }
 
     #[test]
@@ -3761,6 +4954,16 @@ mod tests {
                 E::MigrationMultiInstanceMismatch {
                     instance_key: 1,
                     source_element_id: "a".into(),
+                    source_element_type: "MULTI_INSTANCE_BODY".into(),
+                    target_element_id: "b".into(),
+                    target_element_type: "SERVICE_TASK".into(),
+                },
+                409,
+            ),
+            (
+                E::MigrationLoopCharacteristicsChanged {
+                    instance_key: 1,
+                    source_element_id: "a".into(),
                     target_element_id: "b".into(),
                 },
                 409,
@@ -3785,6 +4988,25 @@ mod tests {
                 409,
             ),
             (
+                E::MigrationCompensationBoundaryTypeChanged {
+                    instance_key: 1,
+                    process_id: "p".into(),
+                    source_boundary_id: "b1".into(),
+                    target_boundary_id: "b2".into(),
+                    target_event_type: "TIMER",
+                },
+                400,
+            ),
+            (
+                E::MigrationCompensationFlowScopeChanged {
+                    instance_key: 1,
+                    process_id: "p".into(),
+                    source_flow_scope_id: "p".into(),
+                    target_flow_scope_id: "sub".into(),
+                },
+                409,
+            ),
+            (
                 E::MigrationCatchEventSubscriptionFailed {
                     instance_key: 1,
                     element_id: "a".into(),
@@ -3797,6 +5019,13 @@ mod tests {
                 E::StartEventExpressionInvalid {
                     process_id: "p".into(),
                     element_id: "s".into(),
+                    reason: "boom".into(),
+                },
+                400,
+            ),
+            (
+                E::InvalidProcessModel {
+                    process_id: "p".into(),
                     reason: "boom".into(),
                 },
                 400,
@@ -3966,7 +5195,7 @@ mod tests {
         let incoming = dir.join(format!("incoming-{}-0.tmp", std::process::id()));
         std::fs::write(&incoming, b"partial").expect("write in-flight partial");
 
-        let in_flight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let in_flight = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
         // A file a concurrent build is still writing (registered in flight)
         // must survive the reap; once its guard drops it is reapable again.
         let building = dir.join("snap-g3-10.bin");
@@ -4286,6 +5515,633 @@ mod tests {
         );
     }
 
+    /// #1664 review: a snapshot build captured BEFORE a divergence latch
+    /// trips, released into publication AFTER it, must not publish — the
+    /// diverged state can never become the durable boot baseline again.
+    #[tokio::test]
+    async fn a_build_captured_before_a_divergence_never_publishes_after_it() {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies");
+            })
+            .await;
+        let mut sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
+        let dir = sm.snapshot_dir.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut builder = sm.get_snapshot_builder().await;
+        builder.test_writer_barrier = Some(Arc::clone(&barrier));
+        let build = tokio::spawn(async move { builder.build_snapshot().await });
+        // Divergence latches (and quarantines) while the build is parked.
+        let chain = ChainDigest::genesis(1);
+        let _ = sm
+            .fail_stop_divergence(Divergence {
+                index: 1,
+                detected_at: 2,
+                leader: chain,
+                local: chain.fold(1, 0, &[]),
+            })
+            .await;
+        barrier.wait().await;
+        let built = build.await.expect("build task");
+        assert!(built.is_err(), "a latched divergence refuses publication");
+        assert!(
+            read_snapshot_ptr(&dir).is_none(),
+            "no boot-baseline pointer is published after the latch"
+        );
+    }
+
+    /// #1691: the divergence latch is crash-durable. A member restarted on a
+    /// diverged replica's dir refuses to adopt its local state (a diverged
+    /// chain can be self-consistent, so replay verification alone would pass),
+    /// and only an authoritative leader snapshot install clears the marker.
+    ///
+    /// #1691 review (round 4): this runs on an INDEPENDENT durable journal —
+    /// reopened from its directory after a deterministic shutdown — so the
+    /// boot-time fence is the only thing between the refusal and the diverged
+    /// journal (the old fixture shared one in-memory journal between both
+    /// state machines, so `fail_stop_divergence` had already fenced the
+    /// "restarted" engine before the boot attempt), and the resync's
+    /// `checkpoint_base` really publishes the adopted base (an in-memory
+    /// journal no-ops it).
+    #[tokio::test]
+    async fn a_restart_after_a_divergence_refuses_local_state_until_resync() {
+        let journal_dir = unique_log_dir("1691-resync");
+        std::fs::create_dir_all(&journal_dir).expect("journal dir");
+        let snap_dir = journal_dir.join("snapshots");
+        let chain = ChainDigest::genesis(1);
+        let divergence = Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain.fold(1, 0, &[]),
+        };
+        // The leader's authoritative snapshot (an in-memory donor), to be
+        // "received" by the diverged replica below. Written in the real
+        // streaming on-disk format (#1337), the bytes `install_snapshot`
+        // actually consumes.
+        let donor = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        donor
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("donor deploy applies");
+            })
+            .await;
+        let (capture, cold_keys, stores) = donor
+            .with(|j| j.streaming_snapshot_parts().expect("donor capture"))
+            .await;
+        let donor_body = journal_dir.join("leader-snapshot.bin");
+        {
+            let header = nano_server_storage::seglog::snapshot_envelope_header_line(&journal_dir)
+                .expect("snapshot header");
+            nano_server_storage::snapstream::write_streaming_snapshot_from_stores(
+                &donor_body,
+                &header,
+                0,
+                None,
+                capture,
+                &cold_keys,
+                stores,
+                false,
+            )
+            .expect("write leader snapshot body");
+        }
+        let leader_bytes = std::fs::read(&donor_body).expect("read leader snapshot body");
+        let leader_meta = SnapshotMeta {
+            last_log_id: Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), 7)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "leader-7".to_string(),
+        };
+
+        // Phase 1: a DURABLE replica applies an entry, detects a divergence,
+        // and fail-stops — persisting the marker at its stable journal dir.
+        {
+            let engine = durable_engine(&journal_dir);
+            engine
+                .with(|j| {
+                    let _ = j
+                        .apply_command_at(deploy_command(), 1)
+                        .expect("deploy applies");
+                })
+                .await;
+            let sm = PartitionStateMachine::new(
+                engine.clone(),
+                0,
+                snap_dir.clone(),
+                Some(journal_dir.clone()),
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("state machine");
+            let _ = sm.fail_stop_divergence(divergence.clone()).await;
+            assert_eq!(
+                read_divergence_marker(&divergence_marker_path(Some(&journal_dir), &snap_dir, 0))
+                    .and_then(Result::ok),
+                Some(divergence),
+                "the divergence is persisted at the stable per-partition dir"
+            );
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+
+        // Phase 2: RESTART over the same durable journal. The reopened journal
+        // starts UNFENCED (the fence is in-memory only) — the crash-durable
+        // marker is the only thing refusing the boot.
+        let engine2 = durable_engine(&journal_dir);
+        assert!(
+            !engine2.with(|j| j.is_fenced()).await,
+            "a reopened journal starts unfenced: only the marker fences the boot"
+        );
+        let mut restarted = Arc::new(
+            PartitionStateMachine::new(
+                engine2.clone(),
+                0,
+                snap_dir.clone(),
+                Some(journal_dir.clone()),
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("restarted state machine"),
+        );
+        assert!(restarted.digest.divergence().is_none());
+        let refused = restarted
+            .restore_newest_boot_state()
+            .await
+            .expect_err("a diverged replica must not resume its local state");
+        assert!(refused.to_string().contains("#1691"), "{refused}");
+        assert!(
+            engine2.with(|j| j.is_fenced()).await,
+            "a refused boot fences the engine against direct writes"
+        );
+        assert!(
+            engine2
+                .with(|j| j.apply_command_at(deploy_command(), 2).map(|_| ()))
+                .await
+                .is_err(),
+            "the fenced journal rejects commands after the refused boot"
+        );
+        // A corrupt marker still fails closed.
+        std::fs::write(
+            divergence_marker_path(Some(&journal_dir), &snap_dir, 0),
+            b"{not json",
+        )
+        .expect("corrupt");
+        assert!(restarted.restore_newest_boot_state().await.is_err());
+
+        // Phase 3: authoritative leader resync. The install ADOPTS the leader's
+        // state over the fence (an authoritative adoption supersedes it) and
+        // checkpoints it as the journal's durable recovery base, then durably
+        // clears the marker.
+        let mut received = restarted
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving snapshot");
+        {
+            use tokio::io::AsyncWriteExt;
+            received
+                .write_all(&leader_bytes)
+                .await
+                .expect("write snapshot body");
+            received.flush().await.expect("flush snapshot body");
+        }
+        restarted
+            .install_snapshot(&leader_meta, received)
+            .await
+            .expect("leader resync installs over the fence");
+        assert!(
+            read_divergence_marker(&divergence_marker_path(Some(&journal_dir), &snap_dir, 0))
+                .is_none(),
+            "cleared by resync"
+        );
+        assert!(
+            !engine2.with(|j| j.is_fenced()).await,
+            "the adopted authoritative state supersedes the fence"
+        );
+        // The adopted state serves commands...
+        engine2
+            .with(|j| {
+                let (_, commit) = j
+                    .apply_command_at(deploy_command(), 3)
+                    .expect("a command applies after the resync");
+                commit
+            })
+            .await
+            .wait()
+            .await;
+        // ...and the journal's recovery base now covers the adopted snapshot:
+        // a SECOND restart (another independent reopen) boots clean and still
+        // serves commands.
+        drop(restarted);
+        shutdown_engine(engine2).await;
+        let engine3 = durable_engine(&journal_dir);
+        assert!(
+            !engine3.with(|j| j.is_fenced()).await,
+            "the resync left no fence behind"
+        );
+        let rebooted = PartitionStateMachine::new(
+            engine3.clone(),
+            0,
+            snap_dir.clone(),
+            Some(journal_dir.clone()),
+            0,
+            false,
+            Arc::new(AtomicU64::new(u64::MAX)),
+        )
+        .expect("rebooted state machine");
+        rebooted
+            .restore_newest_boot_state()
+            .await
+            .expect("boots after resync");
+        engine3
+            .with(|j| {
+                let (_, commit) = j
+                    .apply_command_at(deploy_command(), 4)
+                    .expect("a command applies after the second restart");
+                commit
+            })
+            .await
+            .wait()
+            .await;
+        drop(rebooted);
+        shutdown_engine(engine3).await;
+        let _ = std::fs::remove_dir_all(&journal_dir);
+    }
+
+    /// #1691 review: the marker must survive until the leader's state is
+    /// ADOPTED and checkpointed. A snapshot published without adoption (the
+    /// crash/adoption-failure window) leaves the divergent journal on disk, so
+    /// the marker must still fence the next boot.
+    #[tokio::test]
+    async fn a_resync_interrupted_before_adoption_keeps_the_marker() {
+        let (restarted, _dir, leader_meta, diverged, received) = publication_race_fixture().await;
+        let chain = ChainDigest::genesis(1);
+        let _ = diverged
+            .fail_stop_divergence(Divergence {
+                index: 1,
+                detected_at: 2,
+                leader: chain,
+                local: chain.fold(1, 0, &[]),
+            })
+            .await;
+        restarted
+            .install_snapshot_skip_adoption_for_test(&leader_meta, received)
+            .await
+            .expect("publication without adoption");
+        assert!(
+            read_divergence_marker(restarted.marker()).is_some(),
+            "an unadopted resync must not clear the marker"
+        );
+        assert!(restarted.restore_newest_boot_state().await.is_err());
+    }
+
+    /// #1691 review: owned journals opened from one `SharedWriter` share a
+    /// directory, so the marker (and its staging file) are namespaced by
+    /// partition — one partition's divergence never refuses a sibling's boot
+    /// and a sibling's resync never clears another partition's fence.
+    #[test]
+    fn divergence_markers_are_namespaced_by_partition() {
+        let dir = MarkerTestDir::new();
+        let shared = Some(dir.path());
+        let snaps = dir.path().join("unused-snapshots");
+        let p0 = divergence_marker_path(shared, &snaps, 0);
+        let p1 = divergence_marker_path(shared, &snaps, 1);
+        assert_ne!(p0, p1);
+        assert_ne!(
+            divergence_marker_staging_path(&p0),
+            divergence_marker_staging_path(&p1),
+            "staging files are namespaced too"
+        );
+        let chain = ChainDigest::genesis(1);
+        let d = Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain.fold(1, 0, &[]),
+        };
+        persist_divergence_fence(&p0, &d).expect("persist p0");
+        assert!(read_divergence_marker(&p1).is_none(), "sibling unaffected");
+        clear_divergence_marker(&p1).expect("clear p1");
+        assert_eq!(
+            read_divergence_marker(&p0).and_then(Result::ok),
+            Some(d),
+            "a sibling's clear leaves this partition's fence"
+        );
+    }
+
+    /// #1691 review: every bootstrap constructor resolves the SAME canonical
+    /// marker for a partition (anchored at the engine journal's durable dir,
+    /// whatever its Raft log/snapshot dir), and a marked journal fails every
+    /// one of them closed with a typed, operator-actionable
+    /// [`DivergedBootRefused`] — fencing the engine. No marker → normal boot.
+    #[tokio::test]
+    async fn every_bootstrap_constructor_refuses_a_marked_partition() {
+        let journal_dir = unique_log_dir("1691-ctors");
+        let raft_dir = unique_log_dir("1691-ctors-raft");
+        std::fs::create_dir_all(&journal_dir).expect("journal dir");
+        let expected = divergence_marker_path(Some(&journal_dir), Path::new("/ignored"), 0);
+        let chain = ChainDigest::genesis(1);
+        let d = Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain.fold(1, 0, &[]),
+        };
+        persist_divergence_fence(&expected, &d).expect("persist marker");
+
+        fn assert_refused(r: anyhow::Result<RaftPartition>, expected: &Path, what: &str) {
+            let err = match r {
+                Ok(_) => panic!("{what}: a marked partition must not boot"),
+                Err(e) => e,
+            };
+            let refused = err
+                .downcast_ref::<DivergedBootRefused>()
+                .unwrap_or_else(|| panic!("{what}: untyped refusal: {err:#}"));
+            assert_eq!(refused.partition_id, 0, "{what}");
+            assert_eq!(refused.marker, expected, "{what}: one canonical marker");
+            let msg = refused.to_string();
+            assert!(
+                msg.contains("partition 0") && msg.contains("Remedy"),
+                "{msg}"
+            );
+        }
+
+        for what in ["single_durable", "member", "fresh_receiver", "single"] {
+            let engine = durable_engine(&journal_dir);
+            let r = match what {
+                "single_durable" => {
+                    RaftPartition::bootstrap_single_durable(
+                        0,
+                        0,
+                        "n0".to_string(),
+                        engine.clone(),
+                        &raft_dir,
+                    )
+                    .await
+                }
+                "member" => {
+                    RaftPartition::bootstrap_member(
+                        0,
+                        0,
+                        engine.clone(),
+                        Arc::new(NullTransport),
+                        Some(raft_dir.clone()),
+                        false,
+                    )
+                    .await
+                }
+                "fresh_receiver" => {
+                    RaftPartition::bootstrap_fresh_receiver(
+                        0,
+                        0,
+                        engine.clone(),
+                        Arc::new(NullTransport),
+                        false,
+                    )
+                    .await
+                }
+                _ => RaftPartition::bootstrap_single(0, 0, "n0".to_string(), engine.clone()).await,
+            };
+            assert_refused(r, &expected, what);
+            assert!(
+                engine.with(|j| j.is_fenced()).await,
+                "{what}: a refused boot fences the engine"
+            );
+            shutdown_engine(engine).await;
+        }
+
+        // No marker → the same durable boot proceeds normally.
+        clear_divergence_marker(&expected).expect("clear marker");
+        let engine = durable_engine(&journal_dir);
+        let part = RaftPartition::bootstrap_single_durable(
+            0,
+            0,
+            "n0".to_string(),
+            engine.clone(),
+            &raft_dir,
+        )
+        .await
+        .expect("an unmarked partition boots");
+        assert!(!engine.with(|j| j.is_fenced()).await);
+        part.raft.shutdown().await.ok();
+        drop(part);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&journal_dir);
+        let _ = std::fs::remove_dir_all(&raft_dir);
+    }
+
+    /// The divergence gate runs BEFORE any fallible bootstrap setup (#1691
+    /// review): with a valid marker AND an unusable snapshot directory (a
+    /// regular file where `create_dir_all` must fail), every constructor still
+    /// refuses with the typed [`DivergedBootRefused`] and fences the engine —
+    /// a snapshot-setup failure must never abort the boot before the
+    /// known-diverged journal is fenced.
+    #[tokio::test]
+    async fn a_marked_partition_is_fenced_even_when_snapshot_setup_fails() {
+        let journal_dir = unique_log_dir("1691-fence-before-setup");
+        let raft_dir = unique_log_dir("1691-fence-before-setup-raft");
+        std::fs::create_dir_all(&journal_dir).expect("journal dir");
+        let marker = divergence_marker_path(Some(&journal_dir), Path::new("/ignored"), 0);
+        let chain = ChainDigest::genesis(1);
+        let d = Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain.fold(1, 0, &[]),
+        };
+        persist_divergence_fence(&marker, &d).expect("persist marker");
+
+        // An unusable snapshot/log dir: a regular FILE, so `create_dir_all` and
+        // the log-store open both fail on it.
+        let blocker = unique_log_dir("1691-fence-before-setup-blocker");
+        std::fs::write(&blocker, b"not a dir").expect("blocker file");
+
+        for what in ["single_durable", "member", "fresh_receiver", "single"] {
+            let engine = durable_engine(&journal_dir);
+            let r = match what {
+                "single_durable" => {
+                    RaftPartition::bootstrap_single_durable(
+                        0,
+                        0,
+                        "n0".to_string(),
+                        engine.clone(),
+                        &blocker,
+                    )
+                    .await
+                }
+                "member" => {
+                    RaftPartition::bootstrap_member(
+                        0,
+                        0,
+                        engine.clone(),
+                        Arc::new(NullTransport),
+                        Some(blocker.clone()),
+                        false,
+                    )
+                    .await
+                }
+                "fresh_receiver" => {
+                    RaftPartition::bootstrap_fresh_receiver(
+                        0,
+                        0,
+                        engine.clone(),
+                        Arc::new(NullTransport),
+                        false,
+                    )
+                    .await
+                }
+                _ => RaftPartition::bootstrap_single(0, 0, "n0".to_string(), engine.clone()).await,
+            };
+            let err = match r {
+                Ok(_) => panic!("{what}: a marked partition must not boot"),
+                Err(e) => e,
+            };
+            let refused = err
+                .downcast_ref::<DivergedBootRefused>()
+                .unwrap_or_else(|| {
+                    panic!("{what}: the gate must fire before setup fails: {err:#}")
+                });
+            assert_eq!(refused.partition_id, 0, "{what}");
+            assert_eq!(refused.marker, marker, "{what}: one canonical marker");
+            assert!(
+                engine.with(|j| j.is_fenced()).await,
+                "{what}: a known-diverged journal is fenced even when snapshot setup would fail"
+            );
+            shutdown_engine(engine).await;
+        }
+
+        let _ = std::fs::remove_dir_all(&journal_dir);
+        let _ = std::fs::remove_dir_all(&raft_dir);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// A per-test scratch dir under the system temp dir, removed on drop.
+    struct MarkerTestDir(PathBuf);
+    impl MarkerTestDir {
+        fn new() -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "nano-marker-test-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).expect("mkdir");
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for MarkerTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// #1691 review: marker publication failure still leaves a durable fence
+    /// (an empty fallback marker) that refuses the next boot.
+    #[test]
+    fn a_failed_marker_publication_still_fences_the_boot() {
+        let dir = MarkerTestDir::new();
+        let chain = ChainDigest::genesis(1);
+        let d = Divergence {
+            index: 1,
+            detected_at: 2,
+            leader: chain,
+            local: chain.fold(1, 0, &[]),
+        };
+        // A directory squatting the tmp path makes the detailed write fail.
+        let marker = divergence_marker_path(Some(dir.path()), dir.path(), 0);
+        std::fs::create_dir(divergence_marker_staging_path(&marker)).expect("squat tmp");
+        assert!(persist_divergence_fence(&marker, &d).is_err());
+        assert!(
+            matches!(read_divergence_marker(&marker), Some(Err(_))),
+            "the fallback marker fails closed"
+        );
+    }
+
+    /// #1691 review: a marker lookup error is not "absent".
+    #[test]
+    fn a_marker_lookup_error_fails_closed() {
+        let dir = MarkerTestDir::new();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").expect("file");
+        // `<file>/divergence-marker-p0.json` → ENOTDIR, not NotFound.
+        let under_file = divergence_marker_path(Some(&file), &file, 0);
+        assert!(matches!(read_divergence_marker(&under_file), Some(Err(_))));
+        let marker = divergence_marker_path(Some(dir.path()), dir.path(), 0);
+        assert!(read_divergence_marker(&marker).is_none());
+        clear_divergence_marker(&marker).expect("absent clear still syncs");
+    }
+
+    /// #1664 review: a divergence quarantine keeps BOTH the pointer and the
+    /// snapshot body it names, and neither is reclaimed by the next
+    /// constructor sweep on the same durable dir (forensics retention).
+    #[tokio::test]
+    async fn a_quarantined_snapshot_survives_the_next_constructor_sweep() {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies");
+            })
+            .await;
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
+        let dir = sm.snapshot_dir.clone();
+        let mut builder = Arc::clone(&sm).get_snapshot_builder().await;
+        builder.build_snapshot().await.expect("build publishes");
+        let body = read_snapshot_ptr(&dir).expect("pointer published").path;
+        let body_name = body
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("body name")
+            .to_owned();
+        let chain = ChainDigest::genesis(1);
+        let _ = sm
+            .fail_stop_divergence(Divergence {
+                index: 1,
+                detected_at: 7,
+                leader: chain,
+                local: chain.fold(1, 0, &[]),
+            })
+            .await;
+        drop(sm);
+        // The next member on the same dir runs the constructor sweep.
+        let next = PartitionStateMachine::new(
+            engine.clone(),
+            0,
+            dir.clone(),
+            None,
+            0,
+            false,
+            Arc::new(AtomicU64::new(u64::MAX)),
+        )
+        .expect("next member");
+        assert!(
+            read_snapshot_ptr(&dir).is_none(),
+            "no live baseline remains"
+        );
+        assert!(
+            dir.join(quarantined_name(7, "current-snapshot.json"))
+                .is_file(),
+            "the quarantined pointer is retained"
+        );
+        assert!(
+            dir.join(quarantined_name(7, &body_name)).is_file(),
+            "the quarantined body survives the constructor sweep"
+        );
+        assert!(!body.exists(), "the body left the reclaimable namespace");
+        drop(next);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn an_older_build_never_regresses_a_newer_installed_snapshot() {
         // #1488 review regression: a build captured at index N reaches
@@ -4399,6 +6255,7 @@ mod tests {
                 dst.clone(),
                 0,
                 PartitionStateMachine::temp_snapshot_dir(0),
+                None,
                 DST_NODE,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -4558,14 +6415,14 @@ mod tests {
 
     #[test]
     fn creation_and_activation_are_low_priority_intake() {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
         // Fresh demand entering the system — process creation AND job activation
         // (a poll) — takes the low-priority lane. Putting activation on the high
         // lane lets a flood of empty polls from idle workers starve creation,
         // which is exactly what Zeebe avoids by NOT whitelisting JobBatch.ACTIVATE.
         assert!(is_creation_intake(&Command::CreateInstance {
             process_id: "p".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             tags: vec![],
             business_id: None,
             process_definition_key: None,
@@ -4574,13 +6431,20 @@ mod tests {
         assert!(is_creation_intake(&Command::activate_jobs(
             "t", "w", 1, 1, 0
         )));
+        // #932: conditional-start evaluation creates instances — creation intake.
+        assert!(is_creation_intake(
+            &Command::EvaluateConditionalStartEvents {
+                variables: BTreeMap::new(),
+                process_definition_key: None,
+            }
+        ));
 
         // The drain / progress path (finalization, cancellation, maintenance)
         // takes the high-priority lane; its volume is bounded by low-lane
         // admission, so it can never permanently starve a create.
         assert!(!is_creation_intake(&Command::complete_job_with(
             1,
-            HashMap::new()
+            BTreeMap::new()
         )));
         assert!(!is_creation_intake(&Command::fail_job(1, 0, "e")));
         assert!(!is_creation_intake(&Command::ExpireJobs { now: 0 }));
@@ -4589,6 +6453,160 @@ mod tests {
             instance_key: 1
         }));
         assert!(!is_creation_intake(&deploy_command()));
+    }
+
+    /// #1574 review: the lifecycle guard a member-bound engine op takes must
+    /// survive CANCELLATION of the calling future. The orphan drainer/watcher
+    /// run under a shutdown `select!`; if the stop branch wins after the actor
+    /// callback was queued, the outer future is dropped — the guard must live
+    /// in the QUEUED CLOSURE so the queued update still finishes under the
+    /// shared hold, and retirement's exclusive lock waits for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_member_engine_op_holds_its_guard_until_the_job_runs() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let epoch = engine.lifecycle_epoch();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        // Occupy the actor with a blocking job so the next job stays QUEUED.
+        let blocker = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .with(move |_| {
+                        entered_tx.send(()).ok();
+                        release_rx.recv().ok();
+                    })
+                    .await;
+            }
+        });
+        entered_rx
+            .recv()
+            .expect("the blocking job is running on the actor");
+
+        // Queue the member-bound op, then CANCEL its future mid-flight (the
+        // shutdown select! dropping the drainer/watcher future). Poll it on a
+        // task so it enters the lifecycle lock and queues its actor callback.
+        let (job_ran_tx, job_ran_rx) = mpsc::channel::<()>();
+        let (guard_held_tx, guard_held_rx) = mpsc::channel::<()>();
+        let op = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                with_member_engine_observed(
+                    &engine,
+                    epoch,
+                    move |_| {
+                        job_ran_tx.send(()).ok();
+                    },
+                    move || {
+                        guard_held_tx.send(()).ok();
+                    },
+                )
+                .await;
+            }
+        });
+        // The op holds the shared guard and its callback sits QUEUED behind
+        // the blocker. Now CANCEL the op's future (the shutdown select!
+        // dropping the drainer/watcher): any guard the FUTURE holds dies with
+        // it, while the queued callback's fate is the question under test.
+        guard_held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the op entered the lifecycle lock");
+        op.abort();
+        assert!(
+            op.await.unwrap_err().is_cancelled(),
+            "the op task was cancelled mid-flight"
+        );
+
+        // The cancelled future must NOT have released the guard: retirement's
+        // exclusive lock is still blocked behind the queued job's shared hold.
+        let retire_probe = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.lifecycle_exclusive().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !retire_probe.is_finished(),
+            "a cancelled op must not release the lifecycle guard before its queued job runs"
+        );
+        // The probe holds the write slot (write-preferring lock); keep it as
+        // the retirement under test.
+        let retire = retire_probe;
+
+        // Unblock the actor: the queued job runs under its guard, THEN
+        // retirement's exclusive lock is granted.
+        release_tx.send(()).expect("release the blocking job");
+        blocker.await.expect("blocker task");
+        job_ran_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the queued job still ran after its caller was cancelled");
+        let exclusive = tokio::time::timeout(Duration::from_secs(5), retire)
+            .await
+            .expect("retirement completes once the queued job ran")
+            .expect("retire task");
+        // The job ran BEFORE the exclusive was granted: the epoch only
+        // advances under the exclusive lock, which could not be taken while
+        // the job's guard lived.
+        assert_eq!(
+            engine.lifecycle_epoch(),
+            epoch + 1,
+            "retirement advanced the epoch only after the queued job finished"
+        );
+        drop(exclusive);
+    }
+
+    /// #1574 review: the orphan drainer holds the engine + a Batcher (→ Raft)
+    /// while the journal inside that engine owns the drainer's channel sender,
+    /// so `rx.recv()` never yields `None`. The orphan tasks must still exit on
+    /// every shutdown path — a direct `raft.shutdown()`, `retire()`, and a plain
+    /// drop of the partition — or they keep the Raft alive forever.
+    #[tokio::test]
+    async fn orphan_propose_tasks_exit_on_shutdown() {
+        async fn assert_exits(tasks: [tokio::task::JoinHandle<()>; 2], path: &str) {
+            for task in tasks {
+                tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                    .await
+                    .unwrap_or_else(|_| panic!("orphan task still alive after {path}"))
+                    .expect("orphan task exits cleanly");
+            }
+        }
+        let boot = || async {
+            RaftPartition::bootstrap_single(
+                0,
+                0,
+                "addr".into(),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+            )
+            .await
+            .expect("boot")
+        };
+
+        let mut part = boot().await;
+        let tasks = std::mem::replace(
+            &mut part.orphan_tasks,
+            [tokio::spawn(async {}), tokio::spawn(async {})],
+        );
+        part.raft.shutdown().await.expect("clean shutdown");
+        assert_exits(tasks, "raft.shutdown()").await;
+
+        let mut part = boot().await;
+        let tasks = std::mem::replace(
+            &mut part.orphan_tasks,
+            [tokio::spawn(async {}), tokio::spawn(async {})],
+        );
+        drop(part.retire().await.expect("retire"));
+        assert_exits(tasks, "retire()").await;
+
+        let mut part = boot().await;
+        let tasks = std::mem::replace(
+            &mut part.orphan_tasks,
+            [tokio::spawn(async {}), tokio::spawn(async {})],
+        );
+        drop(part);
+        assert_exits(tasks, "drop(RaftPartition)").await;
     }
 
     /// A fresh receiver is provably empty, and the emptiness guard fails closed
@@ -4856,7 +6874,7 @@ mod tests {
         for i in 0..3u64 {
             let key = src
                 .with(move |j| {
-                    let mut vars = HashMap::new();
+                    let mut vars = BTreeMap::new();
                     vars.insert("data".to_string(), Value::Str(format!("cold-{i}")));
                     let (ev, _) = j
                         .apply_command_at(
@@ -5037,6 +7055,7 @@ mod tests {
                     src,
                     0,
                     snap_dir.clone(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -5070,6 +7089,7 @@ mod tests {
                 dst.clone(),
                 0,
                 snap_dir.clone(),
+                None,
                 0,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -5338,24 +7358,12 @@ mod tests {
         engine: &DeepthiHandle,
     ) -> (u64, u64) {
         let setup = [
-            ReplicatedCommand {
-                command: wait_process_command(),
-                now: 1,
-            },
-            ReplicatedCommand {
-                command: Command::create_instance("w"),
-                now: 2,
-            },
-            ReplicatedCommand {
-                command: Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
-                now: 3,
-            },
+            ReplicatedCommand::new(wait_process_command(), 1),
+            ReplicatedCommand::new(Command::create_instance("w"), 2),
+            ReplicatedCommand::new(Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3),
             // Release the activation lock so the parked instance goes idle and is
             // cold-spillable (a locked job keeps its instance hot).
-            ReplicatedCommand {
-                command: Command::ExpireJobs { now: 64_000 },
-                now: 64_000,
-            },
+            ReplicatedCommand::new(Command::ExpireJobs { now: 64_000 }, 64_000),
         ];
         let mut job_key = None;
         for (i, cmd) in setup.into_iter().enumerate() {
@@ -5413,14 +7421,8 @@ mod tests {
         // A batch [deploy, complete_job]: the deploy succeeds, the completion hits
         // the unreadable row. The whole entry must abort closed at index 5.
         let batch = vec![
-            ReplicatedCommand {
-                command: deploy_command(),
-                now: 5,
-            },
-            ReplicatedCommand {
-                command: Command::complete_job(job_key),
-                now: 6,
-            },
+            ReplicatedCommand::new(deploy_command(), 5),
+            ReplicatedCommand::new(Command::complete_job(job_key), 6),
         ];
         let refused = apply_entry(&sm, 5, batch).await;
         assert!(refused.is_err(), "the impaired replica fails closed");
@@ -5449,14 +7451,8 @@ mod tests {
         // Entry 1: [CompleteJob(unknown key) -> deterministic JobNotFound,
         //           DeployProcess(valid) -> must still apply].
         let batch = vec![
-            ReplicatedCommand {
-                command: Command::complete_job(999_999),
-                now: 1,
-            },
-            ReplicatedCommand {
-                command: deploy_command(),
-                now: 2,
-            },
+            ReplicatedCommand::new(Command::complete_job(999_999), 1),
+            ReplicatedCommand::new(deploy_command(), 2),
         ];
         let outcome = apply_entry(&sm, 1, batch)
             .await
@@ -5527,18 +7523,9 @@ mod tests {
     /// that hits the unreadable cold row.
     fn failing_entry(job_key: u64) -> Vec<ReplicatedCommand> {
         vec![
-            ReplicatedCommand {
-                command: Command::complete_job(999_999),
-                now: 5,
-            },
-            ReplicatedCommand {
-                command: Command::create_instance("w"),
-                now: 6,
-            },
-            ReplicatedCommand {
-                command: Command::complete_job(job_key),
-                now: 7,
-            },
+            ReplicatedCommand::new(Command::complete_job(999_999), 5),
+            ReplicatedCommand::new(Command::create_instance("w"), 6),
+            ReplicatedCommand::new(Command::complete_job(job_key), 7),
         ]
     }
 
@@ -5803,6 +7790,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snap_dir.clone(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -5810,7 +7798,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let before = {
             let engine = durable_engine(&journal_dir);
             let mut sm = new_sm(&engine);
@@ -5879,6 +7867,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.to_path_buf(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -5886,7 +7875,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
         let expected = {
             let engine = durable_engine(&dir.join("peer"));
@@ -5963,6 +7952,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.to_path_buf(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -5970,7 +7960,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
         let peer = durable_engine(&dir.join("peer"));
         let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
@@ -6053,6 +8043,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.to_path_buf(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -6060,7 +8051,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let peer = durable_engine(&dir.join("peer"));
         let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
         apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
@@ -6132,6 +8123,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.to_path_buf(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -6139,7 +8131,7 @@ mod tests {
                 .expect("sm"),
             )
         };
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let peer = durable_engine(&dir.join("peer"));
         let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
         apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
@@ -6219,6 +8211,7 @@ mod tests {
                     engine.clone(),
                     0,
                     snaps.clone(),
+                    None,
                     0,
                     false,
                     Arc::new(AtomicU64::new(u64::MAX)),
@@ -6239,7 +8232,7 @@ mod tests {
                 .build()
                 .expect("valid message-start process"),
         );
-        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let one = |command: Command, now: u64| vec![ReplicatedCommand::new(command, now)];
         let start = || Command::correlate_message("go", "");
         let journal_dir = dir.join("journal");
         // Both replicas apply entries 1..=3 (a deploy + two round-robin starts).
@@ -6310,18 +8303,12 @@ mod tests {
             apply_entry(
                 &sm,
                 1,
-                vec![ReplicatedCommand {
-                    command: wait_process_command(),
-                    now: 1,
-                }],
+                vec![ReplicatedCommand::new(wait_process_command(), 1)],
             )
             .await
             .expect("entry 1");
             let two_creates = (0..2)
-                .map(|i| ReplicatedCommand {
-                    command: Command::create_instance("w"),
-                    now: 2 + i,
-                })
+                .map(|i| ReplicatedCommand::new(Command::create_instance("w"), 2 + i))
                 .collect();
             apply_entry(&sm, 2, two_creates).await.expect("entry 2");
             drop(sm);
@@ -6434,9 +8421,113 @@ mod tests {
     fn journaled_raft_state_round_trips() {
         use openraft::CommittedLeaderId;
         let log_id = LogId::new(CommittedLeaderId::new(3, 1), 17);
-        let json = journaled_raft_state(log_id, &StoredMembership::default()).expect("encode");
+        let json =
+            journaled_raft_state(log_id, &StoredMembership::default(), None).expect("encode");
         let back: JournaledRaftState = serde_json::from_str(&json).expect("decode");
         assert_eq!(back.log_id, log_id);
+    }
+
+    /// #1664: the chain digest rides ADDITIVELY in the journaled raft state —
+    /// a pre-#1664 record (no `digest`) still decodes, and a digest-free
+    /// record serializes exactly as before.
+    #[test]
+    fn journaled_raft_state_digest_is_additive() {
+        use openraft::CommittedLeaderId;
+        let log_id = LogId::new(CommittedLeaderId::new(3, 1), 17);
+        let legacy = journaled_raft_state(log_id, &StoredMembership::default(), None).expect("e");
+        assert!(
+            !legacy.contains("digest"),
+            "no digest -> legacy shape: {legacy}"
+        );
+        let d = nano_server_storage::digest::next_entry_digest(None, 17, 0, &[]);
+        let json = journaled_raft_state(log_id, &StoredMembership::default(), Some(d)).expect("e");
+        let back: JournaledRaftState = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.digest, Some(d));
+        assert_eq!(entry_digest_of(&json), Some(d));
+    }
+
+    /// #1664: the leader's digest claim rides ADDITIVELY in the replicated
+    /// batch — a pre-#1664 batch (no `digest`) decodes as `None` (never
+    /// compared), and a claim round-trips.
+    #[test]
+    fn replicated_batch_digest_claim_is_additive() {
+        let legacy: ReplicatedBatch = serde_json::from_str(r#"{"items":[]}"#).expect("decode");
+        assert_eq!(legacy.digest, None);
+        let claim = DigestClaim {
+            index: 9,
+            chain: nano_server_storage::digest::next_entry_digest(None, 9, 0, &[]).chain,
+        };
+        let json = serde_json::to_string(&ReplicatedBatch::new(vec![]).with_digest(Some(claim)))
+            .expect("encode");
+        let back: ReplicatedBatch = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.digest, Some(claim));
+        let plain = serde_json::to_string(&ReplicatedBatch::new(vec![])).expect("encode");
+        assert!(
+            !plain.contains("digest"),
+            "no claim -> legacy shape: {plain}"
+        );
+    }
+
+    /// #1664: the ledger reports a divergence ONLY for a recorded, comparable
+    /// chain that differs — an unknown index (snapshot restore, learner
+    /// catch-up, an evicted window) or an incomparable chain (a different
+    /// base, e.g. a pre-#1664 replica that re-based) is never a false positive.
+    #[test]
+    fn digest_ledger_flags_only_real_divergence() {
+        use nano_server_storage::digest::next_entry_digest;
+        let ledger = DigestLedger::default();
+        let a = next_entry_digest(None, 5, 0, &[]).chain;
+        ledger.record(5, a);
+        let same = DigestClaim { index: 5, chain: a };
+        assert_eq!(ledger.check(&same), None, "equal chains agree");
+        let mut other = a;
+        other.hash[0] ^= 1;
+        assert_eq!(
+            ledger.check(&DigestClaim {
+                index: 5,
+                chain: other
+            }),
+            Some(a)
+        );
+        assert_eq!(
+            ledger.check(&DigestClaim {
+                index: 4,
+                chain: other
+            }),
+            None,
+            "unknown index"
+        );
+        let rebased = next_entry_digest(None, 3, 0, &[]).chain;
+        assert_eq!(
+            ledger.check(&DigestClaim {
+                index: 5,
+                chain: rebased
+            }),
+            None,
+            "other base"
+        );
+        // A Blank entry keeps the chain; a gap does not invent one.
+        ledger.record_unchanged(6);
+        assert_eq!(
+            ledger.latest_claim(),
+            Some(DigestClaim { index: 6, chain: a })
+        );
+        ledger.record_unchanged(8);
+        assert_eq!(ledger.latest_claim().map(|c| c.index), Some(6));
+        // The window is bounded.
+        for i in 10..(10 + DIGEST_WINDOW as u64 + 5) {
+            ledger.record(i, a);
+        }
+        assert_eq!(
+            ledger.check(&DigestClaim {
+                index: 5,
+                chain: other
+            }),
+            None,
+            "evicted"
+        );
+        ledger.reset();
+        assert_eq!(ledger.latest_claim(), None);
     }
 
     /// Polls `cond` until it holds or `timeout_ms` elapses.
@@ -6532,6 +8623,402 @@ mod tests {
 
         for p in parts {
             p.raft.shutdown().await.expect("clean shutdown");
+        }
+    }
+
+    /// An in-process transport whose member `legacy` runs an OLDER binary that
+    /// does not advertise the digest capability (#1664 mixed-version test).
+    struct MixedVersion {
+        inner: crate::raft_net::LocalCluster,
+        legacy: NodeId,
+    }
+
+    impl RaftTransport for MixedVersion {
+        fn send<'a>(
+            &'a self,
+            target: NodeId,
+            partition: u64,
+            req: crate::raft_net::RaftRpcRequest,
+        ) -> futures_util::future::BoxFuture<
+            'a,
+            Result<crate::raft_net::RaftRpcResponse, crate::raft_net::TransportError>,
+        > {
+            self.inner.send(target, partition, req)
+        }
+
+        fn peer_supports<'a>(
+            &'a self,
+            target: NodeId,
+            _feature: &'static str,
+        ) -> futures_util::future::BoxFuture<'a, bool> {
+            let ok = target != self.legacy;
+            Box::pin(async move { ok })
+        }
+    }
+
+    /// Boots a 3-voter p0 group (node 0 leader) over `transport`, perturbs
+    /// follower 2's chain, proposes past the next digest point and reports
+    /// whether follower 2 fail-stopped on a divergence.
+    async fn perturbed_follower_fail_stops(
+        cluster: crate::raft_net::LocalCluster,
+        transport: Arc<dyn RaftTransport>,
+    ) -> bool {
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                transport.clone(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        parts[0]
+            .propose(deploy_command(), 1_000)
+            .await
+            .expect("deploy");
+        wait_all_applied(&parts).await;
+        parts[2]
+            .sm_engine()
+            .with(|j| j.perturb_chain_for_test())
+            .await;
+        for t in 2..5 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        let stopped = wait_until(1_500, || parts[2].divergence().is_some()).await;
+        assert!(parts[0].divergence().is_none() && parts[1].divergence().is_none());
+        for p in parts {
+            p.raft.shutdown().await.ok();
+        }
+        stopped
+    }
+
+    /// #1664 review (rolling upgrade): with an OLD member in the group the
+    /// leader stamps no digest claim, so a mixed-version cluster never
+    /// compares and never false-positive fail-stops — even a follower whose
+    /// chain really differs. Control: the same injection in an all-new group
+    /// IS detected (proving the gate, not the injection, is what suppresses).
+    #[tokio::test]
+    async fn a_mixed_version_group_never_compares_digests() {
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let mixed: Arc<dyn RaftTransport> = Arc::new(MixedVersion {
+            inner: cluster.clone(),
+            legacy: 1,
+        });
+        assert!(
+            !perturbed_follower_fail_stops(cluster, mixed).await,
+            "a mixed-version group must never compare digests"
+        );
+        let cluster = LocalCluster::default();
+        let all_new: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+        assert!(
+            perturbed_follower_fail_stops(cluster, all_new).await,
+            "an all-new group detects the divergence"
+        );
+    }
+
+    /// Waits until every member has applied up to the leader's (node 0's)
+    /// current `last_applied` — the applied-index barrier a test needs before
+    /// touching a FOLLOWER's state (`propose` only waits for the leader).
+    async fn wait_all_applied(parts: &[RaftPartition]) {
+        let target = parts[0]
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        for (id, p) in parts.iter().enumerate() {
+            let raft = &p.raft;
+            let applied = wait_until(3_000, || {
+                raft.metrics()
+                    .borrow()
+                    .last_applied
+                    .map(|l| l.index)
+                    .unwrap_or(0)
+                    >= target
+            })
+            .await;
+            assert!(applied, "node {id} did not apply up to index {target}");
+        }
+    }
+
+    /// #1447: an off-heap orphan discovered inside replicated state-machine
+    /// application (one replica lost the spill row, the others still have it)
+    /// is surfaced as a durable `VariablesLost` incident proposed by the Raft
+    /// LEADER with a replicated timestamp — every replica applies the identical
+    /// incident (same key, same `created_at`) and the journals stay identical.
+    #[tokio::test]
+    async fn orphan_detected_in_apply_is_leader_proposed_with_replicated_timestamp() {
+        use crate::raft_net::LocalCluster;
+
+        let cluster = LocalCluster::default();
+        let transport: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+
+        // Three voters of partition 0, each with its OWN file-backed spill
+        // store (spill state is replica-local by construction).
+        let mut parts = Vec::new();
+        let mut engines = Vec::new();
+        let mut store_paths = Vec::new();
+        for id in 0u64..3 {
+            let store_dir = unique_log_dir(&format!("1447-spill-{id}"));
+            std::fs::create_dir_all(&store_dir).expect("store dir");
+            let store_path = store_dir.join("var-spill.sqlite");
+            let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+            engine
+                .with({
+                    let store_path = store_path.clone();
+                    move |j| {
+                        let store = Arc::new(
+                            nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                                .expect("open spill store"),
+                        );
+                        // Budget 0: every spill check sheds, so the instance is
+                        // spilled after the forced scan below.
+                        j.set_spill(store, 0);
+                        j.set_replicated_apply(true);
+                    }
+                })
+                .await;
+            engines.push(engine.clone());
+            store_paths.push(store_path);
+            let p = RaftPartition::bootstrap_member(id, 0, engine, transport.clone(), None, false)
+                .await
+                .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await,
+            "node 0 wins the initial election"
+        );
+
+        // Deploy a service-task process and create one instance with a payload,
+        // replicated to every voter.
+        parts[0]
+            .propose(wait_process_command(), 1_000)
+            .await
+            .expect("deploy");
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            "data".to_string(),
+            nanobpmn_engine_core::Value::Str("payload-0".to_string()),
+        );
+        let create_events = parts[0]
+            .propose(
+                Command::CreateInstance {
+                    process_id: "w".into(),
+                    variables: vars,
+                    tags: Vec::new(),
+                    business_id: None,
+                    process_definition_key: None,
+                    version: None,
+                },
+                2_000,
+            )
+            .await
+            .expect("create");
+        let instance_key = create_events
+            .iter()
+            .find_map(|e| e.instance_key())
+            .expect("create minted an instance key");
+        // Applied-index barrier: `propose` returns once the LEADER applied, so
+        // wait for every follower to apply the create before touching its
+        // replica-local spill state (#1447 review).
+        wait_all_applied(&parts).await;
+
+        // Spill the instance's variables on EVERY replica (a purely local
+        // memory-reclamation op, so driving it per-replica is faithful), then
+        // drop the row on node 1 ONLY: its store is now definitively missing
+        // the payload the other two replicas hold.
+        for (id, engine) in engines.iter().enumerate() {
+            engine
+                .with(move |j| {
+                    j.force_spill_scan();
+                    assert!(
+                        j.engine().is_variables_spilled(instance_key),
+                        "replica {id} spilled the instance"
+                    );
+                })
+                .await;
+        }
+        {
+            let store = nano_server_storage::varspill::VarSpillStore::open(Some(&store_paths[1]))
+                .expect("reopen node 1 store");
+            store.forget(&[instance_key]).expect("drop node 1's row");
+        }
+
+        // Replicated activation: node 1 discovers the orphan mid-apply and
+        // hands it to the leader-propose channel; the command itself must
+        // apply identically on every replica (no inline incident).
+        parts[0]
+            .propose(
+                Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
+                3_000,
+            )
+            .await
+            .expect("activate");
+        // Applied-index barrier: node 1 must have applied the activation
+        // before its observation is inspected (#1447 review).
+        wait_all_applied(&parts).await;
+
+        // Precondition: node 1 (the orphan replica) OBSERVED the loss during
+        // the replicated apply (its spill row is definitively absent).
+        let quarantined_on_node1 = engines[1].with(|j| j.quarantined_orphans()).await;
+        assert_eq!(
+            quarantined_on_node1,
+            vec![instance_key],
+            "node 1 observed the orphan during the replicated apply"
+        );
+
+        // The orphan was detected on a FOLLOWER and parked in its backlog
+        // (only the leader proposes). Fail the leader over to node 1: node 0
+        // steps down, node 1 wins the triggered election, its watcher flips
+        // the orphan-leadership flag, and the promotion drain hands the parked
+        // key to its own batcher — which proposes the quarantine through the
+        // log.
+        parts[0].raft.shutdown().await.expect("node 0 steps down");
+        parts[1]
+            .raft
+            .trigger()
+            .elect()
+            .await
+            .expect("trigger node 1 election");
+        assert!(
+            wait_until(3_000, || parts[1].raft.metrics().borrow().current_leader
+                == Some(1))
+            .await,
+            "node 1 wins the triggered election"
+        );
+
+        // The leader's drainer re-proposes the orphan as a
+        // `QuarantineOffheapOrphan` carrying the leader's replicated `now`;
+        // every LIVE replica applies the identical incident (the downed former
+        // leader catches up from the new leader when it rejoins).
+        let mut incidents_per_replica = Vec::new();
+        let mut converged = false;
+        for _ in 0..300 {
+            incidents_per_replica.clear();
+            for engine in engines.iter().skip(1) {
+                let incidents = engine
+                    .with(move |j| {
+                        j.incidents()
+                            .into_iter()
+                            .filter(|i| i.kind == nanobpmn_engine_core::IncidentKind::VariablesLost)
+                            .map(|i| {
+                                (
+                                    i.key,
+                                    i.instance_key,
+                                    i.created_at,
+                                    i.state,
+                                    i.reason.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                incidents_per_replica.push(incidents);
+            }
+            if incidents_per_replica.iter().all(|v| v.len() == 1) {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            converged,
+            "exactly one replicated VariablesLost incident on every replica \
+             (got {incidents_per_replica:?})"
+        );
+        let first = &incidents_per_replica[0][0];
+        assert_eq!(first.1, instance_key, "incident pinned to the orphan");
+        assert_eq!(
+            first.3,
+            nanobpmn_engine_core::IncidentState::Active,
+            "the replicated incident is active"
+        );
+        for (id, incidents) in incidents_per_replica.iter().enumerate() {
+            assert_eq!(
+                &incidents[0],
+                first,
+                "replica {} applied the identical incident (key + replicated timestamp)",
+                id + 1
+            );
+        }
+
+        // The incident journals are identical across the replicas that applied
+        // the proposal (the downed former leader replays the same entry from
+        // the new leader when it rejoins): the orphan replica minted nothing
+        // locally.
+        let mut journals = Vec::new();
+        for engine in engines.iter().skip(1) {
+            let events = engine
+                .with(|j| {
+                    j.state()
+                        .incidents
+                        .values()
+                        .map(|i| (i.key, i.instance_key, i.created_at))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            journals.push(events);
+        }
+        assert!(
+            journals.windows(2).all(|w| w[0] == w[1]),
+            "identical incident journals across replicas (got {journals:?})"
+        );
+        // The stamped quarantine carries no repair (#1574): it raises the
+        // incident and records the replicated tombstone identically on every
+        // live replica, and leaves each replica's off-heap reference alone.
+        let mut tombstones = Vec::new();
+        for engine in engines.iter().skip(1) {
+            tombstones.push(
+                engine
+                    .with(move |j| j.state().variables_lost_quarantined.clone())
+                    .await,
+            );
+        }
+        assert!(
+            tombstones.windows(2).all(|w| w[0] == w[1])
+                && tombstones[0].contains_key(&instance_key),
+            "identical replicated tombstones (got {tombstones:?})"
+        );
+
+        for (id, p) in parts.into_iter().enumerate() {
+            if id == 0 {
+                continue; // already shut down (the failover above)
+            }
+            p.raft.shutdown().await.expect("clean shutdown");
+        }
+        for path in &store_paths {
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
     }
 
@@ -6775,6 +9262,7 @@ mod tests {
                 engine,
                 0,
                 snap_dir,
+                None,
                 0,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -7020,15 +9508,7 @@ mod tests {
         assert!(sm.begin_receiving_snapshot().await.is_err());
 
         // apply: refused, engine untouched.
-        let applied = apply_entry(
-            &sm,
-            1,
-            vec![ReplicatedCommand {
-                command: deploy_command(),
-                now: 1,
-            }],
-        )
-        .await;
+        let applied = apply_entry(&sm, 1, vec![ReplicatedCommand::new(deploy_command(), 1)]).await;
         assert!(applied.is_err(), "a retired member must refuse an apply");
         let processes = dst.with(|j| j.state().processes.len()).await;
         assert_eq!(processes, 0, "a refused apply never reaches the engine");
@@ -7048,10 +9528,7 @@ mod tests {
         apply_entry(
             &successor,
             1,
-            vec![ReplicatedCommand {
-                command: deploy_command(),
-                now: 1,
-            }],
+            vec![ReplicatedCommand::new(deploy_command(), 1)],
         )
         .await
         .expect("the successor applies");
@@ -7152,6 +9629,7 @@ mod tests {
                 engine.clone(),
                 0,
                 dir.clone(),
+                None,
                 0,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -7213,6 +9691,7 @@ mod tests {
                 engine.clone(),
                 0,
                 dir.clone(),
+                None,
                 0,
                 false,
                 Arc::new(AtomicU64::new(u64::MAX)),

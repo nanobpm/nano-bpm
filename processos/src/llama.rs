@@ -15,7 +15,7 @@
 //! weights are the real cost (downloaded on demand by `llama-server` into the shared models dir),
 //! and a profile can still point at a remote endpoint instead.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -233,7 +233,7 @@ const PERF_DEFAULTS: &[(&[&str], &[&str])] = &[
 fn perf_default_args(operator_args: &[String]) -> Vec<String> {
     // Match on the flag portion only, so an operator's `--flag=value` form (e.g.
     // `--cache-reuse=512`) suppresses the default just like the spaced `--flag value` form.
-    let present: std::collections::HashSet<&str> = operator_args
+    let present: std::collections::BTreeSet<&str> = operator_args
         .iter()
         .map(|a| a.split('=').next().unwrap_or(a.as_str()))
         .collect();
@@ -423,7 +423,7 @@ pub struct LlamaManager {
     inner: Arc<Mutex<ManagerInner>>,
     /// One ring buffer per profile id, kept even after the sidecar stops so its final output is
     /// still viewable.
-    logs: Arc<Mutex<HashMap<String, LogBuffer>>>,
+    logs: Arc<Mutex<BTreeMap<String, LogBuffer>>>,
     /// Active background downloads (each a transient `llama-server` fetching a GGUF into the cache).
     downloads: Arc<Mutex<Vec<DownloadHandle>>>,
 }

@@ -12,9 +12,6 @@
 # feature and implements the generated per-tag Api traits.
 set -euo pipefail
 
-OPENAPI_GENERATOR_VERSION="${OPENAPI_GENERATOR_VERSION:-7.21.0}"
-OPENAPI_GENERATOR_VERSION="${OPENAPI_GENERATOR_VERSION#v}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 

@@ -63,7 +63,7 @@ fn task_then_sub() -> ProcessDefinition {
         .unwrap()
 }
 
-fn start(engine: &mut Engine, def: ProcessDefinition, vars_in: HashMap<String, Value>) -> Key {
+fn start(engine: &mut Engine, def: ProcessDefinition, vars_in: BTreeMap<String, Value>) -> Key {
     let id = def.id.clone();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
     engine
@@ -139,7 +139,7 @@ fn complete_all(engine: &mut Engine, job_type: &str) {
 #[test]
 fn activates_inside_the_existing_flow_scope() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let inner = eiks(&engine, inst, "inner")[0];
 
     let events = engine
@@ -159,7 +159,7 @@ fn activates_inside_the_existing_flow_scope() {
 #[test]
 fn creates_missing_flow_scope_without_its_start_event() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, task_then_sub(), HashMap::new());
+    let inst = start(&mut engine, task_then_sub(), BTreeMap::new());
     let a = eiks(&engine, inst, "a")[0];
     let timers_before = engine.state().timers.len();
 
@@ -201,7 +201,7 @@ fn creates_missing_flow_scope_without_its_start_event() {
 #[test]
 fn instructions_share_a_flow_scope_created_by_the_same_modification() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, task_then_sub(), HashMap::new());
+    let inst = start(&mut engine, task_then_sub(), BTreeMap::new());
 
     let events = engine
         .apply_command(modify(
@@ -225,7 +225,7 @@ fn instructions_share_a_flow_scope_created_by_the_same_modification() {
 #[test]
 fn ancestor_selects_the_flow_scope_instance() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     // A second `outer` (with its own `inner` and `t`).
     engine
         .apply_command(modify(inst, vec![ActivateElementInstruction::new("outer")]))
@@ -258,7 +258,7 @@ fn ancestor_selects_the_flow_scope_instance() {
 #[test]
 fn process_instance_key_as_ancestor_creates_the_whole_chain() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let events = engine
         .apply_command(modify(inst, vec![under("t", inst)]))
         .unwrap();
@@ -275,7 +275,7 @@ fn process_instance_key_as_ancestor_creates_the_whole_chain() {
 #[test]
 fn rejects_ambiguous_flow_scope() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     engine
         .apply_command(modify(inst, vec![ActivateElementInstruction::new("outer")]))
         .unwrap();
@@ -299,7 +299,7 @@ fn rejects_ambiguous_flow_scope() {
 #[test]
 fn rejects_unknown_ancestor() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let err = engine
         .apply_command(modify(inst, vec![under("t", 424_242)]))
         .unwrap_err();
@@ -319,7 +319,7 @@ fn rejects_unknown_ancestor() {
 #[test]
 fn rejects_ancestor_that_is_not_an_ancestor() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let t = eiks(&engine, inst, "t")[0];
     let err = engine
         .apply_command(modify(inst, vec![under("t", t)]))
@@ -343,7 +343,7 @@ fn rejects_ancestor_that_is_not_an_ancestor() {
 #[test]
 fn rejects_non_activatable_targets() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, task_then_sub(), HashMap::new());
+    let inst = start(&mut engine, task_then_sub(), BTreeMap::new());
     for (element, ty) in [
         ("ss", "START_EVENT"),
         ("start", "START_EVENT"),
@@ -426,7 +426,7 @@ fn activates_inside_an_existing_multi_instance_child() {
 #[test]
 fn variable_instructions_target_the_matching_scope() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, task_then_sub(), HashMap::new());
+    let inst = start(&mut engine, task_then_sub(), BTreeMap::new());
     let vi = |scope: Option<&str>, name: &str| VariableInstruction {
         variables: vars(&[(name, Value::Int(1))]),
         scope_id: scope.map(str::to_string),
@@ -464,7 +464,7 @@ fn variable_instructions_target_the_matching_scope() {
 #[test]
 fn rejects_invalid_variable_scopes() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, task_then_sub(), HashMap::new());
+    let inst = start(&mut engine, task_then_sub(), BTreeMap::new());
     let with_scope = |scope: &str| {
         modify(
             inst,
@@ -509,7 +509,7 @@ fn rejects_invalid_variable_scopes() {
 #[test]
 fn mixed_root_scope_variable_aliases_apply_in_request_order() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, task_then_sub(), HashMap::new());
+    let inst = start(&mut engine, task_then_sub(), BTreeMap::new());
     let vi = |scope: Option<&str>, value: i64| VariableInstruction {
         variables: vars(&[("x", Value::Int(value))]),
         scope_id: scope.map(str::to_string),
@@ -591,7 +591,7 @@ fn terminate_by_id_terminates_every_instance_including_mi_children() {
 #[test]
 fn terminating_the_last_child_terminates_the_flow_scopes() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let events = engine
         .apply_command(Command::ModifyInstance {
             instance_key: inst,
@@ -613,7 +613,7 @@ fn terminating_the_last_child_terminates_the_flow_scopes() {
 #[test]
 fn cascade_stops_at_a_scope_required_by_an_activation() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let events = engine
         .apply_command(Command::ModifyInstance {
             instance_key: inst,
@@ -641,7 +641,7 @@ fn cascade_stops_at_a_scope_required_by_an_activation() {
 #[test]
 fn terminate_and_activate_in_the_same_scope_keeps_the_scope() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let inner = eiks(&engine, inst, "inner")[0];
     let t = eiks(&engine, inst, "t")[0];
     engine
@@ -662,7 +662,7 @@ fn terminate_and_activate_in_the_same_scope_keeps_the_scope() {
 #[test]
 fn rejects_activation_inside_a_terminated_flow_scope() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let outer = eiks(&engine, inst, "outer")[0];
     let err = engine
         .apply_command(Command::modify_instance(
@@ -688,7 +688,7 @@ fn rejects_activation_inside_a_terminated_flow_scope() {
 #[test]
 fn a_rejected_instruction_applies_nothing() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let t = eiks(&engine, inst, "t")[0];
     let before = engine.state().jobs.len();
     let err = engine.apply_command(Command::ModifyInstance {
@@ -709,7 +709,7 @@ fn a_rejected_instruction_applies_nothing() {
 #[test]
 fn terminate_by_unknown_id_is_a_no_op() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, nested(), HashMap::new());
+    let inst = start(&mut engine, nested(), BTreeMap::new());
     let events = engine
         .apply_command(Command::ModifyInstance {
             instance_key: inst,
@@ -748,7 +748,7 @@ fn element_scoped_variables_are_visible_to_the_targets_input_mappings() {
         .build()
         .unwrap();
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     let events = engine
         .apply_command(modify(
             inst,
@@ -780,7 +780,7 @@ fn element_scoped_variables_are_visible_to_the_targets_input_mappings() {
 #[test]
 fn element_scoped_activation_keeps_instruction_order() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, task_then_sub(), HashMap::new());
+    let inst = start(&mut engine, task_then_sub(), BTreeMap::new());
     let events = engine
         .apply_command(modify(
             inst,
@@ -896,7 +896,7 @@ fn retry_of_a_seeded_activation_keeps_its_element_locals() {
         .build()
         .unwrap();
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     let events = engine
         .apply_command(modify(
             inst,
@@ -961,7 +961,7 @@ fn created_scope_boundaries_see_modification_variables() {
         .unwrap();
     {
         let mut engine = Engine::new();
-        let inst = start(&mut engine, def, HashMap::new());
+        let inst = start(&mut engine, def, BTreeMap::new());
         engine
             .apply_command(modify(
                 inst,
@@ -1016,7 +1016,7 @@ fn preflight_sees_an_earlier_instructions_staged_root_write() {
         .build()
         .unwrap();
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     engine
         .apply_command(modify(
             inst,
@@ -1076,7 +1076,7 @@ fn preflight_rejects_a_boundary_failing_only_under_an_earlier_staged_write() {
         .build()
         .unwrap();
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     // `k` is a NUMBER: the correlation key needs a STRING/number-renderable —
     // but a MAP value fails extraction outright, and only the earlier
     // instruction's staged write brings it into view.
@@ -1156,7 +1156,7 @@ fn preflight_reuses_a_scope_created_by_an_earlier_instruction() {
         .build()
         .unwrap();
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     engine
         .apply_command(modify(
             inst,
@@ -1227,7 +1227,7 @@ fn preflight_carries_an_outer_created_scopes_locals_into_a_nested_scope() {
         .build()
         .unwrap();
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     engine
         .apply_command(modify(
             inst,
@@ -1284,7 +1284,7 @@ fn created_scope_own_locals_do_not_satisfy_its_boundary_preflight() {
         .build()
         .unwrap();
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     let result = engine.apply_command(modify(
         inst,
         vec![ActivateElementInstruction {
@@ -1324,7 +1324,7 @@ fn terminating_a_waiting_join_discards_its_arrivals() {
         .build()
         .unwrap();
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     complete_all(&mut engine, "ja");
     assert_eq!(eiks(&engine, inst, "join").len(), 1, "join is waiting");
     engine
@@ -1348,7 +1348,13 @@ fn terminating_a_waiting_join_discards_its_arrivals() {
         0,
         "join fired on a cancelled arrival"
     );
-    assert_eq!(engine.instance(inst).unwrap().join_flows_taken("join"), 1);
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .join_flows_taken(&crate::state::JoinKey::root("join")),
+        1
+    );
 }
 
 /// A multi-instance body parked on an input-collection incident (active, but
@@ -1483,7 +1489,7 @@ fn parallel_join() -> ProcessDefinition {
 #[test]
 fn seeded_join_activation_runs_after_terminations() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, parallel_join(), HashMap::new());
+    let inst = start(&mut engine, parallel_join(), BTreeMap::new());
     complete_all(&mut engine, "ja");
     assert_eq!(eiks(&engine, inst, "join").len(), 1, "join is waiting");
     let events = engine
@@ -1535,7 +1541,7 @@ fn inclusive_join() -> ProcessDefinition {
 #[test]
 fn reused_waiting_join_routes_with_its_locals() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, inclusive_join(), HashMap::new());
+    let inst = start(&mut engine, inclusive_join(), BTreeMap::new());
     complete_all(&mut engine, "ja");
     assert_eq!(eiks(&engine, inst, "join").len(), 1, "join is waiting");
     engine
@@ -1549,7 +1555,7 @@ fn reused_waiting_join_routes_with_its_locals() {
 #[test]
 fn fresh_join_routes_with_its_locals() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, inclusive_join(), HashMap::new());
+    let inst = start(&mut engine, inclusive_join(), BTreeMap::new());
     complete_all(&mut engine, "ja");
     complete_all(&mut engine, "jb");
     // Both branches arrived without the local: the default route was taken.
@@ -1600,7 +1606,7 @@ fn call_activity_spawn_retry_keeps_element_locals() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(child)).unwrap();
-    let inst = start(&mut engine, parent, HashMap::new());
+    let inst = start(&mut engine, parent, BTreeMap::new());
     engine
         .apply_command(modify(
             inst,
@@ -1663,7 +1669,7 @@ fn call_activity_spawn_retry_keeps_element_locals_on_called_element_expression()
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(child)).unwrap();
-    let inst = start(&mut engine, parent, HashMap::new());
+    let inst = start(&mut engine, parent, BTreeMap::new());
     engine
         .apply_command(modify(
             inst,
@@ -1728,61 +1734,69 @@ fn join_in_sub() -> ProcessDefinition {
         .unwrap()
 }
 
-/// Join bookkeeping is keyed by element id per process instance, so activating
-/// a join under a flow-scope instance other than the one its waiting instance
-/// lives in would take over that instance's arrivals and variables. Both the
-/// plain and the element-local-variable activation paths must fail closed.
+/// Join bookkeeping is keyed per flow-scope instance (#1580, Zeebe parity), so
+/// activating a join under a flow-scope instance other than the one its
+/// waiting instance lives in opens an INDEPENDENT join there: the waiting
+/// join keeps its arrivals untouched and neither fires (each has one of its
+/// two flows). Both the plain and the element-local-variable activation paths.
 #[test]
-fn rejects_join_activation_in_a_different_flow_scope_than_its_waiting_instance() {
+fn join_activation_in_another_flow_scope_opens_an_independent_join() {
     for locals in [false, true] {
         let mut engine = Engine::new();
-        let inst = start(&mut engine, join_in_sub(), HashMap::new());
+        let inst = start(&mut engine, join_in_sub(), BTreeMap::new());
         complete_all(&mut engine, "ja");
         let waiting = eiks(&engine, inst, "join");
         assert_eq!(waiting.len(), 1, "join is waiting");
+        let waiting_scope = scope_of(&engine, inst, waiting[0]);
         // A second `sub` instance, created by activating `b` from the root.
         engine
             .apply_command(modify(inst, vec![under("b", inst)]))
             .unwrap();
         let subs = eiks(&engine, inst, "sub");
         assert_eq!(subs.len(), 2, "two sub instances");
-        let other = *subs
-            .iter()
-            .find(|s| **s != scope_of(&engine, inst, waiting[0]))
-            .unwrap();
+        let other = *subs.iter().find(|s| **s != waiting_scope).unwrap();
         let mut instruction = under("join", other);
         if locals {
             instruction.variable_instructions = vec![VariableInstruction {
-                variables: HashMap::from([("l".to_string(), Value::Int(1))]),
+                variables: BTreeMap::from([("l".to_string(), Value::Int(1))]),
                 scope_id: Some("join".into()),
             }];
         }
-        let before = engine.instance(inst).unwrap().join_flows_taken("join");
+        let events = engine
+            .apply_command(modify(inst, vec![instruction]))
+            .unwrap_or_else(|e| panic!("locals={locals}: {e}"));
         assert!(
-            engine
-                .apply_command(modify(inst, vec![instruction]))
-                .is_err(),
-            "locals={locals}: cross-scope join activation must be rejected"
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ParallelJoinFired { .. })),
+            "locals={locals}: neither scope's join has both flows"
         );
-        assert_eq!(eiks(&engine, inst, "join"), waiting, "locals={locals}");
+        let instance = engine.instance(inst).unwrap();
+        let waiting_key = crate::state::JoinKey::new(waiting_scope, "join");
+        let other_key = crate::state::JoinKey::new(other, "join");
         assert_eq!(
-            engine.instance(inst).unwrap().join_flows_taken("join"),
-            before,
+            instance.join_flows_taken(&waiting_key),
+            1,
             "locals={locals}"
         );
+        assert_eq!(instance.join_flows_taken(&other_key), 1, "locals={locals}");
+        assert_eq!(
+            instance.join_instances.get(&waiting_key),
+            Some(&waiting[0]),
+            "locals={locals}: the waiting join is untouched"
+        );
+        assert_eq!(eiks(&engine, inst, "join").len(), 2, "locals={locals}");
     }
 }
 
-/// With no join waiting, two activations of the same join under DIFFERENT
-/// sub-process instances both pass the waiting-instance check — but the
-/// process-wide join bookkeeping would then combine arrivals from unrelated
-/// scopes and fire the join incorrectly. Both the plain and the
-/// element-local-variable (seeded) activation paths must fail closed.
+/// Two activations of the same join under DIFFERENT sub-process instances
+/// land in two independent joins (#1580, Zeebe parity): each sees one
+/// unidentified arrival of its two flows, so neither fires.
 #[test]
-fn rejects_planned_join_activations_conflicting_across_scopes() {
+fn planned_join_activations_across_scopes_open_independent_joins() {
     for locals in [false, true] {
         let mut engine = Engine::new();
-        let inst = start(&mut engine, join_in_sub(), HashMap::new());
+        let inst = start(&mut engine, join_in_sub(), BTreeMap::new());
         // A second `sub` instance, created by activating `a` from the root.
         engine
             .apply_command(modify(inst, vec![under("a", inst)]))
@@ -1794,28 +1808,30 @@ fn rejects_planned_join_activations_conflicting_across_scopes() {
             let mut instruction = under("join", ancestor);
             if locals {
                 instruction.variable_instructions = vec![VariableInstruction {
-                    variables: HashMap::from([("l".to_string(), Value::Int(1))]),
+                    variables: BTreeMap::from([("l".to_string(), Value::Int(1))]),
                     scope_id: Some("join".into()),
                 }];
             }
             instruction
         };
-        let err = engine
+        let events = engine
             .apply_command(modify(inst, vec![activate(subs[0]), activate(subs[1])]))
-            .unwrap_err();
+            .unwrap_or_else(|e| panic!("locals={locals}: {e}"));
         assert!(
-            err.to_string().contains("different flow scopes"),
-            "locals={locals}: {err}"
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ParallelJoinFired { .. })),
+            "locals={locals}: arrivals in two scopes never combine"
         );
-        assert!(
-            eiks(&engine, inst, "join").is_empty(),
-            "locals={locals}: atomic — no join activated"
-        );
-        assert_eq!(
-            engine.instance(inst).unwrap().join_flows_taken("join"),
-            0,
-            "locals={locals}: no arrival recorded"
-        );
+        let instance = engine.instance(inst).unwrap();
+        for sub in &subs {
+            assert_eq!(
+                instance.join_flows_taken(&crate::state::JoinKey::new(*sub, "join")),
+                1,
+                "locals={locals}: one arrival per scope instance"
+            );
+        }
+        assert_eq!(eiks(&engine, inst, "join").len(), 2, "locals={locals}");
     }
 }
 
@@ -1866,7 +1882,7 @@ fn two_joins_in_two_subs() -> ProcessDefinition {
 #[test]
 fn allows_distinct_join_activations_in_different_scopes() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, two_joins_in_two_subs(), HashMap::new());
+    let inst = start(&mut engine, two_joins_in_two_subs(), BTreeMap::new());
     let sub1 = eiks(&engine, inst, "sub1");
     let sub2 = eiks(&engine, inst, "sub2");
     assert_eq!((sub1.len(), sub2.len()), (1, 1));
@@ -1885,7 +1901,7 @@ fn allows_distinct_join_activations_in_different_scopes() {
 #[test]
 fn allows_planned_join_activations_sharing_a_created_scope() {
     let mut engine = Engine::new();
-    let inst = start(&mut engine, join_in_sub(), HashMap::new());
+    let inst = start(&mut engine, join_in_sub(), BTreeMap::new());
     let events = engine
         .apply_command(modify(
             inst,
@@ -1895,7 +1911,7 @@ fn allows_planned_join_activations_sharing_a_created_scope() {
                     element_id: "join".into(),
                     ancestor_element_instance_key: Some(inst),
                     variable_instructions: vec![VariableInstruction {
-                        variables: HashMap::from([("l".to_string(), Value::Int(1))]),
+                        variables: BTreeMap::from([("l".to_string(), Value::Int(1))]),
                         scope_id: Some("join".into()),
                     }],
                     ..Default::default()
@@ -1978,7 +1994,7 @@ fn rejects_activation_that_would_open_an_inactive_adhoc_container() {
     // Fail closed for every element nested in an inactive container.
     for element in ["inner", "toolSub"] {
         let mut engine = Engine::new();
-        let inst = start(&mut engine, pre_then_adhoc(), HashMap::new());
+        let inst = start(&mut engine, pre_then_adhoc(), BTreeMap::new());
         let err = engine
             .apply_command(modify(
                 inst,
@@ -2163,7 +2179,7 @@ fn created_scope_local_shadows_existing_ancestor_local_in_preflight() {
       </bpmn:process></bpmn:definitions>"#;
     let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     engine
         .apply_command(modify(
             inst,
@@ -2225,7 +2241,7 @@ fn shared_created_scope_boundary_is_checked_only_on_first_creation() {
         .build()
         .unwrap();
     let mut engine = Engine::new();
-    let inst = start(&mut engine, def, HashMap::new());
+    let inst = start(&mut engine, def, BTreeMap::new());
     engine
         .apply_command(modify(
             inst,

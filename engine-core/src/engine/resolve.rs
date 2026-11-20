@@ -25,6 +25,23 @@ pub(crate) struct JobProps {
     pub(crate) priority: i32,
 }
 
+/// The outcome of resolving a user task's form linkage
+/// ([`Engine::resolve_user_task_form_linkage`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FormLinkage {
+    /// The task carries an external form reference (surfaced verbatim; no
+    /// deployed form version is resolved) or no form at all.
+    Unbound {
+        external_form_reference: Option<String>,
+    },
+    /// The `formId` resolved to a concrete deployed form version.
+    Resolved { form_key: Key },
+    /// A `deployment`/`versionTag` binding found no matching form version:
+    /// the task is not created and the element parks on a resolvable
+    /// incident carrying this reason (Zeebe `BpmnUserTaskBehavior` parity).
+    Miss { reason: String },
+}
+
 impl JobProps {
     /// A job with no retries / priority expressions: the engine defaults.
     pub(crate) fn defaults(job_type: String) -> Self {
@@ -49,7 +66,7 @@ impl Engine {
     /// `correlationKey` of `""`.
     pub(crate) fn resolve_correlation_value(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         correlation_key: &str,
     ) -> Result<String, expression::Failure> {
         if correlation_key.trim().is_empty() {
@@ -68,7 +85,7 @@ impl Engine {
     /// subscription named after the expression text (#1398).
     pub(crate) fn resolve_event_name(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: &str,
     ) -> Result<String, expression::Failure> {
         expression::evaluate_string(raw, vars)
@@ -134,6 +151,140 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// The trusted secret-reference roots for an evaluation against `vars`
+    /// from `view_scope` (#1640): the `SECRET_REFERENCE`-kind cluster
+    /// variables that no binding ON `view_scope`'s visible chain shadows and
+    /// whose visible value equals the cluster value. Fail-closed on any doubt.
+    fn trusted_secret_roots(
+        &self,
+        instance_key: Key,
+        view_scope: Key,
+        vars: &BTreeMap<String, Value>,
+    ) -> Vec<String> {
+        // The SAME replicated state `vars` was overlaid from (#1640, #1657):
+        // cluster variables are engine state changed only by their own
+        // commands, so values and kinds are one consistent view for the whole
+        // command, and every replica attributes trust identically.
+        let cluster_roots = self
+            .state
+            .cluster_variables
+            .trusted_secret_roots_for(crate::cluster_vars::DEFAULT_TENANT);
+        let instance = self.state.instances.get(&instance_key);
+        // Only bindings on `view_scope`'s OWN chain shadow what the mapping
+        // reads: the root scope plus every enclosing scope from the view scope
+        // upward — exactly the set `visible_variables` merges. A binding in a
+        // scope off that chain (a sibling branch) is invisible here.
+        let shadowed_on_chain = |name: &str| {
+            instance.is_some_and(|i| {
+                if i.variables.contains_key(name) {
+                    return true;
+                }
+                let mut cur = self.variable_scope_of(i, view_scope);
+                let mut steps = 0usize;
+                loop {
+                    if cur == i.key || steps > i.scope_parents.len() {
+                        return false;
+                    }
+                    if i.scope_variables
+                        .get(&cur)
+                        .is_some_and(|m| m.contains_key(name))
+                    {
+                        return true;
+                    }
+                    match i.scope_parents.get(&cur) {
+                        Some(&parent) if parent != cur => cur = parent,
+                        _ => return false,
+                    }
+                    steps += 1;
+                }
+            })
+        };
+        cluster_roots
+            .into_iter()
+            .filter(|(name, value)| !shadowed_on_chain(name) && vars.get(name) == Some(value))
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Evaluates input `mappings` against `vars` AND captures their
+    /// secret-reference provenance in the SAME pass (#1640 round-5 review).
+    ///
+    /// Value and provenance must come from ONE evaluation per mapping:
+    /// evaluating the value first and re-evaluating for provenance afterwards
+    /// lets a nondeterministic source (`random number()`, `now()`, `uuid()`)
+    /// take a different branch on the second pass, so the journaled value and
+    /// its recorded trust can describe different evaluations — an untrusted
+    /// field the first evaluation kept could be resolved to plaintext at
+    /// activation because the second evaluation dropped it. Here each
+    /// `=`-FEEL source is evaluated exactly once by
+    /// [`crate::feel::eval_with_provenance`], which returns the value and the
+    /// trusted secret names of THAT evaluation together; the value is
+    /// assigned to the mapping's target and the provenance recorded under the
+    /// same overwrite rule (a later mapping drops the provenance of the path,
+    /// its ancestors and its descendants, re-recording only its own
+    /// attributable writes).
+    ///
+    /// The failure contract is [`eval_io_mappings_in`](Self::eval_io_mappings_in)'s,
+    /// unchanged: a source that fails to evaluate is a hard `Err` (the caller
+    /// raises an `IO_MAPPING_ERROR` incident); a static (non-`=`) source is a
+    /// literal that carries no provenance.
+    pub(crate) fn eval_input_mappings_with_provenance(
+        &self,
+        instance_key: Key,
+        view_scope: Key,
+        vars: &BTreeMap<String, Value>,
+        mappings: &[crate::model::Mapping],
+    ) -> Result<(BTreeMap<String, Value>, Vec<crate::state::SecretProvenance>), IoMappingFailure>
+    {
+        let trusted = self.trusted_secret_roots(instance_key, view_scope, vars);
+        let mut result: BTreeMap<String, Value> = BTreeMap::new();
+        let mut provenance: Vec<crate::state::SecretProvenance> = Vec::new();
+        for m in mappings {
+            // The SAME segmentation `assign_io_target` writes with, so an
+            // aliased spelling (`payload..auth`) overwrites the provenance of
+            // the field it actually overwrites.
+            let path = io_target_segments(&m.target).join(".");
+            provenance.retain(|p| !paths_overlap(&p.path, &path));
+            if m.source.trim_start().starts_with('=') {
+                match crate::feel::eval_with_provenance(
+                    m.source.trim(),
+                    vars,
+                    trusted.iter().cloned(),
+                ) {
+                    Ok(evaluated) => {
+                        Self::assign_io_target(&mut result, vars, &m.target, evaluated.value);
+                        if !path.is_empty() && !evaluated.referenced_secrets.is_empty() {
+                            provenance.push(crate::state::SecretProvenance {
+                                path,
+                                secrets: evaluated.referenced_secrets,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        return Err(IoMappingFailure {
+                            reason: format!(
+                                "failed to evaluate io mapping source '{}' for target '{}': {}",
+                                m.source.trim(),
+                                m.target,
+                                err.0
+                            ),
+                        });
+                    }
+                }
+            } else {
+                // A static literal is passed through verbatim and carries no
+                // provenance (it is never a resolved reference).
+                Self::assign_io_target(
+                    &mut result,
+                    vars,
+                    &m.target,
+                    Value::Str(m.source.to_string()),
+                );
+            }
+        }
+        Ok((result, provenance))
+    }
+
     /// Evaluates the given io mappings against an explicit variable context
     /// `vars` (rather than the instance's persisted variables), returning the
     /// merged projection. Used when an as-yet-unapplied result (e.g. a script
@@ -149,10 +300,10 @@ impl Engine {
     /// `null` (an `Ok`), so it is assigned as `null` and does not fail here.
     pub(crate) fn eval_io_mappings_in(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         mappings: &[crate::model::Mapping],
-    ) -> Result<HashMap<String, Value>, IoMappingFailure> {
-        let mut result: HashMap<String, Value> = HashMap::new();
+    ) -> Result<BTreeMap<String, Value>, IoMappingFailure> {
+        let mut result: BTreeMap<String, Value> = BTreeMap::new();
         for m in mappings {
             match Self::eval_io_mapping_source(&m.source, vars) {
                 Ok(value) => Self::assign_io_target(&mut result, vars, &m.target, value),
@@ -185,7 +336,7 @@ impl Engine {
     /// stripped by [`crate::feel::eval`].
     fn eval_io_mapping_source(
         source: &str,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
     ) -> Result<Value, crate::feel::FeelError> {
         if source.trim_start().starts_with('=') {
             crate::feel::eval(source.trim(), vars)
@@ -209,11 +360,11 @@ impl Engine {
     /// silently projecting an empty result (#946).
     pub(crate) fn eval_io_mappings_tolerating(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         mappings: &[crate::model::Mapping],
-        tolerated: &std::collections::HashSet<String>,
-    ) -> Result<HashMap<String, Value>, IoMappingFailure> {
-        let mut result: HashMap<String, Value> = HashMap::new();
+        tolerated: &std::collections::BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Value>, IoMappingFailure> {
+        let mut result: BTreeMap<String, Value> = BTreeMap::new();
         for m in mappings {
             // A mapping that READS a per-child binding absent at the body level
             // is skipped up front; the per-child pass applies it
@@ -290,7 +441,7 @@ impl Engine {
     /// multi-instance locals. Gating this accessor to `cfg(test)` makes that
     /// whole defect class a compile error rather than a review catch.
     #[cfg(test)]
-    pub(crate) fn variables(&self, instance_key: Key) -> Arc<HashMap<String, Value>> {
+    pub(crate) fn variables(&self, instance_key: Key) -> Arc<BTreeMap<String, Value>> {
         let base = self
             .state
             .instances
@@ -310,7 +461,7 @@ impl Engine {
         &self,
         instance_key: Key,
         element_instance_key: Key,
-    ) -> Arc<HashMap<String, Value>> {
+    ) -> Arc<BTreeMap<String, Value>> {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return Arc::default();
         };
@@ -386,7 +537,7 @@ impl Engine {
         &self,
         instance: &crate::state::ProcessInstance,
         scope_key: Key,
-    ) -> Arc<HashMap<String, Value>> {
+    ) -> Arc<BTreeMap<String, Value>> {
         let is_root = scope_key == 0 || scope_key == instance.key;
         if is_root || instance.scope_variables.is_empty() {
             return self.overlay_cluster_variables(Arc::clone(&instance.variables));
@@ -413,7 +564,7 @@ impl Engine {
         self.overlay_cluster_variables(Arc::new(merged))
     }
 
-    /// Layers the host-injected [cluster variables](crate::cluster_vars) *beneath*
+    /// Layers the replicated [cluster variables](crate::cluster_vars) *beneath*
     /// an instance's own visible variables, so a FEEL expression evaluated against
     /// the result reads a cluster variable whenever the instance does not define a
     /// same-named local (instance/scope variables always shadow cluster ones).
@@ -426,16 +577,13 @@ impl Engine {
     /// overlaid; a variable scoped to any other tenant is not visible here.
     pub(crate) fn overlay_cluster_variables(
         &self,
-        base: Arc<HashMap<String, Value>>,
-    ) -> Arc<HashMap<String, Value>> {
-        let guard = match self.cluster_variables.read() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        base: Arc<BTreeMap<String, Value>>,
+    ) -> Arc<BTreeMap<String, Value>> {
+        let guard = &self.state.cluster_variables;
         if guard.is_empty() {
             return base;
         }
-        let mut merged: HashMap<String, Value> = HashMap::new();
+        let mut merged: BTreeMap<String, Value> = BTreeMap::new();
         for (k, v) in guard.resolved_for(crate::cluster_vars::DEFAULT_TENANT) {
             merged.insert(k.clone(), v.clone());
         }
@@ -458,7 +606,7 @@ impl Engine {
         &self,
         instance_key: Key,
         scope: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         local: bool,
     ) -> Vec<crate::Event> {
         let mut writes = self.propagate_variables(instance_key, scope, variables, local);
@@ -494,9 +642,9 @@ impl Engine {
         &self,
         instance_key: Key,
         target_scope: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         local: bool,
-    ) -> Vec<(Key, HashMap<String, Value>)> {
+    ) -> Vec<(Key, BTreeMap<String, Value>)> {
         if variables.is_empty() {
             return Vec::new();
         }
@@ -512,7 +660,7 @@ impl Engine {
         if instance.scope_variables.is_empty() && instance.scope_parents.is_empty() {
             return vec![(root, variables)];
         }
-        let mut by_scope: HashMap<Key, HashMap<String, Value>> = HashMap::new();
+        let mut by_scope: BTreeMap<Key, BTreeMap<String, Value>> = BTreeMap::new();
         for (name, value) in variables {
             let dest = self.scope_defining(instance, target, &name).unwrap_or(root);
             by_scope.entry(dest).or_default().insert(name, value);
@@ -562,7 +710,7 @@ impl Engine {
     /// created (#1390).
     pub(crate) fn resolve_job_type(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         job_type: &str,
     ) -> Result<String, expression::Failure> {
         if !expression::is_expression(job_type) {
@@ -577,7 +725,7 @@ impl Engine {
     /// value must be a `NUMBER` (floored at 0), else an `EXTRACT_VALUE_ERROR`.
     pub(crate) fn resolve_job_retries(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<i32, expression::Failure> {
         let Some(raw) = raw else {
@@ -595,7 +743,7 @@ impl Engine {
     /// raw `=expr` text is never returned.
     pub(crate) fn resolve_user_task_assignee(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<Option<String>, expression::Failure> {
         let Some(raw) = raw else {
@@ -610,7 +758,7 @@ impl Engine {
     /// `EXTRACT_VALUE_ERROR` (#1398).
     pub(crate) fn resolve_user_task_date(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<Option<String>, expression::Failure> {
         match raw {
@@ -625,7 +773,7 @@ impl Engine {
     /// `EXTRACT_VALUE_ERROR` (#1398). `None` resolves to an empty list.
     pub(crate) fn resolve_user_task_list(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<Vec<String>, expression::Failure> {
         let Some(raw) = raw else {
@@ -648,7 +796,7 @@ impl Engine {
     /// [`DEFAULT_PRIORITY`].
     pub(crate) fn resolve_user_task_priority(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<i32, expression::Failure> {
         match raw {
@@ -662,7 +810,7 @@ impl Engine {
     /// [`DEFAULT_PRIORITY`].
     pub(crate) fn resolve_job_priority(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         raw: Option<&str>,
     ) -> Result<i32, expression::Failure> {
         match raw {
@@ -678,7 +826,7 @@ impl Engine {
     /// tools.
     pub(crate) fn resolve_user_task_props(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         props: &crate::model::UserTaskProps,
     ) -> Result<ResolvedUserTask, expression::Failure> {
         Ok(ResolvedUserTask {
@@ -699,7 +847,7 @@ impl Engine {
     /// silently (#1398).
     pub(crate) fn resolve_job_props(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         job_type: &str,
         retries: Option<&str>,
         priority: Option<&str>,
@@ -715,27 +863,92 @@ impl Engine {
     /// enforcing the Zeebe invariant that `formId` and `externalReference` are
     /// mutually exclusive. An `externalReference` wins: it is surfaced verbatim
     /// and suppresses numeric `form_key` resolution, so a task never surfaces
-    /// both a `formKey` and an `externalFormReference`. When no external
-    /// reference is present, `formId` binds to the latest deployed form version
-    /// (Zeebe `latest` binding), stamped as a numeric `form_key`; an unmatched
-    /// `formId` leaves the key unset.
+    /// both a `formKey` and an `externalFormReference` (its binding is moot).
     ///
-    /// Returns `(form_key, external_form_reference)`.
+    /// A `formId` dispatches on its declared binding (Zeebe
+    /// `BpmnUserTaskBehavior.findLinkedForm`):
+    ///
+    /// * `latest` (the default) binds the latest deployed form version;
+    /// * `deployment` binds the version deployed **alongside the process
+    ///   definition** (the same `deployment_key` — `deployment_key` is `0` for
+    ///   a definition restored from a pre-#1193 snapshot, which matches no
+    ///   deployment and therefore misses rather than mis-binding);
+    /// * `versionTag` binds the version carrying the declared tag.
+    ///
+    /// A `deployment`/`versionTag` miss is a [`FormLinkage::Miss`] (the caller
+    /// raises a resolvable incident and creates no task); an unmatched `latest`
+    /// `formId` leaves the key unset, exactly as before #1193.
     pub(crate) fn resolve_user_task_form_linkage(
         &self,
+        instance_key: Key,
         props: &crate::model::UserTaskProps,
-    ) -> (Option<Key>, Option<String>) {
-        let external_form_reference = props.external_form_reference.clone();
-        let form_key = if external_form_reference.is_some() {
-            None
-        } else {
-            props
-                .form_id
-                .as_deref()
-                .and_then(|id| self.state.forms.get(id))
-                .map(|f| f.key)
+    ) -> FormLinkage {
+        if let Some(external) = &props.external_form_reference {
+            return FormLinkage::Unbound {
+                external_form_reference: Some(external.clone()),
+            };
+        }
+        let Some(form_id) = props.form_id.as_deref() else {
+            return FormLinkage::Unbound {
+                external_form_reference: None,
+            };
         };
-        (form_key, external_form_reference)
+        match props.form_binding_type {
+            crate::model::BindingType::Latest => match self.state.forms.get(form_id) {
+                Some(form) => FormLinkage::Resolved { form_key: form.key },
+                None => FormLinkage::Unbound {
+                    external_form_reference: None,
+                },
+            },
+            crate::model::BindingType::Deployment => {
+                let deployment_key = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|instance| self.state.definition_for(instance))
+                    .map(|definition| definition.deployment_key)
+                    .unwrap_or(0);
+                let resolved = self
+                    .state
+                    .form_versions
+                    .values()
+                    .filter(|form| form.form_id == form_id)
+                    .filter(|form| deployment_key != 0 && form.deployment_key == deployment_key)
+                    .max_by_key(|form| form.version);
+                match resolved {
+                    Some(form) => FormLinkage::Resolved { form_key: form.key },
+                    None => FormLinkage::Miss {
+                        reason: format!(
+                            "Expected to find a form with id '{form_id}' in the same deployment \
+                             as the process, but no such form was found. Deploy the form together \
+                             with the process (or migrate the process instance to a process \
+                             definition deployed together with the intended form) and resolve \
+                             the incident."
+                        ),
+                    },
+                }
+            }
+            crate::model::BindingType::VersionTag => {
+                let tag = props.form_version_tag.as_deref().unwrap_or_default();
+                let resolved = self
+                    .state
+                    .form_versions
+                    .values()
+                    .filter(|form| form.form_id == form_id)
+                    .filter(|form| !tag.is_empty() && form.version_tag.as_deref() == Some(tag))
+                    .max_by_key(|form| form.version);
+                match resolved {
+                    Some(form) => FormLinkage::Resolved { form_key: form.key },
+                    None => FormLinkage::Miss {
+                        reason: format!(
+                            "Expected to find a form with id '{form_id}' and version tag '{tag}', \
+                             but no such form was found. Deploy a form version carrying that tag \
+                             and resolve the incident."
+                        ),
+                    },
+                }
+            }
+        }
     }
 
     /// Resolves a timer's due time (and, for a cycle, its re-arm interval) at
@@ -743,9 +956,10 @@ impl Engine {
     /// ([`crate::model::TimerDef`]) when one is declared on the element, and
     /// using the statically-parsed `fallback_millis` only when none is.
     ///
-    /// Returns `(due_at, interval_millis)` where `due_at` is an absolute epoch
-    /// time in the engine's millisecond clock and `interval_millis` is the delay
-    /// used to re-arm a repeating (cycle) timer (0 for an absolute date). `vars`
+    /// Returns a [`ResolvedTimer`]: `due_at` is an absolute epoch time in the
+    /// engine's millisecond clock, `interval_millis` is the delay used to re-arm
+    /// a repeating (cycle) timer (0 for an absolute date), and `repetitions` is
+    /// a bounded cycle's `Rn` fire count (#1596). `vars`
     /// is the scoped view the timer's element sees (empty for a process-level
     /// start timer evaluated at deploy against an empty context). A declared
     /// expression that fails to evaluate, or whose result is not a valid
@@ -754,13 +968,22 @@ impl Engine {
     /// never the static fallback (#1398).
     pub(crate) fn resolve_timer(
         &self,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         def: Option<&crate::model::TimerDef>,
         base_now: u64,
         fallback_millis: u64,
-    ) -> Result<(u64, u64), expression::Failure> {
+    ) -> Result<ResolvedTimer, expression::Failure> {
+        let resolved = |due_at, interval_millis, repetitions| ResolvedTimer {
+            due_at,
+            interval_millis,
+            repetitions,
+        };
         let Some(def) = def else {
-            return Ok((base_now.saturating_add(fallback_millis), fallback_millis));
+            return Ok(resolved(
+                base_now.saturating_add(fallback_millis),
+                fallback_millis,
+                None,
+            ));
         };
         match def.kind {
             crate::model::TimerDefKind::Duration => {
@@ -770,16 +993,20 @@ impl Engine {
                     "duration",
                     crate::temporal::parse_duration_millis,
                 )?;
-                Ok((base_now.saturating_add(ms), ms))
+                Ok(resolved(base_now.saturating_add(ms), ms, None))
             }
             crate::model::TimerDefKind::Cycle => {
-                let ms = expression::evaluate_timer(
+                let cycle = expression::evaluate_timer(
                     &def.expr,
                     vars,
                     "cycle",
-                    crate::temporal::parse_cycle_millis,
+                    crate::temporal::parse_cycle,
                 )?;
-                Ok((base_now.saturating_add(ms), ms))
+                Ok(resolved(
+                    base_now.saturating_add(cycle.interval_millis),
+                    cycle.interval_millis,
+                    cycle.repetitions,
+                ))
             }
             crate::model::TimerDefKind::Date => {
                 let dt = expression::evaluate_timer(
@@ -788,7 +1015,11 @@ impl Engine {
                     "date-time",
                     crate::feel::temporal::DateTime::parse,
                 )?;
-                Ok(((dt.epoch_nanos() / 1_000_000).max(0) as u64, 0))
+                Ok(resolved(
+                    (dt.epoch_nanos() / 1_000_000).max(0) as u64,
+                    0,
+                    None,
+                ))
             }
         }
     }
@@ -820,12 +1051,14 @@ impl Engine {
             .map(|i| i.key)
     }
 
-    pub(crate) fn join_eik(&self, instance_key: Key, element_id: &str) -> Option<Key> {
+    /// The open join instance of `element_id` in flow-scope instance `scope`
+    /// (#1580: joins count per flow-scope instance).
+    pub(crate) fn join_eik(&self, instance_key: Key, scope: Key, element_id: &str) -> Option<Key> {
         self.state
             .instances
             .get(&instance_key)?
             .join_instances
-            .get(element_id)
+            .get(&state::JoinKey::new(scope, element_id))
             .copied()
     }
 
@@ -834,12 +1067,12 @@ impl Engine {
     /// variables so a partial-path mapping (`order.total`) preserves the other
     /// members of `order`.
     fn assign_io_target(
-        result: &mut HashMap<String, Value>,
-        vars: &HashMap<String, Value>,
+        result: &mut BTreeMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         target: &str,
         value: Value,
     ) {
-        let parts: Vec<&str> = target.split('.').filter(|p| !p.is_empty()).collect();
+        let parts = io_target_segments(target);
         match parts.as_slice() {
             [] => {}
             [single] => {
@@ -900,6 +1133,22 @@ impl Engine {
     }
 }
 
+/// `true` when writing dotted path `b` replaces (part of) the value at `a`, or
+/// vice versa: equal paths, or one is a dotted ancestor of the other.
+/// The canonical segmentation of an io-mapping target path: the single
+/// interpretation shared by assignment and secret provenance (#1640).
+pub(crate) fn io_target_segments(target: &str) -> Vec<&str> {
+    target.split('.').filter(|p| !p.is_empty()).collect()
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a.is_empty()
+        || b.is_empty()
+        || a == b
+        || a.strip_prefix(b).is_some_and(|r| r.starts_with('.'))
+        || b.strip_prefix(a).is_some_and(|r| r.starts_with('.'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,7 +1159,7 @@ mod tests {
         // expression; it must resolve to Ok("") (absent) rather than being fed
         // to the FEEL parser and raising a spurious incident.
         let engine = Engine::new();
-        let vars = HashMap::new();
+        let vars = BTreeMap::new();
         assert_eq!(
             engine.resolve_correlation_value(&vars, "   "),
             Ok(String::new())
@@ -926,7 +1175,7 @@ mod tests {
         // A genuinely declared key that cannot evaluate (missing variable)
         // must return Err so the caller can raise an incident.
         let engine = Engine::new();
-        let vars = HashMap::new();
+        let vars = BTreeMap::new();
         assert!(engine
             .resolve_correlation_value(&vars, "missingVar")
             .is_err());
@@ -936,7 +1185,7 @@ mod tests {
     fn correlation_accepts_string_and_number_only() {
         // Zeebe `evaluateMessageCorrelationKeyExpression`.
         let engine = Engine::new();
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("n".to_string(), Value::Int(42));
         vars.insert("s".to_string(), Value::Str("k".to_string()));
         vars.insert("b".to_string(), Value::Bool(true));
@@ -958,7 +1207,7 @@ mod tests {
         // malformed is an EXTRACT_VALUE_ERROR (Zeebe `evaluateStringExpression`)
         // — and never the raw `=expr` stored as the assignee.
         let engine = Engine::new();
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("nullVar".to_string(), Value::Null);
         vars.insert("x".to_string(), Value::Str("alice".to_string()));
         for raw in ["=nullVar", "=missing", "=1 + "] {
@@ -981,7 +1230,7 @@ mod tests {
     #[test]
     fn user_task_date_is_nullable() {
         let engine = Engine::new();
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("nullVar".to_string(), Value::Null);
         vars.insert(
             "dateStr".to_string(),
@@ -1009,39 +1258,51 @@ mod tests {
         // The hot path: with no cluster variables configured, the overlay is a
         // no-op refcount bump — the very same allocation is returned.
         let engine = Engine::new();
-        let mut base = HashMap::new();
+        let mut base = BTreeMap::new();
         base.insert("x".to_string(), Value::Int(1));
         let base = Arc::new(base);
         let out = engine.overlay_cluster_variables(Arc::clone(&base));
         assert!(Arc::ptr_eq(&base, &out), "empty snapshot must not clone");
     }
 
+    /// Creates a cluster variable through the replicated command (#1657).
+    fn put(engine: &mut Engine, tenant: Option<&str>, name: &str, value: Value) {
+        engine
+            .apply_command(crate::Command::CreateClusterVariable {
+                tenant_id: tenant.map(str::to_string),
+                name: name.to_string(),
+                value,
+                kind: crate::cluster_vars::ClusterVariableKind::Json,
+                metadata: Default::default(),
+                distributed: false,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn cluster_variable_overlay_layers_under_instance_variables() {
-        use std::sync::{Arc as StdArc, RwLock};
-
-        use crate::cluster_vars::{ClusterVariableSnapshot, DEFAULT_TENANT};
+        use crate::cluster_vars::DEFAULT_TENANT;
 
         let mut engine = Engine::new();
-        let mut snap = ClusterVariableSnapshot::default();
         // A global var, and a same-named var the instance will shadow.
-        snap.global
-            .insert("region".to_string(), Value::Str("EMEA".to_string()));
-        snap.global
-            .insert("shared".to_string(), Value::Str("from-global".to_string()));
+        put(&mut engine, None, "region", Value::Str("EMEA".to_string()));
+        put(
+            &mut engine,
+            None,
+            "shared",
+            Value::Str("from-global".to_string()),
+        );
         // A default-tenant var (visible to the single-tenant engine).
-        snap.tenants
-            .entry(DEFAULT_TENANT.to_string())
-            .or_default()
-            .insert("tier".to_string(), Value::Int(2));
+        put(&mut engine, Some(DEFAULT_TENANT), "tier", Value::Int(2));
         // A var scoped to some other tenant must NOT be visible.
-        snap.tenants
-            .entry("other".to_string())
-            .or_default()
-            .insert("secret".to_string(), Value::Str("nope".to_string()));
-        engine.set_cluster_variables(StdArc::new(RwLock::new(snap)));
+        put(
+            &mut engine,
+            Some("other"),
+            "secret",
+            Value::Str("nope".to_string()),
+        );
 
-        let mut base = HashMap::new();
+        let mut base = BTreeMap::new();
         base.insert(
             "shared".to_string(),
             Value::Str("from-instance".to_string()),
@@ -1059,6 +1320,29 @@ mod tests {
             out.get("shared"),
             Some(&Value::Str("from-instance".to_string())),
             "instance variable must shadow the same-named cluster variable"
+        );
+    }
+
+    /// #1296: a `SECRET_REFERENCE` cluster variable's value is ordinary JSON
+    /// that may carry `camunda.secrets.<name>` reference text. The engine NEVER
+    /// resolves it — the overlay hands the reference text through unchanged, so
+    /// nothing resolved can ever reach the journal or a snapshot. (Resolution
+    /// happens at job activation, host-side.)
+    #[test]
+    fn cluster_variable_overlay_passes_secret_reference_text_through() {
+        let mut engine = Engine::new();
+        put(
+            &mut engine,
+            None,
+            "api_token",
+            Value::Str("camunda.secrets.API_TOKEN".to_string()),
+        );
+
+        let out = engine.overlay_cluster_variables(Arc::new(BTreeMap::new()));
+        assert_eq!(
+            out.get("api_token"),
+            Some(&Value::Str("camunda.secrets.API_TOKEN".to_string())),
+            "the reference text passes through verbatim, never resolved"
         );
     }
 }
@@ -1094,4 +1378,25 @@ pub(crate) fn conditional_write_checks() -> u64 {
 #[cfg(test)]
 pub(crate) fn note_conditional_write_check() {
     CONDITIONAL_WRITE_CHECKS.with(|c| c.set(c.get() + 1));
+}
+
+/// A timer resolved at creation time (see [`Engine::resolve_timer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedTimer {
+    pub(crate) due_at: u64,
+    pub(crate) interval_millis: u64,
+    /// The `n` of a bounded `Rn/…` cycle; `None` when unbounded / not a cycle.
+    pub(crate) repetitions: Option<u32>,
+}
+
+/// The remaining-fire count a cycle timer re-arms with after a fire that had
+/// `remaining` fires left (including itself), or `None` when that fire was the
+/// last and the cycle must NOT re-arm (Zeebe stops an `R2/…` cycle after two
+/// fires, #1596). An unbounded cycle (`None`) always re-arms unbounded.
+pub(crate) fn rearm_repetitions(remaining: Option<u32>) -> Option<Option<u32>> {
+    match remaining {
+        None => Some(None),
+        Some(n) if n > 1 => Some(Some(n - 1)),
+        Some(_) => None,
+    }
 }

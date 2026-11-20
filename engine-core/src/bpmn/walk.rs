@@ -87,19 +87,19 @@ pub(crate) fn parse_with_captures(
     // Buffer for a timer event's nested `timeDate` (an absolute FEEL/ISO instant).
     let mut date_text: Option<String> = None;
     // Definitions-level `<error id=… errorCode=…>` declarations: id -> code.
-    let mut errors: HashMap<String, String> = HashMap::new();
+    let mut errors: BTreeMap<String, String> = BTreeMap::new();
     // Definitions-level `<message id=… name=…>` declarations, with the
     // correlation-key variable from a nested `zeebe:subscription`: id -> decl.
-    let mut messages: HashMap<String, MessageDecl> = HashMap::new();
+    let mut messages: BTreeMap<String, MessageDecl> = BTreeMap::new();
     // Id of the `<message>` currently being read (to attach its subscription).
     let mut cur_message: Option<String> = None;
     // Definitions-level `<signal id=… name=…>` declarations: id -> name.
-    let mut signals: HashMap<String, String> = HashMap::new();
+    let mut signals: BTreeMap<String, String> = BTreeMap::new();
     // Definitions-level `<escalation id=… name=…>` declarations: id -> name.
     // Captured so the reference-integrity validator (#851) can resolve an
     // `escalationRef` against a declared escalation. The parser does not model
     // escalation execution today; this only records the declarations.
-    let mut escalations: HashMap<String, String> = HashMap::new();
+    let mut escalations: BTreeMap<String, String> = BTreeMap::new();
     // Stack of activity node indices that can carry a `zeebe:ioMapping`, so a
     // nested `zeebe:input`/`zeebe:output` attaches to the innermost open
     // activity. `in_io_mapping` gates input/output reads to a real ioMapping.
@@ -130,6 +130,26 @@ pub(crate) fn parse_with_captures(
     // Gates `zeebe:header` reads to a real `zeebe:taskHeaders` container; each
     // header attaches to the innermost open activity on the io_stack.
     let mut in_task_headers = false;
+    // Gates `zeebe:property` reads to a real `zeebe:properties` container; each
+    // property attaches to the innermost open flow node on the io_stack (#1499).
+    // Without this gate a stray `<zeebe:property>` elsewhere in
+    // `extensionElements` (or the standard BPMN `<property>` data element, which
+    // `is_ignorable_tag` already treats as noise) would be misread as an
+    // extension property.
+    let mut in_properties = false;
+    // The flow node that directly owns the currently-open `<extensionElements>`
+    // (the top of `flow_node_stack` when it opened), or `None` when the owner
+    // is not a flow node (a sequenceFlow, dataObject, process, …). Properties
+    // bind to this exact owner rather than "whatever is innermost on the
+    // io_stack", so a non-flow owner nested in a subprocess can never leak its
+    // properties onto the subprocess (#1499).
+    let mut ext_owner: Option<usize> = None;
+    // `flow_node_stack` depth of the open pending boundary event, and whether
+    // the currently-open `<extensionElements>` is a *direct* child of it. A
+    // boundary's nested `dataOutput/extensionElements` must not populate the
+    // boundary's own properties (#1499).
+    let mut boundary_depth: Option<usize> = None;
+    let mut ext_boundary_direct = false;
     // Gates `zeebe:linkedResource` reads to a real `zeebe:linkedResources`
     // container; each link attaches to the innermost open activity on the
     // io_stack. Without this a stray `linkedResource` tag elsewhere in
@@ -238,9 +258,31 @@ pub(crate) fn parse_with_captures(
                             reason = "the `current.is_some()` match guard proves this is Some"
                         )]
                         let acc = current.as_mut().expect("current process set");
+                        // Count every event-definition element on the start
+                        // event being read — occurrences, not types — so a
+                        // repeated definition of the same type (which would
+                        // otherwise overwrite its field) is still detected as
+                        // an ambiguous trigger at build (#1555).
+                        if let (Some(idx), true) = (cur_start, tag.ends_with("EventDefinition")) {
+                            acc.nodes[idx].start_def_count += 1;
+                            if tag == "conditionalEventDefinition" {
+                                acc.nodes[idx].has_conditional_def = true;
+                            }
+                        }
                         match tag {
                             "startEvent" => {
                                 let idx = acc.add_node(attrs, NodeKind::Start);
+                                // `isInterrupting="false"` on an event
+                                // sub-process's start event marks the event
+                                // sub-process non-interrupting (BPMN default
+                                // `true`). Recorded only as an explicit "false";
+                                // build applies the default (and rejects the
+                                // non-interrupting combinations Zeebe forbids).
+                                if let (Some(i), Some("false")) =
+                                    (idx, attr(attrs, "isInterrupting"))
+                                {
+                                    acc.nodes[i].esp_interrupting = Some(false);
+                                }
                                 // Push onto io_stack so a nested execution listener
                                 // attaches to the start event, not the enclosing
                                 // scope (#1197). A self-closing `<startEvent/>` has
@@ -512,6 +554,7 @@ pub(crate) fn parse_with_captures(
                                 // never a real boundary — not buffering it is safe.
                                 if !self_closing {
                                     if let Some(id) = attr(attrs, "id") {
+                                        boundary_depth = Some(flow_node_stack.len());
                                         cur_boundary = Some(PendingBoundary {
                                             id: id.to_string(),
                                             attached_to: attr(attrs, "attachedToRef")
@@ -531,6 +574,7 @@ pub(crate) fn parse_with_captures(
                                             escalation_dup: false,
                                             start_listeners: Vec::new(),
                                             end_listeners: Vec::new(),
+                                            properties: std::collections::BTreeMap::new(),
                                         });
                                     }
                                 }
@@ -539,15 +583,63 @@ pub(crate) fn parse_with_captures(
                                 let error_ref = attr(attrs, "errorRef").unwrap_or("").to_string();
                                 if let Some(boundary) = cur_boundary.as_mut() {
                                     boundary.error_ref = Some(error_ref);
+                                } else if let Some(idx) = cur_start {
+                                    // An error definition on a START event is an
+                                    // event sub-process's error trigger (#1555):
+                                    // record the raw `errorRef` (empty = no ref =
+                                    // catch-all) for build to resolve against the
+                                    // declared `<error>`s. A process-level error
+                                    // start is invalid, but the ESP build check
+                                    // rejects it naming the construct. A nonempty
+                                    // ref is ALSO captured for the reference-
+                                    // integrity validator (#851), mirroring the
+                                    // escalation arm: `resolve_esp_trigger` only
+                                    // sees starts inside an event sub-process, so a
+                                    // dangling ref anywhere else must not bypass it.
+                                    if !error_ref.is_empty() {
+                                        acc.error_refs_extra
+                                            .push((acc.nodes[idx].id.clone(), error_ref.clone()));
+                                    }
+                                    acc.nodes[idx].esp_error_ref = Some(if error_ref.is_empty() {
+                                        None
+                                    } else {
+                                        Some(error_ref)
+                                    });
                                 } else if let Some(idx) =
                                     flow_node_stack.iter().rev().find_map(|e| *e)
                                 {
                                     // An `errorRef` on a non-boundary error event
-                                    // (an error end / throw event). Recorded so the
-                                    // reference-integrity validator (#851) can
-                                    // resolve it against declared `<error>`s.
+                                    // (an error end / throw event). A non-empty
+                                    // ref is recorded so the reference-integrity
+                                    // validator (#851) can resolve it against
+                                    // declared `<error>`s (mirroring the
+                                    // escalation arm: an absent ref is not a
+                                    // reference and needs no validation).
                                     let node_id = acc.nodes[idx].id.clone();
-                                    acc.error_refs_extra.push((node_id, error_ref));
+                                    if !error_ref.is_empty() {
+                                        acc.error_refs_extra.push((node_id, error_ref.clone()));
+                                    }
+                                    // Only an end event carrier is an error *throw*
+                                    // (#1592); any other placement (an error
+                                    // intermediate throw/catch — not modelled)
+                                    // stays recorded above for #851 but builds no
+                                    // element behaviour.
+                                    // Presence is tracked for EVERY carrier so the
+                                    // competing-definition guard (#1173) still sees an
+                                    // error definition on an intermediate throw.
+                                    // A SECOND definition is a last-wins overwrite
+                                    // of `error_ref`; flag it so `build` rejects
+                                    // the ambiguous throw (mirrors
+                                    // `escalation_throw_dup`).
+                                    if acc.nodes[idx].has_error_def {
+                                        acc.nodes[idx].error_def_dup = true;
+                                    }
+                                    acc.nodes[idx].has_error_def = true;
+                                    if matches!(acc.nodes[idx].kind, NodeKind::End) {
+                                        acc.nodes[idx].is_error_throw = true;
+                                        acc.nodes[idx].error_ref =
+                                            (!error_ref.is_empty()).then_some(error_ref);
+                                    }
                                 }
                             }
                             // `escalationEventDefinition escalationRef="…"` on an
@@ -582,6 +674,22 @@ pub(crate) fn parse_with_captures(
                                             escalation_ref.to_string(),
                                         ));
                                     }
+                                } else if let Some(idx) = cur_start {
+                                    // An escalation definition on a START event is
+                                    // an event sub-process's escalation trigger
+                                    // (#1555): record the raw `escalationRef`
+                                    // (absent = catch-all) for build to resolve
+                                    // against the declared `<escalation>`s. The
+                                    // reference-integrity validator (#851) still
+                                    // sees a dangling ref via `escalation_refs`.
+                                    if let Some(escalation_ref) = escalation_ref {
+                                        acc.escalation_refs.push((
+                                            acc.nodes[idx].id.clone(),
+                                            escalation_ref.to_string(),
+                                        ));
+                                    }
+                                    acc.nodes[idx].esp_escalation_ref =
+                                        Some(escalation_ref.map(str::to_string));
                                 } else if let Some(idx) =
                                     flow_node_stack.iter().rev().find_map(|e| *e)
                                 {
@@ -899,6 +1007,21 @@ pub(crate) fn parse_with_captures(
                                     .filter(|s| !s.is_empty())
                                     .map(str::to_string);
                                 if let Some(idx) = cur_user_task {
+                                    // Zeebe requires exactly one of `formId` /
+                                    // `externalReference` on a user task's
+                                    // formDefinition and rejects the deployment
+                                    // otherwise: with neither there is no form
+                                    // to resolve under any binding, so the task
+                                    // would be created form-less with no
+                                    // incident — a silently accepted dead
+                                    // declaration (#1193 review). Reject it
+                                    // loudly, like the other required-attribute
+                                    // rules.
+                                    if form_id.is_none() && external_reference.is_none() {
+                                        return Err(ParseError::MissingUserTaskFormId {
+                                            task_id: acc.nodes[idx].id.clone(),
+                                        });
+                                    }
                                     let props = &mut acc.nodes[idx].user_task;
                                     props.external_form_reference = external_reference;
                                     props.form_id = if props.external_form_reference.is_some() {
@@ -906,35 +1029,42 @@ pub(crate) fn parse_with_captures(
                                     } else {
                                         form_id
                                     };
-                                    // Interim guard (#1190): the engine resolves
-                                    // a user-task deployed form to the *latest*
-                                    // deployed form version at task creation. The
-                                    // other two Camunda bindings (`deployment`,
-                                    // `versionTag`) are not implemented; rather
-                                    // than silently degrading them to `latest` (a
-                                    // latent mis-binding), reject the deploy
-                                    // loudly. The guard keys off the *raw*
+                                    // The form binding (#1193): an absent
+                                    // `bindingType` defaults to `latest` (Zeebe's
+                                    // default). The guard keys off the *raw*
                                     // `externalReference`: an external form
                                     // resolves no deployed version, so its binding
-                                    // is moot and unaffected; every *other*
-                                    // (deployed) form must carry only the default
-                                    // binding. Only an **absent** `bindingType`
-                                    // defaults — any present value other than the
-                                    // literal `latest`, including an explicitly
-                                    // empty `bindingType=""`, is an explicit
-                                    // unimplemented binding and is rejected rather
-                                    // than silently treated as the default.
+                                    // is moot and unrecorded; every *other*
+                                    // (deployed) form's binding is dispatched at
+                                    // user-task creation. An explicitly empty
+                                    // `bindingType=""` is a present, explicit
+                                    // value — not an absent one — so it is
+                                    // rejected rather than silently treated as the
+                                    // `latest` default (the #1190 fail-loud rule,
+                                    // kept for a value no binding maps to).
                                     if acc.nodes[idx].user_task.external_form_reference.is_none() {
-                                        if let Some(binding) =
-                                            attr(attrs, "bindingType").filter(|s| *s != "latest")
-                                        {
-                                            return Err(
-                                                ParseError::UnsupportedUserTaskFormBinding {
-                                                    task_id: acc.nodes[idx].id.clone(),
-                                                    binding_type: binding.to_string(),
-                                                },
-                                            );
-                                        }
+                                        let binding = match attr(attrs, "bindingType") {
+                                            None | Some("latest") => {
+                                                crate::model::BindingType::Latest
+                                            }
+                                            Some("deployment") => {
+                                                crate::model::BindingType::Deployment
+                                            }
+                                            Some("versionTag") => {
+                                                crate::model::BindingType::VersionTag
+                                            }
+                                            Some(other) => {
+                                                return Err(
+                                                    ParseError::UnsupportedUserTaskFormBinding {
+                                                        task_id: acc.nodes[idx].id.clone(),
+                                                        binding_type: other.to_string(),
+                                                    },
+                                                );
+                                            }
+                                        };
+                                        acc.nodes[idx].user_task.form_binding_type = binding;
+                                        acc.nodes[idx].user_task.form_version_tag =
+                                            attr(attrs, "versionTag").map(str::to_string);
                                     }
                                 } else if let Some(idx) = cur_start {
                                     // Start forms are formId-only by design: the
@@ -1085,10 +1215,14 @@ pub(crate) fn parse_with_captures(
                                 }
                             }
                             // A conditional event's FEEL `<condition>` (nested in
-                            // a `conditionalEventDefinition` on a catch or boundary
-                            // event). Distinct from a sequence flow's
-                            // `conditionExpression` above.
-                            "condition" if cur_intermediate.is_some() || cur_boundary.is_some() => {
+                            // a `conditionalEventDefinition` on a catch, boundary,
+                            // or event sub-process start event). Distinct from a
+                            // sequence flow's `conditionExpression` above.
+                            "condition"
+                                if cur_intermediate.is_some()
+                                    || cur_boundary.is_some()
+                                    || cur_start.is_some() =>
+                            {
                                 event_condition_text = Some(String::new());
                             }
                             // A `multiInstanceLoopCharacteristics` child of an
@@ -1149,6 +1283,9 @@ pub(crate) fn parse_with_captures(
                             // A self-closing container has no children, so only a
                             // real open element enters the subtree.
                             "extensionElements" => {
+                                ext_owner = flow_node_stack.last().copied().flatten();
+                                ext_boundary_direct = cur_boundary.is_some()
+                                    && boundary_depth.map(|d| d + 1) == Some(flow_node_stack.len());
                                 if !self_closing {
                                     extension_depth += 1;
                                 }
@@ -1168,6 +1305,44 @@ pub(crate) fn parse_with_captures(
                                 // `true` and wrongly capture later `zeebe:header`s.
                                 if !self_closing {
                                     in_task_headers = true;
+                                }
+                            }
+                            // zeebe:properties and its nested zeebe:property
+                            // entries (#1499): generic vendor metadata
+                            // (`<zeebe:property name="…" value="…"/>`) attached to
+                            // the innermost open flow node on the io_stack —
+                            // Camunda's MCP tool markers (`io.camunda.tool:*`) and
+                            // inbound connector type (`inbound.type`) ride this
+                            // channel. Same container gate as `taskHeaders`: a
+                            // self-closing `<zeebe:properties />` has no children
+                            // and emits no end tag.
+                            "properties" => {
+                                if !self_closing {
+                                    in_properties = true;
+                                }
+                            }
+                            "property" if in_properties => {
+                                // A boundary event is buffered in `cur_boundary`
+                                // (never on the io_stack), so check it first;
+                                // falling back to the io_stack would drop a
+                                // top-level boundary's properties or attach a
+                                // nested one's to the enclosing subprocess.
+                                if let Some(name) = attr(attrs, "name") {
+                                    let value = attr(attrs, "value").unwrap_or("").to_string();
+                                    if let Some(boundary) = cur_boundary.as_mut() {
+                                        // Only the boundary's own direct
+                                        // extensionElements; nested owners
+                                        // (dataOutput, …) are ignored.
+                                        if ext_boundary_direct {
+                                            boundary.properties.insert(name.to_string(), value);
+                                        }
+                                    } else if let Some(idx) = ext_owner {
+                                        // Bound to the exact flow node owning
+                                        // this extensionElements; a non-flow
+                                        // owner (sequenceFlow, dataObject, …)
+                                        // has `None` and is ignored.
+                                        acc.nodes[idx].properties.insert(name.to_string(), value);
+                                    }
                                 }
                             }
                             // zeebe:header key="…" value="…" inside a
@@ -1624,6 +1799,7 @@ pub(crate) fn parse_with_captures(
                     in_io_mapping = false;
                     in_execution_listeners = false;
                     in_task_listeners = false;
+                    in_properties = false;
                     extension_depth = 0;
                 }
                 "serviceTask" => {
@@ -1697,8 +1873,11 @@ pub(crate) fn parse_with_captures(
                 "ioMapping" => in_io_mapping = false,
                 "extensionElements" => {
                     extension_depth = extension_depth.saturating_sub(1);
+                    ext_owner = None;
+                    ext_boundary_direct = false;
                 }
                 "taskHeaders" => in_task_headers = false,
+                "properties" => in_properties = false,
                 "linkedResources" => in_linked_resources = false,
                 "executionListeners" => in_execution_listeners = false,
                 "taskListeners" => in_task_listeners = false,
@@ -1768,6 +1947,11 @@ pub(crate) fn parse_with_captures(
                                 acc.nodes[idx].event_condition = Some(trimmed.to_string());
                             } else if let Some(boundary) = cur_boundary.as_mut() {
                                 boundary.condition = Some(trimmed.to_string());
+                            } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                                // A `<condition>` on a START event is an event
+                                // sub-process's conditional trigger (#1555), or
+                                // a root-level conditional start (#932).
+                                acc.nodes[idx].esp_condition = Some(trimmed.to_string());
                             }
                         }
                     }
@@ -1850,9 +2034,15 @@ pub(crate) fn parse_with_captures(
                                 // A timer boundary event's duration.
                                 boundary.timer_duration_millis = millis;
                             } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
-                                // A one-shot timer start event's duration.
+                                // A one-shot timer start event's duration. The
+                                // literal text + kind are retained alongside the
+                                // millis so an event sub-process timer trigger can
+                                // carry the verbatim literal in its `TimerDef`.
                                 acc.nodes[idx].duration_millis = millis;
                                 acc.nodes[idx].timer_repeating = Some(false);
+                                acc.nodes[idx].timer_literal = Some(trimmed.to_string());
+                                acc.nodes[idx].timer_def_kind =
+                                    Some(crate::model::TimerDefKind::Duration);
                             }
                         }
                     }
@@ -1874,10 +2064,25 @@ pub(crate) fn parse_with_captures(
                             // A recurring timer start event's cycle.
                             acc.nodes[idx].duration_millis = parse_iso8601_cycle(trimmed);
                             acc.nodes[idx].timer_repeating = Some(true);
+                            acc.nodes[idx].timer_literal = Some(trimmed.to_string());
+                            acc.nodes[idx].timer_def_kind = Some(crate::model::TimerDefKind::Cycle);
+                            // Retain the literal as the element's timer
+                            // definition so its `Rn` repetition count bounds
+                            // the cycle at runtime (#1596).
+                            acc.nodes[idx].timer_expr = Some(crate::model::TimerDef {
+                                kind: crate::model::TimerDefKind::Cycle,
+                                expr: trimmed.to_string(),
+                            });
                         } else if let Some(boundary) = cur_boundary.as_mut() {
-                            // A recurring (cycle) timer boundary event.
+                            // A recurring (cycle) timer boundary event. The
+                            // literal is retained as its timer definition so
+                            // its `Rn` repetition count bounds the cycle (#1596).
                             boundary.timer_duration_millis = parse_iso8601_cycle(trimmed);
                             boundary.timer_repeating = true;
+                            boundary.timer_expr = Some(crate::model::TimerDef {
+                                kind: crate::model::TimerDefKind::Cycle,
+                                expr: trimmed.to_string(),
+                            });
                         }
                     }
                 }
@@ -1897,6 +2102,9 @@ pub(crate) fn parse_with_captures(
                             } else if let Some(boundary) = cur_boundary.as_mut() {
                                 boundary.timer_expr = Some(def);
                             } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                                acc.nodes[idx].timer_literal = Some(trimmed.to_string());
+                                acc.nodes[idx].timer_def_kind =
+                                    Some(crate::model::TimerDefKind::Date);
                                 acc.nodes[idx].timer_expr = Some(def);
                                 acc.nodes[idx].timer_repeating = Some(false);
                             }

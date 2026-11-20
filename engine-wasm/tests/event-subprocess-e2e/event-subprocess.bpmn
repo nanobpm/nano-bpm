@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs_esp_e2e" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="esp_e2e" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f_start_work</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="work" name="Work">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f_start_work</bpmn:incoming>
+      <bpmn:outgoing>f_work_end</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="main_end">
+      <bpmn:incoming>f_work_end</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_start_work" sourceRef="start" targetRef="work" />
+    <bpmn:sequenceFlow id="f_work_end" sourceRef="work" targetRef="main_end" />
+    <bpmn:subProcess id="esp_reminder" name="Reminder" triggeredByEvent="true">
+      <bpmn:startEvent id="esp_reminder_start" isInterrupting="false">
+        <bpmn:outgoing>f_rem_notify</bpmn:outgoing>
+        <bpmn:timerEventDefinition id="ted_reminder">
+          <bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT1M</bpmn:timeDuration>
+        </bpmn:timerEventDefinition>
+      </bpmn:startEvent>
+      <bpmn:serviceTask id="notify" name="Notify">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="notify" />
+        </bpmn:extensionElements>
+        <bpmn:incoming>f_rem_notify</bpmn:incoming>
+        <bpmn:outgoing>f_notify_end</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="esp_reminder_end">
+        <bpmn:incoming>f_notify_end</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="f_rem_notify" sourceRef="esp_reminder_start" targetRef="notify" />
+      <bpmn:sequenceFlow id="f_notify_end" sourceRef="notify" targetRef="esp_reminder_end" />
+    </bpmn:subProcess>
+    <bpmn:subProcess id="esp_cancel" name="Cancel" triggeredByEvent="true">
+      <bpmn:startEvent id="esp_cancel_start" isInterrupting="true">
+        <bpmn:outgoing>f_cancel_end</bpmn:outgoing>
+        <bpmn:messageEventDefinition id="med_cancel" messageRef="msg_cancel" />
+      </bpmn:startEvent>
+      <bpmn:endEvent id="esp_cancel_end">
+        <bpmn:incoming>f_cancel_end</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="f_cancel_end" sourceRef="esp_cancel_start" targetRef="esp_cancel_end" />
+    </bpmn:subProcess>
+  </bpmn:process>
+  <bpmn:message id="msg_cancel" name="cancel">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=orderId" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+  <bpmndi:BPMNDiagram id="diagram_esp_e2e">
+    <bpmndi:BPMNPlane id="plane_esp_e2e" bpmnElement="esp_e2e">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="152" y="102" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="work_di" bpmnElement="work"><dc:Bounds x="240" y="80" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="main_end_di" bpmnElement="main_end"><dc:Bounds x="392" y="102" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f_start_work_di" bpmnElement="f_start_work"><di:waypoint x="188" y="120" /><di:waypoint x="240" y="120" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_work_end_di" bpmnElement="f_work_end"><di:waypoint x="340" y="120" /><di:waypoint x="392" y="120" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="esp_reminder_di" bpmnElement="esp_reminder" isExpanded="true"><dc:Bounds x="150" y="200" width="320" height="140" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="esp_reminder_start_di" bpmnElement="esp_reminder_start"><dc:Bounds x="182" y="252" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="notify_di" bpmnElement="notify"><dc:Bounds x="260" y="230" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="esp_reminder_end_di" bpmnElement="esp_reminder_end"><dc:Bounds x="402" y="252" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f_rem_notify_di" bpmnElement="f_rem_notify"><di:waypoint x="218" y="270" /><di:waypoint x="260" y="270" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_notify_end_di" bpmnElement="f_notify_end"><di:waypoint x="360" y="270" /><di:waypoint x="402" y="270" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="esp_cancel_di" bpmnElement="esp_cancel" isExpanded="true"><dc:Bounds x="150" y="370" width="320" height="120" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="esp_cancel_start_di" bpmnElement="esp_cancel_start"><dc:Bounds x="182" y="412" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="esp_cancel_end_di" bpmnElement="esp_cancel_end"><dc:Bounds x="402" y="412" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f_cancel_end_di" bpmnElement="f_cancel_end"><di:waypoint x="218" y="430" /><di:waypoint x="402" y="430" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

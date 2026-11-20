@@ -231,7 +231,7 @@ run_spec() { # spec_file [model...]
     outcome="$(expected_outcome "$m")"
     if [[ "$outcome" == violates:* ]]; then
       for p in $(tr ',' ' ' <<<"${outcome#violates:}"); do
-        [[ " ${SPEC_INVARIANTS[*]} ${SPEC_PROPERTIES[*]} " == *" $p "* ]] ||
+        [[ " ${SPEC_INVARIANTS[*]-} ${SPEC_PROPERTIES[*]-} " == *" $p "* ]] ||
           { echo "error: ${SPEC_NAME}: EXPECTED $m names $p, which is not a checked invariant or property" >&2; st=1; }
       done
     elif [[ "$outcome" != pass ]]; then
@@ -261,7 +261,7 @@ run_spec() { # spec_file [model...]
     write_cfg "$cfg"
     if [[ "$want" == violates:* ]]; then continue_flag=(-continue -deadlock); fi
     set +e
-    ( cd "$modeldir" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup \
+    ( cd "$modeldir" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup -coverage 60 \
         ${continue_flag[@]+"${continue_flag[@]}"} \
         -metadir "$metadir/$m" -config "$cfg" "$m.tla" ) >"$log" 2>&1
     code=$?

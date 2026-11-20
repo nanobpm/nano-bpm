@@ -15,6 +15,9 @@ members = ["crates/*"]
 
 [dependencies]
 nanobpm-gateway-rest = { path = "../generated" }
+# Run the generated models' validation rules on MCP tool arguments, which
+# bypass the generated REST router (the only other place they run).
+validator = "0.20"
 # Generated console API layer (models + axum router + per-tag Api traits) from
 # spec-console/console-api.yaml. Only needed with the `console` feature.
 nanobpm-console-api = { path = "../generated-console", optional = true }
@@ -84,6 +87,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 # flat observability config at startup — no hot-path involvement.
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "io-util"] }
+# Random correlation keys for MCP process-tool calls (Camunda parity, #1499).
+uuid = { version = "1", features = ["v4"] }
 # WebSocket *client* for the intra-cluster peer uplink: a node speaks the same
 # Falcon protocol it serves (axum's `ws` feature is server-only). Pinned
 # to the same tungstenite the server already pulls in via axum. No TLS — the
@@ -124,6 +129,7 @@ tower = { version = "0.5", features = ["util"] }
 # `Journal::cold_spill_configured`) would vanish. `test-hooks` recompiles them
 # in for test builds only; production builds never see the feature.
 nano-server-storage = { path = "crates/nano-server-storage", features = ["test-hooks"] }
+nano-server-raft = { path = "crates/nano-server-raft", features = ["test-hooks"] }
 
 # The self-contained single-node distribution: bundle the web console (cluster
 # console, BPMN modeler, process-instance explorer, embedded workers) into the
@@ -142,6 +148,27 @@ console-observe = ["console", "nano-server-console/console-observe"]
 # pin the structure behind a live-heap growth via `/debug/heap/prof` + jeprof.
 # The allocator lives in the storage crate, so this forwards there.
 heapprof = ["nano-server-storage/heapprof"]
+
+# Dev/test builds: line tables only for our crates, no debuginfo for
+# dependencies. Panic backtraces keep file:line for our frames (dependency
+# frames keep their function names); what's lost is variable inspection in a
+# debugger. Cuts a cold `cargo test --workspace --no-run` from 158s to 103s,
+# compile CPU by ~29% and server/target from 8.3 GB to 6.3 GB per worktree,
+# which adds up when many agent worktrees build at once. For a debugger
+# session, set both to `debug = "full"` locally (don't commit it).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# First-party crates outside this workspace match `"*"` too; keep their line
+# tables so engine/read-model frames still carry file:line.
+[profile.dev.package.nanobpmn-engine-core]
+debug = "line-tables-only"
+
+[profile.dev.package.nanobpmn-read-model]
+debug = "line-tables-only"
 
 # Optimized for a small production binary. `strip` removes ~8 MB of symbols;
 # fat LTO + a single codegen unit let the linker drop dead code across crate

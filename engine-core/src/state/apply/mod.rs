@@ -37,12 +37,16 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::FormDeployed { .. }
         | Event::GenericResourceDeployed { .. }
         | Event::DecisionEvaluated { .. }
-        | Event::DecisionInstanceDeleted { .. } => resource::apply_resource(state, event),
+        | Event::DecisionInstanceDeleted { .. }
+        | Event::ClusterVariableCreated { .. }
+        | Event::ClusterVariableUpdated { .. }
+        | Event::ClusterVariableDeleted { .. } => resource::apply_resource(state, event),
         Event::ProcessInstanceCreated { .. }
         | Event::VariablesUpdated { .. }
         | Event::ScopedVariablesUpdated { .. }
         | Event::VariableScopeCreated { .. }
         | Event::VariableScopeDestroyed { .. }
+        | Event::EventSubProcessPayloadHeld { .. }
         | Event::AgentInstanceCreated { .. }
         | Event::AgentInstanceUpdated { .. }
         | Event::AgentInstanceCompleted { .. }
@@ -50,6 +54,8 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::AgentHistoryCommitted { .. }
         | Event::AgentHistoryDiscarded { .. }
         | Event::AgentHistoryDeduplicated { .. }
+        | Event::VariablesLostQuarantined { .. }
+        | Event::OrphanStampSuperseded { .. }
         | Event::ProcessInstanceCompleted { .. }
         | Event::ProcessInstanceTerminating { .. }
         | Event::ProcessInstanceSuspended { .. }
@@ -136,6 +142,12 @@ pub fn apply(state: &mut State, event: &Event) {
         // `Engine::replay_partition` / `apply_replayed_events`); it mutates no
         // state.
         Event::RaftEntryApplied { .. } => {}
+        // Replicated lenient-completion mode (#1661): engine state, so every
+        // replica (and every replay of the journal) holds the same value.
+        // One-way: a (never emitted) `false` record cannot clear it.
+        Event::LenientCompletionSet { lenient } => {
+            state.lenient_completion |= *lenient;
+        }
     }
 }
 
@@ -193,15 +205,15 @@ mod incident_kind_serde_compat_tests {
 /// lost/garbled projection. These guard that replay-safety property directly.
 #[cfg(all(test, feature = "serde"))]
 mod adhoc_redrive_serde_tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use crate::event::Event;
     use crate::{IncidentKind, IoMappingRedrive, Value};
 
-    fn projection() -> HashMap<String, Value> {
+    fn projection() -> BTreeMap<String, Value> {
         // A mix of scalar + nested-container values so a structural
         // serialization/recovery regression (not just a dropped key) is caught.
-        HashMap::from([
+        BTreeMap::from([
             ("x".to_string(), Value::Int(1)),
             (
                 "chained".to_string(),

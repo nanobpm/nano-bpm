@@ -29,7 +29,7 @@ fn modify_terminates_one_element_and_activates_another() {
             inst,
             vec![ActivateElementInstruction {
                 element_id: "b".into(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 ..Default::default()
             }],
             vec![a_eik],
@@ -123,7 +123,7 @@ fn modify_activating_an_element_merges_global_variables() {
         .unwrap();
     let a_eik = active_eik_of(&engine, inst, "a");
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("approved".to_string(), Value::Bool(true));
     let events = engine
         .apply_command(Command::modify_instance(
@@ -175,7 +175,7 @@ fn modify_rejects_unknown_instance_and_element_ids() {
             inst,
             vec![ActivateElementInstruction {
                 element_id: "nope".into(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 ..Default::default()
             }],
             vec![],
@@ -223,7 +223,7 @@ fn modify_survives_replay() {
                 inst,
                 vec![ActivateElementInstruction {
                     element_id: "b".into(),
-                    variables: HashMap::new(),
+                    variables: BTreeMap::new(),
                     ..Default::default()
                 }],
                 vec![a_eik],
@@ -389,11 +389,13 @@ fn migration_remaps_both_parallel_join_maps_together() {
 
     let instance = engine.instance(inst).unwrap();
     assert!(
-        instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join")),
         "the join is half-open on the source id before migration"
     );
     assert_eq!(
-        instance.join_flows_taken("join"),
+        instance.join_flows_taken(&crate::state::JoinKey::root("join")),
         1,
         "one branch has arrived at the join before migration"
     );
@@ -413,16 +415,24 @@ fn migration_remaps_both_parallel_join_maps_together() {
 
     let instance = engine.instance(inst).unwrap();
     assert!(
-        instance.join_flow_arrivals.contains_key("join2")
-            && !instance.join_flow_arrivals.contains_key("join"),
+        instance
+            .join_flow_arrivals
+            .contains_key(&crate::state::JoinKey::root("join2"))
+            && !instance
+                .join_flow_arrivals
+                .contains_key(&crate::state::JoinKey::root("join")),
         "join_flow_arrivals re-keyed onto the target join id"
     );
     assert!(
-        instance.join_instances.contains_key("join2")
-            && !instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join2"))
+            && !instance
+                .join_instances
+                .contains_key(&crate::state::JoinKey::root("join")),
         "join_instances re-keyed onto the target join id (kept in sync with the counts)"
     );
-    let arrivals = &instance.join_flow_arrivals["join2"];
+    let arrivals = &instance.join_flow_arrivals[&crate::state::JoinKey::root("join2")];
     assert_eq!(
         arrivals.count(&IncomingFlow {
             from: "a2".to_string(),
@@ -502,7 +512,9 @@ fn migration_rejects_open_join_with_different_incoming_arity() {
     complete_one(&mut engine, "ja");
     let instance = engine.instance(inst).unwrap();
     assert!(
-        instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join")),
         "precondition: the join is open before migration"
     );
 
@@ -537,7 +549,9 @@ fn migration_rejects_open_join_with_different_incoming_arity() {
     let instance = engine.instance(inst).unwrap();
     assert_eq!(instance.process_id, "source", "instance not migrated");
     assert!(
-        instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join")),
         "the open join is left intact on the source id"
     );
 }
@@ -685,7 +699,9 @@ fn migration_allows_open_inclusive_join_with_different_incoming_arity() {
     complete_one(&mut engine, "ja");
     let instance = engine.instance(inst).unwrap();
     assert!(
-        instance.join_instances.contains_key("join"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join")),
         "precondition: the inclusive join is open before migration"
     );
 
@@ -707,7 +723,9 @@ fn migration_allows_open_inclusive_join_with_different_incoming_arity() {
     let instance = engine.instance(inst).unwrap();
     assert_eq!(instance.process_id, "target", "instance migrated");
     assert!(
-        instance.join_instances.contains_key("join2"),
+        instance
+            .join_instances
+            .contains_key(&crate::state::JoinKey::root("join2")),
         "the open inclusive join is re-pointed at the target id"
     );
 
@@ -765,7 +783,9 @@ fn migration_rejects_inclusive_join_with_unidentified_arrival_and_different_arit
         .unwrap();
     let instance = engine.instance(inst).unwrap();
     assert_eq!(
-        instance.join_counts.get("join"),
+        instance
+            .join_counts
+            .get(&crate::state::JoinKey::root("join")),
         Some(&1),
         "precondition: the join holds one unidentified arrival"
     );
@@ -1056,11 +1076,10 @@ fn unsupported_migration_reason_admits_every_boundary_kind_and_sub_process() {
 }
 
 #[test]
-fn migration_rejects_active_multi_instance_body() {
-    // An active parallel multi-instance body keeps per-element bookkeeping in
-    // `ProcessInstance.multi_instances` that this phase does not remap, so
-    // migration is rejected as "not supported yet" (Zeebe parity), matching the
-    // boundary-event rejection above.
+fn migration_accepts_active_multi_instance_body() {
+    // An active parallel multi-instance body is migratable (#1630, Zeebe
+    // `MigrateParallelMultiInstanceBodyTest`): its `multi_instances`
+    // bookkeeping is re-pointed onto the target element.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(multi_instance_service_process(
@@ -1098,18 +1117,19 @@ fn migration_rejects_active_multi_instance_body() {
             Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
         )]),
     );
-    let err = engine
+    engine
         .apply_command(Command::migrate_instance(
             inst,
             target_key,
             vec![("each".to_string(), "each".to_string())],
         ))
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        EngineError::UnsupportedMigration { element_id, reason, .. }
-            if element_id == "each" && reason.contains("multi-instance")
-    ));
+        .unwrap();
+    let live = engine.instance(inst).unwrap();
+    assert_eq!(live.process_id, "mi-target");
+    assert!(live
+        .multi_instances
+        .values()
+        .all(|mi| mi.element_id == "each"));
 }
 
 #[test]
@@ -1268,46 +1288,6 @@ fn modify_of_suspended_instance_is_rejected_as_not_active() {
         Err(EngineError::InstanceNotFound {
             instance_key: 999_999
         })
-    );
-}
-
-#[test]
-fn migration_rejects_instance_with_compensation_runtime() {
-    // Copilot on #1418: `compensation_waits` (throw id + pending handler ids)
-    // and saved `compensable` entries are keyed by source element ids the
-    // applier does not remap, so a migrated in-flight compensation would never
-    // release its throw. Reject until supported (fail closed).
-    let mut engine = Engine::new();
-    engine
-        .apply_command(Command::DeployProcess(process_with_compensation()))
-        .unwrap();
-    let mut target = process_with_compensation();
-    target.id = "trip-v2".to_string();
-    let target_key = deploy_for_migration(&mut engine, target);
-    let created = engine
-        .apply_command(Command::create_instance("trip"))
-        .unwrap();
-    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
-    let book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
-    engine.apply_command(Command::complete_job(book)).unwrap();
-    let mut mapping: Vec<(String, String)> = engine
-        .instance(inst)
-        .unwrap()
-        .active
-        .values()
-        .map(|e| (e.clone(), e.clone()))
-        .collect();
-    mapping.sort();
-    mapping.dedup();
-    let err = engine
-        .apply_command(Command::migrate_instance(inst, target_key, mapping))
-        .unwrap_err();
-    assert!(
-        matches!(
-            &err,
-            EngineError::UnsupportedMigration { reason, .. } if reason.contains("compensation")
-        ),
-        "got {err:?}"
     );
 }
 

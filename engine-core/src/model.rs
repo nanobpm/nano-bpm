@@ -6,7 +6,7 @@
 //! produce [`ProcessDefinition`]s); here processes are built programmatically via
 //! [`ProcessBuilder`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 /// Serde default for boundary-event `interrupting` flags: older serialized
 /// definitions (before non-interrupting boundaries existed) carried only
@@ -132,7 +132,10 @@ impl Condition {
     /// error on a parse/type failure or a non-boolean result. A condition-routed
     /// gateway (exclusive or inclusive) turns such an error into an
     /// `ExpressionEvaluation` incident.
-    pub fn eval(&self, variables: &HashMap<String, Value>) -> Result<bool, crate::feel::FeelError> {
+    pub fn eval(
+        &self,
+        variables: &BTreeMap<String, Value>,
+    ) -> Result<bool, crate::feel::FeelError> {
         crate::feel::eval_bool(&self.expression, variables)
     }
 }
@@ -219,20 +222,24 @@ impl IoMapping {
     }
 }
 
-/// How a [`LinkedResource`]'s `resource_id` is resolved to a concrete deployed
-/// resource version at job activation (Zeebe `bindingType`).
+/// How a [`LinkedResource`]'s `resource_id` — or a user task's
+/// `zeebe:formDefinition formId` — is resolved to a concrete deployed resource
+/// version at activation / user-task creation (Zeebe `bindingType`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BindingType {
-    /// Bind to the version deployed alongside the process definition. Nano does
-    /// not yet track per-resource deployment membership, so this currently
-    /// resolves to the latest version (documented simplification).
+    /// Bind to the version deployed alongside the process definition (the same
+    /// `deployment_key`). A form with no version in that deployment raises a
+    /// resolvable incident at user-task creation (Zeebe parity); a linked
+    /// resource with none is omitted from the resolved header.
     Deployment,
     /// Bind to the latest deployed version of the resource id (the default).
     #[default]
     Latest,
-    /// Bind to the version carrying a matching `version_tag`, falling back to
-    /// the latest when no resource carries the tag.
+    /// Bind to the version carrying a matching `version_tag`. A form with no
+    /// matching tag raises a resolvable incident at user-task creation (Zeebe
+    /// parity); a linked resource with no matching tag falls back to the
+    /// latest version.
     VersionTag,
 }
 
@@ -463,18 +470,27 @@ pub struct UserTaskProps {
     /// `50` when absent or unresolvable.
     pub priority: Option<String>,
     /// The embedded/deployment form id declared via `<zeebe:formDefinition
-    /// formId="…"/>`. Resolved against the currently-deployed forms (latest
-    /// version) to a numeric `form_key` when the user task is created, so the v2
-    /// user-task search can surface a `formKey` and downstream `GetFormByKey`
-    /// can serve the schema. `None` when the task declares no `formId` (or an
-    /// external form instead).
-    ///
-    /// Only Camunda's default `latest` binding is implemented. A
-    /// `<zeebe:formDefinition bindingType="deployment"|"versionTag">` is
-    /// rejected at deploy time (`ParseError::UnsupportedUserTaskFormBinding`)
-    /// rather than silently degraded to `latest` (#1190).
+    /// formId="…"/>`. Resolved against the deployed forms to a numeric
+    /// `form_key` when the user task is created — per [`Self::form_binding_type`]
+    /// (Zeebe `BpmnUserTaskBehavior.findLinkedForm`) — so the v2 user-task
+    /// search can surface a `formKey` and downstream `GetFormByKey` can serve
+    /// the schema. `None` when the task declares no `formId` (or an external
+    /// form instead).
     #[cfg_attr(feature = "serde", serde(default))]
     pub form_id: Option<String>,
+    /// How [`Self::form_id`] is resolved to a concrete deployed form version at
+    /// user-task creation (Zeebe `bindingType`; the default `latest` binds the
+    /// latest deployed version, `deployment` the version deployed alongside the
+    /// process definition, `versionTag` the version carrying
+    /// [`Self::form_version_tag`]). A `deployment`/`versionTag` miss raises a
+    /// resolvable incident and creates no task (#1193). Moot for an external
+    /// form reference, which resolves no deployed version.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub form_binding_type: BindingType,
+    /// The version tag matched when [`Self::form_binding_type`] is
+    /// [`BindingType::VersionTag`] (Zeebe `versionTag`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub form_version_tag: Option<String>,
     /// The external form reference declared via `<zeebe:formDefinition
     /// externalReference="…"/>`. Surfaced verbatim as the task's
     /// `externalFormReference`; the engine does not resolve it to a key. `None`
@@ -491,6 +507,83 @@ pub struct UserTaskProps {
 #[cfg(feature = "serde")]
 fn default_propagate() -> bool {
     true
+}
+
+/// The start-event trigger of an event sub-process
+/// ([`ElementKind::EventSubProcess`]) — which event, raised inside (or observed
+/// by) the enclosing scope, activates the sub-process.
+///
+/// This mirrors the six event definitions Zeebe permits on an event
+/// sub-process's start event. Every field carries the *resolved* reference
+/// (a message/signal/error/escalation name or code, not a BPMN `…Ref` id),
+/// exactly like the corresponding boundary/catch element kinds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum EventSubProcessTrigger {
+    /// A `messageEventDefinition`: the sub-process starts when a message named
+    /// `message_name` correlates to the enclosing scope. `correlation_key` is
+    /// the correlation-key expression declared via `zeebe:subscription
+    /// correlationKey`, canonically stored WITHOUT its leading FEEL `=` marker
+    /// (see [`crate::bpmn::parse_correlation_key`]), resolved against the scope's variables when the subscription is opened —
+    /// same shape as [`ElementKind::MessageIntermediateCatchEvent`].
+    Message {
+        /// The BPMN message name this trigger subscribes to.
+        message_name: String,
+        /// The raw correlation-key expression (the variable/expression whose
+        /// value identifies the scope to correlate to).
+        correlation_key: String,
+    },
+    /// A `timerEventDefinition`: the sub-process starts when the timer becomes
+    /// due after the enclosing scope activates. The definition is always
+    /// carried as a [`TimerDef`] — a static ISO-8601 literal keeps its literal
+    /// text (unlike a process-level timer start, an event sub-process timer is
+    /// armed per *scope activation*, so it is never pre-resolved to millis at
+    /// deploy time); a `=`-prefixed FEEL expression is evaluated at arming.
+    /// `TimerDefKind::Cycle` re-arms after each fire while the scope lives.
+    Timer(TimerDef),
+    /// A `signalEventDefinition`: the sub-process starts when a signal named
+    /// `signal_name` is broadcast while the enclosing scope is active. Signals
+    /// correlate by name only (no correlation key).
+    Signal {
+        /// The BPMN signal name this trigger subscribes to.
+        signal_name: String,
+    },
+    /// An `errorEventDefinition`: the sub-process starts when an error whose
+    /// code matches `error_code` is thrown inside the enclosing scope (an error
+    /// end event, or a job error). `None` (no `errorRef`) is a **catch-all**
+    /// that matches any error not claimed by a more specific code at the same
+    /// scope. Always interrupting — Zeebe rejects a non-interrupting error
+    /// event sub-process at deploy.
+    Error {
+        /// The BPMN error code this trigger catches; `None` is a catch-all.
+        error_code: Option<String>,
+    },
+    /// An `escalationEventDefinition`: the sub-process starts when an
+    /// escalation whose code matches `escalation_code` is raised inside the
+    /// enclosing scope. `None` (no `escalationRef`) is a **catch-all**, same
+    /// convention as [`ElementKind::EscalationBoundaryEvent`]'s empty code.
+    Escalation {
+        /// The BPMN escalation code this trigger catches; `None` is a
+        /// catch-all.
+        escalation_code: Option<String>,
+    },
+    /// A `conditionalEventDefinition`: the sub-process starts when the FEEL
+    /// boolean `condition` becomes `true` in the enclosing scope — evaluated
+    /// when the scope activates and again whenever a referenced variable
+    /// changes while the scope is active.
+    Conditional {
+        /// The FEEL boolean condition (as authored, typically `=`-prefixed).
+        condition: String,
+    },
+}
+
+impl EventSubProcessTrigger {
+    /// Whether arming this trigger opens a subscription (timer, message,
+    /// signal, conditional). Error and escalation triggers are not
+    /// subscriptions: throw-resolution catches them.
+    pub fn is_subscription(&self) -> bool {
+        !matches!(self, Self::Error { .. } | Self::Escalation { .. })
+    }
 }
 
 /// The kind of a BPMN flow node.
@@ -517,6 +610,26 @@ pub enum ElementKind {
     /// an embedded sub-process terminates only that sub-process scope and lets
     /// the parent instance continue on the sub-process's outgoing flow.
     TerminateEndEvent,
+    /// An error end event (`<endEvent>` with an `<errorEventDefinition>`, #1592).
+    ///
+    /// On completion it **throws** the BPMN error `error_code` (resolved from the
+    /// `errorRef`'s `<error … errorCode="…">`; empty when the definition carries
+    /// no `errorRef`) exactly like a worker `ThrowJobError`: the catch is resolved
+    /// by [`Engine::find_error_catch`] — walking outward from the throwing element
+    /// instance through its enclosing scopes, an exact code beats a catch-all, and
+    /// an error event sub-process beats an error boundary of equal match (Zeebe
+    /// `CatchEventAnalyzer`). A catch **interrupts** the caught activity (the
+    /// throwing token is consumed by the throw) and routes the error-handling
+    /// path: the boundary's outgoing flow, or the error event sub-process. An
+    /// **uncaught** error raises an `UNHANDLED_ERROR` incident on the end event's
+    /// element instance (the token parks there, its completion withheld, re-driven
+    /// on resolution), matching the unhandled job-error lifecycle.
+    ErrorEndEvent {
+        /// The BPMN error code this event throws (resolved from the `errorRef`'s
+        /// `<error … errorCode="…">`). Empty when the definition carries no
+        /// `errorRef` (an unnamed throw, matched by catch-alls only).
+        error_code: String,
+    },
     /// A service task. On activation it creates a job of `job_type` and the token
     /// rests until the job is completed. `priority` is the *raw* (un-evaluated)
     /// job-priority expression declared via `zeebe:priorityDefinition` (a literal
@@ -703,6 +816,18 @@ pub enum ElementKind {
         /// Whether the timer re-arms after firing (a cycle) or fires once.
         repeating: bool,
     },
+    /// A root-level conditional start event (`<startEvent>` with a
+    /// `conditionalEventDefinition`, #932). It has no incoming sequence flow and
+    /// opens no subscription: a [`crate::Command::EvaluateConditionalStartEvents`]
+    /// (the `POST /v2/conditionals/evaluation` endpoint) evaluates its FEEL
+    /// `condition` against the supplied variables and, when it is `true`,
+    /// **creates a new instance** (seeded with those variables) that runs along
+    /// this event's outgoing flow. Behaves as a pass-through once an instance
+    /// starts.
+    ConditionalStartEvent {
+        /// The FEEL boolean condition (as authored, typically `=`-prefixed).
+        condition: String,
+    },
     /// An embedded sub-process: a container holding its own flow (its inner
     /// elements carry [`Element::parent`] equal to this element's id). On
     /// activation it opens a token scope and activates its inner start event
@@ -717,6 +842,50 @@ pub enum ElementKind {
         /// Id of the sub-process's inner (none) start event, where its token
         /// scope begins.
         start_event: ElementId,
+    },
+    /// An event sub-process (`<subProcess triggeredByEvent="true">`): a
+    /// container, like [`SubProcess`], holding its own inner flow — but one
+    /// that is **never entered by token flow**. It has no incoming sequence
+    /// flow; instead, while its *enclosing* scope (the process instance, or an
+    /// embedded sub-process) is active, its start event's [`trigger`] is armed,
+    /// and the event's occurrence activates the sub-process.
+    ///
+    /// Zeebe runtime semantics (implemented in `engine/event_subprocess.rs`
+    /// and the throw/catch walk in `engine/boundary.rs`):
+    ///
+    /// - **Arming**: when the enclosing scope activates (the process instance
+    ///   starts, or the containing embedded sub-process is entered), the start
+    ///   event's subscription is opened (message/signal/conditional) or its
+    ///   timer armed. It is disarmed when the scope completes or terminates.
+    /// - **Interrupting** (`interrupting == true`, the BPMN default): on
+    ///   trigger, every other active child of the scope is terminated, the
+    ///   scope's other event sub-process subscriptions are disarmed, and the
+    ///   event sub-process activates; the scope completes when it completes.
+    /// - **Non-interrupting** (`interrupting == false`): the event sub-process
+    ///   activates concurrently, repeatedly (a cycle timer re-arms; a
+    ///   message/signal subscription stays open), and the scope waits for the
+    ///   spawned instances before completing.
+    /// - An **error** trigger is always interrupting (Zeebe rejects a
+    ///   non-interrupting error event sub-process at deploy).
+    ///
+    /// The inner flow is wired exactly like an embedded sub-process's: inner
+    /// elements carry [`Element::parent`] equal to this element's id and the
+    /// inner start event is `start_event`. Use
+    /// [`ProcessDefinition::event_subprocesses_in_scope`] to enumerate the
+    /// event sub-processes directly contained in a given scope.
+    ///
+    /// [`trigger`]: ElementKind::EventSubProcess::trigger
+    EventSubProcess {
+        /// Id of the sub-process's inner (typed) start event, where its token
+        /// scope begins when the trigger fires.
+        start_event: ElementId,
+        /// The start event's trigger — which event activates this sub-process.
+        trigger: EventSubProcessTrigger,
+        /// Whether firing interrupts the enclosing scope's other work (`true`,
+        /// the BPMN default) or spawns a concurrent instance and leaves it
+        /// running (`false`). Always `true` for an
+        /// [`EventSubProcessTrigger::Error`] trigger.
+        interrupting: bool,
     },
     /// An escalation throw event: an `intermediateThrowEvent` or an `endEvent`
     /// carrying an `escalationEventDefinition`. On activation (completion) it
@@ -974,7 +1143,20 @@ pub enum ElementKind {
 }
 
 impl ElementKind {
-    /// Whether this is a start-event kind (none, message or timer start). A
+    /// Whether an instance of this kind owns an inner **token scope** that its
+    /// own start event activates in — an embedded sub-process or an event
+    /// sub-process (#1555). The single source of truth for "tearing this down
+    /// must tear down its inner scope" and "it completes when its scope
+    /// drains": activation, interruption, modification and the drain sweep all
+    /// classify through it, so a new scope-owning kind cannot be half-wired.
+    pub fn owns_token_scope(&self) -> bool {
+        matches!(
+            self,
+            ElementKind::SubProcess { .. } | ElementKind::EventSubProcess { .. }
+        )
+    }
+
+    /// Whether this is a start-event kind (none, message, timer or conditional start). A
     /// process has exactly one process-entry start ([`ProcessDefinition::start_event`],
     /// where a CreateInstance begins) but may declare several process-level starts
     /// — a none start alongside any number of message/timer starts, each wired to
@@ -985,6 +1167,7 @@ impl ElementKind {
             ElementKind::StartEvent
                 | ElementKind::MessageStartEvent { .. }
                 | ElementKind::TimerStartEvent { .. }
+                | ElementKind::ConditionalStartEvent { .. }
         )
     }
 
@@ -1003,6 +1186,7 @@ impl ElementKind {
             ElementKind::StartEvent
             | ElementKind::EndEvent
             | ElementKind::TerminateEndEvent
+            | ElementKind::ErrorEndEvent { .. }
             | ElementKind::ServiceTask { .. }
             | ElementKind::BusinessRuleTask { .. }
             | ElementKind::UserTask(_)
@@ -1014,7 +1198,9 @@ impl ElementKind {
             | ElementKind::MessageIntermediateCatchEvent { .. }
             | ElementKind::MessageStartEvent { .. }
             | ElementKind::TimerStartEvent { .. }
+            | ElementKind::ConditionalStartEvent { .. }
             | ElementKind::SubProcess { .. }
+            | ElementKind::EventSubProcess { .. }
             | ElementKind::IntermediateThrowEvent
             | ElementKind::EscalationThrowEvent { .. }
             | ElementKind::CompensationThrowEvent
@@ -1043,12 +1229,15 @@ impl ElementKind {
             | ElementKind::Task
             | ElementKind::AgentTask { .. }
             | ElementKind::SubProcess { .. }
+            | ElementKind::EventSubProcess { .. }
             | ElementKind::CallActivity { .. } => true,
             ElementKind::StartEvent
             | ElementKind::EndEvent
             | ElementKind::TerminateEndEvent
+            | ElementKind::ErrorEndEvent { .. }
             | ElementKind::MessageStartEvent { .. }
             | ElementKind::TimerStartEvent { .. }
+            | ElementKind::ConditionalStartEvent { .. }
             | ElementKind::IntermediateThrowEvent
             | ElementKind::LinkIntermediateThrowEvent { .. }
             | ElementKind::LinkIntermediateCatchEvent { .. }
@@ -1082,9 +1271,11 @@ impl ElementKind {
         match self {
             ElementKind::StartEvent
             | ElementKind::MessageStartEvent { .. }
-            | ElementKind::TimerStartEvent { .. } => "START_EVENT",
+            | ElementKind::TimerStartEvent { .. }
+            | ElementKind::ConditionalStartEvent { .. } => "START_EVENT",
             ElementKind::EndEvent => "END_EVENT",
             ElementKind::TerminateEndEvent => "END_EVENT",
+            ElementKind::ErrorEndEvent { .. } => "END_EVENT",
             ElementKind::IntermediateThrowEvent => "INTERMEDIATE_THROW_EVENT",
             ElementKind::LinkIntermediateThrowEvent { .. } => "INTERMEDIATE_THROW_EVENT",
             ElementKind::CompensationThrowEvent => "INTERMEDIATE_THROW_EVENT",
@@ -1112,6 +1303,7 @@ impl ElementKind {
             ElementKind::InclusiveGateway => "INCLUSIVE_GATEWAY",
             ElementKind::EventBasedGateway => "EVENT_BASED_GATEWAY",
             ElementKind::SubProcess { .. } => "SUB_PROCESS",
+            ElementKind::EventSubProcess { .. } => "SUB_PROCESS",
             ElementKind::CallActivity { .. } => "CALL_ACTIVITY",
         }
     }
@@ -1183,6 +1375,19 @@ pub struct Element {
     /// on the unchanged hot path (ADR 0037 §6).
     #[cfg_attr(feature = "serde", serde(default))]
     pub task_listeners: Vec<TaskListener>,
+    /// The element's `zeebe:properties` extension properties
+    /// (`<zeebe:property name="…" value="…"/>`), keyed by property name. This is
+    /// the generic vendor-metadata channel Camunda uses to mark a process as an
+    /// MCP tool (`io.camunda.tool:name` / `:purpose` / `:input_N_*` on a message
+    /// start event, #1499) or an inbound connector (`inbound.type`), among
+    /// others. Non-executable metadata: the engine never dispatches on it, but
+    /// it travels with the deployed definition so read models and APIs can
+    /// project it (e.g. a message start subscription's `toolName` /
+    /// `toolProperties`). A `BTreeMap` so the serialized order is deterministic.
+    /// Empty (the default) for elements that declare no properties and for
+    /// definitions serialized before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub properties: BTreeMap<String, String>,
 }
 
 impl Element {
@@ -1312,6 +1517,12 @@ pub struct AdHocTool {
     /// mappings apply on activation, output mappings on completion.
     #[cfg_attr(feature = "serde", serde(default))]
     pub io: IoMapping,
+    /// The tool's own `zeebe:properties` (empty if none). Retained on the
+    /// catalog for the same reason as `io`: the pruned tool element is gone
+    /// from the executable graph, so a re-emitter (processos edit/layout)
+    /// restores them from here instead of silently dropping them.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub properties: std::collections::BTreeMap<String, String>,
 }
 
 /// The retained metadata + tool catalog of one `adHocSubProcess`.
@@ -1411,7 +1622,7 @@ pub struct AdHocActivateElement {
     pub element_id: ElementId,
     /// Local variables to seed into the activated element's scope.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
 }
 
 /// Corrections a task listener may return to user-task data when it completes
@@ -1518,7 +1729,7 @@ pub struct ProcessDefinition {
     /// when deserializing journals/snapshots written before this field existed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub name: Option<String>,
-    pub elements: HashMap<ElementId, Element>,
+    pub elements: BTreeMap<ElementId, Element>,
     pub start_event: ElementId,
     /// The original BPMN XML this definition was parsed from, retained verbatim
     /// so it can be served back (e.g. Camunda's `getProcessDefinitionXML`, the
@@ -1544,7 +1755,81 @@ pub struct ProcessDefinition {
     pub start_form_id: Option<String>,
 }
 
+/// The zeebe:property key carrying a process's MCP tool name (Camunda 8.10 MCP
+/// gateway, `gateways/gateway-mcp`, #1499). Camunda's
+/// `ExtensionPropertyConfiguration` lets an operator *reconfigure* which
+/// property key holds the tool name; Nano hard-codes the default key (the
+/// reconfiguration surface is not modelled).
+pub const TOOL_NAME_PROPERTY: &str = "io.camunda.tool:name";
+
+/// The property-key prefix marking a zeebe:property as MCP tool metadata
+/// (`io.camunda.tool:name`, `:purpose`, `:input_N_{name,type,description,
+/// required}`, `:when_to_use`, `:when_not_to_use`, `:results`).
+pub const TOOL_PROPERTY_PREFIX: &str = "io.camunda.tool:";
+
+/// The tool name declared in `properties` (the [`TOOL_NAME_PROPERTY`] value),
+/// or `None` when the property is absent.
+pub fn tool_name_of(properties: &BTreeMap<String, String>) -> Option<String> {
+    properties.get(TOOL_NAME_PROPERTY).cloned()
+}
+
+/// The subset of `properties` whose keys carry the [`TOOL_PROPERTY_PREFIX`]
+/// prefix — the full MCP tool marker set (name, purpose, inputs, usage hints).
+pub fn tool_properties_of(properties: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    properties
+        .iter()
+        .filter(|(k, _)| k.starts_with(TOOL_PROPERTY_PREFIX))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 impl ProcessDefinition {
+    /// Validates every [`ElementKind::EventSubProcess`] structurally (no
+    /// sequence flow in or out, `start_event` is a start event directly
+    /// contained in it, error trigger interrupting). [`ProcessBuilder::build`]
+    /// runs this; callers that assemble a `ProcessDefinition` directly (e.g.
+    /// an IR parser) must run it too, so every path shares one check.
+    pub fn validate_event_subprocesses(&self) -> Result<(), BuildError> {
+        validate_event_subprocesses(&self.elements)
+    }
+
+    /// Enumerates the event sub-processes ([`ElementKind::EventSubProcess`])
+    /// **directly contained** in `scope`: pass `None` for the process-level
+    /// scope, or `Some(id)` for the embedded sub-process whose id is `id`.
+    ///
+    /// This is the seam the event sub-process *runtime* consumes (#1555): when
+    /// a scope activates, the engine arms the start-event [`trigger`] of every
+    /// event sub-process this iterator yields for that scope (and disarms them
+    /// when the scope completes or terminates). Yields
+    /// `(element id, start event id, trigger, interrupting)` tuples in
+    /// deterministic (element-id) order so key minting and replay stay in
+    /// lock-step. Only *direct* containment is reported — an event sub-process
+    /// nested inside an embedded sub-process belongs to that sub-process's
+    /// scope, not the process's, and is enumerated under
+    /// `Some(containing_sub_process_id)`.
+    ///
+    /// [`trigger`]: ElementKind::EventSubProcess::trigger
+    pub fn event_subprocesses_in_scope(
+        &self,
+        scope: Option<&str>,
+    ) -> impl Iterator<Item = (&ElementId, &ElementId, &EventSubProcessTrigger, bool)> {
+        let mut matched: Vec<(&ElementId, &ElementId, &EventSubProcessTrigger, bool)> = self
+            .elements
+            .values()
+            .filter(|e| e.parent.as_deref() == scope)
+            .filter_map(|e| match &e.kind {
+                ElementKind::EventSubProcess {
+                    start_event,
+                    trigger,
+                    interrupting,
+                } => Some((&e.id, start_event, trigger, *interrupting)),
+                _ => None,
+            })
+            .collect();
+        matched.sort_by(|a, b| a.0.cmp(b.0));
+        matched.into_iter()
+    }
+
     /// Upgrades the historical agent-only model shape without changing event
     /// frames or minting runtime state. Called for legacy deployments and snapshots.
     pub fn normalize_legacy_agent_tasks(&mut self) {
@@ -1622,9 +1907,9 @@ impl ProcessDefinition {
     /// is missing from `library` or a call cycle is detected.
     pub fn inline_call_activities(
         &self,
-        library: &HashMap<String, ProcessDefinition>,
+        library: &BTreeMap<String, ProcessDefinition>,
     ) -> Result<ProcessDefinition, String> {
-        let mut elements = HashMap::new();
+        let mut elements = BTreeMap::new();
         let mut stack = vec![self.id.clone()];
         splice_call_activities(&mut elements, &self.elements, "", None, library, &mut stack)?;
         Ok(ProcessDefinition {
@@ -1648,11 +1933,11 @@ impl ProcessDefinition {
 /// underneath the sub-process that replaced its call activity. `stack` holds the
 /// process ids on the current call path for cycle detection.
 fn splice_call_activities(
-    out: &mut HashMap<ElementId, Element>,
-    src: &HashMap<ElementId, Element>,
+    out: &mut BTreeMap<ElementId, Element>,
+    src: &BTreeMap<ElementId, Element>,
     prefix: &str,
     parent_override: Option<&str>,
-    library: &HashMap<String, ProcessDefinition>,
+    library: &BTreeMap<String, ProcessDefinition>,
     stack: &mut Vec<String>,
 ) -> Result<(), String> {
     let pfx = |id: &str| format!("{prefix}{id}");
@@ -1705,6 +1990,7 @@ fn splice_call_activities(
                     start_listeners: el.start_listeners.clone(),
                     end_listeners: el.end_listeners.clone(),
                     task_listeners: el.task_listeners.clone(),
+                    properties: el.properties.clone(),
                 },
             );
             stack.push(called_process_id.clone());
@@ -1733,6 +2019,7 @@ fn splice_call_activities(
                     start_listeners: el.start_listeners.clone(),
                     end_listeners: el.end_listeners.clone(),
                     task_listeners: el.task_listeners.clone(),
+                    properties: el.properties.clone(),
                 },
             );
         }
@@ -1747,6 +2034,15 @@ fn remap_kind_ids(kind: &ElementKind, pfx: &impl Fn(&str) -> String) -> ElementK
     match kind {
         ElementKind::SubProcess { start_event } => ElementKind::SubProcess {
             start_event: pfx(start_event),
+        },
+        ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            interrupting,
+        } => ElementKind::EventSubProcess {
+            start_event: pfx(start_event),
+            trigger: trigger.clone(),
+            interrupting: *interrupting,
         },
         ElementKind::ErrorBoundaryEvent {
             attached_to,
@@ -1868,6 +2164,11 @@ pub struct ProcessBuilder {
     ///
     /// [`build`]: ProcessBuilder::build
     names: Vec<(ElementId, String)>,
+    /// Recorded `(element id, zeebe:properties)` declarations, applied in
+    /// [`build`].
+    ///
+    /// [`build`]: ProcessBuilder::build
+    properties: Vec<(ElementId, BTreeMap<String, String>)>,
 }
 
 impl ProcessBuilder {
@@ -1886,6 +2187,7 @@ impl ProcessBuilder {
             listeners: Vec::new(),
             task_listeners: Vec::new(),
             names: Vec::new(),
+            properties: Vec::new(),
         }
     }
 
@@ -1910,6 +2212,7 @@ impl ProcessBuilder {
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
             task_listeners: Vec::new(),
+            properties: BTreeMap::new(),
         });
         self
     }
@@ -1958,6 +2261,22 @@ impl ProcessBuilder {
         )
     }
 
+    /// Adds a root-level conditional start event: a
+    /// [`crate::Command::EvaluateConditionalStartEvents`] whose variables make the
+    /// FEEL `condition` `true` creates a new instance starting here.
+    pub fn conditional_start_event(
+        self,
+        id: impl Into<String>,
+        condition: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::ConditionalStartEvent {
+                condition: condition.into(),
+            },
+        )
+    }
+
     /// Adds a none end event.
     pub fn end_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::EndEvent)
@@ -1969,6 +2288,18 @@ impl ProcessBuilder {
     /// then completes that scope.
     pub fn terminate_end_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::TerminateEndEvent)
+    }
+
+    /// Adds an error end event (`<endEvent>` with an `<errorEventDefinition>`;
+    /// see [`ElementKind::ErrorEndEvent`]). Reaching it throws the BPMN error
+    /// `error_code`, resolved to a catch exactly like a job-thrown error.
+    pub fn error_end_event(self, id: impl Into<String>, error_code: impl Into<String>) -> Self {
+        self.add(
+            id,
+            ElementKind::ErrorEndEvent {
+                error_code: error_code.into(),
+            },
+        )
     }
 
     /// Adds a none intermediate throw event (a pass-through; see
@@ -2246,6 +2577,33 @@ impl ProcessBuilder {
         )
     }
 
+    /// Adds an event sub-process (`<subProcess triggeredByEvent="true">`): a
+    /// container never entered by token flow, activated when its start event's
+    /// `trigger` fires while the enclosing scope is active. `start_event` is
+    /// the id of its inner (typed) start event; `interrupting` selects
+    /// Zeebe's interrupting (terminate the scope's other work) vs
+    /// non-interrupting (run concurrently) semantics. Contain it in an
+    /// embedded sub-process with [`contained_in`](ProcessBuilder::contained_in)
+    /// (as for any inner element); leave it parentless for the process scope.
+    /// Enumerate the event sub-processes of a scope with
+    /// [`ProcessDefinition::event_subprocesses_in_scope`].
+    pub fn event_sub_process(
+        self,
+        id: impl Into<String>,
+        start_event: impl Into<String>,
+        trigger: EventSubProcessTrigger,
+        interrupting: bool,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::EventSubProcess {
+                start_event: start_event.into(),
+                trigger,
+                interrupting,
+            },
+        )
+    }
+
     /// Records that `child` is contained in the embedded sub-process `parent`.
     /// Inner elements must be declared this way so their tokens are scoped to the
     /// sub-process and so the process-level start event can be identified.
@@ -2259,6 +2617,18 @@ impl ProcessBuilder {
     /// element-instance search API. Applied in [`build`](ProcessBuilder::build).
     pub fn with_name(mut self, id: impl Into<String>, name: impl Into<String>) -> Self {
         self.names.push((id.into(), name.into()));
+        self
+    }
+
+    /// Attaches `zeebe:properties` extension properties to a previously-added
+    /// element (see [`Element::properties`]). Applied in
+    /// [`build`](ProcessBuilder::build).
+    pub fn with_properties(
+        mut self,
+        id: impl Into<String>,
+        properties: BTreeMap<String, String>,
+    ) -> Self {
+        self.properties.push((id.into(), properties));
         self
     }
 
@@ -2736,7 +3106,7 @@ impl ProcessBuilder {
     /// Fails if there is not exactly one start event, or if a sequence flow
     /// references an unknown element.
     pub fn build(self) -> Result<ProcessDefinition, BuildError> {
-        let mut elements: HashMap<ElementId, Element> = HashMap::new();
+        let mut elements: BTreeMap<ElementId, Element> = BTreeMap::new();
         for e in self.elements {
             if elements.contains_key(&e.id) {
                 return Err(BuildError::DuplicateElement(e.id));
@@ -2840,6 +3210,15 @@ impl ProcessBuilder {
             }
         }
 
+        // Attach `zeebe:properties` extension properties to their elements.
+        for (id, properties) in &self.properties {
+            match elements.get_mut(id) {
+                Some(element) => element.properties = properties.clone(),
+                None => return Err(BuildError::UnknownPropertiesElement(id.clone())),
+            }
+        }
+        validate_event_subprocesses(&elements)?;
+
         // The process-level start event is a start event that is not contained in
         // any sub-process (sub-process inner start events have a parent and start
         // their own scope, not the instance).
@@ -2887,6 +3266,120 @@ impl ProcessBuilder {
     }
 }
 
+/// Structural validation of every [`ElementKind::EventSubProcess`] — the single
+/// canonical check shared by the BPMN parser, the programmatic builder and the
+/// processos IR (all of which assemble through [`ProcessBuilder::build`]).
+///
+/// An event sub-process is entered only by its trigger, so it must have no
+/// incoming or outgoing sequence flow; its `start_event` must name a start
+/// event directly contained in it; and an error trigger must be interrupting.
+pub(crate) fn validate_event_subprocesses(
+    elements: &BTreeMap<ElementId, Element>,
+) -> Result<(), BuildError> {
+    let mut esps: Vec<&Element> = elements
+        .values()
+        .filter(|e| matches!(e.kind, ElementKind::EventSubProcess { .. }))
+        .collect();
+    esps.sort_by(|a, b| a.id.cmp(&b.id));
+    for esp in esps {
+        let ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            interrupting,
+        } = &esp.kind
+        else {
+            continue;
+        };
+        let invalid = |reason: String| BuildError::InvalidEventSubProcess {
+            id: esp.id.clone(),
+            reason,
+        };
+        if let Some(flow) = esp.outgoing.first() {
+            return Err(invalid(format!(
+                "has an outgoing sequence flow to {}; an event sub-process takes no sequence flows",
+                flow.to
+            )));
+        }
+        let mut sources: Vec<&ElementId> = elements
+            .values()
+            .filter(|e| e.outgoing.iter().any(|f| f.to == esp.id))
+            .map(|e| &e.id)
+            .collect();
+        sources.sort();
+        if let Some(src) = sources.first() {
+            return Err(invalid(format!(
+                "has an incoming sequence flow from {src}; an event sub-process takes no sequence flows"
+            )));
+        }
+        match elements.get(start_event) {
+            None => {
+                return Err(invalid(format!(
+                    "references unknown start event {start_event}"
+                )))
+            }
+            Some(start)
+                if !matches!(start.kind, ElementKind::StartEvent)
+                    || start.parent.as_deref() != Some(esp.id.as_str()) =>
+            {
+                return Err(invalid(format!(
+                    "start event {start_event} must be a plain start event directly contained in the event sub-process (the trigger lives on the container)"
+                )))
+            }
+            Some(_) => {}
+        }
+        let mut extra: Vec<&ElementId> = elements
+            .values()
+            .filter(|e| {
+                e.kind.is_start_event()
+                    && e.parent.as_deref() == Some(esp.id.as_str())
+                    && &e.id != start_event
+            })
+            .map(|e| &e.id)
+            .collect();
+        extra.sort();
+        if let Some(other) = extra.first() {
+            return Err(invalid(format!(
+                "must have exactly one start event, found additional start event {other}"
+            )));
+        }
+        // No sequence flow may cross the containment boundary (in either
+        // direction, including from/to nested descendants): the inner work is
+        // entered only through the trigger.
+        let inside = |id: &str| -> bool {
+            let mut cur = elements.get(id).and_then(|e| e.parent.as_deref());
+            let mut hops = 0usize;
+            while let Some(p) = cur {
+                if p == esp.id.as_str() {
+                    return true;
+                }
+                hops += 1;
+                if hops > elements.len() {
+                    return false;
+                }
+                cur = elements.get(p).and_then(|e| e.parent.as_deref());
+            }
+            false
+        };
+        let mut crossing: Vec<(&ElementId, &ElementId)> = elements
+            .values()
+            .flat_map(|e| e.outgoing.iter().map(move |f| (&e.id, &f.to)))
+            .filter(|(from, to)| inside(from) != inside(to))
+            .collect();
+        crossing.sort();
+        if let Some((from, to)) = crossing.first() {
+            return Err(invalid(format!(
+                "sequence flow {from} -> {to} crosses the event sub-process boundary"
+            )));
+        }
+        if matches!(trigger, EventSubProcessTrigger::Error { .. }) && !interrupting {
+            return Err(invalid(
+                "an error event sub-process must be interrupting".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Errors produced while assembling a [`ProcessDefinition`] with [`ProcessBuilder::build`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuildError {
@@ -2922,6 +3415,18 @@ pub enum BuildError {
     UnknownListenerElement(ElementId),
     /// A `with_name` referenced an element that does not exist.
     UnknownNameElement(ElementId),
+    /// A `with_properties` referenced an element that does not exist.
+    UnknownPropertiesElement(ElementId),
+    /// An [`ElementKind::EventSubProcess`] violates a structural constraint:
+    /// it has an incoming/outgoing sequence flow, its `start_event` is not a
+    /// start event directly contained in it, or it carries a non-interrupting
+    /// error trigger.
+    InvalidEventSubProcess {
+        /// The offending event sub-process.
+        id: ElementId,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -2971,8 +3476,14 @@ impl std::fmt::Display for BuildError {
             BuildError::UnknownListenerElement(id) => {
                 write!(f, "execution listeners declared on unknown element {id}")
             }
+            BuildError::InvalidEventSubProcess { id, reason } => {
+                write!(f, "event sub-process {id}: {reason}")
+            }
             BuildError::UnknownNameElement(id) => {
                 write!(f, "name declared on unknown element {id}")
+            }
+            BuildError::UnknownPropertiesElement(id) => {
+                write!(f, "properties declared on unknown element {id}")
             }
         }
     }
@@ -3105,5 +3616,45 @@ mod approx_bytes_tests {
             "map estimate {got} covers the blob"
         );
         assert!(got < blob.len() as u64 + 200, "no runaway overhead: {got}");
+    }
+}
+
+/// Canonical JSON → [`Value`] conversion shared by every runner (engine-wasm,
+/// the native parity replay). Integers representable as `i64` become
+/// [`Value::Int`]; every other number — including unsigned values above
+/// `i64::MAX` — becomes [`Value::Double`], never a wrapped negative `Int`
+/// (which would flip FEEL comparisons such as `x > 0`).
+#[cfg(feature = "serde")]
+pub fn value_from_json(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Double(n.as_f64().unwrap_or(0.0)),
+        },
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Array(items) => Value::List(items.iter().map(value_from_json).collect()),
+        serde_json::Value::Object(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), value_from_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod value_from_json_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_above_i64_max_is_positive_double_not_wrapped_int() {
+        let v = value_from_json(&serde_json::json!(10_000_000_000_000_000_000u64));
+        assert_eq!(v, Value::Double(1e19));
+        assert_eq!(
+            value_from_json(&serde_json::json!(i64::MAX)),
+            Value::Int(i64::MAX)
+        );
+        assert_eq!(value_from_json(&serde_json::json!(-5)), Value::Int(-5));
     }
 }

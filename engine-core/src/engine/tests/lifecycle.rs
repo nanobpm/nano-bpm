@@ -12,7 +12,7 @@ fn subprocess_input_mapping_is_local_to_the_subprocess_scope() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -40,7 +40,7 @@ fn inner_element_input_mapping_resolves_against_the_enclosing_subprocess_scope()
             subprocess_with_nested_input_mapping(),
         ))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     engine
         .apply_command(Command::create_instance_with("nested-scope", vars))
@@ -63,7 +63,7 @@ fn subprocess_scope_local_variable_is_dropped_when_the_subprocess_completes() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -93,7 +93,7 @@ fn subprocess_output_mapping_reads_local_scope_and_propagates_to_root() {
             },
         ])))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -133,7 +133,7 @@ fn set_variables_local_writes_only_the_target_scope() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -152,7 +152,7 @@ fn set_variables_local_writes_only_the_target_scope() {
     engine
         .apply_command(Command::set_variables_scoped(
             sub_scope,
-            HashMap::from([("only_here".to_string(), Value::Int(7))]),
+            BTreeMap::from([("only_here".to_string(), Value::Int(7))]),
             true,
         ))
         .unwrap();
@@ -179,7 +179,7 @@ fn set_variables_non_local_propagates_to_the_root_scope() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -198,7 +198,7 @@ fn set_variables_non_local_propagates_to_the_root_scope() {
     engine
         .apply_command(Command::set_variables_scoped(
             sub_scope,
-            HashMap::from([("bubbled".to_string(), Value::Int(3))]),
+            BTreeMap::from([("bubbled".to_string(), Value::Int(3))]),
             false,
         ))
         .unwrap();
@@ -216,7 +216,7 @@ fn set_variables_non_local_updates_the_defining_scope_not_root() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -236,7 +236,7 @@ fn set_variables_non_local_updates_the_defining_scope_not_root() {
     engine
         .apply_command(Command::set_variables_scoped(
             sub_scope,
-            HashMap::from([("scoped".to_string(), Value::Int(42))]),
+            BTreeMap::from([("scoped".to_string(), Value::Int(42))]),
             false,
         ))
         .unwrap();
@@ -428,7 +428,7 @@ fn resident_variable_bytes_counts_scope_local_maps() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -464,7 +464,7 @@ fn completing_an_instance_drops_its_variables_from_hot_state() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -499,7 +499,7 @@ fn terminating_an_instance_drops_its_variables_from_hot_state() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -559,7 +559,7 @@ fn suspend_drops_message_correlation_and_does_not_rebuffer() {
         engine.instance(instance_key).unwrap().state,
         ProcessInstanceState::Suspended
     );
-    let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 1_500);
+    let fired = engine.correlate_message("payment-received", "A", BTreeMap::new(), 1_500);
     assert!(
         !fired
             .iter()
@@ -588,7 +588,7 @@ fn suspend_drops_message_correlation_and_does_not_rebuffer() {
     );
 
     // A fresh matching message after resume correlates normally and completes.
-    let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 2_500);
+    let fired = engine.correlate_message("payment-received", "A", BTreeMap::new(), 2_500);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
@@ -730,7 +730,7 @@ fn engine_snapshot_round_trips_scope_variables_and_parents() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -777,7 +777,7 @@ fn cold_spill_round_trips_a_message_parked_instance() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("orderId".to_string(), Value::Str("A".to_string()));
     let events = engine
         .apply_command(Command::create_instance_with("wait", vars))
@@ -835,14 +835,14 @@ fn feel_message_name_resolves_on_activation() {
     assert_eq!(subs[0].correlation_key, "A");
 
     // A message for a different region does not correlate.
-    let fired = engine.correlate_message("payment-us", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("payment-us", "A", BTreeMap::new(), 0);
     assert!(!fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
     assert!(!engine.is_completed(instance_key));
 
     // The resolved name correlates and completes the instance.
-    let fired = engine.correlate_message("payment-eu", "A", HashMap::new(), 0);
+    let fired = engine.correlate_message("payment-eu", "A", BTreeMap::new(), 0);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
@@ -1169,7 +1169,7 @@ fn cross_partition_cancel_emits_a_routable_closing() {
         .apply_command(Command::correlate_message_with(
             "payment-received",
             order.clone(),
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     assert!(
@@ -1405,7 +1405,7 @@ fn redriven_dispatch_start_after_a_lost_ack_mints_exactly_one_instance() {
     let dispatch = Command::DispatchStartInstance {
         process_id: "order-flow".into(),
         start_element_id: "start".into(),
-        variables: HashMap::new(),
+        variables: BTreeMap::new(),
         tags: Vec::new(),
         business_id: None,
         message_start: None,
@@ -1513,7 +1513,7 @@ fn redriven_non_interrupting_boundary_correlation_fires_exactly_once() {
         .apply_command(Command::correlate_message_with(
             "reminder",
             order.clone(),
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     let (r_msg, r_kind, r_delivery) = published
@@ -1536,7 +1536,7 @@ fn redriven_non_interrupting_boundary_correlation_fires_exactly_once() {
         element_instance_key: eik,
         element_id: "notify".into(),
         kind: r_kind,
-        variables: HashMap::new(),
+        variables: BTreeMap::new(),
         delivery_key: r_delivery,
     };
 
@@ -1564,7 +1564,7 @@ fn redriven_non_interrupting_boundary_correlation_fires_exactly_once() {
 fn should_publish_a_message_with_no_subscription() {
     let mut engine = Engine::new();
     // With nothing subscribed, a published message is minted and dropped.
-    let fired = engine.correlate_message("nobody-home", "X", HashMap::new(), 0);
+    let fired = engine.correlate_message("nobody-home", "X", BTreeMap::new(), 0);
     assert_eq!(fired.len(), 1);
     assert!(matches!(fired[0], Event::MessagePublished { .. }));
     assert!(engine.message_subscriptions().is_empty());
@@ -1639,7 +1639,7 @@ fn should_correlate_only_the_instance_with_the_matching_key() {
         .unwrap();
 
     // Correlating "A" releases only instance A; B stays parked.
-    engine.correlate_message("payment-received", "A", HashMap::new(), 0);
+    engine.correlate_message("payment-received", "A", BTreeMap::new(), 0);
     assert!(engine.is_completed(a));
     assert!(!engine.is_completed(b));
 }
@@ -1671,7 +1671,7 @@ fn should_recover_an_open_message_subscription_via_replay() {
     assert!(!recovered.is_completed(instance_key));
 
     // The recovered engine correlates the message and completes the instance.
-    recovered.correlate_message("payment-received", "A", HashMap::new(), 0);
+    recovered.correlate_message("payment-received", "A", BTreeMap::new(), 0);
     assert!(recovered.is_completed(instance_key));
 }
 
@@ -1771,7 +1771,7 @@ fn should_run_inclusive_split_taking_every_matching_flow() {
 
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([
+    let vars = BTreeMap::from([
         ("x".to_string(), Value::Bool(true)),
         ("y".to_string(), Value::Bool(true)),
         ("z".to_string(), Value::Bool(false)),
@@ -1826,7 +1826,7 @@ fn should_take_inclusive_split_default_when_no_condition_matches() {
 
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("temp".to_string(), Value::Int(20))]);
+    let vars = BTreeMap::from([("temp".to_string(), Value::Int(20))]);
     let events = engine
         .apply_command(Command::create_instance_with("inc-def", vars))
         .unwrap();
@@ -1905,6 +1905,64 @@ fn chained_inclusive_joins_do_not_fire_downstream_join_prematurely() {
             .count(),
         1,
         "the downstream join must route to the end exactly once (no premature/duplicate fire)"
+    );
+}
+
+#[test]
+fn inclusive_join_waits_for_sibling_token_still_in_transit() {
+    // #1248 (engine guard mutants on `has_active_path_to`). A parallel split
+    // feeds `j` over a short branch (`a`) and a long one (`x -> y -> z`). When
+    // `j`'s queued activation from `a` runs, `x` and `y` have completed and
+    // `z` is only a queued `Step::Activate` — no element on the long branch is
+    // ACTIVE. The join must count that in-transit token (Zeebe's
+    // `activeSequenceFlowIds`) and wait, firing exactly once with both tokens;
+    // ignoring queued activations fires `j` early on `a`'s token alone.
+    let def = ProcessBuilder::new("inc-in-transit")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .exclusive_gateway("a")
+        .exclusive_gateway("x")
+        .exclusive_gateway("y")
+        .exclusive_gateway("z")
+        .inclusive_gateway("j")
+        .end_event("e")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("a", "j")
+        .connect("psplit", "x")
+        .connect("x", "y")
+        .connect("y", "z")
+        .connect("z", "j")
+        .connect("j", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("inc-in-transit"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.active_incidents().is_empty());
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, Event::ParallelJoinFired { element_id, .. } if element_id == "j")
+            )
+            .count(),
+        1,
+        "the inclusive join must wait for the in-transit token and fire exactly once"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e"))
+            .count(),
+        1,
+        "the join must route to the end exactly once"
     );
 }
 
@@ -2041,11 +2099,12 @@ fn terminate_end_kills_sibling_branch_and_completes_the_instance() {
     );
     // No token survives: the instance holds no active elements after completion.
     assert!(engine.instance(instance_key).unwrap().active.is_empty());
-    // The cancelled sibling job can no longer be completed.
+    // The cancelled sibling job is consumed: completing it is NOT_FOUND
+    // (Zeebe parity, #1401).
     let err = engine
         .apply_command(Command::complete_job(work_job))
         .unwrap_err();
-    assert_eq!(err, EngineError::JobNotActive { job_key: work_job });
+    assert_eq!(err, EngineError::JobNotFound { job_key: work_job });
 }
 
 #[test]
@@ -2296,10 +2355,13 @@ fn parallel_join_keeps_surplus_token_waiting_like_zeebe() {
         "the surplus token keeps the instance alive, as in Zeebe"
     );
     let instance = engine.instance(instance_key).unwrap();
-    assert_eq!(instance.join_flows_taken("join"), 1);
+    assert_eq!(
+        instance.join_flows_taken(&crate::state::JoinKey::root("join")),
+        1
+    );
     let open = instance
         .join_instances
-        .get("join")
+        .get(&crate::state::JoinKey::root("join"))
         .copied()
         .expect("the join is re-opened to hold the surplus token");
     assert_eq!(
@@ -2436,11 +2498,13 @@ fn terminate_clears_open_parallel_join_bookkeeping() {
     complete_one(&mut engine, "ja");
     let instance = engine.instance(key).unwrap();
     assert_eq!(
-        instance.join_flows_taken("join"),
+        instance.join_flows_taken(&crate::state::JoinKey::root("join")),
         1,
         "the join is half-open before the terminate"
     );
-    assert!(instance.join_instances.contains_key("join"));
+    assert!(instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("join")));
 
     // The sibling terminate fires when `trigger` completes, ending the instance.
     complete_one(&mut engine, "trigger-job");
@@ -2465,7 +2529,7 @@ fn should_route_exclusive_gateway_by_variable() {
         .apply_command(Command::DeployProcess(approval_process()))
         .unwrap();
 
-    let vars = HashMap::from([("decision".to_string(), Value::Str("yes".into()))]);
+    let vars = BTreeMap::from([("decision".to_string(), Value::Str("yes".into()))]);
     let events = engine
         .apply_command(Command::create_instance_with("approval", vars))
         .unwrap();
@@ -2489,7 +2553,7 @@ fn should_take_default_flow_when_no_condition_matches() {
         .apply_command(Command::DeployProcess(approval_process()))
         .unwrap();
 
-    let vars = HashMap::from([("decision".to_string(), Value::Str("no".into()))]);
+    let vars = BTreeMap::from([("decision".to_string(), Value::Str("no".into()))]);
     let events = engine
         .apply_command(Command::create_instance_with("approval", vars))
         .unwrap();
@@ -2518,7 +2582,7 @@ fn should_route_exclusive_gateway_on_a_numeric_feel_comparison() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
-    let vars = HashMap::from([("amount".to_string(), Value::Int(250))]);
+    let vars = BTreeMap::from([("amount".to_string(), Value::Int(250))]);
     let events = engine
         .apply_command(Command::create_instance_with("amounts", vars))
         .unwrap();
@@ -2638,7 +2702,7 @@ fn should_set_variables_via_an_element_instance_scope_key() {
     engine
         .apply_command(Command::set_variables(
             element_instance_key,
-            HashMap::from([("x".to_string(), Value::Int(42))]),
+            BTreeMap::from([("x".to_string(), Value::Int(42))]),
         ))
         .unwrap();
 
@@ -2655,7 +2719,7 @@ fn should_reject_setting_variables_on_an_unknown_scope() {
     let err = engine
         .apply_command(Command::set_variables(
             404,
-            HashMap::from([("x".to_string(), Value::Int(1))]),
+            BTreeMap::from([("x".to_string(), Value::Int(1))]),
         ))
         .unwrap_err();
     assert_eq!(err, EngineError::ScopeNotFound { scope_key: 404 });
@@ -2710,7 +2774,9 @@ fn recover_lease_restores_a_soft_lease_and_holds_redelivery_until_the_deadline()
     // replicated the create but, under leader-local activation, never saw the
     // previous leader's activation) and a digested lease (key, deadline=1000)
     let mut engine = Engine::new();
-    engine.set_lenient_completion(true);
+    engine
+        .apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
@@ -2802,7 +2868,7 @@ fn should_reject_a_lock_extension_once_the_lock_has_expired() {
 #[cfg(feature = "serde")]
 #[test]
 fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     // (a) Old log entries lack the new fields — they must still deserialize.
     let throw: Command = serde_json::from_str(
@@ -2817,24 +2883,12 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
     let retries: Command =
         serde_json::from_str(r#"{"UpdateJobRetries":{"job_key":7,"retries":3}}"#)
             .expect("legacy UpdateJobRetries without operation_reference must deserialize");
-    assert!(matches!(
-        retries,
-        Command::UpdateJobRetries {
-            operation_reference: None,
-            ..
-        }
-    ));
+    assert!(matches!(retries, Command::UpdateJobRetries { .. }));
 
     let timeout: Command =
         serde_json::from_str(r#"{"UpdateJobTimeout":{"job_key":7,"timeout":5000}}"#)
             .expect("legacy UpdateJobTimeout without operation_reference must deserialize");
-    assert!(matches!(
-        timeout,
-        Command::UpdateJobTimeout {
-            operation_reference: None,
-            ..
-        }
-    ));
+    assert!(matches!(timeout, Command::UpdateJobTimeout { .. }));
 
     // (b) The empty/absent form must not appear on the wire (byte-unchanged).
     let throw_empty = Command::ThrowJobError {
@@ -2843,7 +2897,7 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
         job_key: 7,
         error_code: "E".into(),
         error_message: "m".into(),
-        variables: HashMap::new(),
+        variables: BTreeMap::new(),
     };
     let s = serde_json::to_string(&throw_empty).unwrap();
     assert!(
@@ -2863,17 +2917,18 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
         "absent operation_reference must be skipped: {s}"
     );
 
-    // Present values still round-trip.
-    let s = serde_json::to_string(&Command::update_job_retries_with_ref(7, 3, Some(42))).unwrap();
-    assert!(s.contains("operation_reference"));
-    let back: Command = serde_json::from_str(&s).unwrap();
-    assert!(matches!(
-        back,
-        Command::UpdateJobRetries {
-            operation_reference: Some(42),
-            ..
-        }
-    ));
+    // #1556: the per-command field moved to the generic record envelope. A
+    // pre-#1556 replicated command still carrying it must keep decoding (the
+    // field is ignored — the reference now rides `ReplicatedCommand`).
+    let back: Command = serde_json::from_str(
+        r#"{"UpdateJobRetries":{"job_key":7,"retries":3,"operation_reference":42}}"#,
+    )
+    .expect("pre-#1556 UpdateJobRetries carrying operation_reference must deserialize");
+    assert!(matches!(back, Command::UpdateJobRetries { retries: 3, .. }));
+    let back: Command =
+        serde_json::from_str(r#"{"ResolveIncident":{"incident_key":7,"operation_reference":42}}"#)
+            .expect("pre-#1556 ResolveIncident carrying operation_reference must deserialize");
+    assert!(matches!(back, Command::ResolveIncident { incident_key: 7 }));
 }
 
 /// Class-scoped companion to the above: variables on an UNHANDLED thrown error
@@ -2892,7 +2947,7 @@ fn should_not_seed_variables_when_a_thrown_error_is_unhandled() {
     let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].key;
 
     // when an error no boundary catches is thrown with variables
-    let vars = HashMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
+    let vars = BTreeMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
     let events = engine
         .apply_command(Command::throw_job_error_with(
             job_key, "UNKNOWN", "boom", vars,
@@ -3824,7 +3879,7 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
     engine.set_track_dirty_vars(true);
 
     // Create two instances with variables -> both dirty.
-    let mut v = std::collections::HashMap::new();
+    let mut v = std::collections::BTreeMap::new();
     v.insert("amount".to_string(), Value::Int(50));
     let a = engine
         .apply_command(Command::create_instance_with("order", v.clone()))
@@ -3840,7 +3895,7 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
         .unwrap();
 
     let (upserts, forgets) = engine.drain_dirty_vars();
-    let keys: std::collections::HashSet<Key> = upserts.iter().map(|(k, _)| *k).collect();
+    let keys: std::collections::BTreeSet<Key> = upserts.iter().map(|(k, _)| *k).collect();
     assert_eq!(keys, [a, b].into_iter().collect());
     assert!(forgets.is_empty());
     // Draining clears the set.
@@ -3848,7 +3903,7 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
     assert!(again.is_empty());
 
     // A spilled instance is skipped in the upserts (spill write-through owns it).
-    let mut v2 = std::collections::HashMap::new();
+    let mut v2 = std::collections::BTreeMap::new();
     v2.insert("k".to_string(), Value::Int(1));
     engine
         .apply_command(Command::SetVariables {
@@ -3880,7 +3935,7 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
 
     // Restoring variables from the store onto a lean-recovered engine.
     let mut recovered = Engine::from_snapshot(lean);
-    let mut restored = std::collections::HashMap::new();
+    let mut restored = std::collections::BTreeMap::new();
     restored.insert("amount".to_string(), Value::Int(99));
     recovered.install_variables(b, restored);
     assert_eq!(
@@ -4001,7 +4056,7 @@ fn static_output_mapping_source_is_passed_through_as_literal_not_feel() {
     let inst = create_instance_key(&mut engine, "io-static-out");
     let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
     let events = engine
-        .apply_command(Command::complete_job_with(job_key, HashMap::new()))
+        .apply_command(Command::complete_job_with(job_key, BTreeMap::new()))
         .unwrap();
     assert!(
         engine.active_incidents().is_empty(),
@@ -4047,7 +4102,7 @@ fn input_mapping_with_dotted_target_builds_nested_context() {
     engine.apply_command(Command::DeployProcess(def)).unwrap();
     let mut existing_order = std::collections::BTreeMap::new();
     existing_order.insert("id".to_string(), Value::Str("A1".to_string()));
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("price".to_string(), Value::Int(3));
     vars.insert("qty".to_string(), Value::Int(4));
     vars.insert("order".to_string(), Value::Map(existing_order));
@@ -4097,7 +4152,7 @@ fn input_mapped_local_variable_is_not_visible_to_a_later_activity() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("x".to_string(), Value::Int(1));
     let inst = engine
         .apply_command(Command::create_instance_with("io-local", vars))
@@ -4203,8 +4258,8 @@ fn variable_propagation_updates_nearest_defining_scope_else_root() {
         ]),
         false,
     );
-    let mut by_scope: std::collections::HashMap<Key, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut by_scope: std::collections::BTreeMap<Key, Vec<String>> =
+        std::collections::BTreeMap::new();
     for (scope, map) in writes {
         by_scope
             .entry(scope)
@@ -4591,6 +4646,7 @@ fn deploy_forms_mints_a_form_key_versions_per_id_and_is_idempotent() {
         id: "greeting-form".to_string(),
         resource_name: "greeting.form".to_string(),
         schema: schema.to_string(),
+        version_tag: None,
     };
     let v1 = r#"{"id":"greeting-form","type":"default","components":[]}"#;
 
@@ -4656,6 +4712,7 @@ fn deploy_generic_resources_mints_a_resource_key_versions_per_id_and_is_idempote
         resource_id: "agent-prompt.md".to_string(),
         resource_name: "agent-prompt.md".to_string(),
         content: content.to_string(),
+        version_tag: None,
     };
     let v1 = "# Reviewer\n\nReview the PR.";
 
@@ -4730,6 +4787,7 @@ fn deploy_generic_resources_mints_a_resource_key_versions_per_id_and_is_idempote
             resource_id: "other-prompt.md".to_string(),
             resource_name: "other-prompt.md".to_string(),
             content: "# Other".to_string(),
+            version_tag: None,
         }]))
         .unwrap();
     let other_v = other
@@ -4754,6 +4812,7 @@ fn deploying_multiple_form_versions_retains_every_version_by_key() {
         id: "f".to_string(),
         resource_name: "f.form".to_string(),
         schema: schema.to_string(),
+        version_tag: None,
     };
     let deploy = |engine: &mut Engine, schema: &str| -> (Key, i32) {
         engine
@@ -4799,6 +4858,7 @@ fn deploying_multiple_resource_versions_retains_every_version_by_key() {
                 resource_id: "p.md".to_string(),
                 resource_name: "p.md".to_string(),
                 content: content.to_string(),
+                version_tag: None,
             }]))
             .unwrap()
             .iter()
@@ -4949,6 +5009,7 @@ fn version_retention_survives_a_snapshot_round_trip() {
             id: "f".to_string(),
             resource_name: "f.form".to_string(),
             schema: r#"{"id":"f","components":[]}"#.to_string(),
+            version_tag: None,
         }]))
         .unwrap();
     engine
@@ -4956,6 +5017,7 @@ fn version_retention_survives_a_snapshot_round_trip() {
             id: "f".to_string(),
             resource_name: "f.form".to_string(),
             schema: r#"{"id":"f","components":[{"key":"a"}]}"#.to_string(),
+            version_tag: None,
         }]))
         .unwrap();
     engine
@@ -4963,6 +5025,7 @@ fn version_retention_survives_a_snapshot_round_trip() {
             resource_id: "p.md".to_string(),
             resource_name: "p.md".to_string(),
             content: "v1".to_string(),
+            version_tag: None,
         }]))
         .unwrap();
     engine
@@ -4970,6 +5033,7 @@ fn version_retention_survives_a_snapshot_round_trip() {
             resource_id: "p.md".to_string(),
             resource_name: "p.md".to_string(),
             content: "v2".to_string(),
+            version_tag: None,
         }]))
         .unwrap();
 
@@ -5060,7 +5124,7 @@ fn create_by_key_pins_instance_to_that_exact_version() {
     let events = engine
         .apply_command(Command::create_instance_versioned(
             "order",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             None,
             Some(k1),
@@ -5101,7 +5165,7 @@ fn create_by_id_and_version_selects_that_version_else_latest_else_errors() {
     let by_v1 = engine
         .apply_command(Command::create_instance_versioned(
             "order",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             None,
             None,
@@ -5123,7 +5187,7 @@ fn create_by_id_and_version_selects_that_version_else_latest_else_errors() {
     let by_latest = engine
         .apply_command(Command::create_instance_versioned(
             "order",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             None,
             None,
@@ -5144,7 +5208,7 @@ fn create_by_id_and_version_selects_that_version_else_latest_else_errors() {
     // Unknown version → error, no instance created.
     let err = engine.apply_command(Command::create_instance_versioned(
         "order",
-        HashMap::new(),
+        BTreeMap::new(),
         Vec::new(),
         None,
         None,
@@ -5226,7 +5290,7 @@ fn snapshot_round_trip_retains_all_versions_and_instance_pins() {
     let created = engine
         .apply_command(Command::create_instance_versioned(
             "order",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             None,
             Some(k1),
@@ -5326,7 +5390,7 @@ fn subprocess_end_event_output_propagates_reached_branch_not_last_defined() {
         engine
             .apply_command(Command::DeployProcess(def.clone()))
             .unwrap();
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("pick".to_string(), Value::Str(pick.to_string()));
         engine
             .apply_command(Command::create_instance_with("sp-ends", vars))
@@ -5781,7 +5845,7 @@ fn agent_history_committed_turns_are_immutable_across_later_batches() {
     let stored = stored_history(&engine, instance_key, aik);
     assert_eq!(stored.len(), 2);
     // The first turn is still COMMITTED; only the second flipped to DISCARDED.
-    let by_key: std::collections::HashMap<Key, AgentHistoryCommitStatus> = stored
+    let by_key: std::collections::BTreeMap<Key, AgentHistoryCommitStatus> = stored
         .iter()
         .map(|r| (r.agent_history_key, r.commit_status))
         .collect();
@@ -6325,7 +6389,7 @@ fn agent_instance_update_with_conflicting_instance_is_rejected() {
             instance_key: pi_a,
             activate_instructions: vec![crate::command::ActivateElementInstruction {
                 element_id: "agent".into(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 ..Default::default()
             }],
             terminate_instructions: vec![],
@@ -6765,10 +6829,12 @@ fn inclusive_join_strands_a_surplus_that_arrives_first_like_zeebe() {
     );
     let instance = engine.instance(instance_key).unwrap();
     assert_eq!(
-        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&merge_to_join()),
         1
     );
-    assert!(instance.join_instances.contains_key("join"));
+    assert!(instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("join")));
 }
 
 #[test]
@@ -6823,7 +6889,7 @@ fn inclusive_join_is_not_reevaluated_when_a_competing_path_diverges_like_zeebe()
     let created = engine
         .apply_command(Command::create_instance_with(
             "inc-diverge",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -6839,8 +6905,13 @@ fn inclusive_join_is_not_reevaluated_when_a_competing_path_diverges_like_zeebe()
         ordinal: 0,
     };
     let instance = engine.instance(instance_key).unwrap();
-    assert_eq!(instance.join_flow_arrivals["join"].count(&a_to_join), 1);
-    assert!(instance.join_instances.contains_key("join"));
+    assert_eq!(
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&a_to_join),
+        1
+    );
+    assert!(instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("join")));
 }
 
 #[test]
@@ -6905,10 +6976,12 @@ fn inclusive_join_records_the_flow_each_token_arrived_over() {
     complete_one(&mut engine, "jy");
     let instance = engine.instance(instance_key).unwrap();
     assert_eq!(
-        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&merge_to_join()),
         2
     );
-    assert!(!instance.join_counts.contains_key("join"));
+    assert!(!instance
+        .join_counts
+        .contains_key(&crate::state::JoinKey::root("join")));
 }
 
 /// Count the `join -> e` routings in `events`.
@@ -6936,7 +7009,7 @@ fn inclusive_join_consumes_before_its_incident_like_zeebe() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "inclusive_multi_arrival",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -6952,7 +7025,7 @@ fn inclusive_join_consumes_before_its_incident_like_zeebe() {
     let incident_key = incidents[0].key;
     let instance = engine.instance(instance_key).unwrap();
     assert_eq!(
-        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&merge_to_join()),
         1,
         "the incident parks after the consumption"
     );
@@ -6960,7 +7033,7 @@ fn inclusive_join_consumes_before_its_incident_like_zeebe() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("go".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
     let resolved = engine
@@ -6975,7 +7048,7 @@ fn inclusive_join_consumes_before_its_incident_like_zeebe() {
     );
     let instance = engine.instance(instance_key).unwrap();
     assert_eq!(
-        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        instance.join_flow_arrivals[&crate::state::JoinKey::root("join")].count(&merge_to_join()),
         1
     );
 }
@@ -6997,7 +7070,7 @@ fn inclusive_join_late_arrival_while_an_incident_is_pending_activates_again_like
     let created = engine
         .apply_command(Command::create_instance_with(
             "inclusive_multi_arrival",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -7021,8 +7094,12 @@ fn inclusive_join_late_arrival_while_an_incident_is_pending_activates_again_like
         2,
         "both accepted join instances wait on their incidents"
     );
-    assert!(!instance.join_instances.contains_key("join"));
-    assert!(!instance.join_flow_arrivals.contains_key("join"));
+    assert!(!instance
+        .join_instances
+        .contains_key(&crate::state::JoinKey::root("join")));
+    assert!(!instance
+        .join_flow_arrivals
+        .contains_key(&crate::state::JoinKey::root("join")));
 }
 
 #[test]
@@ -7482,7 +7559,7 @@ fn terminate_end_listener_incident_resolution_restarts_the_chain() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
+            BTreeMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7589,7 +7666,7 @@ fn terminate_end_output_mapping_failure_parks_and_redrives() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingVar".to_string(), Value::Int(21))]),
+            BTreeMap::from([("missingVar".to_string(), Value::Int(21))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7666,7 +7743,7 @@ fn terminate_end_recovery_reprojects_output_mappings_without_repeating_completin
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("x".to_string(), Value::Int(0))]),
+            BTreeMap::from([("x".to_string(), Value::Int(0))]),
         ))
         .unwrap();
 
@@ -7693,7 +7770,7 @@ fn terminate_end_recovery_reprojects_output_mappings_without_repeating_completin
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingType".to_string(), Value::Str("l0".into()))]),
+            BTreeMap::from([("missingType".to_string(), Value::Str("l0".into()))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7767,7 +7844,7 @@ fn terminate_end_mid_chain_recovery_restarts_the_chain_and_reprojects_outputs() 
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("x".to_string(), Value::Int(0))]),
+            BTreeMap::from([("x".to_string(), Value::Int(0))]),
         ))
         .unwrap();
 
@@ -7782,7 +7859,7 @@ fn terminate_end_mid_chain_recovery_restarts_the_chain_and_reprojects_outputs() 
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
+            BTreeMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7887,7 +7964,7 @@ fn terminate_end_output_mapping_failed_retry_does_not_repeat_completing() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("missingVar".to_string(), Value::Int(21))]),
+            BTreeMap::from([("missingVar".to_string(), Value::Int(21))]),
         ))
         .unwrap();
     let resolved = engine
@@ -7993,7 +8070,7 @@ fn terminate_end_listener_completion_variables_are_not_shadowed_for_later_listen
         .into_iter()
         .next()
         .expect("listener 0 job");
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("listenerType".to_string(), Value::Str("next".into()));
     engine
         .apply_command(Command::complete_job_with(job.key, vars))
@@ -8025,7 +8102,7 @@ fn message_start_correlation_is_recorded() {
         .apply_command(Command::CorrelateMessage {
             message_name: "order-placed".into(),
             correlation_key: "c-1".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             business_id: Some("biz-1".into()),
         })
         .unwrap();
@@ -8080,7 +8157,7 @@ fn dispatched_message_start_records_the_correlation_on_the_target() {
         .apply_command(Command::DispatchStartInstance {
             process_id: "order-flow".into(),
             start_element_id: "start".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             tags: Vec::new(),
             business_id: None,
             message_start: Some(crate::MessageStartCorrelation {
@@ -8132,7 +8209,7 @@ fn dispatched_message_start_pins_the_correlated_definition_across_redeploy() {
         .apply_command(Command::DispatchStartInstance {
             process_id: "order-flow".into(),
             start_element_id: "start".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             tags: Vec::new(),
             business_id: None,
             message_start: Some(crate::MessageStartCorrelation {
@@ -8236,7 +8313,7 @@ fn allocator_fold_is_not_masked_by_a_foreign_max_key() {
         element_instance_key: foreign,
         element_id: "catch".into(),
         kind: state::MessageSubscriptionKind::IntermediateCatch,
-        variables: HashMap::new(),
+        variables: BTreeMap::new(),
         delivery_key: local,
     };
     let mut next_local = 0;
@@ -8306,5 +8383,120 @@ fn routed_delivery_ledger_round_trips_with_indexes() {
     assert_eq!(
         back.iter().map(|e| e.delivery_key).collect::<Vec<_>>(),
         vec![9, 3, 7]
+    );
+}
+
+#[test]
+fn tag_only_form_and_resource_redeploys_are_not_skipped_as_duplicates() {
+    // #1193 review: an identical-content redeploy that carries a NEW
+    // `version_tag` must mint a version so the tag reaches state; only a
+    // content- AND tag-identical redeploy is idempotent.
+    use crate::command::{FormResource, GenericResource};
+    let mut engine = Engine::new();
+    let form = |tag: Option<&str>| FormResource {
+        id: "f".to_string(),
+        resource_name: "f.form".to_string(),
+        schema: r#"{"id":"f","components":[]}"#.to_string(),
+        version_tag: tag.map(str::to_string),
+    };
+    let res = |tag: Option<&str>| GenericResource {
+        resource_id: "p.md".to_string(),
+        resource_name: "p.md".to_string(),
+        content: "same".to_string(),
+        version_tag: tag.map(str::to_string),
+    };
+    let forms = |e: &[Event]| {
+        e.iter()
+            .filter(|e| matches!(e, Event::FormDeployed { .. }))
+            .count()
+    };
+    let resources = |e: &[Event]| {
+        e.iter()
+            .filter(|e| matches!(e, Event::GenericResourceDeployed { .. }))
+            .count()
+    };
+    let e = engine
+        .apply_command(Command::DeployForms(vec![form(None)]))
+        .unwrap();
+    assert_eq!(forms(&e), 1);
+    let e = engine
+        .apply_command(Command::DeployForms(vec![form(Some("v1"))]))
+        .unwrap();
+    assert_eq!(forms(&e), 1, "tag-only change mints a version");
+    let e = engine
+        .apply_command(Command::DeployForms(vec![form(Some("v1"))]))
+        .unwrap();
+    assert_eq!(forms(&e), 0, "identical content+tag is idempotent");
+    assert_eq!(engine.state().forms["f"].version_tag.as_deref(), Some("v1"));
+
+    let e = engine
+        .apply_command(Command::DeployGenericResources(vec![res(None)]))
+        .unwrap();
+    assert_eq!(resources(&e), 1);
+    let e = engine
+        .apply_command(Command::DeployGenericResources(vec![res(Some("v1"))]))
+        .unwrap();
+    assert_eq!(resources(&e), 1, "tag-only change mints a version");
+    let e = engine
+        .apply_command(Command::DeployGenericResources(vec![res(Some("v1"))]))
+        .unwrap();
+    assert_eq!(resources(&e), 0, "identical content+tag is idempotent");
+    assert_eq!(
+        engine.state().resources["p.md"].version_tag.as_deref(),
+        Some("v1")
+    );
+}
+
+#[test]
+fn inclusive_join_ignores_its_own_queued_activation_as_a_live_path() {
+    // #1248 (engine guard mutants on `has_active_path_to`). Both siblings `a`
+    // and `b` take their flows into `j` before either queued activation of `j`
+    // is processed, and `j`'s third incoming flow (from `d`) is unreachable.
+    // When the first activation of `j` runs, the only queued step is `j`'s
+    // own second activation: that is not a live path *to* the join (the join
+    // excludes itself), so it must activate and fire at once — not park as an
+    // open join waiting on itself.
+    let def = ProcessBuilder::new("inc-own-activation")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .exclusive_gateway("a")
+        .exclusive_gateway("b")
+        .exclusive_gateway("d")
+        .inclusive_gateway("j")
+        .end_event("e")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("psplit", "b")
+        .connect("a", "j")
+        .connect("b", "j")
+        .connect("d", "j")
+        .connect("j", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("inc-own-activation"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.active_incidents().is_empty());
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, Event::ParallelJoinOpened { element_id, .. } if element_id == "j")
+        ),
+        "the join must not park waiting on its own queued activation"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, Event::ParallelJoinFired { element_id, .. } if element_id == "j")
+            )
+            .count(),
+        1,
+        "the join must fire exactly once"
     );
 }

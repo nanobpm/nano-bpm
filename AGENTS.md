@@ -145,6 +145,13 @@ command limit. Therefore:
   rather than `| tail`, so a failure can be inspected without re-running.
 - **Commit and push early** on your task branch once a coherent step compiles, so
   a killed run resumes from your work instead of starting over.
+- **Never background a job and `sleep` on it.** Patterns like
+  `cmd > /tmp/x.log 2>&1 & sleep 600; tail /tmp/x.log` are silent for the whole
+  sleep, so the idle watchdog kills the run (#1664 lost a 156-minute run this
+  way, #1705). Run long commands in the **foreground** with the log-file pattern
+  above. If a step genuinely outlasts the command limit, split or scope it rather
+  than waiting on it in the background. Benchmarks are long commands too: run
+  them in the foreground, scoped, with a bounded iteration count.
 
 ## BPMN Models need DI
 
@@ -336,6 +343,33 @@ PR — by then the duplicate work already happened.
   `nanobpm/nano-bpm` issue, and the resulting PRs link back to it — one place
   to look, whatever repo the diff ends up in.
 
+## Creating a Worktree: `scripts/new-worktree.sh`
+
+Create agent worktrees with the script, not a bare `git worktree add`:
+
+```
+scripts/new-worktree.sh <name> [<branch>] [<base, default origin/main>]
+```
+
+It puts the worktree in `~/workspace/nanobpmn-worktrees/<name>`, runs the code
+generation the build needs (`generated/`, `generated-console/`, `stub_impls.rs`,
+the response contract), stubs `console/dist` as CI does, and seeds
+`server/target/debug` with a copy-on-write clone of the main checkout's, so
+crates.io dependencies arrive already compiled and only our path crates build.
+
+What it saves is **CPU**, not wall time or disk. A first `cargo test --workspace
+--no-run` costs ~280 CPU-seconds, setup included, against ~400 for a plain
+worktree: about 30% less, which is what matters when a dozen agents build at
+once and compete for cores. Wall time on an idle machine is about the same
+(~2.3 min); the clone adds ~20s to setup and the build saves about as much. Disk
+is barely smaller either: the clone itself is free, but our own crates' output,
+mostly their ~4.5 GB incremental cache, is written fresh in every worktree.
+
+The seed is only as warm as the main checkout. After pulling `main`, run
+`cargo test --workspace --no-run` in its `server/` so new worktrees inherit
+current dependencies. Never copy `generated/` between worktrees: copied files get
+fresh mtimes, so Make would skip regenerating them on a branch whose spec differs.
+
 ## Merging PRs
 
 This repository does **not** auto-merge pull requests. Opening a PR is *not* the
@@ -363,9 +397,10 @@ merges it:
     { "name": "console-ts (server TS typecheck + test)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "console (typecheck + test)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "console (journey e2e)", "acceptedConclusions": ["success", "skipped"] },
-    { "name": "formal (tlc)", "acceptedConclusions": ["success", "skipped"] }
+    { "name": "formal (tlc)", "acceptedConclusions": ["success", "skipped"] },
+    { "name": "determinism (seed/profile/platform/previous-release)", "acceptedConclusions": ["success", "skipped"] }
   ],
-  "checksSemantics": "Every entry in requiredChecks gates the merge and must reach one of its acceptedConclusions. All eleven checks are change-gated in ci.yml: the six code checks share the `code` filter (`*code_gate`), 'console-ts (server TS typecheck + test)' runs on the `code` OR `console` filter (the embedded TS lives under `server/crates/nano-server-console/src/`, but its `typescript`/`@types/node` resolve from `console/node_modules`), 'processos (clippy + test)' has its own `processos` filter, 'formal (tlc)' has its own `formal` filter (`formal/**`, `engine-core/src/**`, `engine-core/tests/**` — tests cited as Zeebe-parity evidence — `engine-core/examples/**` — the FEEL differential-fuzz harness the Lean layer diffs against — `engine-core/Cargo.toml` — a dependency or feature change there can alter compiled FEEL behaviour without touching `src/**`, so it must trigger the differential gate too — `engine-core/Cargo.lock` — a resolved-dependency version bump can alter compiled FEEL behaviour the differential-fuzz gate diffs without touching `Cargo.toml` — `rust-toolchain.toml` — the pinned Rust toolchain compiles that harness — and `.github/workflows/ci.yml`), and both console jobs ('console (typecheck + test)' and 'console (journey e2e)') are gated by the `console` filter (inputs `console/**`, `process-explorer/**` — the shared Process Explorer package the console builds from source —, `spec-console/**`, `spec-app/**`, `spec/**` — the console's generated Camunda REST subset client derives from it —, `.github/workflows/ci.yml`, `AGENTS.md`, and `.mergify.yml`; the typecheck job additionally runs on the `docs` filter for its bundled-docs guard), so each is SKIPPED for PRs (and merge_group batches) that don't touch its inputs (e.g. a Rust-only PR skips both console jobs; a console-only PR skips every code check) and RUNS when they do. A skipped check never reports success, so each accepts 'skipped' too (required-when-run, skip-tolerant). Without this, a merge orchestrator that treats a skipped required check as unsatisfied blocks console-only PRs that GitHub itself reports as CLEAN. 'console (typecheck + test)' is required because it is the only gate on the console `tsc -p tsconfig.test.json` type surface and the `src/gen` / `src/gen-c8` client-drift guard; leaving it non-required let a foundation slice that added a REQUIRED field to a console generated type (without updating the e2e fixture defaults in console/e2e/fixtures.ts) land on main red, forcing each following slice to repair the prior slice's break (epic #1119).",
+  "checksSemantics": "Every entry in requiredChecks gates the merge and must reach one of its acceptedConclusions. All twelve checks are change-gated in ci.yml: the six code checks share the `code` filter (`*code_gate`), 'determinism (seed/profile/platform/previous-release)' runs on the same `code` gate but with `always()` so a failed `determinism-cell` matrix leg FAILS it rather than skipping it (ADR 0066 slice 6, #1665), 'console-ts (server TS typecheck + test)' runs on the `code` OR `console` filter (the embedded TS lives under `server/crates/nano-server-console/src/`, but its `typescript`/`@types/node` resolve from `console/node_modules`), 'processos (clippy + test)' has its own `processos` filter, 'formal (tlc)' has its own `formal` filter (`formal/**`, `engine-core/src/**`, `engine-core/tests/**` — tests cited as Zeebe-parity evidence — `engine-core/examples/**` — the FEEL differential-fuzz harness the Lean layer diffs against — `engine-core/Cargo.toml` — a dependency or feature change there can alter compiled FEEL behaviour without touching `src/**`, so it must trigger the differential gate too — `engine-core/Cargo.lock` — a resolved-dependency version bump can alter compiled FEEL behaviour the differential-fuzz gate diffs without touching `Cargo.toml` — `rust-toolchain.toml` — the pinned Rust toolchain compiles that harness — and `.github/workflows/ci.yml`), and both console jobs ('console (typecheck + test)' and 'console (journey e2e)') are gated by the `console` filter (inputs `console/**`, `process-explorer/**` — the shared Process Explorer package the console builds from source —, `spec-console/**`, `spec-app/**`, `spec/**` — the console's generated Camunda REST subset client derives from it —, `.github/workflows/ci.yml`, `AGENTS.md`, and `.mergify.yml`; the typecheck job additionally runs on the `docs` filter for its bundled-docs guard), so each is SKIPPED for PRs (and merge_group batches) that don't touch its inputs (e.g. a Rust-only PR skips both console jobs; a console-only PR skips every code check) and RUNS when they do. A skipped check never reports success, so each accepts 'skipped' too (required-when-run, skip-tolerant). Without this, a merge orchestrator that treats a skipped required check as unsatisfied blocks console-only PRs that GitHub itself reports as CLEAN. 'console (typecheck + test)' is required because it is the only gate on the console `tsc -p tsconfig.test.json` type surface and the `src/gen` / `src/gen-c8` client-drift guard; leaving it non-required let a foundation slice that added a REQUIRED field to a console generated type (without updating the e2e fixture defaults in console/e2e/fixtures.ts) land on main red, forcing each following slice to repair the prior slice's break (epic #1119).",
   "doc": "AGENTS.md#merging-prs"
 }
 ```

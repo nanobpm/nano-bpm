@@ -1,0 +1,16 @@
+{
+  "description": "An interrupting timer (PT1M) event sub-process terminates the running service task when the clock passes its due date.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "esp-timer-interrupting",
+      "variables": {
+        "orderId": "order-1"
+      }
+    },
+    {
+      "op": "advanceClock",
+      "millis": 60000
+    }
+  ]
+}

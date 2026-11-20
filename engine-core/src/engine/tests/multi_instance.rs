@@ -418,7 +418,7 @@ fn multi_instance_child_input_mapping_failure_raises_io_mapping_and_reactivates(
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("factor".to_string(), Value::Int(5))]),
+            BTreeMap::from([("factor".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     engine
@@ -888,7 +888,7 @@ fn parallel_multi_instance_on_a_subprocess_fans_out_one_scope_per_item() {
     // body until the last one completes. Complete the children in a deliberately
     // shuffled order (last item first, first item last) so that if aggregation
     // accidentally depended on completion order the assert below would catch it.
-    let by_task: std::collections::HashMap<String, u64> =
+    let by_task: std::collections::BTreeMap<String, u64> =
         jobs.iter().map(|j| (bound_task(j), j.key)).collect();
     for task in ["s551", "s549", "s550"] {
         assert!(!engine.is_completed(key));

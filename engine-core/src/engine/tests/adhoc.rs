@@ -75,7 +75,7 @@ fn interrupting_boundary_on_a_multi_instance_adhoc_tears_down_every_container() 
     engine
         .apply_command(Command::complete_job_with_result(
             agents[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("InnerTask")],
                 ..Default::default()
@@ -97,7 +97,7 @@ fn interrupting_boundary_on_a_multi_instance_adhoc_tears_down_every_container() 
     assert!(!engine.is_completed(inst));
 
     // The cancel message fires the interrupting boundary on the whole loop.
-    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    let fired = engine.correlate_message("probe-cancel", "C1", BTreeMap::new(), 0);
     assert_eq!(
         fired
             .iter()
@@ -197,7 +197,7 @@ fn early_multi_instance_completion_tears_down_an_active_adhoc_tool_child() {
     engine
         .apply_command(Command::complete_job_with_result(
             agents[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("InnerTask")],
                 ..Default::default()
@@ -223,7 +223,7 @@ fn early_multi_instance_completion_tears_down_an_active_adhoc_tool_child() {
     let fired = engine
         .apply_command(Command::complete_job_with_result(
             agents[1].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -319,7 +319,7 @@ fn multi_instance_adhoc_child_completes_normally_and_seeds_its_output_collection
         engine
             .apply_command(Command::complete_job_with_result(
                 agent.key,
-                HashMap::new(),
+                BTreeMap::new(),
                 crate::model::AdHocJobResult {
                     activate_elements: vec![activate_element("toolA")],
                     ..Default::default()
@@ -342,7 +342,7 @@ fn multi_instance_adhoc_child_completes_normally_and_seeds_its_output_collection
         engine
             .apply_command(Command::complete_job_with_result(
                 job.key,
-                HashMap::from([("result".to_string(), Value::Int(7))]),
+                BTreeMap::from([("result".to_string(), Value::Int(7))]),
                 crate::model::AdHocJobResult::default(),
             ))
             .unwrap();
@@ -352,7 +352,7 @@ fn multi_instance_adhoc_child_completes_normally_and_seeds_its_output_collection
         engine
             .apply_command(Command::complete_job_with_result(
                 agent.key,
-                HashMap::new(),
+                BTreeMap::new(),
                 crate::model::AdHocJobResult::default(),
             ))
             .unwrap();
@@ -446,7 +446,7 @@ fn multi_instance_declarative_adhoc_child_activates_its_collection_without_a_job
         engine
             .apply_command(Command::complete_job_with(
                 job.key,
-                HashMap::from([("result".to_string(), Value::Str("x".to_string()))]),
+                BTreeMap::from([("result".to_string(), Value::Str("x".to_string()))]),
             ))
             .unwrap();
     }
@@ -616,7 +616,7 @@ fn adhoc_tool_input_mapping_failure_raises_io_mapping_and_reactivates() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -647,7 +647,7 @@ fn adhoc_tool_input_mapping_failure_raises_io_mapping_and_reactivates() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("base".to_string(), Value::Int(5))]),
+            BTreeMap::from([("base".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     engine
@@ -686,7 +686,7 @@ fn adhoc_tool_fromai_input_mapping_returns_llm_value_without_incident() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element_with(
                     "toolA",
@@ -745,7 +745,7 @@ fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![
                     activate_element_with("toolA", &[("fromActivation", Value::Str("A".into()))]),
@@ -793,7 +793,7 @@ fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
     };
     assert_eq!(
         *tool_a.variables,
-        HashMap::from([
+        BTreeMap::from([
             ("fromActivation".to_string(), Value::Str("A".into())),
             ("adHocSubProcessElements".to_string(), expected_catalog()),
             ("results".to_string(), Value::List(vec![])),
@@ -805,7 +805,7 @@ fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
     );
     assert_eq!(
         *tool_b.variables,
-        HashMap::from([
+        BTreeMap::from([
             ("fromActivation".to_string(), Value::Str("B".into())),
             ("adHocSubProcessElements".to_string(), expected_catalog()),
             ("results".to_string(), Value::List(vec![])),
@@ -1161,7 +1161,7 @@ fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -1190,7 +1190,7 @@ fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
     let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
     assert_eq!(tool_jobs.len(), 2, "both tools produced jobs");
     for (job, val) in tool_jobs.iter().zip(["A", "B"]) {
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("result".to_string(), Value::Str(val.to_string()));
         engine
             .apply_command(Command::complete_job_with(job.key, vars))
@@ -1234,7 +1234,7 @@ fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
     let final_events = engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -1296,7 +1296,7 @@ fn adhoc_tools_run_under_a_dedicated_inner_instance_element() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -1352,7 +1352,7 @@ fn adhoc_tools_run_under_a_dedicated_inner_instance_element() {
     // element instance survives in the read model.
     let first = tool_jobs[0].element_instance_key;
     let first_inner = inners[0];
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("A".to_string()));
     engine
         .apply_command(Command::complete_job_with(tool_jobs[0].key, vars))
@@ -1403,7 +1403,7 @@ fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
     let activated = engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("ask")],
                 ..Default::default()
@@ -1450,7 +1450,7 @@ fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
 
     // Complete the human task with an output; it flows through the container's
     // `outputElement` and, as the last active tool, re-emits the agent job.
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("approved".to_string()));
     engine
         .apply_command(Command::complete_user_task_with(user_task_key, vars))
@@ -1491,7 +1491,7 @@ fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
     let final_events = engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -1547,7 +1547,7 @@ fn interrupting_boundary_on_adhoc_cancels_an_activated_tool() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("InnerTask")],
                 ..Default::default()
@@ -1571,7 +1571,7 @@ fn interrupting_boundary_on_adhoc_cancels_an_activated_tool() {
     // The cancel message arrives: the interrupting boundary fires and must tear
     // down the whole ad-hoc scope, then route its own outgoing flow to
     // `EndInterrupted`.
-    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    let fired = engine.correlate_message("probe-cancel", "C1", BTreeMap::new(), 0);
     assert!(
         fired.iter().any(|e| matches!(
             e,
@@ -1648,7 +1648,7 @@ fn interrupting_boundary_on_adhoc_cancels_an_in_flight_agent_job() {
     // The cancel message arrives while the agent job is still in flight: the
     // interrupting boundary must cancel that job (not leave it activated) and
     // route its own outgoing flow to `EndInterrupted`.
-    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    let fired = engine.correlate_message("probe-cancel", "C1", BTreeMap::new(), 0);
     assert!(
         fired.iter().any(|e| matches!(
             e,
@@ -1709,7 +1709,7 @@ fn adhoc_inner_sequence_flow_chains_to_the_follow_up_tool() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1735,7 +1735,7 @@ fn adhoc_inner_sequence_flow_chains_to_the_follow_up_tool() {
     let chain_events = engine
         .apply_command(Command::complete_job_with(
             tool_a.key,
-            HashMap::from([("result".to_string(), Value::Str("A".into()))]),
+            BTreeMap::from([("result".to_string(), Value::Str("A".into()))]),
         ))
         .unwrap();
     assert!(
@@ -1780,7 +1780,7 @@ fn adhoc_inner_sequence_flow_chains_to_the_follow_up_tool() {
     engine
         .apply_command(Command::complete_job_with(
             tool_b.key,
-            HashMap::from([("result".to_string(), Value::Str("B".into()))]),
+            BTreeMap::from([("result".to_string(), Value::Str("B".into()))]),
         ))
         .unwrap();
     let adhoc = engine
@@ -1820,7 +1820,7 @@ fn adhoc_inner_sequence_flow_chains_to_the_follow_up_tool() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -1860,7 +1860,7 @@ fn adhoc_mid_chain_handoff_skips_already_completed_inner_instance() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1903,7 +1903,7 @@ fn adhoc_mid_chain_handoff_skips_already_completed_inner_instance() {
     let events = engine
         .apply_command(Command::complete_job_with(
             tool_a.key,
-            HashMap::from([("result".to_string(), Value::Str("A".into()))]),
+            BTreeMap::from([("result".to_string(), Value::Str("A".into()))]),
         ))
         .unwrap();
     assert!(
@@ -1960,7 +1960,7 @@ fn adhoc_completion_condition_fires_on_the_mid_chain_handoff() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1978,7 +1978,7 @@ fn adhoc_completion_condition_fires_on_the_mid_chain_handoff() {
     let events = engine
         .apply_command(Command::complete_job_with(
             tool_a.key,
-            HashMap::from([
+            BTreeMap::from([
                 ("done".to_string(), Value::Bool(true)),
                 ("result".to_string(), Value::Str("A".into())),
             ]),
@@ -2072,7 +2072,7 @@ fn adhoc_agent_runs_an_embedded_subprocess_tool_body_by_token_flow() {
     let activated = engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("review")],
                 ..Default::default()
@@ -2115,7 +2115,7 @@ fn adhoc_agent_runs_an_embedded_subprocess_tool_body_by_token_flow() {
     // Completing the inner user task drains the tool body to its end event,
     // which completes the tool — feeding the container's outputCollection and
     // re-emitting the agent job for the next turn.
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("approved".to_string()));
     engine
         .apply_command(Command::complete_user_task_with(user_task_key, vars))
@@ -2172,7 +2172,7 @@ fn adhoc_subprocess_tool_body_routes_through_a_gateway_before_completing() {
     let activated = engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("review")],
                 ..Default::default()
@@ -2193,7 +2193,7 @@ fn adhoc_subprocess_tool_body_routes_through_a_gateway_before_completing() {
 
     // The reviewer approves: the body must route the gateway to the offer branch
     // and drain to that end event, completing the tool.
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("decision".to_string(), Value::Str("approve".to_string()));
     engine
         .apply_command(Command::complete_user_task_with(officer_task, vars))
@@ -2222,6 +2222,140 @@ fn adhoc_subprocess_tool_body_routes_through_a_gateway_before_completing() {
 }
 
 #[test]
+fn adhoc_subprocess_tool_arms_and_disarms_its_event_subprocesses() {
+    // Review advisory (round 3): an embedded-subProcess ad-hoc tool activates
+    // through `activate_adhoc_tool`, bypassing the activation body where event
+    // sub-processes are otherwise armed — so an ESP inside the tool's body
+    // must be armed there, and disarmed when the tool completes.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:subProcess id="review">
+              <bpmn:startEvent id="r_s" />
+              <bpmn:userTask id="ask">
+                <bpmn:extensionElements>
+                  <zeebe:assignmentDefinition assignee="alice" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="r_e" />
+              <bpmn:sequenceFlow id="rf1" sourceRef="r_s" targetRef="ask" />
+              <bpmn:sequenceFlow id="rf2" sourceRef="ask" targetRef="r_e" />
+              <bpmn:subProcess id="esp" triggeredByEvent="true">
+                <bpmn:startEvent id="esp_s" isInterrupting="false">
+                  <bpmn:signalEventDefinition signalRef="Sig" />
+                </bpmn:startEvent>
+                <bpmn:serviceTask id="esp_w">
+                  <bpmn:extensionElements>
+                    <zeebe:taskDefinition type="esp-work" />
+                  </bpmn:extensionElements>
+                </bpmn:serviceTask>
+                <bpmn:endEvent id="esp_e" />
+                <bpmn:sequenceFlow id="esf1" sourceRef="esp_s" targetRef="esp_w" />
+                <bpmn:sequenceFlow id="esf2" sourceRef="esp_w" targetRef="esp_e" />
+              </bpmn:subProcess>
+            </bpmn:subProcess>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:signal id="Sig" name="tool-signal" />
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let _inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+
+    // The ESP is not armed before its host (the tool's subProcess) exists.
+    assert!(
+        engine.state().signal_subscriptions.is_empty(),
+        "no ESP trigger armed before the tool is activated"
+    );
+
+    // Turn 1: activate the embedded subProcess tool. Its scope opens here —
+    // bypassing the activation body — so this is where its ESP must arm.
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            BTreeMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("review")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let ask_task = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                user_task_key,
+                element_id,
+                ..
+            } if element_id == "ask" => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("the tool body runs (#872)");
+    assert_eq!(
+        engine.state().signal_subscriptions.len(),
+        1,
+        "activating the subProcess tool arms its event sub-process: \
+         {:?}",
+        engine.state().signal_subscriptions
+    );
+
+    // The armed trigger fires inside the tool's scope. A non-interrupting ESP
+    // trigger STAYS armed after firing (it can fire again), so the signal
+    // subscription remains open alongside the running `esp-work` job.
+    engine
+        .apply_command(Command::BroadcastSignal {
+            signal_name: "tool-signal".into(),
+            variables: BTreeMap::new(),
+        })
+        .unwrap();
+    assert!(
+        engine
+            .state()
+            .jobs
+            .values()
+            .any(|j| j.job_type == "esp-work"),
+        "the tool's event sub-process fired on the signal"
+    );
+
+    // Complete the tool body fully — the human task AND the ESP's job — so the
+    // tool drains and completes, disarming its (still-armed, non-interrupting)
+    // ESP trigger.
+    engine
+        .apply_command(Command::complete_user_task_with(ask_task, BTreeMap::new()))
+        .unwrap();
+    complete_one(&mut engine, "esp-work");
+    assert!(
+        engine
+            .state()
+            .signal_subscriptions
+            .values()
+            .all(|s| s.state != crate::state::MessageSubscriptionState::Open),
+        "completing the subProcess tool disarms its event sub-process: \
+         {:?}",
+        engine.state().signal_subscriptions
+    );
+}
+
+#[test]
 fn adhoc_cancel_remaining_tears_down_an_open_subprocess_tool_body() {
     // Defect-class guard (#872): cancelling the container while an embedded
     // subProcess tool's body is mid-flight (an open human task inside it) must
@@ -2244,7 +2378,7 @@ fn adhoc_cancel_remaining_tears_down_an_open_subprocess_tool_body() {
     let activated = engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("review")],
                 ..Default::default()
@@ -2340,7 +2474,7 @@ fn adhoc_subprocess_tool_read_model_tree_nests_container_inner_tool_and_body() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("review")],
                 ..Default::default()
@@ -2425,7 +2559,7 @@ fn adhoc_output_collection_grows_and_is_visible_during_the_run() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -2434,7 +2568,7 @@ fn adhoc_output_collection_grows_and_is_visible_during_the_run() {
         .unwrap();
     let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
     for (job, val) in tool_jobs.iter().zip(["A", "B"]) {
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("result".to_string(), Value::Str(val.to_string()));
         engine
             .apply_command(Command::complete_job_with(job.key, vars))
@@ -2480,7 +2614,7 @@ fn adhoc_agent_cancel_remaining_instances_completes_container() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 cancel_remaining_instances: true,
                 ..Default::default()
@@ -2550,7 +2684,7 @@ fn adhoc_completion_condition_ends_the_loop_and_cancels_remaining_tools() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -2577,7 +2711,7 @@ fn adhoc_completion_condition_ends_the_loop_and_cancels_remaining_tools() {
         .iter()
         .find(|j| j.element_id == "toolA")
         .expect("toolA job");
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("done".to_string(), Value::Bool(true));
     vars.insert("result".to_string(), Value::Str("A".to_string()));
     let final_events = engine
@@ -2603,6 +2737,99 @@ fn adhoc_completion_condition_ends_the_loop_and_cancels_remaining_tools() {
         results,
         Some(Value::List(vec![Value::Str("A".to_string())])),
         "only the completed tool's output is collected; toolB was cancelled"
+    );
+}
+
+#[test]
+fn adhoc_completion_condition_eval_failure_raises_incident_with_message() {
+    // A `<completionCondition>` that fails to evaluate (here: a FEEL type error,
+    // `done + 1` over a boolean) is an EXTRACT_VALUE_ERROR incident on the
+    // completing tool — never a silent "not yet" (#1398). The incident reason
+    // must carry the wrapped failure MESSAGE ("Failed to evaluate completion
+    // condition. …"): a regression that drops the message (e.g. deleting the
+    // `message` field of the `expression::Failure` built in
+    // `Engine::adhoc_completion_after_tool`) leaves operators an empty reason.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:completionCondition>=done + 1</bpmn:completionCondition>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+
+    // Turn 1: activate toolA.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            BTreeMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // Complete toolA: evaluating `=done + 1` against its output (`done` a
+    // boolean) fails, so the tool completion halts on an incident.
+    let tool_a = engine
+        .activate_jobs("tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("toolA job emitted");
+    let events = engine
+        .apply_command(Command::complete_job_with(
+            tool_a.key,
+            BTreeMap::from([("done".to_string(), Value::Bool(true))]),
+        ))
+        .unwrap();
+
+    let reasons: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::IncidentRaised { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons.len(), 1, "exactly one incident, got {events:?}");
+    assert!(
+        reasons[0].starts_with("Failed to evaluate completion condition. "),
+        "the incident reason carries the wrapped completion-condition failure \
+         message, got {:?}",
+        reasons[0]
+    );
+    assert!(
+        reasons[0].contains("=done + 1"),
+        "the incident reason keeps the underlying evaluation failure (which \
+         names the offending expression), got {:?}",
+        reasons[0]
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the failed tool completion parks"
     );
 }
 
@@ -2645,7 +2872,7 @@ fn adhoc_completion_condition_defers_when_cancel_remaining_is_false() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -2667,7 +2894,7 @@ fn adhoc_completion_condition_defers_when_cancel_remaining_is_false() {
         .find(|j| j.element_id == "toolB")
         .expect("toolB job")
         .clone();
-    let mut vars_a = HashMap::new();
+    let mut vars_a = BTreeMap::new();
     vars_a.insert("done".to_string(), Value::Bool(true));
     vars_a.insert("result".to_string(), Value::Str("A".to_string()));
     engine
@@ -2697,7 +2924,7 @@ fn adhoc_completion_condition_defers_when_cancel_remaining_is_false() {
 
     // Complete toolB: no active children remain, so the deferred container now
     // completes — collecting toolB's output as well.
-    let mut vars_b = HashMap::new();
+    let mut vars_b = BTreeMap::new();
     vars_b.insert("result".to_string(), Value::Str("B".to_string()));
     let final_events = engine
         .apply_command(Command::complete_job_with(job_b.key, vars_b))
@@ -2752,7 +2979,7 @@ fn adhoc_tool_io_mapping_applies_inputs_on_activation_and_outputs_on_completion(
     let inst = engine
         .apply_command(Command::create_instance_with(
             "p",
-            HashMap::from([("base".to_string(), Value::Int(1))]),
+            BTreeMap::from([("base".to_string(), Value::Int(1))]),
         ))
         .unwrap()
         .iter()
@@ -2770,7 +2997,7 @@ fn adhoc_tool_io_mapping_applies_inputs_on_activation_and_outputs_on_completion(
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -2811,7 +3038,7 @@ fn adhoc_tool_io_mapping_applies_inputs_on_activation_and_outputs_on_completion(
     engine
         .apply_command(Command::complete_job_with(
             job.key,
-            HashMap::from([("result".to_string(), Value::Str("ok".to_string()))]),
+            BTreeMap::from([("result".to_string(), Value::Str("ok".to_string()))]),
         ))
         .unwrap();
     assert!(
@@ -2843,7 +3070,7 @@ fn adhoc_agent_completion_flag_with_activations_is_rejected() {
     let err = engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 completion_condition_fulfilled: true,
@@ -2886,7 +3113,7 @@ fn adhoc_agent_completion_flag_alone_completes_and_cancels() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -2925,7 +3152,7 @@ fn adhoc_declarative_activates_collection_elements_without_a_job() {
     let inst = create_instance_with_vars(
         &mut engine,
         "p",
-        HashMap::from([(
+        BTreeMap::from([(
             "tools".to_string(),
             Value::List(vec![
                 Value::Str("toolA".to_string()),
@@ -2974,7 +3201,7 @@ fn adhoc_declarative_activates_collection_elements_without_a_job() {
     assert_eq!(tool_jobs.len(), 2, "both named tools produced jobs");
     let mut final_events = Vec::new();
     for (job, val) in tool_jobs.iter().zip(["A", "B"]) {
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("result".to_string(), Value::Str(val.to_string()));
         final_events = engine
             .apply_command(Command::complete_job_with(job.key, vars))
@@ -3020,7 +3247,7 @@ fn adhoc_declarative_empty_collection_completes_immediately() {
     let inst = create_instance_with_vars(
         &mut engine,
         "p",
-        HashMap::from([("tools".to_string(), Value::List(vec![]))]),
+        BTreeMap::from([("tools".to_string(), Value::List(vec![]))]),
     );
     assert!(
         engine.is_completed(inst),
@@ -3050,7 +3277,7 @@ fn adhoc_declarative_unknown_collection_ids_raise_an_incident() {
     let inst = create_instance_with_vars(
         &mut engine,
         "p",
-        HashMap::from([(
+        BTreeMap::from([(
             "tools".to_string(),
             Value::List(vec![
                 Value::Str("toolA".to_string()),
@@ -3074,7 +3301,7 @@ fn adhoc_declarative_unknown_collection_ids_raise_an_incident() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([(
+            BTreeMap::from([(
                 "tools".to_string(),
                 Value::List(vec![Value::Str("toolA".to_string())]),
             )]),
@@ -3120,7 +3347,7 @@ fn nested_adhoc_tool_stands_up_a_second_level_container_and_propagates_completio
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("subagent")],
                 ..Default::default()
@@ -3168,7 +3395,7 @@ fn nested_adhoc_tool_stands_up_a_second_level_container_and_propagates_completio
     engine
         .apply_command(Command::complete_job_with_result(
             sub_agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("leaf")],
                 ..Default::default()
@@ -3180,7 +3407,7 @@ fn nested_adhoc_tool_stands_up_a_second_level_container_and_propagates_completio
         .into_iter()
         .find(|j| j.element_id == "leaf")
         .expect("leaf tool job emitted inside the nested container");
-    let mut leaf_vars = HashMap::new();
+    let mut leaf_vars = BTreeMap::new();
     leaf_vars.insert("leafOut".to_string(), Value::Str("deep".into()));
     engine
         .apply_command(Command::complete_job_with(leaf.key, leaf_vars))
@@ -3205,7 +3432,7 @@ fn nested_adhoc_tool_stands_up_a_second_level_container_and_propagates_completio
         .apply_command(Command::complete_job_with_result(
             sub_agent2.key,
             {
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert("result".to_string(), Value::Str("nested-done".into()));
                 m
             },
@@ -3238,7 +3465,7 @@ fn nested_adhoc_tool_stands_up_a_second_level_container_and_propagates_completio
     let final_events = engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -3282,7 +3509,7 @@ fn nested_adhoc_read_model_element_tree_nests_correctly() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("subagent")],
                 ..Default::default()
@@ -3298,7 +3525,7 @@ fn nested_adhoc_read_model_element_tree_nests_correctly() {
     engine
         .apply_command(Command::complete_job_with_result(
             sub_agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("leaf")],
                 ..Default::default()
@@ -3364,7 +3591,7 @@ fn nested_adhoc_completion_condition_cancels_remaining_and_feeds_parent() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("subagent")],
                 ..Default::default()
@@ -3382,7 +3609,7 @@ fn nested_adhoc_completion_condition_cancels_remaining_and_feeds_parent() {
     engine
         .apply_command(Command::complete_job_with_result(
             sub_agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("leaf1"), activate_element("leaf2")],
                 ..Default::default()
@@ -3410,7 +3637,7 @@ fn nested_adhoc_completion_condition_cancels_remaining_and_feeds_parent() {
         .iter()
         .find(|j| j.element_id == "leaf1")
         .expect("leaf1 job");
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("leafOut".to_string(), Value::Str("x".into()));
     vars.insert("done".to_string(), Value::Bool(true));
     engine
@@ -3472,7 +3699,7 @@ fn nested_adhoc_completion_condition_cancels_remaining_and_feeds_parent() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -3508,7 +3735,7 @@ fn nested_adhoc_parent_cancel_recursively_tears_down_nested_container() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("subagent")],
                 ..Default::default()
@@ -3527,7 +3754,7 @@ fn nested_adhoc_parent_cancel_recursively_tears_down_nested_container() {
     engine
         .apply_command(Command::complete_job_with_result(
             sub_agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("leaf")],
                 ..Default::default()
@@ -3626,7 +3853,7 @@ fn nested_adhoc_cancel_child_skips_already_completed_inner_instance() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("subagent")],
                 ..Default::default()
@@ -3724,7 +3951,7 @@ fn adhoc_call_activity_tool_spawns_child_and_maps_its_real_output() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -3827,7 +4054,7 @@ fn adhoc_call_activity_tool_spawns_child_and_maps_its_real_output() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -3870,7 +4097,7 @@ fn adhoc_call_activity_tool_output_mapping_evaluated_once_for_chained_mappings()
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -3923,7 +4150,7 @@ fn adhoc_call_activity_tool_output_mapping_evaluated_once_for_chained_mappings()
     engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -3968,7 +4195,7 @@ fn adhoc_call_activity_tool_output_mapping_single_pass_through_chained_flow() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -4046,7 +4273,7 @@ fn adhoc_call_activity_tool_propagates_parent_and_child_variables() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -4144,7 +4371,7 @@ fn adhoc_cancel_remaining_terminates_a_running_call_activity_tool_child() {
     let activated = engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -4222,7 +4449,7 @@ fn adhoc_call_activity_tool_output_failure_preserves_child_result_for_redrive() 
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -4366,7 +4593,7 @@ fn interrupting_boundary_on_adhoc_resolves_the_container_root_incident() {
     // The interrupting message boundary fires while the container carries that
     // incident: the failed agent job is cancelled and the root incident is
     // resolved — not left ACTIVE on the removed container.
-    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    let fired = engine.correlate_message("probe-cancel", "C1", BTreeMap::new(), 0);
     assert!(
         fired
             .iter()
@@ -4482,4 +4709,94 @@ fn error_caught_at_adhoc_cancels_the_failed_agent_job_before_resolving() {
     );
     assert!(engine.active_incidents().is_empty());
     assert!(engine.is_completed(inst));
+}
+
+/// #1193 review: a user-task ad-hoc TOOL whose `versionTag`-bound form is
+/// missing parks on a resolvable incident. Leaf tools live only in the
+/// container's catalog (pruned from the executable graph), so the generic
+/// activation-body retry could not see them: resolving cleared the incident
+/// without ever creating the task, stranding the tool child active forever.
+/// The catalog-aware retry must resume the SAME child and create its task.
+#[test]
+fn adhoc_user_task_tool_form_miss_resolution_creates_the_task() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-agent" />
+            </bpmn:extensionElements>
+            <bpmn:userTask id="InnerTask">
+              <bpmn:extensionElements>
+                <zeebe:userTask />
+                <zeebe:formDefinition formId="tool-form" bindingType="versionTag" versionTag="v1" />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Host" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with("p", vars(&[])))
+        .unwrap();
+    let agent = engine.activate_jobs("probe-agent", "W", 1, 1_000, 0);
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent[0].key,
+            BTreeMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("InnerTask")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(
+        activated
+            .iter()
+            .all(|e| !matches!(e, Event::UserTaskCreated { .. })),
+        "a form miss creates no task"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    let (incident_key, child_key) = (incidents[0].key, incidents[0].element_instance_key);
+
+    engine
+        .apply_command(Command::DeployForms(vec![crate::command::FormResource {
+            id: "tool-form".to_string(),
+            resource_name: "tool-form.form".to_string(),
+            schema: r#"{"id":"tool-form","components":[]}"#.to_string(),
+            version_tag: Some("v1".to_string()),
+        }]))
+        .unwrap();
+    let form_key = engine.state().forms["tool-form"].key;
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let created = resolved.iter().find_map(|e| match e {
+        Event::UserTaskCreated {
+            element_instance_key,
+            form_key,
+            ..
+        } => Some((*element_instance_key, *form_key)),
+        _ => None,
+    });
+    assert_eq!(
+        created,
+        Some((child_key, Some(form_key))),
+        "resolution resumes the SAME tool child and creates its task: {resolved:?}"
+    );
+    assert!(
+        resolved
+            .iter()
+            .all(|e| !matches!(e, Event::ElementActivated { .. })),
+        "the parked child is resumed, never re-activated"
+    );
+    assert!(engine.active_incidents().is_empty());
 }

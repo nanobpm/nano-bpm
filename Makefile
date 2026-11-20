@@ -44,10 +44,12 @@ UV := uv
 REST_SPEC_SRCS := $(wildcard $(PROJECT_ROOT)/spec/*.yaml) \
 	$(wildcard $(PROJECT_ROOT)/spec-patches/*.yaml) \
 	$(PROJECT_ROOT)/openapi-generator-config.yaml \
-	$(PROJECT_ROOT)/scripts/generate.sh
+	$(PROJECT_ROOT)/scripts/generate.sh \
+	$(PROJECT_ROOT)/scripts/lib-openapi-generator.sh
 CONSOLE_SPEC_SRCS := $(PROJECT_ROOT)/spec-console/console-api.yaml \
 	$(PROJECT_ROOT)/openapi-generator-config-console.yaml \
-	$(PROJECT_ROOT)/scripts/generate-console.sh
+	$(PROJECT_ROOT)/scripts/generate-console.sh \
+	$(PROJECT_ROOT)/scripts/lib-openapi-generator.sh
 
 # Canonical formatter: pinned nightly rustfmt. The repo's rustfmt.toml uses
 # unstable options (group_imports), which stable `cargo fmt` silently ignores —
@@ -393,6 +395,10 @@ engine-wasm-ffi-dist: engine-wasm-ffi ## Emit the release FFI wasm + manifest in
 .PHONY: engine-wasm-agent-instance-e2e
 engine-wasm-agent-instance-e2e: console-wasm ## Run the AgentInstance/AgentHistory end-to-end probe against the engine-wasm/pkg read-model TestEngine (built from source by console-wasm) (needs node). Guards the AgentInstance driver + read methods on the exported wasm surface and their REST parity (status/producedAt/object shapes).
 	cd $(WASM_DIR)/tests/agent-instance-e2e && npm install && npm test
+
+.PHONY: engine-wasm-event-subprocess-e2e
+engine-wasm-event-subprocess-e2e: console-wasm ## Run the event sub-process end-to-end probe (#1616) against engine-wasm/pkg (lean + read-model TestEngine, built from source by console-wasm) (needs node). Guards non-interrupting timer + interrupting message ESP execution on the shipped wasm surface.
+	cd $(WASM_DIR)/tests/event-subprocess-e2e && npm install && npm test
 
 .PHONY: engine-wasm-check
 engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)

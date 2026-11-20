@@ -14,7 +14,11 @@ use crate::peer::{PeerLink, PeerSet};
 /// returns its HTTP base URL. Models a peer node: a `PeerLink` connects to
 /// its `/cluster` channel exactly as a forwarding gateway would in a cluster.
 async fn serve_peer() -> String {
-    let server = crate::ServerImpl::default();
+    serve(crate::ServerImpl::default()).await
+}
+
+/// Serves `server`'s intra-cluster falcon endpoint; returns its base URL.
+async fn serve(server: crate::ServerImpl) -> String {
     let registry = crate::falcon::Registry::new();
     crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
     let app = crate::falcon::cluster_router(server, registry, None);
@@ -78,7 +82,9 @@ async fn peer_set_dials_lazily_and_forwards() {
     let topology = crate::cluster::Topology {
         node_id: 0,
         peers: vec!["http://self-unused".to_string(), peer_base],
-        num_partitions: 4,
+        // Must match the served peer's partition count: a mismatch is refused
+        // at the join handshake (#1661).
+        num_partitions: 1,
         replication_factor: 1,
     };
     let peers = PeerSet::new(topology);
@@ -183,6 +189,7 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
             None,
             None,
             Some(vec![1]),
+            None,
         )
         .await
         .expect("scoped publish returns a result");
@@ -196,7 +203,7 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
 
     // Unscoped (legacy): the publish reaches partition 0 and starts an instance.
     let res = link
-        .publish_message("order-placed".to_string(), order_id, None, None, None)
+        .publish_message("order-placed".to_string(), order_id, None, None, None, None)
         .await
         .expect("unscoped publish returns a result");
     assert_eq!(res.status, 200);
@@ -205,4 +212,426 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
         body.get("messageKey").is_some_and(|v| v.as_str().is_some()),
         "the unscoped publish fires partition 0 and mints a message key: {body}"
     );
+}
+
+/// #1600: an `operationReference` riding a forwarded `PublishMessage` frame
+/// must survive the Falcon hop AND persistence on the peer. A DISK-backed
+/// 4-partition peer receives the publish over a real `PeerLink`; every record
+/// the publish produces there — the `MessagePublished` on the correlation-key
+/// partition and the message-start instance on partition 0 — is journaled with
+/// the reference, while the forwarded deploy (sent unreferenced) carries none.
+/// Guards the peer-forward / Falcon-handler leg against silently dropping it.
+#[tokio::test]
+async fn forwarded_publish_persists_operation_reference_on_the_peer() {
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!(
+        "nanobpmn-1600-peer-ref-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let topology = crate::cluster::Topology {
+        node_id: 0,
+        peers: vec!["http://n0".to_string()],
+        num_partitions: 4,
+        replication_factor: 1,
+    };
+    let owned = topology.local_partitions();
+    let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("varstore"));
+    let (writer, recovery) =
+        crate::journal::SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore))
+            .expect("open segmented writer");
+    let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+        recovery.engines.into_iter().collect();
+    let journals: Vec<crate::Journal> = owned
+        .iter()
+        .map(|&p| {
+            let engine = engines
+                .remove(&p)
+                .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+            crate::Journal::from_engine_shared(p, engine, true, &writer)
+        })
+        .collect();
+    let server = crate::build_server_in_memory(journals, topology);
+    let registry = crate::falcon::Registry::new();
+    crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
+    let app = crate::falcon::cluster_router(server, registry, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let link = PeerLink::connect(&format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("connect to peer");
+
+    let intake_bpmn = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="intake">
+          <bpmn:startEvent id="s">
+            <bpmn:messageEventDefinition messageRef="Message_1" />
+          </bpmn:startEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="Message_1" name="order-placed" />
+      </bpmn:definitions>"#;
+    let res = link
+        .deploy(
+            vec![("intake.bpmn".to_string(), intake_bpmn.to_string())],
+            None,
+        )
+        .await
+        .expect("forwarded deploy");
+    assert_eq!(res.status, 200, "deploy should succeed: {res:?}");
+
+    // A correlation key off partition 0, so the publish spans two partitions.
+    let order_id = (0..)
+        .map(|i| format!("order-{i}"))
+        .find(|k| nanobpmn_engine_core::subscription_partition(k, 4) == 1)
+        .expect("some key hashes to partition 1");
+    const REF: i64 = 0x1600_0001;
+    let res = link
+        .publish_message(
+            "order-placed".to_string(),
+            order_id,
+            None,
+            None,
+            None,
+            Some(REF),
+        )
+        .await
+        .expect("forwarded publish returns a result");
+    assert_eq!(res.status, 200, "publish should be 200: {res:?}");
+
+    // Wait until the peer's journal holds the message-start completion.
+    let read_records = || -> Vec<nanobpmn_engine_core::Record> {
+        std::fs::read_dir(&dir)
+            .expect("read journal dir")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| crate::seglog::read_segment_records(&p).expect("read segment"))
+            .collect()
+    };
+    let mut records = read_records();
+    for _ in 0..200 {
+        if records.iter().any(|r| {
+            matches!(
+                r.event,
+                nanobpmn_engine_core::Event::ProcessInstanceCompleted { .. }
+            )
+        }) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        records = read_records();
+    }
+
+    let published: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.event,
+                nanobpmn_engine_core::Event::MessagePublished { .. }
+            )
+        })
+        .collect();
+    assert!(
+        !published.is_empty(),
+        "the publish journals MessagePublished"
+    );
+    for r in &published {
+        assert_eq!(r.operation_reference, Some(REF), "{r:?}");
+    }
+    let completed = records
+        .iter()
+        .find(|r| {
+            matches!(
+                r.event,
+                nanobpmn_engine_core::Event::ProcessInstanceCompleted { .. }
+            )
+        })
+        .expect("the message-start instance completes on the peer");
+    assert_eq!(completed.operation_reference, Some(REF), "{completed:?}");
+    let deployed: Vec<_> = records
+        .iter()
+        .filter(|r| matches!(r.event, nanobpmn_engine_core::Event::ProcessDeployed { .. }))
+        .collect();
+    assert!(!deployed.is_empty());
+    for r in &deployed {
+        assert_eq!(r.operation_reference, None, "unreferenced deploy: {r:?}");
+    }
+    drop(link);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0066 rolling-upgrade gate for cluster variables (#1657, PR #1670 review).
+//
+// The new cluster-variable command variants are Raft entries an older binary
+// cannot decode, so the gateway must emit nothing unless EVERY peer advertises
+// `FEATURE_CLUSTER_VARIABLES`. These drive a real multi-node layout: a gateway
+// (node 0, owning partition 0) plus served peers owning the other partitions.
+// ---------------------------------------------------------------------------
+
+/// Serves a real cluster node `node_id` of `topology` and returns its base URL
+/// plus a handle on its server (for asserting its partition state).
+async fn serve_cluster_node(
+    mut topology: crate::cluster::Topology,
+    node_id: u32,
+) -> (String, crate::ServerImpl) {
+    topology.node_id = node_id;
+    let journals: Vec<crate::Journal> = topology
+        .local_partitions()
+        .iter()
+        .map(|p| crate::Journal::in_memory_partition(*p))
+        .collect();
+    let server = crate::build_server_in_memory(journals, topology);
+    let registry = crate::falcon::Registry::new();
+    crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
+    let app = crate::falcon::cluster_router(server.clone(), registry, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (format!("http://127.0.0.1:{port}"), server)
+}
+
+/// An unreachable base URL (a bound-then-dropped ephemeral port).
+async fn unreachable_peer() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}")
+}
+
+fn cluster_topology(peers: Vec<String>) -> crate::cluster::Topology {
+    let n = peers.len() as u64;
+    crate::cluster::Topology {
+        node_id: 0,
+        peers,
+        num_partitions: n,
+        replication_factor: 1,
+    }
+}
+
+fn create_var(name: &str) -> nanobpmn_engine_core::Command {
+    nanobpmn_engine_core::Command::CreateClusterVariable {
+        tenant_id: None,
+        name: name.to_string(),
+        value: nanobpmn_engine_core::Value::Int(7),
+        kind: Default::default(),
+        metadata: Default::default(),
+        distributed: false,
+    }
+}
+
+/// Asserts a write was rejected 503 BEFORE any partition was touched: the
+/// gateway's partition 0 holds nothing, and so does every capable peer.
+async fn assert_rejected_untouched(
+    gateway: &crate::ServerImpl,
+    capable_peers: &[crate::ServerImpl],
+    name: &str,
+) {
+    let Err(err) = gateway.cluster_variable_mutate(create_var(name)).await else {
+        panic!("the write must fail closed");
+    };
+    assert_eq!(
+        err.0, 503,
+        "rolling-upgrade gate must answer 503: {}",
+        err.1
+    );
+    assert!(
+        gateway.cluster_variable_get(None, name).await.is_none(),
+        "partition 0 must be untouched by a rejected write"
+    );
+    for peer in capable_peers {
+        assert!(
+            peer.cluster_variable_get(None, name).await.is_none(),
+            "a capable peer's partition must be untouched by a rejected write"
+        );
+    }
+}
+
+/// All peers capable: the write commits on partition 0 AND its fan-out copy
+/// reaches the remotely-led partition 1 through the peer link.
+#[tokio::test]
+async fn cluster_variable_write_reaches_remote_partition_when_all_peers_capable() {
+    let (peer_base, peer) = serve_cluster_node(
+        cluster_topology(vec!["http://n0".into(), "http://n1".into()]),
+        1,
+    )
+    .await;
+    let gateway = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory_partition(0)],
+        cluster_topology(vec!["http://self-unused".into(), peer_base]),
+    );
+    let rec = gateway
+        .cluster_variable_mutate(create_var("ok"))
+        .await
+        .expect("an all-capable cluster accepts the write");
+    assert!(rec.is_some());
+    assert!(gateway.cluster_variable_get(None, "ok").await.is_some());
+    assert!(
+        peer.cluster_variable_get(None, "ok").await.is_some(),
+        "the fan-out copy must reach the remotely-led partition 1"
+    );
+}
+
+/// A peer whose `/cluster` join handshake advertises no
+/// `FEATURE_CLUSTER_VARIABLES` (an older binary, #1661 registry): the write is
+/// rejected and no partition (local, capable or legacy peer) is touched.
+#[tokio::test]
+async fn cluster_variable_write_rejected_for_featureless_peer() {
+    let topo = cluster_topology(vec![
+        "http://n0".into(),
+        "http://n1".into(),
+        "http://n2".into(),
+    ]);
+    let (capable_base, capable) = serve_cluster_node(topo.clone(), 1).await;
+    let (legacy_base, legacy) = serve_cluster_node(topo, 2).await;
+    legacy
+        .advertise_cluster_features
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let gateway = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory_partition(0)],
+        cluster_topology(vec!["http://self-unused".into(), capable_base, legacy_base]),
+    );
+    assert_rejected_untouched(&gateway, &[capable, legacy], "legacy").await;
+}
+
+/// An unreachable peer cannot confirm support: fail closed, nothing touched.
+#[tokio::test]
+async fn cluster_variable_write_rejected_for_unreachable_peer() {
+    let topo = cluster_topology(vec![
+        "http://n0".into(),
+        "http://n1".into(),
+        "http://n2".into(),
+    ]);
+    let (capable_base, capable) = serve_cluster_node(topo, 1).await;
+    let gone = unreachable_peer().await;
+    let gateway = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory_partition(0)],
+        cluster_topology(vec!["http://self-unused".into(), capable_base, gone]),
+    );
+    assert_rejected_untouched(&gateway, &[capable], "unreachable").await;
+}
+
+/// Serves node 0 of a two-node, one-partition cluster whose partition's
+/// REPLICATED lenient-completion flag is `lenient` (#1661), set through the
+/// journaled command. (A single node never requires peer features: it
+/// replicates its log to no one.)
+async fn serve_peer_lenient(lenient: bool) -> String {
+    let server = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory()],
+        crate::cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://self-unused".into(), "http://other-unused".into()],
+            num_partitions: 1,
+            replication_factor: 1,
+        },
+    );
+    for handle in server.engine.all() {
+        handle
+            .with(move |journal| {
+                let (_events, _commit) = journal
+                    .apply_command_at(
+                        nanobpmn_engine_core::Command::SetLenientCompletion { lenient },
+                        1,
+                    )
+                    .expect("set lenient");
+            })
+            .await;
+    }
+    serve(server).await
+}
+
+/// #1661: a joiner with the same `NANOBPMN_PARTITIONS` links, and learns the
+/// peer's replicated-command features from the handshake.
+#[tokio::test]
+async fn join_with_matching_partition_count_links_and_learns_features() {
+    let base = serve_peer_lenient(true).await;
+    let link = PeerLink::connect_as(&base, Some(1))
+        .await
+        .expect("same partition count joins");
+    assert!(
+        link.supports(nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION)
+    );
+}
+
+/// #1661: a joiner whose partition count differs is refused at the handshake,
+/// before any frame is exchanged — it would place keys on partitions the rest
+/// of the cluster routes elsewhere.
+#[tokio::test]
+async fn join_with_mismatched_partition_count_is_rejected() {
+    let base = serve_peer().await;
+    let err = match PeerLink::connect_as(&base, Some(4)).await {
+        Ok(_) => panic!("a partition-count mismatch must be refused at join"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err:?}").contains("409"),
+        "refused with 409 Conflict, got {err:?}"
+    );
+}
+
+/// #1661 rolling upgrade: once a node's replicated state carries
+/// `LenientCompletionSet`, a binary that does not advertise the feature (a
+/// pre-#1661 build: no handshake headers at all) is refused — it could not
+/// decode that command in the log it would replicate.
+#[tokio::test]
+async fn join_from_incompatible_binary_is_rejected_once_feature_is_in_use() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let base = serve_peer_lenient(true).await;
+    let url = format!("{}/cluster", base.replacen("http://", "ws://", 1));
+    let request = url.clone().into_client_request().expect("request");
+    let err = match tokio_tungstenite::connect_async(request).await {
+        Ok(_) => panic!("a featureless (pre-#1661) binary must be refused"),
+        Err(e) => e,
+    };
+    assert!(format!("{err:?}").contains("409"), "got {err:?}");
+
+    // A legacy binary still joins a node whose state does not yet depend on
+    // the feature (the rolling-upgrade window).
+    let plain = serve_peer_lenient(false).await;
+    let url = format!("{}/cluster", plain.replacen("http://", "ws://", 1));
+    tokio_tungstenite::connect_async(url.into_client_request().expect("request"))
+        .await
+        .expect("legacy binary joins before the feature is in use");
+}
+
+/// #1661 (outbound direction): once this node's replicated state requires a
+/// feature, it must not DIAL a member that restarted on an older binary — on
+/// either lane — or Raft would stream it entries it cannot decode.
+#[tokio::test]
+async fn outbound_link_to_incompatible_binary_is_refused_once_feature_is_required() {
+    use nano_falcon_protocol::cluster_join::FEATURE_REPLICATED_LENIENT_COMPLETION as F;
+    let old = crate::ServerImpl::default();
+    old.advertise_cluster_features
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let base = serve(old).await;
+    let err = match PeerLink::connect_requiring(&base, Some(1), &[F]).await {
+        Ok(_) => panic!("an outbound link to a featureless binary must be refused"),
+        Err(e) => e,
+    };
+    assert!(format!("{err:?}").contains(F), "got {err:?}");
+    // Before the requirement exists the same peer links (rolling upgrade).
+    let link = PeerLink::connect_requiring(&base, Some(1), &[])
+        .await
+        .expect("no requirement yet");
+    assert!(!link.supports(F));
 }

@@ -270,6 +270,15 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   (`timeDuration`) is retained with no due time (`next_due_at: None`) so it never
   fires again. Like all timers the engine stays **clock-free** and the schedule is
   durable across restarts.
+- **Conditional start events** (a process-level `startEvent` with a
+  `conditionalEventDefinition`) create instances on demand from a **conditional
+  evaluation**. They open no subscription: an `EvaluateConditionalStartEvents {
+  variables, process_definition_key }` command (the REST
+  `POST /v2/conditionals/evaluation`) evaluates every such start's FEEL condition
+  against the supplied variables — across the latest version of every deployed
+  process, or only the exact version a definition key names — and **creates a new
+  instance** (seeded with the variables) for each start whose condition is
+  `true`. A condition that errors or is non-boolean is simply not satisfied.
 - **Variables** can be merged into a scope with `SetVariables` (the scope key may
   be a process instance or any active element instance — nano keeps a single
   instance-level scope). Typically used to correct the data behind a gateway
@@ -292,6 +301,43 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   inner scope (like the error boundary) before routing out the boundary, while a
   **non-interrupting** one spawns a parallel token and leaves the inner scope
   running.
+- An **event sub-process** (`<subProcess triggeredByEvent="true">`, #1555) is a
+  container like an embedded sub-process but **never entered by token flow**:
+  while its enclosing scope (the process, or an embedded sub-process) is active,
+  its single typed start event's trigger is armed, and the event's occurrence
+  activates the sub-process. The parser models it as
+  `ElementKind::EventSubProcess` carrying its start event's trigger — message,
+  timer, signal, error, escalation or conditional — and its `isInterrupting`
+  flag (default `true`; an error start is always interrupting). At runtime
+  the message / timer / signal / conditional start triggers of every event
+  sub-process directly contained in a scope **arm when that scope activates**
+  and **disarm when it completes or is terminated**. An **interrupting**
+  trigger terminates the scope's other active children and disarms its other
+  event sub-process triggers, then runs the event sub-process; the scope
+  completes when it does. A **non-interrupting** trigger runs the event
+  sub-process concurrently and **repeatedly** (message / signal stay armed, a
+  timer cycle re-arms until its `Rn` repetition count is exhausted, #1596);
+  the scope waits for running ones before completing. **Error** (job error by
+  code, or catch-all without a code — always interrupting) and **escalation**
+  (by code or catch-all, interrupting or non-interrupting) start events catch
+  throws from within the scope, resolved outward scope by scope with Zeebe's
+  precedence: an exact code beats a catch-all, and an event sub-process beats
+  a boundary event of equal match; an uncaught error raises an
+  `UNHANDLED_ERROR` incident. Event payload variables (message / signal /
+  error) propagate from the host scope.
+  `ProcessDefinition::event_subprocesses_in_scope` enumerates the
+  event sub-processes directly contained in a scope.
+- An **error end event** (`<endEvent>` with an `<errorEventDefinition>`, #1592)
+  throws the referenced BPMN error on completion, resolved to a catch exactly
+  like a job-thrown error (`ThrowJobError`): the shared catch walk
+  (`Engine::find_error_catch`, Zeebe `CatchEventAnalyzer` parity) walks outward
+  from the throwing element instance through its enclosing scopes — an exact
+  code beats a catch-all, an error event sub-process beats an error boundary of
+  equal match. A catch interrupts the caught activity (the throwing token is
+  consumed by the throw) and routes the error-handling path; an uncaught error
+  raises an `UNHANDLED_ERROR` incident on the end event's element instance and
+  the token parks there (its `ElementCompleted` is not journaled), re-driven on
+  resolution — the same lifecycle as an unhandled job error.
 - A **call activity** invokes another deployed process as a distinct **child
   process instance** of its `calledElement` / `zeebe:calledElement processId`
   (Zeebe/C8 parity), linked back to the caller via `parentProcessInstanceKey` /
@@ -358,13 +404,19 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > **event-triggered instance creation**:
 > **message start events** (a matching message creates a new instance) and
 > **timer start events** (a one-shot `timeDuration` or recurring `timeCycle`
-> creates instances on a host clock tick), and **embedded sub-processes** (a
+> creates instances on a host clock tick), **conditional start events** (a
+> conditional evaluation whose variables satisfy the condition creates a new
+> instance), and **embedded sub-processes** (a
 > token scope whose inner flow runs to its own end before the sub-process routes
 > on, with **error, timer and message boundary events** attached to the
 > sub-process — an interrupting one terminates the whole inner scope and routes to
 > its handler), and **terminate end events** (an `endEvent` with a
 > `terminateEventDefinition` that kills the remaining tokens in its enclosing
-> scope, then completes that scope), and **escalation events** (an
+> scope, then completes that scope), and **error end events** (an `endEvent`
+> with an `errorEventDefinition` that throws the referenced BPMN error on
+> completion — caught by a matching error boundary or error event sub-process
+> exactly like a job-thrown error, else an `UNHANDLED_ERROR` incident), and
+> **escalation events** (an
 > `escalationEventDefinition` on an intermediate throw event or an escalation
 > **end event** raises an escalation that propagates up the scope hierarchy; an
 > **escalation boundary event** on a sub-process whose `escalationCode` matches —

@@ -513,7 +513,7 @@ fn listener_variables_merge_into_the_element_scope() {
         .apply_command(Command::create_instance("order"))
         .unwrap();
     let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("approved".to_string(), Value::Bool(true));
     engine
         .apply_command(Command::complete_job_with(listener[0].key, vars))
@@ -551,7 +551,7 @@ fn start_listener_completion_variables_are_element_local() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "listener-local",
-            HashMap::from([("amount".to_string(), Value::Int(10))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(10))]),
         ))
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -566,7 +566,7 @@ fn start_listener_completion_variables_are_element_local() {
     let done = engine
         .apply_command(Command::complete_job_with(
             listener[0].key,
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap();
 
@@ -633,7 +633,7 @@ fn end_listener_completion_variables_are_element_local() {
     let done = engine
         .apply_command(Command::complete_job_with(
             listener[0].key,
-            HashMap::from([("audited".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("audited".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
 
@@ -709,7 +709,7 @@ fn join_listener_completion_variables_are_element_local() {
     let done = engine
         .apply_command(Command::complete_job_with(
             listener[0].key,
-            HashMap::from([("approved".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("approved".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
     assert!(
@@ -768,7 +768,7 @@ fn terminate_end_listener_completion_is_journaled_once() {
     let done = engine
         .apply_command(Command::complete_job_with(
             job.key,
-            HashMap::from([("listenerType".to_string(), Value::Str("next".into()))]),
+            BTreeMap::from([("listenerType".to_string(), Value::Str("next".into()))]),
         ))
         .unwrap();
     let writes = done
@@ -825,7 +825,7 @@ fn listener_completion_on_an_unregistered_legacy_scope_still_reads_back() {
     engine
         .apply_command(Command::complete_job_with(
             listener[0].key,
-            HashMap::from([("approved".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("approved".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
     assert_eq!(
@@ -1169,7 +1169,7 @@ fn xml_declared_boundary_start_listener_fires_end_to_end() {
 
     // Trigger the boundary: the activity is interrupted, the boundary event
     // activates and parks on its parsed start listener rather than routing.
-    let fired = engine.broadcast_signal("kill-switch", HashMap::new(), 0);
+    let fired = engine.broadcast_signal("kill-switch", BTreeMap::new(), 0);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })));
@@ -1241,7 +1241,7 @@ fn xml_declared_boundary_end_listener_fires_end_to_end() {
     // activates. With only an `end` listener, it completes its activation body
     // and parks in COMPLETING on the parsed end-listener chain rather than
     // routing to `aborted`.
-    let fired = engine.broadcast_signal("kill-switch", HashMap::new(), 0);
+    let fired = engine.broadcast_signal("kill-switch", BTreeMap::new(), 0);
     assert!(fired
         .iter()
         .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })));
@@ -1675,7 +1675,7 @@ fn end_listener_fires_on_an_adhoc_container() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent[0].key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1699,7 +1699,7 @@ fn end_listener_fires_on_an_adhoc_container() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -2071,7 +2071,7 @@ fn task_listener_job_may_not_carry_variables() {
         .apply_command(Command::complete_user_task(key))
         .unwrap();
     let jobs = engine.activate_jobs("onComplete", "W", 10, 1_000, 0);
-    let vars = HashMap::from([("x".to_string(), Value::Bool(true))]);
+    let vars = BTreeMap::from([("x".to_string(), Value::Bool(true))]);
     assert!(matches!(
         engine.apply_command(Command::complete_job_with(jobs[0].key, vars)),
         Err(EngineError::TaskListenerJobWithVariables { .. })
@@ -2312,7 +2312,7 @@ fn start_listener_creation_incident_defers_activated_until_the_chain_drains() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("listenerType".to_string(), Value::Str("ls".into()))]),
+            BTreeMap::from([("listenerType".to_string(), Value::Str("ls".into()))]),
         ))
         .unwrap();
     all.extend(
@@ -2353,7 +2353,7 @@ fn modification_seeded_start_listener_chain_writes_one_activated() {
             vec![crate::command::ActivateElementInstruction {
                 element_id: "charge".into(),
                 variable_instructions: vec![crate::command::VariableInstruction {
-                    variables: HashMap::from([("x".to_string(), Value::Int(1))]),
+                    variables: BTreeMap::from([("x".to_string(), Value::Int(1))]),
                     scope_id: Some("charge".into()),
                 }],
                 ..Default::default()
@@ -2452,7 +2452,7 @@ fn legacy_snapshot_restores_owed_activation_for_a_parked_routing_incident() {
     engine
         .apply_command(Command::create_instance_with(
             "split-listener",
-            HashMap::from([("amount".to_string(), Value::Int(5))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     let incidents = engine.active_incidents();
@@ -2509,7 +2509,7 @@ fn legacy_snapshot_restores_owed_activation_for_a_parked_routing_incident() {
     restored
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap();
     let mut all = restored

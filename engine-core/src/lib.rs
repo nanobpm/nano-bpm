@@ -103,15 +103,19 @@ pub use agent::{
     AgentInstanceLimits, AgentInstanceMetrics, AgentInstanceMetricsDelta, AgentInstanceStatus,
     AgentLimitKind, AgentTool, AgentType, AGENT_LIMIT_UNLIMITED,
 };
-pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
-#[cfg(feature = "serde")]
-pub use command::form_id_of;
+pub use cluster_vars::{
+    ClusterVariable, ClusterVariableKind, ClusterVariableState, DEFAULT_TENANT,
+};
 pub use command::JobActivationOptions;
 pub use command::JobAttribution;
+#[cfg(feature = "serde")]
+pub use command::{form_id_of, form_version_tag_of};
 pub use command::{
-    ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference, FormResource,
-    GenericResource, MoveInstruction, MoveSource, UserTaskChangeset, VariableInstruction,
+    ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference,
+    DeploymentBundle, FormResource, GenericResource, MoveInstruction, MoveSource,
+    UserTaskChangeset, VariableInstruction,
 };
+pub use command::{OrphanIncidentStamp, OrphanKind};
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
 pub use engine::SNAPSHOT_FORMAT_VERSION;
@@ -124,28 +128,35 @@ pub use engine::{BreakCondition, DebugSession};
 pub use event::decode_event_json;
 pub use event::Event;
 pub use event::EventDecodeError;
+pub use event::Record;
+#[cfg(feature = "serde")]
+pub use event::{decode_record_json, encode_record_json};
 pub use event::{
-    MessageStartCorrelation, MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
-    MigratedSubscriptionTrigger, SubscriptionMigrationAction,
+    MessageStartCorrelation, MigratedChildInstance, MigratedCompensationSubscription,
+    MigratedElementInstance, MigratedSubscription, MigratedSubscriptionTrigger,
+    SubscriptionMigrationAction,
 };
 pub use feel::FeelError;
+#[cfg(feature = "serde")]
+pub use model::value_from_json;
 pub use model::{
-    AdHocActivateElement, AdHocImplementationType, AdHocJobResult, AdHocSubProcessDef, AdHocTool,
-    AdHocToolKind, BindingType, BuildError, Condition, Element, ElementId, ElementKind,
-    ExecutionListener, IncomingFlow, IoMapping, LinkedResource, ListenerEventType, Mapping,
-    MultiInstance, ProcessBuilder, ProcessDefinition, SequenceFlow, TaskListener,
-    TaskListenerEventType, TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections,
-    UserTaskProps, Value,
+    tool_name_of, tool_properties_of, AdHocActivateElement, AdHocImplementationType,
+    AdHocJobResult, AdHocSubProcessDef, AdHocTool, AdHocToolKind, BindingType, BuildError,
+    Condition, Element, ElementId, ElementKind, EventSubProcessTrigger, ExecutionListener,
+    IncomingFlow, IoMapping, LinkedResource, ListenerEventType, Mapping, MultiInstance,
+    ProcessBuilder, ProcessDefinition, SequenceFlow, TaskListener, TaskListenerEventType,
+    TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections, UserTaskProps, Value,
+    TOOL_NAME_PROPERTY, TOOL_PROPERTY_PREFIX,
 };
 pub use read_query::ReadQuery;
 pub use state::{
     compose_key, local_of, partition_of, restore_instance_snapshot, stable_hash,
-    subscription_partition, ConditionalSubscription, DeployedProcess, Incident, IncidentKind,
-    IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobSettlement,
-    JobSettlementOutcome, JobState, JobTerminalEnd, Key, MessageStartSubscription,
+    subscription_partition, ConditionalSubscription, DeployedProcess, DeployedResource, Incident,
+    IncidentKind, IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobSettlement,
+    JobSettlementOutcome, JobState, JobTerminalEnd, JoinKey, Key, MessageStartSubscription,
     MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
-    ProcessInstanceState, SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState,
-    UserTask, UserTaskState, DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK,
-    MAX_PARTITION_ID, PARTITION_BITS, ROUTED_DELIVERY_LEDGER_CAP, SETTLED_JOB_LEDGER_CAP,
-    SETTLED_TOKENS_PER_JOB_CAP,
+    ProcessInstanceState, SecretProvenance, SignalSubscription, StartTimer, State, Timer,
+    TimerKind, TimerState, UserTask, UserTaskState, VariablesLostTombstone, DEFAULT_JOB_PRIORITY,
+    DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, PARTITION_BITS,
+    ROUTED_DELIVERY_LEDGER_CAP, SETTLED_JOB_LEDGER_CAP, SETTLED_TOKENS_PER_JOB_CAP,
 };

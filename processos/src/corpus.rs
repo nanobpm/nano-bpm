@@ -21,7 +21,7 @@
 //! `<out>/traces/inst-*.json` (+ `metrics.json`, `expected.json`). Point a workspace
 //! process at `<out>` (or `<out>/traces`) and the Insights fold renders it.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
@@ -76,7 +76,7 @@ pub struct Pack {
     /// The arrival spike that drives the pathology.
     pub peak: Peak,
     /// Per-job-type infra model, keyed by `zeebe:taskDefinition type`.
-    pub jobs: HashMap<String, JobInfra>,
+    pub jobs: BTreeMap<String, JobInfra>,
     /// The input mix (categorical; weights need not sum to 1).
     pub inputs: Vec<InputCase>,
     /// The planted fault — what a correct inference must recover.
@@ -147,7 +147,7 @@ pub struct InputCase {
     #[serde(default = "default_weight")]
     pub weight: f64,
     #[serde(default)]
-    pub vars: HashMap<String, Json>,
+    pub vars: BTreeMap<String, Json>,
     #[serde(default)]
     #[allow(dead_code)] // documents the intended terminal; not asserted by the generator
     pub expected_outcome: Option<String>,
@@ -313,9 +313,9 @@ pub fn load_pack(pack_path: &Path) -> Result<(Pack, ProcessDefinition), String> 
     // Build the resolution library from the main BPMN plus every library entry
     // (a file, or a directory scanned for `*.bpmn`). A single BPMN file may
     // itself declare several `<process>` elements.
-    let mut library: HashMap<String, ProcessDefinition> = HashMap::new();
+    let mut library: BTreeMap<String, ProcessDefinition> = BTreeMap::new();
     let add_file = |path: &Path,
-                    library: &mut HashMap<String, ProcessDefinition>|
+                    library: &mut BTreeMap<String, ProcessDefinition>|
      -> Result<(), String> {
         let xml = std::fs::read_to_string(path)
             .map_err(|e| format!("read bpmn {}: {e}", path.display()))?;
@@ -564,7 +564,7 @@ struct InstancePath {
 fn run_path(
     def: &ProcessDefinition,
     process_id: &str,
-    input_vars: &HashMap<String, Json>,
+    input_vars: &BTreeMap<String, Json>,
     pack: &Pack,
     seed: u64,
     inst_index: u64,
@@ -572,7 +572,7 @@ fn run_path(
     let mut engine = Engine::new();
     let clock = 0u64;
     let _ = engine.apply_command_at(Command::DeployResources(vec![def.clone()]), clock);
-    let vars: HashMap<String, Value> = input_vars
+    let vars: BTreeMap<String, Value> = input_vars
         .iter()
         .map(|(k, v)| (k.clone(), json_to_value(v)))
         .collect();
@@ -659,7 +659,7 @@ fn run_path(
                 );
             } else {
                 let _ = engine
-                    .apply_command_at(Command::complete_job_with(job_key, HashMap::new()), clock);
+                    .apply_command_at(Command::complete_job_with(job_key, BTreeMap::new()), clock);
             }
         }
     }
@@ -870,7 +870,7 @@ struct Acc {
 /// Run the inference over a dataset directory (the folder containing `traces.json`
 /// or `traces/`).
 pub fn infer(dataset_dir: &Path, target_p99_wait_ms: u64) -> Result<Inference, String> {
-    let mut per: HashMap<(String, String), Acc> = HashMap::new();
+    let mut per: BTreeMap<(String, String), Acc> = BTreeMap::new();
     let mut job_types: Vec<String> = Vec::new();
 
     let mut ingest = |trace: &ReadTrace| {
@@ -1153,7 +1153,7 @@ pub(crate) mod tests {
                 start_hour: 9,
                 end_hour: 12,
             },
-            jobs: HashMap::from([
+            jobs: BTreeMap::from([
                 (
                     "credit-check".to_string(),
                     JobInfra {
@@ -1188,12 +1188,12 @@ pub(crate) mod tests {
             inputs: vec![
                 InputCase {
                     weight: 7.0,
-                    vars: HashMap::from([("creditScore".to_string(), serde_json::json!(750))]),
+                    vars: BTreeMap::from([("creditScore".to_string(), serde_json::json!(750))]),
                     expected_outcome: Some("approved".into()),
                 },
                 InputCase {
                     weight: 3.0,
-                    vars: HashMap::from([("creditScore".to_string(), serde_json::json!(650))]),
+                    vars: BTreeMap::from([("creditScore".to_string(), serde_json::json!(650))]),
                     expected_outcome: Some("rejected".into()),
                 },
             ],
@@ -1209,7 +1209,7 @@ pub(crate) mod tests {
     fn run_path_takes_the_approve_branch_for_high_score() {
         let def = loan_def();
         let pack = loan_pack();
-        let vars = HashMap::from([("creditScore".to_string(), serde_json::json!(750))]);
+        let vars = BTreeMap::from([("creditScore".to_string(), serde_json::json!(750))]);
         let path = run_path(&def, "loan-approval", &vars, &pack, 1, 0);
         assert!(path.completed);
         let jobs: Vec<&str> = path.steps.iter().map(|s| s.job_type.as_str()).collect();
@@ -1220,7 +1220,7 @@ pub(crate) mod tests {
     fn run_path_takes_the_reject_branch_for_low_score() {
         let def = loan_def();
         let pack = loan_pack();
-        let vars = HashMap::from([("creditScore".to_string(), serde_json::json!(650))]);
+        let vars = BTreeMap::from([("creditScore".to_string(), serde_json::json!(650))]);
         let path = run_path(&def, "loan-approval", &vars, &pack, 1, 0);
         assert!(path.completed);
         let jobs: Vec<&str> = path.steps.iter().map(|s| s.job_type.as_str()).collect();

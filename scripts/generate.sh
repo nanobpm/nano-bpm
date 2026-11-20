@@ -13,11 +13,6 @@
 # demand from the spec.
 set -euo pipefail
 
-# Version of the openapi-generator CLI. A leading "v" is tolerated (the former
-# Docker image tag used it); the Maven coordinate has no "v".
-OPENAPI_GENERATOR_VERSION="${OPENAPI_GENERATOR_VERSION:-7.21.0}"
-OPENAPI_GENERATOR_VERSION="${OPENAPI_GENERATOR_VERSION#v}"
-
 # Resolve paths relative to the project root so the script works from anywhere.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"

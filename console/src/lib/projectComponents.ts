@@ -17,6 +17,7 @@
 import type { FileNode } from "../gen";
 import { getExtensions } from "../gen";
 import { projectFileEx } from "./api";
+import { BUILTIN_COMPONENTS } from "./builtinComponents";
 import type { ElementTemplate } from "./urbanComponents";
 
 export type { ElementTemplate } from "./urbanComponents";
@@ -151,16 +152,18 @@ export async function loadPackComponents(): Promise<ElementTemplate[]> {
 }
 
 /**
- * Merges the pack-contributed and project-local component sets into the final
- * installed set for the modeler (ADR 0033 §4). Pack components are the base
- * layer; project components override them on an id collision — the local project
- * always wins, mirroring how project files shadow installed defaults.
+ * Merges the built-in, pack-contributed and project-local component sets into
+ * the final installed set for the modeler (ADR 0033 §4). Built-ins
+ * (`builtinComponents.ts`, e.g. the MCP start event) are the base layer, so they
+ * are always offered; pack components override them, and project components
+ * override both on an id collision — the local project always wins, mirroring
+ * how project files shadow installed defaults.
  */
 export function combineComponents(
   pack: ElementTemplate[],
   project: ElementTemplate[],
 ): ElementTemplate[] {
-  return mergeComponentsById([pack, project]);
+  return mergeComponentsById([[...BUILTIN_COMPONENTS], pack, project]);
 }
 
 export {

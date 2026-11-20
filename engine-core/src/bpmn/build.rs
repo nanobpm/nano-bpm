@@ -59,6 +59,56 @@ pub(super) struct NodeAcc {
     /// activatable embedded-subProcess tool (#872) and stays on the pruned-catalog
     /// path with its inner activities.
     pub(super) is_event_subprocess: bool,
+    /// For a start event nested in an event sub-process (`is_event_subprocess`
+    /// scope): the `errorRef` of its `errorEventDefinition`, resolved to an
+    /// error code at build (an [`EventSubProcessTrigger::Error`]). The
+    /// `Option<Option<String>>` distinguishes "no error definition" (outer
+    /// `None`) from "an error definition with no `errorRef`" (outer `Some`,
+    /// inner `None` — a catch-all trigger).
+    ///
+    /// [`EventSubProcessTrigger::Error`]: crate::model::EventSubProcessTrigger::Error
+    pub(super) esp_error_ref: Option<Option<String>>,
+    /// For a start event nested in an event sub-process: the `escalationRef` of
+    /// its `escalationEventDefinition`, resolved to an escalation code at build
+    /// (an [`EventSubProcessTrigger::Escalation`]). Same
+    /// `Option<Option<String>>` convention as `esp_error_ref`.
+    ///
+    /// [`EventSubProcessTrigger::Escalation`]: crate::model::EventSubProcessTrigger::Escalation
+    pub(super) esp_escalation_ref: Option<Option<String>>,
+    /// The FEEL `condition` of a start event's `conditionalEventDefinition`:
+    /// for a start nested in an event sub-process, an
+    /// [`EventSubProcessTrigger::Conditional`]; for a process-level start, a
+    /// root-level [`ConditionalStartEvent`](crate::model::ElementKind::ConditionalStartEvent)
+    /// (#932).
+    ///
+    /// [`EventSubProcessTrigger::Conditional`]: crate::model::EventSubProcessTrigger::Conditional
+    pub(super) esp_condition: Option<String>,
+    /// For a start event nested in an event sub-process: its `isInterrupting`
+    /// attribute. `None` when absent (BPMN/Zeebe default `true`); only an
+    /// explicit `isInterrupting="false"` records `Some(false)`.
+    pub(super) esp_interrupting: Option<bool>,
+    /// Number of `*EventDefinition` child elements read on a start event
+    /// (occurrences, so two same-type definitions count as two).
+    pub(super) start_def_count: u32,
+    /// Whether a `conditionalEventDefinition` element was read on this start
+    /// event — tracked separately from [`Self::esp_condition`] (which is only
+    /// set for a non-blank `<condition>`), so a conditional start with a
+    /// missing or blank condition is rejected instead of silently degrading to
+    /// a none start (#932).
+    pub(super) has_conditional_def: bool,
+    /// For a timer start event: the raw text of its `timeDuration`/`timeCycle`/
+    /// `timeDate` when it is a static ISO-8601 literal (not a `=`-prefixed FEEL
+    /// expression, which populates `timer_expr` instead). Retained so an event
+    /// sub-process timer trigger can carry the literal verbatim in its
+    /// [`TimerDef`](crate::model::TimerDef) — an event sub-process timer is
+    /// armed per scope activation, never pre-resolved to millis at deploy.
+    pub(super) timer_literal: Option<String>,
+    /// For a timer start event carrying a static literal: which time* element
+    /// it came from (`timeDuration`/`timeCycle`/`timeDate`), populating the
+    /// [`TimerDefKind`](crate::model::TimerDefKind) of an event sub-process
+    /// timer trigger. `None` for a FEEL timer (whose `timer_expr` already
+    /// carries the kind).
+    pub(super) timer_def_kind: Option<crate::model::TimerDefKind>,
     /// `zeebe:adHoc outputCollection` on an ad-hoc container, if declared.
     pub(super) adhoc_output_collection: Option<String>,
     /// `zeebe:adHoc outputElement` FEEL expression on an ad-hoc container.
@@ -132,6 +182,12 @@ pub(super) struct NodeAcc {
     /// For a start event: the `zeebe:formDefinition formId` declared on it — the
     /// process's start form. `None` on other nodes and start events with no form.
     pub(super) start_form_id: Option<String>,
+    /// `zeebe:properties` extension properties (`<zeebe:property name value/>`)
+    /// declared on this node, in a deterministic map. Carried onto the built
+    /// [`Element::properties`](crate::model::Element::properties) so vendor
+    /// metadata (Camunda MCP tool markers, inbound connector types, …) survives
+    /// parsing (#1499). Empty when the node declares none.
+    pub(super) properties: std::collections::BTreeMap<String, String>,
     /// True when this `intermediateThrowEvent`/`endEvent` carries a
     /// `messageEventDefinition`. Together with a `zeebe:taskDefinition` it is a
     /// Zeebe *job worker* message event: activation creates a job and the job's
@@ -162,6 +218,23 @@ pub(super) struct NodeAcc {
     /// / [`LinkIntermediateCatchEvent`](crate::model::ElementKind::LinkIntermediateCatchEvent)
     /// at build. `None` on nodes without a `linkEventDefinition`.
     pub(super) link_name: Option<String>,
+    /// True when this `endEvent` carries an `errorEventDefinition`, making it an
+    /// [`ErrorEndEvent`](crate::model::ElementKind::ErrorEndEvent). Its thrown
+    /// error code is resolved from `error_ref` at build.
+    pub(super) is_error_throw: bool,
+    /// True when this node carries a non-boundary `errorEventDefinition` in ANY
+    /// placement (end or intermediate throw). Counted by the competing
+    /// event-definition guard (#1173) independently of `is_error_throw`, which
+    /// is only set on an end-event carrier.
+    pub(super) has_error_def: bool,
+    /// True when a SECOND non-boundary `errorEventDefinition` was seen on this
+    /// node. `error_ref` is last-wins, so `build` rejects the ambiguous
+    /// multi-definition throw (the error analogue of `escalation_throw_dup`).
+    pub(super) error_def_dup: bool,
+    /// The `errorRef` on this error end event, resolved to an `errorCode` at
+    /// build. `None` when the definition carries no `errorRef` (an unnamed
+    /// throw, matched by catch-alls only).
+    pub(super) error_ref: Option<String>,
     /// True when this `endEvent` carries a `terminateEventDefinition`, making it
     /// a [`TerminateEndEvent`](crate::model::ElementKind::TerminateEndEvent)
     /// rather than a plain none end event.
@@ -287,6 +360,11 @@ pub(super) struct PendingBoundary {
     /// mis-attached to the enclosing activity on the `io_stack`.
     pub(super) start_listeners: Vec<crate::model::ExecutionListener>,
     pub(super) end_listeners: Vec<crate::model::ExecutionListener>,
+    /// `zeebe:properties` declared on this boundary event (#1499). Captured on
+    /// the pending boundary (it is never on the `io_stack`) so they attach to
+    /// the boundary element itself — never dropped, nor mis-attached to (and
+    /// overwriting) an enclosing subprocess's properties.
+    pub(super) properties: std::collections::BTreeMap<String, String>,
 }
 
 /// A definitions-level `<message>` declaration: its `name` and the instance
@@ -388,6 +466,14 @@ impl ProcessAcc {
             user_task: crate::model::UserTaskProps::default(),
             is_adhoc: false,
             is_event_subprocess: false,
+            esp_error_ref: None,
+            esp_escalation_ref: None,
+            esp_condition: None,
+            esp_interrupting: None,
+            start_def_count: 0,
+            has_conditional_def: false,
+            timer_literal: None,
+            timer_def_kind: None,
             adhoc_output_collection: None,
             adhoc_output_element: None,
             adhoc_active_elements: None,
@@ -409,12 +495,17 @@ impl ProcessAcc {
             task_headers: std::collections::BTreeMap::new(),
             linked_resources: Vec::new(),
             start_form_id: None,
+            properties: std::collections::BTreeMap::new(),
             is_message_throw: false,
             is_compensation_throw: false,
             is_escalation_throw: false,
             escalation_throw_dup: false,
             escalation_ref: None,
             link_name: None,
+            is_error_throw: false,
+            has_error_def: false,
+            error_def_dup: false,
+            error_ref: None,
             is_terminate: false,
             is_for_compensation: attr(attrs, "isForCompensation") == Some("true"),
             agent_type: None,
@@ -441,10 +532,10 @@ impl ProcessAcc {
     /// (before ad-hoc pruning), mirroring what Zeebe validates at deploy.
     pub(super) fn capture(
         &self,
-        errors: &HashMap<String, String>,
-        messages: &HashMap<String, MessageDecl>,
-        signals: &HashMap<String, String>,
-        escalations: &HashMap<String, String>,
+        errors: &BTreeMap<String, String>,
+        messages: &BTreeMap<String, MessageDecl>,
+        signals: &BTreeMap<String, String>,
+        escalations: &BTreeMap<String, String>,
     ) -> crate::validate::ProcessCapture {
         use crate::validate::{FlowRefCapture, RefSite, TaskDefCapture, UnmodelledElement};
 
@@ -452,7 +543,7 @@ impl ProcessAcc {
             .flows
             .iter()
             .filter_map(|f| f.id.clone())
-            .collect::<std::collections::HashSet<String>>();
+            .collect::<std::collections::BTreeSet<String>>();
 
         let flow_refs = self
             .flow_refs
@@ -579,10 +670,10 @@ impl ProcessAcc {
     /// intermediate catch and boundary events.
     pub(super) fn build(
         mut self,
-        errors: &HashMap<String, String>,
-        messages: &HashMap<String, MessageDecl>,
-        signals: &HashMap<String, String>,
-        escalations: &HashMap<String, String>,
+        errors: &BTreeMap<String, String>,
+        messages: &BTreeMap<String, MessageDecl>,
+        signals: &BTreeMap<String, String>,
+        escalations: &BTreeMap<String, String>,
     ) -> Result<ProcessDefinition, ParseError> {
         // Reject `zeebe:executionListener`s declared where they can never fire
         // (#1197), rather than silently storing a listener that creates no job.
@@ -615,7 +706,7 @@ impl ProcessAcc {
         //   implicitly when its host completes and never entered by token flow,
         //   so it has no lifecycle to hang a listener on.
         {
-            let mut incoming: HashMap<&str, usize> = HashMap::new();
+            let mut incoming: BTreeMap<&str, usize> = BTreeMap::new();
             for flow in &self.flows {
                 if let Some(target) = flow.target.as_deref() {
                     *incoming.entry(target).or_default() += 1;
@@ -702,7 +793,7 @@ impl ProcessAcc {
         // activate-element contract can be honoured later (ADR 0023) without
         // re-parsing.
         let mut adhoc_catalog: Vec<crate::model::AdHocSubProcessDef> = Vec::new();
-        let adhoc_ids: std::collections::HashSet<String> = self
+        let adhoc_ids: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
             .filter(|n| n.is_adhoc)
@@ -762,7 +853,7 @@ impl ProcessAcc {
             });
         }
         if !adhoc_ids.is_empty() {
-            let parent_of: HashMap<&str, &str> = self
+            let parent_of: BTreeMap<&str, &str> = self
                 .nodes
                 .iter()
                 .filter_map(|n| n.parent.as_deref().map(|p| (n.id.as_str(), p)))
@@ -832,7 +923,7 @@ impl ProcessAcc {
             // `adHocSubProcess` (agent-of-agents, #631) is NOT such a tool — it is
             // `is_adhoc` and keeps its own pruned-catalog handling — so exclude it
             // here.
-            let subprocess_tool_ids: std::collections::HashSet<String> = self
+            let subprocess_tool_ids: std::collections::BTreeSet<String> = self
                 .nodes
                 .iter()
                 .filter(|n| {
@@ -863,7 +954,7 @@ impl ProcessAcc {
                 }
                 false
             };
-            let pruned: std::collections::HashSet<String> = self
+            let pruned: std::collections::BTreeSet<String> = self
                 .nodes
                 .iter()
                 .filter(|n| inside_adhoc(&n.id) && !in_subprocess_tool(&n.id))
@@ -1005,7 +1096,7 @@ impl ProcessAcc {
             // non-existent element and hard-fail at runtime. More than one makes
             // the injection target ambiguous. Reject both at parse/deploy time
             // with a clear error rather than defaulting. Iterate in document
-            // order (over `self.nodes`, not the `HashSet`) so the error is
+            // order (over `self.nodes`, not the set) so the error is
             // deterministic when several tools are malformed.
             for n in self
                 .nodes
@@ -1032,7 +1123,7 @@ impl ProcessAcc {
             }
 
             // One catalog entry per ad-hoc container, in document order.
-            let mut index: HashMap<String, usize> = HashMap::new();
+            let mut index: BTreeMap<String, usize> = BTreeMap::new();
             for n in self.nodes.iter().filter(|n| n.is_adhoc) {
                 index.insert(n.id.clone(), adhoc_catalog.len());
                 // A container backed by a job (taskDefinition) is the agentic
@@ -1108,6 +1199,7 @@ impl ProcessAcc {
                         name: n.name.clone().unwrap_or_default(),
                         kind,
                         io: n.io.clone(),
+                        properties: n.properties.clone(),
                     });
                 }
             }
@@ -1211,11 +1303,19 @@ impl ProcessAcc {
         if proc_starts.len() > 1 {
             // A none start carries no message/timer/signal event definition.
             let is_none_start = |n: &NodeAcc| {
-                n.message_ref.is_none() && n.timer_repeating.is_none() && n.signal_ref.is_none()
+                n.message_ref.is_none()
+                    && n.timer_repeating.is_none()
+                    && n.signal_ref.is_none()
+                    && n.esp_condition.is_none()
+                    && !n.has_conditional_def
             };
             // A signal start carries a signalRef but no message/timer definition.
             let is_signal_start = |n: &NodeAcc| {
-                n.signal_ref.is_some() && n.message_ref.is_none() && n.timer_repeating.is_none()
+                n.signal_ref.is_some()
+                    && n.message_ref.is_none()
+                    && n.timer_repeating.is_none()
+                    && n.esp_condition.is_none()
+                    && !n.has_conditional_def
             };
             // Keep a single none/signal start as the process-entry `StartEvent`
             // (prefer a none start); any additional *signal* start is surplus.
@@ -1278,15 +1378,15 @@ impl ProcessAcc {
         }
         // Map each sub-process to its inner start event (a start node whose
         // parent is the sub-process).
-        let sub_starts: HashMap<String, String> = self
+        let sub_starts: BTreeMap<String, String> = self
             .nodes
             .iter()
             .filter(|n| matches!(n.kind, NodeKind::Start))
             .filter_map(|n| n.parent.clone().map(|p| (p, n.id.clone())))
             .collect();
         // Ids of sequence flows declared as a gateway `default` flow.
-        let mut default_flow_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut default_flow_ids: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         // The process-level start event's form id (`zeebe:formDefinition formId`),
         // captured as nodes are consumed and set on the built definition below.
         let mut start_form_id: Option<String> = None;
@@ -1295,7 +1395,7 @@ impl ProcessAcc {
         // `self.nodes` is consumed below so the boundary-handler resolution can
         // reject associations that point at a non-handler node (e.g. a
         // `textAnnotation`) and detect ambiguity.
-        let compensation_handler_ids: std::collections::HashSet<String> = self
+        let compensation_handler_ids: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
             .filter(|n| n.is_for_compensation && n.kind.is_activity())
@@ -1312,8 +1412,42 @@ impl ProcessAcc {
         // outgoing flow), so a malformed `<endEvent>…<escalationEventDefinition/>`
         // with an outgoing flow would otherwise silently deploy as a routing
         // intermediate throw (#1173).
-        let flow_source_ids: std::collections::HashSet<String> =
+        let flow_source_ids: std::collections::BTreeSet<String> =
             self.flows.iter().filter_map(|f| f.source.clone()).collect();
+        // Ids of the event sub-processes (`subProcess triggeredByEvent="true"`),
+        // used to recognise a start event nested directly inside one (its
+        // trigger) and to reject a flow into/out of the event sub-process.
+        let event_subprocess_ids: std::collections::BTreeSet<String> = self
+            .nodes
+            .iter()
+            .filter(|n| n.is_event_subprocess)
+            .map(|n| n.id.clone())
+            .collect();
+        // The start events of each event sub-process (a Start node whose parent
+        // is an event sub-process), mapped esp id -> its start node ids (in
+        // document order, so a "multiple start events" rejection is
+        // deterministic).
+        let mut esp_starts: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            if matches!(n.kind, NodeKind::Start)
+                && n.parent
+                    .as_deref()
+                    .is_some_and(|p| event_subprocess_ids.contains(p))
+            {
+                esp_starts
+                    .entry(n.parent.clone().unwrap_or_default())
+                    .or_default()
+                    .push(i);
+            }
+        }
+        // The resolved trigger + interruptingness of each event sub-process,
+        // keyed by the esp id. Computed here — before the node-consumption loop
+        // moves `self.nodes` — so the `NodeKind::SubProcess` dispatch arm only
+        // looks the result up. Resolution validates against the declared
+        // messages/signals/errors/escalations (reference integrity, #851) and
+        // applies the Zeebe `isInterrupting` default (`true`).
+        let mut esp_triggers: BTreeMap<String, (crate::model::EventSubProcessTrigger, bool)> =
+            BTreeMap::new();
         // Ids of every node an escalation boundary event may legally attach to.
         // An escalation propagates *out* of the inner token scope it is raised
         // in, so only a container that opens such a scope — an embedded
@@ -1321,7 +1455,7 @@ impl ProcessAcc {
         // other activity (plain service/user task, call activity) is a dead
         // boundary that `find_catching_escalation_boundary` can never reach
         // (#1173).
-        let escalation_container_ids: std::collections::HashSet<String> = self
+        let escalation_container_ids: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
             .filter(|n| matches!(n.kind, NodeKind::SubProcess) || n.is_adhoc)
@@ -1336,26 +1470,87 @@ impl ProcessAcc {
         // agent-re-drive completion path is not wired for boundary interruption),
         // so the container would hang `Active` forever. Refuse the model at deploy
         // rather than mis-execute it (#1173); full runtime support is a follow-up.
-        let adhoc_container_ids: std::collections::HashSet<String> = self
+        let adhoc_container_ids: std::collections::BTreeSet<String> = self
             .nodes
             .iter()
             .filter(|n| n.is_adhoc)
             .map(|n| n.id.clone())
             .collect();
-        let node_parent: HashMap<String, String> = self
+        let node_parent: BTreeMap<String, String> = self
             .nodes
             .iter()
             .filter_map(|n| n.parent.clone().map(|p| (n.id.clone(), p)))
             .collect();
-        // Node ids carrying a non-boundary `errorEventDefinition` (an error
-        // throw / end). Recorded separately from the node flags (in
-        // `error_refs_extra`), so surfaced here as a set for the competing
-        // event-definition guard below (#1173).
-        let error_def_node_ids: std::collections::HashSet<String> = self
-            .error_refs_extra
-            .iter()
-            .map(|(node_id, _)| node_id.clone())
-            .collect();
+        // Validate every event sub-process (`subProcess triggeredByEvent="true"`)
+        // BEFORE the node-consumption loop below (#1555): Zeebe's
+        // `EventSubProcessValidator` requires exactly one start event, that start
+        // event to carry exactly one typed trigger, and an error trigger to be
+        // interrupting. Checked here, against the raw nodes, so the rejection
+        // names the construct rather than surfacing as a generic build fallout.
+        // Iterate in document order for a deterministic error. On success the
+        // resolved trigger is recorded in `esp_triggers` for the dispatch arm.
+        for esp in self.nodes.iter().filter(|n| n.is_event_subprocess) {
+            let invalid = |reason: String| ParseError::InvalidProcess {
+                process_id: self.id.clone(),
+                reason,
+            };
+            let starts = esp_starts.get(&esp.id).cloned().unwrap_or_default();
+            if starts.len() != 1 {
+                return Err(invalid(format!(
+                    "event sub-process {} must have exactly one start event, found {}",
+                    esp.id,
+                    starts.len()
+                )));
+            }
+            let start = &self.nodes[starts[0]];
+            // Count the typed triggers on the start event. A timer start is
+            // recognised by `timer_repeating` (set for a timeDuration/timeCycle/
+            // timeDate); message/signal by their refs; error/escalation/
+            // conditional by the esp_* fields.
+            let trigger_count = start.message_ref.is_some() as u32
+                + start.timer_repeating.is_some() as u32
+                + start.signal_ref.is_some() as u32
+                + start.esp_error_ref.is_some() as u32
+                + start.esp_escalation_ref.is_some() as u32
+                + start.esp_condition.is_some() as u32;
+            if trigger_count == 0 {
+                return Err(invalid(format!(
+                    "event sub-process {} start event {} must have exactly one event \
+                     definition (message, timer, signal, error, escalation or \
+                     conditional); a none start event cannot trigger an event \
+                     sub-process",
+                    esp.id, start.id
+                )));
+            }
+            if trigger_count > 1 || start.start_def_count > 1 {
+                return Err(invalid(format!(
+                    "event sub-process {} start event {} declares more than one event \
+                     definition; exactly one trigger (message, timer, signal, error, \
+                     escalation or conditional) is supported",
+                    esp.id, start.id
+                )));
+            }
+            // Zeebe: an error event sub-process is always interrupting — a
+            // non-interrupting error start is rejected at deploy.
+            if start.esp_error_ref.is_some() && start.esp_interrupting == Some(false) {
+                return Err(invalid(format!(
+                    "event sub-process {} start event {} is an error start event and must \
+                     be interrupting (isInterrupting=\"false\" is not allowed)",
+                    esp.id, start.id
+                )));
+            }
+            let interrupting = start.esp_interrupting.unwrap_or(true);
+            let trigger = resolve_esp_trigger(
+                &self.id,
+                &esp.id,
+                start,
+                messages,
+                signals,
+                errors,
+                escalations,
+            )?;
+            esp_triggers.insert(esp.id.clone(), (trigger, interrupting));
+        }
         for mut node in self.nodes {
             let job_worker = node.is_job_worker_message_event();
             // Reject an `endEvent` / `intermediateThrowEvent` that carries more
@@ -1372,7 +1567,7 @@ impl ProcessAcc {
                     + node.is_compensation_throw as u32
                     + node.is_terminate as u32
                     + node.link_name.is_some() as u32
-                    + error_def_node_ids.contains(&node.id) as u32
+                    + node.has_error_def as u32
                     // A job-worker message event is rebuilt as a job task below,
                     // which would silently drop any competing definition.
                     + job_worker as u32;
@@ -1381,7 +1576,7 @@ impl ProcessAcc {
                 // SAME throw/end — a last-wins overwrite of `escalation_ref` that
                 // would silently drop the first (#1173), the throw/end analogue of
                 // the boundary `escalation_dup` guard.
-                if defs > 1 || node.escalation_throw_dup {
+                if defs > 1 || node.escalation_throw_dup || node.error_def_dup {
                     return Err(match node.kind {
                         // The `endEvent` flavour has a reason-bearing error; an
                         // `intermediateThrowEvent` reuses the throw-side
@@ -1394,6 +1589,14 @@ impl ProcessAcc {
                                          escalationEventDefinition; a multi-definition \
                                          escalation end event is not supported (declare \
                                          exactly one)"
+                                .to_string(),
+                        },
+                        NodeKind::End if node.error_def_dup => ParseError::InvalidEndEvent {
+                            process_id: self.id.clone(),
+                            element_id: node.id.clone(),
+                            reason: "end event declares more than one \
+                                     errorEventDefinition; a multi-definition error end \
+                                     event is not supported (declare exactly one)"
                                 .to_string(),
                         },
                         NodeKind::End => ParseError::InvalidEndEvent {
@@ -1444,6 +1647,8 @@ impl ProcessAcc {
             let node_start_listeners = node.start_listeners.clone();
             let node_end_listeners = node.end_listeners.clone();
             let node_task_listeners = node.task_listeners.clone();
+            let properties_id = node.id.clone();
+            let node_properties = node.properties.clone();
             // Only treat as multi-instance when an input collection was actually
             // declared; a bare `multiInstanceLoopCharacteristics` with no
             // `zeebe:loopCharacteristics inputCollection` degenerates to an
@@ -1453,6 +1658,10 @@ impl ProcessAcc {
                 .clone()
                 .filter(|mi| !mi.input_collection.trim().is_empty());
             let parent = node.parent.clone();
+            // Only an ESP *start* has its timer carried by the container.
+            let esp_start_parent = parent
+                .clone()
+                .filter(|_| matches!(node.kind, NodeKind::Start));
             if matches!(node.kind, NodeKind::Start) && parent.is_none() {
                 start_form_id = node.start_form_id.clone();
             }
@@ -1463,8 +1672,45 @@ impl ProcessAcc {
                 NodeKind::Start => {
                     // A messageRef makes it a message start; a timer_repeating
                     // flag makes it a timer start (cycle or one-shot); otherwise
-                    // a plain none start event.
-                    if let Some(message_ref) = node.message_ref {
+                    // a plain none start event. A start event nested in an
+                    // event sub-process is always a plain `StartEvent`: its
+                    // trigger lives on the container (`EventSubProcessTrigger`),
+                    // the single source of truth the emitter derives the start's
+                    // event definition from, so the start kind round-trips.
+                    if parent
+                        .as_deref()
+                        .is_some_and(|p| event_subprocess_ids.contains(p))
+                    {
+                        builder.start_event(node.id)
+                    } else if node.has_conditional_def || node.esp_condition.is_some() {
+                        // A root-level `conditionalEventDefinition` start (#932)
+                        // must declare exactly one event definition carrying a
+                        // non-blank condition. Fail closed on any other shape: a
+                        // missing/blank condition must not degrade to a none
+                        // start, and a duplicate or mixed definition must not
+                        // silently pick one trigger.
+                        let invalid = |reason: &str| ParseError::InvalidProcess {
+                            process_id: self.id.clone(),
+                            reason: format!("conditional start event {} {reason}", node.id),
+                        };
+                        if node.start_def_count > 1 {
+                            return Err(invalid(
+                                "declares more than one event definition; exactly one \
+                                 conditionalEventDefinition is supported",
+                            ));
+                        }
+                        let Some(condition) = node.esp_condition else {
+                            return Err(invalid(
+                                "has a conditionalEventDefinition without a non-blank \
+                                 <condition>",
+                            ));
+                        };
+                        // A root-level `conditionalEventDefinition` start (#932):
+                        // triggered by a conditional evaluation, not a
+                        // subscription. (Inside an event sub-process the
+                        // condition lives on the container trigger, above.)
+                        builder.conditional_start_event(node.id, condition)
+                    } else if let Some(message_ref) = node.message_ref {
                         let decl = messages.get(&message_ref).ok_or_else(|| {
                             ParseError::InvalidMessageEvent {
                                 process_id: self.id.clone(),
@@ -1508,6 +1754,17 @@ impl ProcessAcc {
                             .and_then(|r| escalations.get(r).cloned())
                             .unwrap_or_default();
                         builder.escalation_throw_event(node.id, code)
+                    } else if node.is_error_throw {
+                        // An error end event (#1592): resolve its `errorRef` to
+                        // the declared error code (no ref = an unnamed throw,
+                        // matched by catch-alls only). A dangling ref was already
+                        // rejected by the reference-integrity validator (#851).
+                        let code = node
+                            .error_ref
+                            .as_ref()
+                            .and_then(|r| errors.get(r).cloned())
+                            .unwrap_or_default();
+                        builder.error_end_event(node.id, code)
                     } else if node.is_compensation_throw {
                         builder.compensation_throw_event(node.id)
                     } else if node.is_terminate {
@@ -1653,7 +1910,25 @@ impl ProcessAcc {
                             reason: format!("sub-process {} has no start event", node.id),
                         }
                     })?;
-                    builder.sub_process(node.id, start)
+                    if node.is_event_subprocess {
+                        // An event sub-process (`triggeredByEvent="true"`): the
+                        // trigger was resolved and validated above (exactly one
+                        // start event, exactly one trigger, error always
+                        // interrupting), so the lookup always succeeds.
+                        let (trigger, interrupting) = esp_triggers
+                            .get(&node.id)
+                            .cloned()
+                            .ok_or_else(|| ParseError::InvalidProcess {
+                                process_id: self.id.clone(),
+                                reason: format!(
+                                    "event sub-process {} has no resolved trigger",
+                                    node.id
+                                ),
+                            })?;
+                        builder.event_sub_process(node.id, start, trigger, interrupting)
+                    } else {
+                        builder.sub_process(node.id, start)
+                    }
                 }
                 NodeKind::Call => {
                     // The callee is required; an unresolved call activity is a
@@ -1678,7 +1953,14 @@ impl ProcessAcc {
             if !node_io.is_empty() {
                 builder = builder.with_io(io_id, node_io);
             }
-            if let Some(timer) = node_timer {
+            // An event sub-process start's timer is carried by the container's
+            // `EventSubProcessTrigger::Timer` (the single source of truth);
+            // attaching it to the plain start too would leave two independently
+            // editable timer definitions after a round trip.
+            let in_esp = esp_start_parent
+                .as_deref()
+                .is_some_and(|p| event_subprocess_ids.contains(p));
+            if let Some(timer) = node_timer.filter(|_| !in_esp) {
                 builder = builder.with_timer(timer_id, timer);
             }
             if let Some(retries) = node_retries {
@@ -1697,12 +1979,15 @@ impl ProcessAcc {
             if let Some(name) = node_name {
                 builder = builder.with_name(name_id, name);
             }
+            if !node_properties.is_empty() {
+                builder = builder.with_properties(properties_id, node_properties);
+            }
         }
         let associations = self.associations;
         // Ids of the compensation boundary events. A compensation boundary is a
         // structural marker armed implicitly when its activity completes; it is
         // never reached by ordinary token flow (see the flow validation below).
-        let compensation_boundary_ids: std::collections::HashSet<String> = self
+        let compensation_boundary_ids: std::collections::BTreeSet<String> = self
             .boundaries
             .iter()
             .filter(|b| b.compensation)
@@ -1719,7 +2004,7 @@ impl ProcessAcc {
         // the new escalation boundary (#1173), whose handler would fire with no
         // escalation. Reject such models at deploy (see the flow validation below)
         // rather than mis-executing them.
-        let reactive_boundary_ids: std::collections::HashSet<String> = self
+        let reactive_boundary_ids: std::collections::BTreeSet<String> = self
             .boundaries
             .iter()
             .filter(|b| !b.compensation)
@@ -1745,6 +2030,12 @@ impl ProcessAcc {
                     b.end_listeners.clone(),
                 )
             })
+            .collect();
+        let boundary_properties: Vec<(String, std::collections::BTreeMap<String, String>)> = self
+            .boundaries
+            .iter()
+            .filter(|b| !b.properties.is_empty())
+            .map(|b| (b.id.clone(), b.properties.clone()))
             .collect();
         for boundary in self.boundaries {
             let attached_to =
@@ -1998,6 +2289,10 @@ impl ProcessAcc {
         for (id, start_listeners, end_listeners) in boundary_listeners {
             builder = builder.with_listeners(id, start_listeners, end_listeners);
         }
+        // Likewise re-attach boundary `zeebe:properties` by element id (#1499).
+        for (id, properties) in boundary_properties {
+            builder = builder.with_properties(id, properties);
+        }
         // Compensation boundary events and their `isForCompensation` handlers are
         // structural markers, NOT part of ordinary token flow: a compensation
         // boundary is armed implicitly when its activity completes (never reached
@@ -2075,4 +2370,121 @@ impl ProcessAcc {
         def.start_form_id = start_form_id;
         Ok(def)
     }
+}
+
+/// Resolves the [`EventSubProcessTrigger`] of an event sub-process from its
+/// start event `start` (a scanned [`NodeAcc`]). Called after the event
+/// sub-process pre-validation has established that `start` carries exactly one
+/// typed trigger, so exactly one arm of the cascade matches. Reference
+/// integrity (#851) is enforced here: a dangling `messageRef`/`signalRef`/
+/// `errorRef`/`escalationRef` is a parse error naming the element, never a
+/// silently dropped trigger.
+///
+/// [`EventSubProcessTrigger`]: crate::model::EventSubProcessTrigger
+fn resolve_esp_trigger(
+    process_id: &str,
+    esp_id: &str,
+    start: &NodeAcc,
+    messages: &BTreeMap<String, MessageDecl>,
+    signals: &BTreeMap<String, String>,
+    errors: &BTreeMap<String, String>,
+    escalations: &BTreeMap<String, String>,
+) -> Result<crate::model::EventSubProcessTrigger, ParseError> {
+    use crate::model::EventSubProcessTrigger as T;
+    if let Some(message_ref) = &start.message_ref {
+        let decl = messages.get(message_ref).ok_or_else(|| {
+            ParseError::InvalidMessageEvent {
+                process_id: process_id.to_string(),
+                reason: format!(
+                    "event sub-process {esp_id} start event {} references unknown message '{message_ref}'",
+                    start.id
+                ),
+            }
+        })?;
+        let correlation_key =
+            decl.correlation_key
+                .clone()
+                .ok_or_else(|| ParseError::InvalidMessageEvent {
+                    process_id: process_id.to_string(),
+                    reason: format!(
+                        "message '{message_ref}' has no zeebe:subscription correlationKey"
+                    ),
+                })?;
+        return Ok(T::Message {
+            message_name: decl.name.clone(),
+            correlation_key,
+        });
+    }
+    if start.timer_repeating.is_some() {
+        // A timer trigger is carried as a `TimerDef`: a FEEL expression when
+        // the model declared one (`timer_expr`), else the static ISO-8601
+        // literal text. The kind comes from which time* element was declared.
+        let def = start.timer_expr.clone().unwrap_or(crate::model::TimerDef {
+            kind: start
+                .timer_def_kind
+                .unwrap_or(crate::model::TimerDefKind::Duration),
+            expr: start.timer_literal.clone().unwrap_or_default(),
+        });
+        return Ok(T::Timer(def));
+    }
+    if let Some(signal_ref) = &start.signal_ref {
+        let name = signals.get(signal_ref).cloned().ok_or_else(|| {
+            ParseError::InvalidProcess {
+                process_id: process_id.to_string(),
+                reason: format!(
+                    "event sub-process {esp_id} start event {} references unknown signal '{signal_ref}'",
+                    start.id
+                ),
+            }
+        })?;
+        return Ok(T::Signal { signal_name: name });
+    }
+    if let Some(error_ref) = &start.esp_error_ref {
+        // `Some(None)` is a catch-all (an error definition with no errorRef);
+        // `Some(Some(ref))` resolves the ref to its declared error code.
+        let error_code = match error_ref {
+            None => None,
+            Some(r) => Some(
+                errors
+                    .get(r)
+                    .cloned()
+                    .ok_or_else(|| ParseError::InvalidProcess {
+                        process_id: process_id.to_string(),
+                        reason: format!(
+                        "event sub-process {esp_id} start event {} references unknown error '{r}'",
+                        start.id
+                    ),
+                    })?,
+            ),
+        };
+        return Ok(T::Error { error_code });
+    }
+    if let Some(escalation_ref) = &start.esp_escalation_ref {
+        let escalation_code = match escalation_ref {
+            None => None,
+            Some(r) => Some(escalations.get(r).cloned().ok_or_else(|| {
+                ParseError::InvalidProcess {
+                    process_id: process_id.to_string(),
+                    reason: format!(
+                        "event sub-process {esp_id} start event {} references unknown escalation '{r}'",
+                        start.id
+                    ),
+                }
+            })?),
+        };
+        return Ok(T::Escalation { escalation_code });
+    }
+    if let Some(condition) = &start.esp_condition {
+        return Ok(T::Conditional {
+            condition: condition.clone(),
+        });
+    }
+    // Unreachable: the pre-validation guarantees exactly one trigger.
+    Err(ParseError::InvalidProcess {
+        process_id: process_id.to_string(),
+        reason: format!(
+            "event sub-process {esp_id} start event {} has no resolvable trigger",
+            start.id
+        ),
+    })
 }

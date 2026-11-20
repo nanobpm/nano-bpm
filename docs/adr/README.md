@@ -75,6 +75,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0063](0063-nano-controlled-embedded-harness.md) | Nano-controlled embedded coding-agent harness: an adopted wasm agent whose capability-nil boundary is the mind/world split | Proposed | 2026-08-21 |
 | [0064](0064-server-crate-decomposition.md) | Server crate decomposition (compile-time-driven workspace split) | Proposed | 2026-08-29 |
 | [0065](0065-deno-removal.md) | Deno removal: Node (≥ 22.6) is the sole JS/TS runtime | Accepted | 2026-10-13 |
+| [0066](0066-replication-model.md) | Replication model: event replication vs. command replication with enforced determinism | Accepted (option C) | 2026-11-18 |
 
 ## Reading paths
 

@@ -16,7 +16,7 @@ fn job_type_process(job_type: &str) -> ProcessDefinition {
 
 /// Deploys `def`, creates an instance of `proc_id` with `vars_in`, and returns
 /// `(engine, instance_key)`.
-fn start(def: ProcessDefinition, proc_id: &str, vars_in: HashMap<String, Value>) -> (Engine, Key) {
+fn start(def: ProcessDefinition, proc_id: &str, vars_in: BTreeMap<String, Value>) -> (Engine, Key) {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
     let inst = engine
@@ -43,7 +43,7 @@ fn extract_value_incident(engine: &Engine, element_id: &str) -> state::Incident 
 #[test]
 fn should_create_incident_if_job_type_expression_evaluation_failed() {
     // #1390: the old behaviour created a job whose type was the expression text.
-    let (engine, _) = start(job_type_process("=jobType"), "jt", HashMap::new());
+    let (engine, _) = start(job_type_process("=jobType"), "jt", BTreeMap::new());
     assert!(engine.pending_jobs().is_empty(), "no job is created");
     let incident = extract_value_incident(&engine, "work");
     assert!(
@@ -73,7 +73,7 @@ fn should_create_incident_if_job_type_expression_of_invalid_type() {
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
 fn should_create_incident_if_job_type_expression_is_empty_string() {
-    let (engine, _) = start(job_type_process("=\"\""), "jt", HashMap::new());
+    let (engine, _) = start(job_type_process("=\"\""), "jt", BTreeMap::new());
     assert!(engine.pending_jobs().is_empty());
     let incident = extract_value_incident(&engine, "work");
     assert!(
@@ -103,7 +103,7 @@ fn should_create_incident_if_job_type_exceeds_max_length() {
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
 fn should_resolve_incident_after_job_type_expression_evaluation_failed() {
-    let (mut engine, inst) = start(job_type_process("=jobType"), "jt", HashMap::new());
+    let (mut engine, inst) = start(job_type_process("=jobType"), "jt", BTreeMap::new());
     let incident = extract_value_incident(&engine, "work");
     engine
         .apply_command(Command::set_variables(
@@ -126,7 +126,7 @@ fn should_resolve_incident_after_job_type_expression_evaluation_failed() {
 
 #[test]
 fn resolving_with_still_failing_job_type_raises_a_fresh_incident() {
-    let (mut engine, _) = start(job_type_process("=jobType"), "jt", HashMap::new());
+    let (mut engine, _) = start(job_type_process("=jobType"), "jt", BTreeMap::new());
     let incident = extract_value_incident(&engine, "work");
     engine
         .apply_command(Command::resolve_incident(incident.key))
@@ -233,7 +233,7 @@ fn decision_id_expression_failure_raises_extract_value_incident() {
         .connect("decide", "end")
         .build()
         .unwrap();
-    let (engine, _) = start(def, "brt", HashMap::new());
+    let (engine, _) = start(def, "brt", BTreeMap::new());
     let incident = extract_value_incident(&engine, "decide");
     assert!(
         incident.reason.contains("'=decisionId'"),
@@ -340,7 +340,7 @@ fn job_type_expression_failure_parks_the_element_in_activating() {
         .apply_command(Command::DeployProcess(job_type_process("=jobType")))
         .unwrap();
     let created = engine
-        .apply_command(Command::create_instance_with("jt", HashMap::new()))
+        .apply_command(Command::create_instance_with("jt", BTreeMap::new()))
         .unwrap();
     assert_eq!(lifecycle_of(&created, "work"), vec!["Activating"]);
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -401,7 +401,7 @@ fn input_mapping_failure_parks_the_element_in_activating() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
     let created = engine
-        .apply_command(Command::create_instance_with("io", HashMap::new()))
+        .apply_command(Command::create_instance_with("io", BTreeMap::new()))
         .unwrap();
     assert_eq!(lifecycle_of(&created, "work"), vec!["Activating"]);
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -433,7 +433,7 @@ fn input_mapping_failure_parks_the_element_in_activating() {
 /// a terminated instance.
 #[test]
 fn should_resolve_incident_if_task_is_terminated() {
-    let (mut engine, inst) = start(job_type_process("=jobType"), "jt", HashMap::new());
+    let (mut engine, inst) = start(job_type_process("=jobType"), "jt", BTreeMap::new());
     let incident = extract_value_incident(&engine, "work");
     let events = engine
         .apply_command(Command::cancel_instance(inst))
@@ -499,7 +499,7 @@ fn assert_routing_failure_parks_activating(
     let created = engine
         .apply_command(Command::create_instance_with(
             "split",
-            HashMap::from([("amount".to_string(), bad)]),
+            BTreeMap::from([("amount".to_string(), bad)]),
         ))
         .unwrap();
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -528,7 +528,7 @@ fn assert_routing_failure_parks_activating(
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap();
     let resolved = engine
@@ -640,7 +640,7 @@ fn exclusive_gateway_activation_selection_sees_input_mapped_variables() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "split-mapped",
-            HashMap::from([("amount".to_string(), Value::Int(5))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -669,7 +669,7 @@ fn inclusive_split_activation_selection_sees_input_mapped_variables() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "split-mapped",
-            HashMap::from([("amount".to_string(), Value::Int(5))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -726,7 +726,7 @@ fn assert_selection_is_carried_through_completion(gateway: SplitGateway) {
     let created = engine
         .apply_command(Command::create_instance_with(
             "split-flip",
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap();
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -744,7 +744,7 @@ fn assert_selection_is_carried_through_completion(gateway: SplitGateway) {
     let resumed = engine
         .apply_command(Command::complete_job_with(
             listener[0].key,
-            HashMap::from([("amount".to_string(), Value::Int(5))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(5))]),
         ))
         .unwrap();
 
@@ -811,7 +811,7 @@ fn assert_start_listener_defers_the_routing_gate(gateway: SplitGateway) {
     let created = engine
         .apply_command(Command::create_instance_with(
             "split-listener",
-            HashMap::from([("amount".to_string(), Value::Int(5))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -856,7 +856,7 @@ fn assert_start_listener_defers_the_routing_gate(gateway: SplitGateway) {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap();
     let resolved = engine
@@ -921,7 +921,7 @@ fn assert_retry_redrives_the_gated_activation(gateway: SplitGateway) {
     let created = engine
         .apply_command(Command::create_instance_with(
             "split-listener",
-            HashMap::from([("amount".to_string(), Value::Int(5))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -980,7 +980,7 @@ fn assert_retry_redrives_the_gated_activation(gateway: SplitGateway) {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap();
     let resolved = engine
@@ -1091,7 +1091,7 @@ fn assert_listener_failure_retry_restarts_the_chain(gateway: SplitGateway) {
     let created = engine
         .apply_command(Command::create_instance_with(
             "split-two-listeners",
-            HashMap::from([("amount".to_string(), Value::Int(10))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(10))]),
         ))
         .unwrap();
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -1118,7 +1118,7 @@ fn assert_listener_failure_retry_restarts_the_chain(gateway: SplitGateway) {
     let advanced = engine
         .apply_command(Command::complete_job_with(
             l0[0].key,
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap();
     assert!(
@@ -1148,7 +1148,7 @@ fn assert_listener_failure_retry_restarts_the_chain(gateway: SplitGateway) {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("nextType".to_string(), Value::Str("l1".into()))]),
+            BTreeMap::from([("nextType".to_string(), Value::Str("l1".into()))]),
         ))
         .unwrap();
     let resolved = engine
@@ -1239,7 +1239,7 @@ fn assert_gateway_retry_uses_the_element_local_view(gateway: SplitGateway) {
     let inst = engine
         .apply_command(Command::create_instance_with(
             "split-parked",
-            HashMap::from([("amount".to_string(), Value::Int(500))]),
+            BTreeMap::from([("amount".to_string(), Value::Int(500))]),
         ))
         .unwrap()
         .iter()
@@ -1251,7 +1251,7 @@ fn assert_gateway_retry_uses_the_element_local_view(gateway: SplitGateway) {
             activate_instructions: vec![crate::command::ActivateElementInstruction {
                 element_id: "g".into(),
                 variable_instructions: vec![crate::command::VariableInstruction {
-                    variables: HashMap::from([("amount".to_string(), Value::Int(5))]),
+                    variables: BTreeMap::from([("amount".to_string(), Value::Int(5))]),
                     scope_id: Some("g".to_string()),
                 }],
                 ..Default::default()

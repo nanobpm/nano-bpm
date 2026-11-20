@@ -18,7 +18,7 @@
 //! fewer required new workers. Every candidate keeps its full [`ReplayReport`]
 //! scorecard for drill-down, so the operator decides — the harness only ranks.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::ProcessDefinition;
@@ -223,7 +223,7 @@ fn score_candidate(
             // executor (it expands them into sub-process scopes), so a multi-stage orchestrator —
             // or a variant the droid authored by editing a single called phase — only runs once
             // its phases are spliced in. With no call activities this is a faithful identity.
-            let library: HashMap<String, ProcessDefinition> =
+            let library: BTreeMap<String, ProcessDefinition> =
                 defs.iter().map(|d| (d.id.clone(), d.clone())).collect();
             let run_defs: Vec<ProcessDefinition> = library
                 .get(&process_id)
@@ -305,7 +305,7 @@ fn candidate_order(c: &RankedCandidate) -> (u8, u8, i64, u64, usize, String) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use serde_json::json;
     use serde_json::Value as Json;
@@ -371,7 +371,7 @@ mod tests {
   </bpmn:process>
 </bpmn:definitions>"#;
 
-    fn map(pairs: &[(&str, Json)]) -> HashMap<String, Json> {
+    fn map(pairs: &[(&str, Json)]) -> BTreeMap<String, Json> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))

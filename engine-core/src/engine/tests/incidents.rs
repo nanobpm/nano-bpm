@@ -43,7 +43,7 @@ fn inline_script_task_raises_an_incident_when_the_expression_fails_and_recovers(
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("n".to_string(), Value::Int(41))]),
+            BTreeMap::from([("n".to_string(), Value::Int(41))]),
         ))
         .unwrap();
     engine
@@ -73,7 +73,7 @@ fn should_raise_incident_when_inclusive_split_matches_no_flow() {
 
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("temp".to_string(), Value::Int(20))]);
+    let vars = BTreeMap::from([("temp".to_string(), Value::Int(20))]);
     let events = engine
         .apply_command(Command::create_instance_with("inc-stuck", vars))
         .unwrap();
@@ -121,7 +121,7 @@ fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "inc-redrive",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -142,7 +142,7 @@ fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("go".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
     let resolved = engine
@@ -201,7 +201,7 @@ fn inclusive_join_incident_is_observed_by_the_step_driver() {
     engine
         .apply_command(Command::create_instance_with(
             "inc-redrive",
-            HashMap::from([("go".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("go".to_string(), Value::Bool(false))]),
         ))
         .unwrap();
 
@@ -645,7 +645,7 @@ fn should_raise_an_expression_incident_when_a_condition_cannot_evaluate() {
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
-    let vars = HashMap::from([("name".to_string(), Value::Str("ann".into()))]);
+    let vars = BTreeMap::from([("name".to_string(), Value::Str("ann".into()))]);
     let created = engine
         .apply_command(Command::create_instance_with("typed", vars))
         .unwrap();
@@ -674,7 +674,7 @@ fn should_raise_incident_when_no_exclusive_flow_matches() {
 
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("d".to_string(), Value::Int(7))]);
+    let vars = BTreeMap::from([("d".to_string(), Value::Int(7))]);
     let events = engine
         .apply_command(Command::create_instance_with("strict", vars))
         .unwrap();
@@ -808,7 +808,7 @@ fn should_re_raise_a_gateway_incident_when_resolution_still_finds_no_flow() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("d".to_string(), Value::Bool(false))]);
+    let vars = BTreeMap::from([("d".to_string(), Value::Bool(false))]);
     let created = engine
         .apply_command(Command::create_instance_with("strict", vars))
         .unwrap();
@@ -848,7 +848,7 @@ fn should_recover_a_gateway_incident_after_fixing_variables() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("d".to_string(), Value::Bool(false))]);
+    let vars = BTreeMap::from([("d".to_string(), Value::Bool(false))]);
     let created = engine
         .apply_command(Command::create_instance_with("strict", vars))
         .unwrap();
@@ -859,7 +859,7 @@ fn should_recover_a_gateway_incident_after_fixing_variables() {
     engine
         .apply_command(Command::set_variables(
             instance_key,
-            HashMap::from([("d".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("d".to_string(), Value::Bool(true))]),
         ))
         .unwrap();
     engine
@@ -984,9 +984,10 @@ fn should_retain_a_resolved_incident_as_an_audit_record() {
 
     // when resolved with an operation reference at a known instant
     engine
-        .apply_command_at(
-            Command::resolve_incident_with(incident_key, 4242),
+        .apply_command_records_at(
+            Command::resolve_incident(incident_key),
             1_700_000_000_500,
+            Some(4242),
         )
         .unwrap();
 
@@ -1260,7 +1261,7 @@ fn input_mapping_eval_failure_raises_io_mapping_incident_and_no_job() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("x".to_string(), Value::Int(41))]),
+            BTreeMap::from([("x".to_string(), Value::Int(41))]),
         ))
         .unwrap();
     engine
@@ -1332,7 +1333,7 @@ fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("bad".to_string(), Value::Int(41))]),
+            BTreeMap::from([("bad".to_string(), Value::Int(41))]),
         ))
         .unwrap();
     let events = engine
@@ -1399,7 +1400,7 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
     // Correlating drives completion, which applies the output mapping
     // `=bad + 1` (string + int) and fails: one output-phase `IoMapping` incident,
     // the token held in COMPLETING, and the subscription already consumed.
-    engine.correlate_message("approve", "A", HashMap::new(), 0);
+    engine.correlate_message("approve", "A", BTreeMap::new(), 0);
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
     assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
@@ -1422,7 +1423,7 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("bad".to_string(), Value::Int(41))]),
+            BTreeMap::from([("bad".to_string(), Value::Int(41))]),
         ))
         .unwrap();
     let events = engine
@@ -1517,7 +1518,7 @@ fn subprocess_output_mapping_eval_failure_raises_io_mapping_incident() {
     engine
         .apply_command(Command::set_variables_scoped(
             sub_scope,
-            HashMap::from([("bad".to_string(), Value::Int(41))]),
+            BTreeMap::from([("bad".to_string(), Value::Int(41))]),
             true,
         ))
         .unwrap();
@@ -1606,7 +1607,7 @@ fn multi_instance_body_input_mapping_genuine_failure_raises_incident_and_recover
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("badFactor".to_string(), Value::Int(5))]),
+            BTreeMap::from([("badFactor".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     engine
@@ -1699,7 +1700,7 @@ fn multi_instance_body_output_mapping_genuine_failure_raises_incident_and_recove
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("badOut".to_string(), Value::Int(5))]),
+            BTreeMap::from([("badOut".to_string(), Value::Int(5))]),
         ))
         .unwrap();
     let events = engine
@@ -1767,7 +1768,7 @@ fn business_rule_task_unknown_decision_raises_incident() {
         )))
         .unwrap();
     let events = engine
-        .apply_command(Command::create_instance_with("brt", HashMap::new()))
+        .apply_command(Command::create_instance_with("brt", BTreeMap::new()))
         .unwrap();
     let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -1818,7 +1819,7 @@ fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1830,7 +1831,7 @@ fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
         .into_iter()
         .next()
         .expect("tool job");
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("x".to_string()));
     engine
         .apply_command(Command::complete_job_with(tool.key, vars))
@@ -1899,7 +1900,7 @@ fn adhoc_output_collection_incident_resolution_retries_the_append() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -1911,7 +1912,7 @@ fn adhoc_output_collection_incident_resolution_retries_the_append() {
         .into_iter()
         .next()
         .expect("tool job");
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("result".to_string(), Value::Str("x".to_string()));
     engine
         .apply_command(Command::complete_job_with(tool.key, vars))
@@ -1925,7 +1926,7 @@ fn adhoc_output_collection_incident_resolution_retries_the_append() {
     engine
         .apply_command(Command::set_variables_scoped(
             container,
-            HashMap::from([("results".to_string(), Value::List(Vec::new()))]),
+            BTreeMap::from([("results".to_string(), Value::List(Vec::new()))]),
             true,
         ))
         .unwrap();
@@ -2049,7 +2050,7 @@ fn adhoc_unbound_call_activity_tool_passes_through_without_incident() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("Unbound")],
                 ..Default::default()
@@ -2090,7 +2091,7 @@ fn adhoc_unbound_call_activity_tool_passes_through_without_incident() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent2.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 completion_condition_fulfilled: true,
                 ..Default::default()
@@ -2123,7 +2124,7 @@ fn adhoc_call_activity_tool_spawn_incident_recovers_on_resolve() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -2216,7 +2217,7 @@ fn adhoc_call_activity_tool_propagate_all_redrive_sees_post_incident_container_v
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("CallSpecialist")],
                 ..Default::default()
@@ -2361,7 +2362,7 @@ fn subprocess_input_mapping_failure_reenters_the_body_on_resolve() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("seed".to_string(), Value::Int(4))]),
+            BTreeMap::from([("seed".to_string(), Value::Int(4))]),
         ))
         .unwrap();
     engine
@@ -2459,7 +2460,7 @@ fn should_create_incident_if_job_type_expression_of_invalid_type() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "job-type-incident",
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     let key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -2485,7 +2486,7 @@ fn should_create_incident_if_job_type_expression_is_empty_string() {
     let created = engine
         .apply_command(Command::create_instance_with(
             "job-type-incident",
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     let key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -2525,7 +2526,7 @@ fn should_create_incident_if_job_type_expression_of_non_string_scalar_type() {
         let created = engine
             .apply_command(Command::create_instance_with(
                 "job-type-incident",
-                HashMap::new(),
+                BTreeMap::new(),
             ))
             .unwrap();
         let key = created.iter().find_map(|e| e.instance_key()).unwrap();
@@ -2617,7 +2618,7 @@ fn should_resolve_incident_after_job_type_expression_evaluation_failed() {
     engine
         .apply_command(Command::set_variables(
             key,
-            HashMap::from([("model".to_string(), Value::Str("kimi-k3".into()))]),
+            BTreeMap::from([("model".to_string(), Value::Str("kimi-k3".into()))]),
         ))
         .unwrap();
     let resolve_events = engine
@@ -2711,7 +2712,7 @@ fn job_type_expression_resolves_against_updated_variables() {
     engine
         .apply_command(Command::create_instance_with(
             "job-type-incident",
-            HashMap::new(),
+            BTreeMap::new(),
         ))
         .unwrap();
     assert!(engine.active_incidents().is_empty());
@@ -2772,7 +2773,7 @@ fn adhoc_tool_job_type_failure_parks_container_before_any_child_creation() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -2812,7 +2813,7 @@ fn adhoc_tool_job_type_failure_parks_container_before_any_child_creation() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -2872,7 +2873,7 @@ fn adhoc_tool_job_type_re_raise_after_resolve_keeps_container_parked() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -2941,7 +2942,7 @@ fn adhoc_tool_job_type_redrive_reapplies_input_mappings_to_original_seed() {
     engine
         .apply_command(Command::create_instance_with(
             "p",
-            HashMap::from([("counter".to_string(), Value::Int(1))]),
+            BTreeMap::from([("counter".to_string(), Value::Int(1))]),
         ))
         .unwrap();
     let inst = engine.state().instances.keys().copied().next().unwrap();
@@ -2953,7 +2954,7 @@ fn adhoc_tool_job_type_redrive_reapplies_input_mappings_to_original_seed() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -2964,7 +2965,7 @@ fn adhoc_tool_job_type_redrive_reapplies_input_mappings_to_original_seed() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -3027,7 +3028,7 @@ fn nested_declarative_adhoc_with_long_id_is_not_job_type_validated() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element(&long_id)],
                 ..Default::default()
@@ -3095,7 +3096,7 @@ fn adhoc_tool_job_type_redrive_applies_scope_corrections_over_the_frozen_seed() 
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element_with(
                     "toolA",
@@ -3115,7 +3116,7 @@ fn adhoc_tool_job_type_redrive_applies_scope_corrections_over_the_frozen_seed() 
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -3188,7 +3189,7 @@ fn adhoc_tool_job_type_incident_blocks_agent_job_reemit_until_resolved() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -3208,7 +3209,7 @@ fn adhoc_tool_job_type_incident_blocks_agent_job_reemit_until_resolved() {
     engine
         .apply_command(Command::complete_job_with_result(
             tool_b.key,
-            HashMap::from([("result".to_string(), Value::Int(1))]),
+            BTreeMap::from([("result".to_string(), Value::Int(1))]),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3225,7 +3226,7 @@ fn adhoc_tool_job_type_incident_blocks_agent_job_reemit_until_resolved() {
     engine
         .apply_command(Command::set_variables(
             engine.state().instances.keys().copied().next().unwrap(),
-            HashMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
         ))
         .unwrap();
     engine
@@ -3239,7 +3240,7 @@ fn adhoc_tool_job_type_incident_blocks_agent_job_reemit_until_resolved() {
     engine
         .apply_command(Command::complete_job_with_result(
             tool_a.key,
-            HashMap::from([("result".to_string(), Value::Int(2))]),
+            BTreeMap::from([("result".to_string(), Value::Int(2))]),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3307,7 +3308,7 @@ fn declarative_adhoc_tool_job_type_incident_blocks_container_completion_until_re
     engine
         .apply_command(Command::complete_job_with_result(
             tool_b.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3321,7 +3322,7 @@ fn declarative_adhoc_tool_job_type_incident_blocks_container_completion_until_re
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
         ))
         .unwrap();
     engine
@@ -3335,7 +3336,7 @@ fn declarative_adhoc_tool_job_type_incident_blocks_container_completion_until_re
     engine
         .apply_command(Command::complete_job_with_result(
             tool_a.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3391,7 +3392,7 @@ fn adhoc_tool_job_type_redrive_resolves_against_current_scope_view() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("counter".to_string(), Value::Int(1))]),
+            BTreeMap::from([("counter".to_string(), Value::Int(1))]),
         ))
         .unwrap();
     let agent = engine
@@ -3405,7 +3406,7 @@ fn adhoc_tool_job_type_redrive_resolves_against_current_scope_view() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element_with(
                     "toolA",
@@ -3425,7 +3426,7 @@ fn adhoc_tool_job_type_redrive_resolves_against_current_scope_view() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -3507,7 +3508,7 @@ fn adhoc_cancel_remaining_resolves_container_tool_type_incident() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -3601,7 +3602,7 @@ fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
                 ..Default::default()
@@ -3621,7 +3622,7 @@ fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
     engine
         .apply_command(Command::complete_job_with_result(
             tool_b.key,
-            HashMap::from([("done".to_string(), Value::Bool(true))]),
+            BTreeMap::from([("done".to_string(), Value::Bool(true))]),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3647,7 +3648,7 @@ fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
         ))
         .unwrap();
     engine
@@ -3661,7 +3662,7 @@ fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
     engine
         .apply_command(Command::complete_job_with_result(
             tool_a.key,
-            HashMap::from([("done".to_string(), Value::Bool(false))]),
+            BTreeMap::from([("done".to_string(), Value::Bool(false))]),
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
@@ -3790,7 +3791,7 @@ fn adhoc_tool_redrive_keeps_unseeded_names_inherited() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([
+            BTreeMap::from([
                 ("result".to_string(), Value::Int(0)),
                 ("toolType".to_string(), Value::Int(42)),
             ]),
@@ -3804,7 +3805,7 @@ fn adhoc_tool_redrive_keeps_unseeded_names_inherited() {
     engine
         .apply_command(Command::complete_job_with_result(
             agent.key,
-            HashMap::new(),
+            BTreeMap::new(),
             crate::model::AdHocJobResult {
                 activate_elements: vec![activate_element("toolA")],
                 ..Default::default()
@@ -3817,7 +3818,7 @@ fn adhoc_tool_redrive_keeps_unseeded_names_inherited() {
     engine
         .apply_command(Command::set_variables(
             inst,
-            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+            BTreeMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
         ))
         .unwrap();
     engine
@@ -3828,7 +3829,7 @@ fn adhoc_tool_redrive_keeps_unseeded_names_inherited() {
     engine
         .apply_command(Command::complete_job_with(
             tool[0].key,
-            HashMap::from([("result".to_string(), Value::Int(1))]),
+            BTreeMap::from([("result".to_string(), Value::Int(1))]),
         ))
         .unwrap();
     let agent2 = engine
@@ -3867,7 +3868,10 @@ fn quarantine_offheap_orphan_raises_a_durable_variables_lost_incident() {
     let key = created.iter().find_map(|e| e.instance_key()).unwrap();
 
     let events = engine
-        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .apply_command(Command::QuarantineOffheapOrphan {
+            instance_key: key,
+            stamp: None,
+        })
         .unwrap();
     // Exactly one IncidentRaised, pinned to the instance root.
     let raised: Vec<&Event> = events
@@ -3891,7 +3895,10 @@ fn quarantine_offheap_orphan_raises_a_durable_variables_lost_incident() {
 
     // Idempotent: a second quarantine of the same instance raises nothing.
     let again = engine
-        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .apply_command(Command::QuarantineOffheapOrphan {
+            instance_key: key,
+            stamp: None,
+        })
         .unwrap();
     assert!(
         again
@@ -3906,6 +3913,7 @@ fn quarantine_offheap_orphan_raises_a_durable_variables_lost_incident() {
     let unknown = engine
         .apply_command(Command::QuarantineOffheapOrphan {
             instance_key: 999_999,
+            stamp: None,
         })
         .unwrap();
     assert!(unknown.is_empty(), "unknown instance is a no-op");
@@ -3940,7 +3948,10 @@ fn quarantine_offheap_orphan_raises_for_a_suspended_instance() {
         .apply_command(Command::SuspendInstance { instance_key: key })
         .unwrap();
     let events = engine
-        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .apply_command(Command::QuarantineOffheapOrphan {
+            instance_key: key,
+            stamp: None,
+        })
         .unwrap();
     let raised: Vec<&Event> = events
         .iter()
@@ -3958,7 +3969,10 @@ fn quarantine_offheap_orphan_raises_for_a_suspended_instance() {
 
     // Idempotent across the suspend/quarantine pair too.
     let again = engine
-        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .apply_command(Command::QuarantineOffheapOrphan {
+            instance_key: key,
+            stamp: None,
+        })
         .unwrap();
     assert!(
         again
@@ -3994,7 +4008,10 @@ fn quarantine_offheap_orphan_incident_replays_identically() {
     let key = journal.iter().find_map(|e| e.instance_key()).unwrap();
     journal.extend(
         leader
-            .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+            .apply_command(Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: None,
+            })
             .unwrap(),
     );
 
@@ -4025,7 +4042,8 @@ fn quarantine_cold_orphan_records_a_durable_incident_for_a_non_resident_instance
     assert!(
         engine
             .apply_command(Command::QuarantineOffheapOrphan {
-                instance_key: cold_key
+                instance_key: cold_key,
+                stamp: None,
             })
             .unwrap()
             .is_empty(),
@@ -4090,9 +4108,1393 @@ fn quarantine_cold_orphan_on_a_resident_instance_matches_the_resident_path() {
     assert_eq!(active[0].element_id, "orphan-cold-res");
     assert!(
         engine
-            .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+            .apply_command(Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: None,
+            })
             .unwrap()
             .is_empty(),
         "shares the idempotency guard with the resident command"
+    );
+}
+
+// #1447: a leader-STAMPED `QuarantineOffheapOrphan` applies identically on a
+// replica where the instance is resident and on one where it is cold
+// (non-resident) — same events, same incident key, same key counter — because
+// it never branches on replica-local residency. The bare (local) form diverges
+// on exactly that split, which is the defect the stamp closes.
+#[test]
+fn stamped_orphan_quarantine_is_residency_independent() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    let (mut resident, key) = boot();
+    let (mut cold, cold_key) = boot();
+    assert_eq!(key, cold_key);
+    // Replica-local cold tiering: the instance leaves hot state on `cold` only.
+    assert!(cold.snapshot_instance(key).is_some(), "cold-shed");
+    assert!(cold.instance(key).is_none(), "precondition: cold replica");
+
+    // The leader (resident) resolves the stamp from ITS state. The episode id
+    // is the allocator's next key (#1587) — the incident key the proposal will
+    // mint — so it is nonzero and deterministic for this fixture.
+    let stamp = resident
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .expect("leader stamps a live orphan");
+    assert!(stamp.episode > 0, "the leader mints a nonzero episode id");
+    assert_eq!(
+        stamp,
+        OrphanIncidentStamp {
+            kind: OrphanKind::Resident,
+            element_id: "orphan".into(),
+            reason: "variables lost: spill row missing".into(),
+            terminal_epoch: 0,
+            target_terminated_epoch: 0,
+            episode: stamp.episode,
+        }
+    );
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    let on_resident = resident.apply_command_at(command.clone(), 50).unwrap();
+    let on_cold = cold.apply_command_at(command, 50).unwrap();
+    assert_eq!(
+        on_resident
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "exactly one incident"
+    );
+    assert_eq!(
+        on_resident, on_cold,
+        "identical events on resident and cold replicas"
+    );
+    assert_eq!(
+        resident.snapshot().next_local,
+        cold.snapshot().next_local,
+        "identical key counters"
+    );
+    // Once incidented, the leader stamps nothing more (no duplicate proposal).
+    assert!(resident
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .is_none());
+    // A cold stamp from a leader that does not hold the instance carries the
+    // cold metadata.
+    let cold_stamp = Engine::new()
+        .orphan_incident_stamp(4_242, OrphanKind::Cold)
+        .unwrap();
+    assert_eq!(cold_stamp.element_id, "");
+    assert!(cold_stamp.reason.contains("cold instance row missing"));
+}
+
+// #1574: the `VariablesLostQuarantined` event round-trips (replay-compat for
+// the persisted event frame).
+#[cfg(feature = "serde")]
+#[test]
+fn variables_lost_quarantined_round_trips() {
+    let current = Event::VariablesLostQuarantined {
+        instance_key: 7,
+        incident_key: 9,
+        episode: 9,
+    };
+    let json = serde_json::to_string(&current).unwrap();
+    assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), current);
+    // A pre-#1587 frame (no `episode` field) still decodes, defaulting to the
+    // episode-blind sentinel 0.
+    let legacy = r#"{"VariablesLostQuarantined":{"instance_key":7,"incident_key":9}}"#;
+    let decoded = serde_json::from_str::<Event>(legacy).unwrap();
+    assert!(matches!(
+        decoded,
+        Event::VariablesLostQuarantined {
+            instance_key: 7,
+            incident_key: 9,
+            episode: 0,
+        }
+    ));
+}
+
+// #1574: the quarantine's dedup tombstone rides the replicated event log, so it
+// replays identically on a fresh engine (crash recovery / follower) and a
+// replayed journal does not re-mint the incident.
+#[test]
+fn quarantine_tombstone_replays_identically() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut leader = Engine::new();
+    let mut journal: Vec<Event> = Vec::new();
+    journal.extend(
+        leader
+            .apply_command_at(Command::DeployProcess(def), 1)
+            .unwrap(),
+    );
+    journal.extend(
+        leader
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap(),
+    );
+    let key = journal.iter().find_map(|e| e.instance_key()).unwrap();
+    journal.extend(
+        leader
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(OrphanIncidentStamp {
+                        kind: OrphanKind::Resident,
+                        element_id: "orphan".into(),
+                        reason: "variables lost: spill row missing".into(),
+                        terminal_epoch: 0,
+                        target_terminated_epoch: 0,
+                        episode: 0,
+                    }),
+                },
+                50,
+            )
+            .unwrap(),
+    );
+
+    // The leader's journal carries the repair event alongside the incident.
+    assert!(
+        journal
+            .iter()
+            .any(|e| matches!(e, Event::VariablesLostQuarantined { .. })),
+        "the tombstone is journaled as a replayable event"
+    );
+
+    // Replay into a fresh engine: identical tombstone + incident, and a
+    // duplicate quarantine after replay is still deduped (no second incident).
+    let mut follower = Engine::replay(journal);
+    assert!(
+        follower.has_active_variables_lost(key),
+        "the tombstone survives replay"
+    );
+    let dup = follower
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(OrphanIncidentStamp {
+                    kind: OrphanKind::Resident,
+                    element_id: "orphan".into(),
+                    reason: "variables lost: spill row missing".into(),
+                    terminal_epoch: 0,
+                    target_terminated_epoch: 0,
+                    episode: 0,
+                }),
+            },
+            51,
+        )
+        .unwrap();
+    assert!(
+        dup.iter()
+            .all(|e| !matches!(e, Event::IncidentRaised { .. })),
+        "a post-replay duplicate mints no second incident"
+    );
+}
+
+// #1447: the `stamp` field is additive — a pre-#1447 Raft-log command (no
+// `stamp`) still decodes (as the local form), and the stamped form round-trips.
+#[cfg(feature = "serde")]
+#[test]
+fn quarantine_offheap_orphan_stamp_is_serde_additive() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let old: Command =
+        serde_json::from_str(r#"{"QuarantineOffheapOrphan":{"instance_key":7}}"#).unwrap();
+    assert_eq!(
+        old,
+        Command::QuarantineOffheapOrphan {
+            instance_key: 7,
+            stamp: None
+        }
+    );
+    assert_eq!(
+        serde_json::to_string(&old).unwrap(),
+        r#"{"QuarantineOffheapOrphan":{"instance_key":7}}"#,
+        "an unstamped command keeps its pre-#1447 wire shape"
+    );
+    let stamped = Command::QuarantineOffheapOrphan {
+        instance_key: 7,
+        stamp: Some(OrphanIncidentStamp {
+            kind: OrphanKind::Cold,
+            element_id: String::new(),
+            reason: "r".into(),
+            terminal_epoch: 0,
+            target_terminated_epoch: 0,
+            episode: 0,
+        }),
+    };
+    let json = serde_json::to_string(&stamped).unwrap();
+    assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), stamped);
+}
+
+// #1574 review: two committed STAMPED proposals for the same outstanding loss
+// must not mint two incidents. During failover a promoted member can stamp its
+// parked report before an inherited quarantine entry applies, so both proposals
+// commit; the second must be a no-op because the replicated incident set already
+// carries an active `VariablesLost` for the instance.
+#[test]
+fn stamped_orphan_quarantine_dedupes_a_second_committed_proposal() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(def), 1)
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("orphan"), 2)
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let mk = || Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(OrphanIncidentStamp {
+            kind: OrphanKind::Resident,
+            element_id: "orphan".into(),
+            reason: "variables lost: spill row missing".into(),
+            terminal_epoch: 0,
+            target_terminated_epoch: 0,
+            episode: 0,
+        }),
+    };
+    let first = engine.apply_command_at(mk(), 50).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "the first proposal raises the incident"
+    );
+    // A second committed stamped proposal for the SAME loss mints no second
+    // incident (the dedup tombstone already names the instance).
+    let second = engine.apply_command_at(mk(), 51).unwrap();
+    assert!(
+        second
+            .iter()
+            .all(|e| !matches!(e, Event::IncidentRaised { .. })),
+        "a duplicate committed proposal mints no second incident"
+    );
+    // …and is a COMPLETE no-op: the first proposal emitted exactly one
+    // tombstone event; the duplicate emits none.
+    assert_eq!(
+        first
+            .iter()
+            .filter(|e| matches!(e, Event::VariablesLostQuarantined { .. }))
+            .count(),
+        1,
+        "the first proposal emits exactly one tombstone event"
+    );
+    assert!(
+        second
+            .iter()
+            .all(|e| !matches!(e, Event::VariablesLostQuarantined { .. })),
+        "a duplicate proposal re-emits no tombstone event"
+    );
+    assert!(
+        second.is_empty(),
+        "a duplicate proposal is a complete no-op (no events at all)"
+    );
+    let active = engine
+        .incidents()
+        .iter()
+        .filter(|i| i.kind == crate::state::IncidentKind::VariablesLost)
+        .count();
+    assert_eq!(active, 1, "exactly one VariablesLost incident");
+}
+
+// #1574 review (inline): the dedup guard must survive COLD TIERING and terminal
+// eviction. The `VariablesLost` incident record leaves hot state when its
+// instance cold-spills (`snapshot_instance` drains `incidents` into the cold
+// row), so a guard reading only `incidents` goes blind on exactly the replica
+// that tiered — a duplicate committed proposal then mints a second incident on
+// that replica while a resident replica skips it, diverging the journals. The
+// replicated tombstone (`State::variables_lost_quarantined`) is residency- and
+// eviction-independent, so both replicas dedup identically.
+#[test]
+fn stamped_orphan_quarantine_dedupes_across_cold_tiering() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mk = |key| Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(OrphanIncidentStamp {
+            kind: OrphanKind::Resident,
+            element_id: "orphan".into(),
+            reason: "variables lost: spill row missing".into(),
+            terminal_epoch: 0,
+            target_terminated_epoch: 0,
+            episode: 0,
+        }),
+    };
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    // Two replicas; both apply the first committed stamped proposal.
+    let (mut resident, key) = boot();
+    let (mut tiered, _) = boot();
+    resident.apply_command_at(mk(key), 50).unwrap();
+    tiered.apply_command_at(mk(key), 50).unwrap();
+    assert_eq!(
+        resident
+            .incidents()
+            .iter()
+            .filter(|i| i.kind == crate::state::IncidentKind::VariablesLost)
+            .count(),
+        1
+    );
+
+    // Replica-local cold tiering on ONE replica: the incident record leaves hot
+    // state there, so an incidents-only guard would now be blind on `tiered`.
+    assert!(tiered.snapshot_instance(key).is_some(), "cold-shed");
+    assert!(
+        tiered.instance(key).is_none(),
+        "precondition: instance cold on the tiered replica"
+    );
+    assert!(
+        tiered
+            .incidents()
+            .iter()
+            .all(|i| i.kind != crate::state::IncidentKind::VariablesLost),
+        "precondition: the incident record left hot state on the tiered replica"
+    );
+
+    // A duplicate committed stamped proposal lands on BOTH replicas. The
+    // resident replica dedups via its hot incident; the tiered replica must
+    // dedup via the replicated tombstone — NEITHER mints a second incident.
+    let dup_resident = resident.apply_command_at(mk(key), 51).unwrap();
+    let dup_tiered = tiered.apply_command_at(mk(key), 51).unwrap();
+    for (name, evts) in [("resident", &dup_resident), ("tiered", &dup_tiered)] {
+        assert!(
+            evts.iter()
+                .all(|e| !matches!(e, Event::IncidentRaised { .. })),
+            "{name}: a duplicate proposal mints no second incident after tiering"
+        );
+    }
+    // Both replicas agree: exactly one VariablesLost incident, identical key
+    // counters (no divergent mint on the tiered replica).
+    assert_eq!(
+        resident.snapshot().next_local,
+        tiered.snapshot().next_local,
+        "no divergent key mint across the tiered/resident split"
+    );
+}
+
+// #1574 review: the dedup tombstone must be EPISODE-scoped, not lifetime. A
+// permanent tombstone makes `has_active_variables_lost` return true even after
+// the incident is resolved, so a LATER, distinct loss (operator replaced the
+// variables, spilled again, lost the new row) is suppressed forever. Resolving
+// the incident lifts the tombstone so the next loss reports fresh — while the
+// tombstone still dedups duplicates of the SAME active episode.
+#[test]
+fn quarantine_dedup_is_episode_scoped_across_resolution() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(def), 1)
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("orphan"), 2)
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let mk = || Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(OrphanIncidentStamp {
+            kind: OrphanKind::Resident,
+            element_id: "orphan".into(),
+            reason: "variables lost: spill row missing".into(),
+            terminal_epoch: 0,
+            target_terminated_epoch: 0,
+            episode: 0,
+        }),
+    };
+
+    // Episode 1: quarantine raises the incident and sets the tombstone.
+    engine.apply_command_at(mk(), 50).unwrap();
+    assert!(engine.has_active_variables_lost(key), "episode 1 active");
+    let incident_key = engine
+        .incidents()
+        .iter()
+        .find(|i| i.kind == crate::state::IncidentKind::VariablesLost)
+        .unwrap()
+        .key;
+
+    // Resolve the incident: the episode ends and the tombstone lifts.
+    engine
+        .apply_command_at(Command::resolve_incident(incident_key), 51)
+        .unwrap();
+    assert!(
+        !engine.has_active_variables_lost(key),
+        "resolution lifts the tombstone — the episode is over"
+    );
+
+    // Episode 2: a NEW loss (replacement variables spilled and lost) must be
+    // reported fresh, not suppressed by a lifetime tombstone.
+    let second = engine.apply_command_at(mk(), 52).unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "a second, distinct loss after resolution raises a fresh incident"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|e| matches!(e, Event::VariablesLostQuarantined { .. })),
+        "the second episode records a fresh tombstone"
+    );
+    let active = engine
+        .incidents()
+        .iter()
+        .filter(|i| {
+            i.kind == crate::state::IncidentKind::VariablesLost
+                && i.state == crate::state::IncidentState::Active
+        })
+        .count();
+    assert_eq!(active, 1, "exactly one active VariablesLost incident again");
+}
+
+/// Boots one replica of the orphan fixture: deploy, create, and set `x = 1`.
+fn orphan_replica() -> (Engine, Key) {
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(def), 1)
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("orphan"), 2)
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    engine
+        .apply_command_at(
+            Command::set_variables(key, BTreeMap::from([("x".into(), Value::Int(1))])),
+            3,
+        )
+        .unwrap();
+    (engine, key)
+}
+
+fn stamped(key: Key) -> Command {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(OrphanIncidentStamp {
+            kind: OrphanKind::Resident,
+            element_id: "orphan".into(),
+            reason: "variables lost: spill row missing".into(),
+            terminal_epoch: 0,
+            target_terminated_epoch: 0,
+            episode: 0,
+        }),
+    }
+}
+
+// #1574 (scope B): the stamped quarantine is replica-deterministic. Applied on a
+// replica where the instance is resident and on one where it is cold, it yields
+// identical events, tombstones, key counters and — once the cold replica
+// rehydrates — identical instance state and incidents. It carries no variable
+// payload, so it cannot touch variables on either replica.
+#[test]
+fn stamped_quarantine_converges_resident_and_cold_replicas() {
+    let (mut resident, key) = orphan_replica();
+    let (mut cold, _) = orphan_replica();
+    let row = cold.snapshot_instance(key).expect("cold-shed");
+    assert!(cold.instance(key).is_none(), "precondition: cold replica");
+
+    let on_resident = resident.apply_command_at(stamped(key), 50).unwrap();
+    let on_cold = cold.apply_command_at(stamped(key), 50).unwrap();
+    assert_eq!(on_resident, on_cold, "identical events");
+    assert_eq!(
+        resident.state.variables_lost_quarantined, cold.state.variables_lost_quarantined,
+        "identical tombstones"
+    );
+    assert_eq!(resident.snapshot().next_local, cold.snapshot().next_local);
+
+    // Rehydrate the cold replica: instance state (variables untouched) and the
+    // incident set now match the resident replica exactly.
+    cold.rehydrate_instance(row);
+    let view = |e: &Engine| {
+        let inst = e.instance(key).unwrap();
+        let mut incidents: Vec<_> = e
+            .incidents()
+            .iter()
+            .map(|i| (i.key, i.instance_key, i.kind, i.state, i.reason.clone()))
+            .collect();
+        incidents.sort_by_key(|i| i.0);
+        let mut indexed = inst.incidents.clone();
+        indexed.sort_unstable();
+        (
+            inst.variables.as_ref().clone(),
+            inst.state,
+            incidents,
+            indexed,
+        )
+    };
+    assert_eq!(
+        view(&resident),
+        view(&cold),
+        "identical state and incidents"
+    );
+    assert_eq!(
+        view(&resident).0.get("x"),
+        Some(&Value::Int(1)),
+        "no variable rollback"
+    );
+    assert_eq!(
+        view(&cold).3.len(),
+        1,
+        "the incident raised while cold is indexed on the rehydrated instance"
+    );
+
+    // A later termination resolves the incident identically on both replicas
+    // and lifts both tombstones.
+    let end_resident = resident
+        .apply_command_at(Command::cancel_instance(key), 60)
+        .unwrap();
+    let end_cold = cold
+        .apply_command_at(Command::cancel_instance(key), 60)
+        .unwrap();
+    assert_eq!(end_resident, end_cold, "identical termination events");
+    assert!(end_cold
+        .iter()
+        .any(|e| matches!(e, Event::IncidentResolved { .. })));
+    assert_eq!(
+        resident.state.variables_lost_quarantined, cold.state.variables_lost_quarantined,
+        "identical tombstones after termination"
+    );
+}
+
+// #1587 (acceptance 1 + 2): a delayed duplicate of an already-resolved
+// quarantine episode raises no new incident and never touches variables. The
+// stamp's replicated loss-episode id matches no live tombstone once the
+// episode's incident was resolved, so the apply gate supersedes the duplicate
+// instead of re-reporting it as a fresh episode (the pre-#1587 behaviour).
+// The supersede emits only the engine-internal `OrphanStampSuperseded` signal
+// (no incident, no tombstone, no variable write) — identical on a resident and
+// a cold replica — and the `SetVariables` committed after the resolve is never
+// rolled back. With no reissue sink wired (as here) the duplicate is simply
+// not re-proposed; the journal-side reissue is covered by the storage tests.
+#[test]
+fn delayed_duplicate_after_resolve_is_a_noop_and_touches_no_variables() {
+    let (mut resident, key) = orphan_replica();
+    let (mut cold, _) = orphan_replica();
+    // The leader stamps episode 1 once; BOTH the first proposal and its delayed
+    // duplicate carry that SAME stamped command (same episode id).
+    let episode1 = resident
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("episode 1 stamps");
+    assert!(
+        episode1.episode > 0,
+        "the leader mints a nonzero episode id"
+    );
+    let cmd1 = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(episode1),
+    };
+    let run = |engine: &mut Engine, shed: bool| {
+        // Episode 1: apply the stamped proposal, then resolve its incident.
+        engine.apply_command_at(cmd1.clone(), 50).unwrap();
+        let incident_key = engine.state.variables_lost_quarantined[&key].incident_key;
+        engine
+            .apply_command_at(Command::resolve_incident(incident_key), 51)
+            .unwrap();
+        assert!(
+            !engine.state.variables_lost_quarantined.contains_key(&key),
+            "resolve lifts the tombstone"
+        );
+        // A `SetVariables` commits after the resolve (the intervening write the
+        // repair must never roll back).
+        engine
+            .apply_command_at(
+                Command::set_variables(key, BTreeMap::from([("x".into(), Value::Int(2))])),
+                52,
+            )
+            .unwrap();
+        let row = shed.then(|| engine.snapshot_instance(key).expect("cold-shed"));
+        // The DELAYED DUPLICATE of episode 1 (the SAME stamped command) applies.
+        let dup = engine.apply_command_at(cmd1.clone(), 53).unwrap();
+        if let Some(row) = row {
+            engine.rehydrate_instance(row);
+        }
+        dup
+    };
+    let dup_resident = run(&mut resident, false);
+    let dup_cold = run(&mut cold, true);
+    assert_eq!(dup_resident, dup_cold, "identical events on both replicas");
+    // The supersede emits ONLY the engine-internal signal — no incident, no
+    // tombstone, no variable write — so the duplicate changes no state.
+    assert!(
+        dup_resident
+            .iter()
+            .all(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+        "a delayed duplicate of a resolved episode only journals its supersede: {dup_resident:?}"
+    );
+    for engine in [&resident, &cold] {
+        // Exactly one VariablesLost incident ever (episode 1's, now resolved) —
+        // the duplicate raised none.
+        assert_eq!(
+            engine
+                .incidents()
+                .iter()
+                .filter(|i| i.kind == crate::state::IncidentKind::VariablesLost)
+                .count(),
+            1,
+            "no new incident from the delayed duplicate"
+        );
+        assert!(
+            !engine.state.variables_lost_quarantined.contains_key(&key),
+            "the duplicate re-records no tombstone"
+        );
+        assert_eq!(
+            engine.instance(key).unwrap().variables.get("x"),
+            Some(&Value::Int(2)),
+            "the post-resolve SetVariables is never rolled back"
+        );
+    }
+    assert_eq!(resident.snapshot().next_local, cold.snapshot().next_local);
+}
+
+// #1587: a GENUINELY NEW loss after a resolution is still reported. The leader
+// stamps it with a FRESH episode id (its allocator advanced past episode 1's
+// incident key), so the apply gate sees a new episode — not a duplicate of the
+// resolved one — and raises a fresh incident.
+#[test]
+fn new_loss_after_resolution_is_reported_fresh() {
+    let (mut engine, key) = orphan_replica();
+    // Episode 1: the leader stamps, the proposal applies, the incident resolves.
+    let episode1 = engine
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("episode 1 stamps");
+    engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(episode1.clone()),
+            },
+            50,
+        )
+        .unwrap();
+    let incident_key = engine.state.variables_lost_quarantined[&key].incident_key;
+    assert_eq!(
+        incident_key, episode1.episode,
+        "the episode id IS the incident key the proposal minted"
+    );
+    engine
+        .apply_command_at(Command::resolve_incident(incident_key), 51)
+        .unwrap();
+    assert!(!engine.has_active_variables_lost(key), "episode 1 resolved");
+
+    // Episode 2: the leader re-stamps AFTER the resolution. Its allocator has
+    // advanced past episode 1's incident key, so the new stamp carries a
+    // DISTINCT episode id.
+    let stamp2 = engine
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("a fresh loss stamps");
+    assert_ne!(
+        stamp2.episode, incident_key,
+        "a new episode gets a fresh id, distinct from the resolved episode"
+    );
+    let second = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(stamp2),
+            },
+            52,
+        )
+        .unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "a genuinely new loss after resolution raises a fresh incident"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|e| matches!(e, Event::VariablesLostQuarantined { .. })),
+        "the new episode records a fresh tombstone"
+    );
+    assert!(engine.has_active_variables_lost(key), "episode 2 is active");
+}
+
+// #1587 review (allocator race): unrelated key-minting work between the
+// leader's stamp and the proposal's commitment advances the replicated
+// allocator, so the proposal's episode no longer matches `peek_next_key()`.
+// The gate must NOT silently clear the pending report: it journals
+// `OrphanStampSuperseded` (the leader's journal keeps the report and re-drains
+// it), which re-stamps it at the now-current position and re-proposes it — the fresh
+// quarantine still raises its `VariablesLost` incident.
+#[test]
+fn superseded_orphan_stamp_is_reissued_not_dropped() {
+    let (mut engine, key) = orphan_replica();
+
+    // The leader stamps the live orphan (episode = the allocator's next key).
+    let stamp = engine
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("a live orphan stamps");
+    assert!(stamp.episode > 0, "nonzero episode");
+
+    // Unrelated key-minting work commits BEFORE the proposal: a new instance
+    // creation advances the shared allocator past the stamped episode.
+    engine
+        .apply_command_at(Command::create_instance("orphan"), 49)
+        .unwrap();
+
+    // The stamped proposal now applies SUPERSEDED: it journals the supersede
+    // signal, raises NO incident, and records NO tombstone.
+    let first = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(stamp),
+            },
+            50,
+        )
+        .unwrap();
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, Event::OrphanStampSuperseded { instance_key, .. } if *instance_key == key)),
+        "the stale stamp journals its supersede: {first:?}"
+    );
+    assert!(
+        first.iter().all(|e| !matches!(
+            e,
+            Event::IncidentRaised { .. } | Event::VariablesLostQuarantined { .. }
+        )),
+        "a superseded stamp raises no incident and records no tombstone: {first:?}"
+    );
+    assert!(
+        !engine.has_active_variables_lost(key),
+        "no incident raised by the superseded proposal"
+    );
+
+    // The reissue: the leader RE-STAMPS at the allocator's now-current position
+    // and re-proposes. That proposal applies and raises the incident — the
+    // fresh quarantine is never lost to the allocator race.
+    let restamp = engine
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("the reissue re-stamps");
+    let second = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(restamp),
+            },
+            51,
+        )
+        .unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "the re-stamped re-proposal raises the VariablesLost incident: {second:?}"
+    );
+    assert!(
+        engine.has_active_variables_lost(key),
+        "the fresh quarantine applies after reissue"
+    );
+}
+
+// #1587 review (allocator race, replica-determinism): the supersede decision
+// is a pure function of replicated state, so a resident and a cold replica
+// emit the identical `OrphanStampSuperseded` frame and stay converged.
+#[test]
+fn superseded_orphan_stamp_is_replica_deterministic() {
+    let (mut resident, key) = orphan_replica();
+    let (mut cold, _) = orphan_replica();
+    let stamp = resident
+        .orphan_incident_stamp(key, crate::OrphanKind::Resident)
+        .expect("a live orphan stamps");
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    // Advance BOTH replicas' allocators identically (the replicated work that
+    // raced the proposal), then apply the same stamped command to each.
+    for engine in [&mut resident, &mut cold] {
+        engine
+            .apply_command_at(Command::create_instance("orphan"), 49)
+            .unwrap();
+    }
+    let a = resident.apply_command_at(command.clone(), 50).unwrap();
+    let b = cold.apply_command_at(command, 50).unwrap();
+    assert_eq!(a, b, "identical supersede frames on both replicas");
+    assert!(
+        a.iter()
+            .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+        "both replicas journal the supersede"
+    );
+    assert_eq!(resident.snapshot().next_local, cold.snapshot().next_local);
+}
+
+// #1574 review (cancellation race): an orphan report can be queued before the
+// instance is cancelled and its stamped proposal commit AFTER the cancel. The
+// replicated apply must then be a deterministic no-op — no incident, no
+// tombstone — for a resident terminal instance. (Absent targets are gated by
+// the host journal, which alone can tell cold-live from evicted.)
+#[test]
+fn stamped_orphan_quarantine_is_a_noop_for_terminal_instance() {
+    use crate::{OrphanIncidentStamp, OrphanKind};
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(def), 1)
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("orphan"), 2)
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    engine
+        .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+        .unwrap();
+    let after_cancel = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(OrphanIncidentStamp {
+                    kind: OrphanKind::Resident,
+                    element_id: "orphan".into(),
+                    reason: "variables lost: spill row missing".into(),
+                    terminal_epoch: 0,
+                    target_terminated_epoch: 0,
+                    episode: 0,
+                }),
+            },
+            50,
+        )
+        .unwrap();
+    assert!(
+        after_cancel.is_empty(),
+        "a proposal applying after cancel is a complete no-op: {after_cancel:?}"
+    );
+    assert!(!engine.has_active_variables_lost(key));
+
+    // A replica that has ALREADY EVICTED the terminal instance (eviction is
+    // replica-local in timing) must reach the same decision from replicated
+    // state alone.
+    assert!(engine.evict_instance(key), "terminal instance evicts");
+    assert!(engine.instance(key).is_none());
+    let after_evict = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(OrphanIncidentStamp {
+                    kind: OrphanKind::Cold,
+                    element_id: String::new(),
+                    reason: "variables lost: cold instance row missing".into(),
+                    terminal_epoch: 0,
+                    target_terminated_epoch: 0,
+                    episode: 0,
+                }),
+            },
+            51,
+        )
+        .unwrap();
+    assert!(
+        after_evict.is_empty(),
+        "evicted terminal instance: identical no-op: {after_evict:?}"
+    );
+}
+
+// #1574 review (terminal-history eviction): the terminal gate's replicated
+// `recently_terminated` ring is BOUNDED — once more than
+// [`RECENTLY_TERMINATED_CAP`] terminal transitions commit while a stamped
+// proposal is still in flight, the ring no longer names the instance. The gate
+// must still decide IDENTICALLY on every replica: residency is replica-local,
+// so the gate must never consult it — a replica retaining the terminal
+// instance and one that evicted it must raise (or no-op) together, never mint
+// a key on one alone. The leader's stamp
+// carries the replicated terminal epoch at proposal time; the apply gate reads
+// the epoch distance against the ring's coverage, which is replicated state, so
+// the resident/evicted split after the ring wraps cannot diverge.
+#[test]
+fn stamped_orphan_quarantine_after_ring_wrap_is_a_uniform_noop() {
+    use crate::OrphanKind;
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    // Three replicas with identical journals: the LEADER plus a follower that
+    // retains the terminal instance and a follower that evicts it. The orphan
+    // report is queued while the instance lives; the cancel commits BEFORE the
+    // leader's drainer stamps it (the real flight sequence: report queued →
+    // cancel commits → leader stamps → the proposal commits).
+    let (mut leader, key) = boot();
+    let (mut resident, _) = boot();
+    let (mut evicted, _) = boot();
+    for replica in [&mut leader, &mut resident, &mut evicted] {
+        replica
+            .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+            .unwrap();
+    }
+    // The leader already evicted its terminal shell (eviction is
+    // replica-local), so it still stamps — and the stamp carries the
+    // POST-cancel terminal epoch, which is what lets the apply gate prove the
+    // cancel preceded the stamp even after the ring wraps.
+    assert!(
+        leader.evict_instance(key),
+        "leader evicted its terminal shell"
+    );
+    let stamp = leader
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .expect("an evicted (cold-looking) instance still stamps");
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    // … then MORE THAN the ring's capacity of further terminal transitions
+    // commit while the proposal is still in flight, wrapping the ring.
+    // Each filler is a start→end process: its create's RTC drain completes it
+    // at once, so every create is one terminal transition (a completed
+    // instance rejects CancelInstance — terminal instances are not
+    // cancellable).
+    let filler = ProcessBuilder::new("filler")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .build()
+        .unwrap();
+    for replica in [&mut leader, &mut resident, &mut evicted] {
+        replica
+            .apply_command_at(Command::DeployProcess(filler.clone()), 4)
+            .unwrap();
+    }
+    let mut clock = 10u64;
+    for _ in 0..crate::state::RECENTLY_TERMINATED_CAP {
+        for replica in [&mut leader, &mut resident, &mut evicted] {
+            replica
+                .apply_command_at(Command::create_instance("filler"), clock)
+                .unwrap();
+        }
+        clock += 1;
+    }
+    // Replica-local divergence: ONE follower evicts the terminal instance.
+    assert!(evicted.evict_instance(key), "terminal instance evicts");
+    assert!(evicted.instance(key).is_none());
+    assert!(
+        resident.instance(key).is_some(),
+        "the other replica retains it"
+    );
+
+    // The delayed proposal finally commits on both. The resident replica
+    // no-ops via residency; the evicted replica must reach the SAME decision —
+    // no incident, no tombstone, no key mint.
+    let on_resident = resident.apply_command_at(command.clone(), clock).unwrap();
+    let on_evicted = evicted.apply_command_at(command, clock).unwrap();
+    assert!(
+        on_resident.is_empty(),
+        "resident replica: terminal no-op: {on_resident:?}"
+    );
+    assert_eq!(
+        on_resident, on_evicted,
+        "the evicted replica decides identically after the ring wraps"
+    );
+    assert!(
+        on_evicted
+            .iter()
+            .all(|e| !matches!(e, Event::IncidentRaised { .. })),
+        "no incident on the evicted replica: {on_evicted:?}"
+    );
+    // No divergent key mint: a minted incident key would have advanced the
+    // allocator past the shared journal, and the events themselves are
+    // byte-identical (asserted above) — so both replicas stand identical.
+    assert_eq!(
+        resident.state().terminal_epoch,
+        evicted.state().terminal_epoch,
+        "identical replicated terminal epochs"
+    );
+}
+
+// #1574 review (terminal-history eviction, other half): a stamp minted BEFORE
+// the instance terminated must not be suppressed by an epoch distance the ring
+// can no longer explain. When the proposal was in flight longer than the whole
+// ring window, the gate cannot prove the terminal transition followed the
+// stamp — it fails OPEN (raise the incident) on every replica identically,
+// preserving the pre-epoch behaviour for a genuinely stale stamp.
+#[test]
+fn stamped_orphan_quarantine_with_a_stale_stamp_still_raises() {
+    use crate::OrphanKind;
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    let (mut resident, key) = boot();
+    let (mut evicted, _) = boot();
+    // The stamp predates the terminal transition (the leader stamped while the
+    // instance was live, one terminal epoch earlier). The stamp is a LEGACY
+    // (pre-#1587) one — `episode: 0` — so the apply gate stays episode-blind
+    // and decides on the terminal gate alone (a nonzero episode would no-op as
+    // a duplicate-of-a-resolved-episode once no tombstone is live, which is
+    // not what this terminal-gate test exercises).
+    let stamp = resident
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .expect("a live instance stamps");
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(crate::OrphanIncidentStamp {
+            episode: 0,
+            ..stamp
+        }),
+    };
+
+    // The instance terminates and the ring wraps PAST the stamp's epoch (more
+    // terminal transitions after the cancel than the ring holds).
+    for replica in [&mut resident, &mut evicted] {
+        replica
+            .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+            .unwrap();
+    }
+    // Each filler is a start→end process: its create's RTC drain completes it
+    // at once, so every create is one terminal transition (a completed
+    // instance rejects CancelInstance — terminal instances are not
+    // cancellable).
+    let filler = ProcessBuilder::new("filler")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .build()
+        .unwrap();
+    for replica in [&mut resident, &mut evicted] {
+        replica
+            .apply_command_at(Command::DeployProcess(filler.clone()), 4)
+            .unwrap();
+    }
+    let mut clock = 10u64;
+    for _ in 0..crate::state::RECENTLY_TERMINATED_CAP + 1 {
+        for replica in [&mut resident, &mut evicted] {
+            replica
+                .apply_command_at(Command::create_instance("filler"), clock)
+                .unwrap();
+        }
+        clock += 1;
+    }
+    // ONLY one replica evicts the terminal instance: residency is
+    // replica-local, so the gate must not consult it (stamp-before-cancel
+    // divergence) — both replicas must still decide identically.
+    assert!(resident.instance(key).is_some());
+    assert!(evicted.evict_instance(key));
+
+    // The stamp's epoch is now further back than the ring reaches: the gate
+    // cannot prove the cancel followed the stamp, so it raises on BOTH
+    // replicas identically (fail-open, replica-deterministic).
+    let on_a = resident.apply_command_at(command.clone(), clock).unwrap();
+    let on_b = evicted.apply_command_at(command, clock).unwrap();
+    assert_eq!(on_a, on_b, "both replicas decide identically");
+    assert_eq!(
+        on_a.iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "a stale stamp (epoch beyond the ring's reach) still raises: {on_a:?}"
+    );
+}
+
+// #1574 review (review 5899722557): the epoch-distance gate must not suppress a
+// LIVE orphan when an UNRELATED instance terminates between stamping and
+// commitment. The global `terminal_epoch` counts every terminal transition, so
+// a stamp at epoch 1 followed by one unrelated completion (epoch 1 -> 2) yields
+// `distance = 1`, within the ring's coverage — the old gate read that as "the
+// target terminated after the stamp" and no-opped, permanently losing a live
+// orphan report (the journal settles the no-op; discovery already cleared the
+// spill flag). The gate must decide from the TARGET's replicated lifecycle
+// validity, not the global epoch distance: the target never terminated, so the
+// incident must be raised.
+#[test]
+fn stamped_orphan_quarantine_after_an_unrelated_completion_still_raises() {
+    use crate::OrphanKind;
+    // The orphan process parks on a service task (never completes), so its
+    // instance stays LIVE for the whole scenario.
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    let (mut resident, key) = boot();
+    let (mut cold, _) = boot();
+
+    // An unrelated instance completes BEFORE the stamp, so the leader stamps at
+    // terminal_epoch = 1 (the review's exact scenario: "stamped at
+    // terminal_epoch = 1"). A start->end process completes in its create's RTC
+    // drain.
+    let filler = ProcessBuilder::new("filler")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .build()
+        .unwrap();
+    for replica in [&mut resident, &mut cold] {
+        replica
+            .apply_command_at(Command::DeployProcess(filler.clone()), 3)
+            .unwrap();
+        replica
+            .apply_command_at(Command::create_instance("filler"), 4)
+            .unwrap();
+    }
+
+    // The leader stamps the LIVE orphan at terminal_epoch = 1. As above, the
+    // stamp is made LEGACY (`episode: 0`) so the apply gate stays episode-blind
+    // and decides on the terminal gate alone — this test pins the terminal
+    // gate's target-specificity, not the episode dedup.
+    let stamp = resident
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .expect("a live instance stamps");
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(crate::OrphanIncidentStamp {
+            episode: 0,
+            ..stamp
+        }),
+    };
+
+    // A SECOND unrelated instance completes before the proposal commits,
+    // advancing the global terminal epoch 1 -> 2 (distance = 1, within the
+    // ring's coverage — the false positive the review cites).
+    for replica in [&mut resident, &mut cold] {
+        replica
+            .apply_command_at(Command::create_instance("filler"), 5)
+            .unwrap();
+    }
+    // Replica-local divergence: one replica cold-tiers the (still live) orphan.
+    assert!(cold.snapshot_instance(key).is_some(), "cold-shed");
+    assert!(cold.instance(key).is_none(), "precondition: cold replica");
+    assert!(
+        resident.instance(key).is_some(),
+        "the other replica retains it"
+    );
+
+    // The proposal commits on both. The orphan is LIVE (it never terminated), so
+    // BOTH replicas must raise the incident — the unrelated completion must not
+    // read as the target's termination. The gate is target-specific: it no-ops
+    // only when the TARGET is provably terminal (its own `terminated_epoch`, the
+    // ring, or the stamped target epoch), never on the global epoch distance, so
+    // an unrelated completion advancing the epoch is correctly ignored.
+    let on_resident = resident.apply_command_at(command.clone(), 50).unwrap();
+    let on_cold = cold.apply_command_at(command, 50).unwrap();
+    assert_eq!(
+        on_resident, on_cold,
+        "resident and cold replicas decide identically (target-specific gate)"
+    );
+    assert_eq!(
+        on_resident
+            .iter()
+            .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+            .count(),
+        1,
+        "a live orphan is NOT suppressed by an unrelated completion: {on_resident:?}"
+    );
+}
+
+// #1574 review (review 5899722557), defect-class guard: the cold/evicted path
+// must decide IDENTICALLY to the resident path when a leader-stamped orphan's
+// target terminated BEFORE the stamp but the leader had already evicted its
+// shell (so the stamp's `target_terminated_epoch` is recovered from the ring),
+// and the ring then wraps past it. The resident replica no-ops on the target's
+// own `terminated_epoch`; the cold replica must reach the same no-op from the
+// stamped target epoch — never raise while the resident stays silent, which
+// would split the journals (incident + key mint on one, none on the other).
+#[test]
+fn stamped_orphan_quarantine_cold_path_matches_resident_after_wrap() {
+    use crate::OrphanKind;
+    let def = ProcessBuilder::new("orphan")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let boot = || {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(Command::DeployProcess(def.clone()), 1)
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("orphan"), 2)
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        (engine, key)
+    };
+    let (mut leader, key) = boot();
+    let (mut resident, _) = boot();
+    let (mut evicted, _) = boot();
+    // The target terminates on every replica; the leader then evicts its shell
+    // (eviction is replica-local), so it stamps with the target's terminal epoch
+    // recovered from the replicated ring.
+    for replica in [&mut leader, &mut resident, &mut evicted] {
+        replica
+            .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+            .unwrap();
+    }
+    assert!(
+        leader.evict_instance(key),
+        "leader evicted its terminal shell"
+    );
+    let stamp = leader
+        .orphan_incident_stamp(key, OrphanKind::Resident)
+        .expect("an evicted (cold-looking) instance still stamps");
+    assert!(
+        stamp.target_terminated_epoch > 0,
+        "the leader recovers the target's terminal epoch from the ring"
+    );
+    let command = Command::QuarantineOffheapOrphan {
+        instance_key: key,
+        stamp: Some(stamp),
+    };
+    // The ring wraps past the target's terminal record.
+    let filler = ProcessBuilder::new("filler")
+        .start_event("s")
+        .end_event("e")
+        .connect("s", "e")
+        .build()
+        .unwrap();
+    for replica in [&mut leader, &mut resident, &mut evicted] {
+        replica
+            .apply_command_at(Command::DeployProcess(filler.clone()), 4)
+            .unwrap();
+    }
+    let mut clock = 10u64;
+    for _ in 0..crate::state::RECENTLY_TERMINATED_CAP {
+        for replica in [&mut leader, &mut resident, &mut evicted] {
+            replica
+                .apply_command_at(Command::create_instance("filler"), clock)
+                .unwrap();
+        }
+        clock += 1;
+    }
+    // Replica-local divergence: ONE replica evicts the terminal target.
+    assert!(evicted.evict_instance(key));
+    assert!(resident.instance(key).is_some());
+
+    // Both must no-op identically: the resident via its own `terminated_epoch`,
+    // the evicted via the stamped target epoch.
+    let on_resident = resident.apply_command_at(command.clone(), clock).unwrap();
+    let on_evicted = evicted.apply_command_at(command, clock).unwrap();
+    assert_eq!(
+        on_resident, on_evicted,
+        "cold and resident replicas decide identically after the wrap"
+    );
+    assert!(
+        on_evicted
+            .iter()
+            .all(|e| !matches!(e, Event::IncidentRaised { .. })),
+        "no incident on the evicted replica: {on_evicted:?}"
     );
 }

@@ -12,7 +12,7 @@ fn job_result_updates_the_nearest_defining_ancestor_scope() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -32,7 +32,7 @@ fn job_result_updates_the_nearest_defining_ancestor_scope() {
     // The `work` job completes writing `scoped = 99` (a name owned by the
     // sub-process scope). It must update the sub-process scope, not root.
     let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
-    let mut job_vars = HashMap::new();
+    let mut job_vars = BTreeMap::new();
     job_vars.insert("scoped".to_string(), Value::Int(99));
     let events = engine
         .apply_command(Command::complete_job_with(job_key, job_vars))
@@ -179,7 +179,7 @@ fn variable_spill_selects_only_job_parked_instances() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -218,7 +218,7 @@ fn spilling_a_nested_scope_instance_preserves_the_merged_job_view() {
             Vec::new(),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("seed".to_string(), Value::Int(4));
     let inst = engine
         .apply_command(Command::create_instance_with("sub-scope", vars))
@@ -263,7 +263,7 @@ fn leased_job_instance_is_still_spillable() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -352,7 +352,7 @@ fn cold_spill_round_trips_a_job_parked_instance() {
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("k".to_string(), Value::Int(7));
     let events = engine
         .apply_command(Command::create_instance_with("order", vars))
@@ -418,7 +418,7 @@ fn cold_spill_excludes_instances_with_a_locked_job() {
 
 #[test]
 fn static_retries_declaration_sets_initial_job_retries() {
-    let engine = deploy_and_create_retryable(Some("5"), HashMap::new());
+    let engine = deploy_and_create_retryable(Some("5"), BTreeMap::new());
     let job = engine.state().jobs.values().next().unwrap();
     assert_eq!(job.retries, 5);
 }
@@ -433,7 +433,7 @@ fn feel_retries_expression_resolves_against_variables() {
 
 #[test]
 fn missing_retries_declaration_defaults_to_three() {
-    let engine = deploy_and_create_retryable(None, HashMap::new());
+    let engine = deploy_and_create_retryable(None, BTreeMap::new());
     let job = engine.state().jobs.values().next().unwrap();
     assert_eq!(job.retries, state::DEFAULT_JOB_RETRIES);
 }
@@ -468,7 +468,7 @@ fn activated_job_carries_custom_headers_and_process_identity() {
     engine
         .apply_command(Command::create_instance_full(
             "p",
-            HashMap::new(),
+            BTreeMap::new(),
             vec!["vip".to_string(), "eu".to_string()],
             Some("order-42".to_string()),
         ))
@@ -507,7 +507,7 @@ fn activated_job_carries_custom_headers_and_process_identity() {
 fn activated_job_has_empty_custom_headers_when_task_declares_none() {
     // A service task without zeebe:taskHeaders yields an empty header map — the
     // conservative default, never a borrowed or synthesised set.
-    let engine = deploy_and_create_retryable(None, HashMap::new());
+    let engine = deploy_and_create_retryable(None, BTreeMap::new());
     let mut engine = engine;
     let activated = engine.activate_jobs("do-work", "w1", 10, 60_000, 0);
     assert_eq!(activated.len(), 1);
@@ -595,6 +595,7 @@ fn activated_job_resolves_linked_resource_latest_binding_into_a_header() {
         resource_id: "agent-prompt.md".to_string(),
         resource_name: "agent-prompt.md".to_string(),
         content: content.to_string(),
+        version_tag: None,
     };
     engine
         .apply_command(Command::DeployGenericResources(vec![resource("# v1")]))
@@ -719,7 +720,7 @@ fn should_route_on_variables_returned_by_a_completed_job() {
 
     // when the worker completes the job, returning decision=yes
     let job_key = engine.activate_jobs("decision", "w", 1, 60_000, 0)[0].key;
-    let vars = HashMap::from([("decision".to_string(), Value::Str("yes".into()))]);
+    let vars = BTreeMap::from([("decision".to_string(), Value::Str("yes".into()))]);
     let events = engine
         .apply_command(Command::complete_job_with(job_key, vars))
         .unwrap();
@@ -1044,7 +1045,7 @@ fn should_resolve_feel_variable_reference_job_type_at_job_creation() {
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
     // when an instance is created with jobType bound to a concrete value
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("jobType".to_string(), Value::Str("payment".to_string()));
     engine
         .apply_command(Command::create_instance_with("dynamic", vars))
@@ -1121,7 +1122,9 @@ fn lenient_completion_accepts_a_job_that_was_never_activated() {
     // given a replica engine in lenient-completion mode (leader-local
     // activation: this replica never saw the job activated)
     let mut engine = Engine::new();
-    engine.set_lenient_completion(true);
+    engine
+        .apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
     assert!(engine.lenient_completion());
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
@@ -1233,8 +1236,11 @@ fn should_thread_operation_reference_onto_job_update_events() {
 
     // when a retries update carries an operation reference
     let events = engine
-        .apply_command(Command::update_job_retries_with_ref(job_key, 5, Some(4242)))
-        .unwrap();
+        .apply_command_records_at(Command::update_job_retries(job_key, 5), 0, Some(4242))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect::<Vec<_>>();
     // then the reference lands on the JobRetriesUpdated event
     assert!(events.iter().any(|e| matches!(
         e,
@@ -1246,11 +1252,11 @@ fn should_thread_operation_reference_onto_job_update_events() {
 
     // and likewise for a timeout (lock-extension) update
     let events = engine
-        .apply_command_at(
-            Command::update_job_timeout_with_ref(job_key, 5_000, Some(9001)),
-            100,
-        )
-        .unwrap();
+        .apply_command_records_at(Command::update_job_timeout(job_key, 5_000), 100, Some(9001))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect::<Vec<_>>();
     assert!(events.iter().any(|e| matches!(
         e,
         Event::JobTimeoutUpdated {
@@ -1330,11 +1336,13 @@ fn should_let_a_previous_worker_complete_after_re_activation() {
     // then completion succeeds and the instance finishes
     assert!(engine.is_completed(instance_key));
 
-    // and B can no longer complete the already-completed job
+    // and B can no longer complete the already-completed job: completion
+    // consumed it, so the second Complete is NOT_FOUND (Zeebe parity, #1401),
+    // not the INVALID_STATE of a live-but-not-completable job.
     let err = engine
         .apply_command(Command::complete_job(job_key))
         .unwrap_err();
-    assert_eq!(err, EngineError::JobNotActive { job_key });
+    assert_eq!(err, EngineError::JobNotFound { job_key });
 }
 
 #[test]
@@ -1353,7 +1361,7 @@ fn should_dispatch_jobs_to_a_callback_worker() {
     let mut seen = Vec::new();
     let handled = engine.poll_jobs("payment", "cb", 10, 60_000, 0, |job| {
         seen.push(job.job_type.clone());
-        Some(HashMap::new())
+        Some(BTreeMap::new())
     });
 
     // then the job was dispatched and completed, finishing the instance
@@ -1400,7 +1408,7 @@ fn poll_jobs_does_not_panic_when_a_batch_entry_cancels_a_sibling() {
     // A single batch poll activates both jobs, then completes each in turn.
     // Completing the trigger entry terminates the instance and cancels the work
     // entry, so the work entry is no longer completable when its turn comes.
-    let handled = engine.poll_jobs("jt", "cb", 10, 60_000, 0, |_job| Some(HashMap::new()));
+    let handled = engine.poll_jobs("jt", "cb", 10, 60_000, 0, |_job| Some(BTreeMap::new()));
 
     // No panic; the instance completed (terminate end, Zeebe parity), and at
     // least the trigger job was completed. The cancelled sibling is simply not
@@ -1534,7 +1542,7 @@ fn input_mapping_merges_before_job_activation() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("x".to_string(), Value::Int(1));
     let inst = engine
         .apply_command(Command::create_instance_with("io-in", vars))
@@ -1580,7 +1588,7 @@ fn output_mapping_projects_job_result() {
     let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
     let mut result = std::collections::BTreeMap::new();
     result.insert("ok".to_string(), Value::Bool(true));
-    let mut job_vars = HashMap::new();
+    let mut job_vars = BTreeMap::new();
     job_vars.insert("result".to_string(), Value::Map(result));
     let events = engine
         .apply_command(Command::complete_job_with(job_key, job_vars))
@@ -1665,7 +1673,7 @@ fn business_rule_task_evaluates_decision_and_binds_result_variable() {
         )))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("de".into()));
     let events = engine
         .apply_command(Command::create_instance_with("brt", vars))
@@ -1752,7 +1760,7 @@ fn business_rule_task_failure_records_a_failed_evaluation_before_the_incident() 
             Some("out".to_string()),
         )))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("xx".into()));
     let events = engine
         .apply_command(Command::create_instance_with("brt", vars))
@@ -1801,10 +1809,7 @@ fn business_rule_task_failure_records_a_failed_evaluation_before_the_incident() 
         })
         .unwrap();
     let retried = engine
-        .apply_command(Command::ResolveIncident {
-            incident_key,
-            operation_reference: None,
-        })
+        .apply_command(Command::ResolveIncident { incident_key })
         .unwrap();
     let retry_key = retried
         .iter()
@@ -1833,7 +1838,7 @@ fn evaluated_decisions_are_stamped_within_the_evaluated_drg() {
     assert_ne!(deployed_decision_key(&second, "base"), own_base);
     let first_root = deployed_decision_key(&first, "root");
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("de".into()));
     let events = engine
         .apply_command(Command::EvaluateDecision {
@@ -1874,7 +1879,7 @@ fn standalone_evaluation_records_failures_and_rejects_unknown_decisions() {
             "drg",
         )]))
         .unwrap();
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("xx".into()));
     // A failed evaluation is recorded (with its failure), not rejected.
     let events = engine
@@ -1921,7 +1926,7 @@ fn business_rule_task_resolves_decision_id_via_feel_expression() {
         )))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("en".into()));
     vars.insert("decisionToCall".to_string(), Value::Str("greeting".into()));
     let events = engine
@@ -1982,7 +1987,7 @@ fn business_rule_task_spreads_map_output_without_result_variable() {
         .apply_command(Command::DeployProcess(brt_process("scores", None)))
         .unwrap();
 
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("tier".to_string(), Value::Str("gold".into()));
     let events = engine
         .apply_command(Command::create_instance_with("brt", vars))
@@ -2789,7 +2794,7 @@ fn job_parked_instance(business_id: Option<&str>) -> (Engine, Key, Key) {
     let created = engine
         .apply_command(Command::create_instance_full(
             "biz",
-            HashMap::new(),
+            BTreeMap::new(),
             Vec::new(),
             business_id.map(str::to_string),
         ))
@@ -2961,7 +2966,7 @@ fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
         let err = engine
             .apply_command(Command::create_instance_full(
                 "biz",
-                HashMap::new(),
+                BTreeMap::new(),
                 Vec::new(),
                 Some(id),
             ))
@@ -2979,7 +2984,7 @@ fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
         .apply_command(Command::CorrelateMessage {
             message_name: "m".into(),
             correlation_key: "k".into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             business_id: Some(over),
         })
         .unwrap_err();
@@ -3012,6 +3017,257 @@ fn fail_job_with_retries_left_records_the_error_message_on_the_event() {
             Event::JobFailed { retries: 2, error_message: Some(m), .. } if m == "connection refused"
         )),
         "JobFailed must carry the error message: {log:?}"
+    );
+}
+
+/// #933 — Camunda 8 v2 `retryBackOff`: a job failed with retries left and a
+/// positive backoff is not re-activatable before `now + retryBackOff`, then is.
+#[test]
+fn fail_job_retry_backoff_delays_reactivation_until_elapsed() {
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let log = engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(job_key, 2, "flaky upstream", 5_000),
+            1_000,
+        )
+        .unwrap();
+    assert!(
+        log.iter().any(|e| matches!(
+            e,
+            Event::JobFailed {
+                retry_backoff_until: Some(6_000),
+                ..
+            }
+        )),
+        "JobFailed must carry the absolute backoff instant: {log:?}"
+    );
+    assert!(engine
+        .activate_jobs("payment", "w2", 10, 60_000, 1_000)
+        .is_empty());
+    assert!(engine
+        .activate_jobs("payment", "w2", 10, 60_000, 5_999)
+        .is_empty());
+    let jobs = engine.activate_jobs("payment", "w2", 10, 60_000, 6_000);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].key, job_key);
+    assert_eq!(engine.job(job_key).unwrap().retry_backoff_until, None);
+}
+
+/// #933 (review) — a deferred job is held OUT of the hot activatable set, so a
+/// poll for ready work never scans the delayed prefix; the poll promotes only
+/// the due prefix of the deadline-ordered deferred index. This guards the
+/// defect class "activation repeatedly scans deferred jobs before applying the
+/// limit": with one ready and one deferred job of the same type, a `max_jobs=1`
+/// poll serves the ready job without touching the deferred one, and the
+/// deferred job is served only once its deadline passes.
+#[test]
+fn deferred_jobs_are_not_scanned_before_the_activation_limit() {
+    // A fork/join with two parallel `payment` tasks, so one instance holds two
+    // independent live jobs of the same type (failing one does not complete the
+    // other).
+    let def = ProcessBuilder::new("par")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("a", "payment")
+        .service_task("b", "payment")
+        .parallel_gateway("join")
+        .end_event("end")
+        .connect("start", "fork")
+        .connect("fork", "a")
+        .connect("fork", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("par"))
+        .unwrap();
+    // Two live `payment` jobs. Activate both, then fail ONE back with a backoff
+    // (deferred) and let the other's lock expire (ready).
+    let mut both = engine.activate_jobs("payment", "w1", 10, 60_000, 0);
+    assert_eq!(both.len(), 2);
+    both.sort_by_key(|j| j.key);
+    let deferred_key = both[0].key;
+    let ready_key = both[1].key;
+    // Fail BOTH back at t=1_000: the deferred one behind a 5_000 backoff
+    // (eligible at 6_000), the ready one with no backoff (eligible at once).
+    engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(deferred_key, 2, "flaky", 5_000),
+            1_000,
+        )
+        .unwrap();
+    engine
+        .apply_command_at(Command::fail_job(ready_key, 2, "boom"), 1_000)
+        .unwrap();
+
+    // The deferred job sits in the deferred index, NOT the activatable set; the
+    // ready job is back in the activatable set.
+    assert!(engine
+        .state()
+        .deferred_jobs
+        .iter()
+        .any(|&(_, k)| k == deferred_key));
+    let ready_set = &engine.state().activatable_jobs["payment"];
+    assert!(ready_set.iter().any(|&(_, k)| k == ready_key));
+    assert!(!ready_set.iter().any(|&(_, k)| k == deferred_key));
+
+    // A `max_jobs = 1` poll at t=2_000 (before the backoff elapses at 6_000)
+    // serves the ready job — the deferred prefix is not scanned-and-skipped
+    // ahead of it.
+    let served = engine.activate_jobs("payment", "w2", 1, 60_000, 2_000);
+    assert_eq!(
+        served.len(),
+        1,
+        "the ready job is served, not starved by the deferred one"
+    );
+    assert_eq!(served[0].key, ready_key);
+
+    // Once the backoff elapses (t=6_000), the poll promotes the deferred job
+    // and serves it.
+    let served = engine.activate_jobs("payment", "w3", 1, 60_000, 6_000);
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].key, deferred_key);
+    assert!(engine.state().deferred_jobs.is_empty());
+}
+
+/// #933 — zero, negative and absent backoffs are retryable immediately; a
+/// backoff with no retries left is dropped (the job parks with an incident).
+#[test]
+fn fail_job_retry_backoff_zero_negative_and_terminal_are_immediate_or_ignored() {
+    for backoff in [0_i64, -5_000] {
+        let mut engine = Engine::new();
+        let job_key = activated_payment_job(&mut engine);
+        let log = engine
+            .apply_command_at(
+                Command::fail_job_with_backoff(job_key, 1, "x", backoff),
+                1_000,
+            )
+            .unwrap();
+        assert!(log.iter().any(|e| matches!(
+            e,
+            Event::JobFailed {
+                retry_backoff_until: None,
+                ..
+            }
+        )));
+        assert_eq!(
+            engine
+                .activate_jobs("payment", "w2", 10, 60_000, 1_000)
+                .len(),
+            1,
+            "backoff {backoff} must be retryable immediately"
+        );
+    }
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let log = engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(job_key, 0, "x", 5_000),
+            1_000,
+        )
+        .unwrap();
+    assert!(log.iter().any(|e| matches!(
+        e,
+        Event::JobFailed {
+            retry_backoff_until: None,
+            ..
+        }
+    )));
+    assert_eq!(engine.job(job_key).unwrap().retry_backoff_until, None);
+}
+
+/// #933 — the backoff is carried on the event, so replay (a follower / a
+/// restart) reconstructs the same deferral deterministically.
+#[test]
+fn fail_job_retry_backoff_survives_replay() {
+    let mut engine = Engine::new();
+    let mut journal = Vec::new();
+    journal.extend(
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    journal.extend(
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    journal.extend(
+        engine
+            .apply_command_at(Command::activate_jobs("payment", "w1", 10, 60_000, 0), 0)
+            .unwrap(),
+    );
+    let job_key = engine.state().jobs.keys().copied().next().unwrap();
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::fail_job_with_backoff(job_key, 2, "x", 5_000),
+                1_000,
+            )
+            .unwrap(),
+    );
+    let mut replayed = Engine::replay(journal);
+    assert_eq!(
+        replayed.job(job_key).unwrap().retry_backoff_until,
+        Some(6_000)
+    );
+    assert!(replayed
+        .activate_jobs("payment", "w2", 10, 60_000, 5_999)
+        .is_empty());
+    assert_eq!(
+        replayed
+            .activate_jobs("payment", "w2", 10, 60_000, 6_000)
+            .len(),
+        1
+    );
+}
+
+/// #933 (review) — the deferred-job index is in-memory only (serde-skipped), so
+/// a snapshot round-trip must REBUILD it from `jobs`: a deferred job restored
+/// from a snapshot has to be promoted and served once its backoff elapses, not
+/// stranded in neither index.
+#[cfg(feature = "serde")]
+#[test]
+fn fail_job_retry_backoff_deferred_index_survives_a_snapshot() {
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(job_key, 2, "x", 5_000),
+            1_000,
+        )
+        .unwrap();
+    assert!(engine
+        .state()
+        .deferred_jobs
+        .iter()
+        .any(|&(_, k)| k == job_key));
+
+    // Snapshot + restore: the deferred index is rebuilt from `jobs`.
+    let snapshot = engine.snapshot();
+    let mut restored = Engine::from_snapshot(snapshot);
+    assert!(
+        restored
+            .state()
+            .deferred_jobs
+            .iter()
+            .any(|&(_, k)| k == job_key),
+        "the deferred index is rebuilt on snapshot restore"
+    );
+    assert!(restored
+        .activate_jobs("payment", "w2", 10, 60_000, 5_999)
+        .is_empty());
+    assert_eq!(
+        restored
+            .activate_jobs("payment", "w2", 10, 60_000, 6_000)
+            .len(),
+        1,
+        "the restored deferred job is promoted and served once its backoff elapses"
     );
 }
 
@@ -3274,6 +3530,7 @@ fn retries_left_flag_survives_replayed_out_of_order_terminal_and_retries_records
         retries: 2,
         worker: None,
         error_message: None,
+        retry_backoff_until: None,
     });
     let terminal = dup
         .iter()
@@ -3333,6 +3590,7 @@ fn retries_left_flag_clears_on_every_terminal_transition_under_nonzero_timestamp
         retries: 2,
         worker: None,
         error_message: None,
+        retry_backoff_until: None,
     });
     journal.push(terminal);
     let replayed = Engine::replay(journal);
@@ -3374,6 +3632,7 @@ fn retries_left_flag_clears_on_every_terminal_transition_under_nonzero_timestamp
         retries: 2,
         worker: None,
         error_message: None,
+        retry_backoff_until: None,
     });
     journal.push(cancel);
     let replayed = Engine::replay(journal);
@@ -3418,6 +3677,7 @@ fn legacy_pre_field_fail_and_throw_keep_the_last_known_error_message() {
         retries: 0,
         worker: None,
         error_message: None,
+        retry_backoff_until: None,
     });
     let engine = Engine::replay(journal);
     let job = &engine.state().jobs[&job_key];
@@ -3461,4 +3721,229 @@ fn legacy_pre_field_fail_and_throw_keep_the_last_known_error_message() {
         "a legacy (None-message) JobErrorThrown must not erase the last known message"
     );
     assert_eq!(job.error_code.as_deref(), Some("E42"));
+}
+
+/// #933 — the side-effect-free selector serves a backed-off job once its
+/// deadline is reached (select → `ActivateJobsByKey` planning flow), and a poll
+/// that does not activate it never clears its durable `retry_backoff_until`
+/// (live state must not diverge from replay).
+#[test]
+fn deferred_job_is_selectable_at_expiry_and_poll_keeps_durable_deadline() {
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command_at(
+            Command::fail_job_with_backoff(job_key, 2, "x", 5_000),
+            1_000,
+        )
+        .unwrap();
+    assert!(engine
+        .select_activatable_job_keys("payment", 10, 5_999, false)
+        .is_empty());
+    assert_eq!(
+        engine.select_activatable_job_keys("payment", 10, 6_000, false),
+        vec![job_key]
+    );
+    // A poll for another type after the deadline must not touch this job.
+    assert!(engine
+        .activate_jobs("other", "w", 10, 60_000, 7_000)
+        .is_empty());
+    assert_eq!(
+        engine.state().jobs[&job_key].retry_backoff_until,
+        Some(6_000)
+    );
+    // Nor does a selection: it is side-effect free.
+    let _ = engine.select_activatable_job_keys("payment", 10, 7_000, false);
+    assert_eq!(
+        engine.state().jobs[&job_key].retry_backoff_until,
+        Some(6_000)
+    );
+    // The real activation clears it via `JobActivated`.
+    assert_eq!(
+        engine
+            .activate_jobs("payment", "w", 10, 60_000, 7_000)
+            .len(),
+        1
+    );
+    assert!(engine.state().deferred_jobs.is_empty());
+}
+
+/// #1661 (ADR 0066 slice 2): lenient completion is replicated engine state,
+/// flipped by a command at a log index — never host config a node changes on
+/// its own clock. Two replicas applying the same committed log, with the
+/// policy flip racing a `CompleteJob` (the completion ordered BEFORE the flip
+/// in the log, a second one AFTER it), produce byte-identical events: both
+/// reject the early completion and both accept the late one.
+#[test]
+fn replicas_agree_on_a_completion_racing_a_lenient_policy_flip() {
+    let mut replicas: Vec<Engine> = (0..2).map(|_| Engine::new()).collect();
+    for replica in &mut replicas {
+        replica
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        for _ in 0..2 {
+            replica
+                .apply_command(Command::create_instance("order"))
+                .unwrap();
+        }
+    }
+    let mut jobs: Vec<Key> = replicas[0].pending_jobs().iter().map(|j| j.key).collect();
+    jobs.sort_unstable();
+    let (early, late) = (jobs[0], jobs[1]);
+
+    let committed = [
+        Command::complete_job(early),
+        Command::SetLenientCompletion { lenient: true },
+        Command::complete_job(late),
+    ];
+    let outcomes: Vec<Vec<Result<Vec<Event>, EngineError>>> = replicas
+        .iter_mut()
+        .map(|replica| {
+            committed
+                .iter()
+                .cloned()
+                .map(|c| replica.apply_command(c))
+                .collect()
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "replicas must agree on every entry"
+    );
+    assert_eq!(
+        outcomes[0][0],
+        Err(EngineError::JobNotActivated { job_key: early }),
+        "a completion committed before the flip is strict everywhere"
+    );
+    assert_eq!(
+        outcomes[0][1],
+        Ok(vec![Event::LenientCompletionSet { lenient: true }])
+    );
+    assert!(
+        outcomes[0][2].is_ok(),
+        "a completion after the flip is lenient everywhere"
+    );
+    assert!(replicas.iter().all(Engine::lenient_completion));
+}
+
+/// #1661: the replicated flag survives every recovery path — a full journal
+/// replay, and a snapshot taken before the flip plus the tail carrying it
+/// (and a snapshot taken after it) — so a restarted replica never silently
+/// reverts to strict completion.
+#[cfg(feature = "serde")]
+#[test]
+fn lenient_completion_survives_replay_and_snapshot_plus_tail() {
+    let mut engine = Engine::new();
+    let mut journal = Vec::new();
+    journal.extend(
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    let before_flip = engine.snapshot();
+    let tail = engine
+        .apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
+    journal.extend(tail.clone());
+    assert!(engine.lenient_completion());
+
+    let replayed = Engine::replay_partition(0, journal.clone());
+    assert!(
+        replayed.lenient_completion(),
+        "full replay restores the flag"
+    );
+
+    let mut restored = Engine::from_snapshot(before_flip);
+    assert!(!restored.lenient_completion());
+    restored.apply_replayed_events(tail);
+    assert!(
+        restored.lenient_completion(),
+        "snapshot + tail restores the flag"
+    );
+
+    let after = Engine::from_snapshot(engine.snapshot());
+    assert!(after.lenient_completion(), "a snapshot carries the flag");
+
+    // and it is one-way: a `false` command emits nothing and clears nothing
+    let off = engine
+        .apply_command(Command::SetLenientCompletion { lenient: false })
+        .unwrap();
+    assert!(off.is_empty(), "disabling is a no-op: {off:?}");
+    assert!(engine.lenient_completion());
+    journal.extend(off);
+    assert!(Engine::replay_partition(0, journal).lenient_completion());
+}
+
+/// #1661 (one-way lenience): after a leader-local activation — `activated` on
+/// the leader's replica only — a committed `SetLenientCompletion { false }`
+/// must not strand the job: every replica still accepts its completion /
+/// failure / error identically. A clearable flag would let the leader succeed
+/// and the followers fail `JobNotActivated`.
+#[test]
+fn disabling_lenience_cannot_strand_a_soft_activated_job() {
+    for terminal in 0..3 {
+        let mut replicas: Vec<Engine> = (0..2).map(|_| Engine::new()).collect();
+        for replica in &mut replicas {
+            replica
+                .apply_command(Command::DeployProcess(linear_with_task()))
+                .unwrap();
+            replica
+                .apply_command(Command::create_instance("order"))
+                .unwrap();
+            replica
+                .apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+        }
+        // The leader (replica 0) activates locally; the follower never sees it.
+        let job = replicas[0].pending_jobs()[0].key;
+        replicas[0]
+            .apply_command(Command::activate_jobs("payment", "w", 1, 60_000, 0))
+            .unwrap();
+        let terminal_cmd = match terminal {
+            0 => Command::complete_job(job),
+            1 => Command::fail_job(job, 0, "boom"),
+            _ => Command::throw_job_error(job, "E", "boom"),
+        };
+        let committed = [
+            Command::SetLenientCompletion { lenient: false },
+            terminal_cmd,
+        ];
+        let outcomes: Vec<Vec<bool>> = replicas
+            .iter_mut()
+            .map(|r| {
+                committed
+                    .iter()
+                    .cloned()
+                    .map(|c| r.apply_command(c).is_ok())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(outcomes[0], outcomes[1], "replicas agree (case {terminal})");
+        assert!(
+            outcomes[0][1],
+            "the terminal command applies (case {terminal})"
+        );
+        assert!(replicas.iter().all(Engine::replicated_lenient_completion));
+    }
+}
+
+/// #1661 rolling upgrade: before the replicated flag is committed, the legacy
+/// host flag (set from the activation policy, identically on every node, as
+/// before #1661) still grants lenient completion — without counting as
+/// replicated state.
+#[test]
+fn legacy_lenient_flag_applies_before_cutover_without_replicated_state() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    engine.set_legacy_lenient_completion(true);
+    assert!(engine.lenient_completion());
+    assert!(!engine.replicated_lenient_completion());
+    let job = engine.pending_jobs()[0].key;
+    assert!(engine.apply_command(Command::complete_job(job)).is_ok());
 }

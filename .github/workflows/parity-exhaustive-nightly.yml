@@ -1,0 +1,92 @@
+# Nightly bounded-exhaustive parity run (#1246).
+#
+# Enumerates every well-formed process graph within the `nightly` bound of
+# formal/corpus/bounds.json (a manual dispatch may override it) and runs each
+# through TLC (nano spec vs the Zeebe reference), the nano backend, and a
+# dedicated throwaway live Camunda 8 container. The PR gate runs the smaller
+# `ci` bound (ci.yml: `formal (tlc)` and `parity-runtime (two-backend)`).
+#
+# Any divergence not already committed to formal/corpus/divergences.json (with a
+# filed issue) fails the run; the minimal case of each is uploaded as the
+# `divergences` artifact (the runner's --record output) for committing.
+# Not a PR gate. No retries: a red run is a defect to root-cause.
+
+name: Parity (bounded-exhaustive, nightly)
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      bound:
+        description: 'Named bound from formal/corpus/bounds.json'
+        default: 'nightly'
+      gateways:
+        description: 'Override: max gateways (empty = the named bound)'
+        default: ''
+      flows:
+        description: 'Override: max sequence flows (empty = the named bound)'
+        default: ''
+  # Validate changes to this harness before they reach the nightly run.
+  # Non-required (not in branch protection / .mergify.yml).
+  pull_request:
+    paths:
+      - '.github/workflows/parity-exhaustive-nightly.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parity-exhaustive-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  exhaustive:
+    name: parity (bounded-exhaustive, TLC + nano + live Camunda 8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Resolve pinned TLC version
+        id: tla
+        run: echo "version=$(sed -n 's/^TLA_VERSION="\(.*\)"$/\1/p' formal/tla/check.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nanobpm-formal
+          key: tla2tools-${{ steps.tla.outputs.version }}
+      - name: Fetch the pinned TLC (and model-check the hand-written corpus)
+        run: formal/tla/check.sh
+      - name: Build engine-wasm/pkg (the nano backend's read-model wasm)
+        uses: ./.github/actions/engine-wasm-pkg
+      - name: Start Camunda 8 (version derived from the Zeebe pin)
+        run: formal/parity/runtime/start-camunda.sh "" 8080
+      - name: Bounded-exhaustive run
+        env:
+          CAMUNDA_REST_ADDRESS: http://localhost:8080
+          BOUND: ${{ github.event.inputs.bound || 'nightly' }}
+          GATEWAYS: ${{ github.event.inputs.gateways }}
+          FLOWS: ${{ github.event.inputs.flows }}
+          # A PR touching this workflow validates it on the small bound.
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          args=(--bound "$BOUND" --tlc --backend both --require-camunda --record)
+          if [[ "$IS_PR" == true ]]; then args=(--bound ci --tlc --backend both --require-camunda --record); fi
+          if [[ -n "$GATEWAYS" ]]; then args+=(--gateways "$GATEWAYS"); fi
+          if [[ -n "$FLOWS" ]]; then args+=(--flows "$FLOWS"); fi
+          node formal/corpus/exhaustive.mjs "${args[@]}"
+      - name: Upload minimal divergence cases
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: divergences
+          path: formal/corpus/divergences.json
+      - name: Camunda logs
+        if: failure()
+        run: docker logs parity-camunda 2>&1 | tail -300

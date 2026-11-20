@@ -59,15 +59,26 @@
     clippy::expect_used,
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
-use std::collections::HashMap;
+#![allow(
+    clippy::disallowed_methods,
+    reason = "non-production target: the apply-path purity lint (#1663) does not govern test/example harness I/O"
+)]
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+#[path = "../examples/determinism/compare.rs"]
+#[allow(dead_code)]
+mod determinism_compare;
+#[path = "../examples/determinism/corpus.rs"]
+#[allow(dead_code)]
+mod determinism_corpus;
 
 use nanobpmn_engine_core::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, Engine, EngineSnapshot, Event,
-    IoMapping, Mapping, MessageStartCorrelation, MigratedChildInstance, MigratedElementInstance,
-    MigratedSubscription, MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder,
-    ProcessDefinition, SubscriptionMigrationAction, Value, VariableInstruction,
-    SNAPSHOT_FORMAT_VERSION,
+    IoMapping, Mapping, MessageStartCorrelation, MigratedChildInstance,
+    MigratedCompensationSubscription, MigratedElementInstance, MigratedSubscription,
+    MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder, ProcessDefinition,
+    SubscriptionMigrationAction, Value, VariableInstruction, SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Directory holding the checked-in golden corpus, relative to the crate root.
@@ -93,13 +104,19 @@ fn event_corpus_golden_name() -> String {
 fn event_witnesses_golden_name() -> String {
     format!("event_witnesses.v{SNAPSHOT_FORMAT_VERSION}.json")
 }
+fn command_shapes_golden_name() -> String {
+    format!("command_shapes.v{SNAPSHOT_FORMAT_VERSION}.json")
+}
+fn event_shapes_golden_name() -> String {
+    format!("event_shapes.v{SNAPSHOT_FORMAT_VERSION}.json")
+}
 
 /// Serialize `value` to a **canonical**, deterministic, human-readable JSON
 /// string: routed through [`serde_json::Value`] (whose object is a `BTreeMap`,
 /// so every object's keys are emitted in sorted order regardless of the source
-/// `HashMap`'s per-process iteration order) and pretty-printed with a trailing
+/// (pre-#1662) `HashMap`'s per-process iteration order) and pretty-printed with a trailing
 /// newline. The scenario in [`build_golden_corpus`] is deliberately kept so that
-/// every set-valued (`HashSet`) field holds at most one element, so the only
+/// every set-valued (pre-#1662 `HashSet`, now `BTreeSet`) field holds at most one element, so the only
 /// remaining source of non-determinism — array order — cannot bite.
 fn canonical_json<T: serde::Serialize>(value: &T) -> String {
     let canonical: serde_json::Value =
@@ -166,7 +183,7 @@ fn assert_or_update_golden(name: &str, actual: &str) {
 /// full ordered event journal.
 ///
 /// Determinism contract (so the serialized bytes are stable across processes):
-/// the scenario keeps every `HashSet`-valued `State` field to at most one
+/// the scenario keeps every (pre-#1662 `HashSet`, now `BTreeSet`)-valued `State` field to at most one
 /// element — at snapshot time no job is left in the `Activated` set and each
 /// instance owns at most one job — so the only non-`HashMap` collections that
 /// serialize to JSON arrays are trivially ordered. All `HashMap`s are canonically
@@ -262,10 +279,30 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("deploy escalation"),
     );
 
+    // An error-end-event witness process. Deployed but never instantiated: its
+    // only purpose is to embed `ElementKind::ErrorEndEvent` in the snapshot's
+    // persisted process definitions, so the checked-in golden pins its
+    // serialized tag/fields. Without a witness here the #1069 drift guard would
+    // stay green if a field were added to (or the tag of) the variant changed —
+    // exactly the variant-exhaustiveness blind spot
+    // `snapshot_forward_compat.rs` documents (#1592).
+    let error_end: ProcessDefinition = ProcessBuilder::new("error_end")
+        .start_event("s")
+        .error_end_event("err_end", "E1")
+        .connect("s", "err_end")
+        .build()
+        .expect("build error-end process");
+
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(error_end), T0)
+            .expect("deploy error end"),
+    );
+
     // Instance A: created with variables, its one job activated + completed, so
     // it walks the full lifecycle to a retained-terminal instance. Leaves the
     // `Activated` set empty again (the job completed).
-    let mut vars_a = HashMap::new();
+    let mut vars_a = BTreeMap::new();
     vars_a.insert("amount".to_string(), Value::Int(4200));
     vars_a.insert("currency".to_string(), Value::Str("EUR".to_string()));
     journal.extend(
@@ -322,7 +359,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             )
             .expect("re-activate job A"),
     );
-    let mut result_a = HashMap::new();
+    let mut result_a = BTreeMap::new();
     result_a.insert("approved".to_string(), Value::Bool(true));
     // The completion assigns a Camunda 8.10 business id to root instance A,
     // pinning the additive `ProcessInstanceBusinessIdAssigned` frame and the
@@ -339,7 +376,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
 
     // Instance B: created and left parked on its (created, NOT activated) job —
     // the live working set. One job, not in the `Activated` set.
-    let mut vars_b = HashMap::new();
+    let mut vars_b = BTreeMap::new();
     vars_b.insert("amount".to_string(), Value::Int(999));
     let created_b = engine
         .apply_command_at(Command::create_instance_with("order", vars_b), T0 + 4)
@@ -427,7 +464,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     // the drift guard. The handler parks WITHOUT a job (its job is never
     // created behind the activation incident), and `book` is a pass-through
     // task (no job either), keeping the one-job-per-instance determinism
-    // contract (`jobs_by_instance` is a `HashSet`; a job's serialized order in
+    // contract (`jobs_by_instance` was a `HashSet` before #1662; a job's serialized order in
     // a two-job instance would be nondeterministic).
     let trip: ProcessDefinition = ProcessBuilder::new("trip")
         .start_event("s")
@@ -609,7 +646,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("deploy decide process"),
     );
     for (lang, at) in [("de", T0 + 12), ("xx", T0 + 13)] {
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("lang".to_string(), Value::Str(lang.to_string()));
         journal.extend(
             engine
@@ -617,7 +654,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
                 .expect("create decide instance"),
         );
     }
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("lang".to_string(), Value::Str("en".to_string()));
     journal.extend(
         engine
@@ -673,7 +710,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     // frame incl. its additive `migrated_flow_scopes` / `subscriptions` /
     // `child_instances`. No modify step here: a modification that re-activates
     // `charge` leaves a second (canceled) job on D, and `jobs_by_instance` is a
-    // `HashSet` — that would break the one-job-per-instance determinism
+    // `HashSet` before #1662 — that would break the one-job-per-instance determinism
     // contract above. The populated modify shape is pinned by
     // `build_event_witnesses` instead.
     let created_d = engine
@@ -738,10 +775,107 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .apply_command_at(
                 Command::QuarantineOffheapOrphan {
                     instance_key: inst_e,
+                    stamp: None,
                 },
                 T0 + 23,
             )
             .expect("quarantine instance E"),
+    );
+
+    // Event sub-process held-payload witness (#1555): a non-interrupting
+    // message event sub-process whose start event carries an output mapping and
+    // whose CONTAINER has a `start` execution listener. The correlated payload is
+    // parked (`EventSubProcessPayloadHeld`) until the listener job completes —
+    // which it never does here — so both the journal frame and the snapshot's
+    // held-payload state are pinned by the goldens. The host waits on a TIMER
+    // (not a job) so the instance owns exactly one job (the listener's): the
+    // set-valued `jobs_by_instance` must stay single-element for the canonical
+    // JSON to be deterministic (see `canonical_json`).
+    let esp_xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                      xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+         <bpmn:message id="Msg" name="esp-msg">
+           <bpmn:extensionElements><zeebe:subscription correlationKey="=orderId" /></bpmn:extensionElements>
+         </bpmn:message>
+         <bpmn:process id="esp-held" isExecutable="true">
+           <bpmn:startEvent id="s" />
+           <bpmn:intermediateCatchEvent id="work">
+             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>
+           </bpmn:intermediateCatchEvent>
+           <bpmn:endEvent id="e" />
+           <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+           <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+           <bpmn:subProcess id="esp" triggeredByEvent="true">
+             <bpmn:extensionElements>
+               <zeebe:executionListeners>
+                 <zeebe:executionListener eventType="start" type="esp-gate" />
+               </zeebe:executionListeners>
+             </bpmn:extensionElements>
+             <bpmn:startEvent id="esp_start" isInterrupting="false">
+               <bpmn:extensionElements>
+                 <zeebe:ioMapping><zeebe:output source="=payload" target="mapped" /></zeebe:ioMapping>
+               </bpmn:extensionElements>
+               <bpmn:messageEventDefinition messageRef="Msg" />
+             </bpmn:startEvent>
+             <bpmn:endEvent id="esp_end" />
+             <bpmn:sequenceFlow id="ef1" sourceRef="esp_start" targetRef="esp_end" />
+           </bpmn:subProcess>
+         </bpmn:process>
+       </bpmn:definitions>"#;
+    let esp_def = nanobpmn_engine_core::bpmn::parse_bpmn(esp_xml)
+        .expect("parse esp-held")
+        .remove(0);
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(esp_def), T0 + 24)
+            .expect("deploy esp-held"),
+    );
+    let mut esp_vars = BTreeMap::new();
+    esp_vars.insert("orderId".to_string(), Value::Int(7));
+    journal.extend(
+        engine
+            .apply_command_at(Command::create_instance_with("esp-held", esp_vars), T0 + 25)
+            .expect("create esp-held instance"),
+    );
+    let mut payload = BTreeMap::new();
+    payload.insert("payload".to_string(), Value::Int(42));
+    let correlated = engine
+        .apply_command_at(
+            Command::CorrelateMessage {
+                message_name: "esp-msg".into(),
+                correlation_key: "7".into(),
+                variables: payload,
+                business_id: None,
+            },
+            T0 + 26,
+        )
+        .expect("correlate esp-msg");
+    assert!(
+        correlated
+            .iter()
+            .any(|e| matches!(e, Event::EventSubProcessPayloadHeld { .. })),
+        "the esp-held scenario must journal a held payload: {correlated:?}"
+    );
+    journal.extend(correlated);
+
+    // #1657: cluster variables are replicated engine state — pin the
+    // command-produced events AND their snapshot shape (kind + metadata).
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::CreateClusterVariable {
+                    tenant_id: Some("<default>".to_string()),
+                    name: "apiCfg".to_string(),
+                    value: Value::Str("camunda.secrets.TOKEN".to_string()),
+                    kind: nanobpmn_engine_core::ClusterVariableKind::SecretReference,
+                    metadata: std::collections::BTreeMap::from([(
+                        "owner".to_string(),
+                        Value::Str("ops".to_string()),
+                    )]),
+                    distributed: false,
+                },
+                T0 + 27,
+            )
+            .expect("create cluster variable"),
     );
 
     let snapshot = engine.snapshot();
@@ -753,13 +887,20 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
 /// them lands in later slices, but the persisted shape is pinned here, once,
 /// with every new field non-default.
 fn build_event_witnesses() -> Vec<Event> {
-    let mut vars = HashMap::new();
+    let mut vars = BTreeMap::new();
     vars.insert("x".to_string(), Value::Int(1));
     let scoped = VariableInstruction {
         variables: vars.clone(),
         scope_id: Some("sub".to_string()),
     };
     vec![
+        // The #1555 event sub-process held payload (a correlated payload
+        // parked until the container's start event activates).
+        Event::EventSubProcessPayloadHeld {
+            instance_key: 30,
+            scope_key: 31,
+            variables: vars.clone(),
+        },
         // The #1405 Raft applied-entry record: the last record of a committed
         // entry's atomic journal frame. The executed corpus never applies
         // through Raft, so the frame is pinned here.
@@ -768,6 +909,8 @@ fn build_event_witnesses() -> Vec<Event> {
             raft_state: "{\"opaque\":true}".to_string(),
             start_dispatch_rr: 7,
         },
+        // The #1661 replicated lenient-completion flip (ADR 0066 slice 2).
+        Event::LenientCompletionSet { lenient: true },
         // The #901 bottom-to-top scope-subscription completion frame.
         Event::CompensationScopeSubscriptionCompleted {
             instance_key: 1,
@@ -789,7 +932,7 @@ fn build_event_witnesses() -> Vec<Event> {
         Event::StartInstanceDispatched {
             process_id: "p".to_string(),
             start_element_id: "start".to_string(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             tags: vec![],
             business_id: Some("b".to_string()),
             target_partition: 1,
@@ -906,6 +1049,17 @@ fn build_event_witnesses() -> Vec<Event> {
                 child_instance_key: 19,
                 target_element_id: "call2".to_string(),
             }],
+            join_scoped: true,
+            compensation_subscriptions: vec![MigratedCompensationSubscription {
+                source_element_id: "a".to_string(),
+                source_element_instance_key: 20,
+                source_handler: "undoA".to_string(),
+                source_boundary_id: "bA".to_string(),
+                target_element_id: "c".to_string(),
+                target_handler: "undoC".to_string(),
+                target_boundary_id: "bC".to_string(),
+            }],
+            compensation_migrated: true,
         },
         // The #1181 settlement-ledger frame (additive variant, no version bump).
         Event::JobSettlementRecorded {
@@ -913,6 +1067,44 @@ fn build_event_witnesses() -> Vec<Event> {
             instance_key: 24,
             outcome: nanobpmn_engine_core::JobSettlementOutcome::Failed,
             lease_token: "nano-lease:0000000000000019".to_string(),
+        },
+        // The #1447 off-heap-orphan quarantine tombstone frame (additive
+        // variant, no version bump): pins its field names so a rename fails
+        // the drift guard instead of breaking replay of old journals. The
+        // #1587 `episode` field is additive (`serde(default)`), pinned here
+        // non-default.
+        Event::VariablesLostQuarantined {
+            instance_key: 25,
+            incident_key: 26,
+            episode: 26,
+        },
+        // The #1587-review orphan-stamp supersede signal (additive variant, no
+        // version bump): emitted when a stamped quarantine's episode no longer
+        // matches the allocator's position, so the report is re-stamped and
+        // re-proposed rather than silently dropped.
+        Event::OrphanStampSuperseded {
+            instance_key: 27,
+            episode: 26,
+        },
+        // #1657 cluster-variable lifecycle (additive variants, no version
+        // bump): replicated configuration state, every field non-default.
+        Event::ClusterVariableCreated {
+            tenant_id: None,
+            name: "region".to_string(),
+            value: Value::Str("EMEA".to_string()),
+            kind: nanobpmn_engine_core::ClusterVariableKind::Json,
+            metadata: std::collections::BTreeMap::from([("k".to_string(), Value::Int(1))]),
+        },
+        Event::ClusterVariableUpdated {
+            tenant_id: Some("t1".to_string()),
+            name: "region".to_string(),
+            value: Value::Str("APAC".to_string()),
+            metadata: std::collections::BTreeMap::from([("k".to_string(), Value::Int(2))]),
+            kind: nanobpmn_engine_core::ClusterVariableKind::SecretReference,
+        },
+        Event::ClusterVariableDeleted {
+            tenant_id: Some("t1".to_string()),
+            name: "region".to_string(),
         },
     ]
 }
@@ -930,6 +1122,44 @@ fn event_witnesses_shape_is_pinned_to_version() {
     }
 }
 
+/// Pins the **command and emitted-event shape vocabularies** of the
+/// determinism corpus (#1698): every variant tag and variant-qualified field
+/// its commands use (`examples/determinism/`, which covers every `Command`
+/// variant) and every one the events they emit carry. The previous-release
+/// determinism gate derives its additive set as
+/// `vocabulary(golden @ HEAD) − vocabulary(golden @ prev tag)` over this
+/// directory and fails on any previous-release decode failure, new event
+/// variant or new field that set does not record — so every shape the gate
+/// compares is pinned here, and a new one lands only as a reviewed
+/// (`UPDATE_GOLDEN=1`) additive decision.
+#[test]
+fn determinism_corpus_shapes_are_pinned_to_version() {
+    let corpus = determinism_corpus::build(0);
+    let commands: Vec<serde_json::Value> = corpus
+        .iter()
+        .map(|(_, c)| serde_json::to_value(c).expect("serialize command"))
+        .collect();
+    let mut engine = Engine::new();
+    let mut events = Vec::new();
+    for (now, command) in corpus {
+        if let Ok(emitted) = engine.apply_command_at(command, now) {
+            events.extend(
+                emitted
+                    .iter()
+                    .map(|e| serde_json::to_value(e).expect("event")),
+            );
+        }
+    }
+    assert_or_update_golden(
+        &command_shapes_golden_name(),
+        &canonical_json(&determinism_compare::shape_list(&commands)),
+    );
+    assert_or_update_golden(
+        &event_shapes_golden_name(),
+        &canonical_json(&determinism_compare::shape_list(&events)),
+    );
+}
+
 /// The #1300 additive `message_start` field defaults when absent: a pre-#1300
 /// `StartInstanceDispatched` record still decodes (no format bump).
 #[test]
@@ -940,6 +1170,25 @@ fn pre_1300_start_instance_dispatched_decodes_with_defaults() {
         decoded,
         Event::StartInstanceDispatched {
             message_start: None,
+            ..
+        }
+    ));
+}
+
+/// The #1657 additive `kind` field on `ClusterVariableUpdated` defaults to
+/// `Json` when absent: a record journaled before the field existed still
+/// decodes (no format bump). The field exists so a gateway derives the
+/// update response from the proposal's own events instead of re-reading live
+/// state (PR #1670 review); the state fold ignores it (an update preserves
+/// the stored kind), so the default is replay-inert.
+#[test]
+fn pre_kind_cluster_variable_updated_decodes_with_default() {
+    let old = r#"{"ClusterVariableUpdated":{"tenant_id":null,"name":"region","value":{"Str":"APAC"},"metadata":{}}}"#;
+    let decoded = nanobpmn_engine_core::decode_event_json(old).expect("decode old record");
+    assert!(matches!(
+        decoded,
+        Event::ClusterVariableUpdated {
+            kind: nanobpmn_engine_core::ClusterVariableKind::Json,
             ..
         }
     ));
@@ -1017,6 +1266,9 @@ fn pre_1374_migrated_record_decodes_with_defaults() {
             migrated_flow_scopes: vec![],
             subscriptions: vec![],
             child_instances: vec![],
+            join_scoped: false,
+            compensation_subscriptions: vec![],
+            compensation_migrated: false,
         }
     );
 }
@@ -1142,11 +1394,11 @@ fn canonical_json_is_insensitive_to_map_insertion_order() {
         ("beta", Value::Bool(true)),
     ];
 
-    let mut forward: HashMap<String, Value> = HashMap::new();
+    let mut forward: BTreeMap<String, Value> = BTreeMap::new();
     for (k, v) in entries.iter() {
         forward.insert((*k).to_string(), v.clone());
     }
-    let mut reverse: HashMap<String, Value> = HashMap::new();
+    let mut reverse: BTreeMap<String, Value> = BTreeMap::new();
     for (k, v) in entries.iter().rev() {
         reverse.insert((*k).to_string(), v.clone());
     }
@@ -1155,7 +1407,7 @@ fn canonical_json_is_insensitive_to_map_insertion_order() {
     let reverse_json = canonical_json(&reverse);
     assert_eq!(
         forward_json, reverse_json,
-        "canonical_json must not depend on HashMap insertion/iteration order"
+        "canonical_json must not depend on BTreeMap insertion/iteration order"
     );
 
     // The bytes are equal *because* keys are emitted in sorted order — assert

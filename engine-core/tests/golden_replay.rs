@@ -48,7 +48,7 @@
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
-    decode_event_json, Command, Engine, EngineSnapshot, Event, EventDecodeError, JobState,
+    decode_event_json, Command, Engine, EngineSnapshot, Event, EventDecodeError, JobState, Key,
     ProcessBuilder, SNAPSHOT_FORMAT_VERSION,
 };
 
@@ -143,7 +143,39 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         let raw = std::fs::read_to_string(golden_path(&format!("engine_snapshot.v{version}.json")))
             .unwrap();
         let expected: EngineSnapshot = serde_json::from_str(&raw).unwrap();
-        let replayed = Engine::replay_partition(expected.partition_id, journal);
+        let terminal_keys: std::collections::VecDeque<_> = journal
+            .iter()
+            .filter_map(|e| match e {
+                Event::ProcessInstanceCompleted { instance_key }
+                | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+                _ => None,
+            })
+            .collect();
+        // #1574 review (review 5899722557) stamps each terminal instance's own
+        // `terminated_epoch` with the epoch its terminal transition produced
+        // (the target-specific lifecycle-validity record). Derive it from the
+        // journal BEFORE the journal is consumed by replay: the Nth terminal
+        // event (1-based) sets its instance's `terminated_epoch = N`. Live
+        // instances keep `0`.
+        let mut terminal_epoch_by_instance: std::collections::BTreeMap<Key, u64> =
+            std::collections::BTreeMap::new();
+        {
+            let mut epoch = 0u64;
+            for event in &journal {
+                if let Event::ProcessInstanceCompleted { instance_key }
+                | Event::ProcessInstanceTerminated { instance_key } = event
+                {
+                    epoch += 1;
+                    terminal_epoch_by_instance.insert(*instance_key, epoch);
+                }
+            }
+        }
+        let replayed = Engine::replay_partition(expected.partition_id, journal.clone());
+        // Load the archived snapshot the way a host does (`from_snapshot`), so
+        // its load-time normalizations apply — e.g. legacy element-keyed join
+        // bookkeeping is keyed by flow-scope instance (#1580).
+        let next_local = expected.next_local;
+        let expected = Engine::from_snapshot(expected);
 
         // Replay-compatibility is a NORMALIZED equality, not a byte-identical
         // one: later builds legitimately derive some fields under semantics the
@@ -151,7 +183,7 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         // whose replay-only divergence it absorbs; anything ELSE drifting still
         // fails this assert, which is what keeps the #1065 class guarded.
         let replayed_state = replayed.state().clone();
-        let mut expected_state = expected.state.clone();
+        let mut expected_state = expected.state().clone();
         if version < 3 {
             // #1440 (landed at format v3) retains a job's first terminal
             // instant/deadline; v1/v2 journals predate the event field that
@@ -174,13 +206,56 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
                 job.has_failed_with_retries_left = false;
             }
         }
+        // #1574 review adds the replicated `recently_terminated` ring, derived
+        // purely from terminal events. Archived snapshots predate it (they load
+        // it empty via `serde(default)`), so normalize it to what the archived
+        // journal's own terminal events derive — computed independently here
+        // from the journal, not copied from the replayed state. The same
+        // change adds the replicated `terminal_epoch` counter (one increment
+        // per terminal event), normalized the same way.
+        expected_state.terminal_epoch = terminal_keys.len() as u64;
+        expected_state.recently_terminated = terminal_keys;
+        // #1193 adds `DeployedProcess::deployment_key`, derived purely from the
+        // journal's `ProcessDeployed` frames. Archived snapshots predate the
+        // field and load it `0` via `serde(default)`, so normalize them to the
+        // deployment key the archived journal itself carries for each
+        // definition (computed from the journal, not the replayed state).
+        let deployment_key_by_definition: std::collections::BTreeMap<Key, Key> = journal
+            .iter()
+            .filter_map(|e| match e {
+                Event::ProcessDeployed {
+                    deployment_key,
+                    process_definition_key,
+                    ..
+                } => Some((*process_definition_key, *deployment_key)),
+                _ => None,
+            })
+            .collect();
+        for deployed in expected_state
+            .processes
+            .values_mut()
+            .chain(expected_state.process_versions.values_mut())
+        {
+            if let Some(deployment_key) = deployment_key_by_definition.get(&deployed.key) {
+                deployed.deployment_key = *deployment_key;
+            }
+        }
+        // Normalize each terminal instance's `terminated_epoch` (derived above
+        // from the journal's own terminal events): archived snapshots predate
+        // the field and load it `0`, but replay under current semantics records
+        // it. Live instances (absent from the map) keep `0`.
+        for (key, instance) in expected_state.instances.iter_mut() {
+            if let Some(epoch) = terminal_epoch_by_instance.get(key) {
+                instance.terminated_epoch = *epoch;
+            }
+        }
         assert_eq!(
             &replayed_state, &expected_state,
             "archived format {version}"
         );
         assert_eq!(
             replayed.snapshot().next_local,
-            expected.next_local,
+            next_local,
             "archived allocator {version}"
         );
     }
@@ -208,6 +283,34 @@ fn legacy_record_missing_a_defaulted_field_replays() {
     // tolerates an unmatched job-failed as a no-op; the point is that decode +
     // replay of the legacy shape succeed).
     let _engine = Engine::replay(std::iter::once(decoded));
+}
+
+/// **Pre-#1640 `JobCreated`.** A job journaled before mapping-time secret
+/// provenance existed has no `secret_provenance` key: it must decode to EMPTY
+/// provenance and replay into a job that resolves nothing (fail closed) — an
+/// old job is never retroactively trusted.
+#[test]
+fn pre_1640_job_created_replays_with_empty_secret_provenance() {
+    let legacy_line = r#"{"JobCreated":{"job_key":7,"instance_key":1,"element_instance_key":2,"element_id":"call","job_type":"call-api"}}"#;
+    let decoded = decode_event_json(legacy_line).expect("pre-#1640 JobCreated decodes");
+    match &decoded {
+        Event::JobCreated {
+            secret_provenance, ..
+        } => assert!(secret_provenance.is_empty()),
+        other => panic!("expected JobCreated, got {other:?}"),
+    }
+    let engine = Engine::replay(std::iter::once(decoded));
+    let job = engine
+        .snapshot()
+        .state
+        .jobs
+        .get(&7)
+        .cloned()
+        .expect("the replayed job exists");
+    assert!(
+        job.secret_provenance.is_empty(),
+        "a pre-#1640 job must carry no provenance (resolve nothing)"
+    );
 }
 
 /// **Pre-#1233 parallel join, upgraded mid-flight.** Before #1233 a
@@ -256,7 +359,10 @@ fn pre_1233_half_open_parallel_join_fires_after_upgrade() {
     let mut upgraded = Engine::replay(legacy);
     let instance = upgraded.instance(instance_key).unwrap();
     assert!(instance.join_flow_arrivals.is_empty());
-    assert_eq!(instance.join_flows_taken("join"), 1);
+    assert_eq!(
+        instance.join_flows_taken(&nanobpmn_engine_core::JoinKey::root("join")),
+        1
+    );
 
     let job = upgraded.activate_jobs("sync-task", "w", 1, 60_000, 0)[0].key;
     upgraded.apply_command(Command::complete_job(job)).unwrap();

@@ -3,7 +3,7 @@
     clippy::expect_used,
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{
     bpmn::parse_bpmn, AgentDefinition, AgentType, Command, ElementKind, Engine, EngineError, Event,
@@ -58,6 +58,7 @@ fn agent_markers_preserve_the_entire_worker_job_contract() {
                     resource_id: "prompt.md".into(),
                     resource_name: "prompt.md".into(),
                     content: content.into(),
+                    version_tag: None,
                 }]))
                 .unwrap();
         }
@@ -65,7 +66,7 @@ fn agent_markers_preserve_the_entire_worker_job_contract() {
         let events = engine
             .apply_command(Command::create_instance_with(
                 "external-agent-routing",
-                HashMap::from([
+                BTreeMap::from([
                     ("route".into(), Value::Str("senior:rebase".into())),
                     ("retries".into(), Value::Int(7)),
                     ("priority".into(), Value::Int(42)),
@@ -176,7 +177,7 @@ fn multi_instance_agent_tasks_keep_per_child_jobs_and_leases() {
         engine
             .apply_command(Command::create_instance_with(
                 "external-agent-routing",
-                HashMap::from([("route".into(), Value::Str("senior:rebase".into()))]),
+                BTreeMap::from([("route".into(), Value::Str("senior:rebase".into()))]),
             ))
             .unwrap();
         let jobs = engine.activate_jobs_with_options(
@@ -235,7 +236,7 @@ fn assert_external_job_lifecycle(xml: &str, expected_type: &str) {
     let events = engine
         .apply_command(Command::create_instance_with(
             "external-agent-routing",
-            HashMap::from([("route".into(), Value::Str("senior:rebase".into()))]),
+            BTreeMap::from([("route".into(), Value::Str("senior:rebase".into()))]),
         ))
         .unwrap();
     let (job_key, element_instance_key) = events
@@ -351,7 +352,7 @@ fn job_type_expressions_see_task_inputs_with_and_without_start_listeners() {
             engine
                 .apply_command(Command::create_instance_with(
                     "external-agent-routing",
-                    HashMap::from([
+                    BTreeMap::from([
                         ("route".into(), Value::Str("senior:rebase".into())),
                         ("localRoute".into(), Value::Str("wrong-parent-route".into())),
                     ]),

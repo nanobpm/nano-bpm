@@ -402,11 +402,11 @@ pub fn compare_variants(
 
     let mut candidates: Vec<CandidateModel> = Vec::new();
     // name -> authoring fixes applied, so we can surface them on the matching ranked output below.
-    let mut fixes_by_name: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut fixes_by_name: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     // name -> the (healed) model actually replayed, for job-type-binding hints below.
-    let mut healed_by_name: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut healed_by_name: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     if include_baseline {
         if let Some(base) = base_model {
             candidates.push(CandidateModel {
@@ -480,7 +480,7 @@ pub fn compare_variants(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use serde_json::json;
 
@@ -540,7 +540,7 @@ mod tests {
                         variables: Some(
                             [("label".to_string(), json!("A"))]
                                 .into_iter()
-                                .collect::<HashMap<_, _>>(),
+                                .collect::<BTreeMap<_, _>>(),
                         ),
                     },
                     RecordedStimulus {
@@ -551,7 +551,7 @@ mod tests {
                         variables: Some(
                             [("summary".to_string(), json!("S"))]
                                 .into_iter()
-                                .collect::<HashMap<_, _>>(),
+                                .collect::<BTreeMap<_, _>>(),
                         ),
                     },
                 ],
@@ -759,7 +759,7 @@ mod tests {
                     variables: Some(
                         [("label".to_string(), json!("A"))]
                             .into_iter()
-                            .collect::<HashMap<_, _>>(),
+                            .collect::<BTreeMap<_, _>>(),
                     ),
                 }],
             }],

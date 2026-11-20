@@ -1,15 +1,13 @@
 //! The FEEL builtin function library (feel-scala standard library plus the
 //! Camunda extensions used by Zeebe), implemented dependency-free.
 
-use std::collections::{BTreeMap, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::BTreeMap;
 
 use super::error::FeelError;
 use super::eval::compare;
 use super::regex::Regex;
 use super::temporal::{civil_from_days, Date, DateTime, DtDuration, Time, YmDuration};
 use super::value::{FeelVal, Range};
-use crate::model::Value;
 
 /// The canonical names of every builtin we recognise.
 const BUILTINS: &[&str] = &[
@@ -218,7 +216,7 @@ fn list_or_varargs(args: &[FeelVal]) -> Vec<FeelVal> {
 pub fn call(
     name: &str,
     args: Vec<FeelVal>,
-    base: &HashMap<String, Value>,
+    ctx: &mut super::eval::Ctx,
 ) -> Result<FeelVal, FeelError> {
     use FeelVal::*;
     match name {
@@ -330,7 +328,7 @@ pub fn call(
                 .ok_or_else(|| FeelError(format!("invalid regex '{pattern}'")))?;
             Ok(List(re.find_all(&input).into_iter().map(Str).collect()))
         }
-        "uuid" => Ok(Str(uuid_v4())),
+        "uuid" => Ok(Str(uuid_v4()?)),
         "to base64" => Ok(Str(base64_encode(
             want_str(&arg(&args, 0), "to base64")?.as_bytes(),
         ))),
@@ -465,7 +463,7 @@ pub fn call(
             flatten(&arg(&args, 0), &mut out);
             Ok(List(out))
         }
-        "sort" => sort(&args, base),
+        "sort" => sort(&args, ctx),
         "is empty" => Ok(Bool(want_list(&arg(&args, 0), "is empty")?.is_empty())),
         "partition" => partition(&args),
 
@@ -484,7 +482,7 @@ pub fn call(
             match args.get(1) {
                 Some(v) => {
                     let scale = want_num(v, "floor")? as i32;
-                    let f = 10f64.powi(scale);
+                    let f = pow10(scale);
                     Ok(FeelVal::num((n * f).floor() / f))
                 }
                 None => Ok(FeelVal::num(n.floor())),
@@ -495,7 +493,7 @@ pub fn call(
             match args.get(1) {
                 Some(v) => {
                     let scale = want_num(v, "ceiling")? as i32;
-                    let f = 10f64.powi(scale);
+                    let f = pow10(scale);
                     Ok(FeelVal::num((n * f).ceil() / f))
                 }
                 None => Ok(FeelVal::num(n.ceil())),
@@ -523,15 +521,15 @@ pub fn call(
                 FeelVal::num(n.sqrt())
             })
         }
-        "log" => Ok(FeelVal::num(want_num(&arg(&args, 0), "log")?.ln())),
-        "exp" => Ok(FeelVal::num(want_num(&arg(&args, 0), "exp")?.exp())),
+        "log" => Ok(FeelVal::num(libm::log(want_num(&arg(&args, 0), "log")?))),
+        "exp" => Ok(FeelVal::num(libm::exp(want_num(&arg(&args, 0), "exp")?))),
         "even" => Ok(Bool(want_num(&arg(&args, 0), "even")? as i64 % 2 == 0)),
         "odd" => Ok(Bool(want_num(&arg(&args, 0), "odd")? as i64 % 2 != 0)),
         "round up" => round_builtin(&args, RoundMode::Up),
         "round down" => round_builtin(&args, RoundMode::Down),
         "round half up" => round_builtin(&args, RoundMode::HalfUp),
         "round half down" => round_builtin(&args, RoundMode::HalfDown),
-        "random number" => Ok(Double(rand_unit())),
+        "random number" => Ok(Double(rand_unit()?)),
 
         // --- context ---
         "context put" | "put" => context_put(&args),
@@ -552,8 +550,8 @@ pub fn call(
         "assert" => assert_builtin(&args),
 
         // --- temporal ---
-        "now" => Ok(now_datetime().map(DateTime).unwrap_or(Null)),
-        "today" => Ok(now_datetime().map(|dt| Date(dt.date)).unwrap_or(Null)),
+        "now" => Ok(DateTime(now_datetime("now")?)),
+        "today" => Ok(Date(now_datetime("today")?.date)),
         "day of week" => Ok(with_date(&arg(&args, 0), |d| {
             Str(WEEKDAYS[(d.weekday() - 1) as usize].to_string())
         })),
@@ -703,7 +701,7 @@ fn stddev(items: &[FeelVal]) -> Result<FeelVal, FeelError> {
         .map(|v| want_num(v, "stddev"))
         .collect::<Result<_, _>>()?;
     let mean = nums.iter().sum::<f64>() / n as f64;
-    let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
+    let var = nums.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (n as f64 - 1.0);
     Ok(FeelVal::num(var.sqrt()))
 }
 
@@ -788,18 +786,29 @@ fn string_join(args: &[FeelVal]) -> Result<FeelVal, FeelError> {
     Ok(FeelVal::Str(parts.join(&sep)))
 }
 
-fn sort(args: &[FeelVal], base: &HashMap<String, Value>) -> Result<FeelVal, FeelError> {
+fn sort(args: &[FeelVal], ctx: &mut super::eval::Ctx) -> Result<FeelVal, FeelError> {
     let mut list = want_list(&arg(args, 0), "sort")?;
     match args.get(1) {
         Some(FeelVal::Function(f)) => {
             let f = f.clone();
-            list.sort_by(
-                |a, b| match super::eval::apply(&f, vec![a.clone(), b.clone()], base) {
+            let mut cmp_err = None;
+            list.sort_by(|a, b| {
+                if cmp_err.is_some() {
+                    return std::cmp::Ordering::Equal;
+                }
+                match super::eval::apply(&f, vec![a.clone(), b.clone()], ctx) {
                     Ok(FeelVal::Bool(true)) => std::cmp::Ordering::Less,
                     Ok(FeelVal::Bool(false)) => std::cmp::Ordering::Greater,
-                    _ => std::cmp::Ordering::Equal,
-                },
-            );
+                    Ok(_) => std::cmp::Ordering::Equal,
+                    Err(e) => {
+                        cmp_err = Some(e);
+                        std::cmp::Ordering::Equal
+                    }
+                }
+            });
+            if let Some(e) = cmp_err {
+                return Err(e);
+            }
         }
         _ => {
             list.sort_by(|a, b| super::eval::compare(a, b).unwrap_or(std::cmp::Ordering::Equal));
@@ -881,7 +890,7 @@ fn round_builtin(args: &[FeelVal], mode: RoundMode) -> Result<FeelVal, FeelError
 }
 
 fn round_scale(n: f64, scale: i32, mode: RoundMode) -> f64 {
-    let factor = 10f64.powi(scale);
+    let factor = pow10(scale);
     let x = n * factor;
     let rounded = match mode {
         RoundMode::Up => {
@@ -1079,12 +1088,24 @@ fn date_of(v: &FeelVal) -> Option<Date> {
     }
 }
 
-fn now_datetime() -> Option<DateTime> {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+/// `10^scale` through the pure-Rust libm, so decimal scaling is bit-identical
+/// on every platform (#1663; LLVM's `powi` lowering is not guaranteed to be).
+fn pow10(scale: i32) -> f64 {
+    libm::pow(10.0, f64::from(scale))
+}
+
+/// The installed replicated clock (#1642). Fails closed (#1663): with no
+/// [`super::env`] installed there is no host-clock fallback — reading the
+/// process wall clock would let Raft replicas diverge — so this is a typed
+/// FEEL error the engine surfaces as an incident. Off-apply callers opt into
+/// the host clock explicitly via [`super::env::with_host_env`].
+fn now_datetime(builtin: &str) -> Result<DateTime, FeelError> {
+    let ms = super::env::now_ms().ok_or_else(|| super::env::missing_env_error(builtin))?;
+    let secs = (ms / 1000) as i64;
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
-    Some(DateTime {
+    Ok(DateTime {
         date: Date { year, month, day },
         time: Time {
             hour: (sod / 3600) as u32,
@@ -1298,48 +1319,36 @@ fn rounding_mode(name: &str) -> Result<RoundMode, FeelError> {
     }
 }
 
-/// A dependency-free `[0, 1)` double for `random number()`, seeded from the
-/// wall clock and a monotonic counter (nondeterministic, like `now()`).
-fn rand_unit() -> f64 {
-    (next_random() >> 11) as f64 / (1u64 << 53) as f64
+/// A dependency-free `[0, 1)` double for `random number()`, drawn from the
+/// replicated engine environment's seeded stream (see [`super::env`]).
+fn rand_unit() -> Result<f64, FeelError> {
+    Ok((next_random("random number")? >> 11) as f64 / (1u64 << 53) as f64)
 }
 
-/// A single 64-bit draw from a SplitMix64 generator seeded per call from the
-/// clock and a process-wide counter, so successive calls differ.
-fn next_random() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut z = nanos
-        .wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+/// A single 64-bit draw from the installed, seeded stream (#1642). Fails
+/// closed (#1663): no host-entropy fallback when no environment is installed.
+fn next_random(builtin: &str) -> Result<u64, FeelError> {
+    super::env::next_u64().ok_or_else(|| super::env::missing_env_error(builtin))
 }
 
 /// Generates a random RFC-4122 version-4 UUID string.
-fn uuid_v4() -> String {
-    let a = next_random();
-    let b = next_random();
+fn uuid_v4() -> Result<String, FeelError> {
+    let a = next_random("uuid")?;
+    let b = next_random("uuid")?;
     let mut bytes = [0u8; 16];
     bytes[..8].copy_from_slice(&a.to_be_bytes());
     bytes[8..].copy_from_slice(&b.to_be_bytes());
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10
     let h: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!(
+    Ok(format!(
         "{}-{}-{}-{}-{}",
         &h[0..8],
         &h[8..12],
         &h[12..16],
         &h[16..20],
         &h[20..32]
-    )
+    ))
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

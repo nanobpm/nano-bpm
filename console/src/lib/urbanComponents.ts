@@ -21,8 +21,13 @@ export interface ElementTemplate {
   id: string;
   name: string;
   description?: string;
+  version?: number;
   appliesTo: string[];
-  elementType?: { value: string };
+  engines?: Record<string, string>;
+  entriesVisible?: Record<string, boolean>;
+  elementType?: { value: string; eventDefinition?: string };
+  groups?: Array<{ id: string; label: string; openByDefault?: boolean }>;
+  category?: { id: string; name: string };
   properties: Array<Record<string, unknown>>;
 }
 

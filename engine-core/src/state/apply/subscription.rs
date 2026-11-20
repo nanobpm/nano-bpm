@@ -31,6 +31,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     correlation_key: correlation_key.clone(),
                     state: MessageSubscriptionState::Open,
                     kind: kind.clone(),
+                    correlated_message_keys: Default::default(),
                 },
             );
         }
@@ -59,20 +60,24 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     correlation_key: correlation_key.clone(),
                     state: MessageSubscriptionState::Opening,
                     kind: kind.clone(),
+                    correlated_message_keys: Default::default(),
                 },
             );
         }
 
         Event::MessageCorrelated {
-            subscription_key, ..
+            subscription_key,
+            message_key,
+            ..
         } => {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
-                // A non-interrupting boundary subscription stays open so every
-                // matching message spawns another token; all others settle.
-                if !matches!(
-                    subscription.kind,
-                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                ) {
+                // A persistent subscription (non-interrupting boundary or event
+                // sub-process) stays open so every matching message spawns
+                // another token — recording the message so an at-least-once
+                // redelivery of it is recognised; all others settle.
+                if subscription.kind.stays_open_after_trigger() {
+                    subscription.correlated_message_keys.insert(*message_key);
+                } else {
                     subscription.state = MessageSubscriptionState::Correlated;
                 }
             }
@@ -117,10 +122,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             subscription_key, ..
         } => {
             if let Some(subscription) = state.signal_subscriptions.get_mut(subscription_key) {
-                if !matches!(
-                    subscription.kind,
-                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                ) {
+                if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
                 }
             }
@@ -167,10 +169,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             subscription_key, ..
         } => {
             if let Some(subscription) = state.conditional_subscriptions.get_mut(subscription_key) {
-                if !matches!(
-                    subscription.kind,
-                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                ) {
+                if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
                 }
             }
@@ -233,10 +232,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             subscription_key, ..
         } => {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
-                if !matches!(
-                    subscription.kind,
-                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
-                ) {
+                if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
                 }
             }
@@ -247,6 +243,8 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             process_id,
             message_name,
             start_element_id,
+            tool_name,
+            tool_properties,
         } => {
             // Keyed by message name: re-deploying a process with the same start
             // message replaces the older version's subscription.
@@ -257,6 +255,8 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     process_id: process_id.clone(),
                     message_name: message_name.clone(),
                     start_element_id: start_element_id.clone(),
+                    tool_name: tool_name.clone(),
+                    tool_properties: tool_properties.clone(),
                 },
             );
         }

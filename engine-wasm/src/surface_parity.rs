@@ -73,8 +73,7 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
             js_method: "deploy",
         },
         // Forms and generic resources each have their own JS deploy entry point
-        // (mirroring the native deploy decomposition, which splits one deployment
-        // into DeployResources + DeployForms + DeployGenericResources). deployForm
+        // (the native host deploys a mixed deployment as one DeployBundle). deployForm
         // populates the read model so getFormByKey resolves in-browser; deployResource
         // does the same for getResourceByKey (#815).
         Command::DeployForms(..) => Surface::Surfaced {
@@ -82,6 +81,12 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         },
         Command::DeployGenericResources(..) => Surface::Surfaced {
             js_method: "deployResource/getResourceByKey",
+        },
+        // The mixed-deployment command the native REST host issues for one
+        // multi-resource `POST /deployments`; in-browser each kind has its own
+        // JS entry point above, so there is no mixed-bundle JS method.
+        Command::DeployBundle(..) => Surface::NotSurfaced {
+            reason: "mixed multi-resource deployment is a REST-host path; the JS surface deploys per kind",
         },
         Command::CreateInstance { .. } => Surface::Surfaced {
             js_method: "createInstance",
@@ -161,6 +166,11 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
         },
+        Command::CreateClusterVariable { .. }
+        | Command::UpdateClusterVariable { .. }
+        | Command::DeleteClusterVariable { .. } => Surface::NotSurfaced {
+            reason: "operator-managed cluster variables (REST cluster-variables surface); not exposed by the in-browser test engine",
+        },
         Command::EvaluateDecision { .. } => Surface::Surfaced {
             js_method: "evaluateDecision",
         },
@@ -172,6 +182,10 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         },
         Command::ExpireJobsByDurability { .. } => Surface::NotSurfaced {
             reason: "worker-specific expiration scan; the simulation clock expires both lease modes via ExpireJobs",
+        },
+        Command::EvaluateConditionalStartEvents { .. } => Surface::NotSurfaced {
+            reason: "conditional-start evaluation is a server/REST seam (POST /conditionals/evaluation); \
+                 the in-browser test engine exposes no evaluation driver yet",
         },
         Command::OpenMessageSubscription { .. } => Surface::NotSurfaced {
             reason: "internal subscription lifecycle the engine drives itself; not a user op",
@@ -218,8 +232,15 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         // Raised by the host's storage layer when it quarantines an off-heap
         // orphan (#1384), never by a worker/JS caller — there is no public
         // "quarantine" API to surface.
-        Command::QuarantineOffheapOrphan { .. } | Command::QuarantineColdOrphan { .. } => Surface::NotSurfaced {
+        Command::QuarantineOffheapOrphan { .. }
+        | Command::QuarantineColdOrphan { .. } => Surface::NotSurfaced {
             reason: "host-internal durability command raised by the storage layer, not a public worker/JS API",
+        },
+        // Proposed by a clustered host's partition leader (#1661) to flip the
+        // replicated lenient-completion mode; a single in-browser engine has
+        // no leader-local activation to tolerate.
+        Command::SetLenientCompletion { .. } => Surface::NotSurfaced {
+            reason: "host-internal cluster replication command proposed by the partition leader, not a public worker/JS API",
         },
     }
 }
@@ -391,15 +412,13 @@ mod tests {
                 lease_token: None,
                 job_key: 0,
                 timeout: 0,
-                operation_reference: None,
             }),
             Surface::Surfaced { .. }
         ));
     }
 
     // Forms and generic resources are surfaced via their own JS deploy entry
-    // points (deployForm/deployResource), mirroring the native deploy
-    // decomposition, so getFormByKey/getResourceByKey resolve in-browser (#815).
+    // points (deployForm/deployResource), so getFormByKey/getResourceByKey resolve in-browser (#815).
     #[test]
     fn deploy_forms_and_resources_are_surfaced() {
         assert!(matches!(

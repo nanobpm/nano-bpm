@@ -16,7 +16,7 @@
 //! [`parse_bpmn`](nanobpmn_engine_core::bpmn::parse_bpmn) — exactly the parser production
 //! uses — so the structural view never drifts from executable semantics.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
@@ -41,6 +41,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::StartEvent => "startEvent",
         ElementKind::EndEvent => "endEvent",
         ElementKind::TerminateEndEvent => "terminateEndEvent",
+        ElementKind::ErrorEndEvent { .. } => "errorEndEvent",
         ElementKind::ServiceTask { .. } => "serviceTask",
         ElementKind::BusinessRuleTask { .. } => "businessRuleTask",
         ElementKind::UserTask(_) => "userTask",
@@ -55,7 +56,9 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::MessageBoundaryEvent { .. } => "messageBoundaryEvent",
         ElementKind::MessageStartEvent { .. } => "messageStartEvent",
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
+        ElementKind::ConditionalStartEvent { .. } => "conditionalStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
+        ElementKind::EventSubProcess { .. } => "eventSubProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
         ElementKind::EscalationThrowEvent { .. } => "escalationThrowEvent",
         ElementKind::EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
@@ -119,6 +122,9 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
             m.insert("attachedTo".into(), json!(attached_to));
             m.insert("errorCode".into(), json!(error_code));
         }
+        ElementKind::ErrorEndEvent { error_code } => {
+            m.insert("errorCode".into(), json!(error_code));
+        }
         ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
             m.insert("durationMs".into(), json!(duration_millis));
         }
@@ -161,6 +167,9 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
             m.insert("intervalMs".into(), json!(interval_millis));
             m.insert("repeating".into(), json!(repeating));
         }
+        ElementKind::ConditionalStartEvent { condition } => {
+            m.insert("condition".into(), json!(condition));
+        }
         ElementKind::SubProcess { start_event } => {
             m.insert("innerStartEvent".into(), json!(start_event));
         }
@@ -200,12 +209,12 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
 /// resolution library a multi-stage orchestrator needs to inline its phases.
 fn definition_library(
     xml: &str,
-) -> Result<(Vec<ProcessDefinition>, HashMap<String, ProcessDefinition>), String> {
+) -> Result<(Vec<ProcessDefinition>, BTreeMap<String, ProcessDefinition>), String> {
     let defs = parse_bpmn(xml).map_err(|e| format!("model failed to parse: {e:?}"))?;
     if defs.is_empty() {
         return Err("model contained no process definitions".to_string());
     }
-    let library: HashMap<String, ProcessDefinition> =
+    let library: BTreeMap<String, ProcessDefinition> =
         defs.iter().map(|d| (d.id.clone(), d.clone())).collect();
     Ok((defs, library))
 }
@@ -476,8 +485,8 @@ pub fn read_model_xml(xml: &str, target: Option<&str>) -> Result<Value, String> 
 /// Structural edges used for reachability and loop detection: outgoing sequence flows,
 /// sub-process entry (container -> inner start), and boundary attachment (activity ->
 /// boundary event). The returned map is keyed by element id.
-fn adjacency(def: &ProcessDefinition) -> HashMap<String, Vec<String>> {
-    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+fn adjacency(def: &ProcessDefinition) -> BTreeMap<String, Vec<String>> {
+    let mut adj: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (id, el) in &def.elements {
         let entry = adj.entry(id.clone()).or_default();
         for flow in &el.outgoing {
@@ -486,6 +495,9 @@ fn adjacency(def: &ProcessDefinition) -> HashMap<String, Vec<String>> {
         if let ElementKind::SubProcess { start_event } = &el.kind {
             entry.push(start_event.clone());
         }
+        // An event sub-process is never entered by token flow, so it is not
+        // linked from its start event here (it is reachable only via its
+        // trigger, not the main-flow adjacency).
     }
     // Boundary events have no incoming flow; they become reachable through their host.
     for (id, el) in &def.elements {
@@ -499,9 +511,9 @@ fn adjacency(def: &ProcessDefinition) -> HashMap<String, Vec<String>> {
 /// The set of element ids reachable from the start event over [`adjacency`].
 fn reachable_from_start(
     def: &ProcessDefinition,
-    adj: &HashMap<String, Vec<String>>,
-) -> HashSet<String> {
-    let mut seen = HashSet::new();
+    adj: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
     let mut stack = vec![def.start_event.clone()];
     while let Some(id) = stack.pop() {
         if !seen.insert(id.clone()) {
@@ -519,8 +531,8 @@ fn reachable_from_start(
 }
 
 /// Reverse adjacency (predecessors) for ancestor queries.
-fn predecessors(adj: &HashMap<String, Vec<String>>) -> HashMap<String, Vec<String>> {
-    let mut rev: HashMap<String, Vec<String>> = HashMap::new();
+fn predecessors(adj: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
+    let mut rev: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (from, tos) in adj {
         for to in tos {
             rev.entry(to.clone()).or_default().push(from.clone());
@@ -530,8 +542,8 @@ fn predecessors(adj: &HashMap<String, Vec<String>>) -> HashMap<String, Vec<Strin
 }
 
 /// All ancestors of `node` over the reverse graph (nodes that can reach it).
-fn ancestors(node: &str, rev: &HashMap<String, Vec<String>>) -> HashSet<String> {
-    let mut seen = HashSet::new();
+fn ancestors(node: &str, rev: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
     let mut stack: Vec<String> = rev.get(node).cloned().unwrap_or_default();
     while let Some(id) = stack.pop() {
         if !seen.insert(id.clone()) {
@@ -552,7 +564,7 @@ fn ancestors(node: &str, rev: &HashMap<String, Vec<String>>) -> HashSet<String> 
 /// that constitute a loop (size > 1, or a single self-looping node).
 fn loop_components(
     def: &ProcessDefinition,
-    adj: &HashMap<String, Vec<String>>,
+    adj: &BTreeMap<String, Vec<String>>,
 ) -> Vec<Vec<String>> {
     // Index the nodes deterministically.
     let ids: Vec<String> = {
@@ -560,7 +572,7 @@ fn loop_components(
         v.sort();
         v
     };
-    let index_of: HashMap<&str, usize> = ids
+    let index_of: BTreeMap<&str, usize> = ids
         .iter()
         .enumerate()
         .map(|(i, s)| (s.as_str(), i))
@@ -651,14 +663,14 @@ fn loop_components(
 pub(crate) struct ModelTaskGraph {
     pub process_id: String,
     /// Every service/user task id in the model.
-    pub tasks: HashSet<String>,
+    pub tasks: BTreeSet<String>,
     /// For each task, the set of tasks reachable next via paths of only non-task nodes
     /// (gateways, events, subprocess/boundary edges) — i.e. the transitions the model permits.
-    pub allowed: HashMap<String, HashSet<String>>,
+    pub allowed: BTreeMap<String, BTreeSet<String>>,
     /// Tasks the model can reach first from the start event (legal opening tasks).
-    pub start_tasks: HashSet<String>,
+    pub start_tasks: BTreeSet<String>,
     /// Tasks from which an end event is reachable without an intervening task (legal closing tasks).
-    pub end_tasks: HashSet<String>,
+    pub end_tasks: BTreeSet<String>,
 }
 
 /// Build the [`ModelTaskGraph`] by collapsing the structural graph onto its task nodes.
@@ -669,6 +681,9 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
     let is_end_id = |id: &str| {
         def.element(id).is_some_and(|e| match &e.kind {
             ElementKind::EndEvent | ElementKind::TerminateEndEvent => true,
+            // An error end event is always terminal (#1592): it never has an
+            // outgoing flow (the parser rejects one).
+            ElementKind::ErrorEndEvent { .. } => true,
             // An escalation throw with no outgoing flow is an escalation *end*
             // event (terminal); one with outgoing is an intermediate throw and
             // is not a closing node.
@@ -676,7 +691,7 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
             _ => false,
         })
     };
-    let tasks: HashSet<String> = def
+    let tasks: BTreeSet<String> = def
         .elements
         .iter()
         .filter(|(_, e)| is_task(&e.kind))
@@ -685,10 +700,10 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
 
     // From a starting frontier, walk forward through only non-task nodes, recording the
     // first task reached on each path (and whether any path reaches an end event).
-    let next_tasks = |frontier: Vec<String>| -> (HashSet<String>, bool) {
-        let mut found = HashSet::new();
+    let next_tasks = |frontier: Vec<String>| -> (BTreeSet<String>, bool) {
+        let mut found = BTreeSet::new();
         let mut reached_end = false;
-        let mut visited = HashSet::new();
+        let mut visited = BTreeSet::new();
         let mut stack = frontier;
         while let Some(n) = stack.pop() {
             if !visited.insert(n.clone()) {
@@ -711,8 +726,8 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
         (found, reached_end)
     };
 
-    let mut allowed = HashMap::new();
-    let mut end_tasks = HashSet::new();
+    let mut allowed = BTreeMap::new();
+    let mut end_tasks = BTreeSet::new();
     for t in &tasks {
         let frontier = adj.get(t).cloned().unwrap_or_default();
         let (succ, reached_end) = next_tasks(frontier);
@@ -858,17 +873,20 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
 
     let mut findings = Vec::new();
 
-    // No explicit end event. An escalation throw with no outgoing flow is an
-    // escalation *end* event, so it counts as a terminal node here — otherwise a
-    // process whose only terminal is an escalation end would draw a false
-    // `no-end-event` warning (#1173).
+    // No explicit end event. An error end event is always terminal (#1592), and
+    // an escalation throw with no outgoing flow is an escalation *end* event, so
+    // both count as terminal nodes here — otherwise a process whose only
+    // terminal is an error/escalation end would draw a false `no-end-event`
+    // warning (#1173).
     let end_events = ids
         .iter()
         .filter(|id| {
             let el = &def.elements[**id];
             matches!(
                 el.kind,
-                ElementKind::EndEvent | ElementKind::TerminateEndEvent
+                ElementKind::EndEvent
+                    | ElementKind::TerminateEndEvent
+                    | ElementKind::ErrorEndEvent { .. }
             ) || (matches!(el.kind, ElementKind::EscalationThrowEvent { .. })
                 && el.outgoing.is_empty())
         })
@@ -902,11 +920,16 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         }
 
         // A non-end flow node with no outgoing flow silently drops its token.
-        // An escalation throw with no outgoing flow is an escalation *end* event
-        // (terminal), so — like a plain end event — it must not be flagged as a
-        // dead end (#1173).
-        let is_event_end = matches!(kind, ElementKind::EndEvent | ElementKind::TerminateEndEvent)
-            || (matches!(kind, ElementKind::EscalationThrowEvent { .. }) && el.outgoing.is_empty());
+        // An error end event is always terminal (#1592), and an escalation throw
+        // with no outgoing flow is an escalation *end* event (terminal), so —
+        // like a plain end event — neither is flagged as a dead end (#1173).
+        let is_event_end = matches!(
+            kind,
+            ElementKind::EndEvent
+                | ElementKind::TerminateEndEvent
+                | ElementKind::ErrorEndEvent { .. }
+        ) || (matches!(kind, ElementKind::EscalationThrowEvent { .. })
+            && el.outgoing.is_empty());
         if !is_event_end && el.outgoing.is_empty() && !is_boundary(kind) {
             // Sub-process inner ends and the like aside, a task/gateway with no exit is a
             // dead end.
@@ -1373,11 +1396,34 @@ pub fn validate_model(xml: &str) -> Result<Value, String> {
 
 /// Escape the five predefined XML entities for safe emission into attribute values and text
 /// (the inverse of the engine tokenizer's `unescape`). `&` first so we don't double-escape.
+/// The single canonical rendering of a retained [`TimerDef`] as its
+/// `<bpmn:timeDuration|timeCycle|timeDate>` child element.
+fn timer_def_child_xml(def: &nanobpmn_engine_core::TimerDef) -> String {
+    let tag = match def.kind {
+        nanobpmn_engine_core::TimerDefKind::Duration => "timeDuration",
+        nanobpmn_engine_core::TimerDefKind::Cycle => "timeCycle",
+        nanobpmn_engine_core::TimerDefKind::Date => "timeDate",
+    };
+    format!("<bpmn:{tag}>{}</bpmn:{tag}>", xml_escape(&def.expr))
+}
+
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    escape_attr_whitespace(
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;"),
+    )
+}
+
+/// Encode tab / newline / carriage return as numeric character references.
+/// XML attribute-value normalization turns literal whitespace into spaces, so
+/// a multiline value (e.g. an MCP purpose property) would lose its line breaks
+/// on re-import. Shared by every escaper so no emitter can regress.
+fn escape_attr_whitespace(s: String) -> String {
+    s.replace('\t', "&#9;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
 }
 
 /// A safe id fragment: keep alphanumerics and `_`/`-`, map everything else to `_`.
@@ -1436,8 +1482,8 @@ fn tag_attr(tag: &str, key: &str) -> Option<String> {
 /// Harvest a map of `element id -> human label` from a BPMN document by scanning every start tag
 /// that carries both `id=` and a non-empty `name=`. The engine model drops names (it is purely
 /// semantic), so `edit_model` re-reads them here to preserve operator-facing labels across an edit.
-pub(crate) fn parse_element_names(xml: &str) -> HashMap<String, String> {
-    let mut names = HashMap::new();
+pub(crate) fn parse_element_names(xml: &str) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
     let mut i = 0usize;
     while let Some(rel) = xml[i..].find('<') {
         let start = i + rel;
@@ -1497,8 +1543,8 @@ pub const NANO_NAMESPACE_URI: &str = "http://nano.camunda.io/schema/semantic/1.0
 /// parent). This is a lightweight XML scan — no full parser — because the
 /// serialiser we're pairing with is also lightweight and BPMN documents in
 /// this codebase are small.
-pub(crate) fn extract_nano_extensions(xml: &str) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> = HashMap::new();
+pub(crate) fn extract_nano_extensions(xml: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
     // A stack of open elements: (id, whether we already recorded a nano
     // block for this element). We only ever need the id of the immediate
     // parent of a `<bpmn:extensionElements>` block.
@@ -1671,7 +1717,7 @@ fn collect_nano_children(block: &str, buf: &mut String) {
 /// Returns `emitted` unchanged when `extensions` is empty.
 pub(crate) fn preserve_nano_extensions_in(
     emitted: String,
-    extensions: &HashMap<String, String>,
+    extensions: &BTreeMap<String, String>,
 ) -> String {
     if extensions.is_empty() {
         return emitted;
@@ -1798,9 +1844,11 @@ fn ensure_nano_namespace(mut xml: String) -> String {
 /// Kept separate from [`xml_escape`] because attribute values need `"`
 /// escaped as well.
 fn xml_escape_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('"', "&quot;")
+    escape_attr_whitespace(
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('"', "&quot;"),
+    )
 }
 
 /// Turn a machine id into a readable label: strip a leading kind prefix (`Task_`, `Gateway_`,
@@ -1901,17 +1949,50 @@ fn millis_to_iso8601(ms: u64) -> String {
 }
 
 /// Collect the definitions-level `<bpmn:error>` declarations a model needs: one per distinct
-/// error code carried by an error boundary event. Returns a code → synthesized-error-id map.
-fn collect_error_ids(def: &ProcessDefinition) -> BTreeMap<String, String> {
-    let mut codes: BTreeMap<String, String> = BTreeMap::new();
+/// error code carried by an error boundary event, thrown by an error end event (#1592), or caught
+/// by an error event sub-process. Returns a code → synthesized-error-id map.
+///
+/// `id_fragment` is not injective (`A.B` and `A/B` both normalize to `A_B`), so ids are minted via
+/// [`alloc_unique_id`] in sorted code order against `reserved` — the same scheme as
+/// [`collect_escalations`] — so two distinct codes can never share one `<bpmn:error id>` (which
+/// would reparse both refs onto the last declaration's code and misroute the throw).
+fn collect_error_ids(
+    def: &ProcessDefinition,
+    reserved: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
-        if let ElementKind::ErrorBoundaryEvent { error_code, .. } = &el.kind {
-            codes
-                .entry(error_code.clone())
-                .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+        match &el.kind {
+            ElementKind::ErrorBoundaryEvent { error_code, .. } => {
+                codes.insert(error_code.clone());
+            }
+            // An error end event with a code needs a definitions-level
+            // `<bpmn:error>` for its `errorRef` (an unnamed throw — empty code —
+            // carries no ref and needs no declaration).
+            ElementKind::ErrorEndEvent { error_code } if !error_code.is_empty() => {
+                codes.insert(error_code.clone());
+            }
+            // An event sub-process error trigger with a code needs a
+            // definitions-level `<bpmn:error>` for its start event's `errorRef`.
+            ElementKind::EventSubProcess {
+                trigger:
+                    nanobpmn_engine_core::EventSubProcessTrigger::Error {
+                        error_code: Some(error_code),
+                    },
+                ..
+            } => {
+                codes.insert(error_code.clone());
+            }
+            _ => {}
         }
     }
-    codes
+    let mut used: BTreeSet<String> = reserved.clone();
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for code in codes {
+        let id = alloc_unique_id(format!("Error_{}", id_fragment(&code)), &mut used);
+        out.insert(code, id);
+    }
+    out
 }
 
 /// A definitions-level `<bpmn:message>` declaration needed by a message start/catch/boundary.
@@ -1923,13 +2004,13 @@ struct MessageDecl {
 
 /// The message declarations a model needs, paired with a lookup from `(name, correlation_key)`
 /// to the declaration id (so events differing only in correlation get distinct declarations).
-type MessageCollection = (Vec<MessageDecl>, HashMap<(String, Option<String>), String>);
+type MessageCollection = (Vec<MessageDecl>, BTreeMap<(String, Option<String>), String>);
 
 /// Collect the `<bpmn:message>` declarations a model needs, keyed for lookup by
 /// `(name, correlation_key)` so events that differ in correlation get distinct declarations.
 fn collect_messages(def: &ProcessDefinition) -> MessageCollection {
     let mut decls: Vec<MessageDecl> = Vec::new();
-    let mut lookup: HashMap<(String, Option<String>), String> = HashMap::new();
+    let mut lookup: BTreeMap<(String, Option<String>), String> = BTreeMap::new();
     let mut want: Vec<(String, Option<String>)> = Vec::new();
     let mut ids: Vec<&String> = def.elements.keys().collect();
     ids.sort();
@@ -1945,6 +2026,19 @@ fn collect_messages(def: &ProcessDefinition) -> MessageCollection {
             | ElementKind::MessageBoundaryEvent {
                 message_name,
                 correlation_key,
+                ..
+            } => {
+                want.push((message_name.clone(), Some(correlation_key.clone())));
+            }
+            // An event sub-process message trigger needs a `<bpmn:message>`
+            // (with its correlation-key subscription) for its start event's
+            // `messageRef`.
+            ElementKind::EventSubProcess {
+                trigger:
+                    nanobpmn_engine_core::EventSubProcessTrigger::Message {
+                        message_name,
+                        correlation_key,
+                    },
                 ..
             } => {
                 want.push((message_name.clone(), Some(correlation_key.clone())));
@@ -1976,6 +2070,12 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
         let name = match &el.kind {
             ElementKind::SignalIntermediateCatchEvent { signal_name }
             | ElementKind::SignalBoundaryEvent { signal_name, .. } => Some(signal_name),
+            // An event sub-process signal trigger needs a `<bpmn:signal>`
+            // declaration for its start event's `signalRef`.
+            ElementKind::EventSubProcess {
+                trigger: nanobpmn_engine_core::EventSubProcessTrigger::Signal { signal_name },
+                ..
+            } => Some(signal_name),
             _ => None,
         };
         if let Some(name) = name {
@@ -2002,7 +2102,7 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
 /// or an earlier escalation id.
 fn collect_escalations(
     def: &ProcessDefinition,
-    reserved: &HashSet<String>,
+    reserved: &BTreeSet<String>,
 ) -> BTreeMap<String, String> {
     let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
@@ -2013,6 +2113,18 @@ fn collect_escalations(
             } if !escalation_code.is_empty() => {
                 codes.insert(escalation_code.clone());
             }
+            // An event sub-process escalation trigger with a code needs a
+            // `<bpmn:escalation>` declaration for its start event's
+            // `escalationRef`. A catch-all (`None`) carries no ref.
+            ElementKind::EventSubProcess {
+                trigger:
+                    nanobpmn_engine_core::EventSubProcessTrigger::Escalation {
+                        escalation_code: Some(escalation_code),
+                    },
+                ..
+            } => {
+                codes.insert(escalation_code.clone());
+            }
             _ => {}
         }
     }
@@ -2021,7 +2133,7 @@ fn collect_escalations(
     // — so a generated `Escalation_…` declaration id can never shadow one of
     // them (a process/flow literally named `Escalation_OVERLOAD` would otherwise
     // duplicate a `<bpmn:escalation id>`; #1173).
-    let mut used: HashSet<String> = reserved.clone();
+    let mut used: BTreeSet<String> = reserved.clone();
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for code in codes {
         let id = alloc_unique_id(format!("Escalation_{}", id_fragment(&code)), &mut used);
@@ -2034,7 +2146,7 @@ fn collect_escalations(
 /// inserting the chosen id into `used`. Keeps synthesized declaration ids collision-free against
 /// each other and against reserved (model element) ids, since the id-deriving `id_fragment` is not
 /// injective.
-fn alloc_unique_id(base: String, used: &mut HashSet<String>) -> String {
+fn alloc_unique_id(base: String, used: &mut BTreeSet<String>) -> String {
     if used.insert(base.clone()) {
         return base;
     }
@@ -2119,6 +2231,50 @@ fn emit_io_mapping(el: &Element, out: &mut String) {
     out.push_str("        </zeebe:ioMapping>\n");
 }
 
+/// Emit a `zeebe:properties` block (with its nested `zeebe:property` entries)
+/// if the element carries extension properties — e.g. the `io.camunda.tool:*`
+/// MCP tool metadata (#1499). Emitted INSIDE the owner's
+/// `<bpmn:extensionElements>` so the engine parser (`bpmn::walk`, which reads
+/// `zeebe:property` children of a `zeebe:properties` container) round-trips
+/// them. A no-op when the element declares no properties, so unmarked nodes
+/// stay terse.
+fn emit_properties(el: &Element, out: &mut String) {
+    if el.properties.is_empty() {
+        return;
+    }
+    out.push_str("        <zeebe:properties>\n");
+    for (name, value) in &el.properties {
+        out.push_str(&format!(
+            "          <zeebe:property name=\"{}\" value=\"{}\"/>\n",
+            xml_escape(name),
+            xml_escape(value)
+        ));
+    }
+    out.push_str("        </zeebe:properties>\n");
+}
+
+/// Whether the element needs an `<bpmn:extensionElements>` wrapper for the
+/// shared (kind-independent) extensions: io mappings and/or properties.
+fn has_shared_extensions(el: &Element) -> bool {
+    !el.io.inputs.is_empty() || !el.io.outputs.is_empty() || !el.properties.is_empty()
+}
+
+/// Emit the shared (kind-independent) extensions wrapper — io mappings and
+/// `zeebe:properties` — for an element whose kind arm has no extensions of its
+/// own: self-closing when the element carries neither, otherwise an open
+/// `<bpmn:extensionElements>` block. Kind arms that already emit their own
+/// `<bpmn:extensionElements>` block call [`emit_io_mapping`] + [`emit_properties`]
+/// inside it directly instead.
+fn emit_shared_extensions(el: &Element, out: &mut String) {
+    if !has_shared_extensions(el) {
+        return;
+    }
+    out.push_str("      <bpmn:extensionElements>\n");
+    emit_io_mapping(el, out);
+    emit_properties(el, out);
+    out.push_str("      </bpmn:extensionElements>\n");
+}
+
 /// Serialize one element (and, for a sub-process, its contained children) as BPMN XML. Sequence
 /// flows are emitted separately and flat, so this only renders the node and its event/extension
 /// definitions. `errors`/`messages`/`signals` provide the synthesized declaration ids to reference.
@@ -2128,12 +2284,12 @@ fn emit_element(
     def: &ProcessDefinition,
     id: &str,
     errors: &BTreeMap<String, String>,
-    messages: &HashMap<(String, Option<String>), String>,
+    messages: &BTreeMap<(String, Option<String>), String>,
     signals: &BTreeMap<String, String>,
     escalations: &BTreeMap<String, String>,
-    children_by_parent: &HashMap<String, Vec<String>>,
-    labels: &HashMap<String, String>,
-    default_flows: &HashMap<String, String>,
+    children_by_parent: &BTreeMap<String, Vec<String>>,
+    labels: &BTreeMap<String, String>,
+    default_flows: &BTreeMap<String, String>,
     out: &mut String,
 ) {
     let el = &def.elements[id];
@@ -2147,47 +2303,98 @@ fn emit_element(
     );
     match &el.kind {
         ElementKind::StartEvent => {
-            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}/>\n"));
+            // Round-trip any `zeebe:properties` (e.g. the `io.camunda.tool:*`
+            // MCP tool markers, #1499) and io mappings: a self-closing tag
+            // would silently strip them on re-parse.
+            if has_shared_extensions(el) {
+                out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:startEvent>\n");
+            } else {
+                out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}/>\n"));
+            }
         }
         ElementKind::EndEvent => {
-            // Round-trip any `zeebe:ioMapping` the model carries (the parser
-            // pushes an end event onto the io_stack, so mappings attach to it):
-            // a self-closing tag would silently drop them, changing the model on
-            // re-parse. Terse self-closing form only when there is nothing to nest.
-            if el.io.inputs.is_empty() && el.io.outputs.is_empty() {
+            // Round-trip any `zeebe:ioMapping` / `zeebe:properties` the model
+            // carries (the parser pushes an end event onto the io_stack, so
+            // mappings and properties attach to it): a self-closing tag would
+            // silently drop them, changing the model on re-parse. Terse
+            // self-closing form only when there is nothing to nest.
+            if !has_shared_extensions(el) {
                 out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}/>\n"));
             } else {
                 out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}>\n"));
                 out.push_str("      <bpmn:extensionElements>\n");
                 emit_io_mapping(el, out);
+                emit_properties(el, out);
                 out.push_str("      </bpmn:extensionElements>\n");
                 out.push_str("    </bpmn:endEvent>\n");
             }
         }
         ElementKind::TerminateEndEvent => {
             out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}>\n"));
-            // Preserve any `zeebe:ioMapping` on the terminate end (same io_stack
-            // attachment as a plain end event) so the model round-trips; without
-            // it, re-parsing the emitted BPMN would drop the mapping. Nano — like
-            // Zeebe — does not *apply* io mappings on a terminate end at runtime,
-            // but the serializer must not silently mutate the authored model.
-            if !el.io.inputs.is_empty() || !el.io.outputs.is_empty() {
+            // Preserve any `zeebe:ioMapping` / `zeebe:properties` on the
+            // terminate end (same io_stack attachment as a plain end) so the
+            // model round-trips; without it, re-parsing the emitted BPMN would
+            // drop the mapping/properties. Nano — like Zeebe — does not *apply*
+            // io mappings on a terminate end at runtime, but the serializer
+            // must not silently mutate the authored model.
+            if has_shared_extensions(el) {
                 out.push_str("      <bpmn:extensionElements>\n");
                 emit_io_mapping(el, out);
+                emit_properties(el, out);
                 out.push_str("      </bpmn:extensionElements>\n");
             }
             out.push_str("      <bpmn:terminateEventDefinition />\n");
             out.push_str("    </bpmn:endEvent>\n");
         }
+        ElementKind::ErrorEndEvent { error_code } => {
+            // An error end event (#1592) is always an `<endEvent>` (never an
+            // intermediate throw — it never carries an outgoing flow). An empty
+            // code emits no `errorRef` (an unnamed throw); a named one resolves
+            // to the synthesized `<bpmn:error>` declaration id.
+            out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}>\n"));
+            // Round-trip any `zeebe:ioMapping` / `zeebe:properties` the model
+            // carries (same io_stack attachment as a plain end) — emit the block
+            // before the event definition, mirroring the plain/terminate ends.
+            if has_shared_extensions(el) {
+                out.push_str("      <bpmn:extensionElements>\n");
+                emit_io_mapping(el, out);
+                emit_properties(el, out);
+                out.push_str("      </bpmn:extensionElements>\n");
+            }
+            if error_code.is_empty() {
+                out.push_str("      <bpmn:errorEventDefinition/>\n");
+            } else {
+                let err_id = errors
+                    .get(error_code)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Error_{}", id_fragment(error_code)));
+                out.push_str(&format!(
+                    "      <bpmn:errorEventDefinition errorRef=\"{}\"/>\n",
+                    xml_escape(&err_id)
+                ));
+            }
+            out.push_str("    </bpmn:endEvent>\n");
+        }
         ElementKind::IntermediateThrowEvent => {
-            out.push_str(&format!(
-                "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}/>\n"
-            ));
+            if has_shared_extensions(el) {
+                out.push_str(&format!(
+                    "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}>\n"
+                ));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:intermediateThrowEvent>\n");
+            } else {
+                out.push_str(&format!(
+                    "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}/>\n"
+                ));
+            }
         }
         ElementKind::LinkIntermediateThrowEvent { link_name } => {
             out.push_str(&format!(
                 "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:linkEventDefinition name=\"{}\"/>\n",
                 xml_escape(link_name)
@@ -2198,6 +2405,7 @@ fn emit_element(
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:linkEventDefinition name=\"{}\"/>\n",
                 xml_escape(link_name)
@@ -2206,19 +2414,19 @@ fn emit_element(
         }
         ElementKind::Task => {
             // An abstract task is a pass-through, but — like the typed tasks — it
-            // still round-trips a `zeebe:ioMapping` and/or
+            // still round-trips a `zeebe:ioMapping`, `zeebe:properties`, and/or
             // `multiInstanceLoopCharacteristics` when the model carries them (the
-            // parser pushes it onto the io_stack, so both attach to the element).
-            // Emit an open tag only when there is something to nest; otherwise a
-            // self-closing tag keeps the common case terse.
-            let has_io = !el.io.inputs.is_empty() || !el.io.outputs.is_empty();
-            if !has_io && el.multi_instance.is_none() {
+            // parser pushes it onto the io_stack, so all three attach to the
+            // element). Emit an open tag only when there is something to nest;
+            // otherwise a self-closing tag keeps the common case terse.
+            if !has_shared_extensions(el) && el.multi_instance.is_none() {
                 out.push_str(&format!("    <bpmn:task id=\"{eid}\"{na}/>\n"));
             } else {
                 out.push_str(&format!("    <bpmn:task id=\"{eid}\"{na}>\n"));
-                if has_io {
+                if has_shared_extensions(el) {
                     out.push_str("      <bpmn:extensionElements>\n");
                     emit_io_mapping(el, out);
+                    emit_properties(el, out);
                     out.push_str("      </bpmn:extensionElements>\n");
                 }
                 emit_multi_instance(el, out);
@@ -2237,6 +2445,7 @@ fn emit_element(
                 xml_escape(result_variable)
             ));
             emit_io_mapping(el, out);
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             out.push_str("    </bpmn:scriptTask>\n");
         }
@@ -2275,6 +2484,7 @@ propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
                 ));
             }
             emit_io_mapping(el, out);
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
             out.push_str("    </bpmn:callActivity>\n");
@@ -2284,24 +2494,52 @@ propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
                 .get(id)
                 .map(|f| format!(" default=\"{}\"", xml_escape(f)))
                 .unwrap_or_default();
-            out.push_str(&format!(
-                "    <bpmn:exclusiveGateway id=\"{eid}\"{na}{da}/>\n"
-            ));
+            if has_shared_extensions(el) {
+                out.push_str(&format!(
+                    "    <bpmn:exclusiveGateway id=\"{eid}\"{na}{da}>\n"
+                ));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:exclusiveGateway>\n");
+            } else {
+                out.push_str(&format!(
+                    "    <bpmn:exclusiveGateway id=\"{eid}\"{na}{da}/>\n"
+                ));
+            }
         }
         ElementKind::ParallelGateway => {
-            out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}/>\n"));
+            if has_shared_extensions(el) {
+                out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}>\n"));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:parallelGateway>\n");
+            } else {
+                out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}/>\n"));
+            }
         }
         ElementKind::InclusiveGateway => {
             let da = default_flows
                 .get(id)
                 .map(|f| format!(" default=\"{}\"", xml_escape(f)))
                 .unwrap_or_default();
-            out.push_str(&format!(
-                "    <bpmn:inclusiveGateway id=\"{eid}\"{na}{da}/>\n"
-            ));
+            if has_shared_extensions(el) {
+                out.push_str(&format!(
+                    "    <bpmn:inclusiveGateway id=\"{eid}\"{na}{da}>\n"
+                ));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:inclusiveGateway>\n");
+            } else {
+                out.push_str(&format!(
+                    "    <bpmn:inclusiveGateway id=\"{eid}\"{na}{da}/>\n"
+                ));
+            }
         }
         ElementKind::EventBasedGateway => {
-            out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}/>\n"));
+            if has_shared_extensions(el) {
+                out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}>\n"));
+                emit_shared_extensions(el, out);
+                out.push_str("    </bpmn:eventBasedGateway>\n");
+            } else {
+                out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}/>\n"));
+            }
         }
         ElementKind::ServiceTask {
             job_type,
@@ -2403,6 +2641,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 out.push_str("        </zeebe:linkedResources>\n");
             }
             emit_io_mapping(el, out);
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
             if let Some(adhoc) = adhoc {
@@ -2444,6 +2683,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 xml_escape(decision_id)
             ));
             emit_io_mapping(el, out);
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
             out.push_str("    </bpmn:businessRuleTask>\n");
@@ -2487,14 +2727,29 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 out.push_str("        <zeebe:formDefinition");
                 // Zeebe treats `formId` and `externalReference` as mutually
                 // exclusive; an external reference wins so a round-tripped model
-                // never carries both.
+                // never carries both. The binding attributes (#1193) belong to a
+                // deployed form, so they emit only on the `formId` arm — and only
+                // off the default, so a pre-#1193 model (which never carries
+                // them) round-trips byte-identically.
                 if let Some(r) = &props.external_form_reference {
                     out.push_str(&format!(" externalReference=\"{}\"", xml_escape(r)));
                 } else if let Some(f) = &props.form_id {
                     out.push_str(&format!(" formId=\"{}\"", xml_escape(f)));
+                    if props.form_binding_type != BindingType::Latest {
+                        let binding = match props.form_binding_type {
+                            BindingType::Deployment => "deployment",
+                            BindingType::Latest => unreachable!("guarded above"),
+                            BindingType::VersionTag => "versionTag",
+                        };
+                        out.push_str(&format!(" bindingType=\"{binding}\""));
+                    }
+                    if let Some(t) = &props.form_version_tag {
+                        out.push_str(&format!(" versionTag=\"{}\"", xml_escape(t)));
+                    }
                 }
                 out.push_str("/>\n");
             }
+            emit_properties(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             out.push_str("    </bpmn:userTask>\n");
         }
@@ -2510,6 +2765,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\">\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:errorEventDefinition errorRef=\"{}\"/>\n",
                 xml_escape(&err_id)
@@ -2531,8 +2787,13 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:timerEventDefinition>\n");
-            if *repeating && !*interrupting {
+            if let Some(def) = &el.timer {
+                // The retained definition (e.g. a bounded `R2/…` cycle) wins
+                // over the millis fallback so round-trips stay lossless (#1596).
+                out.push_str(&format!("        {}\n", timer_def_child_xml(def)));
+            } else if *repeating && !*interrupting {
                 out.push_str(&format!(
                     "        <bpmn:timeCycle>R/{}</bpmn:timeCycle>\n",
                     millis_to_iso8601(*duration_millis)
@@ -2565,6 +2826,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
                 xml_escape(&mref)
@@ -2575,6 +2837,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:timerEventDefinition>\n");
             out.push_str(&format!(
                 "        <bpmn:timeDuration>{}</bpmn:timeDuration>\n",
@@ -2594,6 +2857,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
                 xml_escape(&mref)
@@ -2606,6 +2870,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 .cloned()
                 .unwrap_or_default();
             out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
                 xml_escape(&mref)
@@ -2617,8 +2882,11 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             repeating,
         } => {
             out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:timerEventDefinition>\n");
-            if *repeating {
+            if let Some(def) = &el.timer {
+                out.push_str(&format!("        {}\n", timer_def_child_xml(def)));
+            } else if *repeating {
                 out.push_str(&format!(
                     "        <bpmn:timeCycle>R/{}</bpmn:timeCycle>\n",
                     millis_to_iso8601(*interval_millis)
@@ -2632,11 +2900,23 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str("      </bpmn:timerEventDefinition>\n");
             out.push_str("    </bpmn:startEvent>\n");
         }
+        ElementKind::ConditionalStartEvent { condition } => {
+            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
+            out.push_str("      <bpmn:conditionalEventDefinition>\n");
+            out.push_str(&format!(
+                "        <bpmn:condition xsi:type=\"bpmn:tFormalExpression\">{}</bpmn:condition>\n",
+                xml_escape(condition)
+            ));
+            out.push_str("      </bpmn:conditionalEventDefinition>\n");
+            out.push_str("    </bpmn:startEvent>\n");
+        }
         ElementKind::SignalIntermediateCatchEvent { signal_name } => {
             let sref = signals.get(signal_name).cloned().unwrap_or_default();
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:signalEventDefinition signalRef=\"{}\"/>\n",
                 xml_escape(&sref)
@@ -2658,6 +2938,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str(&format!(
                 "      <bpmn:signalEventDefinition signalRef=\"{}\"/>\n",
                 xml_escape(&sref)
@@ -2668,6 +2949,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str(&format!(
                 "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:conditionalEventDefinition>\n");
             out.push_str(&format!(
                 "        <bpmn:condition xsi:type=\"bpmn:tFormalExpression\">{}</bpmn:condition>\n",
@@ -2690,6 +2972,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:conditionalEventDefinition>\n");
             out.push_str(&format!(
                 "        <bpmn:condition xsi:type=\"bpmn:tFormalExpression\">{}</bpmn:condition>\n",
@@ -2709,15 +2992,17 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "intermediateThrowEvent"
             };
             out.push_str(&format!("    <bpmn:{tag} id=\"{eid}\"{na}>\n"));
-            // Round-trip any `zeebe:ioMapping` the model carries: the parser
-            // attaches io mappings on BOTH the `intermediateThrowEvent` and the
-            // `endEvent` form (same io_stack push as a plain/terminate end), so
-            // omitting them here would silently drop inputs/outputs on re-parse.
-            // Mirror the plain/terminate end branches — emit the block before the
-            // event definition. A no-op when there are no mappings.
-            if !el.io.inputs.is_empty() || !el.io.outputs.is_empty() {
+            // Round-trip any `zeebe:ioMapping` / `zeebe:properties` the model
+            // carries: the parser attaches io mappings and properties on BOTH
+            // the `intermediateThrowEvent` and the `endEvent` form (same
+            // io_stack push as a plain/terminate end), so omitting them here
+            // would silently drop inputs/outputs/properties on re-parse. Mirror
+            // the plain/terminate end branches — emit the block before the
+            // event definition. A no-op when there is nothing to nest.
+            if has_shared_extensions(el) {
                 out.push_str("      <bpmn:extensionElements>\n");
                 emit_io_mapping(el, out);
+                emit_properties(el, out);
                 out.push_str("      </bpmn:extensionElements>\n");
             }
             if escalation_code.is_empty() {
@@ -2748,6 +3033,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             if escalation_code.is_empty() {
                 out.push_str("      <bpmn:escalationEventDefinition/>\n");
             } else {
@@ -2774,6 +3060,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "intermediateThrowEvent"
             };
             out.push_str(&format!("    <bpmn:{tag} id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:compensateEventDefinition/>\n");
             out.push_str(&format!("    </bpmn:{tag}>\n"));
         }
@@ -2785,6 +3072,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\">\n",
                 xml_escape(attached_to)
             ));
+            emit_shared_extensions(el, out);
             out.push_str("      <bpmn:compensateEventDefinition/>\n");
             out.push_str("    </bpmn:boundaryEvent>\n");
             // The compensation handler is wired to this boundary by an
@@ -2801,6 +3089,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
         }
         ElementKind::SubProcess { .. } => {
             out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\"{na}>\n"));
+            emit_shared_extensions(el, out);
             if let Some(kids) = children_by_parent.get(id) {
                 for child in kids {
                     // Children are emitted at the same indentation; the engine parser keys
@@ -2821,8 +3110,151 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             }
             out.push_str("    </bpmn:subProcess>\n");
         }
+        ElementKind::EventSubProcess {
+            start_event,
+            trigger,
+            interrupting,
+        } => {
+            // An event sub-process emits as `<subProcess triggeredByEvent="true">`
+            // with its typed start event (carrying the event definition) nested
+            // inside, so the document round-trips back to the same element kind.
+            out.push_str(&format!(
+                "    <bpmn:subProcess id=\"{eid}\"{na} triggeredByEvent=\"true\">\n"
+            ));
+            emit_shared_extensions(el, out);
+            emit_esp_start_event(
+                start_event,
+                def.elements.get(start_event),
+                trigger,
+                *interrupting,
+                errors,
+                messages,
+                signals,
+                escalations,
+                labels,
+                out,
+            );
+            if let Some(kids) = children_by_parent.get(id) {
+                for child in kids {
+                    // The start event is emitted above (with its trigger); emit the
+                    // remaining children by ordinary recursion.
+                    if child == start_event {
+                        continue;
+                    }
+                    emit_element(
+                        def,
+                        child,
+                        errors,
+                        messages,
+                        signals,
+                        escalations,
+                        children_by_parent,
+                        labels,
+                        default_flows,
+                        out,
+                    );
+                }
+            }
+            out.push_str("    </bpmn:subProcess>\n");
+        }
         ElementKind::AgentTask { .. } => unreachable!("legacy agent tasks are normalized"),
     }
+}
+
+/// Emit an event sub-process's typed start event (`start_event`) with the event
+/// definition matching `trigger`, so the emitted document re-parses to the same
+/// [`EventSubProcessTrigger`](nanobpmn_engine_core::EventSubProcessTrigger).
+/// `interrupting` is written as `isInterrupting="false"` only when
+/// non-interrupting (the BPMN default `true` is omitted). The trigger's
+/// message/signal/error/escalation `…Ref` resolves against the caller's
+/// collected definitions-level declaration maps (the same maps the other event
+/// kinds use), so the reference is never dangling.
+#[allow(clippy::too_many_arguments)]
+fn emit_esp_start_event(
+    start_event: &str,
+    start_el: Option<&Element>,
+    trigger: &nanobpmn_engine_core::EventSubProcessTrigger,
+    interrupting: bool,
+    errors: &BTreeMap<String, String>,
+    messages: &BTreeMap<(String, Option<String>), String>,
+    signals: &BTreeMap<String, String>,
+    escalations: &BTreeMap<String, String>,
+    labels: &BTreeMap<String, String>,
+    out: &mut String,
+) {
+    use nanobpmn_engine_core::EventSubProcessTrigger as T;
+    let eid = xml_escape(start_event);
+    let na = format!(
+        " name=\"{}\"",
+        xml_escape(
+            labels
+                .get(start_event)
+                .map(String::as_str)
+                .unwrap_or(start_event)
+        )
+    );
+    let ia = if interrupting {
+        ""
+    } else {
+        " isInterrupting=\"false\""
+    };
+    let def_xml = match trigger {
+        T::Message {
+            message_name,
+            correlation_key,
+        } => {
+            let mid = messages
+                .get(&(message_name.clone(), Some(correlation_key.clone())))
+                .cloned()
+                .unwrap_or_default();
+            format!(
+                "<bpmn:messageEventDefinition messageRef=\"{}\"/>",
+                xml_escape(&mid)
+            )
+        }
+        T::Timer(def) => format!(
+            "<bpmn:timerEventDefinition>{}</bpmn:timerEventDefinition>",
+            timer_def_child_xml(def)
+        ),
+        T::Signal { signal_name } => {
+            let sid = signals.get(signal_name).cloned().unwrap_or_default();
+            format!(
+                "<bpmn:signalEventDefinition signalRef=\"{}\"/>",
+                xml_escape(&sid)
+            )
+        }
+        T::Error { error_code } => match error_code {
+            Some(code) => {
+                let eid = errors.get(code).cloned().unwrap_or_default();
+                format!(
+                    "<bpmn:errorEventDefinition errorRef=\"{}\"/>",
+                    xml_escape(&eid)
+                )
+            }
+            None => "<bpmn:errorEventDefinition/>".to_string(),
+        },
+        T::Escalation { escalation_code } => match escalation_code {
+            Some(code) => {
+                let eid = escalations.get(code).cloned().unwrap_or_default();
+                format!(
+                    "<bpmn:escalationEventDefinition escalationRef=\"{}\"/>",
+                    xml_escape(&eid)
+                )
+            }
+            None => "<bpmn:escalationEventDefinition/>".to_string(),
+        },
+        T::Conditional { condition } => format!(
+            "<bpmn:conditionalEventDefinition><bpmn:condition>{}</bpmn:condition></bpmn:conditionalEventDefinition>",
+            xml_escape(condition)
+        ),
+    };
+    out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}{ia}>\n"));
+    // Round-trip the start event's own `zeebe:ioMapping` (the parser attaches
+    // io on a start event) before its event definition.
+    if let Some(start_el) = start_el {
+        emit_shared_extensions(start_el, out);
+    }
+    out.push_str(&format!("      {def_xml}\n    </bpmn:startEvent>\n"));
 }
 
 /// A hand-authored diagram-interchange sidecar extracted from an original BPMN document, so a pure
@@ -2833,19 +3265,19 @@ struct PreservedDi {
     /// The verbatim `<bpmndi:BPMNDiagram>…</bpmndi:BPMNDiagram>` block.
     diagram_block: String,
     /// Node ids that carry a `<bpmndi:BPMNShape>`.
-    shape_ids: HashSet<String>,
+    shape_ids: BTreeSet<String>,
     /// `(sourceRef, targetRef)` pairs that carry a `<bpmndi:BPMNEdge>` (via their sequence flow).
-    edge_keys: HashSet<(String, String)>,
+    edge_keys: BTreeSet<(String, String)>,
     /// `(sourceRef, targetRef) -> original sequence-flow id`, so the reused body can adopt the same
     /// ids the preserved edges already reference.
-    flow_ids: HashMap<(String, String), String>,
+    flow_ids: BTreeMap<(String, String), String>,
     /// Every `id="…"` attribute declared INSIDE the verbatim diagram block — the
     /// `<bpmndi:BPMNDiagram>`/`<bpmndi:BPMNPlane>`/`<bpmndi:BPMNShape>`/`<bpmndi:BPMNEdge>`
     /// own ids (NOT their `bpmnElement` refs). The block is re-attached
     /// byte-for-byte, so a generated declaration id (`Escalation_…`, `Signal_…`)
     /// must be reserved against these too, or a legal DI id like
     /// `Escalation_OVERLOAD` could duplicate a `<bpmn:escalation id>` (#1173).
-    di_ids: HashSet<String>,
+    di_ids: BTreeSet<String>,
 }
 
 impl PreservedDi {
@@ -2861,7 +3293,7 @@ impl PreservedDi {
     /// duplicate parallel edge the `(src,to)` key can't disambiguate — fails the check and forces a
     /// clean auto-layout instead.
     fn covers(&self, def: &ProcessDefinition) -> bool {
-        let def_nodes: HashSet<&str> = def.elements.keys().map(String::as_str).collect();
+        let def_nodes: BTreeSet<&str> = def.elements.keys().map(String::as_str).collect();
         if def_nodes.len() != self.shape_ids.len()
             || !self
                 .shape_ids
@@ -2876,7 +3308,7 @@ impl PreservedDi {
                 def_flows.push((src.clone(), f.to.clone()));
             }
         }
-        let def_set: HashSet<(String, String)> = def_flows.iter().cloned().collect();
+        let def_set: BTreeSet<(String, String)> = def_flows.iter().cloned().collect();
         if def_set.len() != def_flows.len() {
             return false; // duplicate parallel edge — can't key layout by (src,to)
         }
@@ -2892,7 +3324,7 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
     let diagram_block = xml[ds..de].to_string();
 
     // Map every sequence flow's id to its endpoints (flows live in the process body, not the DI).
-    let mut flow_endpoints: HashMap<String, (String, String)> = HashMap::new();
+    let mut flow_endpoints: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut from = 0;
     while let Some((s, e)) = element_span(xml, "sequenceFlow", from) {
         let span = &xml[s..e];
@@ -2906,7 +3338,7 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
         from = e;
     }
 
-    let mut shape_ids: HashSet<String> = HashSet::new();
+    let mut shape_ids: BTreeSet<String> = BTreeSet::new();
     let mut from = 0;
     while let Some((s, e)) = element_span(&diagram_block, "BPMNShape", from) {
         if let Some(be) = attr_value_in(&diagram_block[s..e], "bpmnElement") {
@@ -2915,8 +3347,8 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
         from = e;
     }
 
-    let mut edge_keys: HashSet<(String, String)> = HashSet::new();
-    let mut flow_ids: HashMap<(String, String), String> = HashMap::new();
+    let mut edge_keys: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut flow_ids: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut from = 0;
     while let Some((s, e)) = element_span(&diagram_block, "BPMNEdge", from) {
         if let Some(be) = attr_value_in(&diagram_block[s..e], "bpmnElement") {
@@ -2931,7 +3363,7 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
     if shape_ids.is_empty() {
         return None;
     }
-    let di_ids: HashSet<String> = all_id_attrs_in(&diagram_block).into_iter().collect();
+    let di_ids: BTreeSet<String> = all_id_attrs_in(&diagram_block).into_iter().collect();
     Some(PreservedDi {
         diagram_block,
         shape_ids,
@@ -2952,7 +3384,7 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
 /// reproduces `def`'s structure (the engine ignores both `name=` and the DI).
 pub fn definition_to_xml_labeled(
     def: &ProcessDefinition,
-    overrides: &HashMap<String, String>,
+    overrides: &BTreeMap<String, String>,
 ) -> String {
     let emitted = serialize_definition(def, overrides, None, None);
     let extensions = extract_nano_extensions(&def.xml);
@@ -2967,7 +3399,7 @@ pub fn definition_to_xml_labeled(
 /// identical to `definition_to_xml_labeled`. This is the DI-preservation lens of ADR 0001 Phase 5.
 pub fn definition_to_xml_preserving_di(
     def: &ProcessDefinition,
-    overrides: &HashMap<String, String>,
+    overrides: &BTreeMap<String, String>,
     di_source: Option<&str>,
 ) -> String {
     let di = di_source.and_then(extract_preserved_di);
@@ -2987,8 +3419,8 @@ pub fn definition_to_xml_preserving_di(
 /// always regenerated — the point of running it is to relay out to the new bands).
 pub fn definition_to_xml_with_row_bias(
     def: &ProcessDefinition,
-    overrides: &HashMap<String, String>,
-    row_bias: &HashMap<String, f64>,
+    overrides: &BTreeMap<String, String>,
+    row_bias: &BTreeMap<String, f64>,
 ) -> String {
     let emitted = serialize_definition(def, overrides, None, Some(row_bias));
     let extensions = extract_nano_extensions(&def.xml);
@@ -3043,6 +3475,7 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: tool.properties.clone(),
                 },
             );
         }
@@ -3060,9 +3493,9 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
 fn flow_id_resolution(
     def: &ProcessDefinition,
     preserve: Option<&PreservedDi>,
-) -> (Vec<String>, HashMap<String, String>) {
+) -> (Vec<String>, BTreeMap<String, String>) {
     let mut flow_ids: Vec<String> = Vec::new();
-    let mut default_flows: HashMap<String, String> = HashMap::new();
+    let mut default_flows: BTreeMap<String, String> = BTreeMap::new();
     let mut sources: Vec<&String> = def.elements.keys().collect();
     sources.sort();
     let mut k = 0usize;
@@ -3083,9 +3516,9 @@ fn flow_id_resolution(
 
 fn serialize_definition(
     def: &ProcessDefinition,
-    overrides: &HashMap<String, String>,
+    overrides: &BTreeMap<String, String>,
     di: Option<&PreservedDi>,
-    row_bias: Option<&HashMap<String, f64>>,
+    row_bias: Option<&BTreeMap<String, f64>>,
 ) -> String {
     let mut normalized = def.clone();
     normalized.normalize_legacy_agent_tasks();
@@ -3102,7 +3535,7 @@ fn serialize_definition(
     // reused verbatim when the flows are emitted below.
     let preserve = di.filter(|d| d.covers(def));
     let (flow_ids, default_flows) = flow_id_resolution(def, preserve);
-    let mut reserved_ids: HashSet<String> = def.elements.keys().cloned().collect();
+    let mut reserved_ids: BTreeSet<String> = def.elements.keys().cloned().collect();
     reserved_ids.insert(def.id.clone());
     reserved_ids.extend(flow_ids.iter().cloned());
     // Reserve every id declared inside a preserved `<bpmndi:BPMNDiagram>` block:
@@ -3113,14 +3546,14 @@ fn serialize_definition(
     if let Some(d) = preserve {
         reserved_ids.extend(d.di_ids.iter().cloned());
     }
-    let errors = collect_error_ids(def);
+    let errors = collect_error_ids(def, &reserved_ids);
     let (messages, msg_lookup) = collect_messages(def);
     let signals = collect_signals(def);
     let escalations = collect_escalations(def, &reserved_ids);
 
     // Resolve a human label for every element: an operator-set name wins, else a readable label
     // derived from the id (so an authored node like `FraudScreen` shows as "Fraud Screen").
-    let mut labels: HashMap<String, String> = HashMap::new();
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
     for id in def.elements.keys() {
         let label = overrides
             .get(id)
@@ -3137,7 +3570,7 @@ fn serialize_definition(
     }
 
     // Group sub-process children by parent so a container emits its contents inline.
-    let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    let mut children_by_parent: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (id, el) in &def.elements {
         if let Some(parent) = &el.parent {
             children_by_parent
@@ -3177,7 +3610,9 @@ fn serialize_definition(
             out.push_str("    <bpmn:extensionElements>\n");
             out.push_str(&format!(
                 "      <zeebe:subscription correlationKey=\"={}\"/>\n",
-                xml_escape(key)
+                xml_escape(
+                    &nanobpmn_engine_core::bpmn::parse_correlation_key(key).unwrap_or_default()
+                )
             ));
             out.push_str("    </bpmn:extensionElements>\n");
             out.push_str("  </bpmn:message>\n");
@@ -3348,6 +3783,8 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
         | ElementKind::UserTask(_)
         | ElementKind::Task
         | ElementKind::CallActivity { .. }
+        // An event sub-process is a container box like an embedded sub-process.
+        | ElementKind::EventSubProcess { .. }
         | ElementKind::SubProcess { .. } => (110.0, 80.0),
         ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
@@ -3365,9 +3802,9 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
 /// (primary→0, exception→+H, escalation→−H, …) instead of drifting toward their predecessors.
 fn desired_row(
     id: &str,
-    preds: &HashMap<String, Vec<String>>,
-    row_of: &HashMap<String, f64>,
-    bias: Option<&HashMap<String, f64>>,
+    preds: &BTreeMap<String, Vec<String>>,
+    row_of: &BTreeMap<String, f64>,
+    bias: Option<&BTreeMap<String, f64>>,
 ) -> f64 {
     if let Some(b) = bias.and_then(|m| m.get(id).copied()) {
         return b;
@@ -3563,14 +4000,14 @@ fn append_diagram(
     def: &ProcessDefinition,
     flows: &[FlowEdge],
     out: &mut String,
-    bias: Option<&HashMap<String, f64>>,
+    bias: Option<&BTreeMap<String, f64>>,
 ) {
     let mut ids: Vec<String> = def.elements.keys().cloned().collect();
     ids.sort();
     let n = ids.len();
 
     // --- Column (rank) per node: longest path from any source, boundary pinned to its host. ---
-    let mut rank: HashMap<String, usize> = ids.iter().map(|s| (s.clone(), 0usize)).collect();
+    let mut rank: BTreeMap<String, usize> = ids.iter().map(|s| (s.clone(), 0usize)).collect();
     for _ in 0..(n + 2) {
         for id in &ids {
             if let Some(host) = def.elements[id].kind.attached_to() {
@@ -3589,7 +4026,7 @@ fn append_diagram(
     }
 
     // --- Row per (non-boundary) node, biased toward the mean of its main-flow predecessors. ---
-    let mut preds: HashMap<String, Vec<String>> = HashMap::new();
+    let mut preds: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for f in flows {
         if !is_boundary(&def.elements[&f.src].kind) {
             preds.entry(f.to.clone()).or_default().push(f.src.clone());
@@ -3600,7 +4037,7 @@ fn append_diagram(
         .filter(|id| !is_boundary(&def.elements[*id].kind))
         .collect();
     let max_rank = grid_ids.iter().map(|id| rank[*id]).max().unwrap_or(0);
-    let mut row_of: HashMap<String, f64> = HashMap::new();
+    let mut row_of: BTreeMap<String, f64> = BTreeMap::new();
     for r in 0..=max_rank {
         let mut here: Vec<String> = grid_ids
             .iter()
@@ -3633,7 +4070,7 @@ fn append_diagram(
     const OY: f64 = 100.0;
     const COL: f64 = 190.0;
     const ROW: f64 = 110.0;
-    let mut rects: HashMap<String, Rect> = HashMap::new();
+    let mut rects: BTreeMap<String, Rect> = BTreeMap::new();
     for id in &ids {
         let kind = &def.elements[id].kind;
         if is_boundary(kind) {
@@ -3774,7 +4211,7 @@ fn req_str<'a>(op: &'a Value, field: &str, op_name: &str) -> Result<&'a str, Str
 /// can correct the *operation* rather than re-typing raw XML.
 fn apply_edit_op(
     def: &mut ProcessDefinition,
-    names: &mut HashMap<String, String>,
+    names: &mut BTreeMap<String, String>,
     op: &Value,
 ) -> Result<String, String> {
     let op_name = op
@@ -3870,6 +4307,7 @@ fn apply_edit_op(
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
             if let Some(label) = &op_name_label {
@@ -3928,6 +4366,7 @@ fn apply_edit_op(
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
             if let Some(label) = &op_name_label {
@@ -4095,6 +4534,7 @@ fn apply_edit_op(
                     start_listeners: Vec::new(),
                     end_listeners: Vec::new(),
                     task_listeners: Vec::new(),
+                    properties: std::collections::BTreeMap::new(),
                 },
             );
             Ok(format!(
@@ -4128,7 +4568,7 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
 /// `write_model_ir` path so both assemble multi-phase models identically.
 pub(crate) fn assemble_model(
     defs: &[ProcessDefinition],
-    names: &HashMap<String, String>,
+    names: &BTreeMap<String, String>,
 ) -> String {
     if defs.len() == 1 {
         definition_to_xml_labeled(&defs[0], names)
@@ -4232,6 +4672,14 @@ pub fn edit_model_in(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xml_escapers_preserve_attribute_whitespace() {
+        let raw = "line1\nline2\r\n\tindented";
+        for escaped in [super::xml_escape(raw), super::xml_escape_attr(raw)] {
+            assert_eq!(escaped, "line1&#10;line2&#13;&#10;&#9;indented");
+        }
+    }
+
     use super::*;
 
     // A small loan-approval-shaped model: start -> credit-check (service) -> XOR gateway
@@ -4656,7 +5104,7 @@ mod tests {
         // The serializer synthesizes humanized `name=` diagram labels that are
         // not part of the structural model, so compare elements ignoring the
         // (display-only) `name` field.
-        let strip = |els: &std::collections::HashMap<String, Element>| {
+        let strip = |els: &std::collections::BTreeMap<String, Element>| {
             let mut m = els.clone();
             for el in m.values_mut() {
                 el.name = None;
@@ -4668,7 +5116,7 @@ mod tests {
 
     /// Serialize with no operator label overrides (humanized fallbacks only).
     fn definition_to_xml(def: &ProcessDefinition) -> String {
-        definition_to_xml_labeled(def, &HashMap::new())
+        definition_to_xml_labeled(def, &BTreeMap::new())
     }
 
     #[test]
@@ -4692,7 +5140,7 @@ mod tests {
             let xml = definition_to_xml(&def);
             assert!(xml.contains("<zeebe:taskDefinition"));
             assert!(xml.contains(expected_declaration), "{xml}");
-            let ir = crate::model_ir::definition_to_ir(&def, &HashMap::new());
+            let ir = crate::model_ir::definition_to_ir(&def, &BTreeMap::new());
             assert!(ir.contains("jobType"), "{ir}");
             let restored = crate::model_ir::ir_to_definition(&ir).unwrap();
             let xml = definition_to_xml(&restored.definition);
@@ -4850,11 +5298,67 @@ mod tests {
             }
             assert!(emitted.contains("bpmnElement=\"ToolWork\""));
             let preserved =
-                definition_to_xml_preserving_di(&original, &HashMap::new(), Some(&source));
+                definition_to_xml_preserving_di(&original, &BTreeMap::new(), Some(&source));
             let authored_di = extract_preserved_di(&source).unwrap();
             assert!(preserved.contains(&authored_di.diagram_block));
             assert_eq!(parse_bpmn(&preserved).unwrap()[0].adhoc, original.adhoc);
         }
+    }
+
+    #[test]
+    fn adhoc_catalog_leaf_tools_round_trip_zeebe_properties() {
+        // PR #1586 review: a `zeebe:properties` block on a PRUNED ad-hoc leaf
+        // tool (service task AND call activity) must survive edit/layout
+        // re-emission — the catalog retains it and the restorer re-attaches it.
+        let source = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:adHocSubProcess id="agent">
+      <bpmn:extensionElements>
+        <zeebe:agentDefinition agentType="external"/>
+        <zeebe:taskDefinition type="agent-worker"/>
+        <zeebe:adHoc outputCollection="results" outputElement="= result"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:serviceTask id="Lookup">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="lookup"/>
+          <zeebe:properties><zeebe:property name="io.camunda.tool:hint" value="svc"/></zeebe:properties>
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:callActivity id="CallSpecialist">
+        <bpmn:extensionElements>
+          <zeebe:calledElement processId="child"/>
+          <zeebe:properties><zeebe:property name="io.camunda.tool:hint" value="call"/></zeebe:properties>
+        </bpmn:extensionElements>
+      </bpmn:callActivity>
+    </bpmn:adHocSubProcess>
+    <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let original = parse_bpmn(source).expect("valid ad-hoc model").remove(0);
+        for (id, hint) in [("Lookup", "svc"), ("CallSpecialist", "call")] {
+            let tool = original.adhoc[0]
+                .tools
+                .iter()
+                .find(|t| t.element_id == id)
+                .expect("tool in the catalog");
+            assert_eq!(
+                tool.properties
+                    .get("io.camunda.tool:hint")
+                    .map(String::as_str),
+                Some(hint),
+                "catalog must retain {id}'s zeebe:properties"
+            );
+        }
+        let emitted = definition_to_xml(&original);
+        let restored = parse_bpmn(&emitted).expect("re-parse").remove(0);
+        assert_eq!(restored.adhoc, original.adhoc, "emitted:\n{emitted}");
     }
 
     #[test]
@@ -4954,7 +5458,7 @@ mod tests {
         );
         for emitted in [
             definition_to_xml(&original),
-            definition_to_xml_preserving_di(&original, &HashMap::new(), Some(&source)),
+            definition_to_xml_preserving_di(&original, &BTreeMap::new(), Some(&source)),
         ] {
             let container_extensions = emitted
                 .split("<bpmn:adHocSubProcess")
@@ -5322,6 +5826,170 @@ mod tests {
     }
 
     #[test]
+    fn definition_to_xml_round_trips_sub_process_and_esp_start_io() {
+        // Every container kind and an event sub-process's start event carry io
+        // the parser attaches; the serializer must not drop any of them.
+        use nanobpmn_engine_core::{EventSubProcessTrigger, Mapping};
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("Scoped")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .end_event("SubEnd")
+            .connect("SubStart", "SubEnd")
+            .contained_in("SubStart", "Sub")
+            .contained_in("SubEnd", "Sub")
+            .end_event("End")
+            .connect("Start", "Sub")
+            .connect("Sub", "End")
+            .event_sub_process(
+                "Esp",
+                "EspStart",
+                EventSubProcessTrigger::Signal {
+                    signal_name: "sig".to_string(),
+                },
+                true,
+            )
+            .start_event("EspStart")
+            .end_event("EspEnd")
+            .connect("EspStart", "EspEnd")
+            .contained_in("EspStart", "Esp")
+            .contained_in("EspEnd", "Esp")
+            .build()
+            .unwrap();
+        for id in ["Sub", "Esp", "EspStart"] {
+            def.elements.get_mut(id).unwrap().io.outputs.push(Mapping {
+                source: format!("= {}", id.to_lowercase()),
+                target: format!("{id}Out"),
+            });
+        }
+
+        let xml = definition_to_xml(&def);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        for id in ["Sub", "Esp", "EspStart"] {
+            assert_eq!(
+                reparsed[0].elements[id].io, def.elements[id].io,
+                "{id} io preserved on round-trip:\n{xml}"
+            );
+        }
+        assert!(matches!(
+            reparsed[0].elements["Esp"].kind,
+            ElementKind::EventSubProcess { .. }
+        ));
+    }
+
+    #[test]
+    fn definition_to_xml_preserves_bounded_start_and_boundary_cycles() {
+        // #1596: a bounded `R2/…` cycle must not widen to unbounded `R/…`
+        // on an XML round-trip, for start and boundary timers alike.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="t">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:timerEventDefinition><bpmn:timeCycle>R2/PT1M</bpmn:timeCycle></bpmn:timerEventDefinition></bpmn:startEvent>
+    <bpmn:userTask id="T"/>
+    <bpmn:boundaryEvent id="B" attachedToRef="T" cancelActivity="false"><bpmn:timerEventDefinition><bpmn:timeCycle>R3/PT5M</bpmn:timeCycle></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+    <bpmn:endEvent id="E"/>
+    <bpmn:endEvent id="BE"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="B" targetRef="BE"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = parse_bpmn(xml).expect("parses").remove(0);
+        let out = definition_to_xml(&def);
+        assert!(
+            out.contains("<bpmn:timeCycle>R2/PT1M</bpmn:timeCycle>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<bpmn:timeCycle>R3/PT5M</bpmn:timeCycle>"),
+            "{out}"
+        );
+        let reparsed = parse_bpmn(&out).expect("re-parses").remove(0);
+        for id in ["S", "B"] {
+            assert_eq!(def.elements[id].timer, reparsed.elements[id].timer, "{id}");
+            assert_eq!(def.elements[id].kind, reparsed.elements[id].kind, "{id}");
+        }
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_message_and_timer_esp_elements_exactly() {
+        // The start's event definition is derived from the container trigger;
+        // every ESP element (container + start) must survive XML -> model
+        // unchanged, for each trigger kind whose start used to be typed.
+        use nanobpmn_engine_core::{EventSubProcessTrigger, TimerDef, TimerDefKind};
+        for trigger in [
+            EventSubProcessTrigger::Message {
+                message_name: "ping".to_string(),
+                correlation_key: "key".to_string(),
+            },
+            EventSubProcessTrigger::Timer(TimerDef {
+                kind: TimerDefKind::Duration,
+                expr: "PT5M".to_string(),
+            }),
+            EventSubProcessTrigger::Timer(TimerDef {
+                kind: TimerDefKind::Date,
+                expr: "2030-01-01T00:00:00Z".to_string(),
+            }),
+            EventSubProcessTrigger::Timer(TimerDef {
+                kind: TimerDefKind::Duration,
+                expr: "= delay".to_string(),
+            }),
+        ] {
+            let def = nanobpmn_engine_core::ProcessBuilder::new("Esp")
+                .start_event("Start")
+                .end_event("End")
+                .connect("Start", "End")
+                .event_sub_process("Esp", "EspStart", trigger, false)
+                .start_event("EspStart")
+                .end_event("EspEnd")
+                .connect("EspStart", "EspEnd")
+                .contained_in("EspStart", "Esp")
+                .contained_in("EspEnd", "Esp")
+                .build()
+                .unwrap();
+            let xml = definition_to_xml(&def);
+            let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+            for id in ["Esp", "EspStart", "EspEnd"] {
+                let (a, b) = (&def.elements[id], &reparsed[0].elements[id]);
+                assert_eq!(a.kind, b.kind, "{id} kind preserved:\n{xml}");
+                assert_eq!(a.parent, b.parent, "{id} parent preserved");
+                assert_eq!(a.timer, b.timer, "{id} timer preserved");
+            }
+        }
+    }
+
+    #[test]
+    fn marked_correlation_key_emits_exactly_one_feel_marker() {
+        for key in ["key", "=key", "= key", " =  key "] {
+            let def = nanobpmn_engine_core::ProcessBuilder::new("Esp")
+                .start_event("Start")
+                .end_event("End")
+                .connect("Start", "End")
+                .event_sub_process(
+                    "Esp",
+                    "EspStart",
+                    nanobpmn_engine_core::EventSubProcessTrigger::Message {
+                        message_name: "ping".to_string(),
+                        correlation_key: key.to_string(),
+                    },
+                    false,
+                )
+                .start_event("EspStart")
+                .end_event("EspEnd")
+                .connect("EspStart", "EspEnd")
+                .contained_in("EspStart", "Esp")
+                .contained_in("EspEnd", "Esp")
+                .build()
+                .unwrap();
+            let xml = definition_to_xml(&def);
+            assert!(
+                xml.contains("correlationKey=\"=key\""),
+                "{key:?} must emit a single marker:\n{xml}"
+            );
+        }
+    }
+
+    #[test]
     fn definition_to_xml_round_trips_a_gateway_default_flow() {
         // The original motivating bug: a gateway `default` fallback was DROPPED by the serializer
         // (no `default="…"` attribute emitted), so an authored default flow silently degraded to a
@@ -5485,6 +6153,51 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
     }
 
     #[test]
+    fn definition_to_xml_round_trips_an_error_end_event() {
+        // An error end event (#1592) must round-trip: the serializer emits an
+        // `<endEvent>` carrying an `errorEventDefinition` whose `errorRef`
+        // resolves to a synthesized `<bpmn:error>` declaration, and the re-parse
+        // reproduces the exact structure (including the terminal flavour — an
+        // error end has no outgoing flow).
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Err")
+            .start_event("Start")
+            .service_task("Charge", "charge-card")
+            .error_end_event("Failed", "CARD_DECLINED")
+            .connect("Start", "Charge")
+            .connect("Charge", "Failed")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(xml.contains("<bpmn:error "), "emits an error declaration");
+        assert!(
+            xml.contains("errorEventDefinition"),
+            "emits the error event definition"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_an_unnamed_error_end_event() {
+        // An error end event with no code (an unnamed throw) emits a bare
+        // `errorEventDefinition` with no `errorRef` and no `<bpmn:error>`
+        // declaration, and round-trips.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Err")
+            .start_event("Start")
+            .error_end_event("Failed", "")
+            .connect("Start", "Failed")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:errorEventDefinition/>"),
+            "emits a bare error event definition: {xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
     fn definition_to_xml_round_trips_signal_events() {
         // A signal intermediate catch and an interrupting signal boundary on a task must
         // round-trip: the serializer synthesizes the <bpmn:signal> declaration + signalRef,
@@ -5560,6 +6273,55 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
     }
 
     #[test]
+    fn collect_error_ids_assigns_distinct_ids_to_colliding_codes() {
+        // `A.B` and `A/B` both normalize to `Error_A_B`; each code must still get
+        // its own `<bpmn:error>` id, or both throws reparse onto one code (#1592).
+        let def = nanobpmn_engine_core::ProcessBuilder::new("CollideErr")
+            .start_event("Start")
+            .parallel_gateway("Split")
+            .error_end_event("Throw1", "A.B")
+            .error_end_event("Throw2", "A/B")
+            .connect("Start", "Split")
+            .connect("Split", "Throw1")
+            .connect("Split", "Throw2")
+            .build()
+            .unwrap();
+        let reserved: std::collections::BTreeSet<String> = def.elements.keys().cloned().collect();
+        let errors = collect_error_ids(&def, &reserved);
+        assert_eq!(errors.len(), 2, "both codes get a declaration");
+        let ids: std::collections::BTreeSet<&String> = errors.values().collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "colliding codes need distinct ids: {errors:?}"
+        );
+        let xml = definition_to_xml(&def);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        for (id, code) in [("Throw1", "A.B"), ("Throw2", "A/B")] {
+            match &reparsed[0].elements[id].kind {
+                ElementKind::ErrorEndEvent { error_code } => assert_eq!(error_code, code),
+                other => panic!("{id}: expected ErrorEndEvent, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn collect_error_ids_reserves_model_ids() {
+        // A model element literally named `Error_OOPS` must not be shadowed.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("ReserveErr")
+            .start_event("Error_OOPS")
+            .error_end_event("Throw", "OOPS")
+            .connect("Error_OOPS", "Throw")
+            .build()
+            .unwrap();
+        let reserved: std::collections::BTreeSet<String> = def.elements.keys().cloned().collect();
+        let errors = collect_error_ids(&def, &reserved);
+        assert_ne!(errors["OOPS"], "Error_OOPS");
+        let xml = definition_to_xml(&def);
+        parse_bpmn(&xml).expect("serialized model re-parses");
+    }
+
+    #[test]
     fn collect_escalations_assigns_distinct_ids_to_colliding_codes() {
         // `id_fragment` is not injective: distinct escalation codes can normalize
         // to the same fragment (e.g. `A/B` and `A_B` both sanitize to `A_B`).
@@ -5584,10 +6346,10 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("Sub", "Done")
             .build()
             .unwrap();
-        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let reserved: std::collections::BTreeSet<String> = def.elements.keys().cloned().collect();
         let escalations = collect_escalations(&def, &reserved);
         assert_eq!(escalations.len(), 2, "both codes get a declaration");
-        let ids: std::collections::HashSet<&String> = escalations.values().collect();
+        let ids: std::collections::BTreeSet<&String> = escalations.values().collect();
         assert_eq!(
             ids.len(),
             2,
@@ -5623,7 +6385,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("Sub", "Done")
             .build()
             .unwrap();
-        let mut reserved: std::collections::HashSet<String> =
+        let mut reserved: std::collections::BTreeSet<String> =
             def.elements.keys().cloned().collect();
         // A preserved sequence-flow id (or the process id) that happens to equal
         // the escalation base id.
@@ -5704,7 +6466,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             di_source.contains("id=\"Escalation_OVERLOAD\""),
             "the DI source carries the colliding plane id"
         );
-        let xml = definition_to_xml_preserving_di(&def, &HashMap::new(), Some(&di_source));
+        let xml = definition_to_xml_preserving_di(&def, &BTreeMap::new(), Some(&di_source));
         assert!(
             xml.contains("id=\"Escalation_OVERLOAD\""),
             "the preserved DI plane id survives verbatim, got:\n{xml}"
@@ -5815,7 +6577,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             di_source.contains("id = 'Escalation_OVERLOAD'"),
             "the DI source carries the alternate-spelling colliding plane id"
         );
-        let xml = definition_to_xml_preserving_di(&def, &HashMap::new(), Some(&di_source));
+        let xml = definition_to_xml_preserving_di(&def, &BTreeMap::new(), Some(&di_source));
         assert!(
             xml.contains("id = 'Escalation_OVERLOAD'"),
             "the preserved DI plane id survives verbatim, got:\n{xml}"
@@ -6615,7 +7377,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .into_iter()
             .next()
             .expect("one process");
-        let emitted = definition_to_xml_labeled(&def, &HashMap::new());
+        let emitted = definition_to_xml_labeled(&def, &BTreeMap::new());
         assert!(
             emitted.contains("xmlns:nano="),
             "definitions root re-declares nano namespace: {emitted}"
@@ -6644,7 +7406,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .into_iter()
             .next()
             .expect("one process");
-        let out = definition_to_xml_with_row_bias(&def, &HashMap::new(), &HashMap::new());
+        let out = definition_to_xml_with_row_bias(&def, &BTreeMap::new(), &BTreeMap::new());
         assert!(
             out.contains("<nano:cost"),
             "row-bias emit preserves nano:cost"
@@ -6654,8 +7416,93 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
 
     #[test]
     fn preserve_nano_extensions_in_is_a_no_op_when_map_is_empty() {
-        let same = preserve_nano_extensions_in("<bpmn:definitions/>".to_string(), &HashMap::new());
+        let same = preserve_nano_extensions_in("<bpmn:definitions/>".to_string(), &BTreeMap::new());
         assert_eq!(same, "<bpmn:definitions/>");
+    }
+
+    /// The MCP tool fixture's `zeebe:properties` (the `io.camunda.tool:*`
+    /// markers, #1499) must survive a BPMN → model → BPMN round trip: dropping
+    /// them would silently unregister the dynamic tool on redeploy (PR #1586
+    /// review). Regression guard for the serializer's `emit_properties`.
+    #[test]
+    fn definition_to_xml_labeled_preserves_zeebe_properties_across_round_trip() {
+        const MCP_FIXTURE: &str =
+            include_str!("../../engine-core/tests/fixtures/mcp-process-with-inputs.bpmn");
+        let def = parse_bpmn(MCP_FIXTURE)
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("one process");
+        // The fixture's start event carries the tool markers.
+        let start = &def.elements[&def.start_event];
+        assert!(
+            !start.properties.is_empty(),
+            "fixture start event carries tool properties"
+        );
+
+        let emitted = definition_to_xml_labeled(&def, &BTreeMap::new());
+        assert!(
+            emitted.contains(
+                "<zeebe:property name=\"io.camunda.tool:name\" value=\"mcp-process-with-inputs\""
+            ),
+            "tool name property survives the round trip: {emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "<zeebe:property name=\"io.camunda.tool:input_1_name\" value=\"firstName\""
+            ),
+            "input metadata survives: {emitted}"
+        );
+
+        // Re-parsing the emitted document reproduces the same properties — the
+        // round trip is lossless, not just textually similar.
+        let redef = parse_bpmn(&emitted)
+            .expect("re-parse")
+            .into_iter()
+            .next()
+            .expect("one process");
+        let re_start = &redef.elements[&redef.start_event];
+        assert_eq!(
+            re_start.properties, start.properties,
+            "properties round-trip exactly"
+        );
+    }
+
+    /// The IR round trip preserves `zeebe:properties` too (as `property`
+    /// attribute lines), so an IR edit → BPMN re-emit never strips the MCP
+    /// tool markers either.
+    #[test]
+    fn ir_round_trip_preserves_zeebe_properties() {
+        const MCP_FIXTURE: &str =
+            include_str!("../../engine-core/tests/fixtures/mcp-process-with-inputs.bpmn");
+        let def = parse_bpmn(MCP_FIXTURE)
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("one process");
+        let start_id = def.start_event.clone();
+        let expected = def.elements[&start_id].properties.clone();
+        assert!(!expected.is_empty());
+
+        let ir = crate::model_ir::definition_to_ir(&def, &BTreeMap::new());
+        assert!(
+            ir.contains("property \"io.camunda.tool:name\" \"mcp-process-with-inputs\""),
+            "IR carries the tool-name property: {ir}"
+        );
+
+        let parsed = crate::model_ir::ir_to_definition(&ir).expect("IR re-parses");
+        let redef = parsed.definition;
+        assert_eq!(
+            redef.elements[&redef.start_event].properties, expected,
+            "IR round trip preserves the properties exactly"
+        );
+
+        // And the re-lowered definition still serializes the markers to BPMN.
+        let emitted = definition_to_xml_labeled(&redef, &BTreeMap::new());
+        assert!(
+            emitted.contains("<zeebe:property name=\"io.camunda.tool:name\""),
+            "IR → BPMN re-emits the tool markers: {emitted}"
+        );
     }
 
     #[test]
@@ -6681,7 +7528,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .build()
             .expect("build");
 
-        let xml = definition_to_xml_labeled(&def, &HashMap::new());
+        let xml = definition_to_xml_labeled(&def, &BTreeMap::new());
         assert!(
             xml.contains(r#"externalReference="https://forms.example/x""#),
             "external reference is emitted:\n{xml}"
@@ -6701,5 +7548,80 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             props.external_form_reference.as_deref(),
             Some("https://forms.example/x")
         );
+    }
+
+    #[test]
+    fn form_definition_binding_attributes_round_trip_through_xml() {
+        // #1193: a user-task formDefinition's `bindingType`/`versionTag` must
+        // serialize to BPMN XML and reparse losslessly (as `linkedResource`'s
+        // already do), so a model edited through ProcessOS keeps its binding.
+        use nanobpmn_engine_core::{BindingType, ProcessBuilder, UserTaskProps};
+        let def = ProcessBuilder::new("p")
+            .start_event("s")
+            .user_task_with(
+                "review",
+                UserTaskProps {
+                    form_id: Some("review-form".into()),
+                    form_binding_type: BindingType::VersionTag,
+                    form_version_tag: Some("v2".into()),
+                    ..Default::default()
+                },
+            )
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("build");
+
+        let xml = definition_to_xml_labeled(&def, &BTreeMap::new());
+        assert!(
+            xml.contains(
+                r#"<zeebe:formDefinition formId="review-form" bindingType="versionTag" versionTag="v2"/>"#
+            ),
+            "the binding attributes are emitted:\n{xml}"
+        );
+
+        let round = &parse_bpmn(&xml).unwrap()[0];
+        let ElementKind::UserTask(props) = &round.element("review").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(props.form_id.as_deref(), Some("review-form"));
+        assert_eq!(props.form_binding_type, BindingType::VersionTag);
+        assert_eq!(props.form_version_tag.as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn form_definition_default_binding_emits_no_binding_attributes() {
+        // The default `latest` binding (and a pre-#1193 model, which carries no
+        // binding fields) must emit no `bindingType`/`versionTag`, so a
+        // round-tripped legacy model stays byte-identical.
+        use nanobpmn_engine_core::{BindingType, ProcessBuilder, UserTaskProps};
+        let def = ProcessBuilder::new("p")
+            .start_event("s")
+            .user_task_with(
+                "review",
+                UserTaskProps {
+                    form_id: Some("review-form".into()),
+                    ..Default::default()
+                },
+            )
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("build");
+
+        let xml = definition_to_xml_labeled(&def, &BTreeMap::new());
+        assert!(
+            xml.contains(r#"<zeebe:formDefinition formId="review-form"/>"#),
+            "no binding attributes on the default binding:\n{xml}"
+        );
+
+        let round = &parse_bpmn(&xml).unwrap()[0];
+        let ElementKind::UserTask(props) = &round.element("review").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(props.form_binding_type, BindingType::Latest);
+        assert_eq!(props.form_version_tag, None);
     }
 }

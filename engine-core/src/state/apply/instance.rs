@@ -1,6 +1,6 @@
 //! Instance-family appliers: process-instance lifecycle, variables, scopes and agent records.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::event::Event;
@@ -23,6 +23,61 @@ fn non_terminal_process_id(state: &State, instance_key: &Key) -> Option<String> 
         }
         _ => None,
     }
+}
+
+/// Drops the mapping-time secret provenance (#1640) of every job of
+/// `instance_key` whose variable view the write to `scope_key` can change.
+/// Provenance attests the value a trusted input mapping wrote; a later write
+/// visible to the job may replace that value (even with equal reference text
+/// from an untrusted source), so trust is revoked — fail closed: the reference
+/// text then passes through unresolved.
+///
+/// A job sees its own element-instance scope and every ancestor scope up to the
+/// root, so a write is relevant iff it targets the root (`None`, `0` or the
+/// instance key) or one of those scopes. A write to a sibling branch (e.g. a
+/// parallel task's own input mappings) cannot reach the job and keeps its
+/// trust. Jobs without provenance are skipped before any scope walk.
+fn revoke_secret_provenance(state: &mut State, instance_key: &Key, scope_key: Option<Key>) {
+    let Some(keys) = state.jobs_by_instance.get(instance_key) else {
+        return;
+    };
+    let scope = scope_key.filter(|s| *s != 0 && s != instance_key);
+    let scopes = state.instances.get(instance_key).map(|i| &i.scopes);
+    for key in keys {
+        let Some(job) = state.jobs.get_mut(key) else {
+            continue;
+        };
+        if job.secret_provenance.is_empty() {
+            continue;
+        }
+        let visible = match scope {
+            None => true,
+            Some(target) => sees_scope(scopes, job.element_instance_key, target),
+        };
+        if visible {
+            job.secret_provenance.clear();
+        }
+    }
+}
+
+/// Whether `target` is `element_instance_key` itself or one of its ancestor
+/// scopes in the instance's element-instance tree. Cycle-safe; an unknown tree
+/// answers `true` (fail closed).
+fn sees_scope(scopes: Option<&BTreeMap<Key, Key>>, element_instance_key: Key, target: Key) -> bool {
+    let Some(scopes) = scopes else {
+        return true;
+    };
+    let mut current = element_instance_key;
+    for _ in 0..=scopes.len() {
+        if current == target {
+            return true;
+        }
+        match scopes.get(&current) {
+            Some(&parent) if parent != 0 => current = parent,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Decrements a definition's in-flight instance count on a terminal transition,
@@ -76,30 +131,32 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     process_definition_key: pinned_key,
                     state: ProcessInstanceState::Active,
                     suspended_at: None,
+                    terminated_epoch: 0,
                     created_at: *created_at,
                     tags: tags.clone(),
                     business_id: business_id.clone(),
                     parent_process_instance_key: *parent_process_instance_key,
                     parent_element_instance_key: *parent_element_instance_key,
-                    active: HashMap::new(),
-                    scopes: HashMap::new(),
+                    active: BTreeMap::new(),
+                    scopes: BTreeMap::new(),
                     variables: Arc::new(variables.clone()),
-                    join_counts: HashMap::new(),
-                    join_flow_arrivals: HashMap::new(),
-                    join_instances: HashMap::new(),
+                    join_counts: BTreeMap::new(),
+                    join_flow_arrivals: BTreeMap::new(),
+                    join_instances: BTreeMap::new(),
                     parked_joins: Default::default(),
                     activating: Default::default(),
-                    gateway_routes: HashMap::new(),
+                    gateway_routes: BTreeMap::new(),
                     incidents: Vec::new(),
                     variables_spilled: false,
-                    multi_instances: HashMap::new(),
-                    adhoc_instances: HashMap::new(),
-                    scope_parents: HashMap::new(),
-                    scope_variables: HashMap::new(),
+                    multi_instances: BTreeMap::new(),
+                    adhoc_instances: BTreeMap::new(),
+                    scope_parents: BTreeMap::new(),
+                    scope_variables: BTreeMap::new(),
+                    esp_held_payloads: BTreeMap::new(),
                     compensable: Default::default(),
-                    compensation_waits: HashMap::new(),
-                    agent_instances: HashMap::new(),
-                    agent_history: HashMap::new(),
+                    compensation_waits: BTreeMap::new(),
+                    agent_instances: BTreeMap::new(),
+                    agent_history: BTreeMap::new(),
                 },
             );
         }
@@ -114,6 +171,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     map.insert(k.clone(), v.clone());
                 }
             }
+            revoke_secret_provenance(state, instance_key, None);
         }
 
         Event::ScopedVariablesUpdated {
@@ -136,6 +194,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     }
                 }
             }
+            revoke_secret_provenance(state, instance_key, Some(*scope_key));
         }
 
         Event::VariableScopeCreated {
@@ -156,6 +215,19 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.scope_parents.remove(scope_key);
                 instance.scope_variables.remove(scope_key);
+                instance.esp_held_payloads.remove(scope_key);
+            }
+        }
+
+        Event::EventSubProcessPayloadHeld {
+            instance_key,
+            scope_key,
+            variables,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .esp_held_payloads
+                    .insert(*scope_key, variables.clone());
             }
         }
 
@@ -215,7 +287,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 .get_mut(instance_key)
                 .and_then(|inst| inst.agent_history.get_mut(agent_instance_key))
             {
-                let keys: HashSet<Key> = agent_history_keys.iter().copied().collect();
+                let keys: BTreeSet<Key> = agent_history_keys.iter().copied().collect();
                 for record in log.iter_mut() {
                     // Only PENDING turns transition; a committed/discarded turn
                     // is immutable (append-only).
@@ -238,7 +310,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 .get_mut(instance_key)
                 .and_then(|inst| inst.agent_history.get_mut(agent_instance_key))
             {
-                let keys: HashSet<Key> = agent_history_keys.iter().copied().collect();
+                let keys: BTreeSet<Key> = agent_history_keys.iter().copied().collect();
                 for record in log.iter_mut() {
                     if record.commit_status == crate::agent::AgentHistoryCommitStatus::Pending
                         && keys.contains(&record.agent_history_key)
@@ -253,7 +325,33 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         // untouched (no record is created for an idempotent retry).
         Event::AgentHistoryDeduplicated { .. } => {}
 
+        // Off-heap orphan quarantine (#1574): record the replicated dedup
+        // tombstone only. Residency-independent, so every replica lands
+        // identically; no instance state is touched. The tombstone carries the
+        // loss-episode id (#1587) so a delayed duplicate of the same episode,
+        // applying after the incident was resolved and the tombstone lifted, is
+        // a deterministic no-op instead of a fresh incident.
+        Event::VariablesLostQuarantined {
+            instance_key,
+            incident_key,
+            episode,
+        } => {
+            state.variables_lost_quarantined.insert(
+                *instance_key,
+                crate::state::types::VariablesLostTombstone {
+                    incident_key: *incident_key,
+                    episode: *episode,
+                },
+            );
+        }
+
+        // A superseded orphan stamp (#1587 review) carries no state change —
+        // it only journals the replica-deterministic decision so the leader's
+        // journal re-enqueues the still-pending report. Nothing to apply.
+        Event::OrphanStampSuperseded { .. } => {}
+
         Event::ProcessInstanceCompleted { instance_key } => {
+            state.note_terminated(*instance_key);
             let terminal_pid = non_terminal_process_id(state, instance_key);
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
@@ -287,6 +385,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 instance.gateway_routes.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
+                instance.esp_held_payloads.clear();
                 // A terminal instance's variables are never read from hot state
                 // again — workers are done, the exporter projects from events,
                 // and recovery replays the journal + durable store. Drop the
@@ -295,7 +394,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // The instance shell stays resident until eviction so status
                 // queries still resolve during the read-model projection gap.
                 if !instance.variables.is_empty() {
-                    instance.variables = Arc::new(HashMap::new());
+                    instance.variables = Arc::new(BTreeMap::new());
                 }
                 instance.variables_spilled = false;
                 instance.scope_variables.clear();
@@ -342,9 +441,12 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             target_process_id,
             target_process_definition_key,
             element_mappings,
+            join_scoped,
+            compensation_subscriptions,
+            compensation_migrated,
             ..
         } => {
-            let remap: HashMap<&str, &str> = element_mappings
+            let remap: BTreeMap<&str, &str> = element_mappings
                 .iter()
                 .map(|(s, t)| (s.as_str(), t.as_str()))
                 .collect();
@@ -363,7 +465,10 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 | MessageSubscriptionKind::NonInterruptingBoundary {
                     boundary_element_id,
                 } => remap_id(boundary_element_id),
-                _ => {}
+                MessageSubscriptionKind::EventSubProcess { esp_element_id, .. } => {
+                    remap_id(esp_element_id)
+                }
+                MessageSubscriptionKind::IntermediateCatch => {}
             };
 
             // Move the live-instance count from the source process id to the
@@ -372,7 +477,93 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 .instances
                 .get(instance_key)
                 .map(|i| i.process_id.clone());
+            // Multi-instance bodies and ad-hoc containers (#1630) adopt the
+            // target element's loop / `zeebe:adHoc` wiring, as Zeebe reads it
+            // from the target definition after migration. The evaluated input
+            // collection, spawned children and collected outputs are runtime
+            // state and are kept. Resolved before borrowing the instance.
+            let target_def = state
+                .process_by_key(*target_process_definition_key)
+                .map(|d| d.definition.clone());
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                for mi in instance.multi_instances.values_mut() {
+                    remap_id(&mut mi.element_id);
+                    if let Some(spec) = target_def
+                        .as_ref()
+                        .and_then(|d| d.element(&mi.element_id))
+                        .and_then(|e| e.multi_instance.as_ref())
+                    {
+                        mi.input_element = spec.input_element.clone();
+                        mi.output_collection = spec.output_collection.clone();
+                        mi.output_element = spec.output_element.clone();
+                        mi.completion_condition = spec.completion_condition.clone();
+                        mi.cancel_remaining_instances = spec.cancel_remaining_instances;
+                    }
+                }
+                for adhoc in instance.adhoc_instances.values_mut() {
+                    remap_id(&mut adhoc.element_id);
+                    if let Some(spec) = target_def
+                        .as_ref()
+                        .and_then(|d| d.adhoc.iter().find(|a| a.container_id == adhoc.element_id))
+                    {
+                        adhoc.output_collection = spec.output_collection.clone();
+                        adhoc.output_element = spec.output_element.clone();
+                    }
+                }
+            }
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                // Compensation (#1631): re-point every subscription the
+                // migration planned, delete the rest (their compensation
+                // boundary was unmapped, Zeebe parity), and re-point in-flight
+                // throws at their mapped throw / handler elements. A legacy
+                // record never carried compensation state (it was rejected).
+                if *compensation_migrated {
+                    // One plan entry per subscription occurrence, keyed by
+                    // (element instance, element, source handler, source boundary id);
+                    // duplicates
+                    // (boundaries sharing a handler) are consumed one each.
+                    let mut plan: BTreeMap<
+                        (Key, &str, &str, &str),
+                        std::collections::VecDeque<&crate::event::MigratedCompensationSubscription>,
+                    > = BTreeMap::new();
+                    for c in compensation_subscriptions {
+                        plan.entry((
+                            c.source_element_instance_key,
+                            c.source_element_id.as_str(),
+                            c.source_handler.as_str(),
+                            c.source_boundary_id.as_str(),
+                        ))
+                        .or_default()
+                        .push_back(c);
+                    }
+                    let mut migrated = Vec::new();
+                    for c in instance.compensable.iter() {
+                        let m = plan
+                            .get_mut(&(
+                                c.element_instance_key,
+                                c.element_id.as_str(),
+                                c.handler.as_str(),
+                                c.boundary_id.as_str(),
+                            ))
+                            .and_then(|q| q.pop_front());
+                        if let Some(m) = m {
+                            let mut c = c.clone();
+                            c.element_id = m.target_element_id.clone();
+                            if !c.scope_subscription {
+                                c.handler = m.target_handler.clone();
+                                c.boundary_id = m.target_boundary_id.clone();
+                            }
+                            migrated.push(c);
+                        }
+                    }
+                    instance.compensable = migrated.into();
+                    for wait in instance.compensation_waits.values_mut() {
+                        remap_id(&mut wait.throw_element_id);
+                        for handler in &mut wait.pending_handlers {
+                            remap_id(handler);
+                        }
+                    }
+                }
                 instance.process_id = target_process_id.clone();
                 // Re-pin the instance to the target definition's version so
                 // `definition_for` resolves execution against the migrated-to
@@ -381,18 +572,18 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 for element_id in instance.active.values_mut() {
                     remap_id(element_id);
                 }
-                // Both parallel-join maps are keyed by the join gateway's element
-                // id, so they must be remapped together to stay in sync (a stale
+                // The join maps are keyed by the join gateway's element id in
+                // its flow-scope instance (#1580; migration keeps element
+                // instance keys, so only the element id is remapped), so they must be remapped together to stay in sync (a stale
                 // `join_instances` key would make `join_eik` miss after migration
                 // and re-open an already-open join). `collect()` would silently
                 // drop entries if two source ids collapse onto one target id, so
                 // merge deterministically instead: sum the arrival counts, and
                 // keep the smallest element-instance key for the open join.
                 if !instance.join_counts.is_empty() {
-                    let mut remapped: HashMap<ElementId, usize> =
-                        HashMap::with_capacity(instance.join_counts.len());
-                    for (mut eid, count) in instance.join_counts.drain() {
-                        remap_id(&mut eid);
+                    let mut remapped: BTreeMap<JoinKey, usize> = BTreeMap::new();
+                    for (mut eid, count) in std::mem::take(&mut instance.join_counts) {
+                        remap_id(&mut eid.element_id);
                         *remapped.entry(eid).or_insert(0) += count;
                     }
                     instance.join_counts = remapped;
@@ -401,10 +592,10 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // source element, so both ids are remapped (the migration guard
                 // has already checked every flow exists in the target).
                 if !instance.join_flow_arrivals.is_empty() {
-                    let mut remapped: HashMap<ElementId, FlowArrivals> =
-                        HashMap::with_capacity(instance.join_flow_arrivals.len());
-                    for (mut eid, mut arrivals) in instance.join_flow_arrivals.drain() {
-                        remap_id(&mut eid);
+                    let mut remapped: BTreeMap<JoinKey, FlowArrivals> = BTreeMap::new();
+                    for (mut eid, mut arrivals) in std::mem::take(&mut instance.join_flow_arrivals)
+                    {
+                        remap_id(&mut eid.element_id);
                         arrivals.remap(remap_id);
                         let merged = remapped.entry(eid).or_default();
                         for (flow, count) in arrivals.iter() {
@@ -414,10 +605,9 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     instance.join_flow_arrivals = remapped;
                 }
                 if !instance.join_instances.is_empty() {
-                    let mut remapped: HashMap<ElementId, Key> =
-                        HashMap::with_capacity(instance.join_instances.len());
-                    for (mut eid, eik) in instance.join_instances.drain() {
-                        remap_id(&mut eid);
+                    let mut remapped: BTreeMap<JoinKey, Key> = BTreeMap::new();
+                    for (mut eid, eik) in std::mem::take(&mut instance.join_instances) {
+                        remap_id(&mut eid.element_id);
                         remapped
                             .entry(eid)
                             .and_modify(|existing| {
@@ -428,6 +618,20 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                             .or_insert(eik);
                     }
                     instance.join_instances = remapped;
+                }
+                // A legacy (pre-#1580) migration merged joins element-wide,
+                // across flow-scope instances: replay that merge.
+                if !*join_scoped {
+                    let mut elements: Vec<ElementId> = instance
+                        .join_keys()
+                        .into_iter()
+                        .map(|k| k.element_id)
+                        .collect();
+                    elements.sort();
+                    elements.dedup();
+                    for element_id in elements {
+                        instance.collapse_legacy_join(&element_id);
+                    }
                 }
             }
             if source_process_id.as_deref() != Some(target_process_id.as_str()) {
@@ -461,6 +665,9 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                         | TimerKind::NonInterruptingBoundary {
                             boundary_element_id,
                         } => remap_id(boundary_element_id),
+                        TimerKind::EventSubProcess { esp_element_id, .. } => {
+                            remap_id(esp_element_id)
+                        }
                         TimerKind::IntermediateCatch => {}
                     }
                 }
@@ -486,6 +693,42 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             for incident in state.incidents.values_mut() {
                 if incident.instance_key == *instance_key {
                     remap_id(&mut incident.element_id);
+                    // A pending ad-hoc tool retry names the tool inside its
+                    // redrive descriptor (#1630 review): re-point it with the
+                    // same mapping so resolving the incident after a tool rename
+                    // re-activates the renamed tool instead of falling through
+                    // on the unknown source id.
+                    match &mut incident.redrive {
+                        Some(crate::state::IoMappingRedrive::AdHocToolActivation {
+                            element_id,
+                            ..
+                        })
+                        | Some(crate::state::IoMappingRedrive::AdHocToolJobType {
+                            element_id,
+                            ..
+                        }) => remap_id(element_id),
+                        _ => {}
+                    }
+                    // A pending cycle re-arm retry names its boundary / ESP
+                    // trigger inside the redrive descriptor (#1596 review):
+                    // re-point it with the same mapping so resolving the
+                    // incident after migration looks up the renamed element.
+                    if let Some(crate::state::IoMappingRedrive::TimerCycleRearm { kind, .. }) =
+                        &mut incident.redrive
+                    {
+                        match kind {
+                            TimerKind::InterruptingBoundary {
+                                boundary_element_id,
+                            }
+                            | TimerKind::NonInterruptingBoundary {
+                                boundary_element_id,
+                            } => remap_id(boundary_element_id),
+                            TimerKind::EventSubProcess { esp_element_id, .. } => {
+                                remap_id(esp_element_id)
+                            }
+                            TimerKind::IntermediateCatch => {}
+                        }
+                    }
                 }
             }
             // The scope tree (`scopes` / `scope_parents` / `scope_variables`)
@@ -498,6 +741,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
+            state.note_terminated(*instance_key);
             let terminal_pid = non_terminal_process_id(state, instance_key);
             // Close any incident still active on the instance: with the instance
             // gone the parked tokens are gone too, so `hasIncident` must clear.
@@ -544,10 +788,11 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 instance.gateway_routes.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
+                instance.esp_held_payloads.clear();
                 // Drop the variable payload on the terminal transition — see
                 // `ProcessInstanceCompleted` above (ADR 0012).
                 if !instance.variables.is_empty() {
-                    instance.variables = Arc::new(HashMap::new());
+                    instance.variables = Arc::new(BTreeMap::new());
                 }
                 instance.variables_spilled = false;
                 instance.scope_variables.clear();

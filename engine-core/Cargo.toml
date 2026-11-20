@@ -20,8 +20,18 @@ serde = { version = "1", optional = true, features = ["derive", "rc"] }
 # persistence/replay). It backs the canonical `form_id_of` helper so the server
 # and the wasm entry point derive a form's identity from one source of truth
 # rather than duplicating the parse rule. The default, feature-off build stays
-# dependency-free (std-only).
-serde_json = { version = "1", optional = true }
+# dependency-free (std-only). `raw_value` lets `decode_record_json` borrow the
+# envelope's `event` payload and hand it straight to `decode_event_json` without
+# materializing a full JSON DOM per journal line (#1556 review).
+serde_json = { version = "1", optional = true, features = ["raw_value"] }
+
+# Pure-Rust libm (#1663, ADR 0066 audit #7): FEEL float transcendentals
+# (`log`, `exp`, `**`, decimal scaling) route through this instead of the
+# platform libm, which can differ by one ulp across OS/arch (glibc vs Apple
+# libm) and make Raft replicas diverge. Pinned exactly so a crate bump cannot
+# silently change results; `tests/feel_libm_golden.rs` guards the bits.
+# Zero dependencies, `no_std`, so the embeddable/wasm build is unaffected.
+libm = "=0.2.16"
 
 [dev-dependencies]
 # Used by the golden serde-drift guard test (`tests/golden_serde_drift.rs`,
@@ -67,3 +77,22 @@ warnings = "deny"
 # `clippy.toml` (`allow-unwrap-in-tests` / `allow-expect-in-tests`).
 unwrap_used = "deny"
 expect_used = "deny"
+
+[[example]]
+name = "replication_size"
+required-features = ["serde"]
+
+[[example]]
+name = "divergence_digest"
+required-features = ["serde"]
+
+# Determinism CI (ADR 0066 slice 6, #1665): the command-corpus generator and
+# the corpus runner `scripts/determinism-ci.sh` drives across seeds, restarts,
+# profiles, platforms and the previous release.
+[[example]]
+name = "determinism_corpus"
+required-features = ["serde"]
+
+[[example]]
+name = "determinism_replay"
+required-features = ["serde"]

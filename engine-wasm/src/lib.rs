@@ -12,7 +12,7 @@
 //!   * Execution mutators return a [`Snapshot`] for rendering; agent CREATE/UPDATE
 //!     return their canonical REST result with `createdHistory`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nanobpmn_engine_core::{
     bpmn::parse_bpmn, form_id_of, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult,
@@ -107,7 +107,7 @@ pub struct TestEngine {
 /// decision instances.
 #[derive(Default)]
 struct HistoryAggregates {
-    completed_counts: HashMap<String, u64>,
+    completed_counts: BTreeMap<String, u64>,
     taken_flows: std::collections::BTreeSet<(String, String)>,
     decisions: Vec<DecisionInstanceDto>,
 }
@@ -321,6 +321,9 @@ impl TestEngine {
             id: id.clone(),
             resource_name: resource_name.clone(),
             schema: schema.to_string(),
+            // The form-js document's optional `versionTag` is matched by a
+            // `versionTag`-bound user-task form (#1193).
+            version_tag: nanobpmn_engine_core::form_version_tag_of(schema),
         }]))
         .map_err(|e| js_err(&format!("deploy error: {e}")))?;
         // Resolve from post-apply state rather than the emitted events: an
@@ -367,6 +370,10 @@ impl TestEngine {
             resource_id: resource_name.to_string(),
             resource_name: resource_name.to_string(),
             content: content.to_string(),
+            // The wasm deploy entry point carries no `versionTag` metadata
+            // yet, so a generic resource deploys untagged (#1193 wires the
+            // engine-side tag storage a future parameter populates).
+            version_tag: None,
         }]))
         .map_err(|e| js_err(&format!("deploy error: {e}")))?;
         // Resolve from post-apply state rather than the emitted events: an
@@ -625,6 +632,7 @@ impl TestEngine {
             lease_token,
             retries,
             error_message: message.to_string(),
+            retry_back_off: 0,
         })
         .map_err(|e| js_err(&format!("fail error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -795,7 +803,7 @@ impl TestEngine {
             attribution: None,
             error_code: error_code.to_string(),
             error_message: error_message.to_string(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             lease_token,
         })
         .map_err(|e| js_err(&format!("throw error: {e}")))?;
@@ -818,7 +826,6 @@ impl TestEngine {
             job_key: key,
             retries,
             lease_token,
-            operation_reference: None,
         })
         .map_err(|e| js_err(&format!("update retries error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -838,7 +845,6 @@ impl TestEngine {
             job_key: parse_key(job_key)?,
             timeout,
             lease_token,
-            operation_reference: None,
         })
         .map_err(|e| js_err(&format!("update timeout error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -852,11 +858,8 @@ impl TestEngine {
     pub fn resolve_incident(&mut self, incident_key: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
         let key = parse_key(incident_key)?;
-        self.apply(Command::ResolveIncident {
-            incident_key: key,
-            operation_reference: None,
-        })
-        .map_err(|e| js_err(&format!("resolve incident error: {e}")))?;
+        self.apply(Command::ResolveIncident { incident_key: key })
+            .map_err(|e| js_err(&format!("resolve incident error: {e}")))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -2354,7 +2357,7 @@ impl TestEngine {
     fn evaluate_decision_json(
         &mut self,
         decision_id: &str,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     ) -> Result<serde_json::Value, String> {
         let events = self
             .apply(Command::EvaluateDecision {
@@ -2477,7 +2480,7 @@ impl TestEngine {
             })
             .collect();
         tokens.sort_by(|a, b| cmp_key(&a.0, &b.0));
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::BTreeSet::new();
         tokens
             .into_iter()
             .filter_map(|(_, id)| seen.insert(id.clone()).then_some(id))
@@ -2544,7 +2547,7 @@ impl TestEngine {
         ids: &[String],
         events: &[Event],
     ) -> Result<Vec<serde_json::Value>, JsValue> {
-        let mut created: std::collections::HashSet<_> = events
+        let mut created: std::collections::BTreeSet<_> = events
             .iter()
             .filter_map(|event| match event {
                 Event::AgentHistoryCreated { record, .. } => Some(record.agent_history_key),
@@ -2746,7 +2749,7 @@ impl TestEngine {
         // current live token count (from instance active elements); `completed`
         // and `incidents` are cumulative counts. `completed` comes from the
         // incrementally-maintained history aggregate (no per-poll log scan).
-        let mut stats: HashMap<String, ElementStat> = HashMap::new();
+        let mut stats: BTreeMap<String, ElementStat> = BTreeMap::new();
         for inst in &instances {
             for el in &inst.active_elements {
                 stats.entry(el.element_id.clone()).or_default().active += 1;
@@ -3015,6 +3018,7 @@ fn subscription_kind_tag(kind: &MessageSubscriptionKind) -> &'static str {
         MessageSubscriptionKind::IntermediateCatch => "intermediateCatch",
         MessageSubscriptionKind::InterruptingBoundary { .. } => "interruptingBoundary",
         MessageSubscriptionKind::NonInterruptingBoundary { .. } => "nonInterruptingBoundary",
+        MessageSubscriptionKind::EventSubProcess { .. } => "eventSubProcess",
     }
 }
 
@@ -3647,7 +3651,7 @@ fn parse_activate_instructions(s: &str) -> Result<Vec<ActivateElementInstruction
             }
         };
         let variables = match map.get("variables") {
-            None | Some(serde_json::Value::Null) => HashMap::new(),
+            None | Some(serde_json::Value::Null) => BTreeMap::new(),
             Some(serde_json::Value::Object(vars)) => vars
                 .iter()
                 .map(|(k, v)| (k.clone(), json_to_value(v)))
@@ -3701,7 +3705,7 @@ fn parse_adhoc_result(s: &str) -> Result<AdHocJobResult, JsValue> {
                     }
                 };
                 let variables = match obj.get("variables") {
-                    None | Some(serde_json::Value::Null) => HashMap::new(),
+                    None | Some(serde_json::Value::Null) => BTreeMap::new(),
                     Some(serde_json::Value::Object(vars)) => vars
                         .iter()
                         .map(|(k, v)| (k.clone(), json_to_value(v)))
@@ -3805,10 +3809,10 @@ fn parse_mapping_instructions(s: &str) -> Result<Vec<(String, String)>, JsValue>
 }
 
 /// Parse a JSON object string into engine variables. Empty/whitespace ⇒ none.
-fn parse_vars(s: &str) -> Result<HashMap<String, Value>, JsValue> {
+fn parse_vars(s: &str) -> Result<BTreeMap<String, Value>, JsValue> {
     let t = s.trim();
     if t.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(BTreeMap::new());
     }
     let json: serde_json::Value =
         serde_json::from_str(t).map_err(|e| js_err(&format!("invalid variables JSON: {e}")))?;
@@ -3927,7 +3931,7 @@ fn parse_user_task_changeset(s: &str) -> Result<UserTaskChangeset, JsValue> {
 }
 
 /// Convert engine variables to a natural JSON object (not the tagged enum form).
-fn vars_to_json(vars: &HashMap<String, Value>) -> serde_json::Value {
+fn vars_to_json(vars: &BTreeMap<String, Value>) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     let mut keys: Vec<&String> = vars.keys().collect();
     keys.sort();
@@ -3958,26 +3962,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 }
 
 fn json_to_value(v: &serde_json::Value) -> Value {
-    match v {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Int(i)
-            } else if let Some(u) = n.as_u64() {
-                Value::Int(u as i64)
-            } else {
-                Value::Double(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        serde_json::Value::String(s) => Value::Str(s.clone()),
-        serde_json::Value::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
-        serde_json::Value::Object(map) => Value::Map(
-            map.iter()
-                .map(|(k, v)| (k.clone(), json_to_value(v)))
-                .collect(),
-        ),
-    }
+    nanobpmn_engine_core::value_from_json(v)
 }
 
 #[cfg(test)]
@@ -5256,6 +5241,7 @@ mod read_channel_tests {
                 id: "greeting".into(),
                 resource_name: "greeting.form".into(),
                 schema: r#"{"components":[],"v":1}"#.into(),
+                version_tag: None,
             }]))
             .expect("deploy form v1");
         let v1_key = form_key_of(&v1);
@@ -5264,6 +5250,7 @@ mod read_channel_tests {
                 id: "greeting".into(),
                 resource_name: "greeting.form".into(),
                 schema: r#"{"components":[],"v":2}"#.into(),
+                version_tag: None,
             }]))
             .expect("deploy form v2");
         let v2_key = form_key_of(&v2);

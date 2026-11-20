@@ -13,18 +13,22 @@
     clippy::expect_used,
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
-use std::collections::HashMap;
+#![allow(
+    clippy::disallowed_methods,
+    reason = "non-production target: the apply-path purity lint (#1663) does not govern test/example harness I/O"
+)]
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use nanobpmn_engine_core::{Command, Engine, Event, ProcessBuilder, Value};
 
-fn build_payload(size_kb: usize) -> HashMap<String, Value> {
+fn build_payload(size_kb: usize) -> BTreeMap<String, Value> {
     let mut s = String::with_capacity(size_kb * 1024);
     while s.len() < size_kb * 1024 {
         s.push_str("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
     }
     s.truncate(size_kb * 1024);
-    let mut m = HashMap::new();
+    let mut m = BTreeMap::new();
     if size_kb > 0 {
         m.insert("data".to_string(), Value::Str(s));
     }
@@ -108,7 +112,7 @@ fn run(label: &str, payload_kb: usize, iters: usize) {
     );
 }
 
-fn lifecycle(engine: &mut Engine, payload: &HashMap<String, Value>) {
+fn lifecycle(engine: &mut Engine, payload: &BTreeMap<String, Value>) {
     let events = engine
         .apply_command_at(
             Command::create_instance_with("bench", payload.clone()),

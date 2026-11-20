@@ -3,7 +3,7 @@
 //! A [`Command`] expresses *intent*. The engine decides whether and how to honour
 //! it, emitting [`crate::Event`]s. Commands never mutate state directly.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::model::{
     AdHocActivateElement, AdHocJobResult, ElementId, ProcessDefinition, TaskListenerJobResult,
@@ -90,6 +90,18 @@ pub enum Command {
     /// does not execute generic resources; it stores them verbatim so they can be
     /// served by `GetResourceByKey` / searched by `resourceId`.
     DeployGenericResources(Vec<GenericResource>),
+    /// Atomically register one mixed deployment — processes, DRGs, forms and
+    /// generic resources submitted together (one REST `POST /deployments`) —
+    /// under ONE shared deployment key (#1193). `bindingType: deployment`
+    /// lookups (user-task forms, linked resources) resolve by exact
+    /// deployment membership, so co-deployed resources must share the key;
+    /// splitting a deployment into per-kind commands would mint one key per
+    /// kind and strand every co-deployed binding. Duplicate semantics follow
+    /// Zeebe: if EVERY resource is identical to its latest version the
+    /// deployment is a no-op (each keeps its existing identity); otherwise
+    /// every resource — unchanged ones included — is re-versioned under the new
+    /// deployment key, so the whole bundle stays mutually resolvable.
+    DeployBundle(DeploymentBundle),
     /// Mark a decision instance (all rows sharing a `decision_evaluation_key`) for
     /// deletion in the read model. `instance_key` is the owning process instance
     /// (`0` for a standalone evaluation), carried so the emitted
@@ -99,6 +111,42 @@ pub enum Command {
     DeleteDecisionInstance {
         instance_key: Key,
         decision_evaluation_key: Key,
+    },
+    /// Create a **cluster variable** (#1657; Zeebe `ClusterVariableIntent.CREATE`).
+    /// `tenant_id` `None` is the global scope. Rejected with
+    /// [`crate::EngineError::ClusterVariableAlreadyExists`] when one already
+    /// exists for `(tenant_id, name)` — unless `distributed`, which marks a
+    /// fan-out copy of a create/update already validated on the authoritative
+    /// partition: it then upserts the full record (value, kind, metadata),
+    /// preserving an existing id — idempotent under re-delivery, and a
+    /// partition that missed an earlier copy converges.
+    CreateClusterVariable {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        kind: crate::cluster_vars::ClusterVariableKind,
+        metadata: std::collections::BTreeMap<String, Value>,
+        distributed: bool,
+    },
+    /// Replace an existing cluster variable's value and metadata (its id and
+    /// kind are preserved). Rejected with
+    /// [`crate::EngineError::ClusterVariableNotFound`] when absent. Only ever
+    /// processed on the authoritative partition: the fan-out to the other
+    /// partitions carries the resulting full record as a `distributed`
+    /// [`Command::CreateClusterVariable`] upsert.
+    UpdateClusterVariable {
+        tenant_id: Option<String>,
+        name: String,
+        value: Value,
+        metadata: std::collections::BTreeMap<String, Value>,
+    },
+    /// Delete a cluster variable. Rejected with
+    /// [`crate::EngineError::ClusterVariableNotFound`] when absent — unless
+    /// `distributed` (a fan-out copy), which is then an idempotent no-op.
+    DeleteClusterVariable {
+        tenant_id: Option<String>,
+        name: String,
+        distributed: bool,
     },
     /// Evaluate a deployed decision on demand — the standalone EvaluateDecision
     /// API (Zeebe `DecisionEvaluation:EVALUATE`). Resolves the decision, evaluates
@@ -110,14 +158,14 @@ pub enum Command {
     /// [`crate::EngineError::DecisionNotFound`].
     EvaluateDecision {
         decision: DecisionReference,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
     /// Start a new instance of a previously deployed process, seeding it with the
     /// given variables (used by exclusive-gateway conditions), optional tags, and
     /// an optional business id.
     CreateInstance {
         process_id: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         /// Selects an exact process **definition version** by its unique key.
@@ -149,7 +197,7 @@ pub enum Command {
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         lease_token: Option<String>,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         /// Optional agentic result for a JOB_WORKER ad-hoc sub-process container
         /// job (Camunda `JobResult`). `None` for every ordinary completion, and
         /// skipped on the wire so plain completions are byte-unchanged. Plumbed
@@ -214,7 +262,7 @@ pub enum Command {
     /// before the parked token resumes. The task must be in the `Created` state.
     CompleteUserTask {
         user_task_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     },
     /// Activate up to `max_jobs` activatable jobs of `job_type` for `worker`,
     /// locking each until `now + timeout`. `now` is a caller-supplied logical
@@ -280,6 +328,13 @@ pub enum Command {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        /// Camunda 8 v2 `retryBackOff` (ms, #933): with retries left, the job is
+        /// not re-activatable before `now + retry_back_off`. `0` (the default,
+        /// and any negative request clamped to it) means retryable immediately;
+        /// ignored when no retries remain (the job parks with an incident).
+        /// Skipped when `0`, so commands without a backoff stay byte-identical.
+        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+        retry_back_off: u64,
         /// Authoritative terminal attribution resolved by the PROPOSING leader
         /// (#963). `None` = unstamped (a legacy/locally-applied command: the
         /// engine falls back to the live job). `Some(..)` is authoritative on
@@ -311,9 +366,9 @@ pub enum Command {
         /// error; ignored when the error is unhandled (parks on an incident).
         #[cfg_attr(
             feature = "serde",
-            serde(default, skip_serializing_if = "HashMap::is_empty")
+            serde(default, skip_serializing_if = "BTreeMap::is_empty")
         )]
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         /// Authoritative terminal attribution resolved by the PROPOSING leader
         /// (#963). `None` = unstamped (a legacy/locally-applied command: the
         /// engine falls back to the live job). `Some(..)` is authoritative on
@@ -328,9 +383,8 @@ pub enum Command {
     },
     /// Update a job's remaining retries. Used to recover a job parked on a
     /// no-retries incident before resolving that incident. Does not by itself
-    /// unblock the job — the incident must still be resolved. `operation_reference`
-    /// is an optional caller-supplied audit correlation id, journaled on the
-    /// resulting event.
+    /// unblock the job — the incident must still be resolved. A caller audit
+    /// `operationReference` rides the generic record envelope (#1556).
     UpdateJobRetries {
         job_key: Key,
         #[cfg_attr(
@@ -339,11 +393,6 @@ pub enum Command {
         )]
         lease_token: Option<String>,
         retries: i32,
-        #[cfg_attr(
-            feature = "serde",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
-        operation_reference: Option<i64>,
     },
     /// Reset the activation lock of a currently-activated job to `now + timeout`.
     /// Signed durations may shorten it; zero or negative values make the lock
@@ -352,9 +401,8 @@ pub enum Command {
     /// legitimately holding a long-running job open past its original lock:
     /// without it the lock simply expires (`JobLockExpired`) and the job is
     /// re-activated elsewhere. Only meaningful for an `Activated` job — a job
-    /// that is not currently locked returns `JobUpdateInvalid`. `operation_reference`
-    /// is an optional caller-supplied audit correlation id, journaled on the
-    /// resulting event.
+    /// that is not currently locked returns `JobUpdateInvalid`. A caller audit
+    /// `operationReference` rides the generic record envelope (#1556).
     UpdateJobTimeout {
         job_key: Key,
         #[cfg_attr(
@@ -363,11 +411,6 @@ pub enum Command {
         )]
         lease_token: Option<String>,
         timeout: i64,
-        #[cfg_attr(
-            feature = "serde",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
-        operation_reference: Option<i64>,
     },
     /// Atomically validate and update job properties. An empty changeset still
     /// validates job state and a supplied lease token.
@@ -378,8 +421,6 @@ pub enum Command {
         #[cfg_attr(feature = "serde", serde(default))]
         timeout: Option<i64>,
         #[cfg_attr(feature = "serde", serde(default))]
-        operation_reference: Option<i64>,
-        #[cfg_attr(feature = "serde", serde(default))]
         lease_token: Option<String>,
     },
     /// Resolve an open incident by retrying the work that failed. A job-incident
@@ -387,11 +428,9 @@ pub enum Command {
     /// pool; an exclusive-gateway incident re-evaluates the gateway against the
     /// current variables; an uncaught-error incident re-creates the service-task
     /// job. If the retry fails again a fresh incident is raised. The resolved
-    /// record is retained for audit, tagged with `operation_reference` if given.
-    ResolveIncident {
-        incident_key: Key,
-        operation_reference: Option<i64>,
-    },
+    /// record is retained for audit, tagged with the command's generic
+    /// `operationReference` (#1556) if given.
+    ResolveIncident { incident_key: Key },
     /// Merge variables into a scope, typically to correct data before resolving
     /// an incident. `scope_key` may be a process instance key or an element
     /// instance key; it resolves to the owning instance's variable scope. When
@@ -401,7 +440,7 @@ pub enum Command {
     /// `SetVariables` semantics.
     SetVariables {
         scope_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         local: bool,
     },
     /// Publish a message and correlate it to every open subscription whose
@@ -414,7 +453,7 @@ pub enum Command {
     CorrelateMessage {
         message_name: String,
         correlation_key: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         /// Camunda 8.10 `businessId`: stamped on the instance a **message start
         /// event** creates; no effect on a catch/boundary correlation. Defaulted
         /// so commands serialized before the field existed still decode.
@@ -430,7 +469,32 @@ pub enum Command {
     /// correlated instance before its token advances.
     BroadcastSignal {
         signal_name: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
+    },
+    /// Evaluate root-level **conditional start events** (#932, Zeebe
+    /// `ConditionalEvaluation:EVALUATE`, `POST /v2/conditionals/evaluation`).
+    ///
+    /// For every deployed process — the **latest** version of each process id,
+    /// or only the exact version `process_definition_key` names when set — each
+    /// process-level [`crate::ElementKind::ConditionalStartEvent`] has its FEEL
+    /// condition evaluated against `variables`; every one that evaluates to
+    /// `true` creates a new instance (seeded with `variables`) on this partition,
+    /// starting at that event. Processes and start events are visited in a
+    /// deterministic order (process id, then element id) so replay mints the
+    /// same keys. A condition that errors or yields a non-boolean is simply not
+    /// satisfied (no instance, no incident). The created instances are the
+    /// [`crate::Event::ProcessInstanceCreated`] events in the returned log; an
+    /// unknown `process_definition_key` is
+    /// [`crate::EngineError::ProcessDefinitionNotFound`].
+    EvaluateConditionalStartEvents {
+        variables: BTreeMap<String, Value>,
+        /// Restrict the evaluation to this exact definition version. `None`
+        /// evaluates the latest version of every deployed process.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        process_definition_key: Option<Key>,
     },
     /// Open the **canonical** record for a message subscription on the partition
     /// that owns its correlation key (`hash(correlation_key)`). Routed by the host
@@ -467,7 +531,7 @@ pub enum Command {
         element_instance_key: Key,
         element_id: String,
         kind: MessageSubscriptionKind,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         /// The message partition's stable delivery identity (#1497), carried
         /// from the routing [`crate::Event::RemoteMessageCorrelation`]. `0`
         /// means "no identity" (legacy): applied without dedup. Non-zero is
@@ -590,7 +654,7 @@ pub enum Command {
     DispatchStartInstance {
         process_id: String,
         start_element_id: String,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         /// The triggering message when a message start event fired (#1300):
@@ -733,7 +797,29 @@ pub enum Command {
     /// leader retry / replay), and an unknown or terminal instance is a no-op too
     /// (the orphan may have been cancelled between the quarantine note and this
     /// command landing). Additive brand-new variant — old journals never carry it.
-    QuarantineOffheapOrphan { instance_key: Key },
+    ///
+    /// **Replicated form (#1447).** Under Raft the residency-dependent rules
+    /// above are NOT replica-independent: whether an instance is resident,
+    /// terminal, or already incidented differs per replica (cold tiering,
+    /// follower retirement), so the bare command could raise the incident on
+    /// one replica and no-op on another, diverging their journals and key
+    /// counters. The partition leader therefore proposes it with a
+    /// [`OrphanIncidentStamp`] (`stamp: Some`) — the orphan kind plus the
+    /// incident metadata it resolved from ITS state — and every replica applies
+    /// a stamped command identically: it unconditionally emits exactly one
+    /// `IncidentRaised` carrying the stamp's metadata, whatever its local
+    /// residency (deduped only by the replicated tombstone). It carries no
+    /// variable payload and triggers no replica-local row repair (#1574).
+    /// Additive `#[serde(default)]` field: a journal written before #1447
+    /// decodes as `stamp: None` (the local form).
+    QuarantineOffheapOrphan {
+        instance_key: Key,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        stamp: Option<OrphanIncidentStamp>,
+    },
     /// Raise a durable [`crate::Event::IncidentRaised`]
     /// ([`crate::IncidentKind::VariablesLost`]) for a **cold** (wholly off-heap)
     /// instance whose cold row the host's storage layer found definitively
@@ -749,6 +835,103 @@ pub enum Command {
     /// active `VariablesLost` incident already names the instance. Additive
     /// brand-new variant — old journals never carry it.
     QuarantineColdOrphan { instance_key: Key },
+    /// Set this partition's lenient-completion mode (#1661, ADR 0066 slice 2):
+    /// see [`crate::state::State::lenient_completion`]. Proposed by the host
+    /// (the partition leader) through the replicated log, so every replica
+    /// flips the mode at the same log index. ONE-WAY: `lenient: true` emits
+    /// [`crate::Event::LenientCompletionSet`] (idempotent); `lenient: false` is
+    /// a no-op — lenience can never be cleared, so no replica can strand a
+    /// leader-local activation its peers never saw.
+    SetLenientCompletion { lenient: bool },
+}
+
+/// Which off-heap tier lost an orphan's payload (#1447).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OrphanKind {
+    /// A resident instance whose spilled variable row is gone: it keeps its
+    /// surviving resident variables.
+    Resident,
+    /// A cold (wholly off-heap) instance whose cold row is gone: the whole
+    /// instance is unrecoverable.
+    Cold,
+}
+
+/// The leader-resolved incident metadata a replicated
+/// [`Command::QuarantineOffheapOrphan`] carries (#1447), so every replica emits
+/// a byte-identical `IncidentRaised` whatever its local residency. Built by
+/// [`crate::Engine::orphan_incident_stamp`] on the proposing leader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OrphanIncidentStamp {
+    /// The tier that lost the payload.
+    pub kind: OrphanKind,
+    /// The incident's `element_id` (the process id when the leader had the
+    /// instance resident; empty for a cold instance whose model is lost).
+    pub element_id: String,
+    /// The incident's `reason`.
+    pub reason: String,
+    /// The leader's replicated terminal epoch
+    /// ([`crate::state::State::terminal_epoch`]) at stamp time (#1574 review).
+    /// The apply gate compares it against the applying replica's epoch and
+    /// terminal ring coverage, so a proposal committing after the ring wrapped
+    /// still decides identically on a resident and an evicted replica.
+    /// Additive: `0` (a stamp minted before this field existed) disables the
+    /// epoch check and keeps the pre-field behaviour (fail open).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub terminal_epoch: u64,
+    /// The target instance's own replicated terminal epoch
+    /// ([`crate::state::types::ProcessInstance::terminated_epoch`]) observed by
+    /// the leader at stamp time (#1574 review, review 5899722557), recovered
+    /// from the resident record OR the replicated terminal ring (so a leader
+    /// that already evicted its terminal shell still proves it). This is the
+    /// target-specific lifecycle-validity record the apply gate reads: the
+    /// bounded `recently_terminated` ring cannot distinguish "cold but LIVE"
+    /// from "terminated and evicted" once unrelated completions fill it, and the
+    /// global epoch distance counts EVERY terminal transition — so it misreads
+    /// an unrelated completion as the target's termination (suppressing a live
+    /// orphan). `> 0` means the leader observed the target already terminal at
+    /// stamp time — a stale proposal the gate no-ops, identically on every
+    /// replica. `0` = the target was live (or unprovable) at stamp time.
+    /// Additive: `0` for a stamp minted before this field existed (fail open).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub target_terminated_epoch: u64,
+    /// The replicated **loss-episode id** (#1587): the leader's replicated
+    /// allocator position at stamp time (the next key it would issue). Two
+    /// stamped copies of one detection episode carry the SAME episode id, so a
+    /// delayed duplicate applying after the episode's incident was resolved is
+    /// a deterministic no-op (it matches no live episode) instead of raising a
+    /// fresh incident — while a genuinely new loss after resolution stamps a
+    /// fresh, distinct episode id and is still reported. The id is a
+    /// *replicated* key (never wall-clock, never replica-local), so every
+    /// replica compares it identically. Unrelated key-minting work can advance
+    /// the allocator between stamping and commitment, so a position mismatch
+    /// at apply time is a SUPERSEDED stamp — re-stamped and re-proposed via
+    /// [`crate::Event::OrphanStampSuperseded`], never silently dropped (#1587
+    /// review). Additive: `0` for a stamp minted before this field existed,
+    /// which keeps the pre-#1587 (episode-blind) dedup behaviour.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero"))]
+    pub episode: u64,
+}
+
+#[cfg(feature = "serde")]
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// Every resource submitted in one deployment, registered atomically by
+/// [`Command::DeployBundle`] under a single shared deployment key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeploymentBundle {
+    /// BPMN process definitions.
+    pub processes: Vec<ProcessDefinition>,
+    /// DMN decision requirements graphs.
+    pub decisions: Vec<crate::dmn::DecisionRequirementsGraph>,
+    /// `form-js` forms.
+    pub forms: Vec<FormResource>,
+    /// Generic (stored-verbatim) resources.
+    pub resources: Vec<GenericResource>,
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
@@ -763,6 +946,11 @@ pub struct FormResource {
     pub resource_name: String,
     /// The verbatim form-js JSON document.
     pub schema: String,
+    /// The optional version tag this form version carries (form-js
+    /// `versionTag`), matched by a `versionTag`-bound user-task form (#1193).
+    /// `None` when the form declares no tag.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub version_tag: Option<String>,
 }
 
 /// Extracts the form-js document `id` from a `.form` resource's JSON — the single
@@ -778,6 +966,23 @@ pub struct FormResource {
 pub fn form_id_of(schema: &str) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
     doc.get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extracts the form-js document `versionTag` from a `.form` resource's JSON —
+/// the single canonical definition of "what counts as a form version tag"
+/// shared by every deploy boundary, mirroring [`form_id_of`]. Returns `None`
+/// when the document carries no non-empty string `versionTag` (an untagged
+/// form; Zeebe treats the tag as optional metadata matched only by a
+/// `versionTag` binding).
+///
+/// Gated behind the `serde` feature for the same reason as [`form_id_of`].
+#[cfg(feature = "serde")]
+pub fn form_version_tag_of(schema: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
+    doc.get("versionTag")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -802,6 +1007,11 @@ pub struct GenericResource {
     pub resource_name: String,
     /// The verbatim resource content.
     pub content: String,
+    /// The optional version tag this resource version carries (Zeebe
+    /// `versionTag` deploy metadata), matched by a `versionTag`-bound
+    /// `zeebe:linkedResource` (#1193). `None` when the deploy carried no tag.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub version_tag: Option<String>,
 }
 
 /// The modification instruction shapes are persisted inside
@@ -858,6 +1068,194 @@ impl Command {
         (key != 0).then_some(key)
     }
 
+    /// A replica-deterministic fingerprint of this command's identity, mixed
+    /// into the FEEL random-stream seed (#1642 / #1649 review) so two commands
+    /// planned at the same timestamp and allocator position (neither minting a
+    /// key) still derive distinct `random number()` / `uuid()` streams.
+    ///
+    /// Pure function of the command — which is itself the replicated log
+    /// entry — so live apply, full replay, snapshot+tail recovery and every
+    /// follower compute the same value with no extra persisted state. Hashes
+    /// the [`Command::kind`] plus the command's target key(s) / names with a
+    /// fixed FNV-1a (never `RandomState`, never `HashMap` iteration order).
+    /// The match is exhaustive so a new variant must decide its identity.
+    pub fn seed_fingerprint(&self) -> u64 {
+        let mut h = Fnv::new();
+        h.str(self.kind());
+        match self {
+            Command::DeployProcess(d) => h.str(&d.id),
+            Command::DeployResources(ds) => {
+                for d in ds {
+                    h.str(&d.id);
+                }
+            }
+            // Same identity as `DeployResources`: the process ids. The other
+            // resource kinds contribute nothing, matching `DeployForms` etc.
+            Command::DeployBundle(b) => {
+                for d in &b.processes {
+                    h.str(&d.id);
+                }
+            }
+            Command::DeployDecisionRequirements(_)
+            | Command::DeployForms(_)
+            | Command::DeployGenericResources(_)
+            | Command::EvaluateConditionalStartEvents { .. } => {}
+            Command::DeleteDecisionInstance {
+                instance_key,
+                decision_evaluation_key,
+            } => {
+                h.key(*instance_key);
+                h.key(*decision_evaluation_key);
+            }
+            Command::CreateClusterVariable {
+                tenant_id, name, ..
+            }
+            | Command::UpdateClusterVariable {
+                tenant_id, name, ..
+            }
+            | Command::DeleteClusterVariable {
+                tenant_id, name, ..
+            } => {
+                h.str(tenant_id.as_deref().unwrap_or(""));
+                h.str(name);
+            }
+            Command::EvaluateDecision { decision, .. } => match decision {
+                DecisionReference::Id(id) => h.str(id),
+                DecisionReference::Key(key) => h.key(*key),
+            },
+            Command::CreateInstance {
+                process_id,
+                business_id,
+                ..
+            } => {
+                h.str(process_id);
+                h.opt(business_id.as_deref());
+            }
+            Command::CompleteJob { job_key, .. }
+            | Command::FailJob { job_key, .. }
+            | Command::ThrowJobError { job_key, .. }
+            | Command::UpdateJobRetries { job_key, .. }
+            | Command::UpdateJobTimeout { job_key, .. }
+            | Command::UpdateJob { job_key, .. } => h.key(*job_key),
+            Command::AssignUserTask { user_task_key, .. }
+            | Command::UnassignUserTask { user_task_key }
+            | Command::UpdateUserTask { user_task_key, .. }
+            | Command::CompleteUserTask { user_task_key, .. } => h.key(*user_task_key),
+            Command::ActivateJobs {
+                job_type,
+                worker,
+                now,
+                ..
+            } => {
+                h.str(job_type);
+                h.str(worker);
+                h.key(*now);
+            }
+            Command::ActivateJobsByKey {
+                job_keys,
+                worker,
+                now,
+                ..
+            } => {
+                for k in job_keys {
+                    h.key(*k);
+                }
+                h.str(worker);
+                h.key(*now);
+            }
+            Command::ExpireJobs { now } | Command::TriggerTimers { now } => h.key(*now),
+            Command::ExpireJobsByDurability { now, durable } => {
+                h.key(*now);
+                h.key(u64::from(*durable));
+            }
+            Command::ResolveIncident { incident_key } => h.key(*incident_key),
+            Command::SetVariables { scope_key, .. } => h.key(*scope_key),
+            Command::CorrelateMessage {
+                message_name,
+                correlation_key,
+                business_id,
+                ..
+            } => {
+                h.str(message_name);
+                h.str(correlation_key);
+                h.opt(business_id.as_deref());
+            }
+            Command::BroadcastSignal { signal_name, .. } => h.str(signal_name),
+            Command::OpenMessageSubscription {
+                subscription_key,
+                element_instance_key,
+                ..
+            }
+            | Command::CloseMessageSubscription {
+                subscription_key,
+                element_instance_key,
+                ..
+            } => {
+                h.key(*subscription_key);
+                h.key(*element_instance_key);
+            }
+            Command::CorrelateMessageSubscription {
+                subscription_key,
+                message_key,
+                element_instance_key,
+                ..
+            } => {
+                h.key(*subscription_key);
+                h.key(*message_key);
+                h.key(*element_instance_key);
+            }
+            Command::CancelInstance { instance_key }
+            | Command::SuspendInstance { instance_key }
+            | Command::ResumeInstance { instance_key }
+            | Command::ModifyInstance { instance_key, .. }
+            | Command::QuarantineOffheapOrphan { instance_key, .. }
+            | Command::QuarantineColdOrphan { instance_key } => h.key(*instance_key),
+            Command::SetLenientCompletion { lenient } => h.str(if *lenient { "1" } else { "0" }),
+            Command::MigrateInstance {
+                instance_key,
+                target_process_definition_key,
+                ..
+            } => {
+                h.key(*instance_key);
+                h.key(*target_process_definition_key);
+            }
+            Command::DispatchStartInstance {
+                process_id,
+                start_element_id,
+                business_id,
+                delivery_key,
+                ..
+            } => {
+                h.str(process_id);
+                h.str(start_element_id);
+                h.opt(business_id.as_deref());
+                h.key(*delivery_key);
+            }
+            Command::ActivateAdHocActivities {
+                ad_hoc_instance_key,
+                ..
+            } => h.key(*ad_hoc_instance_key),
+            Command::CreateAgentInstance {
+                element_instance_key,
+                job_key,
+                ..
+            } => {
+                h.key(*element_instance_key);
+                h.key(*job_key);
+            }
+            Command::UpdateAgentInstance {
+                agent_instance_key,
+                job_key,
+                ..
+            } => {
+                h.key(*agent_instance_key);
+                h.key(*job_key);
+            }
+            Command::CompleteAgentInstance { agent_instance_key } => h.key(*agent_instance_key),
+        }
+        h.0
+    }
+
     /// A stable, allocation-free `&'static str` discriminant for this command,
     /// used as a metrics label so per-command actor cost (wall time and
     /// allocated bytes) can be attributed by kind. Kept in lockstep with the
@@ -869,7 +1267,11 @@ impl Command {
             Command::DeployDecisionRequirements(_) => "deploy_decision_requirements",
             Command::DeployForms(_) => "deploy_forms",
             Command::DeployGenericResources(_) => "deploy_generic_resources",
+            Command::DeployBundle(_) => "deploy_bundle",
             Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
+            Command::CreateClusterVariable { .. } => "create_cluster_variable",
+            Command::UpdateClusterVariable { .. } => "update_cluster_variable",
+            Command::DeleteClusterVariable { .. } => "delete_cluster_variable",
             Command::EvaluateDecision { .. } => "evaluate_decision",
             Command::CreateInstance { .. } => "create_instance",
             Command::CompleteJob { .. } => "complete_job",
@@ -891,6 +1293,7 @@ impl Command {
             Command::SetVariables { .. } => "set_variables",
             Command::CorrelateMessage { .. } => "correlate_message",
             Command::BroadcastSignal { .. } => "broadcast_signal",
+            Command::EvaluateConditionalStartEvents { .. } => "evaluate_conditional_start_events",
             Command::OpenMessageSubscription { .. } => "open_message_subscription",
             Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
@@ -906,6 +1309,7 @@ impl Command {
             Command::CompleteAgentInstance { .. } => "complete_agent_instance",
             Command::QuarantineOffheapOrphan { .. } => "quarantine_offheap_orphan",
             Command::QuarantineColdOrphan { .. } => "quarantine_cold_orphan",
+            Command::SetLenientCompletion { .. } => "set_lenient_completion",
         }
     }
 
@@ -920,7 +1324,7 @@ impl Command {
         // Small fixed overhead for keys, enum tag, and the fixed scalar fields
         // every command carries; the variable payload dominates when present.
         const BASE: u64 = 64;
-        let vars = |variables: &HashMap<String, Value>| -> u64 {
+        let vars = |variables: &BTreeMap<String, Value>| -> u64 {
             variables
                 .iter()
                 .map(|(k, v)| k.len() as u64 + v.approx_bytes())
@@ -933,6 +1337,7 @@ impl Command {
             | Command::SetVariables { variables, .. }
             | Command::CorrelateMessage { variables, .. }
             | Command::BroadcastSignal { variables, .. }
+            | Command::EvaluateConditionalStartEvents { variables, .. }
             | Command::CorrelateMessageSubscription { variables, .. }
             | Command::DispatchStartInstance { variables, .. } => vars(variables),
             Command::ModifyInstance {
@@ -1001,6 +1406,39 @@ impl Command {
                     .sum();
                 tools + history
             }
+            // Cluster-variable writes carry an arbitrary value and metadata map
+            // (#1657 review): count them so the Raft batcher's byte budget sees
+            // the real proposal size instead of the fixed base.
+            Command::CreateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                metadata,
+                ..
+            }
+            | Command::UpdateClusterVariable {
+                tenant_id,
+                name,
+                value,
+                metadata,
+            } => {
+                tenant_id.as_ref().map_or(0, |t| t.len() as u64)
+                    + name.len() as u64
+                    + value.approx_bytes()
+                    + metadata
+                        .iter()
+                        .map(|(k, v)| k.len() as u64 + v.approx_bytes())
+                        .sum::<u64>()
+            }
+            Command::DeleteClusterVariable {
+                tenant_id, name, ..
+            } => tenant_id.as_ref().map_or(0, |t| t.len() as u64) + name.len() as u64,
+            // The stamp's strings are leader-resolved metadata of unbounded
+            // length (#1574 review): count them so the batcher's byte budget
+            // sees the real proposal size.
+            Command::QuarantineOffheapOrphan {
+                stamp: Some(stamp), ..
+            } => stamp.element_id.len() as u64 + stamp.reason.len() as u64,
             _ => 0,
         };
         BASE + payload
@@ -1011,7 +1449,7 @@ impl Command {
     pub fn create_instance(process_id: impl Into<String>) -> Self {
         Command::CreateInstance {
             process_id: process_id.into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             tags: Vec::new(),
             business_id: None,
             process_definition_key: None,
@@ -1022,7 +1460,7 @@ impl Command {
     /// Convenience constructor for a `CreateInstance` with variables.
     pub fn create_instance_with(
         process_id: impl Into<String>,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     ) -> Self {
         Command::CreateInstance {
             process_id: process_id.into(),
@@ -1038,7 +1476,7 @@ impl Command {
     /// optional business id.
     pub fn create_instance_full(
         process_id: impl Into<String>,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
     ) -> Self {
@@ -1060,7 +1498,7 @@ impl Command {
     #[allow(clippy::too_many_arguments)]
     pub fn create_instance_versioned(
         process_id: impl Into<String>,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
         process_definition_key: Option<Key>,
@@ -1082,7 +1520,7 @@ impl Command {
             job_key,
             attribution: None,
             lease_token: None,
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             adhoc_result: None,
             task_listener_result: None,
             business_id: None,
@@ -1099,7 +1537,7 @@ impl Command {
             job_key,
             attribution: None,
             lease_token: None,
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             adhoc_result: None,
             task_listener_result: Some(task_listener_result),
             business_id: None,
@@ -1107,7 +1545,7 @@ impl Command {
     }
 
     /// Convenience constructor for a `CompleteJob` that sets variables.
-    pub fn complete_job_with(job_key: Key, variables: HashMap<String, Value>) -> Self {
+    pub fn complete_job_with(job_key: Key, variables: BTreeMap<String, Value>) -> Self {
         Command::CompleteJob {
             job_key,
             attribution: None,
@@ -1123,7 +1561,7 @@ impl Command {
     /// ad-hoc sub-process result (Camunda `JobResult`).
     pub fn complete_job_with_result(
         job_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         adhoc_result: AdHocJobResult,
     ) -> Self {
         Command::CompleteJob {
@@ -1163,12 +1601,12 @@ impl Command {
     pub fn complete_user_task(user_task_key: Key) -> Self {
         Command::CompleteUserTask {
             user_task_key,
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
         }
     }
 
     /// Convenience constructor for a `CompleteUserTask` that sets variables.
-    pub fn complete_user_task_with(user_task_key: Key, variables: HashMap<String, Value>) -> Self {
+    pub fn complete_user_task_with(user_task_key: Key, variables: BTreeMap<String, Value>) -> Self {
         Command::CompleteUserTask {
             user_task_key,
             variables,
@@ -1177,12 +1615,26 @@ impl Command {
 
     /// Convenience constructor for a `FailJob`.
     pub fn fail_job(job_key: Key, retries: i32, error_message: impl Into<String>) -> Self {
+        Self::fail_job_with_backoff(job_key, retries, error_message, 0)
+    }
+
+    /// Convenience constructor for a `FailJob` carrying a Camunda 8 v2
+    /// `retryBackOff` in milliseconds (#933). A negative backoff is clamped to
+    /// `0` (retryable immediately), matching Zeebe, which only defers the job
+    /// when the backoff is strictly positive.
+    pub fn fail_job_with_backoff(
+        job_key: Key,
+        retries: i32,
+        error_message: impl Into<String>,
+        retry_back_off: i64,
+    ) -> Self {
         Command::FailJob {
             job_key,
             attribution: None,
             lease_token: None,
             retries,
             error_message: error_message.into(),
+            retry_back_off: u64::try_from(retry_back_off).unwrap_or(0),
         }
     }
 
@@ -1198,7 +1650,7 @@ impl Command {
             lease_token: None,
             error_code: error_code.into(),
             error_message: error_message.into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
         }
     }
 
@@ -1208,7 +1660,7 @@ impl Command {
         job_key: Key,
         error_code: impl Into<String>,
         error_message: impl Into<String>,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     ) -> Self {
         Command::ThrowJobError {
             job_key,
@@ -1226,21 +1678,6 @@ impl Command {
             job_key,
             lease_token: None,
             retries,
-            operation_reference: None,
-        }
-    }
-
-    /// `UpdateJobRetries` tagged with a caller audit `operation_reference`.
-    pub fn update_job_retries_with_ref(
-        job_key: Key,
-        retries: i32,
-        operation_reference: Option<i64>,
-    ) -> Self {
-        Command::UpdateJobRetries {
-            job_key,
-            lease_token: None,
-            retries,
-            operation_reference,
         }
     }
 
@@ -1250,44 +1687,16 @@ impl Command {
             job_key,
             lease_token: None,
             timeout,
-            operation_reference: None,
         }
     }
 
-    /// `UpdateJobTimeout` tagged with a caller audit `operation_reference`.
-    pub fn update_job_timeout_with_ref(
-        job_key: Key,
-        timeout: i64,
-        operation_reference: Option<i64>,
-    ) -> Self {
-        Command::UpdateJobTimeout {
-            job_key,
-            lease_token: None,
-            timeout,
-            operation_reference,
-        }
-    }
-
-    /// Convenience constructor for a `ResolveIncident` with no operation
-    /// reference.
+    /// Convenience constructor for a `ResolveIncident`.
     pub fn resolve_incident(incident_key: Key) -> Self {
-        Command::ResolveIncident {
-            incident_key,
-            operation_reference: None,
-        }
-    }
-
-    /// Convenience constructor for a `ResolveIncident` tagged with an operation
-    /// reference for audit.
-    pub fn resolve_incident_with(incident_key: Key, operation_reference: i64) -> Self {
-        Command::ResolveIncident {
-            incident_key,
-            operation_reference: Some(operation_reference),
-        }
+        Command::ResolveIncident { incident_key }
     }
 
     /// Convenience constructor for a propagating (`local = false`) `SetVariables`.
-    pub fn set_variables(scope_key: Key, variables: HashMap<String, Value>) -> Self {
+    pub fn set_variables(scope_key: Key, variables: BTreeMap<String, Value>) -> Self {
         Command::SetVariables {
             scope_key,
             variables,
@@ -1298,7 +1707,7 @@ impl Command {
     /// Convenience constructor for a `SetVariables` with an explicit `local` flag.
     pub fn set_variables_scoped(
         scope_key: Key,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
         local: bool,
     ) -> Self {
         Command::SetVariables {
@@ -1425,7 +1834,7 @@ impl Command {
         Command::CorrelateMessage {
             message_name: message_name.into(),
             correlation_key: correlation_key.into(),
-            variables: HashMap::new(),
+            variables: BTreeMap::new(),
             business_id: None,
         }
     }
@@ -1435,7 +1844,7 @@ impl Command {
     pub fn correlate_message_with(
         message_name: impl Into<String>,
         correlation_key: impl Into<String>,
-        variables: HashMap<String, Value>,
+        variables: BTreeMap<String, Value>,
     ) -> Self {
         Command::CorrelateMessage {
             message_name: message_name.into(),
@@ -1489,6 +1898,39 @@ impl Command {
     }
 }
 
+/// Fixed FNV-1a 64 hasher for [`Command::seed_fingerprint`]: deterministic
+/// across processes and replicas (unlike `std`'s randomly-keyed `RandomState`).
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+    fn bytes(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= u64::from(*b);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    fn str(&mut self, s: &str) {
+        // Length-prefixed so adjacent fields cannot alias ("ab","c" vs "a","bc").
+        self.key(s.len() as u64);
+        self.bytes(s.as_bytes());
+    }
+    fn key(&mut self, k: u64) {
+        self.bytes(&k.to_le_bytes());
+    }
+    fn opt(&mut self, s: Option<&str>) {
+        match s {
+            Some(s) => {
+                self.key(1);
+                self.str(s);
+            }
+            None => self.key(0),
+        }
+    }
+}
+
 #[cfg(test)]
 mod kind_tests {
     use super::*;
@@ -1501,7 +1943,7 @@ mod kind_tests {
                 job_key: 1,
                 attribution: None,
                 lease_token: None,
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 adhoc_result: None,
                 task_listener_result: None,
                 business_id: None,
@@ -1531,7 +1973,7 @@ mod kind_tests {
         let empty = Command::create_instance("p").approx_bytes();
         // A create carrying a big string variable is dominated by that payload.
         let big = "x".repeat(50_000);
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert("p".to_string(), Value::Str(big));
         let heavy = Command::create_instance_with("p", vars).approx_bytes();
         assert!(
@@ -1543,6 +1985,72 @@ mod kind_tests {
         assert!(
             tick <= empty,
             "tick={tick} should be <= empty create={empty}"
+        );
+    }
+
+    // #1657 review: cluster-variable create/update (incl. distributed fan-out
+    // copies) and delete must count their payload, not the fixed base.
+    #[test]
+    fn approx_bytes_counts_cluster_variable_payloads() {
+        use std::collections::BTreeMap;
+        let big = "x".repeat(50_000);
+        let mut meta = BTreeMap::new();
+        meta.insert("m".to_string(), Value::Str("y".repeat(10_000)));
+        let tenant = Some("t".repeat(1_000));
+        let name = "n".repeat(1_000);
+        for distributed in [false, true] {
+            let c = Command::CreateClusterVariable {
+                tenant_id: tenant.clone(),
+                name: name.clone(),
+                value: Value::Str(big.clone()),
+                kind: crate::cluster_vars::ClusterVariableKind::default(),
+                metadata: meta.clone(),
+                distributed,
+            };
+            assert!(
+                c.approx_bytes() >= 62_000,
+                "create distributed={distributed}"
+            );
+        }
+        let u = Command::UpdateClusterVariable {
+            tenant_id: tenant.clone(),
+            name: name.clone(),
+            value: Value::Str(big),
+            metadata: meta,
+        };
+        assert!(u.approx_bytes() >= 62_000);
+        let d = Command::DeleteClusterVariable {
+            tenant_id: tenant,
+            name,
+            distributed: false,
+        };
+        assert!(d.approx_bytes() >= 2_000);
+    }
+
+    // #1574 review: a stamped orphan quarantine carries leader-resolved strings;
+    // `approx_bytes` must count them, not treat the command as fixed-size.
+    #[test]
+    fn approx_bytes_counts_the_orphan_quarantine_stamp() {
+        let bare = Command::QuarantineOffheapOrphan {
+            instance_key: 1,
+            stamp: None,
+        }
+        .approx_bytes();
+        let stamped = Command::QuarantineOffheapOrphan {
+            instance_key: 1,
+            stamp: Some(OrphanIncidentStamp {
+                kind: OrphanKind::Resident,
+                element_id: "e".repeat(10_000),
+                reason: "r".repeat(20_000),
+                terminal_epoch: 0,
+                target_terminated_epoch: 0,
+                episode: 0,
+            }),
+        }
+        .approx_bytes();
+        assert!(
+            stamped >= bare + 30_000,
+            "stamp strings must count: stamped={stamped} bare={bare}"
         );
     }
 

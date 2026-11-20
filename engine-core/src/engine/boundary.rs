@@ -32,8 +32,8 @@ impl Engine {
         &self,
         instance_key: Key,
         only_activity: Option<&str>,
-    ) -> HashMap<ElementId, Vec<(ElementId, ElementId)>> {
-        let mut wiring: HashMap<ElementId, Vec<(ElementId, ElementId)>> = HashMap::new();
+    ) -> BTreeMap<ElementId, Vec<(ElementId, ElementId)>> {
+        let mut wiring: BTreeMap<ElementId, Vec<(ElementId, ElementId)>> = BTreeMap::new();
         if let Some(process) = self.process_of_instance(instance_key) {
             for e in process.elements.values() {
                 if let ElementKind::CompensationBoundaryEvent {
@@ -121,8 +121,8 @@ impl Engine {
         // order preserved within each scope), so the recursive traversal is
         // linear in the subscription count rather than re-filtering the whole
         // `compensable` list per nested scope.
-        let mut by_scope: HashMap<Key, Vec<crate::state::CompensationSubscription>> =
-            HashMap::new();
+        let mut by_scope: BTreeMap<Key, Vec<crate::state::CompensationSubscription>> =
+            BTreeMap::new();
         if let Some(instance) = self.state.instances.get(&instance_key) {
             for c in &instance.compensable {
                 by_scope.entry(c.scope).or_default().push(c.clone());
@@ -145,8 +145,8 @@ impl Engine {
         // for the first child only (#1424 review). Within one instance, two
         // boundaries sharing a handler each journal their OWN lifecycle
         // (boundary-id order).
-        let mut consumed_wiring: HashMap<(ElementId, Key), Vec<(ElementId, ElementId)>> =
-            HashMap::new();
+        let mut consumed_wiring: BTreeMap<(ElementId, Key), Vec<(ElementId, ElementId)>> =
+            BTreeMap::new();
         // Explicit stack (no recursion) so a deeply nested scope chain cannot
         // overflow; LIFO of per-scope cursors reproduces depth-first order.
         let mut stack: Vec<(
@@ -186,10 +186,14 @@ impl Engine {
                         .cloned()
                         .unwrap_or_default()
                 });
-                let boundary = wired
-                    .iter()
-                    .position(|(_, h)| h == &target.handler)
-                    .map(|i| wired.remove(i).0);
+                // A subscription that recorded its boundary (#1635) consumes
+                // exactly that one; older records fall back to occurrence order.
+                let boundary = if target.boundary_id.is_empty() {
+                    wired.iter().position(|(_, h)| h == &target.handler)
+                } else {
+                    wired.iter().position(|(b, _)| b == &target.boundary_id)
+                }
+                .map(|i| wired.remove(i).0);
                 if let Some(boundary) = boundary {
                     boundaries.push((boundary, self.mint_key()));
                 }
@@ -228,16 +232,19 @@ impl Engine {
             return Vec::new();
         }
         let explicit: Vec<Event> = self
-            .compensation_handlers_for(instance_key, element_id)
+            .compensation_boundaries_for(instance_key, element_id)
             .into_iter()
-            .map(|handler| Event::CompensationSubscriptionCreated {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.to_string(),
-                handler,
-                scope,
-                scope_subscription: false,
-            })
+            .map(
+                |(boundary_id, handler)| Event::CompensationSubscriptionCreated {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.to_string(),
+                    handler,
+                    scope,
+                    scope_subscription: false,
+                    boundary_id,
+                },
+            )
             .collect();
         if !explicit.is_empty() {
             return explicit;
@@ -292,6 +299,7 @@ impl Engine {
                 handler: String::new(),
                 scope,
                 scope_subscription: true,
+                boundary_id: String::new(),
             })
         } else {
             None
@@ -427,112 +435,253 @@ impl Engine {
             .cloned()
     }
 
-    /// Finds the error boundary that catches `error_code` thrown from the
-    /// activity `from_element_id` (element instance `from_eik`), propagating up
-    /// enclosing sub-process scopes until one is found. Returns
-    /// `(boundary_id, caught_element_instance_key, caught_element_id)` — the
-    /// boundary event and the activity it is attached to (the throwing task
-    /// itself or an enclosing sub-process).
-    pub(crate) fn find_catching_error_boundary(
-        &self,
-        instance_key: Key,
-        from_element_id: &str,
-        from_eik: Key,
-        error_code: &str,
-    ) -> Option<(ElementId, Key, ElementId)> {
-        if let Some(boundary_id) =
-            self.find_error_boundary(instance_key, from_element_id, error_code)
-        {
-            return Some((boundary_id, from_eik, from_element_id.to_string()));
-        }
-        // Propagate up the enclosing sub-process scopes (innermost first).
-        for eik in self.ancestor_element_instances(instance_key, from_eik) {
-            let element_id = self.element_id_of_instance(instance_key, eik)?;
-            if let Some(boundary_id) =
-                self.find_error_boundary(instance_key, &element_id, error_code)
-            {
-                return Some((boundary_id, eik, element_id));
-            }
-        }
-        None
-    }
-
     /// The escalation boundary attached to `activity_id` that catches
-    /// `escalation_code`, or `None`. An **exact** code match wins over a
-    /// **catch-all** (a boundary with an empty `escalation_code`) at the same
-    /// activity (Zeebe: a specific code beats a catch-all). Among equally
-    /// specific matches the lexicographically smallest boundary id is chosen for
-    /// determinism. Returns the boundary id and whether it is interrupting.
+    /// `escalation_code` in the **exact** pass (`exact`: its code equals
+    /// `escalation_code`) or the **catch-all** pass (its code is empty, only
+    /// for a non-empty thrown code — an empty thrown code already matched the
+    /// catch-alls exactly). Among equal matches the lexicographically smallest
+    /// boundary id wins for determinism. Returns the boundary id and whether it
+    /// is interrupting.
     pub(crate) fn find_escalation_boundary(
         &self,
         instance_key: Key,
         activity_id: &str,
         escalation_code: &str,
+        exact: bool,
     ) -> Option<(ElementId, bool)> {
-        let process = self.process_of_instance(instance_key)?;
-        let pick = |exact: bool| {
-            process
-                .elements
-                .values()
-                .filter(|e| match &e.kind {
-                    ElementKind::EscalationBoundaryEvent {
-                        attached_to,
-                        escalation_code: ec,
-                        ..
-                    } => {
-                        attached_to == activity_id
-                            && if exact {
-                                ec == escalation_code
-                            } else {
-                                ec.is_empty()
-                            }
-                    }
-                    _ => false,
-                })
-                .min_by(|a, b| a.id.cmp(&b.id))
-        };
-        // An exact match (which, when `escalation_code` is itself empty, already
-        // covers the catch-all boundaries) beats a separate catch-all fallback.
-        let chosen = pick(true).or_else(|| {
-            if escalation_code.is_empty() {
-                None
-            } else {
-                pick(false)
-            }
-        })?;
-        match &chosen.kind {
-            ElementKind::EscalationBoundaryEvent { interrupting, .. } => {
-                Some((chosen.id.clone(), *interrupting))
-            }
-            _ => None,
+        if !exact && escalation_code.is_empty() {
+            return None;
         }
+        let process = self.process_of_instance(instance_key)?;
+        process
+            .elements
+            .values()
+            .filter_map(|e| match &e.kind {
+                ElementKind::EscalationBoundaryEvent {
+                    attached_to,
+                    escalation_code: ec,
+                    interrupting,
+                } if attached_to == activity_id
+                    && if exact {
+                        ec == escalation_code
+                    } else {
+                        ec.is_empty()
+                    } =>
+                {
+                    Some((e.id.clone(), *interrupting))
+                }
+                _ => None,
+            })
+            .min_by(|a, b| a.0.cmp(&b.0))
     }
 
-    /// Finds the escalation boundary that catches `escalation_code` raised from
-    /// the scope `from_scope_eik` (the enclosing sub-process element instance the
-    /// throw lives in, or `0` for the process root), propagating up the enclosing
-    /// scopes until one is found. Returns `(boundary_id, caught_element_instance_key,
-    /// caught_element_id, interrupting)` — the boundary event and the activity it
-    /// is attached to (the enclosing sub-process). `None` when uncaught (an
-    /// uncaught escalation is ignored, no incident).
-    pub(crate) fn find_catching_escalation_boundary(
+    /// The catch scopes a throw walks, innermost first (Zeebe
+    /// `CatchEventAnalyzer`): each `(element_instance_key, element_id)` from
+    /// `first` (when given) up through its enclosing element instances. The
+    /// process root (scope `0`) is NOT included — callers check it last.
+    fn catch_levels(
+        &self,
+        instance_key: Key,
+        first: Option<(Key, ElementId)>,
+    ) -> Vec<(Key, ElementId)> {
+        let Some((eik, element_id)) = first else {
+            return Vec::new();
+        };
+        let mut levels = vec![(eik, element_id)];
+        for anc in self.ancestor_element_instances(instance_key, eik) {
+            match self.element_id_of_instance(instance_key, anc) {
+                Some(id) => levels.push((anc, id)),
+                None => break,
+            }
+        }
+        levels
+    }
+
+    /// The event sub-processes `(esp_id, trigger, interrupting)` hosted by the
+    /// scope element instance `scope_eik` (element `scope_element`; `0` /
+    /// `None` = the process root). A multi-instance **body** hosts none — each
+    /// child is the event sub-processes' scope.
+    fn hosted_event_subprocesses(
+        &self,
+        instance_key: Key,
+        scope_eik: Key,
+        scope_element: Option<&str>,
+    ) -> Vec<(ElementId, crate::model::EventSubProcessTrigger, bool)> {
+        if scope_eik != 0 && self.is_multi_instance_body(instance_key, scope_eik) {
+            return Vec::new();
+        }
+        // An interrupting event sub-process already running in the scope has
+        // disabled the scope's other triggers (Zeebe: the flow scope is
+        // *interrupted*), so none of the scope's event sub-processes can catch
+        // — not even the running handler itself, which would otherwise catch
+        // its own throw and restart forever. Boundaries on the scope element
+        // and outer scopes still apply.
+        if self.scope_interrupted_by_event_subprocess(instance_key, scope_eik) {
+            return Vec::new();
+        }
+        self.process_of_instance(instance_key)
+            .map(|p| {
+                p.event_subprocesses_in_scope(scope_element)
+                    .map(|(esp, _, trigger, interrupting)| {
+                        (esp.clone(), trigger.clone(), interrupting)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether an **interrupting** event sub-process instance is live directly
+    /// in scope `scope_eik` (`0` = the process root) of `instance_key`.
+    /// Derived from the live element instances, so it holds across replay.
+    pub(crate) fn scope_interrupted_by_event_subprocess(
+        &self,
+        instance_key: Key,
+        scope_eik: Key,
+    ) -> bool {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return false;
+        };
+        instance.active.iter().any(|(eik, element_id)| {
+            self.scope_of(instance_key, *eik) == scope_eik
+                && matches!(
+                    self.element_kind(instance_key, element_id),
+                    Some(ElementKind::EventSubProcess {
+                        interrupting: true,
+                        ..
+                    })
+                )
+        })
+    }
+
+    /// The single catch-resolution walk shared by errors and escalations
+    /// (Zeebe `CatchEventAnalyzer` parity, #1555). Starting at `first` (the
+    /// throwing element instance for an error; the throw's enclosing scope for
+    /// an escalation, `None` at the root) and walking outward to the process
+    /// root, each scope offers the event sub-processes it hosts and the
+    /// boundary events attached to it. Within one scope an **exact** code beats
+    /// a **catch-all**, and at equal specificity an event sub-process beats a
+    /// boundary event (Zeebe orders event sub-process starts before boundary
+    /// events). `esp_code` extracts the trigger's code (`Some(None)` =
+    /// catch-all, `None` = not this trigger family); `boundary` finds the
+    /// boundary attached to an element for the exact (`true`) or catch-all
+    /// (`false`) pass.
+    fn resolve_throw_catch(
+        &self,
+        instance_key: Key,
+        first: Option<(Key, ElementId)>,
+        code: &str,
+        esp_code: impl Fn(&crate::model::EventSubProcessTrigger) -> Option<Option<String>>,
+        boundary: impl Fn(&str, bool) -> Option<(ElementId, bool)>,
+    ) -> Option<ThrowCatch> {
+        let mut levels: Vec<(Key, Option<ElementId>)> = self
+            .catch_levels(instance_key, first)
+            .into_iter()
+            .map(|(eik, id)| (eik, Some(id)))
+            .collect();
+        levels.push((0, None));
+        for (eik, element_id) in levels {
+            let esps = self.hosted_event_subprocesses(instance_key, eik, element_id.as_deref());
+            for exact in [true, false] {
+                let esp = esps.iter().find(|(_, trigger, _)| match esp_code(trigger) {
+                    Some(Some(c)) => exact && c == code,
+                    // A no-code catch is a catch-all; for an unnamed throw
+                    // (empty code) it is also the exact match, consistent with
+                    // the boundary lookups, so ESP precedence holds.
+                    Some(None) => !exact || code.is_empty(),
+                    None => false,
+                });
+                if let Some((esp_id, _, interrupting)) = esp {
+                    return Some(ThrowCatch::EventSubProcess {
+                        scope_eik: eik,
+                        esp_id: esp_id.clone(),
+                        interrupting: *interrupting,
+                    });
+                }
+                // A multi-instance CHILD shares its element id with the loop
+                // BODY, but the boundaries belong to the body: offer them at
+                // the body level (the next level out), so the child's own
+                // event sub-processes are not outranked by a body boundary.
+                let is_mi_child = eik != 0
+                    && self.is_multi_instance_body(instance_key, self.scope_of(instance_key, eik));
+                if let Some(element_id) = element_id.as_ref().filter(|_| !is_mi_child) {
+                    if let Some((boundary_id, interrupting)) = boundary(element_id, exact) {
+                        return Some(ThrowCatch::Boundary {
+                            boundary_id,
+                            caught_eik: eik,
+                            caught_element_id: element_id.clone(),
+                            interrupting,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolves the catch of an error `error_code` thrown from the activity
+    /// `from_element_id` (element instance `from_eik`): the error boundary or
+    /// error event sub-process that catches it, walking outward (see
+    /// [`Self::resolve_throw_catch`]). An error boundary / event sub-process
+    /// without a code is a catch-all. `None` = unhandled (an incident).
+    pub(crate) fn find_error_catch(
+        &self,
+        instance_key: Key,
+        from_element_id: &str,
+        from_eik: Key,
+        error_code: &str,
+    ) -> Option<ThrowCatch> {
+        self.resolve_throw_catch(
+            instance_key,
+            Some((from_eik, from_element_id.to_string())),
+            error_code,
+            |t| match t {
+                crate::model::EventSubProcessTrigger::Error { error_code } => {
+                    Some(error_code.clone())
+                }
+                _ => None,
+            },
+            |activity, exact| {
+                if exact {
+                    self.find_error_boundary(instance_key, activity, error_code)
+                } else if error_code.is_empty() {
+                    None
+                } else {
+                    self.find_error_boundary(instance_key, activity, "")
+                }
+                .map(|id| (id, true))
+            },
+        )
+    }
+
+    /// Resolves the catch of an escalation `escalation_code` raised in scope
+    /// `from_scope_eik` (`0` = the process root): the escalation boundary or
+    /// escalation event sub-process that catches it, walking outward (see
+    /// [`Self::resolve_throw_catch`]). `None` when uncaught (an uncaught
+    /// escalation is ignored, no incident).
+    pub(crate) fn find_escalation_catch(
         &self,
         instance_key: Key,
         from_scope_eik: Key,
         escalation_code: &str,
-    ) -> Option<(ElementId, Key, ElementId, bool)> {
-        let scopes = std::iter::once(from_scope_eik)
-            .filter(|eik| *eik != 0)
-            .chain(self.ancestor_element_instances(instance_key, from_scope_eik));
-        for eik in scopes {
-            let element_id = self.element_id_of_instance(instance_key, eik)?;
-            if let Some((boundary_id, interrupting)) =
-                self.find_escalation_boundary(instance_key, &element_id, escalation_code)
-            {
-                return Some((boundary_id, eik, element_id, interrupting));
-            }
-        }
-        None
+    ) -> Option<ThrowCatch> {
+        let first = (from_scope_eik != 0)
+            .then(|| self.element_id_of_instance(instance_key, from_scope_eik))
+            .flatten()
+            .map(|id| (from_scope_eik, id));
+        self.resolve_throw_catch(
+            instance_key,
+            first,
+            escalation_code,
+            |t| match t {
+                crate::model::EventSubProcessTrigger::Escalation { escalation_code } => {
+                    Some(escalation_code.clone())
+                }
+                _ => None,
+            },
+            |activity, exact| {
+                self.find_escalation_boundary(instance_key, activity, escalation_code, exact)
+            },
+        )
     }
 
     /// Terminates a sub-process scope: cancels every in-play job, armed timer and
@@ -577,8 +726,27 @@ impl Engine {
     /// [`cascade_cancel_children`](crate::engine::Engine::cascade_cancel_children)
     /// sweep, which sees the `ProcessInstanceTerminated` this emits).
     pub(crate) fn scope_teardown_events(&self, instance_key: Key, scope_eik: Key) -> Vec<Event> {
+        let descendants = self.scope_descendants(instance_key, scope_eik);
+        // An event sub-process trigger rests on its host **scope** (#1555) —
+        // on `scope_eik` itself, not on a descendant — so the descendant sweep
+        // never reaches it, and once the scope token is gone the drain sweep
+        // cannot disarm it either. Every teardown of a scope (interrupting
+        // boundary, modification terminate, error / terminate-end throw)
+        // routes through here, so disarm the scope's own triggers first.
+        let mut events = self.disarm_event_subprocess_events(instance_key, scope_eik);
+        events.extend(self.element_teardown_events(instance_key, &descendants));
+        self.push_scoped_compensation_cleared(&mut events, instance_key, scope_eik);
+        events
+    }
+
+    /// The per-element-instance half of [`Self::scope_teardown_events`]: tears
+    /// down each of `members` (cancelling every runtime resource it owns, then
+    /// completing it) without touching compensation state. An interrupting
+    /// event sub-process uses it directly, so compensable activities completed
+    /// in the scope stay compensable from inside the event sub-process.
+    pub(crate) fn element_teardown_events(&self, instance_key: Key, members: &[Key]) -> Vec<Event> {
         let mut events = Vec::new();
-        for eik in self.scope_descendants(instance_key, scope_eik) {
+        for &eik in members {
             let element_id = self
                 .element_id_of_instance(instance_key, eik)
                 .unwrap_or_default();
@@ -589,6 +757,7 @@ impl Engine {
                 events.push(Event::ParallelJoinReset {
                     instance_key,
                     element_id,
+                    scope: Some(self.scope_of(instance_key, eik)),
                 });
                 continue;
             }
@@ -648,16 +817,12 @@ impl Engine {
             // `join_counts`/`join_flow_arrivals`/`join_instances` bookkeeping (untouched by
             // `ElementCompleted`) cannot fire against a dead token if the scope
             // is ever re-entered.
-            if self
-                .state
-                .instances
-                .get(&instance_key)
-                .and_then(|i| i.join_instances.get(&element_id))
-                == Some(&eik)
-            {
+            let eik_scope = self.scope_of(instance_key, eik);
+            if self.join_eik(instance_key, eik_scope, &element_id) == Some(eik) {
                 events.push(Event::ParallelJoinReset {
                     instance_key,
                     element_id: element_id.clone(),
+                    scope: Some(eik_scope),
                 });
             }
             events.push(Event::ElementCompleting {
@@ -671,6 +836,17 @@ impl Engine {
                 element_id,
             });
         }
+        events
+    }
+
+    /// Appends the [`Event::ScopedCompensationCleared`] for a scope teardown
+    /// of `scope_eik` (see [`Self::scope_teardown_events`]).
+    fn push_scoped_compensation_cleared(
+        &self,
+        events: &mut Vec<Event>,
+        instance_key: Key,
+        scope_eik: Key,
+    ) {
         // Scoped compensation cleanup. A completed compensable activity and an
         // in-flight compensation throw both record the `scope` (element instance
         // of the enclosing sub-process, or `0` for the root) they belong to. The
@@ -687,7 +863,7 @@ impl Engine {
         if let Some(instance) = self.state.instances.get(&instance_key) {
             let mut scopes: Vec<Key> = self.scope_descendants(instance_key, scope_eik);
             scopes.push(scope_eik);
-            let scope_set: std::collections::HashSet<Key> = scopes.iter().copied().collect();
+            let scope_set: std::collections::BTreeSet<Key> = scopes.iter().copied().collect();
             let clears_any = scopes.iter().any(|s| instance.compensable.has_scope(*s))
                 || instance
                     .compensation_waits
@@ -701,7 +877,6 @@ impl Engine {
                 });
             }
         }
-        events
     }
 
     /// Root-record teardown events for an activity interrupted at its boundary —
@@ -1039,7 +1214,7 @@ impl Engine {
         &mut self,
         instance_key: Key,
         element_id: &str,
-        host_vars: &HashMap<String, Value>,
+        host_vars: &BTreeMap<String, Value>,
     ) -> Result<(), expression::Failure> {
         let boundaries = self
             .process_of_instance(instance_key)
@@ -1069,7 +1244,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         host_element_id: &str,
-        host_vars: &HashMap<String, Value>,
+        host_vars: &BTreeMap<String, Value>,
         boundary: &crate::model::Element,
     ) -> Result<Option<Event>, expression::Failure> {
         let boundary_kind = |interrupting: bool| {
@@ -1088,9 +1263,10 @@ impl Engine {
             ElementKind::TimerBoundaryEvent {
                 duration_millis,
                 interrupting,
+                repeating,
                 ..
             } => {
-                let (due_at, _) = self
+                let resolved = self
                     .resolve_timer(
                         host_vars,
                         boundary.timer.as_ref(),
@@ -1119,7 +1295,14 @@ impl Engine {
                     instance_key,
                     element_instance_key,
                     element_id: host_element_id.to_string(),
-                    due_at,
+                    due_at: resolved.due_at,
+                    // Only a non-interrupting cycle re-arms, so only it carries
+                    // a bounded fire count (#1596).
+                    repetitions: if !*interrupting && *repeating {
+                        resolved.repetitions
+                    } else {
+                        None
+                    },
                     kind,
                 }))
             }
@@ -1226,14 +1409,15 @@ impl Engine {
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
-        vars: &HashMap<String, Value>,
+        vars: &BTreeMap<String, Value>,
         element: &crate::model::Element,
     ) -> Result<Vec<Event>, expression::Failure> {
         let element_id = element.id.clone();
         Ok(match &element.kind {
             ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
-                let (due_at, _) =
-                    self.resolve_timer(vars, element.timer.as_ref(), self.now, *duration_millis)?;
+                let due_at = self
+                    .resolve_timer(vars, element.timer.as_ref(), self.now, *duration_millis)?
+                    .due_at;
                 let timer_key = self.mint_key();
                 vec![Event::TimerCreated {
                     timer_key,
@@ -1242,6 +1426,7 @@ impl Engine {
                     element_id,
                     due_at,
                     kind: state::TimerKind::IntermediateCatch,
+                    repetitions: None,
                 }]
             }
             ElementKind::MessageIntermediateCatchEvent {
@@ -1311,13 +1496,14 @@ impl Engine {
         })
     }
 
-    /// Whether `element_id` is an embedded sub-process (interrupting it must tear
-    /// down its whole inner token scope, not just cancel a job).
+    /// Whether `element_id` owns an inner token scope — an embedded sub-process
+    /// or an event sub-process (interrupting or terminating it must tear down
+    /// its whole inner token scope, not just cancel a job). Delegates to the
+    /// canonical [`ElementKind::owns_token_scope`].
     pub(crate) fn is_subprocess(&self, instance_key: Key, element_id: &str) -> bool {
-        matches!(
-            self.element_kind(instance_key, element_id),
-            Some(ElementKind::SubProcess { .. })
-        )
+        self.element_kind(instance_key, element_id)
+            .as_ref()
+            .is_some_and(ElementKind::owns_token_scope)
     }
 
     /// Whether `element_instance_key` is a live ad-hoc sub-process container —
@@ -1752,11 +1938,13 @@ impl Engine {
         // A parked join (#1244) never activated: drop its waiting tokens
         // without an element-instance record.
         if self.is_parked_join(instance_key, element_instance_key) {
+            let scope = Some(self.scope_of(instance_key, element_instance_key));
             self.emit(
                 log,
                 Event::ParallelJoinReset {
                     instance_key,
                     element_id: element_id.to_string(),
+                    scope,
                 },
             );
             return;
@@ -1820,18 +2008,14 @@ impl Engine {
         // `join_counts`/`join_flow_arrivals`/`join_instances` bookkeeping exactly
         // as descendant-scope teardown does, so a later arrival cannot fire it
         // against the cancelled branch's token.
-        if self
-            .state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.join_instances.get(element_id))
-            == Some(&element_instance_key)
-        {
+        let eik_scope = self.scope_of(instance_key, element_instance_key);
+        if self.join_eik(instance_key, eik_scope, element_id) == Some(element_instance_key) {
             self.emit(
                 log,
                 Event::ParallelJoinReset {
                     instance_key,
                     element_id: element_id.to_string(),
+                    scope: Some(eik_scope),
                 },
             );
         }
@@ -1853,4 +2037,25 @@ impl Engine {
             },
         );
     }
+}
+
+/// Where a thrown error / escalation is caught (see
+/// [`Engine::resolve_throw_catch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThrowCatch {
+    /// A boundary event `boundary_id` attached to the activity
+    /// `caught_element_id` (element instance `caught_eik`).
+    Boundary {
+        boundary_id: ElementId,
+        caught_eik: Key,
+        caught_element_id: ElementId,
+        interrupting: bool,
+    },
+    /// The event sub-process `esp_id` hosted by scope `scope_eik` (`0` = the
+    /// process root).
+    EventSubProcess {
+        scope_eik: Key,
+        esp_id: ElementId,
+        interrupting: bool,
+    },
 }

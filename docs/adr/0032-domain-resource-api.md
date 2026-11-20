@@ -166,3 +166,6 @@ external integrators prefer the typed domain resource. Sugar-and-types over a su
    shared with ADR 0026's UI idempotency key and ADR 0025's inbox keys.
 7. **MCP exposure** — is the domain-resource tier auto-published as an MCP toolset, and do transitions
    map one-to-one onto MCP tools (resolving part of ADR 0022's "App as MCP server")?
+   **Settled in part (2026-11-11, epic #1499):** ADR 0022's question is answered — Nano exposes
+   Camunda's MCP contract (`/mcp/cluster`, `/mcp/processes`); any domain-resource MCP toolset
+   would be additive over it.
