@@ -80,18 +80,78 @@ fn is_key_field(name: &str) -> bool {
     name == "key" || name == "scope" || name.ends_with("_key") || name.ends_with("_keys")
 }
 
+/// The schema-known numeric-keyed entity maps of [`EngineSnapshot`]'s `State`
+/// (every `BTreeMap<Key, _>` field it declares). Only these maps are
+/// canonicalized as key-indexed entity collections; any OTHER numeric-keyed
+/// object (an instance's `scope_parents`, a business variable name, a FEEL
+/// context) is DATA whose key→value associations are preserved.
+fn is_entity_map_field(name: &str) -> bool {
+    matches!(
+        name,
+        "process_versions"
+            | "instances"
+            | "jobs"
+            | "settled_jobs"
+            | "user_tasks"
+            | "incidents"
+            | "timers"
+            | "message_subscriptions"
+            | "signal_subscriptions"
+            | "conditional_subscriptions"
+            | "start_timers"
+            | "decision_requirements_versions"
+            | "decision_versions"
+            | "form_versions"
+            | "resource_versions"
+            | "variables_lost_quarantined"
+            | "jobs_by_instance"
+    )
+}
+
+/// The derived counters/indices of [`State`] an excluded (ratified) instance
+/// contributes to. Past the boundary that instance's own contribution is the
+/// declared divergence, so the projection normalizes it: the per-process
+/// counts drop the excluded instance's process entries, the terminal epoch
+/// and the recently-terminated ring drop the excluded instance's terminal
+/// transition, and the key collections (`jobs_by_instance`,
+/// `activatable_jobs`, `activated_jobs`) drop the excluded instance's keys.
+/// Every OTHER process/instance contribution is still compared exactly.
+fn is_derived_counter_field(name: &str) -> bool {
+    matches!(
+        name,
+        "inflight_by_process" | "created_by_process" | "terminal_epoch" | "recently_terminated"
+    )
+}
+
 /// The key-insensitive projection of a canonical snapshot past a ratified
 /// upgrade-boundary divergence (#1528 review). The divergence shifts every
 /// later minted key and changes ITS OWN instances' state by declaration, so
 /// the projection (a) drops every record owned by a ratified instance
-/// (`excluded`: a keyed-map entry under such a key, or an object naming it as
-/// `instance_key` / `process_instance_key`), (b) replaces every key value with
-/// a placeholder and every key-indexed map with the sorted multiset of its
-/// projected values, and (c) drops the key allocator (`next_local`). Every
-/// other field — flags, variables, counts of jobs/tasks/timers of every other
-/// instance — is still compared, so an unrelated post-boundary state
-/// regression fails.
-fn boundary_projection(value: &Json, excluded: &BTreeSet<u64>) -> Option<Json> {
+/// (`excluded`: a keyed entity-map entry under such a key, or an object
+/// naming it as `instance_key` / `process_instance_key`), (b) canonicalizes
+/// every key reference to its entity identity (never one common placeholder,
+/// so a mis-owned retained entity still diverges) and every schema-known
+/// key-indexed entity map to the sorted multiset of its projected values,
+/// (c) drops the snapshot root's key allocator (`next_local`) — and ONLY the
+/// root's, so a nested FEEL context entry of the same name is preserved as
+/// data — and (d) normalizes the excluded instance's derived contributions
+/// (`inflight_by_process`, `terminal_epoch`, `recently_terminated`, and the
+/// `jobs_by_instance` / `activatable_jobs` / `activated_jobs` key
+/// collections). Every other field — flags, variables, counts of
+/// jobs/tasks/timers of every other instance, and every non-entity
+/// numeric-keyed map's key→value associations — is still compared, so an
+/// unrelated post-boundary state regression fails.
+///
+/// `path` is the dot-separated field path from the snapshot root, used to
+/// scope the allocator drop to the root and the entity-map canonicalization
+/// to schema-known fields. `entity_map` is true when `value` is the VALUE of
+/// a schema-known entity-map field (so its numeric keys are entity keys).
+fn boundary_projection(
+    value: &Json,
+    excluded: &BTreeSet<u64>,
+    path: &str,
+    entity_map: bool,
+) -> Option<Json> {
     match value {
         Json::Object(map) => {
             for owner in ["instance_key", "process_instance_key"] {
@@ -103,25 +163,43 @@ fn boundary_projection(value: &Json, excluded: &BTreeSet<u64>) -> Option<Json> {
                     return None;
                 }
             }
-            let keyed = !map.is_empty() && map.keys().all(|k| k.parse::<u64>().is_ok());
-            if keyed {
+            // A schema-known entity map: canonicalize each entry's key to the
+            // entity identity and drop the ratified instance's entries, then
+            // sort the projected values into a multiset (key-insensitive).
+            if entity_map {
                 let mut items: Vec<Json> = map
                     .iter()
                     .filter(|(k, _)| k.parse::<u64>().is_ok_and(|k| !excluded.contains(&k)))
-                    .filter_map(|(_, v)| boundary_projection(v, excluded))
+                    .filter_map(|(_, v)| boundary_projection(v, excluded, path, false))
                     .collect();
                 items.sort_by_key(|v| v.to_string());
                 return Some(Json::Array(items));
             }
             let mut out = serde_json::Map::new();
             for (k, v) in map {
-                if k == "next_local" {
+                // Drop the key allocator ONLY at the snapshot root (`$.next_local`),
+                // never a nested data entry of the same name.
+                if path.is_empty() && k == "next_local" {
                     continue;
                 }
-                let projected = if is_key_field(k) {
-                    key_placeholder(v)
+                let child_path = if path.is_empty() {
+                    k.clone()
                 } else {
-                    match boundary_projection(v, excluded) {
+                    format!("{path}.{k}")
+                };
+                let projected = if is_key_field(k) {
+                    // A key reference: canonicalize to the entity identity so a
+                    // mis-owned reference still diverges, never a placeholder.
+                    key_identity(v, excluded)
+                } else if is_derived_counter_field(k) {
+                    derived_counter_projection(k, v, excluded, map)
+                } else if is_entity_map_field(k) {
+                    match boundary_projection(v, excluded, &child_path, true) {
+                        Some(p) => p,
+                        None => continue,
+                    }
+                } else {
+                    match boundary_projection(v, excluded, &child_path, false) {
                         Some(p) => p,
                         None => continue,
                     }
@@ -133,19 +211,107 @@ fn boundary_projection(value: &Json, excluded: &BTreeSet<u64>) -> Option<Json> {
         Json::Array(items) => Some(Json::Array(
             items
                 .iter()
-                .filter_map(|v| boundary_projection(v, excluded))
+                .filter_map(|v| boundary_projection(v, excluded, path, false))
                 .collect(),
         )),
         other => Some(other.clone()),
     }
 }
 
-/// A key value (or list of keys) with each raw key replaced by a placeholder.
-fn key_placeholder(v: &Json) -> Json {
+/// A key value (or list of keys) with each raw key replaced by the identity
+/// of the entity it references. Unlike a common placeholder, the identity
+/// preserves WHICH entity is referenced, so a reference re-pointed at the
+/// wrong entity (an ownership regression) still diverges. A reference to an
+/// excluded (ratified) instance's own key is dropped (the entity is gone
+/// from the projection), and a reference to a key never minted keeps a
+/// distinct orphan token.
+fn key_identity(v: &Json, excluded: &BTreeSet<u64>) -> Json {
     match v {
-        Json::Number(n) if n.is_u64() => Json::String("#key".into()),
-        Json::Array(items) => Json::Array(items.iter().map(key_placeholder).collect()),
+        Json::Number(n) if n.is_u64() => {
+            let k = n.as_u64().unwrap_or(0);
+            if excluded.contains(&k) {
+                Json::Null
+            } else {
+                Json::String(format!("#key:{k}"))
+            }
+        }
+        Json::Array(items) => {
+            Json::Array(items.iter().map(|i| key_identity(i, excluded)).collect())
+        }
         other => other.clone(),
+    }
+}
+
+/// Normalizes one derived counter/index field for the excluded (ratified)
+/// instance's contribution. `parent` is the enclosing `State` object (so the
+/// per-process counts can find the excluded instance's process id). The
+/// per-process counts drop the excluded instance's process entry (its count
+/// is the declared divergence); `terminal_epoch` and `recently_terminated`
+/// drop the excluded instance's terminal transition; the key collections
+/// drop the excluded instance's keys. Every other contribution is preserved
+/// exactly.
+fn derived_counter_projection(
+    name: &str,
+    v: &Json,
+    excluded: &BTreeSet<u64>,
+    parent: &serde_json::Map<String, Json>,
+) -> Json {
+    match name {
+        // `recently_terminated`: drop the excluded instance's keys.
+        "recently_terminated" => match v {
+            Json::Array(items) => Json::Array(
+                items
+                    .iter()
+                    .filter(|i| i.as_u64().is_none_or(|k| !excluded.contains(&k)))
+                    .cloned()
+                    .collect(),
+            ),
+            other => other.clone(),
+        },
+        // The per-process counts: drop the excluded instance's OWN process
+        // entry (its count is the declared divergence — the head instance
+        // stays parked, the prev one completes). Every OTHER process's count
+        // is still compared exactly.
+        "inflight_by_process" | "created_by_process" => {
+            let excluded_pids: BTreeSet<String> = excluded
+                .iter()
+                .filter_map(|k| {
+                    parent
+                        .get("instances")
+                        .and_then(Json::as_object)
+                        .and_then(|i| i.get(&k.to_string()))
+                        .and_then(|inst| inst.get("process_id"))
+                        .and_then(Json::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+            match v {
+                Json::Object(map) => {
+                    let mut out = map.clone();
+                    for pid in &excluded_pids {
+                        out.remove(pid);
+                    }
+                    Json::Object(out)
+                }
+                other => other.clone(),
+            }
+        }
+        // `terminal_epoch`: the excluded instance's terminal transition
+        // advances it on the completing side only. The projection cannot
+        // isolate that contribution key-insensitively, so it is dropped — but
+        // ONLY when there IS an excluded (ratified) instance whose transition
+        // is the declared divergence; with none, the epoch is compared exactly
+        // (an unrelated terminal transition still fails). The per-instance
+        // `terminated_epoch` and the `recently_terminated` ring still record
+        // WHICH instances terminated, and are compared.
+        "terminal_epoch" => {
+            if excluded.is_empty() {
+                v.clone()
+            } else {
+                Json::Null
+            }
+        }
+        _ => v.clone(),
     }
 }
 
@@ -196,8 +362,8 @@ fn compare_states(
         // instances — every other state is still checked (#1528 review).
         if let (Some(from), Some(i)) = (boundary.from, at.as_u64()) {
             if i >= from {
-                if boundary_projection(&hs, &boundary.head_instances)
-                    != boundary_projection(&ps, &boundary.prev_instances)
+                if boundary_projection(&hs, &boundary.head_instances, "", false)
+                    != boundary_projection(&ps, &boundary.prev_instances, "", false)
                 {
                     return Err(format!(
                         "durable state diverges at entry {at} outside the ratified \
@@ -1402,10 +1568,15 @@ struct MatchedSide<'a> {
 /// `canonical` multisets hold identity strings in the key positions, which no
 /// longer decode); the owner check resolves the raw `element_instance_key`
 /// against the side's own mints.
+/// The `only_in_*` patterns of the side being validated (its own
+/// declaration's patterns), so the required-children check knows which
+/// elements the divergence declares a per-child task for.
 fn validate_unbalanced_surplus(
     scenario: &str,
     head: MatchedSide<'_>,
     prev: MatchedSide<'_>,
+    head_patterns: &[EventPattern],
+    prev_patterns: &[EventPattern],
 ) -> Result<(), String> {
     // The asymmetric remainder of a side's canonical multiset, as raw events:
     // the raw events whose canonical projection is in the surplus.
@@ -1432,7 +1603,10 @@ fn validate_unbalanced_surplus(
         }
         out
     };
-    for (side_name, side, other) in [("head", &head, &prev), ("prev", &prev, &head)] {
+    for (side_name, side, other, patterns) in [
+        ("head", &head, &prev, head_patterns),
+        ("prev", &prev, &head, prev_patterns),
+    ] {
         // The owners of this side's surplus `UserTaskCreated`, by element id.
         let mut task_owners: BTreeMap<String, BTreeMap<u64, usize>> = BTreeMap::new();
         for (event, extra) in surplus_raw(side, other) {
@@ -1472,8 +1646,28 @@ fn validate_unbalanced_surplus(
         // One task per activated multi-instance child of that element: a
         // duplicate owner, a task on a non-child (another valid but wrong
         // element instance) or a child left without its task all fail
-        // (#1528 review).
+        // (#1528 review). The required-children check runs even when the side
+        // emitted NO surplus `UserTaskCreated` at all: for every element the
+        // declaration's `only_in_*` patterns name a `UserTaskCreated` for,
+        // every activated MI child must carry exactly one task — so an
+        // all-tasks-missing stream fails rather than passing silently.
         let children = mi_children_by_element(side.entries);
+        let declared_task_elements: BTreeSet<String> = patterns
+            .iter()
+            .filter(|p| p.variant == "UserTaskCreated")
+            .map(|p| p.element_id.clone().unwrap_or_default())
+            .collect();
+        for element in declared_task_elements {
+            let owners = task_owners.get(&element).cloned().unwrap_or_default();
+            let want = children.get(&element).cloned().unwrap_or_default();
+            if owners.is_empty() && !want.is_empty() {
+                return Err(format!(
+                    "scenario {scenario}: the {side_name}-side surplus emits NO `UserTaskCreated` \
+                     for element {element}, but its activated multi-instance children are \
+                     {want:?} — one task per activated child"
+                ));
+            }
+        }
         for (element, owners) in &task_owners {
             if let Some((owner, n)) = owners.iter().find(|(_, n)| **n > 1) {
                 return Err(format!(
@@ -2049,7 +2243,12 @@ pub fn cross_release_checked(
         // An `unbalanced` marker is validated whether or not the matched
         // events balance (#1528 review): an untraceable marker fails even on
         // a reorder-only scenario, never silently enabling the boundary
-        // state projection below.
+        // state projection below. And whenever a VALID marker is present, the
+        // required-children check runs even when the matched multisets
+        // balance (both empty): a side that emits NO `UserTaskCreated` for an
+        // element the declaration names still owes one task per activated MI
+        // child, so an all-tasks-missing stream fails rather than passing
+        // silently (#1528 review).
         if let Some(u) = &expected.unbalanced {
             if !u.valid(&d.issue) {
                 return Err(format!(
@@ -2059,6 +2258,25 @@ pub fn cross_release_checked(
                     d.issue
                 ));
             }
+            validate_unbalanced_surplus(
+                scenario,
+                MatchedSide {
+                    canonical: &head_matched,
+                    raw: &head_matched_raw,
+                    ids: &head_ids,
+                    remint,
+                    entries: &head_entry_events,
+                },
+                MatchedSide {
+                    canonical: &prev_matched,
+                    raw: &prev_matched_raw,
+                    ids: &prev_ids,
+                    remint,
+                    entries: &prev_entry_events,
+                },
+                &expected.only_in_head,
+                &expected.only_in_prev,
+            )?;
         }
         let unbalanced_surplus = head_matched != prev_matched;
         if unbalanced_surplus {
@@ -2069,34 +2287,8 @@ pub fn cross_release_checked(
             // divergence's issue named. Anything else fails closed.
             match &expected.unbalanced {
                 Some(_) => {
-                    // The declaration ratifies that the two sides' matched
-                    // events have NO counterpart on the other build — but it
-                    // must not ratify a WRONG event. Validate the one-sided
-                    // surplus (the events only one side emits) rather than
-                    // accepting it blindly (#1528 review): every surplus event
-                    // must still decode under the head `Event` type (a
-                    // corrupted one fails), and — whatever the snapshot
-                    // formats — the surplus must be internally consistent (a `UserTaskCreated`
-                    // whose owning `element_instance_key` its own side never
-                    // minted is a wrong-child/wrong-owner event, not a clean
-                    // one-sided emission).
-                    validate_unbalanced_surplus(
-                        scenario,
-                        MatchedSide {
-                            canonical: &head_matched,
-                            raw: &head_matched_raw,
-                            ids: &head_ids,
-                            remint,
-                            entries: &head_entry_events,
-                        },
-                        MatchedSide {
-                            canonical: &prev_matched,
-                            raw: &prev_matched_raw,
-                            ids: &prev_ids,
-                            remint,
-                            entries: &prev_entry_events,
-                        },
-                    )?;
+                    // Already validated above (the marker is present and
+                    // valid, and the surplus check ran unconditionally).
                 }
                 None => {
                     let show = |m: &BTreeMap<String, usize>| {
