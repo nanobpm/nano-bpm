@@ -209,11 +209,24 @@ impl Engine {
         // (child-local wins). With it off, only the input-mapping results cross —
         // an isolated child seeded purely by the mappings.
         let inputs = self.io_inputs(parent_instance, element_id);
+        let is_multi_instance = self
+            .multi_instance_of(parent_instance, element_id)
+            .is_some();
         let input_results = if inputs.is_empty() {
             BTreeMap::new()
         } else {
             match self.eval_io_mappings_in(element_vars, &inputs) {
-                Ok(updates) => updates,
+                Ok(mut updates) => {
+                    // `loopCounter` is a reserved MI binding on the call
+                    // activity's local scope (read back by `complete_mi_child`
+                    // for `outputElement`). Drop a user input mapping targeting
+                    // it, exactly as the regular MI input path does, so the
+                    // local projection can never clobber the engine-owned counter.
+                    if is_multi_instance {
+                        updates.remove("loopCounter");
+                    }
+                    updates
+                }
                 Err(failure) => {
                     // A call-activity input mapping that fails to evaluate halts the
                     // call activity with an `IO_MAPPING_ERROR` incident rather than

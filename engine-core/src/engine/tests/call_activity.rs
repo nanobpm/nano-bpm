@@ -1630,3 +1630,56 @@ fn call_activity_local_merge_precedes_completion_and_leaves_no_scope_behind() {
         Some(&Value::Int(7))
     );
 }
+
+/// PR #1727 review: a call-activity input mapping targeting the reserved
+/// multi-instance `loopCounter` must not clobber it on the call activity's
+/// local scope — `complete_mi_child` reads that scope for `outputElement`.
+#[test]
+fn multi_instance_call_activity_input_cannot_clobber_loop_counter() {
+    let callee = ProcessBuilder::new("callee")
+        .start_event("cs")
+        .end_event("ce")
+        .connect("cs", "ce")
+        .build()
+        .unwrap();
+    let def = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity_with_propagation("each", "callee", true, false)
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: None,
+                output_collection: Some("results".to_string()),
+                output_element: Some("=loopCounter".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .with_io("each", input_io("=loopCounter + 100", "loopCounter"))
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("items", Value::List(vec![Value::Int(7), Value::Int(8)]))]),
+        ))
+        .unwrap();
+    let key = parent_key_of(&created, "orch");
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(1), Value::Int(2)])),
+        "the reserved loopCounter survives a user input mapping targeting it"
+    );
+}
