@@ -3471,6 +3471,24 @@ fn next_cutover_latch(
     }
 }
 
+/// Re-arm the cutover latch when the membership differs from the one it was
+/// latched over (#1715 review). Compares against BOTH the applied signature
+/// (only refreshed by applied `Normal` entries) AND the live membership the
+/// capability check just read from Raft metrics: an idle join's membership
+/// entry does not refresh the applied signature, so without the live check
+/// the first post-join proposal would run under the stale signature and skip
+/// the cutover.
+fn rearm_on_membership_change(
+    done: Option<BTreeSet<NodeId>>,
+    applied: Option<&BTreeSet<NodeId>>,
+    checked: &BTreeSet<NodeId>,
+) -> Option<BTreeSet<NodeId>> {
+    match done {
+        Some(d) if d != *checked || applied.is_some_and(|a| *a != d) => None,
+        other => other,
+    }
+}
+
 impl Batcher {
     fn spawn(
         raft: openraft::Raft<RaftConfig>,
@@ -3592,12 +3610,11 @@ impl Batcher {
                     cutover_done = None;
                 }
                 was_leader = is_leader;
-                if let (Some(done), Some(now)) =
-                    (cutover_done.as_ref(), digest.membership_signature())
-                    && *done != now
-                {
-                    cutover_done = None;
-                }
+                cutover_done = rearm_on_membership_change(
+                    cutover_done,
+                    digest.membership_signature().as_ref(),
+                    &cutover_checked,
+                );
                 let cutover = cutover_gate_open && cutover_done.is_none();
                 let batch = ReplicatedBatch::new(items)
                     .with_digest(claim)
@@ -9186,21 +9203,9 @@ mod tests {
         // cutover base. (The log-replication path journals no digest records,
         // so nothing re-bases it onto the group's chain.)
         parts[3].sm_engine().with(|j| j.drop_chain_for_test()).await;
-        // The digest ledger is populated as entries APPLY, so the drop above
-        // only reaches the NEXT applied entry — force one through.
-        parts[0]
-            .propose(deploy_command(), 2_500)
-            .await
-            .expect("seed the learner's rebased chain");
-        wait_all_applied(&parts).await;
-        let leader = parts[0].digest_claim().expect("leader chain");
-        let joined = parts[3].digest_claim().expect("learner chain");
-        assert!(
-            !leader.chain.comparable(&joined.chain),
-            "the idle join's chain starts at its own index, incomparable with the group"
-        );
-        // The membership change re-armed the cutover: the next proposal
-        // re-bases every replica, learner included.
+        // The membership change re-armed the cutover: the FIRST proposal
+        // after the join (no seed write — the membership entry alone does not
+        // refresh the applied signature) must re-base every replica.
         parts[0]
             .propose(deploy_command(), 3_000)
             .await
@@ -9222,6 +9227,27 @@ mod tests {
     /// is suspended was never checked, so the latch must record the CHECKED
     /// membership — which then differs from the applied (expanded) one and
     /// re-arms the next proposal — never the post-write membership.
+    /// #1715 review: an idle join leaves the applied signature stale, so the
+    /// re-arm must also compare the live (checked) membership.
+    #[test]
+    fn cutover_rearms_on_live_membership_even_with_stale_applied_signature() {
+        let old: BTreeSet<NodeId> = [0, 1, 2].into_iter().collect();
+        let live: BTreeSet<NodeId> = [0, 1, 2, 3].into_iter().collect();
+        assert_eq!(
+            rearm_on_membership_change(Some(old.clone()), Some(&old), &live),
+            None
+        );
+        assert_eq!(
+            rearm_on_membership_change(Some(old.clone()), Some(&live), &old),
+            None
+        );
+        assert_eq!(
+            rearm_on_membership_change(Some(old.clone()), Some(&old), &old),
+            Some(old.clone())
+        );
+        assert_eq!(rearm_on_membership_change(None, Some(&old), &live), None);
+    }
+
     #[test]
     fn cutover_latch_records_the_checked_membership_not_a_concurrent_join() {
         let checked: BTreeSet<NodeId> = [0, 1, 2].into_iter().collect();
