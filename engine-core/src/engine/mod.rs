@@ -11316,7 +11316,8 @@ impl Engine {
         // N-child teardown is O(total user tasks + N) rather than each child
         // rescanning the whole `state.user_tasks` map (#1528 review). The index
         // preserves per-bucket key order, so the emitted events are unchanged.
-        let user_tasks_by_eik = self.created_user_tasks_by_element_instance();
+        let user_tasks_by_eik =
+            (!active.is_empty()).then(|| self.created_user_tasks_by_element_instance());
         // An ad-hoc container child (a JOB_WORKER ad-hoc MI child, #1170) owns its
         // OWN active tool scope (`adhoc_instances[child].active`), its agent job,
         // and an `adhoc_instances` runtime record — none of which the leaf-only
@@ -11338,7 +11339,7 @@ impl Engine {
                     instance_key,
                     body_key,
                     *child,
-                    Some(&user_tasks_by_eik),
+                    user_tasks_by_eik.as_ref(),
                 ));
             } else {
                 // A non-ad-hoc MI child may itself be an embedded SUB-PROCESS that
@@ -11362,13 +11363,13 @@ impl Engine {
                 events.extend(self.scope_teardown_events(
                     instance_key,
                     *child,
-                    Some(&user_tasks_by_eik),
+                    user_tasks_by_eik.as_ref(),
                 ));
                 torn_down.push(*child);
                 events.extend(self.cancel_mi_child_events(
                     instance_key,
                     *child,
-                    Some(&user_tasks_by_eik),
+                    user_tasks_by_eik.as_ref(),
                 ));
             }
         }
@@ -13777,13 +13778,14 @@ impl Engine {
             // own live tools down (each hangs off a dedicated inner instance)
             // before the child completes; a natural completion has none active.
             if cancel {
-                let user_tasks_by_eik = self.created_user_tasks_by_element_instance();
+                let user_tasks_by_eik =
+                    (!active.is_empty()).then(|| self.created_user_tasks_by_element_instance());
                 for child in &active {
                     events.extend(self.cancel_adhoc_active_child(
                         instance_key,
                         container_key,
                         *child,
-                        Some(&user_tasks_by_eik),
+                        user_tasks_by_eik.as_ref(),
                     ));
                 }
                 // Resolve any incident parked on the CONTAINER itself (a failed
@@ -13839,13 +13841,14 @@ impl Engine {
         // descendants + agent job + ad-hoc state), which `cancel_adhoc_active_child`
         // handles — cancelling it as a leaf would orphan its internals.
         if cancel {
-            let user_tasks_by_eik = self.created_user_tasks_by_element_instance();
+            let user_tasks_by_eik =
+                (!active.is_empty()).then(|| self.created_user_tasks_by_element_instance());
             for child in &active {
                 events.extend(self.cancel_adhoc_active_child(
                     instance_key,
                     container_key,
                     *child,
-                    Some(&user_tasks_by_eik),
+                    user_tasks_by_eik.as_ref(),
                 ));
             }
             // Resolve any incident parked on the CONTAINER itself (a failed

@@ -1955,13 +1955,19 @@ fn multi_instance_teardown_cancels_every_child_user_task_once() {
         .apply_command(Command::complete_user_task(first))
         .unwrap();
 
-    let canceled: std::collections::BTreeSet<Key> = events
+    let canceled_events: Vec<Key> = events
         .iter()
         .filter_map(|e| match e {
             Event::UserTaskCanceled { user_task_key, .. } => Some(*user_task_key),
             _ => None,
         })
         .collect();
+    let canceled: std::collections::BTreeSet<Key> = canceled_events.iter().copied().collect();
+    assert_eq!(
+        canceled_events.len(),
+        canceled.len(),
+        "no child's task may be cancelled twice in the journal"
+    );
     // The torn-down children are every task except the one we completed.
     let mut expected = created_tasks.clone();
     expected.remove(&first);
