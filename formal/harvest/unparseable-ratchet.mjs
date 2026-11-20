@@ -69,14 +69,32 @@ export function harvestedByClass(corpusDir) {
 }
 
 /**
+ * Validate a baseline's shape: a non-array `classes` object whose every count is
+ * a positive safe integer. A nonnumeric count would make every `>`/`<`
+ * comparison false and silently admit a regression, so fail closed.
+ * Returns error strings (empty = valid).
+ */
+export function validateBaseline(baseline, label = 'unparseable-baseline.json') {
+  if (!baseline || typeof baseline.classes !== 'object' || baseline.classes === null || Array.isArray(baseline.classes)) {
+    return [`${label} must have a \`classes\` object`];
+  }
+  const errors = [];
+  for (const [cls, n] of Object.entries(baseline.classes)) {
+    if (!Number.isSafeInteger(n) || n <= 0) {
+      errors.push(`${label}: ${cls} has invalid count ${JSON.stringify(n)} (must be a positive integer)`);
+    }
+  }
+  return errors;
+}
+
+/**
  * Compare current per-class unparseable counts against the baseline. Returns a
  * list of error strings (empty = pass).
  */
 export function checkRatchet(current, baseline) {
+  const invalid = validateBaseline(baseline);
+  if (invalid.length) return invalid;
   const errors = [];
-  if (!baseline || typeof baseline.classes !== 'object' || baseline.classes === null) {
-    return ['unparseable-baseline.json must have a `classes` object'];
-  }
   const base = baseline.classes;
   const keys = Object.keys(base);
   const sorted = [...keys].sort();
@@ -105,10 +123,11 @@ export function checkRatchet(current, baseline) {
  * differs. Returns error strings (empty = pass). Fails closed on malformed input.
  */
 export function checkBaseGrowth(headBaseline, baseBaseline, headPin, basePin) {
-  const isClasses = (b) => b && typeof b.classes === 'object' && b.classes !== null;
-  if (!isClasses(headBaseline) || !isClasses(baseBaseline)) {
-    return ['base growth check: both baselines must have a `classes` object'];
-  }
+  const invalid = [
+    ...validateBaseline(headBaseline, 'base growth check: head baseline'),
+    ...validateBaseline(baseBaseline, 'base growth check: target-branch baseline'),
+  ];
+  if (invalid.length) return invalid;
   if (!headPin?.sha || !basePin?.sha) {
     return ['base growth check: both zeebe-test-pin.json files must carry a `sha`'];
   }

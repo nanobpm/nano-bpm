@@ -80,3 +80,16 @@ test('base growth: a Zeebe pin bump may grow the baseline', () => {
 test('base growth: a malformed base baseline fails closed', () => {
   assert.equal(checkBaseGrowth({ classes: { A: 1 } }, {}, SAME_PIN, SAME_PIN).length, 1);
 });
+
+test('malformed class counts are rejected by both checks (#1525)', () => {
+  const pin = { sha: 'a' };
+  for (const bad of ['unknown', 0, -1, 1.5, null, '3', Number.MAX_SAFE_INTEGER + 1]) {
+    const b = { classes: { 'x/ATest': bad } };
+    assert.ok(checkRatchet({ 'x/ATest': 5 }, b).some((e) => /count/.test(e)), `checkRatchet ${bad}`);
+    assert.ok(checkBaseGrowth(b, { classes: { 'x/ATest': 1 } }, pin, pin).some((e) => /count/.test(e)), `head ${bad}`);
+    assert.ok(checkBaseGrowth({ classes: { 'x/ATest': 5 } }, b, pin, pin).some((e) => /count/.test(e)), `base ${bad}`);
+  }
+  const arr = { classes: [] };
+  assert.ok(checkRatchet({}, arr).length > 0);
+  assert.ok(checkBaseGrowth(arr, { classes: {} }, pin, pin).length > 0);
+});
