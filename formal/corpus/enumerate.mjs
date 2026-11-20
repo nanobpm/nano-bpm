@@ -350,6 +350,16 @@ const sizeOrder = (a, b) => (flowCount(a) - flowCount(b)) || (a.kinds.length - b
 // ---------------------------------------------------------------------------
 // Routes and the reference command-level executor
 
+/**
+ * `flows` in the order Zeebe takes them: reverse declaration (document) order
+ * (`Reference.take`, #1694). `bpmnFor` declares every `sequenceFlow` in
+ * `graph.edges` order, so a flow's index there IS its document position.
+ */
+export function executionOrder (graph, flows) {
+  const position = (e) => graph.edges.indexOf(e)
+  return [...flows].sort((a, b) => position(b) - position(a))
+}
+
 const outsOf = (graph) => {
   const out = Object.create(null)
   const inn = Object.create(null)
@@ -695,8 +705,21 @@ export class Reference {
     this.completedElements[n] = (this.completedElements[n] ?? 0) + 1
   }
 
+  /**
+   * Take `flows` (a subset of one node's outgoing flows), queueing their
+   * activations in ZEEBE'S EXECUTION ORDER — reverse document order (#1694):
+   * Zeebe's `ModelWalker` transforms sibling `sequenceFlow`s last-declared
+   * first, so `ExecutableFlowNode.getOutgoing()` (and therefore
+   * `takeOutgoingSequenceFlows`) runs in reverse declaration order, and the
+   * batch drains the resulting ACTIVATE commands FIFO. The order is
+   * observable: an inclusive join reached by a fork's first-declared flow is
+   * guarded AFTER a sibling branch that could still reach it has routed away
+   * (in document order it would be guarded BEFORE, and park forever).
+   * engine-core's single source of the same order is
+   * `Element::outgoing_in_execution_order`.
+   */
   take (flows) {
-    for (const e of flows) {
+    for (const e of executionOrder(this.graph, flows)) {
       this.queue.push(e.id)
       // The branch-sensitive milestone: which FLOWS were taken. An event-based
       // gateway arms every catch (each completes, the losers withdrawn), so the
