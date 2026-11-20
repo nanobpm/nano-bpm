@@ -83,6 +83,7 @@ export function bpmnToGraph(xml) {
   const flowRe = /<sequenceFlow\b[^>]*\bid="([^"]+)"[^>]*\bsourceRef="([^"]+)"[^>]*\btargetRef="([^"]+)"[^>]*>/g;
   let m;
   const condFlows = new Set();
+  const miNodes = new Set();
   for (;;) {
     m = flowRe.exec(xml);
     if (!m) break;
@@ -114,6 +115,9 @@ export function bpmnToGraph(xml) {
       nodes[`__tag:${id}`] = tag;
       const jt = /<[^>]*taskDefinition\b[^>]*\btype="([^"]+)"/.exec(body)?.[1];
       if (jt) jobTypes[id] = jt;
+      // a multi-instance activity (carries a multiInstanceLoopCharacteristics
+      // child) — its input collection must be supplied as a variable at create
+      if (/<multiInstanceLoopCharacteristics\b/.test(body)) miNodes.add(id);
       // event definitions present on this element
       const defs = [];
       for (const ed of ['messageEventDefinition', 'timerEventDefinition', 'errorEventDefinition',
@@ -125,7 +129,7 @@ export function bpmnToGraph(xml) {
       if (defs.length) events[id] = defs;
     }
   }
-  return { nodes, edges, jobTypes, events, condFlows };
+  return { nodes, edges, jobTypes, events, condFlows, miNodes };
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +188,10 @@ export function scenarioFor(graph) {
   // mis-report a data-dependent route as a parity defect.
   const needs = [];
   if (graph.condFlows.size > 0) needs.push('variables'); // conditional routing
+  // A multi-instance activity needs its input collection supplied as a process
+  // variable at create; the empty-variable runner cannot drive it. Tag it as a
+  // driver limitation (out-of-scope), not a Nano divergence.
+  if ((graph.miNodes?.size ?? 0) > 0) needs.push('variables');
   const nodeSet = nodeIds.map((id) => graph.nodes[id]);
   if (nodeSet.includes('eventBased')) needs.push('event-based-gateway');
   if (nodeSet.includes('intermediateCatch') || nodeSet.includes('boundary')) needs.push('catch-event');
