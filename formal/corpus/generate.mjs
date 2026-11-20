@@ -73,7 +73,16 @@ const KIND = {
   // enumerate.mjs), whose scenarios drive the correlation as a command; the
   // hand-written graph sources stay deterministic-route only (validateGraphs).
   evt: { el: 'eventBasedGateway', w: 50, h: 50 },
-  msg: { el: 'intermediateCatchEvent', w: 36, h: 36 }
+  msg: { el: 'intermediateCatchEvent', w: 36, h: 36 },
+  // The differential fuzzer's extended vocabulary (#1673), emitted only for
+  // VARIABLE-routed (enumerate.mjs / fuzz.mjs) graphs: a timer catch, an
+  // embedded subProcess (drawn collapsed, its inner chain on its own plane)
+  // with its inner end event, and interrupting timer / message boundaries.
+  timer: { el: 'intermediateCatchEvent', w: 36, h: 36 },
+  sub: { el: 'subProcess', w: 110, h: 80 },
+  subend: { el: 'endEvent', w: 36, h: 36 },
+  btimer: { el: 'boundaryEvent', w: 36, h: 36 },
+  bmsg: { el: 'boundaryEvent', w: 36, h: 36 }
 }
 // The node kinds the hand-written, deterministic-route corpus (graphs/*.json)
 // may use. evt/msg need a correlation command per route, which only the
@@ -102,6 +111,9 @@ export const CORRELATION_KEY_VARIABLE = 'correlationKey'
 // the clock one `advanceTime` step per `tick` command. The value matches the
 // traces fuzzer's tick (formal/traces/fuzz/generate.mjs TICK_MS).
 export const TIMER_TICK_MS = 60_000
+// The ISO-8601 duration of one tick, emitted as every generated timer's
+// `timeDuration` — derived from TIMER_TICK_MS so the two cannot drift.
+export const TIMER_DURATION = `PT${TIMER_TICK_MS / 1000}S`
 // CASE arm order for MCKind; `task` is the OTHER fallback.
 const KIND_ORDER = ['start', 'end', 'and', 'or', 'xor', 'evt', 'msg']
 
@@ -627,7 +639,7 @@ export function bpmnFor (graph, opts = {}) {
   L.push('    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"')
   L.push('    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"')
   L.push(`    id="${xmlEscape(definitionsId(graph.id))}" targetNamespace="http://nanobpm.io/corpus">`)
-  for (const id of nodes.filter((n) => graph.nodes[n] === 'msg')) {
+  for (const id of nodes.filter((n) => ['msg', 'bmsg'].includes(graph.nodes[n]))) {
     L.push(`  <bpmn:message id="${xmlEscape(messageId(id))}" name="${xmlEscape(messageName(graph.id, id))}">`)
     L.push('    <bpmn:extensionElements>')
     L.push(`      <zeebe:subscription correlationKey="=${CORRELATION_KEY_VARIABLE}"/>`)
@@ -636,10 +648,19 @@ export function bpmnFor (graph, opts = {}) {
   }
   L.push(`  <bpmn:process id="${xmlEscape(graph.id)}" isExecutable="true">`)
 
-  for (const id of nodes) {
+  // Scoping (#1673): an inner node of an embedded subProcess (`scopeOf`) is
+  // emitted INSIDE its container, as is every flow between inner nodes; a
+  // boundary event (`boundaryOf`) is attached to its task.
+  // Null-prototype copies: a node named `constructor` must not read an
+  // inherited Object.prototype member as its scope / attachment.
+  const scopeOf = Object.assign(Object.create(null), graph.scopeOf)
+  const boundaryOf = Object.assign(Object.create(null), graph.boundaryOf)
+  const flowScope = (e) => scopeOf[e.from]
+  const emitNode = (id, ind, out) => {
     const kind = graph.nodes[id]
     const el = KIND[kind].el
     const attrs = [`id="${xmlEscape(id)}"`]
+    if (boundaryOf[id]) attrs.push(`cancelActivity="true"`, `attachedToRef="${xmlEscape(boundaryOf[id])}"`)
     // A diverging gateway declares NO default flow: a default is only ever taken
     // when no outgoing condition matches, but every branch here is conditioned,
     // so a default would be provably unreachable and misrepresent the graph. An
@@ -648,27 +669,36 @@ export function bpmnFor (graph, opts = {}) {
     // and the rest `=false` — so one deterministic route is taken and the other
     // branch is still faithfully present (see the sequenceFlow loop below).
     const kids = []
-    for (const e of inFlows[id] ?? []) kids.push(`      <bpmn:incoming>${xmlEscape(e.id)}</bpmn:incoming>`)
-    for (const e of outFlows[id] ?? []) kids.push(`      <bpmn:outgoing>${xmlEscape(e.id)}</bpmn:outgoing>`)
-    if (kind === 'msg') {
-      kids.push(`      <bpmn:messageEventDefinition messageRef="${xmlEscape(messageId(id))}"/>`)
+    for (const e of inFlows[id] ?? []) kids.push(`${ind}  <bpmn:incoming>${xmlEscape(e.id)}</bpmn:incoming>`)
+    for (const e of outFlows[id] ?? []) kids.push(`${ind}  <bpmn:outgoing>${xmlEscape(e.id)}</bpmn:outgoing>`)
+    if (kind === 'msg' || kind === 'bmsg') {
+      kids.push(`${ind}  <bpmn:messageEventDefinition messageRef="${xmlEscape(messageId(id))}"/>`)
+    }
+    if (kind === 'timer' || kind === 'btimer') {
+      kids.push(
+        `${ind}  <bpmn:timerEventDefinition>`,
+        `${ind}    <bpmn:timeDuration xsi:type="bpmn:tFormalExpression">${TIMER_DURATION}</bpmn:timeDuration>`,
+        `${ind}  </bpmn:timerEventDefinition>`)
     }
     if (kind === 'task') {
       kids.unshift(
-        '      <bpmn:extensionElements>',
-        `        <zeebe:taskDefinition type="${xmlEscape(id)}"/>`,
-        '      </bpmn:extensionElements>')
+        `${ind}  <bpmn:extensionElements>`,
+        `${ind}    <zeebe:taskDefinition type="${xmlEscape(id)}"/>`,
+        `${ind}  </bpmn:extensionElements>`)
+    }
+    if (kind === 'sub') {
+      for (const inner of nodes.filter((n) => scopeOf[n] === id)) emitNode(inner, `${ind}  `, kids)
+      for (const e of graph.edges.filter((f) => flowScope(f) === id)) emitFlow(e, `${ind}  `, kids)
     }
     if (kids.length === 0) {
-      L.push(`    <bpmn:${el} ${attrs.join(' ')}/>`)
+      out.push(`${ind}<bpmn:${el} ${attrs.join(' ')}/>`)
     } else {
-      L.push(`    <bpmn:${el} ${attrs.join(' ')}>`)
-      L.push(...kids)
-      L.push(`    </bpmn:${el}>`)
+      out.push(`${ind}<bpmn:${el} ${attrs.join(' ')}>`)
+      out.push(...kids)
+      out.push(`${ind}</bpmn:${el}>`)
     }
   }
-
-  for (const e of graph.edges) {
+  const emitFlow = (e, ind, out) => {
     // A diverging gateway conditions ALL its outgoing flows and declares no
     // default. An inclusive (`or`) split makes every branch `=true`, so every
     // branch is taken and matches the scenario's scheduled tasks. An exclusive
@@ -695,39 +725,60 @@ export function bpmnFor (graph, opts = {}) {
       cond = taken.has(e.id) ? '=true' : '=false'
     }
     if (cond) {
-      L.push(`    <bpmn:sequenceFlow id="${xmlEscape(e.id)}" sourceRef="${xmlEscape(e.from)}" targetRef="${xmlEscape(e.to)}">`)
-      L.push(`      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${cond}</bpmn:conditionExpression>`)
-      L.push('    </bpmn:sequenceFlow>')
+      out.push(`${ind}<bpmn:sequenceFlow id="${xmlEscape(e.id)}" sourceRef="${xmlEscape(e.from)}" targetRef="${xmlEscape(e.to)}">`)
+      out.push(`${ind}  <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${cond}</bpmn:conditionExpression>`)
+      out.push(`${ind}</bpmn:sequenceFlow>`)
     } else {
-      L.push(`    <bpmn:sequenceFlow id="${xmlEscape(e.id)}" sourceRef="${xmlEscape(e.from)}" targetRef="${xmlEscape(e.to)}"/>`)
+      out.push(`${ind}<bpmn:sequenceFlow id="${xmlEscape(e.id)}" sourceRef="${xmlEscape(e.from)}" targetRef="${xmlEscape(e.to)}"/>`)
     }
   }
+  for (const id of nodes.filter((n) => !scopeOf[n])) emitNode(id, '    ', L)
+  for (const e of graph.edges.filter((f) => !flowScope(f))) emitFlow(e, '    ', L)
   L.push('  </bpmn:process>')
 
-  // BPMNDI
-  const rects = layout(graph)
+  // BPMNDI. One plane per scope (#1673): the process plane lays out the
+  // top-level nodes (a subProcess drawn COLLAPSED), and each subProcess gets
+  // its own plane for its inner chain — the bpmn-js convention for a
+  // collapsed subprocess. A boundary event is not laid out on its own: it
+  // sits on the bottom edge of the task it is attached to.
   const fmt = (v) => String(Math.round(v))
-  L.push(`  <bpmndi:BPMNDiagram id="${BPMN_DIAGRAM_ID}">`)
-  L.push(`    <bpmndi:BPMNPlane id="${BPMN_PLANE_ID}" bpmnElement="${xmlEscape(graph.id)}">`)
-  for (const id of nodes) {
-    const b = rects[id]
-    const marker = ['xor', 'or'].includes(graph.nodes[id]) ? ' isMarkerVisible="true"' : ''
-    L.push(`      <bpmndi:BPMNShape id="${xmlEscape(diId(id))}" bpmnElement="${xmlEscape(id)}"${marker}>`)
-    L.push(`        <dc:Bounds x="${fmt(b.x)}" y="${fmt(b.y)}" width="${fmt(b.w)}" height="${fmt(b.h)}"/>`)
-    L.push('      </bpmndi:BPMNShape>')
-  }
-  for (const e of graph.edges) {
-    L.push(`      <bpmndi:BPMNEdge id="${xmlEscape(diId(e.id))}" bpmnElement="${xmlEscape(e.id)}">`)
-    // Obstacles are every node except this edge's own endpoints, so routing
-    // keeps the segments out of unrelated shapes (a renderable diagram).
-    const obstacles = nodes.filter((id) => id !== e.from && id !== e.to).map((id) => rects[id])
-    for (const [x, y] of waypoints(rects[e.from], rects[e.to], obstacles)) {
-      L.push(`        <di:waypoint x="${fmt(x)}" y="${fmt(y)}"/>`)
+  const plane = (diagramId, planeId, element, scope) => {
+    const inScope = (n) => (scopeOf[n] ?? null) === scope
+    const laid = nodes.filter((n) => inScope(n) && !boundaryOf[n])
+    const laidSet = new Set(laid)
+    const rects = layout({ nodes: Object.fromEntries(laid.map((n) => [n, graph.nodes[n]])), edges: graph.edges.filter((e) => laidSet.has(e.from) && laidSet.has(e.to)) })
+    for (const n of nodes.filter((x) => inScope(x) && boundaryOf[x])) {
+      const t = rects[boundaryOf[n]]
+      const { w, h } = KIND[graph.nodes[n]]
+      rects[n] = { x: t.cx - w / 2, y: t.y + t.h - h / 2, w, h, cx: t.cx, cy: t.y + t.h }
     }
-    L.push('      </bpmndi:BPMNEdge>')
+    const shown = nodes.filter((n) => rects[n])
+    L.push(`  <bpmndi:BPMNDiagram id="${xmlEscape(diagramId)}">`)
+    L.push(`    <bpmndi:BPMNPlane id="${xmlEscape(planeId)}" bpmnElement="${xmlEscape(element)}">`)
+    for (const id of shown) {
+      const b = rects[id]
+      const marker = ['xor', 'or'].includes(graph.nodes[id]) ? ' isMarkerVisible="true"' : ''
+      const expanded = graph.nodes[id] === 'sub' ? ' isExpanded="false"' : ''
+      L.push(`      <bpmndi:BPMNShape id="${xmlEscape(diId(id))}" bpmnElement="${xmlEscape(id)}"${marker}${expanded}>`)
+      L.push(`        <dc:Bounds x="${fmt(b.x)}" y="${fmt(b.y)}" width="${fmt(b.w)}" height="${fmt(b.h)}"/>`)
+      L.push('      </bpmndi:BPMNShape>')
+    }
+    for (const e of graph.edges.filter((f) => rects[f.from] && rects[f.to] && (scopeOf[f.from] ?? null) === scope)) {
+      L.push(`      <bpmndi:BPMNEdge id="${xmlEscape(diId(e.id))}" bpmnElement="${xmlEscape(e.id)}">`)
+      // Obstacles are every node except this edge's own endpoints (and the
+      // task a boundary source sits on), so routing keeps the segments out of
+      // unrelated shapes (a renderable diagram).
+      const obstacles = shown.filter((id) => id !== e.from && id !== e.to && id !== boundaryOf[e.from]).map((id) => rects[id])
+      for (const [x, y] of waypoints(rects[e.from], rects[e.to], obstacles)) {
+        L.push(`        <di:waypoint x="${fmt(x)}" y="${fmt(y)}"/>`)
+      }
+      L.push('      </bpmndi:BPMNEdge>')
+    }
+    L.push('    </bpmndi:BPMNPlane>')
+    L.push('  </bpmndi:BPMNDiagram>')
   }
-  L.push('    </bpmndi:BPMNPlane>')
-  L.push('  </bpmndi:BPMNDiagram>')
+  plane(BPMN_DIAGRAM_ID, BPMN_PLANE_ID, graph.id, null)
+  for (const sub of nodes.filter((n) => graph.nodes[n] === 'sub')) plane(`${sub}_diagram`, `${sub}_plane`, sub, sub)
   L.push('</bpmn:definitions>')
   return L.join('\n') + '\n'
 }

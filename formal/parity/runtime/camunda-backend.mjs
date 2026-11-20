@@ -526,6 +526,22 @@ export class CamundaBackend {
     await this.#pinClock((this.pinnedClockMs ?? 0) + ms);
   }
 
+  // Cancel the running instance (#1673). The bare gateway learns an instance's
+  // key only from the jobs it activates (`handle.instanceKeys`); a scenario
+  // that cancels before any job was activated has no key to cancel, so it
+  // fails LOUDLY rather than leaving a live instance behind. Cancelled
+  // scenarios are nano-only in the generated corpus (the awaitCompletion
+  // create never answers `processCompleted` for them), so this is the
+  // interface-completeness path, not a differential one.
+  async cancelInstance(handle) {
+    if (handle.instanceKeys.size === 0) {
+      throw new Error("cancelInstance: no process instance key learned yet (no job was activated)");
+    }
+    for (const key of handle.instanceKeys) {
+      await this.#json("POST", `/process-instances/${key}/cancellation`, {}, "cancel process instance");
+    }
+  }
+
   async observe(handle) {
     const obs = emptyObservation();
     const result = await handle.pending;

@@ -181,17 +181,31 @@ export class NanoBackend {
     const pik = handle.processInstanceKey;
     const events = JSON.parse(this.engine.events());
     const obs = emptyObservation();
+    // Interrupted (terminated) element instances (#1673). nano's journal has
+    // no element-termination event: an activity interrupted by a boundary
+    // event is closed with `ElementCompleting`/`ElementCompleted` right after
+    // its job's `JobCanceled`. Zeebe records that as ELEMENT_TERMINATED, never
+    // a completion — so an element instance whose job was cancelled is not
+    // counted as completed here. (Whole-instance cancellation emits no
+    // per-element `ElementCompleted`, so it needs no translation.)
+    const jobElement = new Map();
+    const terminated = new Set();
 
     for (const ev of events) {
       if (String(ev.instance_key) !== pik) continue;
       switch (ev.type) {
+        case "JobCanceled":
+          if (jobElement.has(String(ev.job_key))) terminated.add(jobElement.get(String(ev.job_key)));
+          break;
         case "ElementCompleted":
+          if (terminated.has(String(ev.element_instance_key))) break;
           bump(obs.completedElements, ev.element_id);
           break;
         case "SequenceFlowTaken":
           bump(obs.sequenceFlows, `${ev.from}->${ev.to}`);
           break;
         case "JobCreated":
+          jobElement.set(String(ev.job_key), String(ev.element_instance_key));
           bump(obs.jobsCreated, ev.job_type);
           break;
         case "ProcessInstanceCompleted":
