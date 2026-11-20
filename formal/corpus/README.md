@@ -231,6 +231,11 @@ node formal/corpus/fuzz.mjs --seed 42 --labels task,timer --cancel-rate 0  # nar
   outgoing flow joins the task's at a merge-capable target). A random walk also
   **cancels** the instance with probability `--cancel-rate` (default 0.05) per
   step (`cancelInstance`; a cancelled scenario is nano-only, like a stuck one).
+  A scenario that **ticks** is nano-only too: the bare-gateway Camunda backend
+  has no timer-readiness barrier, so a tick could overtake the timer it fires.
+  A tick that re-activates a routed gateway is preceded by a `setVariables`
+  step carrying that gateway's route suffix, and a message **boundary**
+  correlation takes the same settlement barrier (`settled`) as a catch's.
   `--labels` picks the wait-state labels drawn (default: all). The Reference
   models each: a tick fires every due timer atomically, an interrupting boundary
   terminates its task (never completed), the container completes when its inner

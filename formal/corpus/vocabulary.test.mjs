@@ -191,3 +191,42 @@ test('fuzz: a boundary edge shrinks to a task edge, then to a direct one', () =>
   assert.ok(labels.includes('task'))
   assert.ok(labels.includes('direct'))
 })
+
+// #1731 review: a timer tick that re-activates a routed gateway must deliver
+// that gateway's route suffix BEFORE the tick (the tick carries no variables).
+// Gen_499477cf0f's shape: the boundary timer's tick re-enters G3, whose second
+// activation reads the next route entry.
+test('a tick re-activating a routed gateway delivers its route suffix first', () => {
+  const g = materialize({ kinds: ['and', 'xor', 'evt'], edges: [[0, 1, 'direct'], [1, 2, 'direct'], [2, 3, 'direct'], [1, 2, 'btimer'], [2, 4, 'direct'], [3, 4, 'msg'], [3, 4, 'msg']] })
+  const { scenarios } = scenariosFor(g)
+  let checked = 0
+  for (const sc of scenarios) {
+    const route = sc.run.route.route_G3
+    // Only a CHANGED head needs delivery (an identical suffix is already held).
+    if (!route || route.length < 2 || JSON.stringify(route[0]) === JSON.stringify(route[1])) continue
+    const t = sc.steps.findIndex((s) => s.op === 'advanceTime')
+    if (t < 0 || sc.run.steps.findIndex((c) => c.op === 'tick') !== 0) continue
+    // The tick is the first command: G3's create-time head is in the start
+    // variables, and the tick-driven activation's suffix rides a setVariables.
+    assert.deepEqual(sc.steps[t - 1], { op: 'setVariables', variables: { route_G3: route.slice(1) } }, sc.name)
+    checked++
+  }
+  assert.ok(checked > 0, 'a tick-first run with two G3 activations exists')
+})
+
+test('a scenario that ticks is nano-only (Camunda has no timer-readiness barrier)', () => {
+  for (const g of [graphOf([[0, 1, 'timer']]), graphOf([[0, 1, 'btimer']])]) {
+    for (const sc of scenariosFor(g).scenarios) {
+      const ticks = sc.steps.some((s) => s.op === 'advanceTime')
+      assert.deepEqual(sc.backends, ticks ? ['nano'] : undefined, sc.name)
+    }
+  }
+})
+
+test('a message boundary correlation carries a settlement barrier like a catch', () => {
+  // T1 interrupted by M -> T2: the correlation creates T2, the job barrier.
+  const g = materialize({ kinds: ['xor'], edges: [[0, 1, 'bmsg'], [1, 2, 'task']] })
+  const fired = scenariosFor(g).scenarios.filter((s) => s.run.steps[0].op === 'correlateBoundary')
+  assert.ok(fired.length > 0)
+  for (const sc of fired) assert.ok(sc.steps[0].settled, `${sc.name}: boundary publish has no settled barrier`)
+})

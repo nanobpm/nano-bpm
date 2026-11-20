@@ -977,6 +977,8 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
     // The variables the PROCESS produced (the oracle's `variables`): the start
     // variables minus the routing schedule the driver fed in.
     const expectVariables = Object.fromEntries(Object.entries(variables).filter(([k]) => !k.startsWith('route_')))
+    // Set when a step has no Camunda settlement barrier (a timer tick).
+    let nanoOnly = false
     for (const c of run.steps) {
       // A command's completion drains every queued activation in ONE settle —
       // including a CHAIN of gateways (T1 -> G1 -> G2) that all route before the
@@ -1041,13 +1043,35 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
         // Advance the virtual clock one tick (#1673). The driver's advanceTime
         // moves BOTH engines' pinned clocks by the same tick; due timers are
         // released by the engine. The step is a no-op when no timer is armed.
+        //
+        // A tick that (re)activates a routed gateway (a timer catch / boundary
+        // leading to one) must deliver that gateway's route suffix BEFORE the
+        // timer fires — the tick carries no variables of its own, so the
+        // suffix rides a `setVariables` step placed immediately ahead of it
+        // (#1673 review: discarding `cmdVars` here left the gateway reading
+        // its previous route).
+        // (A suffix the start variables can still carry was already placed
+        // there above; `cmdVars` holds only mid-run deliveries.)
+        if (Object.keys(cmdVars).length > 0) steps.push({ op: 'setVariables', variables: cmdVars })
         steps.push({ op: 'advanceTime', ms: TIMER_TICK_MS })
+        // The bare-gateway Camunda backend has NO timer-readiness barrier: its
+        // create is in flight under awaitCompletion and a job completion's or
+        // clock update's response does not acknowledge that the next timer is
+        // armed, so a tick can overtake the timer it is meant to fire (#1673
+        // review). Until a query-API barrier exists, a scenario that ticks is
+        // observed by nano only — never a false Camunda divergence.
+        nanoOnly = true
       } else if (c.op === 'correlateBoundary') {
         // An interrupting MESSAGE boundary (#1673): correlate its message. The
         // boundary's subscription is keyed on the scenario correlation key,
         // exactly like a catch event's.
+        // It takes the SAME settlement barrier as a catch correlation (#1673
+        // review): without one Camunda can run the next command before the
+        // boundary interrupts its task.
         const step = { op: 'publishMessage', name: messageName(graph.id, c.node), correlationKey: name }
         if (Object.keys(cmdVars).length > 0) step.variables = cmdVars
+        const settled = messageSettlement(seeded, after)
+        if (settled) step.settled = settled
         steps.push(step)
       } else if (c.op === 'cancel') {
         // Instance cancellation (#1673): the driver cancels the instance. The
@@ -1058,41 +1082,9 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
       } else {
         const step = { op: 'publishMessage', name: messageName(graph.id, c.catch), correlationKey: name }
         if (Object.keys(cmdVars).length > 0) step.variables = cmdVars
-        // The barrier must be a job THIS correlation creates, not a task that
-        // was already waiting: `barrierJob()` returns the sole waiting task,
-        // but when the catch leads straight to the end event the correlation
-        // activates no job — it only leaves a PRE-EXISTING task as the sole
-        // wait. Long-polling that pre-existing job is no barrier: Camunda can
-        // activate and release it before the message correlates, letting the
-        // next command run before the message-first step settles (#1246
-        // review). Only a job whose count the correlation INCREASED is created
-        // by it; otherwise the correlation produces no job and the driver
-        // relies on the awaitCompletion create settling as the barrier.
-        //
-        // The count increase is NOT sufficient on its own: when a job of the
-        // SAME type was ALREADY waiting at the time of the correlation
-        // (`seeded.waiting[b] > 0`), Camunda's type-only activation can return
-        // that OLDER job before the message correlates, so the type barrier
-        // still does not acknowledge THIS correlation (#1246 review). Use the
-        // job-type barrier only when NO job of that type was waiting; otherwise
-        // fall through to the `settled.ack` correlation acknowledgement below.
-        const createdByCorrelation = (b) => b &&
-          (after.jobsCreated[b] ?? 0) > (seeded.jobsCreated[b] ?? 0) &&
-          (seeded.waiting[b] ?? 0) === 0
-        const barrier = after.barrierJob()
-        if (createdByCorrelation(barrier)) {
-          step.settled = { jobType: barrier }
-        } else if (!after.completed) {
-          // The correlation created no job but the instance SURVIVES (a
-          // parallel branch is still running): there is no correlation-created
-          // job to barrier on and no completion to await, so without an
-          // acknowledgement the driver advances while the buffered message is
-          // in flight and Camunda can run the next command (complete the
-          // still-waiting task) BEFORE the message correlates — inverting the
-          // scripted order (#1246 review). Ask the backend to acknowledge the
-          // correlation before advancing.
-          step.settled = { ack: true }
-        }
+        // Settlement barrier: see `messageSettlement`.
+        const settled = messageSettlement(seeded, after)
+        if (settled) step.settled = settled
         steps.push(step)
       }
       state = state.apply(c)
@@ -1134,10 +1126,33 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
       // by nano only: the bare-gateway Camunda backend learns an instance's
       // outcome through its awaitCompletion create response, which a stuck or
       // cancelled instance never answers with `processCompleted: true`.
-      ...(run.completed ? {} : { backends: ['nano'] })
+      ...(run.completed && !nanoOnly ? {} : { backends: ['nano'] })
     })
   })
   return { scenarios, skipped: 0 }
+}
+
+/**
+ * The Camunda settlement barrier for a message correlation — a catch event's
+ * OR an interrupting boundary's (#1673 review: one selection for every
+ * message step, so no message kind can skip it).
+ *
+ * The barrier must be a job THIS correlation creates, not a task that was
+ * already waiting: long-polling a pre-existing job is no barrier, since Camunda
+ * can activate and release it before the message correlates (#1246 review).
+ * Only a job whose count the correlation INCREASED is created by it — and only
+ * when NO job of that type was already waiting, since type-only activation
+ * could return the older job. Otherwise, while the instance survives, ask the
+ * backend to acknowledge the correlation (`ack`); a correlation that completes
+ * the instance is settled by the awaitCompletion create.
+ */
+export function messageSettlement (seeded, after) {
+  const b = after.barrierJob()
+  if (b && (after.jobsCreated[b] ?? 0) > (seeded.jobsCreated[b] ?? 0) && (seeded.waiting[b] ?? 0) === 0) {
+    return { jobType: b }
+  }
+  if (!after.completed) return { ack: true }
+  return null
 }
 
 // The reference's taken-flow multiset in the observation vocabulary: nano's
