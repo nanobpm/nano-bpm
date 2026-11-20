@@ -1324,3 +1324,309 @@ fn terminating_a_call_activity_terminates_its_suspended_child() {
         "a suspended child must not outlive its terminated call activity"
     );
 }
+
+/// #1536 review: the call activity's input-local variable scope must hang off
+/// the call activity's real enclosing scope — the scope its activation is
+/// planned in — even though that activation is not yet applied when the input
+/// locals are journaled. Asserts the class invariant for every live call
+/// activity that carries child processes: its variable-scope parent equals its
+/// flow scope.
+fn assert_call_scopes_hang_off_their_flow_scope(engine: &Engine, parent_key: Key) {
+    let inst = engine
+        .state
+        .instances
+        .get(&parent_key)
+        .expect("parent live");
+    let call_eiks: Vec<Key> = engine
+        .state
+        .instances
+        .values()
+        .filter(|i| i.parent_process_instance_key == Some(parent_key))
+        .filter_map(|i| i.parent_element_instance_key)
+        .collect();
+    assert!(!call_eiks.is_empty(), "a child process is running");
+    for call_eik in call_eiks {
+        let flow_scope = inst.scopes.get(&call_eik).copied().unwrap_or(0);
+        assert_eq!(
+            inst.scope_parents.get(&call_eik).copied(),
+            Some(flow_scope),
+            "call activity {call_eik}'s variable scope must hang off its flow scope"
+        );
+    }
+}
+
+fn parked_callee() -> ProcessDefinition {
+    ProcessBuilder::new("callee")
+        .start_event("cs")
+        .service_task("cw", "callee-work")
+        .end_event("ce")
+        .connect("cs", "cw")
+        .connect("cw", "ce")
+        .build()
+        .unwrap()
+}
+
+fn input_io(source: &str, target: &str) -> crate::model::IoMapping {
+    crate::model::IoMapping {
+        inputs: vec![crate::model::Mapping {
+            source: source.to_string(),
+            target: target.to_string(),
+        }],
+        outputs: Vec::new(),
+    }
+}
+
+#[test]
+fn call_activity_input_locals_in_a_sub_process_keep_the_enclosing_scope() {
+    let def = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io("sub", input_io("=5", "subLocal"))
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .call_activity("c1", "callee")
+        .contained_in("c1", "sub")
+        .with_io("c1", input_io("=subLocal", "fromSub"))
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "c1")
+        .connect("c1", "sub_end")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(parked_callee()))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+    assert_call_scopes_hang_off_their_flow_scope(&engine, parent_key);
+}
+
+#[test]
+fn multi_instance_call_activity_input_locals_keep_the_body_scope() {
+    let def = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("each", "callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .with_io("each", input_io("=item", "fromItem"))
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(parked_callee()))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+    assert_call_scopes_hang_off_their_flow_scope(&engine, parent_key);
+    // The per-child `item` binding is still readable by the callee seed.
+    let jobs = engine.activate_jobs("callee-work", "W", 10, 60_000, 0);
+    let mut seeded: Vec<_> = jobs
+        .iter()
+        .map(|j| j.variables.get("fromItem").cloned())
+        .collect();
+    seeded.sort_by_key(|v| format!("{v:?}"));
+    assert_eq!(seeded, vec![Some(Value::Int(1)), Some(Value::Int(2))]);
+}
+
+#[test]
+fn call_activity_spawn_retry_applies_input_mappings_exactly_once() {
+    // An undeployed callee parks a spawn incident; the retry must not evaluate
+    // `n := n + 1` against the first attempt's own result (1 -> 2, never 3).
+    let def = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "callee")
+        .with_io("c1", input_io("=n + 1", "n"))
+        .end_event("done")
+        .connect("start", "c1")
+        .connect("c1", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("n", Value::Int(1))]),
+        ))
+        .unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    let incident_key = active[0].key;
+    engine
+        .apply_command(Command::DeployProcess(parked_callee()))
+        .unwrap();
+    engine
+        .apply_command(Command::ResolveIncident { incident_key })
+        .unwrap();
+    assert!(engine.active_incidents().is_empty());
+    let jobs = engine.activate_jobs("callee-work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].variables.get("n"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn call_activity_spawn_retry_callee_expression_ignores_input_locals() {
+    // The input mapping writes `callee`; on retry the `=callee` expression must
+    // still resolve against the pre-input view, as on the first attempt.
+    let def = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "=callee")
+        .with_io("c1", input_io("=\"WRONG\"", "callee"))
+        .end_event("done")
+        .connect("start", "c1")
+        .connect("c1", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("callee", Value::Str("callee".into()))]),
+        ))
+        .unwrap();
+    let incident_key = engine.active_incidents()[0].key;
+    engine
+        .apply_command(Command::DeployProcess(parked_callee()))
+        .unwrap();
+    engine
+        .apply_command(Command::ResolveIncident { incident_key })
+        .unwrap();
+    assert!(engine.active_incidents().is_empty());
+    assert_eq!(
+        engine
+            .activate_jobs("callee-work", "W", 10, 60_000, 0)
+            .len(),
+        1
+    );
+}
+
+/// Deploys `orch`: start -> c1 (call "callee", output `echo := x`) -> wait
+/// (service task "after") -> done, and drives the callee to completion.
+fn run_output_mapped_call_to_downstream_wait(
+    parent_vars: &[(&str, Value)],
+    child_result: &[(&str, Value)],
+) -> (Engine, Key, Key, Vec<Event>) {
+    let def = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "callee")
+        .with_io(
+            "c1",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=x".to_string(),
+                    target: "echo".to_string(),
+                }],
+            },
+        )
+        .service_task("wait", "after")
+        .end_event("done")
+        .connect("start", "c1")
+        .connect("c1", "wait")
+        .connect("wait", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(parked_callee()))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with("orch", vars(parent_vars)))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+    let call_eik = engine
+        .state
+        .instances
+        .values()
+        .find(|i| i.parent_process_instance_key == Some(parent_key))
+        .and_then(|i| i.parent_element_instance_key)
+        .expect("child running");
+    let jobs = engine.activate_jobs("callee-work", "W", 10, 60_000, 0);
+    let completed = engine
+        .apply_command(Command::complete_job_with_result(
+            jobs[0].key,
+            vars(child_result),
+            Default::default(),
+        ))
+        .unwrap();
+    (engine, parent_key, call_eik, completed)
+}
+
+#[test]
+fn call_activity_local_merge_compares_against_the_call_scope_only() {
+    // Parent `x = 1`, no input for `x`, child returns `x = 1`: the call activity
+    // has no LOCAL `x`, so `mergeLocalDocument` still creates it locally.
+    let (_engine, parent_key, call_eik, completed) =
+        run_output_mapped_call_to_downstream_wait(&[("x", Value::Int(1))], &[("x", Value::Int(1))]);
+    assert!(
+        completed.iter().any(|e| matches!(
+            e,
+            Event::ScopedVariablesUpdated { instance_key, scope_key, variables }
+                if *instance_key == parent_key
+                    && *scope_key == call_eik
+                    && variables.get("x") == Some(&Value::Int(1))
+        )),
+        "the child's x is merged local to the call activity"
+    );
+}
+
+#[test]
+fn call_activity_local_merge_precedes_completion_and_leaves_no_scope_behind() {
+    let (mut engine, parent_key, call_eik, completed) =
+        run_output_mapped_call_to_downstream_wait(&[], &[("x", Value::Int(7))]);
+    let merge = completed
+        .iter()
+        .position(|e| {
+            matches!(e, Event::ScopedVariablesUpdated { scope_key, .. } if *scope_key == call_eik)
+        })
+        .expect("local merge journaled");
+    let done = completed
+        .iter()
+        .position(|e| {
+            matches!(e, Event::ElementCompleted { element_instance_key, .. }
+                if *element_instance_key == call_eik)
+        })
+        .expect("call activity completed");
+    assert!(merge < done, "the local merge precedes the completion");
+    let inst = engine
+        .state
+        .instances
+        .get(&parent_key)
+        .expect("parked on wait");
+    assert!(!inst.scope_variables.contains_key(&call_eik));
+    assert!(!inst.scope_parents.contains_key(&call_eik));
+    assert_eq!(
+        engine.activate_jobs("after", "W", 10, 60_000, 0)[0]
+            .variables
+            .get("echo"),
+        Some(&Value::Int(7))
+    );
+}

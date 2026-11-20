@@ -9669,6 +9669,13 @@ impl Engine {
                     &called_process_id,
                     propagate_all_parent_variables,
                     &element_vars,
+                    // `activate` registers a listener-bearing element's scope
+                    // earlier in this batch (#1437).
+                    if self.has_execution_listeners(instance_key, &element_id) {
+                        call_activity::CallScope::PreRegistered
+                    } else {
+                        call_activity::CallScope::Under(scope)
+                    },
                 );
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
@@ -10589,6 +10596,9 @@ impl Engine {
                     &called_process_id,
                     propagate_all_parent_variables,
                     child_vars,
+                    // `MultiInstanceChildActivated` registers the child's scope
+                    // under the body earlier in this batch.
+                    call_activity::CallScope::PreRegistered,
                 );
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
