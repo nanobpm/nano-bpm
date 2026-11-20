@@ -107,6 +107,13 @@ claimed by wildcard rules: `element:<BpmnClass>`, `event:<position>:<kind>`,
 counterpart of the per-site `failure:` cells: it records that an error type
 exists, while `failure:` records every site that raises it.
 
+`lifecycle:` is **per-element** (#1526): a rule claiming a `lifecycle:` cell
+must name the element type literally (`lifecycle:MULTI_INSTANCE_BODY:*` is
+fine, `lifecycle:*` is rejected by `check.mjs`). A family-wide wildcard once hid
+every element's lifecycle — all multi-instance cells included — behind one
+line; per-element rules keep each element family's gap separately visible and
+separately burnable.
+
 ## Files
 
 | File | Role |
