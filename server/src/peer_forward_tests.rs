@@ -632,7 +632,8 @@ async fn join_from_incompatible_binary_is_rejected_once_feature_is_in_use() {
 /// truth the boundary table is derived from at build time) declares v0.0.28
 /// `upgrade-boundary` entries (#1244 fork/join order, #1402
 /// `GatewayRouteSelected`), so 0.0.27 and 0.0.28 members must never share a
-/// cluster. A join WITHIN one boundary region still succeeds.
+/// cluster. Later boundaries (e.g. v0.0.29, #1528) are read from the ledger,
+/// never hard-coded here. A join WITHIN one boundary region still succeeds.
 ///
 /// Drives the `/cluster` handshake at the HTTP level so each side presents
 /// its own version header: the acceptor's answer always carries this build's
@@ -697,14 +698,10 @@ async fn a_mixed_version_join_across_an_upgrade_boundary_is_refused() {
         assert!(msg.contains(needle), "the refusal names {needle:?}: {msg}");
     }
     // Within the same boundary region the join still succeeds (both at the
-    // boundary release), and a NEWER release joins this boundary-release
-    // acceptor (no declared boundary above v0.0.28).
+    // boundary release).
     dial_with_version(&url, Some("0.0.28"))
         .await
         .expect("same-version members join");
-    dial_with_version(&url, Some("0.0.29"))
-        .await
-        .expect("no boundary above v0.0.28: a newer member joins");
     // A pre-#1702 binary (no version header) dialing the boundary release is
     // refused closed: it may be pre-boundary, and the boundary release cannot
     // tell (it is the first release that advertises versions).
@@ -720,6 +717,20 @@ async fn a_mixed_version_join_across_an_upgrade_boundary_is_refused() {
     for needle in ["unknown", "0.0.28"] {
         assert!(msg.contains(needle), "the refusal names {needle:?}: {msg}");
     }
+    // A NEWER release joins an acceptor at the NEWEST declared boundary (no
+    // boundary lies above it). Derived from the ledger, not a hard-coded
+    // pair: a later boundary (e.g. v0.0.29, #1528) must not stale this check.
+    let newest = cj::UPGRADE_BOUNDARIES
+        .last()
+        .expect("the ledger declares at least the v0.0.28 boundary")
+        .version;
+    let (maj, min, patch) = cj::parse_release_triple(newest).expect("boundary is a release triple");
+    let past_newest: &'static str = format!("{maj}.{min}.{}", patch + 1).leak();
+    cj::set_advertised_version_override(Some(newest));
+    dial_with_version(&url, Some(past_newest))
+        .await
+        .expect("no boundary above the newest: a newer member joins");
+    cj::set_advertised_version_override(Some("0.0.28"));
 
     // Dialer side, through the REAL `PeerLink::connect_as` (#1702 review):
     // an acceptor that PERMITS the upgrade but answers a release across the
@@ -752,9 +763,19 @@ async fn a_mixed_version_join_across_an_upgrade_boundary_is_refused() {
         Ok(_) => panic!("a versionless acceptor must be refused by a release dialer"),
         Err(e) => e.to_string(),
     };
+    // The fail-closed error names the newest boundary at or below the
+    // dialer's own release (v0.0.29 here), derived from the ledger so a later
+    // boundary (#1528 declares v0.0.29) cannot stale it.
+    let dialer = cj::parse_release_triple("0.0.29").expect("triple");
+    let expected_boundary = cj::UPGRADE_BOUNDARIES
+        .iter()
+        .rev()
+        .find(|b| cj::parse_release_triple(b.version).is_some_and(|v| v <= dialer))
+        .expect("a boundary at or below the dialer")
+        .version;
     assert!(
-        err.contains("unknown") && err.contains("0.0.28"),
-        "the fail-closed error names the boundary: {err}"
+        err.contains("unknown") && err.contains(expected_boundary),
+        "the fail-closed error names boundary v{expected_boundary}: {err}"
     );
 
     // The gateway's own pre-#1702 model (version advertisement cleared,
