@@ -26,6 +26,7 @@ export interface ShapeModdleElement {
   optional?: boolean;
   list?: boolean;
   spread?: boolean;
+  description?: string;
   key?: string;
   value?: string;
   shapes?: ShapeModdleElement[];
@@ -57,6 +58,7 @@ export type ShapeOp =
       type: string;
       optional?: boolean;
       list?: boolean;
+      description?: string;
     }
   | {
       op: "reference";
@@ -64,6 +66,7 @@ export type ShapeOp =
       ref: string;
       spread?: boolean;
       list?: boolean;
+      description?: string;
     };
 
 /** A composed motion-shape declaration carried on the process (mirrors the reifier). */
@@ -83,7 +86,9 @@ export interface EnvelopeShapeField {
 /**
  * The flat scalar field list of a shape, or `null` if the shape uses any op the
  * flat envelope field editor can't round-trip losslessly — composition
- * (`carry`/`project`/`reference`) or a `list` field. Drives both whether the
+ * (`carry`/`project`/`reference`), a `list` field, or a field carrying a
+ * `description` (the flat editor has no description column, so saving would
+ * drop it — and the description feeds the MCP tool `inputSchema`, #1738). Drives both whether the
  * picker offers "Edit fields…" and the editor's pre-fill: an empty shape or one
  * with a single non-`extend` op returns `null` so those types stay in the shape
  * composer instead of silently losing ops on save.
@@ -93,7 +98,7 @@ export function envelopeEditableFields(
 ): EnvelopeShapeField[] | null {
   if (!shape || shape.ops.length === 0) return null;
   const fields = shape.ops.flatMap((o) =>
-    o.op === "extend" && !o.list
+    o.op === "extend" && !o.list && !o.description
       ? [{ name: o.name, type: o.type, optional: !!o.optional }]
       : [],
   );
@@ -169,6 +174,8 @@ function readOp(el: ShapeModdleElement): ShapeOp | undefined {
       const op: ShapeOp = { op: "extend", name, type };
       if (el.optional) op.optional = true;
       if (el.list) op.list = true;
+      const description = el.description?.trim();
+      if (description) op.description = description;
       return op;
     }
     case "Reference": {
@@ -177,6 +184,8 @@ function readOp(el: ShapeModdleElement): ShapeOp | undefined {
       const op: ShapeOp = { op: "reference", name, ref };
       if (el.spread) op.spread = true;
       if (el.list) op.list = true;
+      const description = el.description?.trim();
+      if (description) op.description = description;
       return op;
     }
     default:
@@ -232,6 +241,7 @@ function buildOp(
       const attrs: Record<string, unknown> = { name: op.name, type: op.type };
       if (op.optional) attrs.optional = true;
       if (op.list) attrs.list = true;
+      if (op.description) attrs.description = op.description;
       el = moddle.create(OP_TYPE.extend, attrs);
       break;
     }
@@ -239,6 +249,7 @@ function buildOp(
       const attrs: Record<string, unknown> = { name: op.name, ref: op.ref };
       if (op.spread) attrs.spread = true;
       if (op.list) attrs.list = true;
+      if (op.description) attrs.description = op.description;
       el = moddle.create(OP_TYPE.reference, attrs);
       break;
     }

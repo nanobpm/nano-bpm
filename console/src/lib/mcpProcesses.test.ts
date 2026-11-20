@@ -27,6 +27,62 @@ test("inputRows lists declared inputs first and businessId last", () => {
   assert.equal(rows[1].description, "");
 });
 
+test("inputRows flattens a nested data-envelope schema (#1738)", () => {
+  const rows = inputRows({
+    type: "object",
+    properties: {
+      businessId: { type: "string" },
+      customer: {
+        type: "object",
+        properties: { email: { type: "string" } },
+        required: ["email"],
+      },
+      lines: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { qty: { type: "integer" } },
+          required: ["qty"],
+        },
+      },
+      placed: { type: "string", format: "date-time" },
+    },
+    required: ["customer"],
+  });
+  assert.deepEqual(
+    rows.map((r) => [r.name, r.type, r.required, r.reserved]),
+    [
+      ["customer", "object", true, false],
+      ["customer.email", "string", true, false],
+      ["lines", "array<object>", false, false],
+      ["lines[].qty", "integer", true, false],
+      ["placed", "string (date-time)", false, false],
+      ["businessId", "string", false, true],
+    ],
+  );
+});
+
+test("inputRows quotes non-identifier names so distinct paths never collide", () => {
+  const rows = inputRows({
+    type: "object",
+    properties: {
+      "customer.email": { type: "string" },
+      customer: {
+        type: "object",
+        properties: { email: { type: "string" }, "a[]": { type: "number" } },
+      },
+    },
+  });
+  const names = rows.map((r) => r.name);
+  assert.deepEqual(names, [
+    '["customer.email"]',
+    "customer",
+    "customer.email",
+    'customer["a[]"]',
+  ]);
+  assert.equal(new Set(names).size, names.length);
+});
+
 test("inputRows tolerates a missing schema", () => {
   assert.deepEqual(inputRows(undefined), []);
   assert.deepEqual(inputRows({}), []);

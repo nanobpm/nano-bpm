@@ -1,0 +1,20 @@
+[package]
+name = "nano-data-envelope"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The data-envelope / composed-shape model scan (ADR 0040), extracted from the
+# console crate so the always-built gateway can consume the SAME parser: the
+# `/mcp/processes` server derives a process tool's `inputSchema` from the start
+# message's data envelope (issue #1738), while the console reifier keeps using
+# it for typed-worker codegen. One parser, one shape model, two consumers.
+
+[dependencies]
+nanobpmn-engine-core = { path = "../../../engine-core" }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

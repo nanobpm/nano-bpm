@@ -45,7 +45,7 @@ use tokio::sync::broadcast;
 pub mod agent_brief;
 pub mod config;
 pub mod connectors;
-mod envelope_scan;
+use nano_data_envelope as envelope_scan;
 pub mod extensions;
 pub mod projects;
 pub mod pty;

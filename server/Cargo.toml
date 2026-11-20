@@ -22,6 +22,9 @@ validator = "0.20"
 # spec-console/console-api.yaml. Only needed with the `console` feature.
 nanobpm-console-api = { path = "../generated-console", optional = true }
 nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
+# The data-envelope shape model scan (ADR 0040): `/mcp/processes` derives a
+# tool inputSchema from the start message envelope (issue #1738).
+nano-data-envelope = { path = "crates/nano-data-envelope" }
 # The shared SQLite read model (CQRS query side), extracted so the same
 # projection + read queries compile both here (native/bundled C SQLite) and for
 # the in-browser WASM test engine. The gateway consumes the `native` backend.

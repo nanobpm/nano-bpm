@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:nano="https://nanobpm.io/schema/shapes/1.0" id="Definitions_envelope" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="mcpProcessWithEnvelope" name="MCP Process With Envelope" isExecutable="true">
+    <bpmn:extensionElements>
+      <nano:shapes>
+        <nano:shape id="PlaceOrder" name="Place order">
+          <nano:extend name="orderId" type="string" description="The order id." />
+          <nano:extend name="note" type="string" optional="true" />
+          <nano:reference name="customer" ref="Customer" description="Who is ordering." />
+          <nano:reference name="lines" ref="OrderLine" list="true" description="The order lines." />
+        </nano:shape>
+        <nano:shape id="Customer">
+          <nano:extend name="email" type="string" />
+        </nano:shape>
+        <nano:shape id="OrderLine">
+          <nano:extend name="sku" type="string" />
+          <nano:extend name="qty" type="integer" />
+        </nano:shape>
+      </nano:shapes>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="StartEvent_1" name="Place order tool triggered">
+      <bpmn:extensionElements>
+        <zeebe:properties>
+          <zeebe:property name="io.camunda.tool:name" value="place-order" />
+          <zeebe:property name="io.camunda.tool:purpose" value="Place an order." />
+          <zeebe:property name="io.camunda.tool:input_1_name" value="legacy" />
+          <zeebe:property name="io.camunda.tool:input_1_type" value="string" />
+          <zeebe:property name="io.camunda.tool:input_1_required" value="true" />
+        </zeebe:properties>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_1" messageRef="Message_place_order" />
+    </bpmn:startEvent>
+    <bpmn:endEvent id="EndEvent_1">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="StartEvent_1" targetRef="EndEvent_1" />
+  </bpmn:process>
+  <bpmn:message id="Message_place_order" name="place-order">
+    <bpmn:extensionElements>
+      <zeebe:properties>
+        <zeebe:property name="io.nanobpm.dataEnvelope.in" value="PlaceOrder" />
+      </zeebe:properties>
+    </bpmn:extensionElements>
+  </bpmn:message>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="mcpProcessWithEnvelope">
+      <bpmndi:BPMNShape id="StartEvent_1_di" bpmnElement="StartEvent_1">
+        <dc:Bounds x="150" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_1_di" bpmnElement="EndEvent_1">
+        <dc:Bounds x="242" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1">
+        <di:waypoint x="186" y="118" />
+        <di:waypoint x="242" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
