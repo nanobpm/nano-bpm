@@ -18377,7 +18377,7 @@ impl ServerImpl {
                     let hosted = if deferred {
                         // A fresh receiver (empty log/vote/committed) so the
                         // incumbent never meets a divergent committed prefix (#1454).
-                        crate::raft::RaftPartition::bootstrap_fresh_receiver(
+                        crate::raft::RaftPartition::bootstrap_receiver_healing(
                             me,
                             p,
                             engine,
@@ -20565,7 +20565,7 @@ impl ServerImpl {
         let evict_terminal = self.engine.local_for_partition(p).is_none();
         // A fresh receiver: empty log, vote and committed state, so the new leader
         // never meets a divergent committed prefix (issue #1454).
-        match RaftPartition::bootstrap_fresh_receiver(me, p, engine, transport, evict_terminal)
+        match RaftPartition::bootstrap_receiver_healing(me, p, engine, transport, evict_terminal)
             .await
         {
             Ok(part) => {
@@ -20757,7 +20757,7 @@ impl ServerImpl {
         let rebuilt_fresh = log_dir.is_none();
         let rebuilt = match log_dir {
             None => {
-                RaftPartition::bootstrap_fresh_receiver(me, p, engine, transport, evict_terminal)
+                RaftPartition::bootstrap_receiver_healing(me, p, engine, transport, evict_terminal)
                     .await
             }
             dir @ Some(_) => {

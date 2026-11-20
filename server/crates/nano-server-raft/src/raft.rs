@@ -57,7 +57,7 @@ use std::io::Write as _;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -1414,6 +1414,15 @@ pub struct PartitionStateMachine {
     /// The engine journal's durable dir the marker was resolved from (kept so
     /// a continuation member re-resolves the identical path).
     journal_durable_dir: Option<PathBuf>,
+    /// Recovery-only mode (#1701): set by
+    /// [`RaftPartition::bootstrap_recovery_receiver`] for a member booted over a
+    /// divergence-marked partition. While set, every entry `apply` is refused
+    /// BEFORE it touches the engine (the local, known-diverged state is never
+    /// extended) and only a leader `InstallSnapshot` is accepted. Cleared only
+    /// once that snapshot is adopted, checkpointed as the journal's recovery
+    /// base AND the crash-durable marker is cleared — after which the member
+    /// continues as a normal replica.
+    recovering: Arc<AtomicBool>,
     /// This node's id, compared against [`leader`](Self::leader) so `apply` can
     /// tell whether it is currently the leader of this partition.
     node_id: NodeId,
@@ -1540,6 +1549,7 @@ impl PartitionStateMachine {
                 partition_id,
             ),
             journal_durable_dir,
+            recovering: Arc::default(),
             snapshot_dir,
             node_id,
             evict_eligible,
@@ -2152,6 +2162,10 @@ impl PartitionStateMachine {
             }
             clear_divergence_marker(self.marker())
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            // The authoritative state is adopted, checkpointed and the marker
+            // durably cleared: a recovery-only member (#1701) now continues
+            // as a normal replica and applies the leader's log from here on.
+            self.recovering.store(false, Ordering::SeqCst);
         }
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2557,6 +2571,23 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                 "apply a Raft entry",
             )
         })?;
+        // Recovery-only member (#1701): refuse every entry BEFORE touching the
+        // engine. Its local state is known-diverged; only an authoritative
+        // leader snapshot may replace it, so nothing is applied on top of it.
+        // The refusal is a fatal `StorageError` (the core stops, the
+        // supervisor rebuilds the member, still in recovery) — never a silent
+        // skip that would advance `last_applied` past unapplied entries.
+        if self.recovering.load(Ordering::SeqCst) {
+            return Err(StorageError::from_io_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                std::io::Error::other(format!(
+                    "partition {}: recovery-only member refuses to apply log entries until \
+                     the leader's snapshot is installed (#1701)",
+                    self.partition_id()
+                )),
+            ));
+        }
         let mut responses = Vec::new();
         // Each Normal entry is a BATCH of commands. We apply the whole batch in a
         // single engine-actor round-trip (the actor runs them in submission order),
@@ -3987,6 +4018,18 @@ fn wire_orphan_propose(
     (OrphanProposeStop { tx: stop_tx }, watcher, drainer)
 }
 
+/// How a member bootstrap treats the partition's divergence marker (#1691).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BootGate {
+    /// Every normal boot: a marked partition is refused
+    /// ([`DivergedBootRefused`]) and its engine fenced.
+    RefuseDiverged,
+    /// [`RaftPartition::bootstrap_recovery_receiver`] (#1701): the caller has
+    /// verified the marker and fenced the engine; the member boots
+    /// recovery-only and accepts nothing but the leader's snapshot.
+    RecoveryOnly,
+}
+
 /// A Raft-managed partition: the openraft instance plus handles to its stores.
 pub struct RaftPartition {
     pub raft: openraft::Raft<RaftConfig>,
@@ -4028,6 +4071,9 @@ pub struct RaftPartition {
     /// This member's recent chain digests and divergence latch (#1664),
     /// shared with its state machine and batcher.
     digest: DigestLedger,
+    /// Shared with the state machine: whether this member is still a
+    /// recovery-only receiver waiting for the leader's snapshot (#1701).
+    recovering: Arc<AtomicBool>,
 }
 
 impl RaftPartition {
@@ -4075,6 +4121,7 @@ impl RaftPartition {
         state_machine.refuse_diverged_boot().await?;
         let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
         let digest = state_machine.digest.clone();
+        let recovering_flag = state_machine.recovering.clone();
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
         let transport: Arc<dyn RaftTransport> = Arc::new(NullTransport);
         let network =
@@ -4103,6 +4150,7 @@ impl RaftPartition {
             orphan_stop,
             orphan_tasks: [orphan_watcher, orphan_drainer],
             digest,
+            recovering: recovering_flag,
         })
     }
 
@@ -4149,6 +4197,7 @@ impl RaftPartition {
         )?);
         let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
         let digest = state_machine.digest.clone();
+        let recovering_flag = state_machine.recovering.clone();
         // A durable journal-backed engine already holds every entry its journal
         // recorded: boot from the newer of journal and snapshot so openraft
         // re-applies neither's entries (#1405).
@@ -4185,6 +4234,7 @@ impl RaftPartition {
             orphan_stop,
             orphan_tasks: [orphan_watcher, orphan_drainer],
             digest,
+            recovering: recovering_flag,
         })
     }
 
@@ -4211,6 +4261,31 @@ impl RaftPartition {
         log_dir: Option<std::path::PathBuf>,
         evict_eligible: bool,
     ) -> anyhow::Result<Self> {
+        Self::bootstrap_member_inner(
+            node_id,
+            partition_id,
+            engine,
+            transport,
+            log_dir,
+            evict_eligible,
+            BootGate::RefuseDiverged,
+        )
+        .await
+    }
+
+    /// The single construction body behind [`bootstrap_member`],
+    /// [`bootstrap_fresh_receiver`] and [`bootstrap_recovery_receiver`]: `gate`
+    /// selects whether a divergence-marked partition is refused (every normal
+    /// boot) or booted recovery-only (#1701).
+    async fn bootstrap_member_inner(
+        node_id: NodeId,
+        partition_id: u64,
+        engine: DeepthiHandle,
+        transport: Arc<dyn RaftTransport>,
+        log_dir: Option<std::path::PathBuf>,
+        evict_eligible: bool,
+        gate: BootGate,
+    ) -> anyhow::Result<Self> {
         let journal_durable_dir = journal_durable_dir(&engine).await;
         // Anchor snapshots next to the durable log when there is one, else a temp
         // dir for the volatile (in-memory-log) deployments.
@@ -4227,14 +4302,21 @@ impl RaftPartition {
         let engine_for_orphans = engine.clone();
         // The divergence gate runs BEFORE the fallible state-machine
         // construction below: a snapshot-setup failure must not abort the boot
-        // before a known-diverged journal is fenced (#1691).
-        refuse_diverged_boot_before_setup(
-            &engine,
-            journal_durable_dir.as_deref(),
-            &snapshot_dir,
-            partition_id,
-        )
-        .await?;
+        // before a known-diverged journal is fenced (#1691). A recovery-only
+        // boot (#1701) was gated (marker present, engine fenced) by its caller.
+        let recovering = match gate {
+            BootGate::RefuseDiverged => {
+                refuse_diverged_boot_before_setup(
+                    &engine,
+                    journal_durable_dir.as_deref(),
+                    &snapshot_dir,
+                    partition_id,
+                )
+                .await?;
+                false
+            }
+            BootGate::RecoveryOnly => true,
+        };
         // Config validation is fallible too, so it also runs after the gate.
         let config = Arc::new(raft_config(partition_id).validate()?);
         let state_machine = Arc::new(PartitionStateMachine::new(
@@ -4246,8 +4328,11 @@ impl RaftPartition {
             evict_eligible,
             leader.clone(),
         )?);
+        // Armed BEFORE openraft can call `apply` (#1701).
+        state_machine.recovering.store(recovering, Ordering::SeqCst);
         let (sm_engine, sm_epoch, sm_snapshot_dir) = state_machine.retirement_handles();
         let digest = state_machine.digest.clone();
+        let recovering_flag = state_machine.recovering.clone();
         // Restore the engine from the durable current snapshot (if any) BEFORE
         // openraft is constructed: with a compacted log the snapshot holds the
         // purged prefix, and the state machine already carries its applied
@@ -4260,7 +4345,15 @@ impl RaftPartition {
         // applied metadata, and openraft only re-applies entries neither holds
         // (#1405). A volatile (fresh-receiver) member restores its snapshot (if
         // any) and otherwise installs the leader's.
-        if log_dir.is_some() {
+        //
+        // A recovery-only member (#1701) restores NOTHING: its local state is
+        // known-diverged, so it waits, empty, for the leader's snapshot.
+        if recovering {
+            anyhow::ensure!(
+                log_dir.is_none(),
+                "partition {partition_id}: a recovery-only member never resumes a durable log"
+            );
+        } else if log_dir.is_some() {
             state_machine.restore_newest_boot_state().await?;
         } else {
             state_machine.restore_from_current_snapshot().await?;
@@ -4320,6 +4413,7 @@ impl RaftPartition {
             orphan_stop,
             orphan_tasks: [orphan_watcher, orphan_drainer],
             digest,
+            recovering: recovering_flag,
         })
     }
 
@@ -4373,6 +4467,125 @@ impl RaftPartition {
             return Err(e);
         }
         Ok(part)
+    }
+
+    /// Boots a **recovery-only receiver** for a partition whose crash-durable
+    /// divergence marker (#1691) is present, so a divergence-fenced replica
+    /// heals itself from the leader without an operator (#1701).
+    ///
+    /// Every other constructor REFUSES a marked partition
+    /// ([`DivergedBootRefused`]); this is the one public path that boots it,
+    /// and only as a recovery receiver:
+    ///
+    /// - the engine journal is fenced FIRST, so no direct (non-Raft) write can
+    ///   extend the known-diverged state;
+    /// - the member is a fresh receiver (empty volatile log, default vote,
+    ///   nothing committed/applied/snapshotted — checked like
+    ///   [`bootstrap_fresh_receiver`]) that restores NO local state;
+    /// - its state machine refuses every entry `apply` (fail closed, before the
+    ///   engine is touched) and accepts only an `InstallSnapshot` from the
+    ///   leader. Snapshot builds are refused by the fenced journal, so local
+    ///   state is never served to a peer either;
+    /// - the install adopts the leader's state, checkpoints it as the journal's
+    ///   recovery base (which lifts the fence only on success), and only THEN
+    ///   durably clears the marker and leaves recovery mode — after which the
+    ///   member continues as a normal replica. A crash anywhere before the
+    ///   clear leaves the marker in place, so the next boot recovers again.
+    ///
+    /// Fails (without fencing anything) when the partition carries no marker:
+    /// a healthy partition boots through [`bootstrap_fresh_receiver`].
+    pub async fn bootstrap_recovery_receiver(
+        node_id: NodeId,
+        partition_id: u64,
+        engine: DeepthiHandle,
+        transport: Arc<dyn RaftTransport>,
+        evict_eligible: bool,
+    ) -> anyhow::Result<Self> {
+        let journal_durable_dir = journal_durable_dir(&engine).await;
+        // A volatile journal has no durable state to fence, so its marker
+        // would live in this boot's fresh temp snapshot dir — i.e. it can only
+        // be present for a journal with a durable dir.
+        let Some(durable) = journal_durable_dir.as_deref() else {
+            anyhow::bail!(
+                "partition {partition_id}: no divergence marker (volatile journal); boot a \
+                 fresh receiver instead (#1701)"
+            );
+        };
+        let marker = divergence_marker_path(Some(durable), durable, partition_id);
+        anyhow::ensure!(
+            read_divergence_marker(&marker).is_some(),
+            "partition {partition_id}: no divergence marker at {marker:?}; boot a fresh \
+             receiver instead (#1701)"
+        );
+        // Fence before any fallible setup (#1691): the journal is known
+        // diverged and must not take a direct write while we construct.
+        engine.with(|journal| journal.abort_raft_entry()).await;
+        let part = Self::bootstrap_member_inner(
+            node_id,
+            partition_id,
+            engine,
+            transport,
+            None,
+            evict_eligible,
+            BootGate::RecoveryOnly,
+        )
+        .await?;
+        if let Err(e) = part.ensure_fresh_receiver_state().await {
+            part.raft.shutdown().await.ok();
+            return Err(e);
+        }
+        tracing::warn!(
+            partition = partition_id,
+            node = node_id,
+            "raft: partition booted RECOVERY-ONLY over a divergence marker; waiting for the \
+             leader's snapshot (#1701)"
+        );
+        Ok(part)
+    }
+
+    /// Boots this node's receiver for `partition_id`, healing a
+    /// divergence-marked partition instead of refusing it (#1701): a
+    /// [`bootstrap_fresh_receiver`](Self::bootstrap_fresh_receiver) when the
+    /// partition is healthy, else — only on a typed [`DivergedBootRefused`] —
+    /// a [`bootstrap_recovery_receiver`](Self::bootstrap_recovery_receiver).
+    /// The one call every server receiver path uses, so the heal-vs-refuse
+    /// decision lives in one place. Durable-log (quorum voter) boots still
+    /// refuse: rebuilding a voter on an empty log is the amnesiac-voter hazard.
+    pub async fn bootstrap_receiver_healing(
+        node_id: NodeId,
+        partition_id: u64,
+        engine: DeepthiHandle,
+        transport: Arc<dyn RaftTransport>,
+        evict_eligible: bool,
+    ) -> anyhow::Result<Self> {
+        match Self::bootstrap_fresh_receiver(
+            node_id,
+            partition_id,
+            engine.clone(),
+            transport.clone(),
+            evict_eligible,
+        )
+        .await
+        {
+            Err(e) if e.downcast_ref::<DivergedBootRefused>().is_some() => {
+                Self::bootstrap_recovery_receiver(
+                    node_id,
+                    partition_id,
+                    engine,
+                    transport,
+                    evict_eligible,
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    /// Whether this member is still a recovery-only receiver waiting for the
+    /// leader's snapshot (#1701) — see
+    /// [`bootstrap_recovery_receiver`](Self::bootstrap_recovery_receiver).
+    pub fn is_recovering(&self) -> bool {
+        self.recovering.load(Ordering::SeqCst)
     }
 
     /// Fails unless this member's Raft state is that of a fresh receiver: no log,
@@ -5950,6 +6163,8 @@ mod tests {
                 local: chain.fold(1, 0, &[]),
             })
             .await;
+        // A recovery-only member (#1701) stays in recovery across it too.
+        restarted.recovering.store(true, Ordering::SeqCst);
         restarted
             .install_snapshot_skip_adoption_for_test(&leader_meta, received)
             .await
@@ -5957,6 +6172,10 @@ mod tests {
         assert!(
             read_divergence_marker(restarted.marker()).is_some(),
             "an unadopted resync must not clear the marker"
+        );
+        assert!(
+            restarted.recovering.load(Ordering::SeqCst),
+            "an unadopted resync never leaves recovery mode"
         );
         assert!(restarted.restore_newest_boot_state().await.is_err());
     }
@@ -6094,6 +6313,204 @@ mod tests {
         shutdown_engine(engine).await;
         let _ = std::fs::remove_dir_all(&journal_dir);
         let _ = std::fs::remove_dir_all(&raft_dir);
+    }
+
+    /// #1701: a divergence-marked partition heals ITSELF through the public
+    /// recovery bootstrap constructor — no operator wipe. The recovery member
+    /// starts fenced and empty, refuses log entries, and accepts only the
+    /// leader's snapshot; once that is adopted + checkpointed the marker is
+    /// cleared, the fence lifted, and the member applies the leader's log as a
+    /// normal replica.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_marked_partition_self_heals_from_the_leader_snapshot() {
+        use crate::raft_net::LocalCluster;
+        let journal_dir = unique_log_dir("1701-heal");
+        std::fs::create_dir_all(&journal_dir).expect("journal dir");
+        let marker = divergence_marker_path(Some(&journal_dir), Path::new("/ignored"), 0);
+
+        let cluster = LocalCluster::default();
+        let transport: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+        // Leader: a sole voter that commits, snapshots and PURGES its log, so a
+        // returning replica can only catch up from the snapshot.
+        let leader_engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let leader =
+            RaftPartition::bootstrap_member(0, 0, leader_engine, transport.clone(), None, false)
+                .await
+                .expect("boot leader");
+        cluster.register(0, 0, leader.raft.clone());
+        let mut members = BTreeMap::new();
+        members.insert(0, BasicNode::new("local-0"));
+        leader.initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || leader.raft.metrics().borrow().current_leader
+                == Some(0))
+            .await,
+            "leader elected"
+        );
+        leader
+            .propose(deploy_command(), 1_000)
+            .await
+            .expect("deploy");
+        let applied = leader
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .expect("leader applied");
+        leader.raft.trigger().snapshot().await.expect("snapshot");
+        assert!(
+            wait_until(5_000, || leader
+                .raft
+                .metrics()
+                .borrow()
+                .snapshot
+                .is_some_and(|s| s.index >= applied.index))
+            .await,
+            "leader snapshot built"
+        );
+        leader
+            .raft
+            .trigger()
+            .purge_log(applied.index)
+            .await
+            .expect("purge");
+        assert!(
+            wait_until(5_000, || leader.raft.metrics().borrow().purged.is_some()).await,
+            "leader log purged"
+        );
+
+        // The diverged replica: a durable journal carrying LOCAL state, plus
+        // the crash-durable marker a fail-stop left behind.
+        let engine = durable_engine(&journal_dir);
+        engine
+            .with(|j| {
+                let _ = j
+                    .apply_command_at(deploy_command(), 1)
+                    .expect("local deploy applies");
+            })
+            .await;
+        let chain = ChainDigest::genesis(1);
+        persist_divergence_fence(
+            &marker,
+            &Divergence {
+                index: 1,
+                detected_at: 2,
+                leader: chain,
+                local: chain.fold(1, 0, &[]),
+            },
+        )
+        .expect("persist marker");
+        // Every NORMAL constructor still refuses it (#1691).
+        let refused =
+            RaftPartition::bootstrap_fresh_receiver(1, 0, engine.clone(), transport.clone(), true)
+                .await
+                .err()
+                .expect("a fresh receiver refuses a marked partition");
+        assert!(refused.downcast_ref::<DivergedBootRefused>().is_some());
+
+        // The server's receiver path heals instead of refusing.
+        let recovering = RaftPartition::bootstrap_receiver_healing(
+            1,
+            0,
+            engine.clone(),
+            transport.clone(),
+            true,
+        )
+        .await
+        .expect("the recovery receiver boots a marked partition");
+        assert!(recovering.is_recovering());
+        assert!(
+            engine.with(|j| j.is_fenced()).await,
+            "local state is fenced until the snapshot is adopted"
+        );
+        assert!(
+            engine
+                .with(|j| j.apply_command_at(deploy_command(), 2).map(|_| ()))
+                .await
+                .is_err(),
+            "the known-diverged journal is never extended"
+        );
+        cluster.register(0, 1, recovering.raft.clone());
+        leader
+            .add_learner(1, BasicNode::new("local-1"))
+            .await
+            .expect("add learner");
+
+        assert!(
+            wait_until(10_000, || !recovering.is_recovering()).await,
+            "the recovery member adopts the leader's snapshot"
+        );
+        assert!(read_divergence_marker(&marker).is_none(), "marker cleared");
+        assert!(!engine.with(|j| j.is_fenced()).await, "fence lifted");
+        assert!(!recovering.is_shutdown());
+
+        // It now continues as a normal replica, applying the leader's log.
+        leader
+            .propose(deploy_command(), 2_000)
+            .await
+            .expect("deploy 2");
+        let target = leader
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .expect("applied")
+            .index;
+        assert!(
+            wait_until(5_000, || recovering
+                .raft
+                .metrics()
+                .borrow()
+                .last_applied
+                .is_some_and(|l| l.index >= target))
+            .await,
+            "the healed member applies entries after the resync"
+        );
+        assert!(!recovering.is_shutdown());
+
+        leader.raft.shutdown().await.ok();
+        recovering.raft.shutdown().await.ok();
+        drop(recovering);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&journal_dir);
+    }
+
+    /// #1701: a recovery-only member refuses every log entry BEFORE touching
+    /// the engine (local state is never extended), and the recovery
+    /// constructor refuses — without fencing — a partition that has no marker.
+    #[tokio::test]
+    async fn a_recovery_member_refuses_entries_and_needs_a_marker() {
+        let journal_dir = unique_log_dir("1701-refuse");
+        std::fs::create_dir_all(&journal_dir).expect("journal dir");
+        let engine = durable_engine(&journal_dir);
+        let err = RaftPartition::bootstrap_recovery_receiver(
+            0,
+            0,
+            engine.clone(),
+            Arc::new(NullTransport),
+            false,
+        )
+        .await
+        .err()
+        .expect("no marker, no recovery boot");
+        assert!(err.to_string().contains("no divergence marker"), "{err}");
+        assert!(
+            !engine.with(|j| j.is_fenced()).await,
+            "a healthy partition is never fenced by a refused recovery boot"
+        );
+
+        // State-machine level: a recovering member refuses an entry apply
+        // and the engine is not touched (no instance is deployed).
+        let sm = Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+        sm.recovering.store(true, Ordering::SeqCst);
+        let before = engine.with(|j| j.raft_applied()).await;
+        let r = apply_entry(&sm, 1, vec![ReplicatedCommand::new(deploy_command(), 1)]).await;
+        assert!(r.is_err(), "a recovery member refuses entries");
+        assert_eq!(engine.with(|j| j.raft_applied()).await, before);
+        assert!(sm.inner.lock().expect("meta").last_applied.is_none());
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&journal_dir);
     }
 
     /// The divergence gate runs BEFORE any fallible bootstrap setup (#1691
