@@ -181,9 +181,19 @@ test("replaceOp swaps an op outright, leaving no stale fields (retype)", () => {
 });
 
 test("changeOpKind preserves a field description across extend <-> reference", () => {
-  const ext: ShapeOp = { op: "extend", name: "a", type: "string", description: "Doc." };
+  const ext: ShapeOp = {
+    op: "extend",
+    name: "a",
+    type: "string",
+    description: "Doc.",
+  };
   const ref = changeOpKind(ext, "reference");
-  assert.deepEqual(ref, { op: "reference", name: "a", ref: "", description: "Doc." });
+  assert.deepEqual(ref, {
+    op: "reference",
+    name: "a",
+    ref: "",
+    description: "Doc.",
+  });
   assert.deepEqual(changeOpKind(ref, "extend"), {
     op: "extend",
     name: "a",
