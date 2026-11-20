@@ -2741,3 +2741,54 @@ fn unit_variants_cover_every_engine_unit_variant() {
         "unit variants not covered by ENGINE_TYPE_SOURCES (add their file): {missing:?}"
     );
 }
+
+/// #1528 (review): the MI BODY's generic-activation mint bypass covers only
+/// the body's OWN activation (same instance, same element). An activation of
+/// a DIFFERENT element reusing the body's key, or a job reusing it, is a
+/// collision and fails closed.
+#[test]
+fn prev_release_gate_rejects_mi_body_key_reuse() {
+    let other_element = |shift: u64| {
+        let mut t = nested_tree(shift);
+        t.push(serde_json::json!({"ElementActivating":{"element_id":"zzz","element_instance_key":11 + shift,"instance_key":10,"scope":0}}));
+        t
+    };
+    let err = nested_gate(other_element(0), other_element(100)).unwrap_err();
+    assert!(err.contains("minted for two entities"), "{err}");
+
+    let job_first = |shift: u64| {
+        let mut t = nested_tree(shift);
+        t.insert(1, serde_json::json!({"JobCreated":{"job_key":11 + shift,"element_instance_key":12 + shift,"element_id":"outer","job_type":"w","instance_key":10}}));
+        t
+    };
+    let err = nested_gate(job_first(0), job_first(100)).unwrap_err();
+    assert!(err.contains("minted for two entities"), "{err}");
+}
+
+/// #1528 (review): a permitted reorder may put a historical scope-less
+/// `ElementActivating` AFTER the body's `ElementActivated` (which carries the
+/// real parent scope). The authoritative scope must win regardless of order,
+/// so a mixed-version nested stream still reconciles under reorder + remint.
+#[test]
+fn prev_release_gate_nested_mi_body_scope_is_order_independent() {
+    let mixed = |shift: u64| {
+        let mut t = nested_tree(shift);
+        // Inner body 14 (scope 12): add its ElementActivated (authoritative
+        // scope) and move a scope-less historical ElementActivating after it.
+        let pos = t
+            .iter()
+            .position(|e| e["ElementActivating"]["element_instance_key"] == 14 + shift)
+            .unwrap();
+        t[pos] = serde_json::json!({"ElementActivated":{"element_id":"inner","element_instance_key":14 + shift,"instance_key":10,"scope":12 + shift}});
+        t.insert(pos + 1, serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":14 + shift,"instance_key":10}}));
+        t
+    };
+    let mut reordered = mixed(100);
+    // Same tree on the other side, with the scope-less record FIRST.
+    let pos = reordered
+        .iter()
+        .position(|e| e["ElementActivated"]["element_instance_key"] == 114)
+        .unwrap();
+    reordered.swap(pos, pos + 1);
+    nested_gate(mixed(0), reordered).expect("the authoritative scope wins regardless of order");
+}

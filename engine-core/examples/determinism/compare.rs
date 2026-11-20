@@ -1231,21 +1231,35 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
         .collect();
     // body key -> (parent scope key, or None for the process scope; instance
     // key; element id), from the body's own generic activation.
+    // Folded `ElementActivating` sightings FIRST and `ElementActivated`
+    // sightings SECOND, so the authoritative `ElementActivated` scope wins
+    // regardless of corpus order — a permitted reorder may put a historical
+    // scope-less `ElementActivating` after its `ElementActivated`, and must not
+    // overwrite the real parent scope with the process scope (#1528 review).
+    // A scope-less sighting never erases a scope already recorded.
     let mut bodies: Bodies = BTreeMap::new();
-    for (_, body) in parsed
-        .iter()
-        .filter(|(variant, _)| *variant == "ElementActivating" || *variant == "ElementActivated")
-    {
-        if let (Some(k), Some(id)) = (
-            u64_of(body, "element_instance_key"),
-            str_of(body, "element_id"),
-        ) {
-            if body_keys.contains(&k) {
-                let scope = u64_of(body, "scope").filter(|s| *s != 0);
-                bodies.insert(k, (scope, u64_of(body, "instance_key"), id.to_owned()));
+    for wanted in ["ElementActivating", "ElementActivated"] {
+        for (_, body) in parsed.iter().filter(|(variant, _)| *variant == wanted) {
+            if let (Some(k), Some(id)) = (
+                u64_of(body, "element_instance_key"),
+                str_of(body, "element_id"),
+            ) {
+                if body_keys.contains(&k) {
+                    let scope = u64_of(body, "scope")
+                        .filter(|s| *s != 0)
+                        .or_else(|| bodies.get(&k).and_then(|(s, _, _)| *s));
+                    bodies.insert(k, (scope, u64_of(body, "instance_key"), id.to_owned()));
+                }
             }
         }
     }
+    // body key -> (raw instance key, element id) of the body's OWN activation,
+    // so pass 3 skips only that activation's generic re-sighting (#1528
+    // review), never another element's/instance's activation reusing the key.
+    let body_activations: BTreeMap<u64, (Option<u64>, String)> = bodies
+        .iter()
+        .map(|(k, (_, instance, id))| (*k, (*instance, id.clone())))
+        .collect();
     // child key -> (body key, child index, instance key).
     let mut children: Children = BTreeMap::new();
     for (_, body) in parsed
@@ -1302,9 +1316,10 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
         for (base, keys) in by_base {
             // `keys` is ascending (BTreeMap iteration), i.e. raw-key order.
             for k in keys {
-                if ids.get(&k).is_none() {
-                    ids.mint(k, base.clone())?;
-                }
+                // Always validated: `mint` is idempotent for the same base and
+                // fails closed when the key already belongs to another entity
+                // (e.g. a job) (#1528 review).
+                ids.mint(k, base.clone())?;
             }
         }
         for k in &ready_bodies {
@@ -1413,7 +1428,12 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
             // collide with the `mi-body:…` base on the same key.
             let generic_child_resight = base.starts_with("element:")
                 && matches!(variant.as_str(), "ElementActivating" | "ElementActivated")
-                && (body_keys.contains(&k)
+                && (body_activations
+                    .get(&k)
+                    .is_some_and(|(reg_instance, reg_element)| {
+                        *reg_instance == u64_of(body, "instance_key")
+                            && str_of(body, "element_id") == Some(reg_element.as_str())
+                    })
                     || mi_child_activations
                         .get(&k)
                         .is_some_and(|(reg_instance, reg_element)| {

@@ -11685,6 +11685,28 @@ impl Engine {
         index
     }
 
+    /// Tears down `root` and every element instance nested inside it,
+    /// depth-first: each element's TERMINATING precedes the teardown of its
+    /// DIRECT scope children (recursively), and its TERMINATED follows them
+    /// (#1535 / #1528 review). Children are visited in key order.
+    fn cancel_scope_tree_events(
+        &self,
+        instance_key: Key,
+        root: Key,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+    ) -> Vec<Event> {
+        let direct: Vec<Key> = self
+            .scope_descendants(instance_key, root)
+            .into_iter()
+            .filter(|d| self.scope_of(instance_key, *d) == root)
+            .collect();
+        let mut inner = Vec::new();
+        for d in direct {
+            inner.extend(self.cancel_scope_tree_events(instance_key, d, user_tasks_by_eik));
+        }
+        self.cancel_mi_child_events(instance_key, root, inner, user_tasks_by_eik)
+    }
+
     /// Builds the events that cancel a still-running multi-instance child (its job
     /// and element instance), for an early body completion. The child is torn down
     /// WITHOUT completing, so its element lifecycle is
@@ -11893,21 +11915,10 @@ impl Engine {
             // no-op there and the leaf behaviour is byte-identical.
             // The body descendants are torn down INSIDE the subProcess tool's
             // TERMINATING/TERMINATED pair (#1535 depth-first order).
-            let mut inner = Vec::new();
-            for descendant in self.scope_descendants(instance_key, child) {
-                inner.extend(self.cancel_mi_child_events(
-                    instance_key,
-                    descendant,
-                    Vec::new(),
-                    user_tasks_by_eik,
-                ));
-            }
-            events.extend(self.cancel_mi_child_events(
-                instance_key,
-                child,
-                inner,
-                user_tasks_by_eik,
-            ));
+            // Each nested scope level's teardown is itself nested inside its own
+            // parent's pair (recursively), so a multi-level tool stays
+            // depth-first (#1528 review).
+            events.extend(self.cancel_scope_tree_events(instance_key, child, user_tasks_by_eik));
         }
         // A `callActivity` tool (issue #1159) is a leaf in the ad-hoc scope tree
         // but drives a distinct CHILD PROCESS INSTANCE hanging off this tool
