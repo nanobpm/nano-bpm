@@ -65,6 +65,90 @@ fn canonical_state(record: &Json, side: &str, erasable: &Vocab) -> Result<Json, 
     Ok(v)
 }
 
+/// The scope of a ratified upgrade-boundary `unbalanced` divergence for the
+/// same-format state comparison: the first divergent entry, and each side's
+/// process instances that the divergent entries touch.
+#[derive(Debug, Default)]
+struct RatifiedBoundary {
+    from: Option<u64>,
+    head_instances: BTreeSet<u64>,
+    prev_instances: BTreeSet<u64>,
+}
+
+/// Whether a field name holds an entity key (or a list of them).
+fn is_key_field(name: &str) -> bool {
+    name == "key" || name == "scope" || name.ends_with("_key") || name.ends_with("_keys")
+}
+
+/// The key-insensitive projection of a canonical snapshot past a ratified
+/// upgrade-boundary divergence (#1528 review). The divergence shifts every
+/// later minted key and changes ITS OWN instances' state by declaration, so
+/// the projection (a) drops every record owned by a ratified instance
+/// (`excluded`: a keyed-map entry under such a key, or an object naming it as
+/// `instance_key` / `process_instance_key`), (b) replaces every key value with
+/// a placeholder and every key-indexed map with the sorted multiset of its
+/// projected values, and (c) drops the key allocator (`next_local`). Every
+/// other field — flags, variables, counts of jobs/tasks/timers of every other
+/// instance — is still compared, so an unrelated post-boundary state
+/// regression fails.
+fn boundary_projection(value: &Json, excluded: &BTreeSet<u64>) -> Option<Json> {
+    match value {
+        Json::Object(map) => {
+            for owner in ["instance_key", "process_instance_key"] {
+                if map
+                    .get(owner)
+                    .and_then(Json::as_u64)
+                    .is_some_and(|k| excluded.contains(&k))
+                {
+                    return None;
+                }
+            }
+            let keyed = !map.is_empty() && map.keys().all(|k| k.parse::<u64>().is_ok());
+            if keyed {
+                let mut items: Vec<Json> = map
+                    .iter()
+                    .filter(|(k, _)| k.parse::<u64>().is_ok_and(|k| !excluded.contains(&k)))
+                    .filter_map(|(_, v)| boundary_projection(v, excluded))
+                    .collect();
+                items.sort_by_key(|v| v.to_string());
+                return Some(Json::Array(items));
+            }
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if k == "next_local" {
+                    continue;
+                }
+                let projected = if is_key_field(k) {
+                    key_placeholder(v)
+                } else {
+                    match boundary_projection(v, excluded) {
+                        Some(p) => p,
+                        None => continue,
+                    }
+                };
+                out.insert(k.clone(), projected);
+            }
+            Some(Json::Object(out))
+        }
+        Json::Array(items) => Some(Json::Array(
+            items
+                .iter()
+                .filter_map(|v| boundary_projection(v, excluded))
+                .collect(),
+        )),
+        other => Some(other.clone()),
+    }
+}
+
+/// A key value (or list of keys) with each raw key replaced by a placeholder.
+fn key_placeholder(v: &Json) -> Json {
+    match v {
+        Json::Number(n) if n.is_u64() => Json::String("#key".into()),
+        Json::Array(items) => Json::Array(items.iter().map(key_placeholder).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Compares state checkpoints (through the head `EngineSnapshot` type) when
 /// both builds share a `SNAPSHOT_FORMAT_VERSION`, erasing `erasable` fields.
 fn compare_states(
@@ -72,7 +156,7 @@ fn compare_states(
     prev_states: &[&Json],
     entries: usize,
     erasable: &Vocab,
-    state_divergent_from: Option<u64>,
+    boundary: &RatifiedBoundary,
 ) -> Result<CrossReleaseReport, String> {
     if head_states.len() != prev_states.len() {
         return Err(format!(
@@ -84,7 +168,7 @@ fn compare_states(
     if head_states.is_empty() {
         return Err("no state checkpoints to compare (run with --state-every)".into());
     }
-    let (mut compared, mut skipped, mut skipped_ratified) = (0, 0, 0);
+    let (mut compared, mut skipped, mut projected) = (0, 0, 0);
     for (h, p) in head_states.iter().zip(prev_states.iter()) {
         let at = h.get("i").cloned().unwrap_or(Json::Null);
         if p.get("i") != h.get("i") {
@@ -99,20 +183,32 @@ fn compare_states(
             skipped += 1;
             continue;
         }
-        // A ratified upgrade-boundary `unbalanced` divergence changes the
-        // durable state BY DECLARATION (its one-sided events reach it: #1528
-        // leaves the MI instance waiting on per-child user tasks where the
-        // previous release completed it) and shifts every later minted key,
-        // so no raw snapshot from its first divergent entry on can agree.
-        // Those checkpoints are skipped and REPORTED; every earlier one is
-        // still compared strictly.
-        if let (Some(from), Some(i)) = (state_divergent_from, at.as_u64()) {
+        // Always decode both checkpoints: a snapshot that no longer decodes
+        // fails whatever the comparison mode (#1528 review).
+        let (hs, ps) = (
+            canonical_state(h, "head", erasable)?,
+            canonical_state(p, "prev", erasable)?,
+        );
+        // Past a ratified upgrade-boundary `unbalanced` divergence the raw
+        // snapshots cannot agree (its declared state change, and every later
+        // minted key shifts), so they are compared through the
+        // key-insensitive projection that excludes only the ratified
+        // instances — every other state is still checked (#1528 review).
+        if let (Some(from), Some(i)) = (boundary.from, at.as_u64()) {
             if i >= from {
-                skipped_ratified += 1;
+                if boundary_projection(&hs, &boundary.head_instances)
+                    != boundary_projection(&ps, &boundary.prev_instances)
+                {
+                    return Err(format!(
+                        "durable state diverges at entry {at} outside the ratified \
+                         upgrade-boundary instances (same snapshot format {hf:?})"
+                    ));
+                }
+                projected += 1;
                 continue;
             }
         }
-        if canonical_state(h, "head", erasable)? != canonical_state(p, "prev", erasable)? {
+        if hs != ps {
             return Err(format!(
                 "durable state diverges at entry {at} (same snapshot format {hf:?})"
             ));
@@ -123,7 +219,7 @@ fn compare_states(
         entries,
         states_compared: compared,
         states_skipped_format_bump: skipped,
-        states_skipped_ratified_boundary: skipped_ratified,
+        states_compared_outside_ratified_boundary: projected,
     })
 }
 
@@ -134,9 +230,9 @@ pub struct CrossReleaseReport {
     pub states_compared: usize,
     pub states_skipped_format_bump: usize,
     /// Checkpoints at or after the first entry of a ratified upgrade-boundary
-    /// `unbalanced` divergence (its declared state change makes them
-    /// incomparable).
-    pub states_skipped_ratified_boundary: usize,
+    /// `unbalanced` divergence, compared key-insensitively with the ratified
+    /// instances excluded (see `boundary_projection`).
+    pub states_compared_outside_ratified_boundary: usize,
 }
 
 // ---- Previous-release gate: golden-derived additive set (#1698) ----------
@@ -1283,6 +1379,8 @@ struct MatchedSide<'a> {
     /// Whether the declaration remints keys — the `canonical` multiset was
     /// projected with this setting, so the surplus lookup must be too.
     remint: bool,
+    /// Every raw event of this side's divergent entries.
+    entries: &'a [&'a String],
 }
 
 /// Validates the one-sided surplus an `unbalanced` declaration ratifies
@@ -1335,6 +1433,8 @@ fn validate_unbalanced_surplus(
         out
     };
     for (side_name, side, other) in [("head", &head, &prev), ("prev", &prev, &head)] {
+        // The owners of this side's surplus `UserTaskCreated`, by element id.
+        let mut task_owners: BTreeMap<String, BTreeMap<u64, usize>> = BTreeMap::new();
         for (event, extra) in surplus_raw(side, other) {
             // Decode under the head type: a corrupted surplus event fails.
             let decoded = nanobpmn_engine_core::decode_event_json(&event).map_err(|e| {
@@ -1356,11 +1456,85 @@ fn validate_unbalanced_surplus(
                              one-sided emission: {event}"
                         ));
                     }
+                    let element = body
+                        .get("element_id")
+                        .and_then(Json::as_str)
+                        .unwrap_or("?")
+                        .to_owned();
+                    *task_owners
+                        .entry(element)
+                        .or_default()
+                        .entry(owner)
+                        .or_insert(0) += extra;
                 }
+            }
+        }
+        // One task per activated multi-instance child of that element: a
+        // duplicate owner, a task on a non-child (another valid but wrong
+        // element instance) or a child left without its task all fail
+        // (#1528 review).
+        let children = mi_children_by_element(side.entries);
+        for (element, owners) in &task_owners {
+            if let Some((owner, n)) = owners.iter().find(|(_, n)| **n > 1) {
+                return Err(format!(
+                    "scenario {scenario}: {n} {side_name}-side surplus `UserTaskCreated` for \
+                     element {element} share the owner {owner} — one task per child"
+                ));
+            }
+            let got: BTreeSet<u64> = owners.keys().copied().collect();
+            let want = children.get(element).cloned().unwrap_or_default();
+            if got != want {
+                return Err(format!(
+                    "scenario {scenario}: the {side_name}-side surplus `UserTaskCreated` for \
+                     element {element} are owned by {got:?}, but the activated multi-instance \
+                     children are {want:?} — one task per activated child"
+                ));
             }
         }
     }
     Ok(())
+}
+
+/// The process instances `events` touch (every event body's `instance_key`).
+fn instance_keys_of(events: &[&String]) -> BTreeSet<u64> {
+    events
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Json>(e).ok())
+        .filter_map(|v| {
+            variant_body(&v).and_then(|(_, body)| body.get("instance_key").and_then(Json::as_u64))
+        })
+        .collect()
+}
+
+/// The multi-instance children `events` activate, by element id: the child
+/// keys of `MultiInstanceChildActivated`, labelled with the element id of
+/// their own `ElementActivating`/`ElementActivated`.
+fn mi_children_by_element(events: &[&String]) -> BTreeMap<String, BTreeSet<u64>> {
+    let parsed: Vec<Json> = events
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Json>(e).ok())
+        .collect();
+    let children: BTreeSet<u64> = parsed
+        .iter()
+        .filter_map(|v| match variant_body(v) {
+            Some(("MultiInstanceChildActivated", b)) => b.get("child_key").and_then(Json::as_u64),
+            _ => None,
+        })
+        .collect();
+    let mut out: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    for v in &parsed {
+        if let Some(("ElementActivating" | "ElementActivated", b)) = variant_body(v) {
+            if let (Some(k), Some(id)) = (
+                b.get("element_instance_key").and_then(Json::as_u64),
+                b.get("element_id").and_then(Json::as_str),
+            ) {
+                if children.contains(&k) {
+                    out.entry(id.to_owned()).or_default().insert(k);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A ratified behavioural change in one corpus scenario.
@@ -1771,7 +1945,7 @@ pub fn cross_release_checked(
     // shape is the only exception and is validated exactly, per entity. A
     // pattern removed but never re-added (a real loss) still fails.
     let mut ratified_scenarios: BTreeSet<&str> = BTreeSet::new();
-    let mut state_divergent_from: Option<u64> = None;
+    let mut boundary = RatifiedBoundary::default();
     for (scenario, pend) in &pending {
         let d = pend.divergence;
         let expected = &d.expected;
@@ -1792,6 +1966,10 @@ pub fn cross_release_checked(
         // Every head event of the divergent entries, canonical — the parked
         // join exception below looks up head's `ParallelJoinOpened` here.
         let mut head_all: Vec<Json> = Vec::new();
+        // Every RAW event of the divergent entries, per side — the surplus
+        // owner check derives the activated user-task children from these.
+        let (mut head_entry_events, mut prev_entry_events): (Vec<&String>, Vec<&String>) =
+            (Vec::new(), Vec::new());
         for (i, hc, pc) in &pend.entries {
             let (Some(hs), Some(ps)) = (hc, pc) else {
                 return Err(format!(
@@ -1810,6 +1988,8 @@ pub fn cross_release_checked(
                     render(ps)
                 ));
             }
+            head_entry_events.extend(hs.iter());
+            prev_entry_events.extend(ps.iter());
             for e in hs {
                 if let Ok(v) = serde_json::from_str::<Json>(e) {
                     head_all.push(pattern_projection(
@@ -1866,14 +2046,29 @@ pub fn cross_release_checked(
                 }
             }
         }
-        if head_matched != prev_matched {
+        // An `unbalanced` marker is validated whether or not the matched
+        // events balance (#1528 review): an untraceable marker fails even on
+        // a reorder-only scenario, never silently enabling the boundary
+        // state projection below.
+        if let Some(u) = &expected.unbalanced {
+            if !u.valid(&d.issue) {
+                return Err(format!(
+                    "scenario {scenario}: an unbalanced divergence declaration is valid \
+                     only with a non-empty reason AND a named issue ({}) — the \
+                     declaration must be traceable to a reviewed decision",
+                    d.issue
+                ));
+            }
+        }
+        let unbalanced_surplus = head_matched != prev_matched;
+        if unbalanced_surplus {
             // An UNBALANCED declaration (#1528) ratifies the mismatch — the
             // change adds or removes events outright, so the declared
             // patterns can never reconcile as a move — but only when it is
             // traceable: a non-empty reason on the declaration and the
             // divergence's issue named. Anything else fails closed.
             match &expected.unbalanced {
-                Some(u) if u.valid(&d.issue) => {
+                Some(_) => {
                     // The declaration ratifies that the two sides' matched
                     // events have NO counterpart on the other build — but it
                     // must not ratify a WRONG event. Validate the one-sided
@@ -1892,22 +2087,16 @@ pub fn cross_release_checked(
                             raw: &head_matched_raw,
                             ids: &head_ids,
                             remint,
+                            entries: &head_entry_events,
                         },
                         MatchedSide {
                             canonical: &prev_matched,
                             raw: &prev_matched_raw,
                             ids: &prev_ids,
                             remint,
+                            entries: &prev_entry_events,
                         },
                     )?;
-                }
-                Some(_) => {
-                    return Err(format!(
-                        "scenario {scenario}: an unbalanced divergence declaration is valid \
-                         only with a non-empty reason AND a named issue ({}) — the \
-                         declaration must be traceable to a reviewed decision",
-                        d.issue
-                    ));
                 }
                 None => {
                     let show = |m: &BTreeMap<String, usize>| {
@@ -1931,16 +2120,48 @@ pub fn cross_release_checked(
         }
         ratified_entries += pend.entries.len();
         ratified_scenarios.insert(scenario);
-        if expected.unbalanced.is_some() && d.upgrade == UpgradeMode::UpgradeBoundary {
+        // Only an ACCEPTED one-sided surplus (an unbalanced divergence that
+        // really is unbalanced, and whose surplus validated above) scopes the
+        // same-format boundary state projection.
+        if unbalanced_surplus && d.upgrade == UpgradeMode::UpgradeBoundary {
             let first = pend
                 .entries
                 .iter()
                 .filter_map(|(i, _, _)| head_entries[*i].get("i").and_then(Json::as_u64))
                 .min();
-            state_divergent_from = match (state_divergent_from, first) {
+            boundary.from = match (boundary.from, first) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
+            // Exclude the ratified instances by IDENTITY (the union over
+            // both sides), so an instance only one side's divergent events
+            // name is excluded on both, at its own raw key.
+            let identities: BTreeSet<String> = instance_keys_of(&head_entry_events)
+                .into_iter()
+                .map(|k| head_ids.owner(k))
+                .chain(
+                    instance_keys_of(&prev_entry_events)
+                        .into_iter()
+                        .map(|k| prev_ids.owner(k)),
+                )
+                .collect();
+            for (ids, out) in [
+                (&head_ids, &mut boundary.head_instances),
+                (&prev_ids, &mut boundary.prev_instances),
+            ] {
+                out.extend(
+                    ids.ids
+                        .iter()
+                        .filter(|(_, id)| identities.contains(*id))
+                        .map(|(k, _)| *k),
+                );
+                // A key never minted on either side (`?orphan:<raw>`) is
+                // excluded at its raw value on both.
+                out.extend(identities.iter().filter_map(|id| {
+                    id.strip_prefix("?orphan:")
+                        .and_then(|r| r.parse::<u64>().ok())
+                }));
+            }
         }
     }
     for o in &ctx.allowlist.observational_variants {
@@ -1981,7 +2202,7 @@ pub fn cross_release_checked(
         &prev_states,
         prev_entries.len(),
         &state_erasable,
-        state_divergent_from,
+        &boundary,
     )?;
     // Report the fields actually erased (present on the head side of their
     // own stream), not the whole candidate set.
