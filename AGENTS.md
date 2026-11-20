@@ -434,10 +434,12 @@ clone fresh do not, and hit these traps:
   space-free path. Scripts that need build artifacts must resolve the
   *effective* target dir through `scripts/lib-cargo-target-dir.sh` (or its
   `.mjs` twin), never a hard-coded `<crate>/target`. The generated-file rules
-  (`$(GENERATED_DIR)/Cargo.toml` et al., reached via `make all` / `make setup`)
-  still cannot run from a spaced path, because GNU make can't express one in a
-  prerequisite. The phony `make generate` target carries no prerequisites and
-  invokes the generation scripts directly, so it works from a spaced path.
+  (`$(GENERATED_DIR)/Cargo.toml` et al., reached via the targets that carry
+  them as prerequisites — `make all`, `make build`, `make release`, …) still
+  cannot run from a spaced path, because GNU make can't express one in a
+  prerequisite. The phony targets carry no such prerequisites and invoke the
+  generation scripts directly, so `make generate` — and `make setup`, which
+  delegates to it — work from a spaced path.
 
 ## The wasm32 surface-parity gate: every new `Command`/`ReadQuery` needs an arm
 
