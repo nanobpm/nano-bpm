@@ -17,6 +17,7 @@ nano-server-storage = { path = "../nano-server-storage", features = ["console"] 
 nano-server-runtime = { path = "../nano-server-runtime", features = ["console"] }
 nano-trace-store = { path = "../nano-trace-store" }
 nano-server-net = { path = "../nano-server-net" }
+nano-data-envelope = { path = "../nano-data-envelope" }
 nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
 nanobpmn-read-model = { path = "../../../read-model", features = ["native"] }
 
