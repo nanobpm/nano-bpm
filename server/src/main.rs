@@ -43506,6 +43506,35 @@ mod clustered_startup_tests {
             wait_follower_applied(&node1, &part0).await,
             "follower catches up"
         );
+        // The replicated digest cutover (#1692) re-bases every replica's chain
+        // from genesis on the first entry proposed once the capability gates
+        // open — which also wipes any perturbation injected before it. Inject
+        // only AFTER the follower has applied the cutover, so the divergence
+        // under test survives to the next digest point.
+        let mut cut_over = false;
+        for round in 0..50 {
+            let last_cutover = part1
+                .sm_engine()
+                .with(|journal| {
+                    journal
+                        .raft_applied()
+                        .and_then(|(_, state)| nano_server_storage::digest::entry_digest_of(&state))
+                })
+                .await;
+            if last_cutover.is_some_and(|d| d.cutover) {
+                cut_over = true;
+                break;
+            }
+            part0
+                .propose(deploy_cmd(&format!("warm-{round}")), 1_000)
+                .await
+                .expect("warm-up deploy");
+            assert!(
+                wait_follower_applied(&node1, &part0).await,
+                "follower catches up"
+            );
+        }
+        assert!(cut_over, "the replicated digest cutover is committed");
         // Healthy replicas agree on the chain: no false positive so far.
         assert!(part1.divergence().is_none());
         assert_eq!(part0.digest_claim(), part1.digest_claim(), "chains agree");

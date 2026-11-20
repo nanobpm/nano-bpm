@@ -3237,7 +3237,10 @@ impl Journal {
     /// [`commit_raft_entry`](Self::commit_raft_entry) journals ahead of the
     /// `RaftEntryApplied` record. Pure: call it between the entry's commands
     /// and its commit, then carry the result in that commit's `raft_state`.
-    pub fn raft_entry_digest(&self, index: u64) -> crate::digest::EntryDigest {
+    ///
+    /// `cutover` marks a replicated digest cutover entry (#1692): the chain
+    /// re-bases at `index` instead of continuing the previous record's.
+    pub fn raft_entry_digest(&self, index: u64, cutover: bool) -> crate::digest::EntryDigest {
         let prev = self.engine.raft_applied().map(|(_, state)| state.as_str());
         let events: &[Event] = self
             .raft_entry
@@ -3246,7 +3249,12 @@ impl Journal {
             .unwrap_or(&[]);
         // The cursor `commit_raft_entry` journals in the same frame (#1664
         // review): it is replayed state, so it is part of the chain.
-        crate::digest::next_entry_digest(prev, index, self.engine.start_dispatch_rr(), events)
+        let rr = self.engine.start_dispatch_rr();
+        if cutover {
+            crate::digest::cutover_entry_digest(index, rr, events)
+        } else {
+            crate::digest::next_entry_digest(prev, index, rr, events)
+        }
     }
 
     /// TEST-ONLY divergence injection (#1664): perturbs THIS replica's
@@ -3254,6 +3262,22 @@ impl Journal {
     /// different bytes for its last applied entry. The next entry's digest then
     /// folds from the perturbed value, so a peer comparing at that index sees a
     /// mismatch — exactly what a real divergence looks like on the wire.
+    /// TEST-ONLY rolling-upgrade simulation (#1692): drops THIS replica's
+    /// recorded chain from its last applied record, exactly as if it had run a
+    /// pre-#1664 binary until now and was just upgraded in place — its next
+    /// folded entry re-bases the chain at that entry's own index, so it no
+    /// longer shares a base with replicas that hashed from genesis.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn drop_chain_for_test(&mut self) {
+        if let Some((index, state)) = self.engine.raft_applied().cloned()
+            && let Ok(serde_json::Value::Object(mut v)) = serde_json::from_str(&state)
+        {
+            v.remove("digest");
+            self.engine
+                .set_raft_applied(index, serde_json::Value::Object(v).to_string());
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn perturb_chain_for_test(&mut self) {
         if let Some((index, state)) = self.engine.raft_applied().cloned()

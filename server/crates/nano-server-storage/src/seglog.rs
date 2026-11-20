@@ -7627,7 +7627,7 @@ mod tests {
     fn digest_entry(journal: &mut crate::journal::Journal, index: u64, cmd: Command) {
         journal.begin_raft_entry();
         let _ = journal.apply_command(cmd).unwrap();
-        let digest = journal.raft_entry_digest(index);
+        let digest = journal.raft_entry_digest(index, false);
         let state = serde_json::json!({ "digest": digest }).to_string();
         let (_, commit) = journal.commit_raft_entry(index, state).unwrap();
         commit.blocking_wait();

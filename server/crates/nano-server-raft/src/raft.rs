@@ -51,7 +51,7 @@
 // in a plain `cargo build`, so dead-code is allowed at the module level.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::io::Write as _;
 use std::ops::RangeBounds;
@@ -68,8 +68,9 @@ use openraft::storage::{
     LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine, Snapshot,
 };
 use openraft::{
-    BasicNode, Config, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, OptionalSend,
-    RaftSnapshotBuilder, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
+    BasicNode, Config, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Membership,
+    OptionalSend, RaftSnapshotBuilder, SnapshotMeta, StorageError, StorageIOError,
+    StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 
@@ -293,6 +294,14 @@ pub struct ReplicatedBatch {
     /// the unknown field — so mixed-version clusters keep replicating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<DigestClaim>,
+    /// Digest **cutover** marker (#1692): every replica re-bases its chain
+    /// digest at THIS entry's index, so replicas whose chains started at
+    /// different indices (upgraded in place during a rolling upgrade) share
+    /// one comparable base from here on. The leader stamps it on its first
+    /// proposal once the whole group advertises the digest capability.
+    /// Additive on the wire: absent decodes as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub digest_cutover: bool,
     /// Live-count/-bytes guard (see [`LIVE_BATCHES`]/[`LIVE_BATCH_BYTES`]).
     /// Skipped on the wire (reconstructed on deserialize), so the replicated
     /// bytes are unchanged.
@@ -314,9 +323,17 @@ impl<'de> serde::Deserialize<'de> for ReplicatedBatch {
             items: Vec<ReplicatedCommand>,
             #[serde(default)]
             digest: Option<DigestClaim>,
+            #[serde(default)]
+            digest_cutover: bool,
         }
-        let Wire { items, digest } = Wire::deserialize(deserializer)?;
-        Ok(ReplicatedBatch::new(items).with_digest(digest))
+        let Wire {
+            items,
+            digest,
+            digest_cutover,
+        } = Wire::deserialize(deserializer)?;
+        Ok(ReplicatedBatch::new(items)
+            .with_digest(digest)
+            .with_digest_cutover(digest_cutover))
     }
 }
 
@@ -327,6 +344,7 @@ impl ReplicatedBatch {
         Self {
             items,
             digest: None,
+            digest_cutover: false,
             _live: BatchLiveGuard::with_bytes(bytes),
         }
     }
@@ -334,6 +352,13 @@ impl ReplicatedBatch {
     /// Stamps the proposing leader's chain digest claim (#1664).
     pub fn with_digest(mut self, digest: Option<DigestClaim>) -> Self {
         self.digest = digest;
+        self
+    }
+
+    /// Marks this entry as the digest cutover (#1692): every replica re-bases
+    /// its chain at this entry's index.
+    pub fn with_digest_cutover(mut self, cutover: bool) -> Self {
+        self.digest_cutover = cutover;
         self
     }
 
@@ -1252,6 +1277,12 @@ struct DigestLedgerInner {
     recent: BTreeMap<u64, ChainDigest>,
     /// Sticky once set: this member fail-stopped on a divergence.
     diverged: Option<Divergence>,
+    /// The voter/learner id set the state machine last applied, kept so the
+    /// batcher can re-arm the digest cutover (#1692) when membership changes
+    /// while it is idle — a member that joined (and possibly upgraded) since
+    /// the last cutover never re-based, so its chain is incomparable until
+    /// the next one (#1715 review).
+    membership: Option<BTreeSet<NodeId>>,
 }
 
 /// One replica's recent chain digests (#1664), shared by its state machine
@@ -1324,6 +1355,19 @@ impl DigestLedger {
     /// The divergence this member fail-stopped on, if any (sticky).
     pub fn divergence(&self) -> Option<Divergence> {
         self.lock().diverged.clone()
+    }
+
+    /// Records the voter/learner id set an applied entry carried (#1715
+    /// review): the batcher compares it against its last-cutover signature so
+    /// a membership change that lands while no proposal flows (an idle join,
+    /// or one replicated by another leader) re-arms the digest cutover.
+    fn note_membership(&self, membership: &Membership<NodeId, BasicNode>) {
+        self.lock().membership = Some(membership.nodes().map(|(id, _)| *id).collect());
+    }
+
+    /// The last applied voter/learner id set, when any entry carried one.
+    fn membership_signature(&self) -> Option<BTreeSet<NodeId>> {
+        self.lock().membership.clone()
     }
 }
 
@@ -2584,6 +2628,11 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                         .unwrap_or_else(|e| e.into_inner())
                         .last_membership
                         .clone();
+                    // Track the applied voter/learner set so the batcher
+                    // re-arms the digest cutover when membership changed
+                    // while it was idle (#1715 review).
+                    self.digest.note_membership(membership.membership());
+                    let cutover = batch.digest_cutover;
                     type EntryOutcomes = Vec<(&'static str, ApplyOutcome)>;
                     let applied: std::io::Result<(
                         EntryOutcomes,
@@ -2621,7 +2670,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                             }
                             // Fold exactly the events this entry journals
                             // into the chain and record it in the same frame.
-                            let digest = journal.raft_entry_digest(log_id.index);
+                            let digest = journal.raft_entry_digest(log_id.index, cutover);
                             let raft_state =
                                 journaled_raft_state(log_id, &membership, Some(digest))
                                     .inspect_err(|_| journal.abort_raft_entry())?;
@@ -2714,7 +2763,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                             journal.begin_raft_entry();
                             // A membership entry journals no command events,
                             // but still advances the chain (#1664).
-                            let digest = journal.raft_entry_digest(log_id.index);
+                            let digest = journal.raft_entry_digest(log_id.index, false);
                             let raft_state =
                                 journaled_raft_state(log_id, &journaled_membership, Some(digest))
                                     .inspect_err(|_| journal.abort_raft_entry())?;
@@ -3369,6 +3418,19 @@ async fn all_members_support(
     transport: &dyn RaftTransport,
     feature: &'static str,
 ) -> bool {
+    checked_members_support(raft, transport, feature).await.0
+}
+
+/// [`all_members_support`], also returning the exact voter/learner id set
+/// (self included) the verdict was computed over. The cutover latch must
+/// record THIS set — not the membership observed after the (async) checks and
+/// the write — so a member that joins while a check is suspended is never
+/// recorded as cut over (#1715 review).
+async fn checked_members_support(
+    raft: &openraft::Raft<RaftConfig>,
+    transport: &dyn RaftTransport,
+    feature: &'static str,
+) -> (bool, BTreeSet<NodeId>) {
     let (me, members): (NodeId, Vec<NodeId>) = {
         let m = raft.metrics();
         let m = m.borrow();
@@ -3381,12 +3443,50 @@ async fn all_members_support(
                 .collect(),
         )
     };
+    let checked: BTreeSet<NodeId> = members.iter().copied().collect();
     for id in members.into_iter().filter(|id| *id != me) {
         if !transport.peer_supports(id, feature).await {
-            return false;
+            return (false, checked);
         }
     }
-    true
+    (true, checked)
+}
+
+/// The cutover latch after a proposal (#1692 / #1715 review). A closed gate
+/// re-arms; a successfully written cutover latches the membership the gate
+/// was CHECKED over, so a member that joined during the check differs from the
+/// applied membership and re-arms the next proposal.
+fn next_cutover_latch(
+    prev: Option<BTreeSet<NodeId>>,
+    gate_open: bool,
+    written_ok: bool,
+    checked: BTreeSet<NodeId>,
+) -> Option<BTreeSet<NodeId>> {
+    if !gate_open {
+        None
+    } else if prev.is_none() && written_ok {
+        Some(checked)
+    } else {
+        prev
+    }
+}
+
+/// Re-arm the cutover latch when the membership differs from the one it was
+/// latched over (#1715 review). Compares against BOTH the applied signature
+/// (only refreshed by applied `Normal` entries) AND the live membership the
+/// capability check just read from Raft metrics: an idle join's membership
+/// entry does not refresh the applied signature, so without the live check
+/// the first post-join proposal would run under the stale signature and skip
+/// the cutover.
+fn rearm_on_membership_change(
+    done: Option<BTreeSet<NodeId>>,
+    applied: Option<&BTreeSet<NodeId>>,
+    checked: &BTreeSet<NodeId>,
+) -> Option<BTreeSet<NodeId>> {
+    match done {
+        Some(d) if d != *checked || applied.is_some_and(|a| *a != d) => None,
+        other => other,
+    }
 }
 
 impl Batcher {
@@ -3400,6 +3500,21 @@ impl Batcher {
         let (lo_tx, mut lo_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
         let max_bytes = max_entry_bytes();
         tokio::spawn(async move {
+            // Whether this batcher has committed a digest cutover (#1692)
+            // since the rolling-upgrade gate last opened — and, if so, the
+            // voter/learner id set it cut over (#1715 review): a membership
+            // change that lands while this batcher is idle (an idle join, or
+            // one replicated by another leader) re-arms the cutover, because
+            // the joined/upgraded member never re-based and its chain is
+            // incomparable until the next cutover.
+            let mut cutover_done: Option<BTreeSet<NodeId>> = None;
+            // Leadership changes re-arm the cutover too: a leader whose last
+            // cutover attempt went uncommitted (a crash or failover before the
+            // write landed) leaves the latch set on the batcher that survives
+            // the transition, so watch for this node's leadership start.
+            let mut metrics = raft.metrics();
+            let my_id = metrics.borrow().id;
+            let mut was_leader = false;
             loop {
                 // Block until at least one submission is queued on either lane.
                 // `biased` polls the high-priority (drain) lane first, so when
@@ -3453,19 +3568,65 @@ impl Batcher {
                 // Rolling-upgrade gate (#1664 / #1661): stamp only while
                 // every other member advertises the digest capability, so a
                 // mixed-version group never compares (never false-positives).
-                let claim = if all_members_support(
+                let gate_open = all_members_support(
                     &raft,
                     transport.as_ref(),
                     nano_falcon_protocol::cluster_join::FEATURE_REPLICA_DIGEST,
                 )
-                .await
-                {
+                .await;
+                let claim = if gate_open {
                     digest.latest_claim()
                 } else {
                     None
                 };
-                let batch = ReplicatedBatch::new(items).with_digest(claim);
-                match raft.client_write(batch).await {
+                // Common chain base at cutover (#1692): the first entry this
+                // batcher proposes after the gate opens (a completed rolling
+                // upgrade, or this member's leadership start) re-bases every
+                // replica's chain at that entry's index, so in-place-upgraded
+                // replicas that started hashing at different indices become
+                // comparable without a snapshot resync. Closing the gate (an
+                // old-version member joined) re-arms it.
+                //
+                // The cutover is gated on its OWN capability
+                // (`FEATURE_REPLICA_DIGEST_CUTOVER`, #1715 review): the
+                // pre-cutover #1688 binary already advertises
+                // `FEATURE_REPLICA_DIGEST` yet ignores the marker, so a
+                // cutover gated on the digest token would leave those
+                // followers on their old chain base while the leader re-bases
+                // — permanently incomparable, with `cutover_done` preventing
+                // another cutover.
+                let (cutover_gate_open, cutover_checked) = checked_members_support(
+                    &raft,
+                    transport.as_ref(),
+                    nano_falcon_protocol::cluster_join::FEATURE_REPLICA_DIGEST_CUTOVER,
+                )
+                .await;
+                // Re-arm on this node's leadership start and on any membership
+                // change applied since the last committed cutover (an idle
+                // join, or one replicated by another leader while this batcher
+                // saw no submissions — #1715 review).
+                let is_leader = metrics.borrow_and_update().current_leader == Some(my_id);
+                if is_leader && !was_leader {
+                    cutover_done = None;
+                }
+                was_leader = is_leader;
+                cutover_done = rearm_on_membership_change(
+                    cutover_done,
+                    digest.membership_signature().as_ref(),
+                    &cutover_checked,
+                );
+                let cutover = cutover_gate_open && cutover_done.is_none();
+                let batch = ReplicatedBatch::new(items)
+                    .with_digest(claim)
+                    .with_digest_cutover(cutover);
+                let written = raft.client_write(batch).await;
+                cutover_done = next_cutover_latch(
+                    cutover_done,
+                    cutover_gate_open,
+                    written.is_ok(),
+                    cutover_checked,
+                );
+                match written {
                     Ok(res) => {
                         let mut out = res.data.items;
                         if out.len() == n {
@@ -8461,6 +8622,11 @@ mod tests {
             .expect("encode");
         let back: ReplicatedBatch = serde_json::from_str(&json).expect("decode");
         assert_eq!(back.digest, Some(claim));
+        assert!(!legacy.digest_cutover);
+        let cut = serde_json::to_string(&ReplicatedBatch::new(vec![]).with_digest_cutover(true))
+            .expect("encode");
+        let back: ReplicatedBatch = serde_json::from_str(&cut).expect("decode");
+        assert!(back.digest_cutover);
         let plain = serde_json::to_string(&ReplicatedBatch::new(vec![])).expect("encode");
         assert!(
             !plain.contains("digest"),
@@ -8733,6 +8899,373 @@ mod tests {
         assert!(
             perturbed_follower_fail_stops(cluster, all_new).await,
             "an all-new group detects the divergence"
+        );
+    }
+
+    /// A transport whose member `legacy` runs an OLD binary until `upgraded`
+    /// flips (#1692 rolling-upgrade test).
+    struct RollingUpgrade {
+        inner: crate::raft_net::LocalCluster,
+        legacy: NodeId,
+        upgraded: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RaftTransport for RollingUpgrade {
+        fn send<'a>(
+            &'a self,
+            target: NodeId,
+            partition: u64,
+            req: crate::raft_net::RaftRpcRequest,
+        ) -> futures_util::future::BoxFuture<
+            'a,
+            Result<crate::raft_net::RaftRpcResponse, crate::raft_net::TransportError>,
+        > {
+            self.inner.send(target, partition, req)
+        }
+
+        fn peer_supports<'a>(
+            &'a self,
+            target: NodeId,
+            _feature: &'static str,
+        ) -> futures_util::future::BoxFuture<'a, bool> {
+            let ok = target != self.legacy || self.upgraded.load(Ordering::SeqCst);
+            Box::pin(async move { ok })
+        }
+    }
+
+    /// #1692: after a rolling upgrade old -> new, a replica that was upgraded
+    /// in place (its chain re-based at a later index than its peers', so its
+    /// chain is incomparable with the leader's) is brought onto the common
+    /// base by the replicated cutover entry — so an injected divergence on it
+    /// IS detected, with no snapshot resync.
+    #[tokio::test]
+    async fn a_rolling_upgrade_cutover_restores_divergence_detection() {
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let upgraded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport: Arc<dyn RaftTransport> = Arc::new(RollingUpgrade {
+            inner: cluster.clone(),
+            legacy: 2,
+            upgraded: upgraded.clone(),
+        });
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                transport.clone(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        // Mixed-version phase: node 2 is old (no claims are stamped).
+        for t in 1..3 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        wait_all_applied(&parts).await;
+        // Node 2 is upgraded in place: it starts hashing from its next entry,
+        // a different base than the leader's genesis-based chain.
+        parts[2].sm_engine().with(|j| j.drop_chain_for_test()).await;
+        upgraded.store(true, Ordering::SeqCst);
+        for t in 3..6 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        wait_all_applied(&parts).await;
+        let leader = parts[0].digest_claim().expect("leader chain");
+        let follower = parts[2].digest_claim().expect("follower chain");
+        assert_eq!(leader.index, follower.index);
+        assert_eq!(
+            leader.chain, follower.chain,
+            "after the cutover every replica shares one comparable chain"
+        );
+        // An injected divergence on the upgraded replica IS detected.
+        parts[2]
+            .sm_engine()
+            .with(|j| j.perturb_chain_for_test())
+            .await;
+        for t in 6..9 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        let stopped = wait_until(1_500, || parts[2].divergence().is_some()).await;
+        assert!(parts[0].divergence().is_none() && parts[1].divergence().is_none());
+        for p in parts {
+            p.raft.shutdown().await.ok();
+        }
+        assert!(stopped, "the upgraded replica's divergence is detected");
+    }
+
+    /// A transport whose member `legacy` runs the pre-cutover #1688 binary: it
+    /// advertises the digest capability but NOT the cutover capability until
+    /// `upgraded` flips (#1715 review — leader-first upgrade).
+    struct PreCutover {
+        inner: crate::raft_net::LocalCluster,
+        legacy: NodeId,
+        upgraded: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RaftTransport for PreCutover {
+        fn send<'a>(
+            &'a self,
+            target: NodeId,
+            partition: u64,
+            req: crate::raft_net::RaftRpcRequest,
+        ) -> futures_util::future::BoxFuture<
+            'a,
+            Result<crate::raft_net::RaftRpcResponse, crate::raft_net::TransportError>,
+        > {
+            self.inner.send(target, partition, req)
+        }
+
+        fn peer_supports<'a>(
+            &'a self,
+            target: NodeId,
+            feature: &'static str,
+        ) -> futures_util::future::BoxFuture<'a, bool> {
+            let upgraded = self.upgraded.load(Ordering::SeqCst);
+            let ok = match feature {
+                // The #1688 binary advertises the digest capability…
+                nano_falcon_protocol::cluster_join::FEATURE_REPLICA_DIGEST => true,
+                // …but not the cutover one until it is itself upgraded.
+                nano_falcon_protocol::cluster_join::FEATURE_REPLICA_DIGEST_CUTOVER => {
+                    target != self.legacy || upgraded
+                }
+                _ => true,
+            };
+            Box::pin(async move { ok })
+        }
+    }
+
+    /// #1715 review: a leader upgraded FIRST must not emit its cutover while a
+    /// follower still runs the pre-cutover #1688 binary (which advertises the
+    /// digest capability but ignores the marker) — otherwise the leader
+    /// re-bases alone, the follower's chain stays incomparable, and the
+    /// leader's `cutover_done` latch prevents another cutover after the
+    /// follower upgrades. The cutover waits for the follower; once the whole
+    /// group is cutover-capable, the next entry re-bases every chain onto one
+    /// comparable base.
+    #[tokio::test]
+    async fn cutover_waits_for_pre_cutover_followers_then_rebases_all() {
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let upgraded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport: Arc<dyn RaftTransport> = Arc::new(PreCutover {
+            inner: cluster.clone(),
+            legacy: 2,
+            upgraded: upgraded.clone(),
+        });
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                transport.clone(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        // Leader-first upgrade: node 2 still runs #1688. Entries replicate
+        // (the marker is additive, so the old follower decodes and ignores
+        // it), but NO cutover may be stamped while it cannot apply one.
+        for t in 1..4 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        wait_all_applied(&parts).await;
+        // The follower upgrades in place: its chain re-bases at its next
+        // entry, incomparable with the leader's genesis-based chain — exactly
+        // the state a leader-first cutover would have left it in permanently.
+        parts[2].sm_engine().with(|j| j.drop_chain_for_test()).await;
+        upgraded.store(true, Ordering::SeqCst);
+        for t in 4..7 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        wait_all_applied(&parts).await;
+        let leader = parts[0].digest_claim().expect("leader chain");
+        let follower = parts[2].digest_claim().expect("follower chain");
+        assert_eq!(leader.index, follower.index);
+        assert_eq!(
+            leader.chain, follower.chain,
+            "the cutover fired only once every member could apply it, so all chains share one base"
+        );
+        for p in parts {
+            p.raft.shutdown().await.ok();
+        }
+    }
+
+    /// #1715 review: a learner that joins (and was upgraded) while the
+    /// leader's batcher is IDLE never saw the last cutover, so its chain
+    /// re-bases at its own first entry and stays incomparable — and with no
+    /// submission flowing, the closed-gate re-arm never fires. The membership
+    /// change itself must re-arm the cutover, so the next proposal after the
+    /// join re-bases every replica onto one comparable chain.
+    #[tokio::test]
+    async fn an_idle_join_re_arms_the_cutover_on_membership_change() {
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let transport: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                transport.clone(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        // The initial cutover commits over the {0,1,2} membership…
+        for t in 1..3 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        wait_all_applied(&parts).await;
+        // …then an upgraded learner joins while NO submission flows.
+        let learner = RaftPartition::bootstrap_member(
+            3,
+            0,
+            DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+            transport.clone(),
+            None,
+            false,
+        )
+        .await
+        .expect("boot learner");
+        cluster.register(0, 3, learner.raft.clone());
+        parts[0]
+            .add_learner(3, BasicNode::new("local-3"))
+            .await
+            .expect("add learner");
+        parts.push(learner);
+        wait_all_applied(&parts).await;
+        // The learner was born of the post-cutover log, so its chain starts
+        // at its own first applied entry — a different base than the group's
+        // cutover base. (The log-replication path journals no digest records,
+        // so nothing re-bases it onto the group's chain.)
+        parts[3].sm_engine().with(|j| j.drop_chain_for_test()).await;
+        // The membership change re-armed the cutover: the FIRST proposal
+        // after the join (no seed write — the membership entry alone does not
+        // refresh the applied signature) must re-base every replica.
+        parts[0]
+            .propose(deploy_command(), 3_000)
+            .await
+            .expect("deploy after join");
+        wait_all_applied(&parts).await;
+        let leader = parts[0].digest_claim().expect("leader chain");
+        let joined = parts[3].digest_claim().expect("learner chain");
+        assert_eq!(leader.index, joined.index);
+        assert_eq!(
+            leader.chain, joined.chain,
+            "the post-join cutover re-based the learner onto the common chain"
+        );
+        for p in parts {
+            p.raft.shutdown().await.ok();
+        }
+    }
+
+    /// #1715 review: a learner that joins while the cutover capability check
+    /// is suspended was never checked, so the latch must record the CHECKED
+    /// membership — which then differs from the applied (expanded) one and
+    /// re-arms the next proposal — never the post-write membership.
+    /// #1715 review: an idle join leaves the applied signature stale, so the
+    /// re-arm must also compare the live (checked) membership.
+    #[test]
+    fn cutover_rearms_on_live_membership_even_with_stale_applied_signature() {
+        let old: BTreeSet<NodeId> = [0, 1, 2].into_iter().collect();
+        let live: BTreeSet<NodeId> = [0, 1, 2, 3].into_iter().collect();
+        assert_eq!(
+            rearm_on_membership_change(Some(old.clone()), Some(&old), &live),
+            None
+        );
+        assert_eq!(
+            rearm_on_membership_change(Some(old.clone()), Some(&live), &old),
+            None
+        );
+        assert_eq!(
+            rearm_on_membership_change(Some(old.clone()), Some(&old), &old),
+            Some(old.clone())
+        );
+        assert_eq!(rearm_on_membership_change(None, Some(&old), &live), None);
+    }
+
+    #[test]
+    fn cutover_latch_records_the_checked_membership_not_a_concurrent_join() {
+        let checked: BTreeSet<NodeId> = [0, 1, 2].into_iter().collect();
+        let applied_after_join: BTreeSet<NodeId> = [0, 1, 2, 3].into_iter().collect();
+        let latch = next_cutover_latch(None, true, true, checked.clone());
+        assert_eq!(latch.as_ref(), Some(&checked));
+        assert_ne!(
+            latch.as_ref(),
+            Some(&applied_after_join),
+            "the joiner was never capability-checked; the latch must re-arm for it"
+        );
+        // A closed gate or a failed write never latches.
+        assert_eq!(next_cutover_latch(None, false, true, checked.clone()), None);
+        assert_eq!(next_cutover_latch(None, true, false, checked.clone()), None);
+        // An existing latch survives an open gate unchanged.
+        assert_eq!(
+            next_cutover_latch(Some(checked.clone()), true, true, applied_after_join),
+            Some(checked)
         );
     }
 

@@ -42,12 +42,22 @@ pub const FEATURE_CLUSTER_VARIABLES: &str = "cluster-variables-v1";
 /// mixed-version cluster never compares (and never false-positives).
 pub const FEATURE_REPLICA_DIGEST: &str = "replica-digest-v1";
 
+/// Replicated digest **cutover** (#1692, #1715 review): this binary decodes
+/// and applies the `digest_cutover` marker on a replicated batch, re-basing
+/// its chain at the cutover entry's index. Gated separately from
+/// [`FEATURE_REPLICA_DIGEST`] because the pre-cutover #1688 binary already
+/// advertises that token yet IGNORES the marker — a cutover gated on it would
+/// leave those followers on their old chain base while the leader re-bases,
+/// permanently disabling divergence comparison between them.
+pub const FEATURE_REPLICA_DIGEST_CUTOVER: &str = "replica-digest-cutover-v1";
+
 /// Every replicated-command feature this binary supports — the single source
 /// of truth for what the handshake advertises.
 pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_REPLICATED_LENIENT_COMPLETION,
     FEATURE_CLUSTER_VARIABLES,
     FEATURE_REPLICA_DIGEST,
+    FEATURE_REPLICA_DIGEST_CUTOVER,
 ];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.
