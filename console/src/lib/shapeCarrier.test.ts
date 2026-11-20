@@ -68,8 +68,20 @@ const sample: ShapeDecl[] = [
         via: "Order.customerId",
       },
       { op: "extend", name: "approved", type: "boolean" },
-      { op: "extend", name: "reviewedBy", type: "string", optional: true },
-      { op: "reference", name: "lines", ref: "OrderLine", list: true },
+      {
+        op: "extend",
+        name: "reviewedBy",
+        type: "string",
+        optional: true,
+        description: "Who approved the order.",
+      },
+      {
+        op: "reference",
+        name: "lines",
+        ref: "OrderLine",
+        list: true,
+        description: "The order lines.",
+      },
     ],
   },
 ];
@@ -109,6 +121,14 @@ test("envelopeEditableFields: null for empty, undefined, or non-extend shapes", 
         { op: "extend", name: "note", type: "string" },
         { op: "carry", ref: "base" },
       ],
+    }),
+    null,
+  );
+  // A described field would lose its description on save (#1738).
+  assert.equal(
+    envelopeEditableFields({
+      id: "described",
+      ops: [{ op: "extend", name: "a", type: "string", description: "A." }],
     }),
     null,
   );

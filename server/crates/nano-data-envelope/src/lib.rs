@@ -28,6 +28,8 @@ use std::path::Path;
 use nanobpmn_engine_core::xml::{Token, attr, local_name, tokenize};
 use serde::Serialize;
 
+pub mod json_schema;
+
 /// Reserved `zeebe:property` name carrying the input data-envelope type ref.
 /// Must match `console/src/lib/dataEnvelope.ts` `ENVELOPE_KEY.inputType`.
 const ENVELOPE_IN: &str = "io.nanobpm.dataEnvelope.in";
@@ -140,6 +142,10 @@ pub enum ShapeOp {
         optional: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         list: Option<bool>,
+        /// Human-readable field description (surfaced in a derived JSON
+        /// Schema, e.g. an MCP tool `inputSchema`, issue #1738).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     /// Pull in another motion shape: `spread` inlines its fields, else nests it.
     Reference {
@@ -149,6 +155,10 @@ pub enum ShapeOp {
         spread: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         list: Option<bool>,
+        /// Human-readable field description (surfaced in a derived JSON
+        /// Schema, e.g. an MCP tool `inputSchema`, issue #1738).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
 }
 
@@ -476,12 +486,14 @@ fn parse_shape_op(ln: &str, attrs: &[(String, String)]) -> Option<ShapeOp> {
             r#type: shape_attr(attrs, "type")?,
             optional: bool_attr(attrs, "optional"),
             list: bool_attr(attrs, "list"),
+            description: shape_attr(attrs, "description"),
         }),
         "reference" => Some(ShapeOp::Reference {
             name: shape_attr(attrs, "name")?,
             r#ref: shape_attr(attrs, "ref")?,
             spread: bool_attr(attrs, "spread"),
             list: bool_attr(attrs, "list"),
+            description: shape_attr(attrs, "description"),
         }),
         _ => None,
     }
@@ -1252,7 +1264,7 @@ mod tests {
                  <nano:carry ref="Order" />
                  <nano:project ref="Customer" fields="tier, region" via="Order.customerId" />
                  <nano:extend name="approved" type="boolean" />
-                 <nano:extend name="reviewedBy" type="string" optional="true" />
+                 <nano:extend name="reviewedBy" type="string" optional="true" description=" Who approved. " />
                  <nano:reference name="lines" ref="OrderLine" spread="false" list="true" />
                </nano:shape>"#,
         );
@@ -1276,18 +1288,21 @@ mod tests {
                         r#type: "boolean".into(),
                         optional: None,
                         list: None,
+                        description: None,
                     },
                     ShapeOp::Extend {
                         name: "reviewedBy".into(),
                         r#type: "string".into(),
                         optional: Some(true),
                         list: None,
+                        description: Some("Who approved.".into()),
                     },
                     ShapeOp::Reference {
                         name: "lines".into(),
                         r#ref: "OrderLine".into(),
                         spread: Some(false),
                         list: Some(true),
+                        description: None,
                     },
                 ],
             }]
@@ -1387,6 +1402,7 @@ mod tests {
                     r#type: "boolean".into(),
                     optional: None,
                     list: None,
+                    description: None,
                 },
             ],
         };

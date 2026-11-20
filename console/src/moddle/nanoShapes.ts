@@ -59,6 +59,7 @@ export const nanoShapesModdle = {
         { name: "type", type: "String", isAttr: true },
         { name: "optional", type: "Boolean", isAttr: true },
         { name: "list", type: "Boolean", isAttr: true },
+        { name: "description", type: "String", isAttr: true },
       ],
     },
     {
@@ -69,6 +70,7 @@ export const nanoShapesModdle = {
         { name: "ref", type: "String", isAttr: true },
         { name: "spread", type: "Boolean", isAttr: true },
         { name: "list", type: "Boolean", isAttr: true },
+        { name: "description", type: "String", isAttr: true },
       ],
     },
     // Model-level metadata (ADR 0040 §5), a sibling of `nano:shapes` under the
