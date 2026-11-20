@@ -35,6 +35,15 @@
 //! divergence (no false positives across a rolling upgrade). A snapshot install
 //! adopts the leader's chain (base included), so every replica converges on one
 //! comparable chain after its next install.
+//!
+//! **Cutover (#1692).** A caught-up follower may never need a snapshot, so the
+//! leader also re-bases every chain explicitly: the first entry it proposes
+//! once every member advertises the digest capability carries a replicated
+//! `digest_cutover` marker, and every replica folds that entry from
+//! [`ChainDigest::genesis`] at its own index ([`cutover_entry_digest`], recorded
+//! with [`EntryDigest::cutover`]). All replicas apply the same entry at the same
+//! index, so from there on they share one comparable base and divergence
+//! detection resumes after a rolling upgrade.
 
 use nanobpmn_engine_core::Event;
 use serde::{Deserialize, Serialize};
@@ -141,6 +150,18 @@ pub struct EntryDigest {
     /// Number of command events (excluding the `RaftEntryApplied` record) the
     /// entry journaled and folded.
     pub events: u64,
+    /// Set on the replicated digest **cutover** entry (#1692): the chain was
+    /// deliberately re-based at this entry's own index (folded from
+    /// [`ChainDigest::genesis`]) because the leader stamped a cutover into the
+    /// replicated entry, so EVERY replica re-bases at the same index and their
+    /// chains become comparable after a rolling upgrade. Additive: absent on
+    /// every other record (skipped when `false`, so their bytes are unchanged).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cutover: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Strictly extracts the [`EntryDigest`] from a `RaftEntryApplied` record's
@@ -193,6 +214,21 @@ pub fn next_entry_digest(
     EntryDigest {
         chain: prev.fold(index, start_dispatch_rr, events),
         events: events.len() as u64,
+        cutover: false,
+    }
+}
+
+/// The chain digest of a replicated **cutover** entry (#1692): entry `index`
+/// re-bases the chain at its own index regardless of the replica's previous
+/// chain. Every replica applies the same cutover entry at the same index, so
+/// after it every replica's chain has the same base — divergence detection
+/// resumes for replicas whose chains started at different indices (a rolling
+/// upgrade of in-place replicas) without forcing a snapshot resync.
+pub fn cutover_entry_digest(index: u64, start_dispatch_rr: u64, events: &[Event]) -> EntryDigest {
+    EntryDigest {
+        chain: ChainDigest::genesis(index).fold(index, start_dispatch_rr, events),
+        events: events.len() as u64,
+        cutover: true,
     }
 }
 
@@ -292,6 +328,22 @@ pub fn verify_journal_chain(
             derived: why,
         };
         let start = match prev {
+            // A replicated cutover entry (#1692) re-bases at its own index by
+            // construction: verify it from genesis whatever the predecessor.
+            _ if rec.cutover => {
+                if rec.chain.base != *index {
+                    return Err(reject(format!(
+                        "<cutover record based at {} instead of its own index>",
+                        rec.chain.base
+                    )));
+                }
+                if n > pos && complete {
+                    return Err(reject(format!(
+                        "<no verifiable cutover: {n} events claimed, {pos} present>"
+                    )));
+                }
+                (n <= pos).then(|| ChainDigest::genesis(*index))
+            }
             Some(p) if p.comparable(&rec.chain) => Some(p),
             // A same-version record never re-bases under a known
             // predecessor: the live fold always continues it.
@@ -601,6 +653,72 @@ mod tests {
         );
         // A window (which may open mid-frame) still anchors there.
         assert!(verify_journal_chain(None, &j, Coverage::Window).is_ok());
+    }
+
+    #[test]
+    fn cutover_rebases_every_replica_onto_one_comparable_chain() {
+        // #1692: two replicas upgraded in place started hashing at different
+        // indices, so their chains are incomparable and a divergence between
+        // them would go unnoticed.
+        let a = next_entry_digest(None, 2, rr(2), &[ev(1)]);
+        let b = next_entry_digest(None, 4, rr(4), &[ev(1)]);
+        assert!(!a.chain.comparable(&b.chain));
+        // The replicated cutover entry at index 5 re-bases both at 5.
+        let ca = cutover_entry_digest(5, rr(5), &[ev(9)]);
+        let cb = cutover_entry_digest(5, rr(5), &[ev(9)]);
+        assert!(ca.chain.comparable(&cb.chain));
+        assert_eq!(ca, cb);
+        // Continuing the chain keeps them comparable, and an injected
+        // divergence afterwards IS visible as unequal comparable hashes.
+        let sa = serde_json::json!({ "digest": ca }).to_string();
+        let sb = serde_json::json!({ "digest": cb }).to_string();
+        let na = next_entry_digest(Some(&sa), 6, rr(6), &[ev(10)]);
+        let nb = next_entry_digest(Some(&sb), 6, rr(6), &[ev(11)]);
+        assert!(na.chain.comparable(&nb.chain));
+        assert_ne!(na.chain.hash, nb.chain.hash);
+    }
+
+    #[test]
+    fn non_cutover_records_serialize_unchanged() {
+        let d = next_entry_digest(None, 3, 7, &[ev(1)]);
+        assert!(!serde_json::to_string(&d).unwrap().contains("cutover"));
+        let c = cutover_entry_digest(3, 7, &[ev(1)]);
+        let back: EntryDigest = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(back.cutover);
+    }
+
+    #[test]
+    fn complete_history_verifies_a_cutover_under_a_known_predecessor() {
+        // A journal whose entry 3 is a replicated cutover: it re-bases at its
+        // own index and the complete-history verifier accepts it.
+        let mut j = journal(1, &[&[1], &[2]]);
+        let c = cutover_entry_digest(3, rr(3), &[ev(3)]);
+        j.push(ev(3));
+        j.push(record(3, Some(c)));
+        let state = serde_json::json!({ "digest": c }).to_string();
+        let n = next_entry_digest(Some(&state), 4, rr(4), &[ev(4)]);
+        j.push(ev(4));
+        j.push(record(4, Some(n)));
+        assert_eq!(
+            verify_journal_chain(None, &j, Coverage::Complete).map(|v| v.0),
+            Ok(4)
+        );
+        // An altered cutover entry still fails closed.
+        let mut bad = j.clone();
+        bad[4] = ev(99);
+        assert_eq!(
+            verify_journal_chain(None, &bad, Coverage::Complete).map_err(|e| e.index),
+            Err(3)
+        );
+        // A cutover flag on a record NOT based at its own index is rejected.
+        let mut forged = c;
+        forged.chain.base = 1;
+        let mut bad = j.clone();
+        bad[5] = record(3, Some(forged));
+        assert_eq!(
+            verify_journal_chain(None, &bad, Coverage::Complete).map_err(|e| e.index),
+            Err(3)
+        );
     }
 
     #[test]

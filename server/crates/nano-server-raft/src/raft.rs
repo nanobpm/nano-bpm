@@ -293,6 +293,14 @@ pub struct ReplicatedBatch {
     /// the unknown field — so mixed-version clusters keep replicating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<DigestClaim>,
+    /// Digest **cutover** marker (#1692): every replica re-bases its chain
+    /// digest at THIS entry's index, so replicas whose chains started at
+    /// different indices (upgraded in place during a rolling upgrade) share
+    /// one comparable base from here on. The leader stamps it on its first
+    /// proposal once the whole group advertises the digest capability.
+    /// Additive on the wire: absent decodes as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub digest_cutover: bool,
     /// Live-count/-bytes guard (see [`LIVE_BATCHES`]/[`LIVE_BATCH_BYTES`]).
     /// Skipped on the wire (reconstructed on deserialize), so the replicated
     /// bytes are unchanged.
@@ -314,9 +322,17 @@ impl<'de> serde::Deserialize<'de> for ReplicatedBatch {
             items: Vec<ReplicatedCommand>,
             #[serde(default)]
             digest: Option<DigestClaim>,
+            #[serde(default)]
+            digest_cutover: bool,
         }
-        let Wire { items, digest } = Wire::deserialize(deserializer)?;
-        Ok(ReplicatedBatch::new(items).with_digest(digest))
+        let Wire {
+            items,
+            digest,
+            digest_cutover,
+        } = Wire::deserialize(deserializer)?;
+        Ok(ReplicatedBatch::new(items)
+            .with_digest(digest)
+            .with_digest_cutover(digest_cutover))
     }
 }
 
@@ -327,6 +343,7 @@ impl ReplicatedBatch {
         Self {
             items,
             digest: None,
+            digest_cutover: false,
             _live: BatchLiveGuard::with_bytes(bytes),
         }
     }
@@ -334,6 +351,13 @@ impl ReplicatedBatch {
     /// Stamps the proposing leader's chain digest claim (#1664).
     pub fn with_digest(mut self, digest: Option<DigestClaim>) -> Self {
         self.digest = digest;
+        self
+    }
+
+    /// Marks this entry as the digest cutover (#1692): every replica re-bases
+    /// its chain at this entry's index.
+    pub fn with_digest_cutover(mut self, cutover: bool) -> Self {
+        self.digest_cutover = cutover;
         self
     }
 
@@ -2584,6 +2608,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                         .unwrap_or_else(|e| e.into_inner())
                         .last_membership
                         .clone();
+                    let cutover = batch.digest_cutover;
                     type EntryOutcomes = Vec<(&'static str, ApplyOutcome)>;
                     let applied: std::io::Result<(
                         EntryOutcomes,
@@ -2621,7 +2646,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                             }
                             // Fold exactly the events this entry journals
                             // into the chain and record it in the same frame.
-                            let digest = journal.raft_entry_digest(log_id.index);
+                            let digest = journal.raft_entry_digest(log_id.index, cutover);
                             let raft_state =
                                 journaled_raft_state(log_id, &membership, Some(digest))
                                     .inspect_err(|_| journal.abort_raft_entry())?;
@@ -2714,7 +2739,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                             journal.begin_raft_entry();
                             // A membership entry journals no command events,
                             // but still advances the chain (#1664).
-                            let digest = journal.raft_entry_digest(log_id.index);
+                            let digest = journal.raft_entry_digest(log_id.index, false);
                             let raft_state =
                                 journaled_raft_state(log_id, &journaled_membership, Some(digest))
                                     .inspect_err(|_| journal.abort_raft_entry())?;
@@ -3400,6 +3425,9 @@ impl Batcher {
         let (lo_tx, mut lo_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
         let max_bytes = max_entry_bytes();
         tokio::spawn(async move {
+            // Whether this batcher has committed a digest cutover (#1692)
+            // since the rolling-upgrade gate last opened.
+            let mut cutover_done = false;
             loop {
                 // Block until at least one submission is queued on either lane.
                 // `biased` polls the high-priority (drain) lane first, so when
@@ -3453,19 +3481,31 @@ impl Batcher {
                 // Rolling-upgrade gate (#1664 / #1661): stamp only while
                 // every other member advertises the digest capability, so a
                 // mixed-version group never compares (never false-positives).
-                let claim = if all_members_support(
+                let gate_open = all_members_support(
                     &raft,
                     transport.as_ref(),
                     nano_falcon_protocol::cluster_join::FEATURE_REPLICA_DIGEST,
                 )
-                .await
-                {
+                .await;
+                let claim = if gate_open {
                     digest.latest_claim()
                 } else {
                     None
                 };
-                let batch = ReplicatedBatch::new(items).with_digest(claim);
-                match raft.client_write(batch).await {
+                // Common chain base at cutover (#1692): the first entry this
+                // batcher proposes after the gate opens (a completed rolling
+                // upgrade, or this member's leadership start) re-bases every
+                // replica's chain at that entry's index, so in-place-upgraded
+                // replicas that started hashing at different indices become
+                // comparable without a snapshot resync. Closing the gate (an
+                // old-version member joined) re-arms it.
+                let cutover = gate_open && !cutover_done;
+                let batch = ReplicatedBatch::new(items)
+                    .with_digest(claim)
+                    .with_digest_cutover(cutover);
+                let written = raft.client_write(batch).await;
+                cutover_done = gate_open && (cutover_done || written.is_ok());
+                match written {
                     Ok(res) => {
                         let mut out = res.data.items;
                         if out.len() == n {
@@ -8461,6 +8501,11 @@ mod tests {
             .expect("encode");
         let back: ReplicatedBatch = serde_json::from_str(&json).expect("decode");
         assert_eq!(back.digest, Some(claim));
+        assert!(!legacy.digest_cutover);
+        let cut = serde_json::to_string(&ReplicatedBatch::new(vec![]).with_digest_cutover(true))
+            .expect("encode");
+        let back: ReplicatedBatch = serde_json::from_str(&cut).expect("decode");
+        assert!(back.digest_cutover);
         let plain = serde_json::to_string(&ReplicatedBatch::new(vec![])).expect("encode");
         assert!(
             !plain.contains("digest"),
@@ -8734,6 +8779,122 @@ mod tests {
             perturbed_follower_fail_stops(cluster, all_new).await,
             "an all-new group detects the divergence"
         );
+    }
+
+    /// A transport whose member `legacy` runs an OLD binary until `upgraded`
+    /// flips (#1692 rolling-upgrade test).
+    struct RollingUpgrade {
+        inner: crate::raft_net::LocalCluster,
+        legacy: NodeId,
+        upgraded: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RaftTransport for RollingUpgrade {
+        fn send<'a>(
+            &'a self,
+            target: NodeId,
+            partition: u64,
+            req: crate::raft_net::RaftRpcRequest,
+        ) -> futures_util::future::BoxFuture<
+            'a,
+            Result<crate::raft_net::RaftRpcResponse, crate::raft_net::TransportError>,
+        > {
+            self.inner.send(target, partition, req)
+        }
+
+        fn peer_supports<'a>(
+            &'a self,
+            target: NodeId,
+            _feature: &'static str,
+        ) -> futures_util::future::BoxFuture<'a, bool> {
+            let ok = target != self.legacy || self.upgraded.load(Ordering::SeqCst);
+            Box::pin(async move { ok })
+        }
+    }
+
+    /// #1692: after a rolling upgrade old -> new, a replica that was upgraded
+    /// in place (its chain re-based at a later index than its peers', so its
+    /// chain is incomparable with the leader's) is brought onto the common
+    /// base by the replicated cutover entry — so an injected divergence on it
+    /// IS detected, with no snapshot resync.
+    #[tokio::test]
+    async fn a_rolling_upgrade_cutover_restores_divergence_detection() {
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let upgraded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport: Arc<dyn RaftTransport> = Arc::new(RollingUpgrade {
+            inner: cluster.clone(),
+            legacy: 2,
+            upgraded: upgraded.clone(),
+        });
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                transport.clone(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        // Mixed-version phase: node 2 is old (no claims are stamped).
+        for t in 1..3 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        wait_all_applied(&parts).await;
+        // Node 2 is upgraded in place: it starts hashing from its next entry,
+        // a different base than the leader's genesis-based chain.
+        parts[2].sm_engine().with(|j| j.drop_chain_for_test()).await;
+        upgraded.store(true, Ordering::SeqCst);
+        for t in 3..6 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        wait_all_applied(&parts).await;
+        let leader = parts[0].digest_claim().expect("leader chain");
+        let follower = parts[2].digest_claim().expect("follower chain");
+        assert_eq!(leader.index, follower.index);
+        assert_eq!(
+            leader.chain, follower.chain,
+            "after the cutover every replica shares one comparable chain"
+        );
+        // An injected divergence on the upgraded replica IS detected.
+        parts[2]
+            .sm_engine()
+            .with(|j| j.perturb_chain_for_test())
+            .await;
+        for t in 6..9 {
+            parts[0]
+                .propose(deploy_command(), t * 1_000)
+                .await
+                .expect("deploy");
+        }
+        let stopped = wait_until(1_500, || parts[2].divergence().is_some()).await;
+        assert!(parts[0].divergence().is_none() && parts[1].divergence().is_none());
+        for p in parts {
+            p.raft.shutdown().await.ok();
+        }
+        assert!(stopped, "the upgraded replica's divergence is detected");
     }
 
     /// Waits until every member has applied up to the leader's (node 0's)
