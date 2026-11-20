@@ -72,6 +72,7 @@ fn compare_states(
     prev_states: &[&Json],
     entries: usize,
     erasable: &Vocab,
+    state_divergent_from: Option<u64>,
 ) -> Result<CrossReleaseReport, String> {
     if head_states.len() != prev_states.len() {
         return Err(format!(
@@ -83,7 +84,7 @@ fn compare_states(
     if head_states.is_empty() {
         return Err("no state checkpoints to compare (run with --state-every)".into());
     }
-    let (mut compared, mut skipped) = (0, 0);
+    let (mut compared, mut skipped, mut skipped_ratified) = (0, 0, 0);
     for (h, p) in head_states.iter().zip(prev_states.iter()) {
         let at = h.get("i").cloned().unwrap_or(Json::Null);
         if p.get("i") != h.get("i") {
@@ -98,6 +99,19 @@ fn compare_states(
             skipped += 1;
             continue;
         }
+        // A ratified upgrade-boundary `unbalanced` divergence changes the
+        // durable state BY DECLARATION (its one-sided events reach it: #1528
+        // leaves the MI instance waiting on per-child user tasks where the
+        // previous release completed it) and shifts every later minted key,
+        // so no raw snapshot from its first divergent entry on can agree.
+        // Those checkpoints are skipped and REPORTED; every earlier one is
+        // still compared strictly.
+        if let (Some(from), Some(i)) = (state_divergent_from, at.as_u64()) {
+            if i >= from {
+                skipped_ratified += 1;
+                continue;
+            }
+        }
         if canonical_state(h, "head", erasable)? != canonical_state(p, "prev", erasable)? {
             return Err(format!(
                 "durable state diverges at entry {at} (same snapshot format {hf:?})"
@@ -109,6 +123,7 @@ fn compare_states(
         entries,
         states_compared: compared,
         states_skipped_format_bump: skipped,
+        states_skipped_ratified_boundary: skipped_ratified,
     })
 }
 
@@ -118,6 +133,10 @@ pub struct CrossReleaseReport {
     pub entries: usize,
     pub states_compared: usize,
     pub states_skipped_format_bump: usize,
+    /// Checkpoints at or after the first entry of a ratified upgrade-boundary
+    /// `unbalanced` divergence (its declared state change makes them
+    /// incomparable).
+    pub states_skipped_ratified_boundary: usize,
 }
 
 // ---- Previous-release gate: golden-derived additive set (#1698) ----------
@@ -907,6 +926,33 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
     // the head build's child keys interleave with the task keys while the
     // previous release's stay contiguous — a clean per-child remint that
     // only a distinct, order-independent child identity reconciles.
+    // Pass 2a: register every MI BODY's element identity first — a body is
+    // usually activated in the same entry as its children, and a child's
+    // identity embeds its body's CANONICAL identity, so the body must be
+    // known before any child is derived (#1528 review). Nested bodies are
+    // element activations too, so they are covered here as well; a later
+    // pass-3 sighting of the same key re-mints idempotently (same base).
+    let body_keys: BTreeSet<u64> = parsed
+        .iter()
+        .filter(|(variant, _)| *variant == "MultiInstanceChildActivated")
+        .filter_map(|(_, body)| u64_of(body, "body_key"))
+        .collect();
+    for (_, body) in parsed
+        .iter()
+        .filter(|(variant, _)| *variant == "ElementActivating" || *variant == "ElementActivated")
+    {
+        if let (Some(k), Some(id)) = (
+            u64_of(body, "element_instance_key"),
+            str_of(body, "element_id"),
+        ) {
+            if body_keys.contains(&k) {
+                let instance = u64_of(body, "instance_key")
+                    .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
+                ids.mint(k, format!("element:{instance}:{id}"))?;
+            }
+        }
+    }
+    // Pass 2b: the children.
     for (_, body) in parsed
         .iter()
         .filter(|(variant, _)| *variant == "MultiInstanceChildActivated")
@@ -1234,6 +1280,9 @@ struct MatchedSide<'a> {
     raw: &'a BTreeMap<String, usize>,
     /// This side's corpus-wide key identities.
     ids: &'a KeyIds,
+    /// Whether the declaration remints keys — the `canonical` multiset was
+    /// projected with this setting, so the surplus lookup must be too.
+    remint: bool,
 }
 
 /// Validates the one-sided surplus an `unbalanced` declaration ratifies
@@ -1243,9 +1292,9 @@ struct MatchedSide<'a> {
 ///
 /// * every surplus event must still decode under the head `Event` type (a
 ///   corrupted or truncated one fails); and
-/// * when the snapshot format is unchanged (so the durable-state comparison
-///   is live and the surplus's payload reaches it), the surplus must be
-///   internally consistent: a `UserTaskCreated` whose owning element instance
+/// * regardless of snapshot format (when formats differ the durable-state
+///   comparison is skipped, so this is the ONLY payload check), the surplus
+///   must be internally consistent: a `UserTaskCreated` whose owning element instance
 ///   its own side never minted points at a wrong or missing child — not a
 ///   clean one-sided emission — and fails.
 ///
@@ -1259,7 +1308,6 @@ fn validate_unbalanced_surplus(
     scenario: &str,
     head: MatchedSide<'_>,
     prev: MatchedSide<'_>,
-    state_format_unchanged: bool,
 ) -> Result<(), String> {
     // The asymmetric remainder of a side's canonical multiset, as raw events:
     // the raw events whose canonical projection is in the surplus.
@@ -1273,7 +1321,7 @@ fn validate_unbalanced_surplus(
                     continue;
                 }
             };
-            let proj = pattern_projection(&v, side.ids, true).to_string();
+            let proj = pattern_projection(&v, side.ids, side.remint).to_string();
             let extra = side
                 .canonical
                 .get(&proj)
@@ -1294,21 +1342,19 @@ fn validate_unbalanced_surplus(
                     "scenario {scenario}: a {side_name}-side surplus event does not decode under head: {e}: {event}"
                 )
             })?;
-            if state_format_unchanged {
-                // The owning element instance of a one-sided `UserTaskCreated`
-                // must be an entity its own side minted — otherwise the task
-                // hangs off a wrong or missing child.
-                let v = serde_json::to_value(&decoded).map_err(|e| e.to_string())?;
-                if let Some(("UserTaskCreated", body)) = variant_body(&v) {
-                    if let Some(owner) = body.get("element_instance_key").and_then(Json::as_u64) {
-                        if side.ids.get(&owner).is_none() {
-                            return Err(format!(
-                                "scenario {scenario}: a {side_name}-side surplus `UserTaskCreated` \
-                                 (x{extra}) names an owning element_instance_key {owner} its own \
-                                 side never minted — a wrong-child/wrong-owner event, not a clean \
-                                 one-sided emission: {event}"
-                            ));
-                        }
+            // The owning element instance of a one-sided `UserTaskCreated`
+            // must be an entity its own side minted — otherwise the task
+            // hangs off a wrong or missing child.
+            let v = serde_json::to_value(&decoded).map_err(|e| e.to_string())?;
+            if let Some(("UserTaskCreated", body)) = variant_body(&v) {
+                if let Some(owner) = body.get("element_instance_key").and_then(Json::as_u64) {
+                    if side.ids.get(&owner).is_none() {
+                        return Err(format!(
+                            "scenario {scenario}: a {side_name}-side surplus `UserTaskCreated` \
+                             (x{extra}) names an owning element_instance_key {owner} its own \
+                             side never minted — a wrong-child/wrong-owner event, not a clean \
+                             one-sided emission: {event}"
+                        ));
                     }
                 }
             }
@@ -1724,22 +1770,8 @@ pub fn cross_release_checked(
     // entity and scope preserved, occurrences counted); the parked-join
     // shape is the only exception and is validated exactly, per entity. A
     // pattern removed but never re-added (a real loss) still fails.
-    // Whether the two builds share a snapshot format — when they do, the
-    // durable-state comparison below is live, so an `unbalanced` declaration
-    // must also validate the one-sided events' internal consistency (their
-    // payloads reach the compared state). When the format differs the state
-    // comparison is skipped, so only the (cheaper) decode check applies.
-    let state_format_unchanged = {
-        let format = |records: &[Json]| {
-            records
-                .iter()
-                .filter(|r| is_state(r))
-                .find_map(|r| r.get("format").and_then(Json::as_u64))
-        };
-        let (hf, pf) = (format(head), format(prev));
-        hf.is_some() && hf == pf
-    };
     let mut ratified_scenarios: BTreeSet<&str> = BTreeSet::new();
+    let mut state_divergent_from: Option<u64> = None;
     for (scenario, pend) in &pending {
         let d = pend.divergence;
         let expected = &d.expected;
@@ -1848,9 +1880,8 @@ pub fn cross_release_checked(
                     // surplus (the events only one side emits) rather than
                     // accepting it blindly (#1528 review): every surplus event
                     // must still decode under the head `Event` type (a
-                    // corrupted one fails), and — when the snapshot format is
-                    // unchanged, so the durable state comparison is live — the
-                    // surplus must be internally consistent (a `UserTaskCreated`
+                    // corrupted one fails), and — whatever the snapshot
+                    // formats — the surplus must be internally consistent (a `UserTaskCreated`
                     // whose owning `element_instance_key` its own side never
                     // minted is a wrong-child/wrong-owner event, not a clean
                     // one-sided emission).
@@ -1860,13 +1891,14 @@ pub fn cross_release_checked(
                             canonical: &head_matched,
                             raw: &head_matched_raw,
                             ids: &head_ids,
+                            remint,
                         },
                         MatchedSide {
                             canonical: &prev_matched,
                             raw: &prev_matched_raw,
                             ids: &prev_ids,
+                            remint,
                         },
-                        state_format_unchanged,
                     )?;
                 }
                 Some(_) => {
@@ -1899,6 +1931,17 @@ pub fn cross_release_checked(
         }
         ratified_entries += pend.entries.len();
         ratified_scenarios.insert(scenario);
+        if expected.unbalanced.is_some() && d.upgrade == UpgradeMode::UpgradeBoundary {
+            let first = pend
+                .entries
+                .iter()
+                .filter_map(|(i, _, _)| head_entries[*i].get("i").and_then(Json::as_u64))
+                .min();
+            state_divergent_from = match (state_divergent_from, first) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
     }
     for o in &ctx.allowlist.observational_variants {
         if !observed.contains(&o.variant) {
@@ -1938,6 +1981,7 @@ pub fn cross_release_checked(
         &prev_states,
         prev_entries.len(),
         &state_erasable,
+        state_divergent_from,
     )?;
     // Report the fields actually erased (present on the head side of their
     // own stream), not the whole candidate set.

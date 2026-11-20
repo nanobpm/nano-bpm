@@ -1929,6 +1929,167 @@ fn prev_release_gate_unbalanced_rejects_wrong_one_sided_events() {
     );
 }
 
+/// [`head_records`], computed once per test binary (a full corpus run).
+fn cached_head_records() -> &'static [serde_json::Value] {
+    static CACHE: std::sync::OnceLock<Vec<serde_json::Value>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(head_records)
+}
+
+/// A real `UserTaskCreated` event from the corpus (so it decodes under the
+/// head `Event` type), re-keyed to `user_task_key` / `owner`.
+fn user_task_created(user_task_key: u64, owner: u64, instance: u64) -> serde_json::Value {
+    let mut e = cached_head_records()
+        .iter()
+        .filter_map(|r| r.get("events")?.as_array().cloned())
+        .flatten()
+        .find(|e| e.get("UserTaskCreated").is_some())
+        .expect("the corpus emits UserTaskCreated");
+    let body = e.get_mut("UserTaskCreated").expect("body");
+    body["user_task_key"] = serde_json::json!(user_task_key);
+    body["element_instance_key"] = serde_json::json!(owner);
+    if body.get("instance_key").is_some() {
+        body["instance_key"] = serde_json::json!(instance);
+    }
+    e
+}
+
+/// A self-contained MI create entry: instance 10, body `body` activating one
+/// child `child`, plus `extra` events.
+fn mi_entry(body: u64, child: u64, extra: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut events = vec![
+        serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+        serde_json::json!({"ElementActivating":{"element_id":"review","element_instance_key":body,"instance_key":10,"scope":0}}),
+        serde_json::json!({"ElementActivating":{"element_id":"review","element_instance_key":child,"instance_key":10,"scope":body}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":body,"child_key":child,"index":0,"instance_key":10,"local_variables":{}}}),
+    ];
+    events.extend(extra);
+    serde_json::json!({"i": 0, "events": events})
+}
+
+/// A real state checkpoint at position `i` with snapshot `format`.
+fn state_at(i: u64, format: u64) -> serde_json::Value {
+    let mut s = cached_head_records()
+        .iter()
+        .find(|r| r.get("state").is_some())
+        .cloned()
+        .expect("a state checkpoint");
+    s["i"] = serde_json::json!(i);
+    s["format"] = serde_json::json!(format);
+    s
+}
+
+/// `cross_release_checked` over a single-scenario (`s`) synthetic run.
+fn checked_s(
+    head: &[serde_json::Value],
+    prev: &[serde_json::Value],
+    expected: serde_json::Value,
+) -> Result<compare::CheckedReport, String> {
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": "s", "expected": expected,
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let n = head.iter().filter(|r| r.get("state").is_none()).count();
+    let scenarios = vec!["s".to_string(); n];
+    let allowlist = compare::parse_allowlist(&allow.to_string())?;
+    let added = compare::Vocab::new();
+    let ctx = compare::CrossReleaseContext {
+        scenarios: &scenarios,
+        allowlist: &allowlist,
+        prev_tag: "v0.0.1",
+        added: &added,
+    };
+    compare::cross_release_checked(head, prev, &ctx)
+}
+
+/// #1528 (review): an MI body activated in the SAME entry as its child, with
+/// both keys differing across releases, reconciles under `remint_keys` — the
+/// body's identity is registered before the child's is derived from it.
+#[test]
+fn prev_release_gate_same_entry_body_and_child_remint() {
+    let head = vec![mi_entry(11, 12, vec![]), state_at(0, 3)];
+    let prev = vec![mi_entry(21, 22, vec![]), state_at(0, 3)];
+    checked_s(&head, &prev, serde_json::json!({"remint_keys": true}))
+        .expect("a same-entry body+child remint reconciles");
+}
+
+/// #1528 (review): the one-sided surplus owner check runs with AND without
+/// `remint_keys`, and whatever the snapshot formats — a surplus
+/// `UserTaskCreated` naming an unminted owner always fails.
+#[test]
+fn prev_release_gate_unbalanced_owner_check_is_unconditional() {
+    let bad = || user_task_created(500, 9_999_999, 10);
+    let good = || user_task_created(500, 12, 10);
+    let expected = |remint: bool| {
+        serde_json::json!({
+            "remint_keys": remint,
+            "only_in_head": [{"variant": "UserTaskCreated"}],
+            "unbalanced": {"reason": "a real reason"}
+        })
+    };
+    for remint in [false, true] {
+        for prev_format in [3, 2] {
+            let prev = vec![mi_entry(11, 12, vec![]), state_at(0, prev_format)];
+            let ok_head = vec![mi_entry(11, 12, vec![good()]), state_at(0, 3)];
+            checked_s(&ok_head, &prev, expected(remint)).unwrap_or_else(|e| {
+                panic!("remint={remint} format={prev_format}: a valid surplus passes: {e}")
+            });
+            let bad_head = vec![mi_entry(11, 12, vec![bad()]), state_at(0, 3)];
+            let err = checked_s(&bad_head, &prev, expected(remint)).unwrap_err();
+            assert!(
+                err.contains("never minted"),
+                "remint={remint} format={prev_format}: a wrong-owner surplus must fail: {err}"
+            );
+        }
+    }
+}
+
+/// #1528 (review): with the SAME snapshot format on both sides, a ratified
+/// upgrade-boundary `unbalanced` divergence's declared state change does not
+/// fail the gate — checkpoints from its first divergent entry on are skipped
+/// and reported — while a state difference BEFORE it still fails.
+#[test]
+fn prev_release_gate_same_format_ratified_state_change() {
+    let expected = serde_json::json!({
+        "only_in_head": [{"variant": "UserTaskCreated"}],
+        "unbalanced": {"reason": "a real reason"}
+    });
+    let plain = |i: u64| {
+        let mut e = mi_entry(11, 12, vec![]);
+        e["i"] = serde_json::json!(i);
+        e
+    };
+    let mut divergent = mi_entry(31, 32, vec![user_task_created(500, 32, 10)]);
+    divergent["i"] = serde_json::json!(1);
+    let mut prev_divergent = mi_entry(31, 32, vec![]);
+    prev_divergent["i"] = serde_json::json!(1);
+    let mut changed = state_at(1, 3);
+    changed["state"]["next_local"] = serde_json::json!(987_654_321u64);
+    // The divergent state is erased by nothing: head's checkpoint after the
+    // ratified entry differs from prev's.
+    let head = vec![plain(0), state_at(0, 3), divergent, changed.clone()];
+    let prev = vec![
+        plain(0),
+        state_at(0, 3),
+        prev_divergent.clone(),
+        state_at(1, 3),
+    ];
+    let report = checked_s(&head, &prev, expected.clone())
+        .expect("a ratified state change after the divergent entry passes");
+    assert_eq!(report.base.states_compared, 1);
+    assert_eq!(report.base.states_skipped_ratified_boundary, 1);
+
+    // A state difference BEFORE the divergent entry is still compared.
+    let mut early = state_at(0, 3);
+    early["state"]["next_local"] = serde_json::json!(987_654_321u64);
+    let mut divergent2 = mi_entry(31, 32, vec![user_task_created(500, 32, 10)]);
+    divergent2["i"] = serde_json::json!(1);
+    let head = vec![plain(0), early, divergent2, state_at(1, 3)];
+    let prev = vec![plain(0), state_at(0, 3), prev_divergent, state_at(1, 3)];
+    let err = checked_s(&head, &prev, expected).unwrap_err();
+    assert!(err.contains("durable state diverges"), "{err}");
+}
+
 /// Drift guard: every unit variant declared anywhere in engine-core/src is
 /// covered by `compare::unit_variants` (derived from `ENGINE_TYPE_SOURCES`).
 #[test]
