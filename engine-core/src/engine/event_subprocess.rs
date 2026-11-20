@@ -658,10 +658,13 @@ impl Engine {
             boundary_element_id,
         } = kind
         {
-            self.boundary_payloads.insert(
-                (instance_key, flow_scope, boundary_element_id.clone()),
-                variables.clone(),
-            );
+            // One broadcast can queue several same-scope boundary activations
+            // (concurrent hosts of one activity); push each trigger's payload so
+            // every activation pops its own (FIFO) rather than sharing one entry.
+            self.boundary_payloads
+                .entry((instance_key, flow_scope, boundary_element_id.clone()))
+                .or_default()
+                .push_back(variables.clone());
             return;
         }
         for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false) {

@@ -197,3 +197,39 @@ test("production trace: a job canceled by an interrupting boundary stops at the 
   );
   assert.match(html2, /1\.00 s/);
 });
+
+test("simulation trace: an interrupted activity closes its lane on ElementTerminated (#1535)", () => {
+  // A boundary/event-sub-process interruption journals `ElementTerminated`, not
+  // `ElementCompleted`. `foldSimTrace` must still close the element's lane so
+  // the timeline stops its clock (exitedAt/durationMs set) instead of leaving
+  // the interrupted activity running forever.
+  const events: WasmEvent[] = [
+    { seq: 1, type: "ProcessInstanceCreated", instance_key: "1" },
+    {
+      seq: 2,
+      type: "ElementActivating",
+      instance_key: "1",
+      element_instance_key: "10",
+      element_id: "task",
+    },
+    {
+      seq: 3,
+      type: "ElementActivated",
+      instance_key: "1",
+      element_instance_key: "10",
+      element_id: "task",
+    },
+    {
+      seq: 7,
+      type: "ElementTerminated",
+      instance_key: "1",
+      element_instance_key: "10",
+      element_id: "task",
+    },
+  ] as unknown as WasmEvent[];
+  const trace = foldSimTrace(events, "1", "p");
+  const el = trace.elements.find((x) => x.elementInstanceKey === "10");
+  assert.ok(el, "the interrupted element is present");
+  assert.equal(el.exitedAt, 7, "ElementTerminated closes the lane");
+  assert.equal(el.durationMs, 7 - 2, "duration derives from enteredAt");
+});

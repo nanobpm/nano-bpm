@@ -1111,6 +1111,154 @@ fn interrupting_a_call_activity_via_a_boundary_cancels_its_child() {
     assert!(engine.pending_jobs().is_empty());
 }
 
+/// Review round-2 (#1535): when a boundary interrupt tears down a scope that
+/// holds a NESTED call activity (a sub-process whose inner call activity parks a
+/// child process instance), the parent's `ElementTerminating` must be emitted
+/// BEFORE the descendant call-child's teardown (`discard_instance_events(child)`
+/// emits the child's `ProcessInstanceTerminated`). Emitting the child's
+/// termination first reverses Zeebe's parent-before-child termination order.
+#[test]
+fn boundary_teardown_emits_parent_terminating_before_nested_call_child() {
+    // mid: start -> sub [ sub_start -> callInner(call activity -> leaf) ]
+    //      sub --(interrupting timer boundary "timeout")--> escaped
+    let leaf = ProcessBuilder::new("leaf")
+        .start_event("lstart")
+        .service_task("leafwork", "leaf-job")
+        .end_event("lend")
+        .connect("lstart", "leafwork")
+        .connect("leafwork", "lend")
+        .build()
+        .unwrap();
+    let mid = ProcessBuilder::new("mid")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .call_activity("callInner", "leaf")
+        .contained_in("callInner", "sub")
+        .timer_boundary_event("timeout", "sub", 5_000)
+        .end_event("done")
+        .end_event("escaped")
+        .connect("start", "sub")
+        .connect("sub_start", "callInner")
+        .connect("sub", "done")
+        .connect("timeout", "escaped")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(leaf)).unwrap();
+    engine.apply_command(Command::DeployProcess(mid)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("mid"), 1_000)
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // The nested call activity spawned a grandchild "leaf" instance parked on
+    // its job.
+    let leaf_key = engine
+        .pending_jobs()
+        .first()
+        .expect("leaf child parked on its job")
+        .instance_key;
+    assert_ne!(leaf_key, parent_key);
+
+    // Fire the boundary: it interrupts `sub`, tearing down the nested call
+    // activity and its parked "leaf" child instance.
+    let fired = engine.trigger_timers(6_000);
+
+    // `sub`'s TERMINATING must precede the leaf child instance's TERMINATED.
+    let sub_terminating = fired
+        .iter()
+        .position(
+            |e| matches!(e, Event::ElementTerminating { element_id, .. } if element_id == "sub"),
+        )
+        .expect("sub emits ElementTerminating");
+    let leaf_terminated = fired
+        .iter()
+        .position(|e| matches!(e, Event::ProcessInstanceTerminated { instance_key } if *instance_key == leaf_key))
+        .expect("the nested call child is terminated");
+    assert!(
+        sub_terminating < leaf_terminated,
+        "parent TERMINATING (idx {sub_terminating}) precedes the descendant call-child's termination (idx {leaf_terminated}): {fired:?}"
+    );
+    // And `sub`'s own TERMINATED lands after the child's teardown.
+    let sub_terminated = fired
+        .iter()
+        .position(
+            |e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "sub"),
+        )
+        .expect("sub emits ElementTerminated");
+    assert!(
+        leaf_terminated < sub_terminated,
+        "the child's teardown completes before the parent's TERMINATED"
+    );
+}
+
+/// Review round-2 (#1535): one signal broadcast can reach the SAME boundary
+/// event on two concurrent instances of one activity in the SAME flow scope (a
+/// parallel split routing two tokens into the same task). Each queued boundary
+/// activation must carry its OWN trigger payload: keying the hold by
+/// `(flow_scope, boundary_id)` and removing it on the first activation leaves
+/// the second activation reading a missing payload — and for an output-mapped
+/// boundary its mappings then read stale/absent values. The hold is a per-key
+/// FIFO, so each activation pops one.
+#[test]
+fn one_broadcast_hands_each_same_scope_boundary_host_its_payload() {
+    // fork routes TWO tokens into the SAME task "work" (two parallel instances
+    // in the root scope), each arming the interrupting signal boundary "abort"
+    // (output-mapped `=payload -> mapped`). One broadcast interrupts BOTH.
+    let def = ProcessBuilder::new("same-scope-hosts")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("work", "w")
+        .signal_boundary_event("abort", "work", "kill-switch")
+        .with_io(
+            "abort",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=payload".to_string(),
+                    target: "mapped".to_string(),
+                }],
+            },
+        )
+        .service_task("after", "after-work")
+        .connect("start", "fork")
+        .connect("fork", "work")
+        .connect("fork", "work")
+        .connect("abort", "after")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("same-scope-hosts"))
+        .unwrap();
+    // Two parallel instances of "work" in the root scope each opened a boundary
+    // signal subscription.
+    let subs = engine.signal_subscriptions();
+    assert_eq!(
+        subs.len(),
+        2,
+        "two live same-scope boundary hosts: {subs:?}"
+    );
+
+    let fired = engine.broadcast_signal("kill-switch", vars(&[("payload", Value::Int(42))]), 0);
+
+    // Each of the two boundary activations received the payload LOCALLY (the
+    // `payload` variable seeded on its own boundary element-instance scope) —
+    // not one shared, first-come-only entry.
+    let local_payloads = fired
+        .iter()
+        .filter(|e| matches!(e, Event::ScopedVariablesUpdated { variables, .. } if variables.get("payload") == Some(&Value::Int(42))))
+        .count();
+    assert_eq!(
+        local_payloads, 2,
+        "both same-scope boundary hosts received their own payload: {fired:?}"
+    );
+}
+
 #[test]
 fn feel_boundary_timer_evaluates_variable() {
     // A boundary timer with a FEEL timeDuration resolves against the instance

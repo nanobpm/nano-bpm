@@ -266,7 +266,15 @@ pub struct Engine {
     /// output-mapped targets). The boundary's activation is queued in the SAME
     /// drain as the correlation, so this in-drain scratch bridges the two;
     /// cleared per command like [`esp_start_payloads`](Self::esp_start_payloads).
-    boundary_payloads: BTreeMap<(Key, Key, String), BTreeMap<String, Value>>,
+    ///
+    /// The value is a FIFO **queue**, not a single payload: one broadcast can
+    /// reach several instances of the same activity in one flow scope (e.g. a
+    /// signal caught by the same boundary on two concurrent multi-instance
+    /// hosts sharing a scope). Each queued boundary activation pops exactly one
+    /// payload, so every host gets its own copy — a single overwritten entry
+    /// would hand the whole payload to the first activation and leave the rest
+    /// reading a missing (or, for output-mapped boundaries, stale) payload.
+    boundary_payloads: BTreeMap<(Key, Key, String), VecDeque<BTreeMap<String, Value>>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -8348,10 +8356,14 @@ impl Engine {
         // A boundary event's trigger payload (#1535) is likewise LOCAL to the
         // boundary instance; with no output mappings Zeebe then propagates the
         // whole payload to the flow scope (an output-mapped boundary
-        // propagates only its mapped targets, on completion).
-        let boundary_payload =
-            self.boundary_payloads
-                .remove(&(instance_key, scope, element_id.clone()));
+        // propagates only its mapped targets, on completion). Each queued
+        // boundary activation pops ONE payload from the per-key FIFO (several
+        // same-scope hosts of one activity each queue their own), so a broadcast
+        // hands every host its own copy.
+        let boundary_payload = self
+            .boundary_payloads
+            .get_mut(&(instance_key, scope, element_id.clone()))
+            .and_then(VecDeque::pop_front);
         let propagate_boundary_payload = boundary_payload.clone().filter(|_| {
             !self
                 .process_of_instance(instance_key)

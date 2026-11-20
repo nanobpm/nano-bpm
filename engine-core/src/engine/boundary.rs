@@ -785,14 +785,6 @@ impl Engine {
                 });
                 return;
             }
-            // Terminate any call-activity child process instance parked on this
-            // element instance before the parent token is removed — the child is
-            // a separate instance `scope_descendants` cannot see, so completing
-            // the call-activity token without this would leave the child (and its
-            // jobs/timers) running with no parent.
-            if let Some(child) = self.call_activity_child_of(eik) {
-                events.extend(self.discard_instance_events(child));
-            }
             if let Some(job_key) = self.active_job_on(eik) {
                 events.push(Event::JobCanceled {
                     job_key,
@@ -851,6 +843,18 @@ impl Engine {
             }
             let [terminating, terminated] = termination_events(instance_key, eik, element_id);
             events.push(terminating);
+            // Terminate any call-activity child process instance parked on this
+            // element instance before the parent token is removed — the child is
+            // a separate instance `scope_descendants` cannot see, so completing
+            // the call-activity token without this would leave the child (and its
+            // jobs/timers) running with no parent. Emitted AFTER this element's
+            // own `ElementTerminating` so a parent's TERMINATING always precedes
+            // its descendant call-child's termination (Zeebe's parent-before-child
+            // order, #1535); its `ElementTerminated` still lands after the child's
+            // teardown below.
+            if let Some(child) = self.call_activity_child_of(eik) {
+                events.extend(self.discard_instance_events(child));
+            }
             for &child in members {
                 if child != eik && self.scope_of(instance_key, child) == eik {
                     self.push_member_teardown(events, instance_key, child, members);
