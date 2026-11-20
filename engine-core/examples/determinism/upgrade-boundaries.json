@@ -7,7 +7,9 @@
         "GatewayRouteSelected (#1402)",
         "messages-signals-conditional (#1244)",
         "suspend-resume-cancel (#1244)",
-        "random-workload (#1244)"
+        "random-workload (#1244)",
+        "timers-and-job-expiry (#1535, #1712)",
+        "adhoc-agents-quarantine (#1632)"
       ]
     }
   ]
