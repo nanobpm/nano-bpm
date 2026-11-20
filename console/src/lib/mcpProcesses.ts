@@ -84,10 +84,24 @@ function displayType(p: McpInputProperty): string {
   return p.type ?? "any";
 }
 
+/** A plain identifier segment, rendered bare (`a.b`); anything else is quoted. */
+const PLAIN_SEGMENT = /^[A-Za-z_$][A-Za-z0-9_$-]*$/;
+
+/**
+ * Append a field name to a display path unambiguously: a plain name as
+ * `.name`, any other (dots, brackets, quotes, empty) as `["…"]` (JSON-quoted),
+ * so distinct payload paths never render — or key — the same.
+ */
+function joinPath(prefix: string, name: string): string {
+  if (!PLAIN_SEGMENT.test(name)) return `${prefix}[${JSON.stringify(name)}]`;
+  return prefix ? `${prefix}.${name}` : name;
+}
+
 /**
  * Flatten an advertised input schema into display rows: declared inputs
  * first in schema order (nested object fields — also array items' — follow
- * their parent as dotted `parent.child` / `parent[].child` rows), the
+ * their parent as dotted `parent.child` / `parent[].child` rows; a name that
+ * is not a plain identifier is quoted, `parent["a.b"]`), the
  * reserved `businessId` last. Pure presentation — the schema itself comes
  * from the server.
  */
@@ -99,7 +113,7 @@ export function inputRows(schema: McpInputSchema | undefined): McpInputRow[] {
   ) => {
     const required = new Set(s?.required ?? []);
     for (const [name, p] of Object.entries(s?.properties ?? {})) {
-      const path = prefix ? `${prefix}.${name}` : name;
+      const path = joinPath(prefix, name);
       rows.push({
         name: path,
         type: displayType(p),

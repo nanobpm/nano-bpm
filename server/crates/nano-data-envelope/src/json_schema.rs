@@ -26,6 +26,8 @@
 //! A reference cycle resolves to an unconstrained object at the point it
 //! closes, so derivation always terminates.
 
+use std::cell::Cell;
+
 use serde_json::{Map, Value, json};
 
 use crate::{ShapeDecl, ShapeOp, scan_bpmn};
@@ -47,47 +49,87 @@ pub fn scalar_schema(keyword: &str) -> Option<Value> {
     })
 }
 
+/// Why a resolvable data envelope's schema could not be derived. A caller must
+/// treat this as a hard failure for the envelope (never as "no envelope"):
+/// falling back to a weaker contract would let calls that omit envelope fields
+/// through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaError {
+    /// The expansion exceeded [`MAX_EXPANDED_OPS`] or [`MAX_EXPANDED_BYTES`].
+    TooLarge,
+    /// The reference nesting exceeded [`MAX_DEPTH`].
+    TooDeep,
+}
+
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge => write!(
+                f,
+                "its expanded schema exceeds {MAX_EXPANDED_OPS} shape ops or \
+                 {MAX_EXPANDED_BYTES} bytes"
+            ),
+            Self::TooDeep => write!(f, "its shape references nest deeper than {MAX_DEPTH}"),
+        }
+    }
+}
+
+impl std::error::Error for SchemaError {}
+
 /// The data envelope a message's payload is typed by, resolved from one BPMN
-/// document: `Some((shape_id, object_schema))` when the named `bpmn:message`
-/// carries an `io.nanobpm.dataEnvelope.in` ref that resolves to a `nano:shape`
-/// declared in the same document; `None` otherwise (no envelope, or a ref the
-/// model alone cannot resolve). `process_id` prefers a shape declared on that
-/// process when several processes declare the same id.
+/// document: `Ok(Some((shape_id, object_schema)))` when the named
+/// `bpmn:message` carries an `io.nanobpm.dataEnvelope.in` ref that resolves to
+/// a `nano:shape` declared in the same document; `Ok(None)` when there is no
+/// envelope (or a ref the model alone cannot resolve); `Err((shape_id, e))`
+/// when the envelope resolves but its schema exceeds the derivation limits.
+/// `process_id` prefers a shape declared on that process when several
+/// processes declare the same id.
 pub fn message_input_schema(
     xml: &str,
     message_name: &str,
     process_id: Option<&str>,
-) -> Option<(String, Value)> {
+) -> Result<Option<(String, Value)>, (String, SchemaError)> {
     let scan = scan_bpmn(xml);
-    let shape_id = scan
+    let Some(shape_id) = scan
         .messages
         .iter()
-        .find(|m| m.message_name == message_name)?
-        .input_type
-        .clone()?;
-    let schema = shape_json_schema(&scan.shapes, &shape_id, process_id)?;
-    Some((shape_id, schema))
+        .find(|m| m.message_name == message_name)
+        .and_then(|m| m.input_type.clone())
+    else {
+        return Ok(None);
+    };
+    match shape_json_schema(&scan.shapes, &shape_id, process_id) {
+        Ok(Some(schema)) => Ok(Some((shape_id, schema))),
+        Ok(None) => Ok(None),
+        Err(e) => Err((shape_id, e)),
+    }
 }
 
 /// The object JSON Schema of shape `shape_id` (`{type, properties,
-/// required?}`), or `None` if no shape with that id is declared.
+/// required?}`), `Ok(None)` if no shape with that id is declared, or an error
+/// when the expansion exceeds the derivation limits (an incomplete schema is
+/// never returned).
 pub fn shape_json_schema(
     shapes: &[ShapeDecl],
     shape_id: &str,
     process_id: Option<&str>,
-) -> Option<Value> {
+) -> Result<Option<Value>, SchemaError> {
     let resolver = Resolver {
         shapes,
         process_id,
-        budget: std::cell::Cell::new(MAX_EXPANDED_OPS),
+        ops: Cell::new(MAX_EXPANDED_OPS),
+        bytes: Cell::new(MAX_EXPANDED_BYTES),
+        error: Cell::new(None),
     };
-    let shape = resolver.find(shape_id)?;
+    let Some(shape) = resolver.find(shape_id) else {
+        return Ok(None);
+    };
     let mut stack = Vec::new();
     let obj = resolver.object(shape, &mut stack);
-    // An acyclic graph of shared references can still expand exponentially;
-    // an exhausted budget means the schema is incomplete, so derive nothing
-    // rather than advertise a truncated contract.
-    (resolver.budget.get() > 0).then(|| obj.into_schema())
+    match resolver.error.get() {
+        Some(e) => Err(e),
+        None => Ok(Some(obj.into_schema())),
+    }
 }
 
 /// An object schema under construction: ordered properties plus the
@@ -124,15 +166,30 @@ impl Obj {
 }
 
 /// The most shape ops a single derivation may expand (counting every op of
-/// every nested occurrence), bounding the work and the schema size for
+/// every nested occurrence and every projected field), bounding the work for
 /// acyclic graphs whose shared references expand exponentially.
 pub const MAX_EXPANDED_OPS: usize = 10_000;
+
+/// The most bytes (field names, descriptions and type keywords of every
+/// expanded occurrence, plus the size of every projected copy) a single
+/// derivation may produce, bounding the schema's memory independently of the
+/// op count (a few ops can carry very long descriptions).
+pub const MAX_EXPANDED_BYTES: usize = 1 << 20;
+
+/// The deepest chain of nested shape references a derivation may follow,
+/// bounding recursion here and in later cloning / serialization / validation
+/// of the schema.
+pub const MAX_DEPTH: usize = 32;
 
 struct Resolver<'a> {
     shapes: &'a [ShapeDecl],
     process_id: Option<&'a str>,
-    /// Remaining op-expansion budget; `0` once exhausted.
-    budget: std::cell::Cell<usize>,
+    /// Remaining op-expansion budget.
+    ops: Cell<usize>,
+    /// Remaining byte budget.
+    bytes: Cell<usize>,
+    /// The first limit hit; once set, expansion stops.
+    error: Cell<Option<SchemaError>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -149,13 +206,39 @@ impl<'a> Resolver<'a> {
         )
     }
 
-    /// Resolve a shape's object, or `None` when it is unknown or would close a
-    /// reference cycle.
+    fn fail(&self, e: SchemaError) {
+        if self.error.get().is_none() {
+            self.error.set(Some(e));
+        }
+    }
+
+    /// Charge one op of `bytes` bytes, before allocating it; `false` (and
+    /// the error recorded) once a budget is exhausted.
+    fn charge(&self, bytes: usize) -> bool {
+        if self.error.get().is_some() {
+            return false;
+        }
+        let (ops, left) = (self.ops.get(), self.bytes.get());
+        if ops == 0 || left < bytes {
+            self.fail(SchemaError::TooLarge);
+            return false;
+        }
+        self.ops.set(ops - 1);
+        self.bytes.set(left - bytes);
+        true
+    }
+
+    /// Resolve a shape's object, or `None` when it is unknown, would close a
+    /// reference cycle, or exceeds a limit (recorded in `error`).
     fn resolve(&self, id: &str, stack: &mut Vec<String>) -> Option<Obj> {
-        if stack.iter().any(|s| s == id) {
+        if self.error.get().is_some() || stack.iter().any(|s| s == id) {
             return None;
         }
         let shape = self.find(id)?;
+        if stack.len() >= MAX_DEPTH {
+            self.fail(SchemaError::TooDeep);
+            return None;
+        }
         Some(self.object(shape, stack))
     }
 
@@ -163,11 +246,25 @@ impl<'a> Resolver<'a> {
         stack.push(shape.id.clone());
         let mut obj = Obj::default();
         for op in &shape.ops {
-            let left = self.budget.get();
-            if left == 0 {
+            let cost = match op {
+                ShapeOp::Carry { r#ref } => r#ref.len(),
+                ShapeOp::Project { r#ref, .. } => r#ref.len(),
+                ShapeOp::Extend {
+                    name,
+                    r#type,
+                    description,
+                    ..
+                } => name.len() + r#type.len() + description.as_ref().map_or(0, String::len),
+                ShapeOp::Reference {
+                    name,
+                    r#ref,
+                    description,
+                    ..
+                } => name.len() + r#ref.len() + description.as_ref().map_or(0, String::len),
+            };
+            if !self.charge(cost) {
                 break;
             }
-            self.budget.set(left - 1);
             match op {
                 ShapeOp::Carry { r#ref } => {
                     if let Some(inner) = self.resolve(r#ref, stack) {
@@ -177,11 +274,20 @@ impl<'a> Resolver<'a> {
                 ShapeOp::Project { r#ref, fields, .. } => {
                     let inner = self.resolve(r#ref, stack);
                     for field in fields {
-                        match inner.as_ref().and_then(|o| {
-                            let required = o.required.contains(field);
-                            o.properties.get(field).cloned().map(|s| (s, required))
-                        }) {
-                            Some((schema, required)) => obj.set(field, schema, required),
+                        let found = inner.as_ref().and_then(|o| {
+                            o.properties
+                                .get(field)
+                                .map(|s| (s, o.required.contains(field)))
+                        });
+                        // Every projected copy is charged (op + its size)
+                        // before it is cloned, so repeated projections of a
+                        // large field cannot amplify memory.
+                        let size = field.len() + found.map_or(0, |(s, _)| value_size(s));
+                        if !self.charge(size) {
+                            break;
+                        }
+                        match found {
+                            Some((schema, required)) => obj.set(field, schema.clone(), required),
                             None => obj.set(field, json!({}), false),
                         }
                     }
@@ -225,6 +331,22 @@ impl<'a> Resolver<'a> {
     }
 }
 
+/// An estimate of a schema value's size in bytes (string and key lengths plus
+/// one per node). Recursion is bounded by [`MAX_DEPTH`]-limited nesting.
+fn value_size(v: &Value) -> usize {
+    match v {
+        Value::String(s) => s.len() + 1,
+        Value::Array(a) => 1 + a.iter().map(value_size).sum::<usize>(),
+        Value::Object(m) => {
+            1 + m
+                .iter()
+                .map(|(k, v)| k.len() + value_size(v))
+                .sum::<usize>()
+        }
+        _ => 1,
+    }
+}
+
 /// Wrap an item schema as a field: an array of it with `list`, plus the
 /// field's description.
 fn field(item: Value, list: Option<bool>, description: Option<&str>) -> Value {
@@ -253,7 +375,9 @@ mod tests {
             r#"<nano:shape id="Order"><nano:project ref="Base" fields="a,a" /></nano:shape>
                <nano:shape id="Base"><nano:extend name="a" type="number" /></nano:shape>"#,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None).unwrap();
+        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             schema,
             json!({"type":"object","properties":{"a":{"type":"number"}},"required":["a"]})
@@ -266,7 +390,9 @@ mod tests {
             r#"<nano:shape id="Order"><nano:reference name="b" ref="Base" spread="true" list="true" /></nano:shape>
                <nano:shape id="Base"><nano:extend name="a" type="number" /></nano:shape>"#,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None).unwrap();
+        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             schema,
             json!({"type":"object","properties":{"a":{"type":"number"}},"required":["a"]})
@@ -287,7 +413,58 @@ mod tests {
         shapes.push_str(
             r#"<nano:shape id="S25"><nano:extend name="x" type="string" /></nano:shape>"#,
         );
-        assert!(message_input_schema(&shapes_doc(&shapes), "placeOrder", None).is_none());
+        assert_eq!(
+            message_input_schema(&shapes_doc(&shapes), "placeOrder", None),
+            Err(("Order".into(), SchemaError::TooLarge))
+        );
+    }
+
+    #[test]
+    fn deep_acyclic_chain_is_rejected_not_recursed() {
+        let mut shapes = String::from(
+            r#"<nano:shape id="Order"><nano:reference name="n" ref="S0" /></nano:shape>"#,
+        );
+        for i in 0..5_000 {
+            shapes.push_str(&format!(
+                r#"<nano:shape id="S{i}"><nano:reference name="n" ref="S{n}" /></nano:shape>"#,
+                n = i + 1
+            ));
+        }
+        assert_eq!(
+            message_input_schema(&shapes_doc(&shapes), "placeOrder", None),
+            Err(("Order".into(), SchemaError::TooDeep))
+        );
+    }
+
+    #[test]
+    fn long_descriptions_exhaust_the_byte_budget() {
+        let big = "x".repeat(64 * 1024);
+        let mut order = String::from(r#"<nano:shape id="Order">"#);
+        for i in 0..40 {
+            order.push_str(&format!(r#"<nano:reference name="f{i}" ref="Big" />"#));
+        }
+        order.push_str("</nano:shape>");
+        let shapes = format!(
+            r#"{order}<nano:shape id="Big"><nano:extend name="a" type="string" description="{big}" /></nano:shape>"#
+        );
+        assert_eq!(
+            message_input_schema(&shapes_doc(&shapes), "placeOrder", None),
+            Err(("Order".into(), SchemaError::TooLarge))
+        );
+    }
+
+    #[test]
+    fn repeated_projection_of_a_large_field_is_charged() {
+        let big = "x".repeat(64 * 1024);
+        let fields = vec!["a"; 40].join(",");
+        let shapes = format!(
+            r#"<nano:shape id="Order"><nano:project ref="Base" fields="{fields}" /></nano:shape>
+               <nano:shape id="Base"><nano:extend name="a" type="string" description="{big}" /></nano:shape>"#
+        );
+        assert_eq!(
+            message_input_schema(&shapes_doc(&shapes), "placeOrder", None),
+            Err(("Order".into(), SchemaError::TooLarge))
+        );
     }
 
     fn doc(shapes: &str, message_props: &str) -> String {
@@ -325,7 +502,9 @@ mod tests {
                </nano:shape>"#,
             ENVELOPE,
         );
-        let (id, schema) = message_input_schema(&xml, "placeOrder", Some("orders")).unwrap();
+        let (id, schema) = message_input_schema(&xml, "placeOrder", Some("orders"))
+            .unwrap()
+            .unwrap();
         assert_eq!(id, "Order");
         assert_eq!(
             schema,
@@ -376,7 +555,9 @@ mod tests {
                </nano:shape>"#,
             ENVELOPE,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None).unwrap();
+        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             schema,
             json!({
@@ -397,7 +578,9 @@ mod tests {
             r#"<nano:shape id="Order"><nano:reference name="self" ref="Order" /></nano:shape>"#,
             ENVELOPE,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None).unwrap();
+        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             schema["properties"]["self"],
             json!({ "type": "object" }),
@@ -405,9 +588,9 @@ mod tests {
         );
         // A ref with no declared shape, no envelope, or an unknown message.
         let xml = doc("", ENVELOPE);
-        assert_eq!(message_input_schema(&xml, "placeOrder", None), None);
+        assert_eq!(message_input_schema(&xml, "placeOrder", None), Ok(None));
         let xml = doc(r#"<nano:shape id="Order" />"#, "");
-        assert_eq!(message_input_schema(&xml, "placeOrder", None), None);
-        assert_eq!(message_input_schema(&xml, "other", None), None);
+        assert_eq!(message_input_schema(&xml, "placeOrder", None), Ok(None));
+        assert_eq!(message_input_schema(&xml, "other", None), Ok(None));
     }
 }

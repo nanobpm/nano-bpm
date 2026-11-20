@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use nano_data_envelope::json_schema::message_input_schema;
+use nano_data_envelope::json_schema::{SchemaError, message_input_schema};
 use nanobpm_gateway_rest::models;
 // The tool-metadata property prefix (single source: engine-core).
 use nanobpmn_engine_core::TOOL_PROPERTY_PREFIX;
@@ -105,20 +105,54 @@ struct ProcessTool {
     process_definition_version: i32,
     process_name: Option<String>,
     properties: BTreeMap<String, String>,
-    /// The start message's data envelope, when it resolves: `(shape id,
-    /// object schema)`.
-    envelope: Option<(String, Value)>,
+    /// The start message's data envelope: `Ok(Some((shape id, object
+    /// schema)))` when it resolves, `Ok(None)` with none, and `Err` when it
+    /// resolves but its schema exceeds the derivation limits — the tool then
+    /// rejects every call (never falls back to a weaker contract).
+    envelope: Envelope,
+}
+
+type Envelope = Result<Option<(String, Value)>, (String, SchemaError)>;
+
+/// The message explaining why a tool whose envelope schema could not be
+/// derived rejects calls.
+fn envelope_error_message(shape: &str, e: SchemaError) -> String {
+    format!(
+        "Data envelope `{shape}` cannot be used as the tool inputSchema: {e}; the tool rejects calls until the envelope is simplified."
+    )
 }
 
 impl ProcessTool {
     /// The advertised (and enforced) input schema.
-    fn input_schema(&self) -> Value {
-        resolve_input_schema(self.envelope.as_ref().map(|(_, s)| s), &self.properties)
+    /// `Err` (with the reason) when the envelope's schema could not be derived.
+    fn input_schema(&self) -> Result<Value, String> {
+        match &self.envelope {
+            Ok(envelope) => Ok(resolve_input_schema(
+                envelope.as_ref().map(|(_, s)| s),
+                &self.properties,
+            )),
+            Err((shape, e)) => Err(envelope_error_message(shape, *e)),
+        }
+    }
+
+    /// The advertised input schema; for an underivable envelope, only the
+    /// reserved `businessId` (calls are rejected regardless, see
+    /// [`call_tool`]).
+    fn advertised_input_schema(&self) -> Value {
+        self.input_schema().unwrap_or_else(|_| {
+            json!({
+                "type": "object",
+                "properties": { BUSINESS_ID_ARGUMENT: business_id_schema() },
+            })
+        })
     }
 
     /// Authoring conflicts surfaced to the console (never silently merged).
     fn warnings(&self) -> Vec<String> {
-        envelope_warnings(self.envelope.as_ref(), &self.properties)
+        match &self.envelope {
+            Ok(envelope) => envelope_warnings(envelope.as_ref(), &self.properties),
+            Err((shape, e)) => vec![envelope_error_message(shape, *e)],
+        }
     }
 }
 
@@ -179,7 +213,7 @@ fn open_tools(server: &ServerImpl) -> Vec<ProcessTool> {
             let envelope = server
                 .store
                 .process_definition_xml(s.process_definition_key)
-                .and_then(|xml| {
+                .map_or(Ok(None), |xml| {
                     message_input_schema(&xml, &s.message_name, Some(s.process_id.as_str()))
                 });
             Some(ProcessTool {
@@ -427,7 +461,7 @@ fn descriptor(tool: &ProcessTool) -> Value {
         "name": tool.name,
         "title": tool.tool_name,
         "description": build_description(&tool.properties),
-        "inputSchema": tool.input_schema(),
+        "inputSchema": tool.advertised_input_schema(),
         "outputSchema": output_schema(),
     })
 }
@@ -463,12 +497,15 @@ pub(crate) fn console_catalog(server: &ServerImpl, enabled: bool) -> Value {
             v["processDefinitionId"] = json!(t.process_definition_id);
             v["processDefinitionVersion"] = json!(t.process_definition_version);
             v["processName"] = json!(t.process_name);
-            v["inputSchemaSource"] = json!(if t.envelope.is_some() {
+            v["inputSchemaSource"] = json!(if !matches!(t.envelope, Ok(None)) {
                 "dataEnvelope"
             } else {
                 "toolProperties"
             });
-            v["dataEnvelope"] = json!(t.envelope.as_ref().map(|(id, _)| id));
+            v["dataEnvelope"] = json!(match &t.envelope {
+                Ok(envelope) => envelope.as_ref().map(|(id, _)| id),
+                Err((id, _)) => Some(id),
+            });
             v["warnings"] = json!(t.warnings());
             v
         })
@@ -508,7 +545,11 @@ async fn call_tool(server: &ServerImpl, name: String, args: Value) -> Value {
         _ => return tool_error_result("`arguments` must be an object", 400),
     };
     // Validate against the SAME schema advertised in `tools/list`.
-    if let Err(msg) = validate_arguments(&tool.input_schema(), &arguments) {
+    let schema = match tool.input_schema() {
+        Ok(schema) => schema,
+        Err(msg) => return tool_error_result(&msg, 400),
+    };
+    if let Err(msg) = validate_arguments(&schema, &arguments) {
         return tool_error_result(&msg, 400);
     }
     // `businessId` is a reserved tool argument, not a process variable. A
@@ -847,6 +888,48 @@ mod tests {
         )
         .await;
         assert_eq!(r["isError"], json!(false), "{r}");
+    }
+
+    /// An envelope that resolves but exceeds the derivation limits must NOT
+    /// fall back to the `input_N_*` (weaker) contract: every call is rejected
+    /// and the catalog reports why.
+    #[tokio::test]
+    async fn over_limit_envelope_rejects_calls_instead_of_falling_back() {
+        let server = ServerImpl::default();
+        let mut chain = String::from(
+            r#"<nano:shape id="Deep"><nano:reference name="n" ref="D0" /></nano:shape>"#,
+        );
+        for i in 0..100 {
+            chain.push_str(&format!(
+                r#"<nano:shape id="D{i}"><nano:reference name="n" ref="D{n}" /></nano:shape>"#,
+                n = i + 1
+            ));
+        }
+        let xml = ENVELOPE_FIXTURE
+            .replace(
+                ENVELOPE_PROPERTY,
+                r#"<zeebe:property name="io.nanobpm.dataEnvelope.in" value="Deep" />"#,
+            )
+            .replace("<nano:shapes>", &format!("<nano:shapes>{chain}"));
+        deploy_xml(&server, &xml).await;
+        let tools = wait_tools(&server, |t| t.len() == 1).await;
+        let name = tools[0]["name"].as_str().unwrap().to_string();
+        let entry = &console_catalog(&server, true)["tools"][0];
+        assert_eq!(entry["inputSchemaSource"], json!("dataEnvelope"));
+        assert_eq!(entry["dataEnvelope"], json!("Deep"));
+        assert!(
+            entry["warnings"][0].as_str().unwrap().contains("Deep"),
+            "{entry}"
+        );
+        let r = rpc(
+            &server,
+            "tools/call",
+            json!({ "name": name, "arguments": { "legacy": "x" } }),
+        )
+        .await;
+        assert_eq!(r["isError"], json!(true), "{r}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(server.store.process_instances().is_empty());
     }
 
     /// Without an envelope the `input_N_*` properties define the schema
