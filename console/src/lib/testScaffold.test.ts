@@ -134,6 +134,59 @@ test("scaffoldStartVars yields {} when the start fans out and only one target is
   assert.equal(scaffoldStartVars(m), "{}");
 });
 
+// --- none-start-event envelopes (process start inputs) ---------------------
+
+test("parseModelEnvelopes lifts a none start event's input envelope", () => {
+  const xml = XML.replace(
+    '<bpmn:startEvent id="Start">',
+    '<bpmn:startEvent id="Start"><bpmn:extensionElements><zeebe:properties>' +
+      '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="ReviewIn" />' +
+      "</zeebe:properties></bpmn:extensionElements>",
+  );
+  const m = parseModelEnvelopes(xml);
+  assert.equal(m.startEnvelopes.get("p"), "ReviewIn");
+});
+
+test("scaffoldStartVars prefers the declared start envelope over the entry task's", () => {
+  // The start event declares `ReviewOut` while the entry task declares
+  // `ReviewIn`: the start event is the authoritative start-input carrier.
+  const xml = XML.replace(
+    '<bpmn:startEvent id="Start">',
+    '<bpmn:startEvent id="Start"><bpmn:extensionElements><zeebe:properties>' +
+      '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="ReviewOut" />' +
+      "</zeebe:properties></bpmn:extensionElements>",
+  );
+  const m = parseModelEnvelopes(xml);
+  assert.deepEqual(JSON.parse(scaffoldStartVars(m)), {
+    status: "",
+    summary: "",
+  });
+});
+
+test("a message/timer start event is not a none start and carries no start envelope", () => {
+  for (const def of [
+    '<bpmn:messageEventDefinition messageRef="Msg_1" />',
+    "<bpmn:timerEventDefinition><bpmn:timeCycle>R/PT1H</bpmn:timeCycle></bpmn:timerEventDefinition>",
+  ]) {
+    const xml = XML.replace(
+      '<bpmn:startEvent id="Start">',
+      '<bpmn:startEvent id="Start"><bpmn:extensionElements><zeebe:properties>' +
+        '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="ReviewIn" />' +
+        `</zeebe:properties></bpmn:extensionElements>${def}`,
+    );
+    const m = parseModelEnvelopes(xml);
+    assert.equal(m.startEnvelopes.size, 0);
+  }
+});
+
+test("a none start with no envelope leaves the entry-task heuristic in place", () => {
+  // Sanity: the none start carries no envelope here, so the heuristic still
+  // applies (the lone entry task's input envelope).
+  const m = parseModelEnvelopes(XML);
+  assert.equal(m.startEnvelopes.size, 0);
+  assert.equal(JSON.parse(scaffoldStartVars(m)).prUrl, "");
+});
+
 test("scaffoldStartVars scopes to the selected process in a multi-process model", () => {
   // Two processes, each with its own start → entry task and distinct input
   // envelope. Unscoped, the union of start targets is ambiguous → "{}"; scoped
@@ -202,4 +255,35 @@ test("prefillMessagePublish tolerates a missing correlation key", () => {
 test("prefillSignalBroadcast seeds the signal name only (name-only correlation)", () => {
   const form = prefillSignalBroadcast({ signalName: "cancel-all" });
   assert.deepEqual(form, { signalName: "cancel-all", variables: "{}" });
+});
+
+test("a subprocess's start event never supplies the process start envelope", () => {
+  const nested =
+    '<bpmn:subProcess id="sub"><bpmn:subProcess id="sub2"></bpmn:subProcess>' +
+    '<bpmn:startEvent id="Inner"><bpmn:extensionElements><zeebe:properties>' +
+    '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="InnerIn" />' +
+    "</zeebe:properties></bpmn:extensionElements></bpmn:startEvent></bpmn:subProcess>";
+  const typedOuter =
+    '<bpmn:startEvent id="Start"><bpmn:extensionElements><zeebe:properties>' +
+    '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="ReviewIn" />' +
+    "</zeebe:properties></bpmn:extensionElements>";
+  for (const nestedFirst of [true, false]) {
+    const place = (outer: string) =>
+      nestedFirst
+        ? XML.replace('<bpmn:startEvent id="Start">', nested + outer)
+        : XML.replace("</bpmn:process>", nested + "</bpmn:process>").replace(
+            '<bpmn:startEvent id="Start">',
+            outer,
+          );
+    // Outer start declares an envelope: it wins regardless of XML order.
+    assert.equal(
+      parseModelEnvelopes(place(typedOuter)).startEnvelopes.get("p"),
+      "ReviewIn",
+    );
+    // Outer start has none: the nested envelope must not leak in, and the
+    // entry-task heuristic stays in place.
+    const m = parseModelEnvelopes(place('<bpmn:startEvent id="Start">'));
+    assert.equal(m.startEnvelopes.size, 0, `nestedFirst=${nestedFirst}`);
+    assert.equal(JSON.parse(scaffoldStartVars(m)).prUrl, "");
+  }
 });
