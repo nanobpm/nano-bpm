@@ -3418,6 +3418,19 @@ async fn all_members_support(
     transport: &dyn RaftTransport,
     feature: &'static str,
 ) -> bool {
+    checked_members_support(raft, transport, feature).await.0
+}
+
+/// [`all_members_support`], also returning the exact voter/learner id set
+/// (self included) the verdict was computed over. The cutover latch must
+/// record THIS set — not the membership observed after the (async) checks and
+/// the write — so a member that joins while a check is suspended is never
+/// recorded as cut over (#1715 review).
+async fn checked_members_support(
+    raft: &openraft::Raft<RaftConfig>,
+    transport: &dyn RaftTransport,
+    feature: &'static str,
+) -> (bool, BTreeSet<NodeId>) {
     let (me, members): (NodeId, Vec<NodeId>) = {
         let m = raft.metrics();
         let m = m.borrow();
@@ -3430,12 +3443,32 @@ async fn all_members_support(
                 .collect(),
         )
     };
+    let checked: BTreeSet<NodeId> = members.iter().copied().collect();
     for id in members.into_iter().filter(|id| *id != me) {
         if !transport.peer_supports(id, feature).await {
-            return false;
+            return (false, checked);
         }
     }
-    true
+    (true, checked)
+}
+
+/// The cutover latch after a proposal (#1692 / #1715 review). A closed gate
+/// re-arms; a successfully written cutover latches the membership the gate
+/// was CHECKED over, so a member that joined during the check differs from the
+/// applied membership and re-arms the next proposal.
+fn next_cutover_latch(
+    prev: Option<BTreeSet<NodeId>>,
+    gate_open: bool,
+    written_ok: bool,
+    checked: BTreeSet<NodeId>,
+) -> Option<BTreeSet<NodeId>> {
+    if !gate_open {
+        None
+    } else if prev.is_none() && written_ok {
+        Some(checked)
+    } else {
+        prev
+    }
 }
 
 impl Batcher {
@@ -3544,7 +3577,7 @@ impl Batcher {
                 // followers on their old chain base while the leader re-bases
                 // — permanently incomparable, with `cutover_done` preventing
                 // another cutover.
-                let cutover_gate_open = all_members_support(
+                let (cutover_gate_open, cutover_checked) = checked_members_support(
                     &raft,
                     transport.as_ref(),
                     nano_falcon_protocol::cluster_join::FEATURE_REPLICA_DIGEST_CUTOVER,
@@ -3570,11 +3603,12 @@ impl Batcher {
                     .with_digest(claim)
                     .with_digest_cutover(cutover);
                 let written = raft.client_write(batch).await;
-                if !cutover_gate_open {
-                    cutover_done = None;
-                } else if cutover_done.is_none() && written.is_ok() {
-                    cutover_done = Some(digest.membership_signature().unwrap_or_default());
-                }
+                cutover_done = next_cutover_latch(
+                    cutover_done,
+                    cutover_gate_open,
+                    written.is_ok(),
+                    cutover_checked,
+                );
                 match written {
                     Ok(res) => {
                         let mut out = res.data.items;
@@ -9182,6 +9216,31 @@ mod tests {
         for p in parts {
             p.raft.shutdown().await.ok();
         }
+    }
+
+    /// #1715 review: a learner that joins while the cutover capability check
+    /// is suspended was never checked, so the latch must record the CHECKED
+    /// membership — which then differs from the applied (expanded) one and
+    /// re-arms the next proposal — never the post-write membership.
+    #[test]
+    fn cutover_latch_records_the_checked_membership_not_a_concurrent_join() {
+        let checked: BTreeSet<NodeId> = [0, 1, 2].into_iter().collect();
+        let applied_after_join: BTreeSet<NodeId> = [0, 1, 2, 3].into_iter().collect();
+        let latch = next_cutover_latch(None, true, true, checked.clone());
+        assert_eq!(latch.as_ref(), Some(&checked));
+        assert_ne!(
+            latch.as_ref(),
+            Some(&applied_after_join),
+            "the joiner was never capability-checked; the latch must re-arm for it"
+        );
+        // A closed gate or a failed write never latches.
+        assert_eq!(next_cutover_latch(None, false, true, checked.clone()), None);
+        assert_eq!(next_cutover_latch(None, true, false, checked.clone()), None);
+        // An existing latch survives an open gate unchanged.
+        assert_eq!(
+            next_cutover_latch(Some(checked.clone()), true, true, applied_after_join),
+            Some(checked)
+        );
     }
 
     /// Waits until every member has applied up to the leader's (node 0's)
