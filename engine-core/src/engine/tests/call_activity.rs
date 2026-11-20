@@ -973,6 +973,96 @@ fn call_activity_propagate_all_parent_false_copies_only_input_mapping_results() 
 }
 
 #[test]
+fn call_activity_input_mappings_create_local_variables_on_the_call_activity_scope() {
+    // Zeebe parity (#1536): a call activity's input mappings are first written as
+    // variables LOCAL to the call activity's element instance (`VARIABLE CREATED`,
+    // scope = the call activity), and only then copied into the child process.
+    let io = crate::model::IoMapping {
+        inputs: vec![crate::model::Mapping {
+            source: "=orderId".to_string(),
+            target: "childOrder".to_string(),
+        }],
+        outputs: Vec::new(),
+    };
+    let mut engine = deploy_native_call_with_propagation(io, propagating_child(), false, true);
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("orderId", Value::Int(42))]),
+        ))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+    let call_eik = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id,
+                ..
+            } if *instance_key == parent_key && element_id == "c1" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("call activity activated");
+    let local_pos = created
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                Event::ScopedVariablesUpdated { instance_key, scope_key, variables }
+                    if *instance_key == parent_key
+                        && *scope_key == call_eik
+                        && variables.get("childOrder") == Some(&Value::Int(42))
+            )
+        })
+        .expect("input mapping must create a local variable on the call activity scope");
+    let child_pos = created
+        .iter()
+        .position(|e| {
+            matches!(e, Event::ProcessInstanceCreated { process_id, .. } if process_id == "phase")
+        })
+        .expect("child created");
+    assert!(
+        local_pos < child_pos,
+        "the local variable is created before the child process instance"
+    );
+    assert!(engine.is_completed(parent_key));
+}
+
+#[test]
+fn call_activity_with_output_mappings_merges_child_variables_locally() {
+    // Zeebe parity (#1536): with output mappings declared, the finished child's
+    // variables are merged LOCAL to the call activity (`mergeLocalDocument`) and
+    // only the output mappings reach the flow scope.
+    let io = crate::model::IoMapping {
+        inputs: Vec::new(),
+        outputs: vec![crate::model::Mapping {
+            source: "=childOnly".to_string(),
+            target: "echo".to_string(),
+        }],
+    };
+    let mut engine = deploy_native_call_with_propagation(io, propagating_child(), true, true);
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("shared", Value::Str("parent".into()))]),
+        ))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+    assert!(engine.is_completed(parent_key));
+    assert_eq!(
+        parent_var_after(&created, parent_key, "echo"),
+        Some(&Value::Int(99))
+    );
+    assert_eq!(parent_var_after(&created, parent_key, "childOnly"), None);
+    assert!(created.iter().any(|e| matches!(
+        e,
+        Event::ScopedVariablesUpdated { instance_key, variables, .. }
+            if *instance_key == parent_key && variables.get("childOnly") == Some(&Value::Int(99))
+    )));
+}
+
+#[test]
 fn call_activity_propagate_all_child_false_without_output_mappings_copies_nothing_back() {
     // propagateAllChildVariables="false" with no output mappings: nothing crosses
     // back. Parent → child still copies all visible variables (default true).

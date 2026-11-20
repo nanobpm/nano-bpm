@@ -19,20 +19,20 @@
     {
       "scenario": "g-1",
       "issue": "#1534",
-      "reason": "MI outputCollection not body-local (#1534) + #1518 outputElement nil seed + call-activity input mapping not local (#1536)",
-      "nanoTrace": "caa9352862837c44"
+      "reason": "MI outputCollection not body-local (#1534) + #1518 outputElement nil seed",
+      "nanoTrace": "900d6a5d97c3572b"
     },
     {
       "scenario": "g-2",
-      "issue": "#1536",
-      "reason": "call-activity input mapping creates no local variable on the call activity scope",
-      "nanoTrace": "1ac56d307597479b"
+      "issue": "#1534",
+      "reason": "multi-instance child output mapping not applied to the process scope (call-activity input locality fixed by #1536)",
+      "nanoTrace": "99d19b69dfb04a3b"
     },
     {
       "scenario": "g-3",
       "issue": "#1535",
       "reason": "interrupting boundary: attached activity COMPLETED instead of TERMINATED",
-      "nanoTrace": "4b9f8ac0c1585f7f"
+      "nanoTrace": "d6a409458df42591"
     },
     {
       "scenario": "g-4",
@@ -44,13 +44,13 @@
       "scenario": "g-5",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "1506d2748f35dd0d"
+      "nanoTrace": "26426ba3d10a6d8b"
     },
     {
       "scenario": "g-6",
       "issue": "#1535",
       "reason": "interrupting message boundary: attached activity COMPLETED instead of TERMINATED; message variables not boundary-local",
-      "nanoTrace": "1c0bc09d3cef5d37"
+      "nanoTrace": "6f535e747cd59cbc"
     },
     {
       "scenario": "g-8",
@@ -74,13 +74,13 @@
       "scenario": "g-11",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "4d2f10a516f32e3a"
+      "nanoTrace": "1aaa9b1ec6023f35"
     },
     {
       "scenario": "g-12",
       "issue": "#1535",
       "reason": "a task interrupted by a message boundary completes instead of terminating",
-      "nanoTrace": "32ad2d735a6060c0"
+      "nanoTrace": "f205c6a5cc974a5a"
     },
     {
       "scenario": "g-13",
@@ -101,22 +101,10 @@
       "nanoTrace": "b73282d8a918c858"
     },
     {
-      "scenario": "g-24",
-      "issue": "#1536",
-      "reason": "call-activity input mapping creates no local variable on the call activity scope",
-      "nanoTrace": "887d7a7c160bfcc2"
-    },
-    {
       "scenario": "g-26",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local",
-      "nanoTrace": "1a5781de4dd2b8e3"
-    },
-    {
-      "scenario": "g-28",
-      "issue": "#1534",
-      "reason": "MI outputCollection not body-local",
-      "nanoTrace": "267117b7e9b371cd"
+      "nanoTrace": "0a3e95cdde62f95f"
     },
     {
       "scenario": "g-30",

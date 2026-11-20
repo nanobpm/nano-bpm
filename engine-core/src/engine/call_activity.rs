@@ -227,6 +227,12 @@ impl Engine {
                 }
             }
         };
+        // Zeebe parity (#1536): the input-mapping results are first created as
+        // variables LOCAL to the call activity's element instance, then copied
+        // into the child. Journaled ahead of the spawn so the order matches
+        // Zeebe's record stream (call-activity VARIABLE CREATED, then the child's).
+        let mut local_events =
+            self.local_element_variable_events(parent_instance, call_eik, input_results.clone());
         let child_vars = if propagate_all_parent {
             let mut merged = element_vars.clone();
             merged.extend(input_results);
@@ -234,7 +240,7 @@ impl Engine {
         } else {
             input_results
         };
-        self.spawn_call_activity_instance(
+        let (events, steps) = self.spawn_call_activity_instance(
             parent_instance,
             call_eik,
             element_id,
@@ -242,7 +248,9 @@ impl Engine {
             element_vars,
             child_vars,
             None,
-        )
+        );
+        local_events.extend(events);
+        (local_events, steps)
     }
 
     /// Shared child-process spawn for a call activity, whether it is reached on
@@ -537,7 +545,26 @@ impl Engine {
         // back into the parent scope (child wins on collision) *before* the output
         // mappings, so an explicit output mapping still overrides a propagated
         // value.
-        if propagate_all_child && !child_variables.is_empty() {
+        //
+        // With output mappings declared, Zeebe instead merges the child's
+        // variables LOCAL to the call activity's element instance
+        // (`mergeLocalDocument`, #1536) — only the output mappings then write to
+        // the flow scope. Names whose local value is unchanged (e.g. an input
+        // mapping round-tripped through the child) produce no write.
+        let outputs = self.io_outputs(instance_key, &element_id);
+        if !outputs.is_empty() {
+            let current = self.variables_for_element(instance_key, element_instance_key);
+            let changed: BTreeMap<String, Value> = child_variables
+                .iter()
+                .filter(|(name, value)| current.get(*name) != Some(*value))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            events.extend(self.local_element_variable_events(
+                instance_key,
+                element_instance_key,
+                changed,
+            ));
+        } else if propagate_all_child && !child_variables.is_empty() {
             events.extend(self.propagated_updates(
                 instance_key,
                 scope,
@@ -545,7 +572,6 @@ impl Engine {
                 false,
             ));
         }
-        let outputs = self.io_outputs(instance_key, &element_id);
         if !outputs.is_empty() {
             match self.eval_io_mappings_in(&child_variables, &outputs) {
                 Ok(updates) => {
