@@ -20,7 +20,7 @@
       "scenario": "g-1",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local (#1534) + #1518 outputElement nil seed",
-      "nanoTrace": "900d6a5d97c3572b"
+      "nanoTrace": "f536758fff754e45"
     },
     {
       "scenario": "g-2",
@@ -35,12 +35,6 @@
       "nanoTrace": "e54566911f6a643f"
     },
     {
-      "scenario": "g-4",
-      "issue": "#1711",
-      "reason": "a null completion value equal to the MI child's null-valued local is not propagated (Zeebe updates the process-scope result)",
-      "nanoTrace": "22b8187942dcf7b4"
-    },
-    {
       "scenario": "g-5",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
@@ -51,12 +45,6 @@
       "issue": "#1536",
       "reason": "call-activity input mapping creates no local variable on the call activity scope",
       "nanoTrace": "b8c1d7b5f5b52387"
-    },
-    {
-      "scenario": "g-9",
-      "issue": "#1534",
-      "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "d517e6bf427fc8c7"
     },
     {
       "scenario": "g-11",
@@ -80,7 +68,7 @@
       "scenario": "g-30",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "69af519d14988e10"
+      "nanoTrace": "8fb3ffbc79ce7ea2"
     }
   ]
 }
