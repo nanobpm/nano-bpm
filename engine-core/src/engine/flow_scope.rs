@@ -95,9 +95,36 @@ impl Engine {
         element_instance_key: Key,
         variables: BTreeMap<String, Value>,
     ) -> Vec<Event> {
+        let parent_scope = self.scope_of(instance_key, element_instance_key);
+        self.local_element_variable_events_under(
+            instance_key,
+            element_instance_key,
+            Some(parent_scope),
+            variables,
+        )
+    }
+
+    /// [`Self::local_element_variable_events`] for an element whose activation
+    /// may still be pending in the current batch: the caller supplies the
+    /// enclosing scope to register under, or `None` when an earlier planned
+    /// event already registers the element's scope.
+    pub(crate) fn local_element_variable_events_under(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        register_under: Option<Key>,
+        variables: BTreeMap<String, Value>,
+    ) -> Vec<Event> {
         if variables.is_empty() {
             return Vec::new();
         }
+        let Some(parent_scope) = register_under else {
+            return vec![Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key: element_instance_key,
+                variables,
+            }];
+        };
         let scope_registered = self
             .state
             .instances
@@ -108,7 +135,7 @@ impl Engine {
             events.push(Event::VariableScopeCreated {
                 instance_key,
                 scope_key: element_instance_key,
-                parent_scope_key: self.scope_of(instance_key, element_instance_key),
+                parent_scope_key: parent_scope,
             });
         }
         events.push(Event::ScopedVariablesUpdated {

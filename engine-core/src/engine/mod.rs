@@ -8522,9 +8522,9 @@ impl Engine {
                 .get(&instance_key)
                 .map(|i| i.scope_parents.contains_key(&element_instance_key))
                 .unwrap_or(false);
-        // A call activity's input mappings seed only its isolated child process
-        // scope (applied in `spawn_call_activity_child`) — never the call
-        // activity's own element scope — so they are NOT projected here. Routing
+        // A call activity's input mappings are applied in
+        // `spawn_call_activity_child` (which writes them to the call activity's
+        // local scope and seeds the child, #1536) — so they are NOT projected here. Routing
         // them through the spawn also means a failure re-drives the spawn
         // (`CallActivitySpawn`) rather than re-running this whole activation body
         // (which would re-arm the already-armed boundary events).
@@ -9669,6 +9669,13 @@ impl Engine {
                     &called_process_id,
                     propagate_all_parent_variables,
                     &element_vars,
+                    // `activate` registers a listener-bearing element's scope
+                    // earlier in this batch (#1437).
+                    if self.has_execution_listeners(instance_key, &element_id) {
+                        call_activity::CallScope::PreRegistered
+                    } else {
+                        call_activity::CallScope::Under(scope)
+                    },
                 );
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
@@ -10589,6 +10596,9 @@ impl Engine {
                     &called_process_id,
                     propagate_all_parent_variables,
                     child_vars,
+                    // `MultiInstanceChildActivated` registers the child's scope
+                    // under the body earlier in this batch.
+                    call_activity::CallScope::PreRegistered,
                 );
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
