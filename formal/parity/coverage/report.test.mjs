@@ -285,3 +285,9 @@ test('an empty measurement fails --check and --update instead of passing at 100%
   // --update must not have written a raised floor from the empty measurement.
   assert.deepEqual(JSON.parse(readFileSync(baseline, 'utf8')), { nano: { unit: 'region', floorPercent: 50 }, zeebe: { unit: 'branch', floorPercent: 10 } });
 });
+
+test('selfTest rejects invalid run counts instead of silently skipping (#1707)', () => {
+  for (const runs of [0, 1, NaN, 2.5]) {
+    assert.throws(() => selfTest({ zeebe: () => parseJacoco(JACOCO_TIMING) }, { runs }), /runs must be an integer/);
+  }
+});

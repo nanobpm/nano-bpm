@@ -247,6 +247,7 @@ export function loadZeebeExcludes(spec) {
  * it. Returns a list of human-readable differences (empty = deterministic).
  */
 export function selfTest(measureFns, { runs = 3 } = {}) {
+  if (!Number.isInteger(runs) || runs < 2) throw new Error(`selfTest: runs must be an integer ≥ 2 (got ${runs})`);
   const errors = [];
   for (const [side, fn] of Object.entries(measureFns)) {
     const first = signature(fn());
@@ -387,7 +388,7 @@ export function markdown(measured, baseline) {
 }
 
 function parseArgs(argv) {
-  const a = { nano: null, zeebe: null, out: null, check: false, update: false, allowLower: false, selfTest: 0, baseline: join(HERE, 'baseline.json') };
+  const a = { nano: null, zeebe: null, out: null, check: false, update: false, allowLower: false, selfTest: null, baseline: join(HERE, 'baseline.json') };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === '--nano') a.nano = argv[++i];
@@ -401,7 +402,7 @@ function parseArgs(argv) {
     else throw new Error(`unknown argument ${x}`);
   }
   if (!a.nano && !a.zeebe) throw new Error('pass --nano and/or --zeebe');
-  if (a.selfTest && (!Number.isInteger(a.selfTest) || a.selfTest < 2)) throw new Error('--self-test needs an integer ≥ 2');
+  if (a.selfTest !== null && (!Number.isInteger(a.selfTest) || a.selfTest < 2)) throw new Error('--self-test needs an integer ≥ 2');
   return a;
 }
 
@@ -422,7 +423,7 @@ function main() {
   }
   // Gate self-test (#1707): identical inputs must give an identical covered
   // count — fail loudly with the differing branches when they do not.
-  if (args.selfTest) errors.push(...selfTest(measure, { runs: args.selfTest }));
+  if (args.selfTest !== null) errors.push(...selfTest(measure, { runs: args.selfTest }));
 
   const measured = {};
   if (args.nano) {
