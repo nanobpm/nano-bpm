@@ -425,10 +425,21 @@ clone fresh do not, and hit these traps:
 - **A disk-full build leaves corrupted artifacts**, for example a bogus E0277 or
   "multiple versions of crate `serde_core`". Delete the target dir and rebuild.
 - **A checkout path containing a space** (macOS agent workspaces under
-  `~/Library/Application Support/…`) breaks `make fmt` / `make console-wasm`
-  and `tikv-jemalloc-sys`'s configure. The fix is tracked in #1716. Until it
-  lands, run the underlying per-crate commands directly and use a space-free
-  `CARGO_TARGET_DIR`.
+  `~/Library/Application Support/…`) is supported for `make fmt` /
+  `make fmt-check` / `make console-wasm` (#1716). The guard is
+  `scripts/spaced-path-guard.sh`, run in CI. Invoke make as `make -C <dir>` or
+  `cd <dir> && make`, not `make -f <spaced path>/Makefile`.
+  `tikv-jemalloc-sys`'s configure still can't take a spaced target dir, so the
+  Makefile and `scripts/new-worktree.sh` redirect `CARGO_TARGET_DIR` to a
+  space-free path. Scripts that need build artifacts must resolve the
+  *effective* target dir through `scripts/lib-cargo-target-dir.sh` (or its
+  `.mjs` twin), never a hard-coded `<crate>/target`. The generated-file rules
+  (`$(GENERATED_DIR)/Cargo.toml` et al., reached via the targets that carry
+  them as prerequisites — `make all`, `make build`, `make release`, …) still
+  cannot run from a spaced path, because GNU make can't express one in a
+  prerequisite. The phony targets carry no such prerequisites and invoke the
+  generation scripts directly, so `make generate` — and `make setup`, which
+  delegates to it — work from a spaced path.
 
 ## The wasm32 surface-parity gate: every new `Command`/`ReadQuery` needs an arm
 
