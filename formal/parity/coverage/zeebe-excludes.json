@@ -1,0 +1,22 @@
+{
+  "$comment": "Zeebe JaCoCo branch-coverage exclusions (#1707): the timing-dependent surface REMOVED from the measured set so the ratchet compares only branches deterministically reachable from the parity corpus. Root cause: on identical inputs (same commit a0da02ec, same camunda/camunda:8.10.10 digest) two runs measured 1037 vs 1033 covered branches, flipping the 12.5% floor. A 30-run census (28 archived daily artifacts + both issue runs) found exactly 15 branch-carrying lines ever vary, ALL in the two message packages below plus ExpressionProcessor.java:507 — background scheduler sweeps (TTL/lock-release/dedup-expiry), the message-correlation race, and the FEEL typeCheck failure branch (#1679). Which arm runs is decided by wall-clock ticks vs. the settle window, not by the corpus. With these exclusions every one of the 30 runs is byte-identical (951/7872 = 12.08%). `packages` excludes whole packages (recursively — `io/camunda/zeebe/engine/processing/message` also covers its `…/message/command` subpackage); `lines` excludes individual source lines. Every entry carries the issue that justifies it; removing coverage here is a reviewed claim, and #1679 tracks making these paths themselves deterministic so the exclusions can shrink.",
+  "packages": [
+    {
+      "match": "io/camunda/zeebe/engine/processing/message",
+      "issue": 1707,
+      "reason": "Message-start/subscription background schedulers (CrossPartitionMessageStartLockReleaseScheduler, MessageStartDedupExpirationSweepScheduler, PendingMessageStartAskCheckScheduler, …) and the MessageCorrelator correlation race: which branch arm executes depends on whether a wall-clock scheduler tick lands inside the settle window and on the order of the correlate/lock-release race — not on the corpus. 6 of the 15 historically varying lines live here (MessageCorrelator:64/78/79/81/85/113, the two schedulers, MessageSubscriptionCreateProcessor:102, ProcessMessageSubscriptionCorrelateProcessor:214)."
+    },
+    {
+      "match": "io/camunda/zeebe/engine/state/message",
+      "issue": 1707,
+      "reason": "Message/subscription RocksDB state scans (DbMessageSubscriptionState:163/275, DbProcessMessageSubscriptionState:203, DbMessageState:645) whose branch arms depend on what a timing-dependent scheduler sweep happened to persist before shutdown. 5 of the 15 historically varying lines."
+    }
+  ],
+  "lines": [
+    {
+      "match": "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/ExpressionProcessor.java:507",
+      "issue": 1679,
+      "reason": "The ExpressionProcessor.typeCheck failure branch: covered in 13 of 30 census runs, not in 17, on identical inputs. Timing-dependent evaluation-failure path (#1679's residual). Excluded as a single line — the rest of ExpressionProcessor stays measured."
+    }
+  ]
+}

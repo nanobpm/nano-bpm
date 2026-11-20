@@ -48,6 +48,31 @@ review). CI:
   (needs a live broker, so it is not a PR gate). Determinism: the periodic
   message-TTL checker is set to 1 s and the run settles before shutdown, so
   background expiry passes are always measured (they previously depended on
-  whether a 1-minute tick landed before stop). Residual variance in the job
-  activation scan is absorbed by `slackPercent` (applied once, at `--check`:
-  effective floor = `floorPercent − slackPercent`) and tracked in #1679.
+  whether a 1-minute tick landed before stop).
+
+### Deterministic measured set — `zeebe-excludes.json` (#1707)
+
+The zeebe side measures a **live** broker, and some of `zeebe/engine`'s branch
+arms are decided by wall-clock timing, not by the corpus: background scheduler
+sweeps (message TTL, lock-release, dedup-expiry), the message-correlation race,
+and the FEEL `typeCheck` failure branch. On identical inputs (same commit, same
+image digest) two runs measured **1037 vs 1033** covered branches — ±4 branches
+of noise that flipped the 12.5 % floor (#1707). A 30-run census found exactly
+15 branch-carrying lines ever vary, all in the two message packages plus
+`ExpressionProcessor.java:507`.
+
+`zeebe-excludes.json` removes that timing-dependent surface from the measured
+set — whole packages (`packages`, recursive) and individual lines (`lines`),
+each entry naming the issue that justifies it. With those exclusions every one
+of the 30 census runs is byte-identical (951/7872 = 12.08 %), so the floor is a
+**hard** ratchet again (no `slackPercent` absorption band — that was the
+palliative this replaces). An exclusion is a reviewed claim; shrink the list as
+#1679 makes those paths deterministic.
+
+### Gate self-test — `--self-test N` (#1707)
+
+Re-running the measurement on identical inputs must give an identical covered
+count. `--self-test N` re-parses each input N times and fails loudly with the
+differing branches when any re-parse disagrees, so a nondeterministic
+measurement fails the gate instead of flapping it. The daily job runs
+`--self-test 3 --check`.
