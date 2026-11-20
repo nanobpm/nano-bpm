@@ -22,7 +22,7 @@
 //! Zeebe-pure. It reuses only the engine's generic XML tokenizer
 //! ([`nanobpmn_engine_core::xml`]).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use nanobpmn_engine_core::xml::{Token, attr, local_name, tokenize};
@@ -306,7 +306,14 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
     // In-scope `xmlns[:prefix]` declarations, one frame per open element, so a
     // shape-vocabulary element is recognised only in the Nano shapes namespace
     // (a foreign `vendor:shape` with the same local name is ignored).
-    let mut ns_frames: Vec<Vec<(String, String)>> = Vec::new();
+    // Kept as an active prefix -> URI-stack index (each frame records only the
+    // prefixes it declared, popped on close), so resolution is O(1) per element
+    // rather than a walk over every ancestor frame.
+    let mut ns_frames: Vec<Vec<String>> = Vec::new();
+    let mut ns_active: HashMap<String, Vec<String>> = HashMap::new();
+    // Per-job-type header membership, kept for the whole scan so merging
+    // duplicate tasks never reindexes earlier headers.
+    let mut worker_seen: HashMap<String, HashSet<String>> = HashMap::new();
 
     for tok in &tokens {
         match tok {
@@ -316,18 +323,23 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                 self_closing,
             } => {
                 let ln = local_name(name);
-                let frame: Vec<(String, String)> = attrs
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        if k == "xmlns" {
-                            Some((String::new(), v.clone()))
-                        } else {
-                            k.strip_prefix("xmlns:").map(|p| (p.to_string(), v.clone()))
-                        }
-                    })
-                    .collect();
+                let mut frame: Vec<String> = Vec::new();
+                for (k, v) in attrs {
+                    let prefix = if k == "xmlns" {
+                        ""
+                    } else if let Some(p) = k.strip_prefix("xmlns:") {
+                        p
+                    } else {
+                        continue;
+                    };
+                    ns_active
+                        .entry(prefix.to_string())
+                        .or_default()
+                        .push(v.clone());
+                    frame.push(prefix.to_string());
+                }
                 ns_frames.push(frame);
-                let in_nano_ns = namespace_of(name, &ns_frames) == Some(NANO_SHAPES_NS);
+                let in_nano_ns = namespace_of(name, &ns_active) == Some(NANO_SHAPES_NS);
                 if cur.is_none() {
                     if SERVICE_TASK_LOCALS.contains(&ln) {
                         // A self-closing service task carries no `taskDefinition`
@@ -343,7 +355,13 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         // union (ADR 0040 slice 2), so flush it straight away.
                         let acc = Accum::new(Kind::Message, message_name(attr(attrs, "name")));
                         if *self_closing {
-                            flush(&mut workers, &mut messages, &mut starts, acc);
+                            flush(
+                                &mut workers,
+                                &mut worker_seen,
+                                &mut messages,
+                                &mut starts,
+                                acc,
+                            );
                         } else {
                             cur = Some((depth, acc));
                         }
@@ -357,7 +375,13 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         // a none start by construction: flush it straight away.
                         let acc = Accum::new(Kind::Start, process_id.clone());
                         if *self_closing {
-                            flush(&mut workers, &mut messages, &mut starts, acc);
+                            flush(
+                                &mut workers,
+                                &mut worker_seen,
+                                &mut messages,
+                                &mut starts,
+                                acc,
+                            );
                         } else {
                             cur = Some((depth, acc));
                         }
@@ -444,17 +468,23 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                     decl.ops.push(op);
                 }
                 if *self_closing {
-                    ns_frames.pop();
+                    pop_ns_frame(&mut ns_frames, &mut ns_active);
                 } else {
                     depth += 1;
                 }
             }
             Token::End { .. } => {
-                ns_frames.pop();
+                pop_ns_frame(&mut ns_frames, &mut ns_active);
                 depth = depth.saturating_sub(1);
                 if let Some((open_depth, acc)) = cur.take() {
                     if depth == open_depth {
-                        flush(&mut workers, &mut messages, &mut starts, acc);
+                        flush(
+                            &mut workers,
+                            &mut worker_seen,
+                            &mut messages,
+                            &mut starts,
+                            acc,
+                        );
                     } else {
                         cur = Some((open_depth, acc));
                     }
@@ -486,16 +516,41 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
 /// (`shape`, its ops, `meta`) are recognised only in this namespace.
 pub const NANO_SHAPES_NS: &str = "https://nanobpm.io/schema/shapes/1.0";
 
-/// Resolve the namespace URI of a qualified element name against the in-scope
-/// declaration frames (innermost wins); `None` when the prefix is undeclared.
-fn namespace_of<'a>(name: &str, frames: &'a [Vec<(String, String)>]) -> Option<&'a str> {
+/// Resolve the namespace URI of a qualified element name against the active
+/// prefix index (innermost declaration wins); `None` when undeclared.
+fn namespace_of<'a>(name: &str, active: &'a HashMap<String, Vec<String>>) -> Option<&'a str> {
     let prefix = name.split_once(':').map_or("", |(p, _)| p);
-    frames
-        .iter()
-        .rev()
-        .flat_map(|f| f.iter())
-        .find(|(p, _)| p == prefix)
-        .map(|(_, uri)| uri.as_str())
+    active
+        .get(prefix)
+        .and_then(|stack| stack.last())
+        .map(String::as_str)
+}
+
+/// Close one element's namespace scope: restore every prefix it declared.
+fn pop_ns_frame(frames: &mut Vec<Vec<String>>, active: &mut HashMap<String, Vec<String>>) {
+    for prefix in frames.pop().unwrap_or_default() {
+        if let Some(stack) = active.get_mut(&prefix) {
+            stack.pop();
+            if stack.is_empty() {
+                active.remove(&prefix);
+            }
+        }
+    }
+}
+
+/// Append `keys` to a worker's header list in first-seen order, using the
+/// scan-lifetime membership set for that job type (linear in new keys only).
+fn merge_header_keys(
+    entry: &mut WorkerIo,
+    seen: &mut HashMap<String, HashSet<String>>,
+    keys: Vec<String>,
+) {
+    let set = seen.entry(entry.task_type.clone()).or_default();
+    for k in keys {
+        if set.insert(k.clone()) {
+            entry.header_keys.push(k);
+        }
+    }
 }
 
 /// Parse one `nano:shape` composition child into a `ShapeOp`. An op missing its
@@ -572,6 +627,7 @@ fn bool_attr(attrs: &[(String, String)], local: &str) -> Option<bool> {
 /// fill any still-empty envelope side so a binding is not lost.
 fn flush(
     workers: &mut BTreeMap<String, WorkerIo>,
+    worker_seen: &mut HashMap<String, HashSet<String>>,
     messages: &mut BTreeMap<String, MessageIo>,
     starts: &mut BTreeMap<String, StartIo>,
     acc: Accum,
@@ -596,12 +652,7 @@ fn flush(
             fill(&mut entry.output_type, acc.output_type);
             // Union header keys across duplicate task entries, first-seen order
             // (hash-indexed, so the union is linear in the header count).
-            let mut seen: HashSet<String> = entry.header_keys.iter().cloned().collect();
-            for k in acc.header_keys {
-                if seen.insert(k.clone()) {
-                    entry.header_keys.push(k);
-                }
-            }
+            merge_header_keys(entry, worker_seen, acc.header_keys);
         }
         Kind::Message => {
             let entry = messages
@@ -647,6 +698,7 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
         Err(_) => return BpmnScan::default(),
     };
     let mut workers: BTreeMap<String, WorkerIo> = BTreeMap::new();
+    let mut worker_seen: HashMap<String, HashSet<String>> = HashMap::new();
     let mut messages: BTreeMap<String, MessageIo> = BTreeMap::new();
     let mut starts: BTreeMap<String, StartIo> = BTreeMap::new();
     let mut shapes: Vec<ShapeDecl> = Vec::new();
@@ -676,12 +728,7 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
                 });
             fill(&mut entry.input_type, io.input_type);
             fill(&mut entry.output_type, io.output_type);
-            let mut seen: HashSet<String> = entry.header_keys.iter().cloned().collect();
-            for k in io.header_keys {
-                if seen.insert(k.clone()) {
-                    entry.header_keys.push(k);
-                }
-            }
+            merge_header_keys(entry, &mut worker_seen, io.header_keys);
         }
         for io in scan.messages {
             let entry = messages
@@ -925,6 +972,52 @@ mod tests {
         let ws = workers(&doc(&body));
         assert_eq!(ws[0].header_keys.len(), 9_000);
         assert_eq!(ws[0].header_keys[8_999], "h8999");
+    }
+
+    #[test]
+    fn many_same_type_tasks_merge_headers_linearly() {
+        // 9,000 single-header tasks sharing one job type: the cross-task union
+        // must keep one membership set per type rather than reindexing.
+        let body: String = (0..9_000)
+            .map(|i| {
+                let k = format!("h{}", i % 100);
+                task_with_headers(&format!("t{i}"), "charge", &[(k.as_str(), "v")], IN_ORDER)
+            })
+            .collect();
+        let ws = workers(&doc(&body));
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].header_keys.len(), 100);
+        assert_eq!(ws[0].header_keys[99], "h99");
+    }
+
+    #[test]
+    fn deeply_nested_extensions_resolve_namespaces_with_scoped_restore() {
+        // 9,000 nested foreign elements (one re-declaring `nano` to a foreign URI
+        // mid-way): resolution must stay O(1) per element and restore on close.
+        let depth = 9_000;
+        let open: String = (0..depth)
+            .map(|i| {
+                if i == depth / 2 {
+                    r#"<vendor:x xmlns:nano="https://example.com/not-nano">"#.to_string()
+                } else {
+                    "<vendor:x>".to_string()
+                }
+            })
+            .collect();
+        let close = "</vendor:x>".repeat(depth);
+        let xml = format!(
+            r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                xmlns:vendor="https://example.com/vendor"
+                xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
+              <bpmn:process id="orders"><bpmn:extensionElements>
+                {open}<nano:shape id="Shadowed"><nano:carry ref="X" /></nano:shape>{close}
+                <nano:shape id="S"><nano:carry ref="Order" /></nano:shape>
+              </bpmn:extensionElements></bpmn:process>
+            </bpmn:definitions>"#
+        );
+        let scan = scan_bpmn(&xml);
+        let ids: Vec<&str> = scan.shapes.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["S"]);
     }
 
     #[test]
