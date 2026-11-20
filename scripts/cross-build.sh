@@ -155,7 +155,9 @@ fi
 # Same cwd + cargo as the build below (`cd server && cargo ...`).
 server_target="$(cd "$PROJECT_ROOT/server" && cargo_target_dir Cargo.toml cargo)" || die "cannot resolve server target dir"
 if [ "$WINDOWS" = 0 ]; then
-  zig_tools="$PROJECT_ROOT/server/target/zig-tools"
+  # Stage the zig ar/ranlib shims under the RESOLVED target dir, not a guessed
+  # server/target: under a redirected CARGO_TARGET_DIR (#1716) the two differ.
+  zig_tools="$server_target/zig-tools"
   mkdir -p "$zig_tools"
   printf '#!/bin/sh\nexec zig ar "$@"\n' >"$zig_tools/ar"
   printf '#!/bin/sh\nexec zig ranlib "$@"\n' >"$zig_tools/ranlib"
