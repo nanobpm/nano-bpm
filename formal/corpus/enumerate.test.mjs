@@ -147,7 +147,10 @@ test('reference: a gateway reached twice routes PER ACTIVATION, not per instance
   // route (all activations share one choice) can only make zero or two.
   const g = graphOf(['and', 'xor'], [[0, 1, 'direct'], [1, 2, 'task'], [1, 2, 'task'], [2, 3, 'task'], [2, 3, 'direct']])
   const runs = exploreOrders(g)
-  const byJobs = new Map(runs.map((r) => [JSON.stringify(r.jobsCreated), r]))
+  // Key by the SORTED job multiset: job creation order is the engine's flow order
+  // (reverse document order, #1693), not part of what this test pins.
+  const jobsKey = (jobs) => JSON.stringify(Object.fromEntries(Object.entries(jobs).sort()))
+  const byJobs = new Map(runs.map((r) => [jobsKey(r.jobsCreated), r]))
   assert.ok(byJobs.has('{"T1":1,"T2":1}'), 'route both to E: no T3')
   assert.ok(byJobs.has('{"T1":1,"T2":1,"T3":1}'), 'route one to T3, one to E: exactly one T3 job')
   assert.ok(byJobs.has('{"T1":1,"T2":1,"T3":2}'), 'route both to T3: two T3 jobs')
@@ -565,4 +568,21 @@ test('the committed divergence corpus is well-formed: every case is filed and re
 test('error classes mask ids and numbers so one defect is one signature', () => {
   assert.equal(errorClass(new Error("no 'T1' job became activatable within 30000ms\nmore")),
     errorClass(new Error("no 'T7' job became activatable within 5ms")))
+})
+
+test('Reference takes a fork\'s flows in reverse document order, as Zeebe (#1693, #1675)', () => {
+  // Gen_a0e9274136: G1 forks to G2 (f2) and G3 (f3); G2 can reach the inclusive
+  // join G3 over f4 but routes to E (f5). Zeebe takes f3 BEFORE f2, so G3 is
+  // evaluated while G2's activation is still in transit and is rejected; G2
+  // then routes away and G3 is never re-evaluated — live Camunda 8 strands the
+  // instance with no T1 job. A document-order (f2 first) reference drains G2
+  // before G3 and wrongly expects completion.
+  const g = materialize({ kinds: ['or', 'or', 'or'], edges: [[0, 1, 'direct'], [1, 2, 'direct'], [1, 3, 'direct'], [2, 3, 'direct'], [2, 4, 'direct'], [3, 4, 'task']] })
+  const ref = new Reference(g, { route_G1: [['f2', 'f3']], route_G2: [['f5']] })
+  assert.equal(ref.completed, false)
+  assert.equal(ref.jobsCreated.T1, undefined)
+  assert.equal(ref.joinsFired.G3, undefined)
+  assert.deepEqual(ref.commands(), [])
+  // The order is per element: the reversed fork still takes BOTH flows.
+  assert.deepEqual({ ...ref.takenFlows }, { f1: 1, f2: 1, f3: 1, f5: 1 })
 })

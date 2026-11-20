@@ -17,6 +17,8 @@ import {
   shrinkGraph,
   shrinkRuns,
   corpusProblems,
+  rederive,
+  canonJson,
   judgeCase,
   caseRunnable,
   shorterRepro,
@@ -173,6 +175,20 @@ test('corpusProblems: a committed case needs an issue, a fixed flag and a reprod
   assert.match(corpusProblems([{ ...ok, fixed: undefined }])[0], /boolean "fixed"/)
   assert.match(corpusProblems([{ ...ok, scenario: undefined }])[0], /"skeleton" and "scenario"/)
   assert.match(corpusProblems([{ ...ok, graph: { ...ok.graph, key: 'other' } }])[0], /no longer materialises/)
+})
+
+test('corpusProblems: a frozen scenario must still be a current-Reference behaviour (#1693)', () => {
+  const ok = sampleCase()
+  assert.ok(rederive(ok), 'a freshly recorded case re-derives')
+  const staleExpect = { ...ok, scenario: { ...ok.scenario, expect: { ...ok.scenario.expect, completed: !ok.scenario.expect.completed } } }
+  assert.match(corpusProblems([staleExpect])[0], /frozen "expect" is stale/)
+  const unreachable = { ...ok, scenario: { ...ok.scenario, steps: [...ok.scenario.steps, { op: 'completeOneJob', jobType: 'NoSuchTask' }] } }
+  assert.match(corpusProblems([unreachable])[0], /no longer a behaviour of the current Reference/)
+})
+
+test('canonJson ignores key order and the per-execution correlation key', () => {
+  assert.equal(canonJson({ b: 1, a: { d: 2, c: 3 }, correlationKey: 'x' }), canonJson({ a: { c: 3, d: 2 }, b: 1, correlationKey: 'y' }))
+  assert.notEqual(canonJson([1, 2]), canonJson([2, 1]))
 })
 
 test('judgeCase: open cases must reproduce, fixed cases must agree (regression guard)', () => {

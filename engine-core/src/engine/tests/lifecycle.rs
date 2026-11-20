@@ -8500,3 +8500,44 @@ fn inclusive_join_ignores_its_own_queued_activation_as_a_live_path() {
         "the join must fire exactly once"
     );
 }
+
+#[test]
+fn inclusive_join_reached_by_a_fork_sibling_still_in_transit_waits_like_zeebe() {
+    // The #1693 fuzz reproducer (`Gen_a0e9274136`): the inclusive split `g1`
+    // takes both `g1 -> g2` and `g1 -> g3`. Zeebe takes a fork's flows in
+    // reverse document order, so `g3`'s ACTIVATE is processed while `g2`'s is
+    // still in transit, and `g2` can still reach `g3` over the untaken
+    // `g2 -> g3`: the join is rejected. `g2` then routes to `e` only, nothing
+    // else arrives at `g3`, and the instance stays active — exactly what live
+    // Camunda 8 does (verified against camunda/camunda:8.10.6).
+    let def = ProcessBuilder::new("inc-in-transit")
+        .start_event("s")
+        .inclusive_gateway("g1")
+        .inclusive_gateway("g2")
+        .inclusive_gateway("g3")
+        .service_task("t1", "T1")
+        .end_event("e")
+        .connect("s", "g1")
+        .connect_when("g1", "g2", "true")
+        .connect_when("g1", "g3", "true")
+        .connect_when("g2", "g3", "false")
+        .connect_when("g2", "e", "true")
+        .connect("g3", "t1")
+        .connect("t1", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-in-transit"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(join_fire_count(&created, "g3"), 0);
+    assert!(
+        !created
+            .iter()
+            .any(|e| matches!(e, Event::JobCreated { .. })),
+        "no T1 job: the join never activates"
+    );
+    assert!(!engine.is_completed(instance_key));
+}

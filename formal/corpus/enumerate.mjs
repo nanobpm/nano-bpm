@@ -696,7 +696,15 @@ export class Reference {
   }
 
   take (flows) {
-    for (const e of flows) {
+    // Zeebe (and the engine, `ElementDef::outgoing_in_execution_order`) takes
+    // an element's outgoing flows in REVERSE document order — `ModelWalker`
+    // pushes sibling flows with `addFirst` — so their ACTIVATE commands queue
+    // last-declared first. `flows` is in document order (`graph.edges`, which
+    // `bpmnFor` emits as-is), so enqueue it reversed. The order is observable:
+    // an inclusive join reached by a fork's later-declared flow is evaluated
+    // while the earlier-declared sibling is still in transit, and is rejected
+    // if that sibling can still reach it (#1693 / #1675, `Gen_a0e9274136`).
+    for (const e of [...flows].reverse()) {
       this.queue.push(e.id)
       // The branch-sensitive milestone: which FLOWS were taken. An event-based
       // gateway arms every catch (each completes, the losers withdrawn), so the
