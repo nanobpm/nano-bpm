@@ -1908,8 +1908,8 @@ fn interrupting_boundary_terminates_the_activity_and_cancels_its_user_task() {
 /// byte-for-byte.
 ///
 /// The scan count is asserted through the test-only `user_task_scan_count`
-/// probe: the `None` fallback scans `state.user_tasks` at most once for the
-/// whole teardown, never once per member.
+/// probe, which counts both `None` fallbacks and shared-index builds: the
+/// interrupted root's own fallback plus one index build — exactly 2, never N.
 #[test]
 fn interrupting_boundary_on_a_multi_instance_user_task_cancels_every_child_task_once() {
     const N: i64 = 32;
@@ -1966,9 +1966,10 @@ fn interrupting_boundary_on_a_multi_instance_user_task_cancels_every_child_task_
     engine.user_task_scan_count.set(0);
     let fired = engine.trigger_timers(6_000);
     assert!(
-        engine.user_task_scan_count.get() <= 1,
-        "the N-member teardown scanned `state.user_tasks` at most once (the shared \
-         fallback index), never once per member: {}",
+        engine.user_task_scan_count.get() == 2,
+        "an N-member interrupt scans `state.user_tasks` exactly twice — the \
+         interrupted root's own `None` fallback plus ONE shared index build for \
+         its members — never once per member (index builds are counted too): {}",
         engine.user_task_scan_count.get()
     );
 

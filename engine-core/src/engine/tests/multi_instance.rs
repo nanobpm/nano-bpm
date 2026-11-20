@@ -166,6 +166,80 @@ fn early_multi_instance_completion_tears_down_a_running_subprocess_child_scope()
     );
 }
 
+/// Depth-first termination order guard (#1535, #1528 review): when an early MI
+/// completion cancels a still-running sub-process child, the child's
+/// `ElementTerminating` must precede every event of its subtree teardown (the
+/// inner job's cancellation and the inner element's termination), and its
+/// `ElementTerminated` must follow them. Previously the parent pair was appended
+/// AFTER the descendant cleanup, so the journal reported descendants terminating
+/// before their parent began terminating.
+#[test]
+fn early_multi_instance_completion_terminates_a_subprocess_child_parent_first() {
+    let def = ProcessBuilder::new("mi-sub-order")
+        .start_event("start")
+        .sub_process("each", "sub_start")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "each")
+        .service_task("inner", "work")
+        .contained_in("inner", "each")
+        .end_event("sub_end")
+        .contained_in("sub_end", "each")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("each", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub-order",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let jobs = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 2);
+    let events = engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+
+    let pos = |pred: &dyn Fn(&Event) -> bool| events.iter().position(pred);
+    let child_terminating =
+        pos(&|e| matches!(e, Event::ElementTerminating { element_id, .. } if element_id == "each"))
+            .expect("the cancelled sub-process child terminates");
+    let child_terminated =
+        pos(&|e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "each"))
+            .expect("the cancelled sub-process child terminates");
+    let job_canceled = pos(&|e| matches!(e, Event::JobCanceled { .. }))
+        .expect("the sibling inner job is cancelled");
+    let inner_terminated =
+        pos(&|e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "inner"))
+            .expect("the sibling inner task is terminated");
+    assert!(
+        child_terminating < job_canceled && child_terminating < inner_terminated,
+        "parent TERMINATING precedes its subtree teardown: {events:#?}"
+    );
+    assert!(
+        job_canceled < child_terminated && inner_terminated < child_terminated,
+        "parent TERMINATED follows its subtree teardown: {events:#?}"
+    );
+}
+
 /// Defect-class guard (dead-scope guard, multi-instance retry branches): a
 /// resolved MI input-mapping incident re-drives the *already-activated* child /
 /// body via `RetryMiChildActivation` / `RetryMiBodyActivation`, reusing existing

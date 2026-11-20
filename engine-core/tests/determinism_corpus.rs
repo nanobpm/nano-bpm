@@ -1921,6 +1921,104 @@ fn prev_release_gate_nested_mi_body_identity_is_order_independent() {
     );
 }
 
+/// Runs the cross-release gate over ONE synthetic entry per side (plus a
+/// real state checkpoint so the state comparison is live), with `reorder` +
+/// `remint_keys` declared for the scenario.
+fn nested_gate(
+    head_events: Vec<serde_json::Value>,
+    prev_events: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let real_state = head_records()
+        .into_iter()
+        .find(|r| r.get("state").is_some())
+        .expect("a state checkpoint");
+    let state = || {
+        let mut s = real_state.clone();
+        s["i"] = serde_json::json!(1);
+        s
+    };
+    let head = vec![serde_json::json!({"i": 0, "events": head_events}), state()];
+    let prev = vec![serde_json::json!({"i": 0, "events": prev_events}), state()];
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": "s", "expected": {"reorder": true, "remint_keys": true},
+        "introduced_in": "v0.0.2", "issue": "#1528", "upgrade": "upgrade-boundary",
+        "rationale": "upgrade-boundary: test"
+    }]});
+    let scenarios = vec!["s".to_string()];
+    let allowlist = compare::parse_allowlist(&allow.to_string()).unwrap();
+    let added = compare::Vocab::new();
+    let ctx = compare::CrossReleaseContext {
+        scenarios: &scenarios,
+        allowlist: &allowlist,
+        prev_tag: "v0.0.1",
+        added: &added,
+    };
+    compare::cross_release_checked(&head, &prev, &ctx).map(|_| ())
+}
+
+/// A nested MI tree (outer body 11 → children 12, 13 → inner bodies 14, 16 →
+/// inner children 15, 17), every element-instance key offset by `shift` (the
+/// instance key 10 stays put), each inner child parking one job (key 30+).
+fn nested_tree(shift: u64) -> Vec<serde_json::Value> {
+    let k = |raw: u64| raw + shift;
+    vec![
+        serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+        serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":k(11),"instance_key":10,"scope":0}}),
+        serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":k(12),"instance_key":10,"scope":k(11)}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(11),"child_key":k(12),"index":0,"instance_key":10,"local_variables":{}}}),
+        serde_json::json!({"ElementActivating":{"element_id":"outer","element_instance_key":k(13),"instance_key":10,"scope":k(11)}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(11),"child_key":k(13),"index":1,"instance_key":10,"local_variables":{}}}),
+        serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":k(14),"instance_key":10,"scope":k(12)}}),
+        serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":k(15),"instance_key":10,"scope":k(14)}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(14),"child_key":k(15),"index":0,"instance_key":10,"local_variables":{}}}),
+        serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":k(16),"instance_key":10,"scope":k(13)}}),
+        serde_json::json!({"ElementActivating":{"element_id":"inner","element_instance_key":k(17),"instance_key":10,"scope":k(16)}}),
+        serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(16),"child_key":k(17),"index":0,"instance_key":10,"local_variables":{}}}),
+    ]
+}
+
+/// #1528 (review): an inner MI body activated in the SAME entry as the outer
+/// child that is its parent scope must derive its identity from that child's
+/// canonical `mi-child:…` identity, not a raw-key `?orphan:` token — so a
+/// clean REMINT of the whole nested tree (every key shifted) reconciles.
+/// Registration is parent-before-child to a fixpoint.
+#[test]
+fn prev_release_gate_nested_mi_tree_reconciles_under_remint() {
+    nested_gate(nested_tree(0), nested_tree(100))
+        .expect("a reminted nested MI tree reconciles: inner bodies derive from their outer child");
+}
+
+/// #1528 (review): two executions of the SAME MI activity in one parent scope
+/// (a loop-back) must keep DISTINCT body identities — and so distinct child
+/// identities — or `remint_keys` would hide a reference that points to the
+/// wrong execution. Swapping which execution's child owns a job must fail.
+#[test]
+fn prev_release_gate_repeated_mi_body_executions_stay_distinct() {
+    let tree = |shift: u64, job_owner: u64| {
+        let k = |raw: u64| raw + shift;
+        vec![
+            serde_json::json!({"ProcessInstanceCreated":{"business_id":null,"created_at":1,"instance_key":10,"parent_element_instance_key":null,"parent_process_instance_key":null,"process_definition_key":9,"process_id":"p","tags":[],"variables":{},"version":1}}),
+            // Execution 1 of MI activity `a`.
+            serde_json::json!({"ElementActivating":{"element_id":"a","element_instance_key":k(11),"instance_key":10,"scope":0}}),
+            serde_json::json!({"ElementActivating":{"element_id":"a","element_instance_key":k(12),"instance_key":10,"scope":k(11)}}),
+            serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(11),"child_key":k(12),"index":0,"instance_key":10,"local_variables":{}}}),
+            // Execution 2 of the same activity, same parent scope.
+            serde_json::json!({"ElementActivating":{"element_id":"a","element_instance_key":k(13),"instance_key":10,"scope":0}}),
+            serde_json::json!({"ElementActivating":{"element_id":"a","element_instance_key":k(14),"instance_key":10,"scope":k(13)}}),
+            serde_json::json!({"MultiInstanceChildActivated":{"body_key":k(13),"child_key":k(14),"index":0,"instance_key":10,"local_variables":{}}}),
+            serde_json::json!({"JobCreated":{"job_key":20,"element_instance_key":k(job_owner),"element_id":"a","job_type":"w","instance_key":10}}),
+        ]
+    };
+    // Positive control: a clean remint plus a pure reorder reconciles.
+    let mut reversed = tree(100, 12);
+    reversed.reverse();
+    nested_gate(tree(0, 12), reversed).expect("a reminted, reordered tree reconciles");
+    assert!(
+        nested_gate(tree(0, 12), tree(100, 14)).is_err(),
+        "a job re-pointed at the OTHER execution's child must not reconcile"
+    );
+}
+
 /// #1528 (review): the mint bypass for an MI child's generic re-sighting is
 /// restricted to that lifecycle — a key reused for an UNRELATED entity (a
 /// `UserTaskCreated` reusing its child's key, or a child reusing a job key)

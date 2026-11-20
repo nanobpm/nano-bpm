@@ -770,6 +770,11 @@ impl Engine {
         // subtrees (a scope's transitive descendants), so visit the members
         // whose flow scope is not itself a member as roots, recursing into the
         // members nested under each.
+        // A no-op teardown must not pay for (scan + allocate) the user-task
+        // index it would never read (#1528 review).
+        if members.is_empty() {
+            return Vec::new();
+        }
         let member_set: BTreeSet<Key> = members.iter().copied().collect();
         let fallback_index;
         let user_tasks_by_eik = match user_tasks_by_eik {

@@ -1210,17 +1210,28 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
     // element activates one body per OUTER child, so an
     // `element:{instance}:{id}` base cannot tell those bodies apart and an
     // ordinal `mint` would swap their identities under a pure reorder (#1528
-    // review). A `resight` keeps the registration independent of whether the
-    // body's `ElementActivating` or its `ElementActivated` is folded first.
+    // review). Bodies are collected from both their `ElementActivating` and
+    // `ElementActivated` sightings into one record, so the registration is
+    // independent of which is folded first.
     // A body activated in an EARLIER entry than its parent scope's own
     // registration (a ratified cross-entry reorder) derives from that scope's
     // `?orphan:<raw>` token — still deterministic, and identical on both
     // sides of a clean remint.
+    type Bodies = BTreeMap<u64, (Option<u64>, Option<u64>, String)>;
+    type Children = BTreeMap<u64, (Option<u64>, u64, Option<u64>)>;
+    fn parent_ready(ids: &KeyIds, bodies: &Bodies, children: &Children, p: Option<u64>) -> bool {
+        p.is_none_or(|p| {
+            ids.get(&p).is_some() || !(bodies.contains_key(&p) || children.contains_key(&p))
+        })
+    }
     let body_keys: BTreeSet<u64> = parsed
         .iter()
         .filter(|(variant, _)| *variant == "MultiInstanceChildActivated")
         .filter_map(|(_, body)| u64_of(body, "body_key"))
         .collect();
+    // body key -> (parent scope key, or None for the process scope; instance
+    // key; element id), from the body's own generic activation.
+    let mut bodies: Bodies = BTreeMap::new();
     for (_, body) in parsed
         .iter()
         .filter(|(variant, _)| *variant == "ElementActivating" || *variant == "ElementActivated")
@@ -1230,43 +1241,107 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
             str_of(body, "element_id"),
         ) {
             if body_keys.contains(&k) {
-                let parent = match u64_of(body, "scope") {
-                    Some(0) | None => u64_of(body, "instance_key")
-                        .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone()),
-                    Some(scope) => ids.owner(scope).clone(),
-                };
-                ids.resight(k, &format!("mi-body:{parent}:{id}"))?;
+                let scope = u64_of(body, "scope").filter(|s| *s != 0);
+                bodies.insert(k, (scope, u64_of(body, "instance_key"), id.to_owned()));
             }
         }
     }
-    // Pass 2b: the children. For each, ALSO record the (instance, element_id)
-    // its own generic `ElementActivating`/`ElementActivated` will name, so
-    // pass 3 can tell that lifecycle re-sighting apart from an UNRELATED
-    // entity (a `ParallelJoinOpened`, or a different element's activation)
-    // reusing the child's key — the latter must mint and collide, not be
-    // skipped (#1528 review). The element id comes from the child's generic
-    // activation (the `mi-child:…` identity string is not parseable — its
-    // instance and body segments themselves contain `:`/`#`).
-    let mut mi_child_activations: BTreeMap<u64, (String, String)> = BTreeMap::new();
+    // child key -> (body key, child index, instance key).
+    let mut children: Children = BTreeMap::new();
     for (_, body) in parsed
         .iter()
         .filter(|(variant, _)| *variant == "MultiInstanceChildActivated")
     {
         if let (Some(k), Some(index)) = (u64_of(body, "child_key"), u64_of(body, "index")) {
-            let body_id =
-                u64_of(body, "body_key").map_or_else(|| "?".to_owned(), |b| ids.owner(b).clone());
-            let instance = u64_of(body, "instance_key")
-                .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
-            ids.resight(k, &format!("mi-child:{instance}:{body_id}#{index}"))?;
+            children.insert(
+                k,
+                (
+                    u64_of(body, "body_key"),
+                    index,
+                    u64_of(body, "instance_key"),
+                ),
+            );
+        }
+    }
+    // Register bodies and children in PARENT-BEFORE-CHILD order, to a
+    // fixpoint (#1528 review): an inner MI body activated in the same entry
+    // as the outer child that is its parent scope must see that child's
+    // `mi-child:…` identity, not a raw-key `?orphan:` token (which a clean
+    // remint would make unequal). A node is ready once its parent is either
+    // registered or NOT pending registration in this entry (then it
+    // legitimately resolves to whatever `owner` yields).
+    //
+    // Bodies sharing a base (the SAME MI activity executed twice in one
+    // parent scope, e.g. via a loop-back) are told apart by an ordinal
+    // assigned in RAW-KEY order — never encounter order — so the identity
+    // is reorder-stable (a reorder permutes events, not key values) and
+    // remint-stable (keys are allocated monotonically, so a release that
+    // shifts them preserves their relative order). Each execution therefore
+    // keeps a distinct identity, and its children with it (#1528 review).
+    let mut mi_child_activations: BTreeMap<u64, (String, String)> = BTreeMap::new();
+    let owner_or =
+        |ids: &KeyIds, k: Option<u64>| k.map_or_else(|| "?".to_owned(), |k| ids.owner(k));
+    loop {
+        let ready_bodies: Vec<u64> = bodies
+            .iter()
+            .filter(|(_, (scope, _, _))| parent_ready(ids, &bodies, &children, *scope))
+            .map(|(k, _)| *k)
+            .collect();
+        let mut by_base: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for k in &ready_bodies {
+            let (scope, instance, id) = &bodies[k];
+            let parent = match scope {
+                None => owner_or(ids, *instance),
+                Some(s) => ids.owner(*s),
+            };
+            by_base
+                .entry(format!("mi-body:{parent}:{id}"))
+                .or_default()
+                .push(*k);
+        }
+        for (base, keys) in by_base {
+            // `keys` is ascending (BTreeMap iteration), i.e. raw-key order.
+            for k in keys {
+                if ids.get(&k).is_none() {
+                    ids.mint(k, base.clone())?;
+                }
+            }
+        }
+        for k in &ready_bodies {
+            bodies.remove(k);
+        }
+        let ready_children: Vec<u64> = children
+            .iter()
+            .filter(|(_, (body_key, _, _))| parent_ready(ids, &bodies, &children, *body_key))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in &ready_children {
+            let (body_key, index, instance_key) = children[k];
+            let body_id = owner_or(ids, body_key);
+            let instance = owner_or(ids, instance_key);
+            ids.resight(*k, &format!("mi-child:{instance}:{body_id}#{index}"))?;
             let child_element_id = parsed
                 .iter()
                 .filter(|(variant, _)| {
                     *variant == "ElementActivating" || *variant == "ElementActivated"
                 })
-                .find(|(_, b)| u64_of(b, "element_instance_key") == Some(k))
+                .find(|(_, b)| u64_of(b, "element_instance_key") == Some(*k))
                 .and_then(|(_, b)| str_of(b, "element_id"))
                 .unwrap_or("?");
-            mi_child_activations.insert(k, (instance, child_element_id.to_owned()));
+            mi_child_activations.insert(*k, (instance, child_element_id.to_owned()));
+            children.remove(k);
+        }
+        if ready_bodies.is_empty() && ready_children.is_empty() {
+            // Empty: done. Otherwise a parent cycle, impossible for a real
+            // scope tree — fail closed rather than guess.
+            if !bodies.is_empty() || !children.is_empty() {
+                return Err(format!(
+                    "multi-instance scope cycle among keys {:?} / {:?}",
+                    bodies.keys().collect::<Vec<_>>(),
+                    children.keys().collect::<Vec<_>>()
+                ));
+            }
+            break;
         }
     }
     // Pass 3: every other mint, in corpus order.

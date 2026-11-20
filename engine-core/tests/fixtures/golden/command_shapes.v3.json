@@ -307,6 +307,8 @@
   "SignalIntermediateCatchEvent.signal_name",
   "StartEvent",
   "Str",
+  "SubProcess",
+  "SubProcess.start_event",
   "SuspendInstance",
   "SuspendInstance.instance_key",
   "Thinking",

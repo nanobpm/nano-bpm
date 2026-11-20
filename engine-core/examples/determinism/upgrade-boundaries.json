@@ -16,7 +16,8 @@
       "version": "0.0.29",
       "entries": [
         "multi-instance-user-tasks (#1528)",
-        "newest-variants (#1528)"
+        "newest-variants (#1528)",
+        "multi-instance-cancel-remaining (#1528)"
       ]
     }
   ]

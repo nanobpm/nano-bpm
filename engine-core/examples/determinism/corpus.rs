@@ -857,6 +857,71 @@ fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
         }
     }
 
+    // ---- Multi-instance cancel-remaining (#1528 review) -------------------
+    // A satisfied completion condition cancels the loop's still-running
+    // children. They now TERMINATE (ElementTerminating/ElementTerminated,
+    // depth-first: a sub-process child's TERMINATING precedes its inner
+    // teardown) where the previous release COMPLETED them — an
+    // upgrade-boundary behavioural change ratified in
+    // `divergence-allowlist.json`. Both a leaf (service task) child and an
+    // embedded sub-process child are driven. Placed BEFORE the #1528 user-task
+    // scenario, whose extra per-child keys would otherwise offset the job keys
+    // harvested here, and with a FIXED command count (`build_excluding`).
+    g.scenario("multi-instance-cancel-remaining");
+    let cancel_mi = || nanobpmn_engine_core::MultiInstance {
+        input_collection: "=items".to_string(),
+        input_element: Some("item".to_string()),
+        output_collection: None,
+        output_element: None,
+        completion_condition: Some("=true".to_string()),
+        cancel_remaining_instances: true,
+        sequential: false,
+    };
+    let mi_leaf = ProcessBuilder::new("mi_cancel_leaf")
+        .start_event("start")
+        .service_task("each", "mi-cancel-leaf")
+        .with_multi_instance("each", cancel_mi())
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .expect("mi_cancel_leaf");
+    let mi_sub = ProcessBuilder::new("mi_cancel_sub")
+        .start_event("start")
+        .sub_process("each", "sub_start")
+        .with_multi_instance("each", cancel_mi())
+        .start_event("sub_start")
+        .contained_in("sub_start", "each")
+        .service_task("inner", "mi-cancel-inner")
+        .contained_in("inner", "each")
+        .end_event("sub_end")
+        .contained_in("sub_end", "each")
+        .end_event("end")
+        .connect("start", "each")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("each", "end")
+        .build()
+        .expect("mi_cancel_sub");
+    for (model, job_type) in [(mi_leaf, "mi-cancel-leaf"), (mi_sub, "mi-cancel-inner")] {
+        let process_id = model.id.clone();
+        g.push(Command::DeployProcess(model));
+        g.push(create(
+            &process_id,
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ));
+        let now = g.now;
+        let act = g.push(activate(job_type, 10, now));
+        // Completing ONE child satisfies the condition and cancels the rest.
+        let first = all(&act, "JobActivated", "job_key")
+            .into_iter()
+            .min()
+            .unwrap_or(0);
+        g.push(Command::complete_job(first));
+    }
     // ---- Multi-instance user tasks (#1528) --------------------------------
     // A multi-instance on a DIRECT user task creates one user task per child
     // (the previous release completed each child at once — an upgrade-boundary
