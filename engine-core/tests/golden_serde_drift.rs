@@ -66,6 +66,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[path = "../examples/determinism/compare.rs"]
+#[allow(dead_code)]
+mod determinism_compare;
+#[path = "../examples/determinism/corpus.rs"]
+#[allow(dead_code)]
+mod determinism_corpus;
+
 use nanobpmn_engine_core::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, Engine, EngineSnapshot, Event,
     IoMapping, Mapping, MessageStartCorrelation, MigratedChildInstance,
@@ -96,6 +103,12 @@ fn event_corpus_golden_name() -> String {
 }
 fn event_witnesses_golden_name() -> String {
     format!("event_witnesses.v{SNAPSHOT_FORMAT_VERSION}.json")
+}
+fn command_shapes_golden_name() -> String {
+    format!("command_shapes.v{SNAPSHOT_FORMAT_VERSION}.json")
+}
+fn event_shapes_golden_name() -> String {
+    format!("event_shapes.v{SNAPSHOT_FORMAT_VERSION}.json")
 }
 
 /// Serialize `value` to a **canonical**, deterministic, human-readable JSON
@@ -1107,6 +1120,44 @@ fn event_witnesses_shape_is_pinned_to_version() {
         let decoded = nanobpmn_engine_core::decode_event_json(&json).expect("decode witness");
         assert_eq!(&decoded, event);
     }
+}
+
+/// Pins the **command and emitted-event shape vocabularies** of the
+/// determinism corpus (#1698): every variant tag and variant-qualified field
+/// its commands use (`examples/determinism/`, which covers every `Command`
+/// variant) and every one the events they emit carry. The previous-release
+/// determinism gate derives its additive set as
+/// `vocabulary(golden @ HEAD) − vocabulary(golden @ prev tag)` over this
+/// directory and fails on any previous-release decode failure, new event
+/// variant or new field that set does not record — so every shape the gate
+/// compares is pinned here, and a new one lands only as a reviewed
+/// (`UPDATE_GOLDEN=1`) additive decision.
+#[test]
+fn determinism_corpus_shapes_are_pinned_to_version() {
+    let corpus = determinism_corpus::build(0);
+    let commands: Vec<serde_json::Value> = corpus
+        .iter()
+        .map(|(_, c)| serde_json::to_value(c).expect("serialize command"))
+        .collect();
+    let mut engine = Engine::new();
+    let mut events = Vec::new();
+    for (now, command) in corpus {
+        if let Ok(emitted) = engine.apply_command_at(command, now) {
+            events.extend(
+                emitted
+                    .iter()
+                    .map(|e| serde_json::to_value(e).expect("event")),
+            );
+        }
+    }
+    assert_or_update_golden(
+        &command_shapes_golden_name(),
+        &canonical_json(&determinism_compare::shape_list(&commands)),
+    );
+    assert_or_update_golden(
+        &event_shapes_golden_name(),
+        &canonical_json(&determinism_compare::shape_list(&events)),
+    );
 }
 
 /// The #1300 additive `message_start` field defaults when absent: a pre-#1300

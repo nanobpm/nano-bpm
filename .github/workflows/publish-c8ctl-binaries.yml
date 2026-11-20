@@ -183,10 +183,10 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             asset: nanobpm-gateway-rest-server-darwin-arm64
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
             asset: nanobpm-gateway-rest-server-darwin-x64
           # Linux legs cross-compile with cargo-zigbuild, pinning a glibc floor
           # (`.2.31` = Ubuntu 20.04) so the dynamically-linked `-gnu` binaries run

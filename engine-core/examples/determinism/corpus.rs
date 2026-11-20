@@ -63,6 +63,10 @@ pub struct Gen {
     position: u64,
     /// Per unfiltered position: `Some(accepted?)`, or `None` when excluded.
     outcomes: Vec<Option<bool>>,
+    /// The scenario subsequent pushes belong to (see [`Gen::scenario`]).
+    scenario: &'static str,
+    /// Per recorded entry (parallel to `entries`): its scenario label.
+    labels: Vec<&'static str>,
 }
 
 impl Default for Gen {
@@ -81,7 +85,17 @@ impl Gen {
             exclude: BTreeSet::new(),
             position: 0,
             outcomes: Vec::new(),
+            scenario: "setup",
+            labels: Vec::new(),
         }
+    }
+
+    /// Labels every subsequent entry with `name`. The previous-release gate's
+    /// behavioural-divergence allowlist (`divergence-allowlist.json`, #1698)
+    /// ratifies divergences **per scenario**, so a ratified change in one
+    /// scenario never masks an undeclared one elsewhere.
+    fn scenario(&mut self, name: &'static str) {
+        self.scenario = name;
     }
 
     fn next_rand(&mut self) -> u64 {
@@ -113,6 +127,7 @@ impl Gen {
             return Err(EXCLUDED.into());
         }
         self.entries.push((self.now, command.clone()));
+        self.labels.push(self.scenario);
         let result = match self.engine.apply_command_at(command, self.now) {
             Ok(events) => Ok(events
                 .iter()
@@ -229,19 +244,29 @@ const DMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     clippy::too_many_lines,
     reason = "one linear scenario script; splitting it would scatter the corpus"
 )]
-/// An external (job-backed) agent task plus a job-worker ad-hoc container,
-/// side by side, both left running for the ad-hoc / agent commands.
+/// An external (job-backed) agent task and a job-worker ad-hoc container, in
+/// TWO processes, both left running for the ad-hoc / agent commands. Not one
+/// process behind a parallel fork: the corpus harvests the element-instance
+/// keys the commands address from the head engine, and the order a fork mints
+/// its branches' keys is release-specific (#1244 changed it), so a forked
+/// model would address the WRONG branch on a previous release — a corpus
+/// artefact, not an engine divergence (#1698).
 const AGENTS_BPMN: &str = r#"
   <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                     xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
     <bpmn:process id="agents" isExecutable="true">
       <bpmn:startEvent id="s" />
-      <bpmn:parallelGateway id="fork" />
       <bpmn:serviceTask id="agent">
         <bpmn:extensionElements>
           <zeebe:agentDefinition agentType="external" />
         </bpmn:extensionElements>
       </bpmn:serviceTask>
+      <bpmn:endEvent id="e1" />
+      <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+      <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e1" />
+    </bpmn:process>
+    <bpmn:process id="adhocs" isExecutable="true">
+      <bpmn:startEvent id="s" />
       <bpmn:adHocSubProcess id="adhoc">
         <bpmn:extensionElements>
           <zeebe:taskDefinition type="adhoc-worker" />
@@ -252,21 +277,27 @@ const AGENTS_BPMN: &str = r#"
           </bpmn:extensionElements>
         </bpmn:serviceTask>
       </bpmn:adHocSubProcess>
-      <bpmn:endEvent id="e1" />
       <bpmn:endEvent id="e2" />
-      <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="fork" />
-      <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="agent" />
-      <bpmn:sequenceFlow id="f3" sourceRef="fork" targetRef="adhoc" />
-      <bpmn:sequenceFlow id="f4" sourceRef="agent" targetRef="e1" />
-      <bpmn:sequenceFlow id="f5" sourceRef="adhoc" targetRef="e2" />
+      <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="adhoc" />
+      <bpmn:sequenceFlow id="f2" sourceRef="adhoc" targetRef="e2" />
     </bpmn:process>
   </bpmn:definitions>"#;
 
 const EXCLUDED: &str = "excluded from this corpus";
 
+/// The kept-coverage floor of a filtered (previous-release) corpus: at least
+/// this share of the unfiltered entries must survive the exclusions.
+pub const MIN_KEPT_PERCENT: usize = 90;
+
 /// Builds the full corpus. `random_instances` sizes the randomized workload.
 pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
     generate(random_instances, BTreeSet::new()).0
+}
+
+/// [`build`], plus each entry's scenario label (parallel to the entries).
+pub fn build_labeled(random_instances: usize) -> (Corpus, Vec<&'static str>) {
+    let (entries, _, labels) = generate(random_instances, BTreeSet::new());
+    (entries, labels)
 }
 
 /// Builds the corpus WITHOUT the commands at the unfiltered positions in
@@ -275,20 +306,20 @@ pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
 /// address real entities. A kept command whose outcome (accepted vs
 /// rejected) would change depends on an excluded one, so it is excluded too
 /// (returned in the set) rather than silently compared as a degraded
-/// execution both builds agree on; fails if more than 10% of the corpus is
-/// lost that way.
+/// execution both builds agree on; fails if less than [`MIN_KEPT_PERCENT`]
+/// percent of the corpus survives. Also returns each kept entry's scenario label.
 pub fn build_excluding(
     random_instances: usize,
     exclude: BTreeSet<u64>,
-) -> Result<(Corpus, BTreeSet<u64>), String> {
-    let (_, full) = generate(random_instances, BTreeSet::new());
+) -> Result<(Corpus, Vec<&'static str>, BTreeSet<u64>), String> {
+    let (_, full, _) = generate(random_instances, BTreeSet::new());
     let mut excluded = exclude;
     // Fixpoint: a kept command whose outcome flips depends on an excluded one
     // (e.g. a create of a process whose deployment the old release cannot
     // decode) — that scenario is unreachable for the old release, so it is
     // excluded too, and the corpus regenerated, until nothing flips.
     for _ in 0..64 {
-        let (entries, filtered) = generate(random_instances, excluded.clone());
+        let (entries, filtered, labels) = generate(random_instances, excluded.clone());
         if full.len() != filtered.len() {
             return Err(format!(
                 "excluding entries changed the corpus shape: {} vs {} positions",
@@ -306,7 +337,7 @@ pub fn build_excluding(
         if flipped.is_empty() {
             // Bound the silent loss: the compatible corpus must keep the bulk
             // of the scenarios, or the cross-release gate proves little.
-            if entries.len() * 10 < full.len() * 9 {
+            if entries.len() * 100 < full.len() * MIN_KEPT_PERCENT {
                 return Err(format!(
                     "only {} of {} corpus entries survive the exclusions ({:?}); \
                      isolate newer variants so they do not take core scenarios with them",
@@ -315,21 +346,23 @@ pub fn build_excluding(
                     excluded
                 ));
             }
-            return Ok((entries, excluded));
+            return Ok((entries, labels, excluded));
         }
         excluded.extend(flipped);
     }
     Err("exclusions did not reach a fixpoint".into())
 }
 
-fn generate(
-    random_instances: usize,
-    exclude: BTreeSet<u64>,
-) -> (Vec<(u64, Command)>, Vec<Option<bool>>) {
+/// A generated corpus: its entries, each entry's head outcome (`None` for an
+/// excluded position), and each entry's scenario label.
+type Generated = (Vec<(u64, Command)>, Vec<Option<bool>>, Vec<&'static str>);
+
+fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
     let mut g = Gen::new();
     g.exclude = exclude;
 
     // ---- Deployments -------------------------------------------------------
+    g.scenario("deployments");
     let order = ProcessBuilder::new("order")
         .start_event("s")
         .service_task("pay", "payment")
@@ -464,6 +497,7 @@ fn generate(
     }}));
 
     // ---- Decisions ---------------------------------------------------------
+    g.scenario("decisions");
     let eval = g.push_json(json!({"EvaluateDecision": {
         "decision": {"Id": "tier"},
         "variables": {"amount": {"Int": 250}}
@@ -479,6 +513,7 @@ fn generate(
     });
 
     // ---- Jobs and user tasks ----------------------------------------------
+    g.scenario("jobs-and-user-tasks");
     // Transcendental-float instances (ADR 0066 audit #7): the results persist
     // into instance variables, so the platform matrix compares their bits.
     let fl = g.push(create("floats", vars(&[("base", Value::Int(2))])));
@@ -555,6 +590,7 @@ fn generate(
     g.push(Command::throw_job_error(e1_job, "E42", "business error"));
 
     // ---- Timers and job expiry --------------------------------------------
+    g.scenario("timers-and-job-expiry");
     for _ in 0..3 {
         g.push(create("timers", BTreeMap::new()));
     }
@@ -620,6 +656,7 @@ fn generate(
     g.push(Command::TriggerTimers { now });
 
     // ---- Messages, signals, event sub-processes, conditional starts -------
+    g.scenario("messages-signals-conditional");
     let m1 = g.push(create(
         "messaging",
         vars(&[("orderId", Value::Str("o-1".into()))]),
@@ -666,6 +703,7 @@ fn generate(
     }}));
 
     // ---- Suspend / resume / cancel ----------------------------------------
+    g.scenario("suspend-resume-cancel");
     g.push(Command::SuspendInstance {
         instance_key: m1_instance,
     });
@@ -683,6 +721,7 @@ fn generate(
     });
 
     // ---- Migration and modification ---------------------------------------
+    g.scenario("migration-and-modification");
     let mig = g.push(create("order", vars(&[("amount", Value::Int(3))])));
     let mig_instance = find(&mig, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
     let v2 = g.push(Command::DeployProcess(order_v2));
@@ -702,17 +741,18 @@ fn generate(
     }}));
 
     // ---- Ad-hoc, agents, orphan quarantine --------------------------------
+    g.scenario("adhoc-agents-quarantine");
     // A running ad-hoc container and an active external agent task, so both
     // command families exercise their SUCCESS paths (push_ok_json), not only
     // rejections against an unrelated key.
-    let agents = nanobpmn_engine_core::bpmn::parse_bpmn(AGENTS_BPMN)
-        .expect("agents model")
-        .remove(0);
-    g.push(Command::DeployProcess(agents));
+    for model in nanobpmn_engine_core::bpmn::parse_bpmn(AGENTS_BPMN).expect("agents model") {
+        g.push(Command::DeployProcess(model));
+    }
     let ag = g.push(create("agents", BTreeMap::new()));
+    let ah = g.push(create("adhocs", BTreeMap::new()));
     // `unwrap_or(0)`: unfiltered, a 0 key makes push_ok_json panic below.
     let ag_instance = find(&ag, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
-    let container = activated(&ag, "adhoc").unwrap_or(0);
+    let container = activated(&ah, "adhoc").unwrap_or(0);
     let agent_ei = activated(&ag, "agent").unwrap_or(0);
     g.push_ok_json(json!({"ActivateAdHocActivities": {
         "ad_hoc_instance_key": container,
@@ -770,6 +810,7 @@ fn generate(
     });
 
     // ---- Seeded randomized workload ---------------------------------------
+    g.scenario("random-workload");
     for n in 0..random_instances {
         match g.next_rand() % 4 {
             0 | 1 => {
@@ -817,6 +858,7 @@ fn generate(
     }
 
     // ---- Newest log variants last (see module doc) ------------------------
+    g.scenario("newest-variants");
     g.push_json(json!({"CreateClusterVariable": {
         "tenant_id": null, "name": "region", "value": {"Str": "eu"},
         "kind": "JSON", "metadata": {}, "distributed": false
@@ -831,7 +873,8 @@ fn generate(
     g.push(create("order", vars(&[("amount", Value::Int(42))])));
 
     let outcomes = std::mem::take(&mut g.outcomes);
-    (g.into_entries(), outcomes)
+    let labels = std::mem::take(&mut g.labels);
+    (g.into_entries(), outcomes, labels)
 }
 
 /// Plays the cross-partition message-subscription protocol across a real
@@ -992,11 +1035,16 @@ pub fn covered_kinds(entries: &[(u64, Command)]) -> std::collections::BTreeSet<&
     entries.iter().map(|(_, c)| c.kind()).collect()
 }
 
-/// Serializes the corpus as the runner's JSON-lines input.
-pub fn to_jsonl(entries: &[(u64, Command)]) -> String {
+/// Serializes the corpus as the runner's JSON-lines input. Each line carries
+/// its `scenario` label (`labels` is parallel to `entries`); the runner
+/// ignores it (serde skips unknown fields, so a previous release's runner
+/// reads the same file), the cross-release comparison keys its
+/// behavioural-divergence allowlist on it.
+pub fn to_jsonl(entries: &[(u64, Command)], labels: &[&str]) -> String {
+    assert_eq!(entries.len(), labels.len(), "one scenario label per entry");
     let mut out = String::new();
-    for (now, command) in entries {
-        out.push_str(&json!({ "now": now, "command": command }).to_string());
+    for ((now, command), scenario) in entries.iter().zip(labels) {
+        out.push_str(&json!({ "now": now, "command": command, "scenario": scenario }).to_string());
         out.push('\n');
     }
     out

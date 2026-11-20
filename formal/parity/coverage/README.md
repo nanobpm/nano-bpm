@@ -49,4 +49,5 @@ review). CI:
   message-TTL checker is set to 1 s and the run settles before shutdown, so
   background expiry passes are always measured (they previously depended on
   whether a 1-minute tick landed before stop). Residual variance in the job
-  activation scan is absorbed by `slackPercent` and tracked in #1679.
+  activation scan is absorbed by `slackPercent` (applied once, at `--check`:
+  effective floor = `floorPercent − slackPercent`) and tracked in #1679.

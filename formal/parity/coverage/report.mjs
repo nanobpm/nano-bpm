@@ -23,9 +23,10 @@
 //     extension (nano-extensions.json) or a MISSING SCENARIO.
 //
 // Ratchet (baseline.json): each side has a `floorPercent`. `--check` fails
-// when a measured side drops below its floor (or measures in a different unit).
-// `--update` raises floors to the measured values (minus the side's optional
-// `slackPercent`, truncated to 0.1 %); it
+// when a measured side drops below its floor minus the side's optional
+// `slackPercent` (or measures in a different unit). `--update` raises floors
+// to the measured values (truncated to 0.1 %) — the slack is applied ONCE, at
+// check time, never also subtracted when seeding; it
 // refuses to LOWER a floor unless `--allow-lower` is passed, so a drop is
 // always an explicit, reviewed baseline change.
 //
@@ -214,10 +215,18 @@ export function checkRatchet(measured, baseline) {
       errors.push(`${side}: measured in ${m.unit}s but the baseline floor is in ${b.unit}s — re-baseline explicitly (--update --allow-lower)`);
       continue;
     }
-    if (m.percent < b.floorPercent) {
+    // The floor is a hard ratchet on the DETERMINISTIC side; a side measured
+    // against a live broker (zeebe JaCoCo) carries irreducible
+    // broker-scheduling variance (#1679), so its `slackPercent` is the
+    // documented absorption band: the effective floor is `floorPercent −
+    // slackPercent`. A drop beyond the band is a real coverage loss and fails.
+    const slackPercent = b.slackPercent ?? 0;
+    const effectiveFloor = floor1(b.floorPercent - slackPercent);
+    if (m.percent < effectiveFloor) {
       errors.push(
-        `${side}: ${m.unit} coverage ${m.percent.toFixed(2)}% dropped below the ratchet floor ${b.floorPercent}% ` +
-          `(${m.covered}/${m.total}) — add a parity scenario for the uncovered code, or register a Nano-only extension`,
+        `${side}: ${m.unit} coverage ${m.percent.toFixed(2)}% dropped below the ratchet floor ${b.floorPercent}%` +
+          (slackPercent ? ` (effective ${effectiveFloor}% after the ${slackPercent}% scheduling-variance slack, #1679)` : '') +
+          ` (${m.covered}/${m.total}) — add a parity scenario for the uncovered code, or register a Nano-only extension`,
       );
     }
   }
@@ -232,8 +241,9 @@ export function updateBaseline(measured, baseline, { allowLower = false } = {}) 
     const m = measured[side];
     if (!m) continue;
     const b = baseline[side];
-    const slackPercent = b?.slackPercent ?? 0;
-    const floorPercent = floor1(m.percent - slackPercent);
+    // The slack is applied once, at CHECK time (checkRatchet); seeding the
+    // floor from `measured − slack` as well would widen the band to 2×slack.
+    const floorPercent = floor1(m.percent);
     if (b && !allowLower && (b.unit !== m.unit || floorPercent < b.floorPercent)) {
       errors.push(`${side}: refusing to lower the floor ${b.floorPercent}% (${b.unit}) to ${floorPercent}% (${m.unit}) without --allow-lower`);
       continue;

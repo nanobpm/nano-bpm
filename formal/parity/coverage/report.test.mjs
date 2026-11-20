@@ -113,6 +113,28 @@ test('ratchet: a drop below the floor or a unit switch fails; at/above passes', 
   assert.deepEqual(checkRatchet({ zeebe: { unit: 'branch', percent: 1 } }, base), []);
 });
 
+test('ratchet: the documented slack absorbs live-broker scheduling variance (#1679)', () => {
+  // zeebe JaCoCo measures against a live Camunda 8, so its branch count swings
+  // run to run; `slackPercent` is the absorption band, applied at CHECK time
+  // (effective floor = floorPercent − slackPercent), exactly once. The
+  // observed 12.45% vs a 12.6% floor is inside the 0.2% band; 12.39% is
+  // beyond it.
+  const base = { zeebe: { unit: 'branch', floorPercent: 12.6, slackPercent: 0.2 } };
+  assert.deepEqual(
+    checkRatchet({ zeebe: { unit: 'branch', percent: 12.45, covered: 1033, total: 8296 } }, base),
+    [],
+    'a drop within the slack band passes',
+  );
+  assert.match(
+    checkRatchet({ zeebe: { unit: 'branch', percent: 12.39, covered: 1028, total: 8296 } }, base)[0],
+    /dropped below.*effective 12\.4%/,
+    'a drop beyond the band fails and names the effective floor',
+  );
+  // The deterministic side (no slack) stays a hard floor.
+  const nano = { nano: { unit: 'region', floorPercent: 15.9 } };
+  assert.match(checkRatchet({ nano: { unit: 'region', percent: 15.89, covered: 1, total: 2 } }, nano)[0], /dropped below/);
+});
+
 test('update: floors only rise unless --allow-lower', () => {
   const base = { $comment: 'c', nano: { unit: 'region', floorPercent: 50.0 } };
   const up = updateBaseline({ nano: { unit: 'region', percent: 61.27 } }, base);
@@ -121,9 +143,13 @@ test('update: floors only rise unless --allow-lower', () => {
   assert.match(updateBaseline({ nano: { unit: 'region', percent: 40 } }, base).errors[0], /refusing/);
   assert.equal(updateBaseline({ nano: { unit: 'region', percent: 40 } }, base, { allowLower: true }).next.nano.floorPercent, 40);
   assert.equal(floor1(33.3399), 33.3);
-  // a side's documented slack is kept and lowers the floor it seeds
+  // a side's documented slack is kept but NOT subtracted from the floor it
+  // seeds: checkRatchet applies it once, so seeding with it too would double it
   const slack = updateBaseline({ zeebe: { unit: 'branch', percent: 12.61 } }, { zeebe: { unit: 'branch', floorPercent: 12.0, slackPercent: 0.1 } });
-  assert.deepEqual(slack.next.zeebe, { unit: 'branch', floorPercent: 12.5, slackPercent: 0.1 });
+  assert.deepEqual(slack.next.zeebe, { unit: 'branch', floorPercent: 12.6, slackPercent: 0.1 });
+  // seed-then-check: the effective band below the measurement is exactly the slack
+  assert.deepEqual(checkRatchet({ zeebe: { unit: 'branch', percent: 12.5 } }, slack.next), []);
+  assert.match(checkRatchet({ zeebe: { unit: 'branch', percent: 12.49 } }, slack.next)[0], /dropped below/);
 });
 
 test('the committed baseline seeds a floor for both engines', () => {
