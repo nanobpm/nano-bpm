@@ -48,6 +48,12 @@ local `make fmt-check` pass is exactly what the gate checks. If the toolchain is
 missing, install it once:
 `rustup toolchain install nightly-2026-06-26 --component rustfmt`.
 
+`make fmt` / `make fmt-check` **fail** when rustfmt prints the "unstable features
+are only available in nightly" warning. On some hosts `rustup run <nightly> cargo
+fmt` resolves the `cargo-fmt` shim to *stable*, which silently skips
+`group_imports`. If you hit it, invoke the toolchain binary directly:
+`$(rustup which --toolchain nightly-2026-06-26 cargo-fmt) -- --check`.
+
 `cargo fmt` runs `cargo metadata` over the `server` workspace, so the gitignored
 codegen inputs must exist on disk first. In a fresh (unbuilt) clone, generate
 the throwaway parse-only stubs before formatting — `make fmt` / `make fmt-check`
@@ -226,6 +232,10 @@ one parity test):**
   published `@nanobpm/engine-wasm` is built from the tag at release. The Bojtos framework packages that consume
   it (`@nanobpm/bojtos-kit` / `-react`) live in the separate `nanobpm/bojtos`
   repo and are element-type-agnostic, so they need no change here.
+- "Thin pass-through" applies to the `pkg/` **artifact**, not to
+  `engine-wasm/src/`. If the element also adds an engine-core `Command` or
+  `ReadQuery` variant, you must add its arm to `engine-wasm/src/surface_parity.rs`
+  in the same PR (see *The wasm32 surface-parity gate* below).
 
 **4. `console` — only if the element needs modeller/palette support:**
 
@@ -369,6 +379,118 @@ The seed is only as warm as the main checkout. After pulling `main`, run
 `cargo test --workspace --no-run` in its `server/` so new worktrees inherit
 current dependencies. Never copy `generated/` between worktrees: copied files get
 fresh mtimes, so Make would skip regenerating them on a branch whose spec differs.
+
+## Building from a fresh clone (agent workspaces)
+
+`scripts/new-worktree.sh` (above) does all of this for you. Agent workers that
+clone fresh do not, and hit these traps:
+
+- **There is no workspace root.** `engine-core`, `read-model`, `processos` and
+  `engine-wasm` are each their own workspace (own `Cargo.lock`), and `server/` is
+  a separate workspace (ADR 0064). Run cargo from the crate directory
+  (`cd engine-core && cargo test`), not the repo root, or use the `make`
+  targets.
+- **`server/` needs codegen first.** Its manifest has path deps on the
+  gitignored `generated/` and `generated-console/` crates, produced by
+  `make generate` (needs Java + uv). Until then every `server/` build fails with
+  `failed to read …/generated-console/Cargo.toml`: that means "run codegen", not
+  a broken dependency. `make generate` also writes `server/src/stub_impls.rs`;
+  never hand-edit it. The delegation source of truth is the `OVERRIDES` table in
+  `scripts/gen-stub-server.py`.
+- **Iterating on `nano-server-storage` (or another `server/crates/*` member)
+  without codegen:** its own deps (`engine-core`, `read-model`) don't need the
+  generated crates. Temporarily append an empty `[workspace]` table to its
+  `Cargo.toml`, build/test, then revert that edit and delete the stray
+  `Cargo.lock` before committing.
+- **`--features serde` is `engine-core`-only.** Without it, the golden drift
+  guard and the serde-gated tests compile to nothing and silently pass.
+  `nano-server-storage` has no `serde` feature (it enables serde on
+  `engine-core` as a dependency), so passing the flag there is an error.
+- **The `console` feature needs `console/dist`.** It is a gitignored, CI-built
+  frontend embedded via `rust_embed`. Without it, any build that pulls the
+  `console` feature aborts with
+  ``no associated function `get` found for struct `Assets` `` — a missing
+  artifact, not a code error. Build the frontend
+  (`cd console && npm install && npm run build`) or, when you only need
+  clippy/tests to compile, stub it:
+  `mkdir -p console/dist && echo stub > console/dist/index.html`.
+
+### Host footguns
+
+- **Quota-capped `/tmp`.** On hosts where `/tmp` is a small tmpfs, builds fail
+  with `Disk quota exceeded (os error 122)` / `EDQUOT` /
+  `Unknown system error -122`. Point `CARGO_TARGET_DIR` at a directory under
+  `$HOME`, and export `TMPDIR`/`TMP`/`TEMP` (plus
+  `MAVEN_OPTS=-Djava.io.tmpdir=…`) there too, for vitest and maven.
+- **A disk-full build leaves corrupted artifacts**, for example a bogus E0277 or
+  "multiple versions of crate `serde_core`". Delete the target dir and rebuild.
+- **A checkout path containing a space** (macOS agent workspaces under
+  `~/Library/Application Support/…`) breaks `make fmt` / `make console-wasm`
+  and `tikv-jemalloc-sys`'s configure. The fix is tracked in #1716. Until it
+  lands, run the underlying per-crate commands directly and use a space-free
+  `CARGO_TARGET_DIR`.
+
+## The wasm32 surface-parity gate: every new `Command`/`ReadQuery` needs an arm
+
+`engine-wasm/src/surface_parity.rs` holds two exhaustive matches with no
+catch-all arm: `classify(&Command)` and `classify_read(&ReadQuery)`. They exist
+to fail the wasm32 type-check (E0004) the moment a new engine capability lands,
+whether or not a new BPMN element is involved.
+
+- **Add the arm in the same PR that adds the variant**, with a deliberate
+  `Surfaced` / `NotSurfaced` decision (`Surfaced` if it should be reachable
+  through the wasm `TestEngine` / read-model surface). A missing arm turns the
+  required `engine-wasm-ffi (dist + verify)` check red on your PR and on every
+  later PR on the branch.
+- This edits `engine-wasm/src/` **source**, which is allowed. Do not commit the
+  `engine-wasm/pkg/` artifact (#668).
+- **Verify before opening the PR:**
+  `cargo check -p engine-wasm --target wasm32-unknown-unknown`. `classify` and
+  `classify_read` are separate functions, so parallel write-side and read-side
+  slices don't collide.
+
+## Wire-faithful OpenAPI schemas: prefer a flat enum tag over a discriminated `oneOf`
+
+The rust-axum OpenAPI generator serializes a `oneOf` discriminator as the
+schema **struct name** (e.g. `"AgentInstanceTextContent"`), not the `mapping`
+value (e.g. `"TEXT"`), which silently breaks round-tripping.
+`scripts/postprocess-generated.py` only fixes *compilation* of optional
+discriminators, not the wire value. When a tag must match a fixed Camunda/spec
+spelling, model the schema as a **flat object with an explicit enum tag field**,
+and add a contract test that round-trips the exact wire spelling.
+
+The Camunda `c8-orchestration-cluster-e2e-test-suite` Playwright specs (the v2
+API parity harness) run against a live cluster and are **not** vendored here.
+Don't hunt for them or block on them. Verify v2 REST endpoints with the Rust
+`rest_*` tests instead.
+
+## Fan-out epics: pre-land shared surfaces, don't collide on them
+
+Parallel slices that append to the same hunks produce a textual conflict for
+every PR after the first. The usual shared surfaces are `ServerImpl` fields and
+their init (`server/src/main.rs`), the `OVERRIDES` table in
+`scripts/gen-stub-server.py`, helpers in `server/src/query.rs`, and the manifest
+and publish of a shared npm package.
+
+- **Land the shared surface first, in a dedicated wave-0 scaffold task** (no
+  feature work), and make every slice that touches it `dependsOn` the scaffold.
+  The scaffold pre-declares one region per slice (e.g. `# --- BEGIN/END
+  issue-N ---` blocks in `OVERRIDES`, one per-feature sub-struct on
+  `ServerImpl`), so each slice edits only its own region. Don't fold the
+  scaffold into a feature slice: that serialises everything behind the heaviest
+  slice. Reference: epic #903.
+- **Placeholder state must compile under `warnings = "deny"`.** Annotate
+  scaffolded fields that no slice reads yet with `#[allow(dead_code)]`.
+- **`server/src/query.rs`: append, don't interleave.** Add new matchers after
+  the existing ones (before `pub struct SortKey`).
+- **A shared published package has one owner per wave.** One slice bumps the
+  version, extends the `exports` map and publishes; siblings `dependsOn` it and
+  bump to the *next* version. Never schedule two manifest-editing slices in the
+  same wave: they conflict textually and race the publish.
+- **Add to an existing package as a subpath export, not a new package**, unless
+  the new artifact has distinct consumers or a distinct release cadence. Name
+  the target package and subpath in the slice prompt; a prompt that says only
+  "a published module" lets the agent invent a new package (epic #1005).
 
 ## Merging PRs
 
