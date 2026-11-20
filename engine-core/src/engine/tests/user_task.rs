@@ -1970,7 +1970,10 @@ fn a_process_only_redeploy_with_a_missing_deployment_bound_linked_resource_is_a_
 /// the children immediately. Completing each task feeds the loop's
 /// `outputElement` (resolved in the child's completion scope) into the
 /// `outputCollection`, and the instance only completes after every task.
-fn direct_mi_user_task_process(sequential: bool) -> crate::model::ProcessDefinition {
+fn direct_mi_user_task_process_with_listeners(
+    sequential: bool,
+    listeners: Vec<crate::model::TaskListener>,
+) -> crate::model::ProcessDefinition {
     ProcessBuilder::new("mi_review")
         .start_event("start")
         .user_task("review")
@@ -1991,6 +1994,7 @@ fn direct_mi_user_task_process(sequential: bool) -> crate::model::ProcessDefinit
         .connect("start", "review")
         .connect("review", "sink")
         .connect("sink", "end")
+        .with_task_listeners("review", listeners)
         .build()
         .unwrap()
 }
@@ -2008,11 +2012,38 @@ fn created_user_tasks(events: &[Event]) -> Vec<Key> {
 #[test]
 fn direct_mi_user_task_creates_a_task_per_child_and_collects_output_element() {
     for sequential in [false, true] {
+        run_direct_mi_user_task(sequential, false);
+    }
+}
+
+/// #1719 review — a `completing` task listener DEFERS the completion; the
+/// deferred commit must propagate the submitted variables from the MI child's
+/// own scope (`completion_scope`), not the body, or the child's seeded
+/// `decision = null` shadows the submitted value and the aggregate collects
+/// null. Covers parallel and sequential.
+#[test]
+fn direct_mi_user_task_with_completing_listener_collects_submitted_output_element() {
+    for sequential in [false, true] {
+        run_direct_mi_user_task(sequential, true);
+    }
+}
+
+fn run_direct_mi_user_task(sequential: bool, completing_listener: bool) {
+    {
+        let listeners = if completing_listener {
+            vec![crate::model::TaskListener {
+                event_type: crate::model::TaskListenerEventType::Completing,
+                job_type: "on-complete".to_string(),
+                retries: None,
+            }]
+        } else {
+            Vec::new()
+        };
         let mut engine = Engine::new();
         engine
-            .apply_command(Command::DeployProcess(direct_mi_user_task_process(
-                sequential,
-            )))
+            .apply_command(Command::DeployProcess(
+                direct_mi_user_task_process_with_listeners(sequential, listeners),
+            ))
             .unwrap();
         let created = engine
             .apply_command(Command::create_instance_with(
@@ -2033,12 +2064,21 @@ fn direct_mi_user_task_creates_a_task_per_child_and_collects_output_element() {
         while let Some(task) = pending.first().copied() {
             pending.remove(0);
             n += 1;
-            let done = engine
+            let mut done = engine
                 .apply_command(Command::complete_user_task_with(
                     task,
                     vars(&[("decision", Value::Int(n * 10))]),
                 ))
                 .unwrap();
+            if completing_listener {
+                let jobs = engine.activate_jobs("on-complete", "W", 10, 1_000, 0);
+                assert_eq!(jobs.len(), 1, "one completing listener job per task");
+                done.extend(
+                    engine
+                        .apply_command(Command::complete_job(jobs[0].key))
+                        .unwrap(),
+                );
+            }
             pending.extend(created_user_tasks(&done));
         }
         assert_eq!(
