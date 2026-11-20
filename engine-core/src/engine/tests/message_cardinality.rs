@@ -128,10 +128,11 @@ fn single_gateway() -> ProcessDefinition {
 }
 
 /// start -> fork(and) => { gw(event-based) -> { onM1 | onM2 } -> end
-///                         \-> stop(terminate end) }
+///                         \-> hold(service task) -> stop(terminate end) }
 ///
-/// The fork's second branch reaches a TOP-LEVEL terminate end event while the
-/// first branch's gateway catches are still armed: the terminate completes the
+/// The fork's second branch waits on a `hold` job, so the first branch's
+/// gateway catches are provably armed before the branch then reaches a
+/// TOP-LEVEL terminate end event: the terminate completes the
 /// whole instance without emitting per-catch terminal events, so only the
 /// whole-instance reducer can clear the armed races (#1676 review).
 fn gateway_then_top_level_terminate() -> ProcessDefinition {
@@ -142,10 +143,12 @@ fn gateway_then_top_level_terminate() -> ProcessDefinition {
         .message_intermediate_catch_event("onM1", "M1", "=key")
         .message_intermediate_catch_event("onM2", "M2", "=key")
         .end_event("end")
+        .service_task("hold", "hold")
         .terminate_end_event("stop")
         .connect("start", "fork")
         .connect("fork", "gw")
-        .connect("fork", "stop")
+        .connect("fork", "hold")
+        .connect("hold", "stop")
         .connect("gw", "onM1")
         .connect("gw", "onM2")
         .connect("onM1", "end")
@@ -207,6 +210,16 @@ fn top_level_terminate_end_clears_armed_races() {
         "gw-stop",
         vars(&[("key", Value::Str("k".into()))]),
     );
+    assert_eq!(
+        engine.instance(inst).unwrap().races.len(),
+        2,
+        "both catches are armed while the terminate branch waits on its job"
+    );
+
+    let job_key = engine.activate_jobs("hold", "w", 1, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::complete_job_with(job_key, BTreeMap::new()))
+        .unwrap();
 
     let instance = engine.instance(inst).unwrap();
     assert_eq!(
