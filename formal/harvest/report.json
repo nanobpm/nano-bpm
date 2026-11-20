@@ -51,6 +51,392 @@
     "normalise": 2,
     "run": 36
   },
+  "unparseableByClass": [
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementTypeTest",
+      "unparseable": 27,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/BpmnEventTypeTest",
+      "unparseable": 22,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/StartEventFormTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest",
+      "unparseable": 1,
+      "harvested": 3,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AdHocSubProcessElementsVariableTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AdHocSubProcessTest",
+      "unparseable": 2,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest",
+      "unparseable": 5,
+      "harvested": 1,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/BusinessRuleTaskTest",
+      "unparseable": 2,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityBusinessIdTest",
+      "unparseable": 3,
+      "harvested": 2,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityInterruptionTest",
+      "unparseable": 1,
+      "harvested": 1,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest",
+      "unparseable": 11,
+      "harvested": 16,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CamundaUserTaskTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ConditionalEventTransformerTest",
+      "unparseable": 4,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/JobBasedAdHocSubProcessTest",
+      "unparseable": 2,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/JobBasedUserTaskFormTest",
+      "unparseable": 7,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/JobBasedUserTaskTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/JobPriorityTest",
+      "unparseable": 24,
+      "harvested": 1,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/JobWorkerElementMultiTenantTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/JobWorkerElementTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/NativeUserTaskFormTest",
+      "unparseable": 7,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/OutputMappingTest",
+      "unparseable": 1,
+      "harvested": 3,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ScriptTaskExpressionTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest",
+      "unparseable": 3,
+      "harvested": 1,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ServiceTaskTest",
+      "unparseable": 13,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/TerminateEndEventTest",
+      "unparseable": 7,
+      "harvested": 1,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/UserTaskTransformerTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerBoundaryEventElementTest",
+      "unparseable": 5,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerCancelTest",
+      "unparseable": 38,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerEndEventElementTest",
+      "unparseable": 7,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerGatewayElementsTest",
+      "unparseable": 8,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerIntermediateCatchEventElementTest",
+      "unparseable": 6,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerIntermediateThrowEventElementTest",
+      "unparseable": 8,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerMultiInstanceActivitiesTest",
+      "unparseable": 4,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerProcessInstanceTest",
+      "unparseable": 8,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerStartEventElementTest",
+      "unparseable": 4,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerTaskElementsTest",
+      "unparseable": 6,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/execution/ExecutionListenerTest",
+      "unparseable": 17,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/task/TaskListenerIncidentsTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/listeners/task/TaskListenerTestHelper",
+      "unparseable": 2,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventElementTest",
+      "unparseable": 1,
+      "harvested": 1,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventLegacyCorrelationKeyScopeTest",
+      "unparseable": 2,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest",
+      "unparseable": 11,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventWithoutOutgoingSequenceFlowTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventCompatibilityTest",
+      "unparseable": 2,
+      "harvested": 1,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventExecutionTest",
+      "unparseable": 39,
+      "harvested": 3,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/error/ErrorCatchEventTest",
+      "unparseable": 11,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/error/ErrorEventTest",
+      "unparseable": 11,
+      "harvested": 2,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/escalation/EscalationCatchEventTest",
+      "unparseable": 4,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/escalation/EscalationEventTest",
+      "unparseable": 22,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest",
+      "unparseable": 5,
+      "harvested": 4,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest",
+      "unparseable": 2,
+      "harvested": 8,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest",
+      "unparseable": 7,
+      "harvested": 18,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/link/LinkEventTest",
+      "unparseable": 3,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceActivityTest",
+      "unparseable": 4,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceCallActivityTest",
+      "unparseable": 1,
+      "harvested": 1,
+      "fullyUnparseable": false
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceSubProcessTest",
+      "unparseable": 3,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/EmbeddedSubProcessConcurrencyTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/EmbeddedSubProcessTest",
+      "unparseable": 1,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessConcurrencyTest",
+      "unparseable": 2,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessTest",
+      "unparseable": 11,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/MultipleEventSubprocessTest",
+      "unparseable": 3,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/NonInterruptingEventSubprocessTest",
+      "unparseable": 4,
+      "harvested": 0,
+      "fullyUnparseable": true
+    },
+    {
+      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest",
+      "unparseable": 21,
+      "harvested": 4,
+      "fullyUnparseable": false
+    }
+  ],
   "runnableIds": [
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-0-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-3-process",
