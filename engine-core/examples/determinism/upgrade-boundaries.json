@@ -1,0 +1,14 @@
+{
+  "_comment": "Append-only ledger of determinism upgrade boundaries (#1702). divergence-allowlist.json entries EXPIRE (compare.rs check_expiry removes them once the previous release reaches introduced_in), but the join restriction they imply never does: a v0.0.27 member must never join a v0.0.29 cluster even after the v0.0.28 allowlist entries are gone. nano-falcon-protocol/build.rs derives the cluster-join boundary table from THIS file and fails the build if any allowlist upgrade-boundary entry is not recorded here, so ratifying a boundary forces the ledger append. Never remove or edit a recorded boundary.",
+  "boundaries": [
+    {
+      "version": "0.0.28",
+      "entries": [
+        "GatewayRouteSelected (#1402)",
+        "messages-signals-conditional (#1244)",
+        "suspend-resume-cancel (#1244)",
+        "random-workload (#1244)"
+      ]
+    }
+  ]
+}

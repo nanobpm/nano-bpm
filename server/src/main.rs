@@ -3654,6 +3654,13 @@ pub struct ServerImpl {
     /// (`reconcile_lenient_completion_via_raft` honours it as the leader's own
     /// feature support).
     advertise_cluster_features: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this node's `/cluster` handshake response advertises its
+    /// release version (#1702). Always `true` in production; a test clears it
+    /// to model a pre-#1702 binary. Separate from
+    /// [`advertise_cluster_features`](Self::advertise_cluster_features) so
+    /// feature-negotiation fixtures stay version-compatible on a stamped
+    /// release build (a versionless peer fails closed at every boundary).
+    advertise_cluster_version: Arc<std::sync::atomic::AtomicBool>,
     /// The Raft groups this node hosts (one per partition it replicates), empty
     /// unless per-partition Raft is enabled. The falcon handler dispatches
     /// inbound RPCs through it; the write path proposes through it. An empty
@@ -4392,6 +4399,7 @@ impl ServerImpl {
             pipeline_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes_watermark,
             advertise_cluster_features: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            advertise_cluster_version: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             drain_guard: Arc::new(crate::drain_guard::DrainGuard::new(
                 crate::drain_guard::DrainGuardCfg::from_env(),
             )),

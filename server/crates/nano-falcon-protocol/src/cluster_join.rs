@@ -19,15 +19,17 @@
 //!   (`NANOBPM_VERSION`, #1702). Raft members **re-execute** committed
 //!   commands (ADR 0066, "Rolling upgrade", option C), so a determinism-affecting
 //!   release the previous-release gate ratifies as an `upgrade-boundary` entry
-//!   in `engine-core/examples/determinism/divergence-allowlist.json` (the
-//!   single source of truth, derived into [`UPGRADE_BOUNDARIES`] at build time)
+//!   in `engine-core/examples/determinism/divergence-allowlist.json` (recorded in
+//!   the append-only `upgrade-boundaries.json` ledger, which outlives allowlist
+//!   expiry and is derived into [`UPGRADE_BOUNDARIES`] at build time)
 //!   forbids mixed-version membership across it: a join whose two versions
 //!   straddle a declared boundary is refused with
 //!   [`JoinRejection::UpgradeBoundary`].
 //!
-//! A peer that sends neither header is a pre-#1661 binary: it is admitted
-//! (rolling upgrade) unless a feature is already required or its missing
-//! version header places it on the wrong side of a boundary (see
+//! A peer that sends no partition/feature headers is a pre-#1661 binary: it
+//! is admitted (rolling upgrade) unless a feature is already required. A peer
+//! that sends no version header is refused by any release-tagged node once a
+//! boundary is declared — its side of the boundary is unknown (see
 //! [`check_join`]).
 //!
 //!
@@ -263,14 +265,11 @@ impl std::error::Error for JoinRejection {}
 ///
 /// Upgrade boundary (#1702): when both versions are release tags and straddle
 /// a declared [`UPGRADE_BOUNDARIES`] entry the join is refused. A MISSING
-/// peer version (a pre-#1702 binary, which sends no version header) is
-/// refused only when the local version is itself AT or BELOW the newest
-/// declared boundary: such a peer is then potentially pre-boundary (the
-/// boundary release is the first advertising versions, so an at-boundary
-/// local cannot distinguish a pre-boundary peer from an at-boundary one and
-/// fails closed), while a local release NEWER than every boundary knows the
-/// versionless peer is at-or-past the newest boundary too (it survived the
-/// handshake's own introduction) and admits it.
+/// peer version (a pre-#1702 binary, which sends no version header) fails
+/// CLOSED whenever the local version is a release tag and any boundary is
+/// declared: nothing about the local release proves the versionless peer sits
+/// on the same side of every boundary (a v0.0.27 peer is versionless whether
+/// it dials v0.0.28 or v0.0.29), so compatibility cannot be established.
 pub fn check_join(
     local_partitions: u64,
     partitions: Option<&str>,
@@ -301,16 +300,15 @@ pub fn check_join(
     }
     let boundary = match peer_version {
         Some(peer) => straddled_boundary(local_version, peer),
-        None => {
-            // The newest boundary at/above the local version: a versionless
-            // peer may sit below it. `None` once the local release is past
-            // every declared boundary.
-            parse_release_triple(local_version).and_then(|local| {
-                UPGRADE_BOUNDARIES.iter().find(|b| {
-                    parse_release_triple(b.version).is_some_and(|boundary| local <= boundary)
-                })
-            })
-        }
+        // Fail closed: a versionless peer may sit below any declared
+        // boundary. Report the newest boundary at/above the local release,
+        // else the newest one overall.
+        None => parse_release_triple(local_version).and_then(|local| {
+            UPGRADE_BOUNDARIES
+                .iter()
+                .find(|b| parse_release_triple(b.version).is_some_and(|boundary| local <= boundary))
+                .or_else(|| UPGRADE_BOUNDARIES.last())
+        }),
     };
     if let Some(boundary) = boundary {
         return Err(JoinRejection::UpgradeBoundary {
@@ -372,7 +370,11 @@ mod tests {
     fn a_legacy_peer_joins_until_a_feature_is_required() {
         // A pre-#1661 binary sends no headers at all: admitted during a
         // rolling upgrade ...
-        assert_eq!(check_join(4, None, None, &[], "0.0.29", None), Ok(()));
+        // (Version-compatible: the version rule is exercised separately.)
+        assert_eq!(
+            check_join(4, None, None, &[], "0.0.29", Some("0.0.29")),
+            Ok(())
+        );
         // ... but refused once the cluster's replicated state depends on a
         // command variant it cannot decode.
         assert_eq!(
@@ -382,7 +384,7 @@ mod tests {
                 None,
                 &[FEATURE_REPLICATED_LENIENT_COMPLETION],
                 "0.0.29",
-                None
+                Some("0.0.29")
             ),
             Err(JoinRejection::MissingFeature(
                 FEATURE_REPLICATED_LENIENT_COMPLETION
@@ -407,9 +409,8 @@ mod tests {
 
     /// The checked-in allowlist declares `upgrade-boundary` entries introduced
     /// in `v0.0.28` (#1244 fork/join order, #1402 `GatewayRouteSelected`), so
-    /// the derived boundary list names that release. This is the guard that
-    /// keeps the generated table from drifting off the allowlist (the single
-    /// source of truth): a stale or hand-edited table fails here.
+    /// the derived boundary list names that release (the build fails if the
+    /// append-only `upgrade-boundaries.json` ledger misses one of them).
     #[test]
     fn the_upgrade_boundaries_derive_from_the_allowlist() {
         assert!(
@@ -492,22 +493,48 @@ mod tests {
         );
     }
 
-    /// A pre-#1702 peer sends no version header. With the boundary derived
-    /// from the CURRENT allowlist (v0.0.28 = the in-flight release), a local
-    /// build that IS the boundary release cannot tell a pre-boundary peer
-    /// (incompatible) from an at-boundary one (compatible), so it fails
-    /// closed; a later local release admits it (the boundary is below both).
+    /// A pre-#1702 peer sends no version header, so its side of every
+    /// boundary is unknown: a release-tagged node refuses it whether it is AT
+    /// the boundary release or PAST it (a v0.0.27 peer is just as versionless
+    /// when it dials v0.0.29). Only a non-release (dev) local build admits it.
     #[test]
-    fn a_versionless_peer_is_refused_only_at_the_boundary_release() {
+    fn a_versionless_peer_is_refused_by_every_release() {
         let features = local_features_header();
-        assert!(matches!(
-            check_join(4, Some("4"), Some(&features), &[], "0.0.28", None),
-            Err(JoinRejection::UpgradeBoundary { boundary, .. }) if boundary == "0.0.28"
-        ));
+        for local in ["0.0.27", "0.0.28", "0.0.29", "1.0.0"] {
+            assert!(
+                matches!(
+                    check_join(4, Some("4"), Some(&features), &[], local, None),
+                    Err(JoinRejection::UpgradeBoundary { ref peer_version, .. })
+                        if peer_version == "unknown"
+                ),
+                "local {local} must refuse a versionless peer"
+            );
+        }
         assert_eq!(
-            check_join(4, Some("4"), Some(&features), &[], "0.0.29", None),
+            check_join(4, Some("4"), Some(&features), &[], "dev", None),
             Ok(())
         );
+    }
+
+    /// #1702 review: a boundary restricts joins across it FOREVER, not only
+    /// between adjacent releases — v0.0.27 and v0.0.29 both advertise and
+    /// still straddle v0.0.28.
+    #[test]
+    fn a_join_across_a_non_adjacent_boundary_is_refused() {
+        let features = local_features_header();
+        for (local, peer) in [
+            ("0.0.29", "0.0.27"),
+            ("0.0.27", "0.0.29"),
+            ("1.2.3", "0.0.1"),
+        ] {
+            assert!(
+                matches!(
+                    check_join(4, Some("4"), Some(&features), &[], local, Some(peer)),
+                    Err(JoinRejection::UpgradeBoundary { boundary, .. }) if boundary == "0.0.28"
+                ),
+                "{local} vs {peer}"
+            );
+        }
     }
 
     /// A version that is not a release tag (a local `git describe` build,

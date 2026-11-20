@@ -63,8 +63,12 @@ a mixed-version cluster spanning that release would journal different events
 for the same command. Since #1702 the cluster-join handshake **enforces** this
 — a member whose version straddles a declared boundary is refused at join with
 a typed `JoinRejection::UpgradeBoundary` error naming both versions and the
-boundary (the boundary table is derived from the allowlist at build time, so
-it can never drift from it).
+boundary. The boundary table is derived at build time from the append-only
+ledger `engine-core/examples/determinism/upgrade-boundaries.json`, and the build
+fails if a live allowlist `upgrade-boundary` entry is missing from it — so
+ratifying a boundary forces the ledger append, and the later (mandatory)
+allowlist expiry never lifts the join restriction. A peer that advertises no
+version (pre-#1702) is refused by every release build once any boundary exists.
 
 Every `upgrade-boundary` entry **must be called out in the release notes** as:
 "no rolling upgrade across this release; quiesce and upgrade all nodes". The

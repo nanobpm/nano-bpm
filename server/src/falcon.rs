@@ -622,6 +622,10 @@ async fn cluster_ws_handler(
         .server
         .advertise_cluster_features
         .load(std::sync::atomic::Ordering::Relaxed);
+    let advertise_version = state
+        .server
+        .advertise_cluster_version
+        .load(std::sync::atomic::Ordering::Relaxed);
     let worker = params.worker.unwrap_or_default();
     let mut response = ws.on_upgrade(move |socket| handle_socket(socket, state, worker));
     // Answer with our own partition count + features + version so the dialer
@@ -632,10 +636,9 @@ async fn cluster_ws_handler(
     {
         response_headers.insert(cluster_join::CLUSTER_FEATURES_HEADER, value);
     }
-    // The version header rides the same advertisement gate as the features
-    // header: a pre-#1702 binary (modelled by the cleared flag in tests) sent
-    // no version header either, so its answer must carry none.
-    if advertise_features
+    // The version header has its OWN advertisement gate (#1702): a test clears
+    // it to model a pre-#1702 binary, independently of feature negotiation.
+    if advertise_version
         && let Ok(value) = axum::http::HeaderValue::from_str(&cluster_join::local_version_header())
     {
         response_headers.insert(cluster_join::CLUSTER_VERSION_HEADER, value);

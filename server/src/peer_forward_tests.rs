@@ -607,9 +607,20 @@ async fn join_from_incompatible_binary_is_rejected_once_feature_is_in_use() {
 
     // A legacy binary still joins a node whose state does not yet depend on
     // the feature (the rolling-upgrade window).
+    // It carries this build's version: this fixture exercises FEATURE
+    // negotiation only, and a versionless joiner fails closed at every
+    // determinism boundary on a stamped release build (#1702).
     let plain = serve_peer_lenient(false).await;
     let url = format!("{}/cluster", plain.replacen("http://", "ws://", 1));
-    tokio_tungstenite::connect_async(url.into_client_request().expect("request"))
+    let mut request = url.into_client_request().expect("request");
+    request.headers_mut().insert(
+        nano_falcon_protocol::cluster_join::CLUSTER_VERSION_HEADER,
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(
+            &nano_falcon_protocol::cluster_join::local_version_header(),
+        )
+        .expect("version header"),
+    );
+    tokio_tungstenite::connect_async(request)
         .await
         .expect("legacy binary joins before the feature is in use");
 }
@@ -632,12 +643,10 @@ async fn a_mixed_version_join_across_an_upgrade_boundary_is_refused() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
-    // The version-override hook is process-global, so the acceptor-side and
-    // dialer-side cases each need their OWN server, brought up while the
-    // override names that side's version. The acceptor-side server is the
-    // boundary release (v0.0.28); the dialer-side server answers the NEWER
-    // release (v0.0.29), so a v0.0.27 dialer straddles the boundary against
-    // it.
+    // The version-override hook is process-global: the gateway acceptor
+    // below runs the boundary release (v0.0.28) while it names that version;
+    // the dialer-side cases later switch it to v0.0.29 and dial raw
+    // acceptors whose advertised versions are fixed per server.
     cj::set_advertised_version_override(Some("0.0.28"));
     let base = serve_peer().await;
     let url = format!("{}/cluster", base.replacen("http://", "ws://", 1));
@@ -712,59 +721,51 @@ async fn a_mixed_version_join_across_an_upgrade_boundary_is_refused() {
         assert!(msg.contains(needle), "the refusal names {needle:?}: {msg}");
     }
 
-    // Dialer side: a v0.0.27 dialer must refuse the link itself when the
-    // acceptor answers a version across the boundary (PeerLink runs the same
-    // check against the handshake response). The override is process-global
-    // and read at REQUEST time, so the acceptor is served fresh while the
-    // override names ITS version (v0.0.29), and the dialer's side is driven
-    // by a raw handshake: the dialer-side `check_join` in `PeerLink::dial`
-    // runs against the acceptor's answer, which is what is asserted here.
+    // Dialer side, through the REAL `PeerLink::connect_as` (#1702 review):
+    // an acceptor that PERMITS the upgrade but answers a release across the
+    // boundary must be refused by the dialer's own response check. The
+    // acceptor is a raw WebSocket server so its advertised version is
+    // independent of the process-global override (which names the dialer's
+    // version, v0.0.29, here).
     cj::set_advertised_version_override(Some("0.0.29"));
-    let new_base = serve_peer().await;
-    let new_url = format!("{new_base}/cluster").replacen("http://", "ws://", 1);
-    // The acceptor answers its overridden version (v0.0.29) on the wire.
-    let (_ws, resp) = dial_with_version(&new_url, Some("0.0.29"))
-        .await
-        .expect("0.0.29 joins the 0.0.29 acceptor");
-    let peer_version = resp
-        .headers()
-        .get(cj::CLUSTER_VERSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    assert_eq!(peer_version.as_deref(), Some("0.0.29"));
-    // The dialer-side check (exactly as `PeerLink::dial` runs it) refuses a
-    // 0.0.27 local against that answer, naming both versions + the boundary.
-    let rejection = cj::check_join(
-        1,
-        Some("1"),
-        resp.headers()
-            .get(cj::CLUSTER_FEATURES_HEADER)
-            .and_then(|v| v.to_str().ok()),
-        &[],
-        "0.0.27",
-        peer_version.as_deref(),
-    )
-    .expect_err("a 0.0.27 dialer refuses a 0.0.29 peer across the v0.0.28 boundary");
-    let msg = rejection.to_string();
+    let old_release = raw_cluster_acceptor(Some("0.0.27")).await;
+    let err = match PeerLink::connect_as(&old_release, Some(1)).await {
+        Ok(_) => panic!("a v0.0.29 dialer must refuse a v0.0.27 acceptor (v0.0.28 boundary)"),
+        Err(e) => e.to_string(),
+    };
     for needle in ["0.0.29", "0.0.27", "0.0.28", "no rolling upgrade"] {
         assert!(
-            msg.contains(needle),
-            "the dialer-side error names {needle:?}: {msg}"
+            err.contains(needle),
+            "the dialer-side error names {needle:?}: {err}"
         );
     }
+    // Same release: the identical acceptor shape links (the refusal above is
+    // the version check, not a broken fixture).
+    let same_release = raw_cluster_acceptor(Some("0.0.29")).await;
+    PeerLink::connect_as(&same_release, Some(1))
+        .await
+        .expect("a same-release acceptor links");
+    // A versionless (pre-#1702) acceptor fails closed even PAST the boundary:
+    // a v0.0.27 binary is just as versionless as a v0.0.28 one.
+    let versionless = raw_cluster_acceptor(None).await;
+    let err = match PeerLink::connect_as(&versionless, Some(1)).await {
+        Ok(_) => panic!("a versionless acceptor must be refused by a release dialer"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("unknown") && err.contains("0.0.28"),
+        "the fail-closed error names the boundary: {err}"
+    );
 
-    // A versionless (pre-#1702) acceptor: the dialer at the boundary release
-    // fails closed (the peer may be pre-boundary); past the boundary it
-    // admits the peer (it is at-or-past the newest boundary too). Clearing
-    // `advertise_cluster_features` suppresses the acceptor's version header,
-    // modelling a pre-#1702 binary.
+    // The gateway's own pre-#1702 model (version advertisement cleared,
+    // features still advertised) answers no version header.
     let legacy = crate::ServerImpl::default();
     legacy
-        .advertise_cluster_features
+        .advertise_cluster_version
         .store(false, std::sync::atomic::Ordering::Relaxed);
     let legacy_base = serve(legacy).await;
     let legacy_url = format!("{legacy_base}/cluster").replacen("http://", "ws://", 1);
-    let (_ws, legacy_resp) = dial_with_version(&legacy_url, Some("0.0.28"))
+    let (_ws, legacy_resp) = dial_with_version(&legacy_url, Some("0.0.29"))
         .await
         .expect("a versionless acceptor still upgrades the socket");
     assert!(
@@ -774,16 +775,54 @@ async fn a_mixed_version_join_across_an_upgrade_boundary_is_refused() {
             .is_none(),
         "the legacy acceptor answers no version header"
     );
-    let rejection = cj::check_join(1, Some("1"), None, &[], "0.0.28", None)
-        .expect_err("a versionless peer of the boundary release is refused (fail closed)");
-    let msg = rejection.to_string();
     assert!(
-        msg.contains("unknown") && msg.contains("0.0.28"),
-        "the fail-closed error names the boundary: {msg}"
+        legacy_resp
+            .headers()
+            .get(cj::CLUSTER_FEATURES_HEADER)
+            .is_some(),
+        "version advertisement is independent of feature advertisement"
     );
-    cj::check_join(1, Some("1"), None, &[], "0.0.29", None)
-        .expect("a post-boundary release admits a versionless (at-or-past-boundary) peer");
     cj::set_advertised_version_override(None);
+}
+
+/// A raw `/cluster` acceptor (#1702 tests) that upgrades every socket and
+/// answers partition count 1, this build's features and `version` (none when
+/// `None`) — a member running another release, without depending on the
+/// process-global version override. Returns its `http://` base URL.
+#[allow(
+    clippy::result_large_err,
+    reason = "tungstenite's accept_hdr callback signature fixes the Err type"
+)]
+async fn raw_cluster_acceptor(version: Option<&'static str>) -> String {
+    use nano_falcon_protocol::cluster_join as cj;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let callback = move |_req: &Request, mut resp: Response| {
+                    let headers = resp.headers_mut();
+                    headers.insert(cj::CLUSTER_PARTITIONS_HEADER, HeaderValue::from(1));
+                    if let Ok(v) = HeaderValue::from_str(&cj::local_features_header()) {
+                        headers.insert(cj::CLUSTER_FEATURES_HEADER, v);
+                    }
+                    if let Some(v) = version {
+                        headers.insert(cj::CLUSTER_VERSION_HEADER, HeaderValue::from_static(v));
+                    }
+                    Ok(resp)
+                };
+                if let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await {
+                    use futures_util::StreamExt as _;
+                    while let Some(Ok(_)) = ws.next().await {}
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
 }
 
 /// #1661 (outbound direction): once this node's replicated state requires a

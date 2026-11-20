@@ -14,6 +14,9 @@
 //! here (`pub(crate) use nano_falcon_protocol::*;`) so its handler code keeps
 //! its unqualified `ClientFrame`/`ServerFrame` paths unchanged.
 
+/// Upgrade-boundary derivation (#1702); compiled into `build.rs`, unit-tested here.
+#[cfg(test)]
+mod boundary_ledger;
 pub mod cluster_join;
 
 use nanobpmn_engine_core::Event;
