@@ -5970,11 +5970,12 @@ pub async fn project_data_preview_domaintypes(
         "write": false,
         "derivedShapes": shapes,
         // The preview only needs `text` + `shapeDiagnostics` (both independent
-        // of worker/message IO), so supply empty lists: with all derived maps
-        // present, `run_data_op` skips the `resources/processes/*.bpmn` scan
+        // of worker/message/start IO), so supply empty lists: with all derived
+        // maps present, `run_data_op` skips the `resources/processes/*.bpmn` scan
         // entirely on this debounced, latency-sensitive path.
         "derivedWorkers": [],
         "derivedMessages": [],
+        "derivedStarts": [],
     });
     // The composer edits model-level metadata alongside shapes, so preview the
     // in-editor `nano:meta` too (ADR 0040 §5) — it feeds the resolved fuse/accessor

@@ -4,7 +4,11 @@
 // receives) and `out` (data it produces). The envelope lives on the element for
 // tasks, and on the shared `bpmn:Message` (reached through `messageRef`) for
 // message-bearing elements — the `bpmn:message` + `messageRef` split BPMN uses
-// for the message name, applied to its payload type. Absent = untyped.
+// for the message name, applied to its payload type. A **none start event** (a
+// `bpmn:StartEvent` with no event definition — how processes started over the
+// API or from a call activity begin) carries its envelope on the start event
+// itself, input only: it produces the process's initial variables, so there is
+// no `.out`. Absent = untyped.
 //
 // These helpers are pure (the moddle/modeling services are injected), so they
 // live here — apart from the browser-only bpmn-js modeler component — to keep
@@ -70,6 +74,9 @@ export interface EnvelopeContext {
   // For user tasks: the linked form id (`zeebe:formDefinition:formId`), if any,
   // so the envelope can default to the form's bound type (ADR 0033 §6 / 0029 §5).
   formId?: string;
+  // True when the carrier is input-only — a none start event produces the
+  // process's initial variables, so it has an `in` envelope but no `out`.
+  inputOnly?: boolean;
 }
 
 // The `bpmn:Message` a message-bearing element references, if any.
@@ -96,6 +103,17 @@ export function userTaskFormId(
   return typeof id === "string" && id ? id : undefined;
 }
 
+// A **none** start event: a `bpmn:StartEvent` carrying no event definition (no
+// message/timer/signal/… trigger). This is how a process started over the API or
+// from a call activity begins, so it is where the process's start inputs are
+// declared. A message start is *not* none — its envelope stays on the referenced
+// `bpmn:Message` (handled by `referencedMessage` above).
+export function isNoneStartEvent(bo: EnvModdleElement | undefined): boolean {
+  return (
+    bo?.$type === "bpmn:StartEvent" && (bo.eventDefinitions ?? []).length === 0
+  );
+}
+
 // Whether `element` supports a data envelope, and where it is carried. Returns
 // undefined for elements with no typed data boundary (or a message with no
 // message assigned yet, and a service task with no literal worker type).
@@ -117,6 +135,8 @@ export function envelopeContext(
   }
   if (element.type === "bpmn:UserTask")
     return { target: bo, formId: userTaskFormId(bo) };
+  if (element.type === "bpmn:StartEvent" && isNoneStartEvent(bo))
+    return { target: bo, inputOnly: true };
   return undefined;
 }
 
