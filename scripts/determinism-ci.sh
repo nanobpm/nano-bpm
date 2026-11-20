@@ -130,10 +130,23 @@ cmd_prev_release() {
   mkdir -p "$PREV_SRC/engine-core/examples/determinism"
   cp "$ENGINE/examples/determinism_replay.rs" "$PREV_SRC/engine-core/examples/"
   cp "$ENGINE/examples/determinism/runner.rs" "$PREV_SRC/engine-core/examples/determinism/"
-  (cd "$PREV_SRC/engine-core" && cargo build --features serde --example determinism_replay)
-  # Resolve the previous-release binary from Cargo's effective target dir too —
-  # under a redirected CARGO_TARGET_DIR (#1716) it is not $PREV_SRC/engine-core/target.
-  local prev_target; prev_target=$(cd "$PREV_SRC/engine-core" && cargo_target_dir Cargo.toml cargo) || {
+  # Build the previous release into an ISOLATED target dir, never the shared
+  # one: under an absolute CARGO_TARGET_DIR (#1716) HEAD and the previous
+  # release would resolve to the SAME directory, so this build would overwrite
+  # HEAD's determinism_replay and both replays below would run the old binary —
+  # the cross-release gate would pass without testing HEAD. Export the isolated
+  # dir so the build and the resolution below see the same setting; `local`
+  # keeps it scoped to this function. Resolve it ABSOLUTE and fail on a space:
+  # the previous release's C dependencies (tikv-jemalloc-sys) cannot build under
+  # a spaced target dir (#1716), and a relative one would resolve under
+  # $PREV_SRC, not $out.
+  local prev_target; prev_target=$(mkdir -p "$out/prev-target" && cd "$out/prev-target" && pwd -P)
+  case "$prev_target" in
+    *" "*) echo "::error::prev-release target dir contains a space ($prev_target); tikv-jemalloc-sys cannot build (#1716). Use a space-free OUTDIR."; exit 1 ;;
+  esac
+  (export CARGO_TARGET_DIR="$prev_target"; cd "$PREV_SRC/engine-core" && cargo build --features serde --example determinism_replay)
+  # Resolve the previous-release binary with that same isolated target dir.
+  prev_target=$(cd "$PREV_SRC/engine-core" && CARGO_TARGET_DIR="$prev_target" cargo_target_dir Cargo.toml cargo) || {
     echo "::error::cannot resolve previous-release effective target dir (#1716)"; exit 1;
   }
   local prev_bin="$prev_target/debug/examples/determinism_replay"
