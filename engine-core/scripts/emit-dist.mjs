@@ -25,6 +25,8 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { resolveTargetDir } from './lib-cargo-target-dir.mjs';
+
 const ABI_VERSION = 2;
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -36,9 +38,12 @@ const engineVersionMatch = cargoToml.match(/^\s*version\s*=\s*"([^"]+)"/m);
 if (!engineVersionMatch) die('could not read engine-core version from Cargo.toml');
 const engineVersion = engineVersionMatch[1];
 
+// Resolve Cargo's EFFECTIVE target dir (#1716): the Makefile redirects
+// CARGO_TARGET_DIR to a space-free path when the checkout path contains a
+// space, so the cdylib is not necessarily under engine-core/target — reading
+// the default would fail on a fresh checkout or package a stale artifact.
 const rawWasm = join(
-  engineCoreDir,
-  'target',
+  resolveTargetDir(engineCoreDir),
   'wasm32-unknown-unknown',
   'release',
   'nanobpmn_engine_core.wasm',

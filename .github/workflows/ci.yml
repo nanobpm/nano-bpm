@@ -271,6 +271,15 @@ jobs:
         run: ./scripts/fmt-stub-codegen.sh
       - name: Format check
         run: make fmt-check
+      # #1716: a checkout path containing a space must not break the Makefile
+      # (word-splitting of unquoted path expansions). The guard scans the
+      # Makefile for unquoted path-derived shell words; with
+      # NANOBPMN_SPACED_PROBE=1 it also copies the formatted crates into a
+      # directory whose path contains a space and runs `make fmt-check` there.
+      - name: Spaced checkout path guard (#1716)
+        run: ./scripts/spaced-path-guard.sh
+        env:
+          NANOBPMN_SPACED_PROBE: "1"
 
   engine-core:
     name: engine-core (clippy + test)

@@ -50,19 +50,22 @@ git checkout main && git pull
 
 # Only these crates change between builds; console/dist rarely does. --delete keeps
 # the build host tree identical to the source (no stale files leaking into a build).
+# scripts/ MUST be synced too: build-server.sh sources scripts/lib-cargo-target-dir.sh
+# to resolve Cargo's effective target dir (#1716), so a stale/absent scripts/ aborts
+# the build under `set -e` after the server build and before verification/staging.
 SSHK="-i $HOME/.ssh/google_compute_engine"
 RSYNC_EXCLUDES="--exclude target --exclude .git --exclude nano-data"
 
 # Hop 1: dev box -> loadbox (via the persistent IAP tunnel on localhost:2223)
 rsync -az --delete $RSYNC_EXCLUDES \
   -e "ssh $SSHK -p 2223" \
-  engine-core server generated \
+  engine-core server generated scripts \
   joshua.wulf@localhost:~/src-stage/
 
 # Hop 2: loadbox -> node0 build-console (run from the loadbox)
 ssh $SSHK -p 2223 joshua.wulf@localhost \
   'rsync -az --delete ~/src-stage/engine-core ~/src-stage/server \
-     ~/src-stage/generated \
+     ~/src-stage/generated ~/src-stage/scripts \
      -e "ssh -i ~/.ssh/google_compute_engine -o StrictHostKeyChecking=no" \
      10.128.0.19:~/build-console/'
 ```

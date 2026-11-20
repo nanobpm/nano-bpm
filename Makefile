@@ -17,7 +17,16 @@
 # output under generated/ and server/src/stub_impls.rs is git-ignored.
 
 SHELL := /usr/bin/env bash
-PROJECT_ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+# Resolve the project root whitespace-safely (#1716). $(CURDIR) is the
+# directory make is running in, set by make itself with the spaced path intact
+# — unlike $(abspath)/$(dir)/$(lastword $(MAKEFILE_LIST)), which word-split a
+# checkout path containing a space (make lists are whitespace-separated). The
+# supported invocation is `make -C <dir>` / `cd <dir> && make`, which chdir
+# into the checkout so $(CURDIR) IS the project root. (`make -f <spaced
+# path>/Makefile` from a space-free cwd is NOT a supported workflow: GNU make
+# cannot express a spaced path in a prerequisite, so the codegen file targets
+# already cannot work from a spaced checkout — see the note below.)
+PROJECT_ROOT := $(CURDIR)
 GENERATED_DIR := $(PROJECT_ROOT)/generated
 CONSOLE_GENERATED_DIR := $(PROJECT_ROOT)/generated-console
 STUB_IMPLS := $(PROJECT_ROOT)/server/src/stub_impls.rs
@@ -55,8 +64,81 @@ CONSOLE_SPEC_SRCS := $(PROJECT_ROOT)/spec-console/console-api.yaml \
 # unstable options (group_imports), which stable `cargo fmt` silently ignores —
 # producing import-ordering drift. Always format via this toolchain so the tree
 # matches the `make fmt-check` CI gate. Bump deliberately (single style commit).
+# make lists are whitespace-separated, so a path containing a space cannot be
+# a list element directly (#1716). Encode spaces as `~` (never present in
+# these directory names, and never produced by `mktemp` — unlike `+`, which a
+# `tr` decode would also hit in a random mktemp suffix); recipes decode with
+# $(subst ~,$(SPACE),word).
+# NOTE: encode/decode are = (recursive) so $(SPACE) is expanded at use time —
+# at define time $(SPACE) is still empty (it is set just below). `decode` is
+# currently unused: the only make list holding paths is FMT_CRATES (below),
+# whose recipes decode in the shell with `tr '~' ' '` — a make-level decode
+# would inject a literal space into the recipe line, which the shell would
+# word-split again. Kept as the canonical pair for future path lists.
+EMPTY :=
+SPACE := $(EMPTY) $(EMPTY)
+encode = $(subst $(SPACE),~,$(1))
+decode = $(subst ~,$(SPACE),$(1))
+
 FMT_TOOLCHAIN := nightly-2026-06-26
-FMT_CRATES := $(ENGINE_DIR) $(PROJECT_ROOT)/server $(PROCESSOS_DIR) $(WASM_DIR) $(READ_MODEL_DIR)
+# FMT_CRATES is a make list, whose entries are whitespace-separated — a
+# checkout path containing a space would split one crate dir into two "words"
+# (#1716). Each entry is space-encoded individually (a `$(foreach …,$(call
+# encode,$d))` would split on the space BEFORE encode sees it); the
+# fmt/fmt-check recipes decode with `tr '~' ' '` in the shell (a make-level
+# decode would inject a literal space into the recipe line, which the shell
+# would word-split again).
+FMT_CRATES := $(call encode,$(ENGINE_DIR)) $(call encode,$(PROJECT_ROOT)/server) \
+	$(call encode,$(PROCESSOS_DIR)) $(call encode,$(WASM_DIR)) $(call encode,$(READ_MODEL_DIR))
+
+# Checkout paths containing a space (#1716). Two distinct failure classes:
+#
+# 1. tikv-jemalloc-sys's autoconf `configure` word-splits a spaced build
+#    directory, so the server `heapprof` feature cannot build when
+#    CARGO_TARGET_DIR resolves under a spaced checkout path (macOS agent
+#    workspaces live under `~/Library/Application Support/…`). When the
+#    checkout path contains a space and the caller has NOT chosen a target
+#    dir, we redirect cargo's target dir to a space-free per-checkout hash
+#    under the (space-free) XDG data home. Consumers of a built artifact
+#    (engine-core/scripts/verify-wasm-ffi.mjs, emit-dist.mjs) resolve Cargo's
+#    EFFECTIVE target dir via lib-cargo-target-dir.mjs rather than assuming
+#    engine-core/target. An explicit CARGO_TARGET_DIR that is relative or has a
+#    space fails fast with a clear message instead of an autoconf error that
+#    looks like a toolchain bug.
+# 2. GNU make cannot express a prerequisite whose path contains a space
+#    (whitespace is the prerequisite separator and backslash-escaping is not
+#    honored on target/prerequisite lines), so the file-target rules for the
+#    codegen artifacts ($(GENERATED_DIR)/Cargo.toml et al.) cannot work from
+#    a spaced checkout. The phony targets agents run — `make fmt`,
+#    `make fmt-check`, `make console-wasm`, `make generate` — carry no such
+#    prerequisites and work; anything needing the codegen file targets must
+#    build from a space-free checkout (scripts/new-worktree.sh) instead.
+#
+# Guarded by scripts/spaced-path-guard.sh.
+ifneq ($(findstring $(SPACE),$(PROJECT_ROOT)),)
+  ifeq ($(origin CARGO_TARGET_DIR),undefined)
+    CHECKOUT_HASH := $(shell printf '%s' "$(PROJECT_ROOT)" | cksum | cut -d' ' -f1)
+    export CARGO_TARGET_DIR := $(HOME)/.local/share/nanobpm/target/$(CHECKOUT_HASH)
+    $(info note: checkout path contains a space; CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) (jemalloc configure splits spaced paths, #1716))
+  else
+    # Caller chose a target dir. It must be ABSOLUTE and space-free: a relative
+    # value (e.g. CARGO_TARGET_DIR=target) is space-free as text but Cargo
+    # resolves it under the (spaced) workspace root, so jemalloc's configure
+    # still word-splits it (#1716). Reject both failure shapes with a clear
+    # message instead of an autoconf error that looks like a toolchain bug.
+    #
+    # Check the space FIRST: $(findstring) matches a space anywhere, whereas
+    # the absolute test below uses $(filter /%,…), which word-splits a spaced
+    # value and so only works once the value is known to be a single word.
+    ifneq ($(findstring $(SPACE),$(CARGO_TARGET_DIR)),)
+      $(error CARGO_TARGET_DIR ($(CARGO_TARGET_DIR)) contains a space: tikv-jemalloc-sys cannot build there (#1716). Point it at a space-free directory, e.g. $$HOME/.local/share/nanobpm/target)
+    endif
+    # Space-free now, so a single word: $(filter /%,…) is a safe absolute test.
+    ifneq ($(filter /%,$(CARGO_TARGET_DIR)),$(CARGO_TARGET_DIR))
+      $(error CARGO_TARGET_DIR ($(CARGO_TARGET_DIR)) is relative, so Cargo resolves it under the spaced checkout and tikv-jemalloc-sys still cannot build (#1716). Use an ABSOLUTE space-free path, e.g. $$HOME/.local/share/nanobpm/target)
+    endif
+  endif
+endif
 
 .DEFAULT_GOAL := build
 
@@ -101,17 +183,17 @@ check-deps: ## Check that the required toolchain is installed (rust, uv, java) a
 
 .PHONY: all
 all: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Build nano top-to-bottom: generate REST stubs, then compile the gateway (nano) and ProcessOS
-	cd $(GENERATED_DIR) && cargo build
-	cd $(PROJECT_ROOT)/server && cargo build
-	cd $(PROCESSOS_DIR) && cargo build
+	cd "$(GENERATED_DIR)" && cargo build
+	cd "$(PROJECT_ROOT)/server" && cargo build
+	cd "$(PROCESSOS_DIR)" && cargo build
 	@echo
 	@echo "Built nano top-to-bottom: generated REST crate + gateway (server) + ProcessOS."
 
 .PHONY: all-release
 all-release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Build optimized release binaries of nano (gateway) and ProcessOS top-to-bottom
-	cd $(GENERATED_DIR) && cargo build --release
-	cd $(PROJECT_ROOT)/server && cargo build --release
-	cd $(PROCESSOS_DIR) && cargo build --release
+	cd "$(GENERATED_DIR)" && cargo build --release
+	cd "$(PROJECT_ROOT)/server" && cargo build --release
+	cd "$(PROCESSOS_DIR)" && cargo build --release
 	@echo
 	@echo "Built release binaries:"
 	@echo "  gateway (nano): $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
@@ -216,16 +298,16 @@ FORCE-contract-check:
 
 .PHONY: build
 build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Compile the generated crate and the stub server
-	cd $(GENERATED_DIR) && cargo build
-	cd $(PROJECT_ROOT)/server && cargo build
+	cd "$(GENERATED_DIR)" && cargo build
+	cd "$(PROJECT_ROOT)/server" && cargo build
 
 .PHONY: release
 release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) console-frontend ## Build the optimized self-contained distribution (gateway + embedded console + Swagger)
 	@# Force the RustEmbed derive to re-run so the just-built console/dist (which
 	@# release builds bake in at compile time) is embedded, even if the gateway
 	@# sources are otherwise unchanged.
-	touch $(PROJECT_ROOT)/server/crates/nano-server-console/src/lib.rs
-	cd $(PROJECT_ROOT)/server && cargo build --release --features console
+	touch "$(PROJECT_ROOT)/server/crates/nano-server-console/src/lib.rs"
+	cd "$(PROJECT_ROOT)/server" && cargo build --release --features console
 	@echo "Built self-contained distribution: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
 	@echo "  landing /  ·  console /console  ·  API docs /swagger  ·  REST /v2"
 
@@ -234,14 +316,14 @@ debug: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IM
 	@# Force the RustEmbed derive to re-run so the just-built console/dist is
 	@# embedded, even if the gateway sources are otherwise unchanged (mirrors
 	@# `release`; the embed is a compile-time bake regardless of profile).
-	touch $(PROJECT_ROOT)/server/crates/nano-server-console/src/lib.rs
-	cd $(PROJECT_ROOT)/server && cargo build --features console
+	touch "$(PROJECT_ROOT)/server/crates/nano-server-console/src/lib.rs"
+	cd "$(PROJECT_ROOT)/server" && cargo build --features console
 	@echo "Built self-contained debug distribution: $(PROJECT_ROOT)/server/target/debug/nanobpm-gateway-rest-server"
 	@echo "  landing /  ·  console /console  ·  API docs /swagger  ·  REST /v2"
 
 .PHONY: release-gateway
 release-gateway: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Build the optimized API-only gateway (no web console)
-	cd $(PROJECT_ROOT)/server && cargo build --release
+	cd "$(PROJECT_ROOT)/server" && cargo build --release
 	@echo "Built API-only gateway: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
 
 # ---------------------------------------------------------------------------
@@ -276,34 +358,34 @@ CROSS_PREREQS := $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) 
 .PHONY: cross
 cross: $(CROSS_PREREQS) ## Cross-compile the gateway for TARGET=<rust-triple> (GLIBC floor default 2.31; extra flags via CROSS_ARGS, e.g. --no-console)
 	@test -n "$(TARGET)" || { echo "Set TARGET=<rust-triple>, e.g. make cross TARGET=armv7-unknown-linux-gnueabihf" >&2; exit 2; }
-	$(PROJECT_ROOT)/scripts/cross-build.sh "$(TARGET)" --glibc "$(GLIBC)" $(CROSS_ARGS)
+	"$(PROJECT_ROOT)/scripts/cross-build.sh" "$(TARGET)" --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux-x64
 cross-linux-x64: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for Linux x86-64 -> dist/
-	$(PROJECT_ROOT)/scripts/cross-build.sh x86_64-unknown-linux-gnu --glibc "$(GLIBC)" $(CROSS_ARGS)
+	"$(PROJECT_ROOT)/scripts/cross-build.sh" x86_64-unknown-linux-gnu --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux-armv7
 cross-linux-armv7: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for Raspberry Pi ARMv7 -> dist/
-	$(PROJECT_ROOT)/scripts/cross-build.sh armv7-unknown-linux-gnueabihf --glibc "$(GLIBC)" $(CROSS_ARGS)
+	"$(PROJECT_ROOT)/scripts/cross-build.sh" armv7-unknown-linux-gnueabihf --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux-arm64
 cross-linux-arm64: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for Linux ARM64 -> dist/
-	$(PROJECT_ROOT)/scripts/cross-build.sh aarch64-unknown-linux-gnu --glibc "$(GLIBC)" $(CROSS_ARGS)
+	"$(PROJECT_ROOT)/scripts/cross-build.sh" aarch64-unknown-linux-gnu --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux-armv6
 cross-linux-armv6: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for ARMv6 (Pi 1/Zero) -> dist/
-	$(PROJECT_ROOT)/scripts/cross-build.sh arm-unknown-linux-gnueabihf --glibc "$(GLIBC)" $(CROSS_ARGS)
+	"$(PROJECT_ROOT)/scripts/cross-build.sh" arm-unknown-linux-gnueabihf --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux
 cross-linux: cross-linux-x64 cross-linux-armv7 ## Cross-compile the gateway for both Linux x86-64 and Raspberry Pi ARMv7 -> dist/
 
 .PHONY: cross-windows
 cross-windows: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for Windows x64 (msvc) -> dist/
-	$(PROJECT_ROOT)/scripts/cross-build.sh x86_64-pc-windows-msvc $(CROSS_ARGS)
+	"$(PROJECT_ROOT)/scripts/cross-build.sh" x86_64-pc-windows-msvc $(CROSS_ARGS)
 
 .PHONY: console-frontend
 console-frontend: console-wasm ## Build the web console SPA (console/ -> console/dist)
-	cd $(CONSOLE_DIR) && npm install && npm run build
+	cd "$(CONSOLE_DIR)" && npm install && npm run build
 
 .PHONY: console-wasm
 console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine-wasm/pkg, the @nanobpm/engine-wasm package). Builds BOTH subpath variants: lean (pkg/lean) and read-model (pkg/readmodel). engine-wasm/pkg is a gitignored build output (#668), so this is the ONLY way to get it: needs wasm-pack and, for the read-model build, an LLVM clang with a wasm backend (see below). Fails if wasm-pack is absent.
@@ -311,21 +393,21 @@ console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine
 	if command -v wasm-pack >/dev/null 2>&1; then \
 		echo "Regenerating engine-wasm/pkg (@nanobpm/engine-wasm) via wasm-pack (lean + read-model)..."; \
 		echo "  -> lean  (pkg/lean)"; \
-		cd $(PROJECT_ROOT)/engine-wasm; \
+		cd "$(PROJECT_ROOT)/engine-wasm"; \
 		wasm-pack build --target web --release --no-pack --out-dir pkg/lean --out-name nanobpmn_engine; \
-		rm -f $(PROJECT_ROOT)/engine-wasm/pkg/lean/.gitignore; \
+		rm -f "$(PROJECT_ROOT)/engine-wasm/pkg/lean/.gitignore"; \
 		echo "  -> read-model (pkg/readmodel, --features read-model)"; \
 		$(WASM_READ_MODEL_ENV) wasm-pack build --target web --release --no-pack --out-dir pkg/readmodel --out-name nanobpmn_engine -- --features read-model; \
-		rm -f $(PROJECT_ROOT)/engine-wasm/pkg/readmodel/.gitignore; \
+		rm -f "$(PROJECT_ROOT)/engine-wasm/pkg/readmodel/.gitignore"; \
 		echo "  -> use-after-free DX guard (scripts/inject-free-guard.mjs)"; \
-		node $(PROJECT_ROOT)/engine-wasm/scripts/inject-free-guard.mjs $(PROJECT_ROOT)/engine-wasm/pkg/lean/nanobpmn_engine.js $(PROJECT_ROOT)/engine-wasm/pkg/readmodel/nanobpmn_engine.js; \
-		cp $(PROJECT_ROOT)/engine-wasm/pkg.package.json $(PROJECT_ROOT)/engine-wasm/pkg/package.json; \
-		cp $(PROJECT_ROOT)/engine-wasm/README.md $(PROJECT_ROOT)/engine-wasm/pkg/README.md; \
+		node "$(PROJECT_ROOT)/engine-wasm/scripts/inject-free-guard.mjs" "$(PROJECT_ROOT)/engine-wasm/pkg/lean/nanobpmn_engine.js" "$(PROJECT_ROOT)/engine-wasm/pkg/readmodel/nanobpmn_engine.js"; \
+		cp "$(PROJECT_ROOT)/engine-wasm/pkg.package.json" "$(PROJECT_ROOT)/engine-wasm/pkg/package.json"; \
+		cp "$(PROJECT_ROOT)/engine-wasm/README.md" "$(PROJECT_ROOT)/engine-wasm/pkg/README.md"; \
 		echo "  -> readmodel-types (pkg/readmodel-types, derived DTO types)"; \
-		mkdir -p $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types; \
-		cp $(PROJECT_ROOT)/engine-wasm/readmodel-types/types.gen.ts $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/types.gen.d.ts; \
-		cp $(PROJECT_ROOT)/engine-wasm/readmodel-types/index.d.ts $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/index.d.ts; \
-		cp $(PROJECT_ROOT)/engine-wasm/readmodel-types/index.js $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/index.js; \
+		mkdir -p "$(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types"; \
+		cp "$(PROJECT_ROOT)/engine-wasm/readmodel-types/types.gen.ts" "$(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/types.gen.d.ts"; \
+		cp "$(PROJECT_ROOT)/engine-wasm/readmodel-types/index.d.ts" "$(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/index.d.ts"; \
+		cp "$(PROJECT_ROOT)/engine-wasm/readmodel-types/index.js" "$(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/index.js"; \
 	else \
 		echo "error: wasm-pack not found. engine-wasm/pkg is a build output (not committed, #668); install it with 'make install-wasm-pack' and re-run 'make console-wasm'." >&2; \
 		exit 1; \
@@ -357,56 +439,56 @@ console: release ## Alias for `release` (the self-contained single-node distribu
 
 .PHONY: console-dev
 console-dev: ## Run the console frontend dev server (Vite); proxies /console/api to a gateway on :8080
-	cd $(CONSOLE_DIR) && npm run dev
+	cd "$(CONSOLE_DIR)" && npm run dev
 
 .PHONY: run
 run: $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Run the stub server (PORT overrides the default 8080)
-	cd $(PROJECT_ROOT)/server && cargo run
+	cd "$(PROJECT_ROOT)/server" && cargo run
 
 .PHONY: server-test
 server-test: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Test the stub server (incl. journal-replay e2e tests)
-	cd $(PROJECT_ROOT)/server && cargo test --workspace
+	cd "$(PROJECT_ROOT)/server" && cargo test --workspace
 
 .PHONY: server-test-release
 server-test-release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Test the stub server with release optimizations (uses the release-test profile to avoid the panic=abort double-compile)
-	cd $(PROJECT_ROOT)/server && cargo test --workspace --profile release-test --features nanobpm-gateway-rest-server/console
+	cd "$(PROJECT_ROOT)/server" && cargo test --workspace --profile release-test --features nanobpm-gateway-rest-server/console
 
 .PHONY: engine-build
 engine-build: ## Build the embeddable BPMN engine-core crate (no Docker, no codegen)
-	cd $(ENGINE_DIR) && cargo build
+	cd "$(ENGINE_DIR)" && cargo build
 
 .PHONY: engine-test
 engine-test: ## Test the engine-core crate (unit + integration + doctests)
-	cd $(ENGINE_DIR) && cargo test
+	cd "$(ENGINE_DIR)" && cargo test
 
 .PHONY: engine-wasm
 engine-wasm: ## Build engine-core for wasm32 (portability check; needs the wasm32 target)
-	cd $(ENGINE_DIR) && cargo build --target wasm32-unknown-unknown
+	cd "$(ENGINE_DIR)" && cargo build --target wasm32-unknown-unknown
 
 .PHONY: engine-wasm-ffi
 engine-wasm-ffi: ## Build the FFI cdylib for wasm32 and verify its exports (needs the wasm32 target + node)
-	cd $(ENGINE_DIR) && cargo build --release --features ffi --target wasm32-unknown-unknown
-	node $(ENGINE_DIR)/scripts/verify-wasm-ffi.mjs
+	cd "$(ENGINE_DIR)" && cargo build --release --features ffi --target wasm32-unknown-unknown
+	node "$(ENGINE_DIR)/scripts/verify-wasm-ffi.mjs"
 
 .PHONY: engine-wasm-ffi-dist
 engine-wasm-ffi-dist: engine-wasm-ffi ## Emit the release FFI wasm + manifest into dist/engine-wasm-ffi/ (needs wasm-opt/binaryen). Deliberately independent of the browser package engine-wasm/pkg: the nano-bernd release workflows run this without wasm-pack (the browser-package probes, e.g. engine-wasm-agent-instance-e2e, run in CI against the package built once from the PR source).
-	node $(ENGINE_DIR)/scripts/emit-dist.mjs
+	node "$(ENGINE_DIR)/scripts/emit-dist.mjs"
 
 .PHONY: engine-wasm-agent-instance-e2e
 engine-wasm-agent-instance-e2e: console-wasm ## Run the AgentInstance/AgentHistory end-to-end probe against the engine-wasm/pkg read-model TestEngine (built from source by console-wasm) (needs node). Guards the AgentInstance driver + read methods on the exported wasm surface and their REST parity (status/producedAt/object shapes).
-	cd $(WASM_DIR)/tests/agent-instance-e2e && npm install && npm test
+	cd "$(WASM_DIR)/tests/agent-instance-e2e" && npm install && npm test
 
 .PHONY: engine-wasm-event-subprocess-e2e
 engine-wasm-event-subprocess-e2e: console-wasm ## Run the event sub-process end-to-end probe (#1616) against engine-wasm/pkg (lean + read-model TestEngine, built from source by console-wasm) (needs node). Guards non-interrupting timer + interrupting message ESP execution on the shipped wasm surface.
-	cd $(WASM_DIR)/tests/event-subprocess-e2e && npm install && npm test
+	cd "$(WASM_DIR)/tests/event-subprocess-e2e" && npm install && npm test
 
 .PHONY: engine-wasm-check
 engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)
-	cd $(WASM_DIR) && cargo check --target wasm32-unknown-unknown
+	cd "$(WASM_DIR)" && cargo check --target wasm32-unknown-unknown
 
 .PHONY: engine-wasm-check-read-model
 engine-wasm-check-read-model: ## Type-check engine-wasm with the off-by-default `read-model` feature for wasm32. Compiles a trimmed SQLite C amalgamation, so it needs the wasm32 target AND an LLVM clang with a wasm backend (Apple/GCC clang have none): point CC_wasm32_unknown_unknown/AR_wasm32_unknown_unknown at llvm clang/llvm-ar (e.g. Homebrew LLVM on macOS, the distro `llvm`/`clang` on CI).
-	cd $(WASM_DIR) && $(WASM_READ_MODEL_ENV) cargo check --features read-model --target wasm32-unknown-unknown
+	cd "$(WASM_DIR)" && $(WASM_READ_MODEL_ENV) cargo check --features read-model --target wasm32-unknown-unknown
 
 .PHONY: clippy-matrix
 clippy-matrix: ## Run every Clippy (-D warnings) permutation that gates the #1357 unwrap/expect denies — the single source of truth is scripts/clippy-matrix.json (CI runs the same runner per job). Narrow with JOB=<ci-job> or ID=<entry-id>; list with `node scripts/clippy-matrix.mjs list`. Server entries need `make generate` + a console/dist stub; wasm32 read-model entries need LLVM clang (scripts/wasm-cc-env.sh).
@@ -419,11 +501,11 @@ clippy-matrix-guard: ## Coverage guard: fail if a production crate, cargo featur
 .PHONY: release-tags
 release-tags: ## Cut release tags for every train whose version is bumped but untagged (dry run; PUSH=1 to tag origin/main HEAD and push). One tag per push + confirms each release workflow started — see RELEASE.md.
 	@case "$(PUSH)" in ""|1) ;; *) echo "PUSH must be 1 (push) or unset (dry run), got '$(PUSH)'" >&2; exit 1;; esac
-	node $(PROJECT_ROOT)/scripts/release-tags.mjs $(if $(filter 1,$(PUSH)),--push)
+	node "$(PROJECT_ROOT)/scripts/release-tags.mjs" $(if $(filter 1,$(PUSH)),--push)
 
 .PHONY: release-engine-wasm
 release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-v<pkg version> on origin/main HEAD and push it (CI OIDC-publishes). Thin wrapper over scripts/release-tags.mjs.
-	node $(PROJECT_ROOT)/scripts/release-tags.mjs --only engine-wasm --push
+	node "$(PROJECT_ROOT)/scripts/release-tags.mjs" --only engine-wasm --push
 
 .PHONY: processos-build
 processos-build: ## Build ProcessOS, the separate optimization-plane server (Stage T1: Insights)
@@ -444,8 +526,9 @@ processos-run: ## Run ProcessOS (PROCESSOS_PORT=8090, NANO_BASE_URL=http://local
 .PHONY: fmt
 fmt: ## Format every hand-written crate with the pinned nightly rustfmt (see FMT_TOOLCHAIN)
 	@for d in $(FMT_CRATES); do \
+		d="$$(printf '%s' "$$d" | tr '~' ' ')"; \
 		echo "fmt $$d"; \
-out=$$(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt 2>&1); rc=$$?; \
+out=$$(cd "$$d" && rustup run $(FMT_TOOLCHAIN) cargo fmt 2>&1); rc=$$?; \
 		[ -z "$$out" ] || printf '%s\n' "$$out"; \
 		if printf '%s' "$$out" | grep -q "only available in nightly"; then \
 			echo "error: rustfmt ran as STABLE, not $(FMT_TOOLCHAIN) (cargo-fmt shim mis-resolved); see AGENTS.md Formatting" >&2; exit 1; fi; \
@@ -455,8 +538,9 @@ out=$$(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt 2>&1); rc=$$?; \
 .PHONY: fmt-check
 fmt-check: ## Verify formatting with the pinned nightly rustfmt (CI gate; fails on drift)
 	@for d in $(FMT_CRATES); do \
+		d="$$(printf '%s' "$$d" | tr '~' ' ')"; \
 		echo "fmt-check $$d"; \
-out=$$(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt -- --check 2>&1); rc=$$?; \
+out=$$(cd "$$d" && rustup run $(FMT_TOOLCHAIN) cargo fmt -- --check 2>&1); rc=$$?; \
 		[ -z "$$out" ] || printf '%s\n' "$$out"; \
 		if printf '%s' "$$out" | grep -q "only available in nightly"; then \
 			echo "error: rustfmt ran as STABLE, not $(FMT_TOOLCHAIN) (cargo-fmt shim mis-resolved); see AGENTS.md Formatting" >&2; exit 1; fi; \
@@ -465,11 +549,11 @@ out=$$(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt -- --check 2>&1); rc=$$?;
 
 .PHONY: console-fmt
 console-fmt: ## Format the web console TypeScript/CSS with Prettier (console/)
-	cd $(CONSOLE_DIR) && npm run format
+	cd "$(CONSOLE_DIR)" && npm run format
 
 .PHONY: console-fmt-check
 console-fmt-check: ## Verify console Prettier formatting (CI gate; fails on drift)
-	cd $(CONSOLE_DIR) && npm run format:check
+	cd "$(CONSOLE_DIR)" && npm run format:check
 
 .PHONY: install-hooks
 install-hooks: ## Activate the tracked git hooks (.githooks) — adds a pre-push rustfmt gate
@@ -479,12 +563,12 @@ install-hooks: ## Activate the tracked git hooks (.githooks) — adds a pre-push
 
 .PHONY: clippy
 clippy: $(GENERATED_DIR)/Cargo.toml ## Lint the generated crate, then every production crate permutation via the clippy matrix (scripts/clippy-matrix.json)
-	cd $(GENERATED_DIR) && cargo clippy
+	cd "$(GENERATED_DIR)" && cargo clippy
 	$(MAKE) clippy-matrix
 
 .PHONY: clean
 clean: ## Remove all generated artifacts
-	rm -rf $(PROJECT_ROOT)/build $(GENERATED_DIR) $(STUB_IMPLS) $(RESPONSE_CONTRACT) $(PROJECT_ROOT)/server/target $(ENGINE_DIR)/target
+	rm -rf "$(PROJECT_ROOT)/build" "$(GENERATED_DIR)" "$(STUB_IMPLS)" "$(RESPONSE_CONTRACT)" "$(PROJECT_ROOT)/server/target" "$(ENGINE_DIR)/target"
 
 .PHONY: help
 help: ## Show this help
