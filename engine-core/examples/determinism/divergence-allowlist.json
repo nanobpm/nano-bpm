@@ -85,6 +85,8 @@
     {
       "scenario": "timers-and-job-expiry",
       "expected": {
+        "reorder": true,
+        "remint_keys": true,
         "only_in_prev": [
           {
             "variant": "ElementCompleting",
@@ -117,9 +119,9 @@
         ]
       },
       "introduced_in": "v0.0.28",
-      "issue": "#1535",
+      "issue": "#1535, #1712",
       "upgrade": "upgrade-boundary",
-      "rationale": "upgrade-boundary: not feature-gated. Zeebe parity (#1535): an activity interrupted by an interrupting boundary event or event sub-process now TERMINATES (ElementTerminating/ElementTerminated) instead of COMPLETING (ElementCompleting/ElementCompleted) - completion implies the activity finished its work and takes its outgoing flows, termination is the interrupt. In this scenario the interrupting timer boundary on the `slow` task fires, so prev journals the task's completion pair where head journals the termination pair; the boundary event, its outgoing flow and every other event are unchanged (only_in_prev/only_in_head reconcile the substitution per element instance at scenario level). Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C): a previous-release member journals the completion pair where a new member journals termination, so a mixed-version cluster diverges for the same command. The release therefore requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
+      "rationale": "upgrade-boundary: not feature-gated. Zeebe parity (#1535): an activity interrupted by an interrupting boundary event or event sub-process now TERMINATES (ElementTerminating/ElementTerminated) instead of COMPLETING (ElementCompleting/ElementCompleted) - completion implies the activity finished its work and takes its outgoing flows, termination is the interrupt. In this scenario the interrupting timer boundary on the `slow` task fires, so prev journals the task's completion pair where head journals the termination pair; the boundary event, its outgoing flow and every other event are unchanged (only_in_prev/only_in_head reconcile the substitution per element instance at scenario level). Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C): a previous-release member journals the completion pair where a new member journals termination, so a mixed-version cluster diverges for the same command. The release therefore requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it. Additionally (#1712, Zeebe parity): a TriggerTimers batch now fires its due timers ONE AT A TIME in key order, each drained to completion before the next (Zeebe writes one TIMER TRIGGER command per due timer), so in this scenario the three `wait` catches' completions and the `slow` activations/jobs/boundary timers interleave per timer instead of all TimerTriggered events preceding all follow-ups (reorder). Element instances created by the follow-ups (`tb`, `timed-out`) are therefore minted in a different order (remint_keys); the multiset of events is otherwise unchanged. This is likewise not feature-gated: a previous-release member journals the batch-first order where a new member journals per-trigger order for the same command, so the same all-nodes-same-version (quiesced) upgrade is required."
     },
     {
       "scenario": "adhoc-agents-quarantine",

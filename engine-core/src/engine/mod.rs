@@ -288,6 +288,15 @@ pub struct Engine {
     /// before the next, mirroring Zeebe's one-TRIGGER-command-per-timer
     /// processing. Per-command scratch: cleared by every `plan_command_at`.
     pending_timer_fires: VecDeque<PendingTimerFire>,
+    /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
+    /// `complete_finished_instances`) derive their touched-instance set from.
+    /// `0` for a whole command; advanced to the fire point each time the
+    /// fixpoint loop fires the next timer of a batch (#1712), because every
+    /// instance touched before that point already swept to a fixpoint at
+    /// quiescence, and any later state change to it emits an event carrying
+    /// its key into the new window. Keeps an N-timer batch linear instead of
+    /// rescanning the growing prefix after every fire. Per-command scratch.
+    sweep_from: usize,
 }
 
 /// One due timer awaiting its fire in a `TriggerTimers` batch (#1712).
@@ -714,6 +723,7 @@ impl Engine {
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
+            sweep_from: 0,
             raft_applied: None,
         }
     }
@@ -886,6 +896,7 @@ impl Engine {
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
+            sweep_from: 0,
             raft_applied,
         }
     }
@@ -2514,7 +2525,7 @@ impl Engine {
         self.operation_reference = operation_reference;
         let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
             self.run(&mut log, queue);
-            self.cascade_cancel_children(&mut log);
+            self.cascade_cancel_children(&mut log, 0);
             self.finish_command(&log);
             log
         });
@@ -2596,6 +2607,7 @@ impl Engine {
         self.esp_start_payloads.clear();
         self.boundary_payloads.clear();
         self.pending_timer_fires.clear();
+        self.sweep_from = 0;
         // Per-command terminal-deadline stamp (#1494): set from THIS command
         // only (or cleared), never inherited from a previous one.
         self.terminal_deadline_stamp = match &command {
@@ -6455,8 +6467,6 @@ impl Engine {
     fn fire_due_timer(&mut self, log: &mut Vec<Event>, queue: &mut VecDeque<Step>, timer_key: Key) {
         // An earlier fire in this batch may have interrupted an activity and
         // disarmed this timer; re-check it is still armed.
-        // A boundary timer earlier in this batch may have interrupted
-        // an activity that disarmed this one; re-check it is still due.
         let timer = match self.state.timers.get(&timer_key) {
             Some(t) if t.state == state::TimerState::Created => t,
             _ => return,
@@ -6819,8 +6829,27 @@ impl Engine {
             }
             // Quiescent: fire the next due timer of a `TriggerTimers` batch, if
             // any, and drain it to completion before the one after (#1712).
+            if !self.pending_timer_fires.is_empty() {
+                // An earlier fire may have ended an instance (a top-level
+                // terminate end, an interrupted call activity's child): tear its
+                // call-activity descendants down NOW, transitively, so a later
+                // timer of the batch never fires inside a dead child
+                // (r4642239002). Idempotent on resume (terminated children are
+                // no longer swept), so a pause here is safe.
+                let window = self.sweep_from;
+                let cascade_from = log.len();
+                self.cascade_cancel_children(log, window);
+                if log.len() > cascade_from {
+                    if let Drive::Pause = driver.after_step(&log[cascade_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                }
+            }
             if let Some(fire) = self.pending_timer_fires.pop_front() {
                 let fired_from = log.len();
+                // Everything before this point is at a fixpoint: later sweeps
+                // need only consider instances this fire touches.
+                self.sweep_from = fired_from;
                 match fire {
                     PendingTimerFire::Timer(key) => self.fire_due_timer(log, &mut queue, key),
                     PendingTimerFire::Start(key) => self.fire_start_timer(log, &mut queue, key),
@@ -7252,7 +7281,10 @@ impl Engine {
         // active instance instead made this O(total active backlog) per command:
         // under a large undrained backlog that scan dominated the engine thread
         // (per-command cost grew linearly with the backlog).
-        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log[self.sweep_from..]
+            .iter()
+            .filter_map(|e| e.instance_key())
+            .collect();
         let mut drained: Vec<(Key, Key, ElementId)> = Vec::new();
         for instance_key in &touched {
             let Some(instance) = self.state.instances.get(instance_key) else {
@@ -17156,7 +17188,10 @@ impl Engine {
     /// completion — currently the [`Step::CompleteCallActivity`] that releases a
     /// parent's parked call-activity token when its spawned child finishes.
     fn complete_finished_instances(&mut self, log: &mut Vec<Event>) -> Vec<Step> {
-        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log[self.sweep_from..]
+            .iter()
+            .filter_map(|e| e.instance_key())
+            .collect();
         let mut finished: Vec<Key> = touched
             .into_iter()
             .filter(|k| {
@@ -17493,8 +17528,10 @@ impl Engine {
     ///   is a **top-level terminate end event** (#1085), which completes the
     ///   instance while its sibling call-activity children are still live and
     ///   must be terminated here.
-    fn cascade_cancel_children(&mut self, log: &mut Vec<Event>) {
-        let mut ended: BTreeSet<Key> = log
+    ///
+    /// Only `log[from..]` seeds the sweep (`0` for the whole command).
+    fn cascade_cancel_children(&mut self, log: &mut Vec<Event>, from: usize) {
+        let mut ended: BTreeSet<Key> = log[from..]
             .iter()
             .filter_map(|e| match e {
                 Event::ProcessInstanceTerminated { instance_key }
