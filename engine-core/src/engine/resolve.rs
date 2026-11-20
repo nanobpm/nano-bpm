@@ -665,7 +665,7 @@ impl Engine {
         // value matches while a planned write changes it.
         let suppress = self.may_suppress_equal_writes(instance_key);
         let unchanged = |dest: Key, name: &str, value: &Value| {
-            suppress && Self::value_in_scope(instance, pending, dest, name) == Some(value)
+            suppress && Self::value_in_scope(instance, pending, dest, name) == Ok(Some(value))
         };
         // Fast path: local write, or a root-only instance — one scope, no walk.
         if local || (instance.scope_variables.is_empty() && instance.scope_parents.is_empty()) {
@@ -711,7 +711,7 @@ impl Engine {
         variables
             .into_iter()
             .filter(|(name, value)| {
-                Self::value_in_scope(instance, pending, scope, name) != Some(value)
+                Self::value_in_scope(instance, pending, scope, name) != Ok(Some(value))
             })
             .collect()
     }
@@ -741,42 +741,89 @@ impl Engine {
     /// instance's root variables), without walking ancestors — as seen after
     /// the not-yet-applied `pending` events of the current batch (the latest
     /// pending write to `scope` wins over committed state).
+    ///
+    /// Fails closed: `Err(())` when a pending event mutates `scope`'s variables
+    /// through any path other than a plain variable write (an ad-hoc tool's
+    /// `outputCollection` append, a scope being opened/re-seeded/torn down,
+    /// the instance's payload being cleared). The value after the batch is
+    /// then not known here, so the caller must keep the write rather than
+    /// risk dropping a restoring one.
     fn value_in_scope<'a>(
         instance: &'a crate::state::ProcessInstance,
         pending: &'a [crate::Event],
         scope: Key,
         name: &str,
-    ) -> Option<&'a Value> {
+    ) -> Result<Option<&'a Value>, ()> {
+        use crate::Event as E;
         let root = instance.key;
+        let norm = |k: Key| if k == 0 { root } else { k };
         for event in pending.iter().rev() {
             let written = match event {
-                crate::Event::VariablesUpdated {
+                E::VariablesUpdated {
                     instance_key,
                     variables,
                 } if *instance_key == root && scope == root => variables.get(name),
-                crate::Event::ScopedVariablesUpdated {
+                E::ScopedVariablesUpdated {
                     instance_key,
                     scope_key,
                     variables,
-                } if *instance_key == root
-                    && (if *scope_key == 0 { root } else { *scope_key }) == scope =>
+                } if *instance_key == root && norm(*scope_key) == scope => variables.get(name),
+                E::AdHocToolCompleted {
+                    instance_key,
+                    container_key: k,
+                    ..
+                }
+                | E::AdHocToolActivated {
+                    instance_key,
+                    child_key: k,
+                    ..
+                }
+                | E::MultiInstanceChildActivated {
+                    instance_key,
+                    child_key: k,
+                    ..
+                }
+                | E::VariableScopeCreated {
+                    instance_key,
+                    scope_key: k,
+                    ..
+                }
+                | E::VariableScopeDestroyed {
+                    instance_key,
+                    scope_key: k,
+                }
+                | E::ElementCompleted {
+                    instance_key,
+                    element_instance_key: k,
+                    ..
+                }
+                | E::ElementTerminated {
+                    instance_key,
+                    element_instance_key: k,
+                    ..
+                } if *instance_key == root && norm(*k) == scope => return Err(()),
+                E::ParallelJoinReset { instance_key, .. }
+                | E::ProcessInstanceCompleted { instance_key }
+                | E::ProcessInstanceTerminated { instance_key }
+                | E::ProcessInstanceMigrated { instance_key, .. }
+                    if *instance_key == root =>
                 {
-                    variables.get(name)
+                    return Err(());
                 }
                 _ => None,
             };
             if written.is_some() {
-                return written;
+                return Ok(written);
             }
         }
-        if scope == instance.key {
+        Ok(if scope == instance.key {
             instance.variables.get(name)
         } else {
             instance
                 .scope_variables
                 .get(&scope)
                 .and_then(|m| m.get(name))
-        }
+        })
     }
 
     /// The nearest scope (from `scope` upward to the root) that already defines
