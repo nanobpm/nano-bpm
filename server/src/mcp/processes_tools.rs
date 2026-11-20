@@ -200,9 +200,10 @@ pub(crate) fn build_description(props: &BTreeMap<String, String>) -> String {
 
 /// Whether any `io.camunda.tool:input_N_*` property is declared.
 fn has_input_properties(props: &BTreeMap<String, String>) -> bool {
-    props
-        .keys()
-        .any(|k| k.strip_prefix(TOOL_PROPERTY_PREFIX).is_some_and(|r| r.starts_with("input_")))
+    props.keys().any(|k| {
+        k.strip_prefix(TOOL_PROPERTY_PREFIX)
+            .is_some_and(|r| r.starts_with("input_"))
+    })
 }
 
 /// The tool input schema: the data-envelope object schema (with the reserved
@@ -786,8 +787,14 @@ mod tests {
         let ok = json!({ "orderId": "o-1", "customer": { "email": "a@b" },
             "lines": [ { "sku": "x", "qty": 2 } ] });
         for (args, expect) in [
-            (json!({ "orderId": "o-1", "customer": { "email": "a@b" } }), "lines"),
-            (json!({ "orderId": "o-1", "customer": {}, "lines": [] }), "customer.email"),
+            (
+                json!({ "orderId": "o-1", "customer": { "email": "a@b" } }),
+                "lines",
+            ),
+            (
+                json!({ "orderId": "o-1", "customer": {}, "lines": [] }),
+                "customer.email",
+            ),
             (
                 json!({ "orderId": "o-1", "customer": { "email": "a@b" },
                     "lines": [ { "sku": "x", "qty": "two" } ] }),

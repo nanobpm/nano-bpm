@@ -115,7 +115,25 @@ function ToolCard({ tool }: { tool: McpProcessTool }) {
           {tool.description}
         </pre>
       )}
+      {(tool.warnings ?? []).map((w) => (
+        <div
+          key={w}
+          data-testid="mcp-tool-warning"
+          className="mt-3 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-fg"
+        >
+          {w}
+        </div>
+      ))}
       <SectionLabel>Input schema</SectionLabel>
+      {tool.inputSchemaSource === "dataEnvelope" && tool.dataEnvelope && (
+        <div
+          data-testid="mcp-tool-envelope"
+          className="mt-1 text-xs text-fg-muted"
+        >
+          from data envelope{" "}
+          <code className="font-mono">{tool.dataEnvelope}</code>
+        </div>
+      )}
       <table
         className="mt-1 w-full text-left text-xs"
         data-testid="mcp-tool-inputs"

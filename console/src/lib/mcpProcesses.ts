@@ -8,10 +8,15 @@
 // schemas here — that would be a second source of truth that can drift from
 // what an agent is actually offered.
 
-/** One JSON-Schema property of a tool's `inputSchema`. */
+/** One JSON-Schema property of a tool's `inputSchema` (nested for a
+ * data-envelope-derived schema, issue #1738). */
 export interface McpInputProperty {
   type?: string;
+  format?: string;
   description?: string;
+  properties?: Record<string, McpInputProperty>;
+  required?: string[];
+  items?: McpInputProperty;
 }
 
 /** A tool's `inputSchema` exactly as advertised in `tools/list`. */
@@ -36,6 +41,13 @@ export interface McpProcessTool {
   processDefinitionId: string;
   processDefinitionVersion: number;
   processName?: string | null;
+  /** Where `inputSchema` came from: the start message's data envelope, or the
+   * `io.camunda.tool:input_N_*` properties (issue #1738). */
+  inputSchemaSource?: "dataEnvelope" | "toolProperties";
+  /** The envelope shape id, when the schema derives from one. */
+  dataEnvelope?: string | null;
+  /** Authoring conflicts (e.g. envelope AND input_N_* declared). */
+  warnings?: string[];
 }
 
 /** The catalog payload. */
@@ -64,22 +76,42 @@ export interface McpInputRow {
   reserved: boolean;
 }
 
+/** A property's display type: `array<item>` for arrays, the `format` when set. */
+function displayType(p: McpInputProperty): string {
+  if (p.type === "array")
+    return `array<${p.items ? displayType(p.items) : "any"}>`;
+  if (p.type && p.format) return `${p.type} (${p.format})`;
+  return p.type ?? "any";
+}
+
 /**
- * Flatten an advertised input schema into display rows: declared
- * (`io.camunda.tool:input_N_*`) inputs first in schema order, the reserved
- * `businessId` last. Pure presentation — the schema itself comes from the
- * server.
+ * Flatten an advertised input schema into display rows: declared inputs
+ * first in schema order (nested object fields — also array items' — follow
+ * their parent as dotted `parent.child` / `parent[].child` rows), the
+ * reserved `businessId` last. Pure presentation — the schema itself comes
+ * from the server.
  */
 export function inputRows(schema: McpInputSchema | undefined): McpInputRow[] {
-  const props = schema?.properties ?? {};
-  const required = new Set(schema?.required ?? []);
-  const rows = Object.entries(props).map(([name, p]) => ({
-    name,
-    type: p.type ?? "any",
-    description: p.description ?? "",
-    required: required.has(name),
-    reserved: name === BUSINESS_ID_ARGUMENT,
-  }));
+  const rows: McpInputRow[] = [];
+  const walk = (
+    s: McpInputSchema | McpInputProperty | undefined,
+    prefix: string,
+  ) => {
+    const required = new Set(s?.required ?? []);
+    for (const [name, p] of Object.entries(s?.properties ?? {})) {
+      const path = prefix ? `${prefix}.${name}` : name;
+      rows.push({
+        name: path,
+        type: displayType(p),
+        description: p.description ?? "",
+        required: required.has(name),
+        reserved: !prefix && name === BUSINESS_ID_ARGUMENT,
+      });
+      walk(p, path);
+      if (p.items) walk(p.items, `${path}[]`);
+    }
+  };
+  walk(schema, "");
   return [
     ...rows.filter((r) => !r.reserved),
     ...rows.filter((r) => r.reserved),
