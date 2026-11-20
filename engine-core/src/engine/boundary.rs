@@ -709,8 +709,8 @@ impl Engine {
     /// resource it owns — its in-play job, armed timers, open message/signal/
     /// conditional subscriptions, any resting (`Created`) user task, any
     /// parallel-join bookkeeping it accumulates, and any call-activity child
-    /// process instance it parks — followed by its `ElementCompleting` and
-    /// `ElementCompleted`. The sub-process element instance itself is left for
+    /// process instance it parks — wrapped in its `ElementTerminating` /
+    /// `ElementTerminated` (#1535). The sub-process element instance itself is left for
     /// the caller to complete. Returns the events (does not emit) so it composes
     /// both inside an emit-driven command tail ([`terminate_subprocess_scope`])
     /// and inside a decide-only `process_step` result (a terminate end event's
@@ -745,8 +745,32 @@ impl Engine {
     /// event sub-process uses it directly, so compensable activities completed
     /// in the scope stay compensable from inside the event sub-process.
     pub(crate) fn element_teardown_events(&self, instance_key: Key, members: &[Key]) -> Vec<Event> {
+        // Zeebe terminates a container depth-first (#1535): the container's
+        // TERMINATING, then each child's whole termination, then the
+        // container's TERMINATED. `members` is key-ordered and may hold whole
+        // subtrees (a scope's transitive descendants), so visit the members
+        // whose flow scope is not itself a member as roots, recursing into the
+        // members nested under each.
+        let member_set: BTreeSet<Key> = members.iter().copied().collect();
         let mut events = Vec::new();
         for &eik in members {
+            if !member_set.contains(&self.scope_of(instance_key, eik)) {
+                self.push_member_teardown(&mut events, instance_key, eik, members);
+            }
+        }
+        events
+    }
+
+    /// One member of [`Self::element_teardown_events`] and, nested between its
+    /// TERMINATING and TERMINATED, the members inside it.
+    fn push_member_teardown(
+        &self,
+        events: &mut Vec<Event>,
+        instance_key: Key,
+        eik: Key,
+        members: &[Key],
+    ) {
+        {
             let element_id = self
                 .element_id_of_instance(instance_key, eik)
                 .unwrap_or_default();
@@ -759,15 +783,7 @@ impl Engine {
                     element_id,
                     scope: Some(self.scope_of(instance_key, eik)),
                 });
-                continue;
-            }
-            // Terminate any call-activity child process instance parked on this
-            // element instance before the parent token is removed — the child is
-            // a separate instance `scope_descendants` cannot see, so completing
-            // the call-activity token without this would leave the child (and its
-            // jobs/timers) running with no parent.
-            if let Some(child) = self.call_activity_child_of(eik) {
-                events.extend(self.discard_instance_events(child));
+                return;
             }
             if let Some(job_key) = self.active_job_on(eik) {
                 events.push(Event::JobCanceled {
@@ -825,18 +841,27 @@ impl Engine {
                     scope: Some(eik_scope),
                 });
             }
-            events.push(Event::ElementCompleting {
-                instance_key,
-                element_instance_key: eik,
-                element_id: element_id.clone(),
-            });
-            events.push(Event::ElementCompleted {
-                instance_key,
-                element_instance_key: eik,
-                element_id,
-            });
+            let [terminating, terminated] = termination_events(instance_key, eik, element_id);
+            events.push(terminating);
+            // Terminate any call-activity child process instance parked on this
+            // element instance before the parent token is removed — the child is
+            // a separate instance `scope_descendants` cannot see, so completing
+            // the call-activity token without this would leave the child (and its
+            // jobs/timers) running with no parent. Emitted AFTER this element's
+            // own `ElementTerminating` so a parent's TERMINATING always precedes
+            // its descendant call-child's termination (Zeebe's parent-before-child
+            // order, #1535); its `ElementTerminated` still lands after the child's
+            // teardown below.
+            if let Some(child) = self.call_activity_child_of(eik) {
+                events.extend(self.discard_instance_events(child));
+            }
+            for &child in members {
+                if child != eik && self.scope_of(instance_key, child) == eik {
+                    self.push_member_teardown(events, instance_key, child, members);
+                }
+            }
+            events.push(terminated);
         }
-        events
     }
 
     /// Appends the [`Event::ScopedCompensationCleared`] for a scope teardown
@@ -1571,7 +1596,7 @@ impl Engine {
 
     /// Interrupts the activity `element_instance_key`/`element_id` because an
     /// interrupting timer or message boundary fired on it: tears down the work it
-    /// owns, completes its element instance, and disarms any sibling boundaries.
+    /// owns, terminates its element instance, and disarms any sibling boundaries.
     /// A service task's job is cancelled; a sub-process's whole inner token scope
     /// is terminated; a call activity's spawned child instance is cancelled. The
     /// caller then routes the boundary's outgoing flow.
@@ -1582,6 +1607,12 @@ impl Engine {
         element_instance_key: Key,
         element_id: &str,
     ) {
+        // Zeebe writes the interrupted activity's TERMINATING before tearing
+        // down anything it owns (its job, inner scope, called child), and its
+        // TERMINATED after (#1535).
+        let [terminating, terminated] =
+            termination_events(instance_key, element_instance_key, element_id.to_string());
+        self.emit(log, terminating);
         if self.is_multi_instance_body(instance_key, element_instance_key) {
             // An interrupting boundary attached to a multi-instance activity is
             // armed on its BODY (`run_mi_body_activation`), so `element_instance_key`
@@ -1687,6 +1718,14 @@ impl Engine {
                 },
             );
         }
+        // Cancel a resting user task on the interrupted element (#1535, Zeebe
+        // parity: `USER_TASK CANCELED` precedes the task's TERMINATED). The
+        // token removal alone leaves the task `Created` — still listed,
+        // claimable and completable against a vanished element. A non-user-task
+        // element yields nothing.
+        for ev in self.cancel_created_user_tasks_on(element_instance_key) {
+            self.emit(log, ev);
+        }
         // Resolve every ACTIVE incident parked on the interrupted element
         // instance itself — once, unconditionally, for every branch above
         // (#1508, Zeebe parity: terminating an element resolves its incidents).
@@ -1704,22 +1743,7 @@ impl Engine {
         for ev in self.resolve_incidents_on(instance_key, element_instance_key) {
             self.emit(log, ev);
         }
-        self.emit(
-            log,
-            Event::ElementCompleting {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.to_string(),
-            },
-        );
-        self.emit(
-            log,
-            Event::ElementCompleted {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.to_string(),
-            },
-        );
+        self.emit(log, terminated);
         // Disarm any sibling boundary timers and message subscriptions on it.
         for event in self.cancel_boundary_timers_on(element_instance_key) {
             self.emit(log, event);
@@ -1923,7 +1947,7 @@ impl Engine {
     /// work the element instance owns — a service task's job, a resting user
     /// task, a sub-process's whole inner token scope, armed timers, and open
     /// message/signal/conditional subscriptions (its own catch-event
-    /// subscriptions and any attached boundary events) — then completes its
+    /// subscriptions and any attached boundary events) — then terminates its
     /// element instance. Unlike [`Self::interrupt_activity_via_boundary`] this
     /// also cancels a resting user task and works for any active element
     /// instance, not only activities that carry boundary events. User-task
@@ -1949,6 +1973,11 @@ impl Engine {
             );
             return;
         }
+        // TERMINATING before the owned work is torn down, TERMINATED after
+        // (#1535, Zeebe parity).
+        let [terminating, terminated] =
+            termination_events(instance_key, element_instance_key, element_id.to_string());
+        self.emit(log, terminating);
         // Any element instance that owns an inner scope — a sub-process, a
         // multi-instance body (its children), an ad-hoc container (its tools) —
         // has that whole scope torn down; a call activity's child process
@@ -2020,23 +2049,34 @@ impl Engine {
             );
         }
 
-        self.emit(
-            log,
-            Event::ElementCompleting {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.to_string(),
-            },
-        );
-        self.emit(
-            log,
-            Event::ElementCompleted {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.to_string(),
-            },
-        );
+        self.emit(log, terminated);
     }
+}
+
+/// The lifecycle records of an element instance torn down WITHOUT completing
+/// (#1535): an activity interrupted by an interrupting boundary event or event
+/// sub-process, a descendant swept by a scope teardown, or an element
+/// terminated by a modification. Zeebe writes `ELEMENT_TERMINATING` /
+/// `ELEMENT_TERMINATED` for these — never `ELEMENT_COMPLETING`/`COMPLETED`,
+/// which drive different listeners, metrics and compensation eligibility. The
+/// single canonical constructor for every teardown site.
+pub(crate) fn termination_events(
+    instance_key: Key,
+    element_instance_key: Key,
+    element_id: ElementId,
+) -> [Event; 2] {
+    [
+        Event::ElementTerminating {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        },
+        Event::ElementTerminated {
+            instance_key,
+            element_instance_key,
+            element_id,
+        },
+    ]
 }
 
 /// Where a thrown error / escalation is caught (see

@@ -81,6 +81,61 @@
       "issue": "#1244",
       "upgrade": "upgrade-boundary",
       "rationale": "upgrade-boundary: not feature-gated. Zeebe execution order at forks and joins (#1244, PR #1428): a parallel fork now activates its branches in Zeebe's order, so the branch elements' keys are minted in a different order (reorder + remint_keys), and a parallel join activates its element instance when it FIRES rather than on the first arriving token (the join's ElementActivating/ElementActivated move from the first token's entry to the firing entry, which only_in_prev/only_in_head declare for element `join` alone). Every other event - flows taken, subscriptions, variables, completions - is unchanged. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C) rather than replay the leader's events, so previous-release and new members would mint different keys and journal different events for the same command. The new order is not gated on a cluster-wide capability, so the release requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
+    },
+    {
+      "scenario": "timers-and-job-expiry",
+      "expected": {
+        "only_in_prev": [
+          {
+            "variant": "ElementCompleting",
+            "element_id": "slow"
+          },
+          {
+            "variant": "ElementCompleted",
+            "element_id": "slow"
+          }
+        ],
+        "only_in_head": [
+          {
+            "variant": "ElementTerminating",
+            "element_id": "slow"
+          },
+          {
+            "variant": "ElementTerminated",
+            "element_id": "slow"
+          }
+        ],
+        "variant_substitutions": [
+          {
+            "prev": "ElementCompleting",
+            "head": "ElementTerminating"
+          },
+          {
+            "prev": "ElementCompleted",
+            "head": "ElementTerminated"
+          }
+        ]
+      },
+      "introduced_in": "v0.0.28",
+      "issue": "#1535",
+      "upgrade": "upgrade-boundary",
+      "rationale": "upgrade-boundary: not feature-gated. Zeebe parity (#1535): an activity interrupted by an interrupting boundary event or event sub-process now TERMINATES (ElementTerminating/ElementTerminated) instead of COMPLETING (ElementCompleting/ElementCompleted) - completion implies the activity finished its work and takes its outgoing flows, termination is the interrupt. In this scenario the interrupting timer boundary on the `slow` task fires, so prev journals the task's completion pair where head journals the termination pair; the boundary event, its outgoing flow and every other event are unchanged (only_in_prev/only_in_head reconcile the substitution per element instance at scenario level). Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C): a previous-release member journals the completion pair where a new member journals termination, so a mixed-version cluster diverges for the same command. The release therefore requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
+    },
+    {
+      "scenario": "adhoc-agents-quarantine",
+      "expected": {
+        "field_overrides": [
+          {
+            "variant": "ElementActivating",
+            "field": "scope",
+            "value": 0
+          }
+        ]
+      },
+      "introduced_in": "v0.0.28",
+      "issue": "#1632",
+      "upgrade": "upgrade-boundary",
+      "rationale": "upgrade-boundary: not feature-gated. Ad-hoc sub-process activation (#1632) now records the real enclosing scope on ElementActivating for a tool's `<container>#innerInstance` and its tool child (the container's element-instance key), where the previous release's journal carries no `ElementActivating.scope` field and decodes it to the serde default `0`. The field is golden-recorded as added since the previous release, so it is erased from both sides where it holds the default; here head populates it, a one-field behavioural refinement declared as a field_overrides normalization to `0` on both sides. Every other event - the activation, the job, the completion - is unchanged. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C): a previous-release member journals `scope: 0` (absent) where a new member journals the real scope, so a mixed-version cluster journals different events for the same command. The release therefore requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
     }
   ]
 }

@@ -7418,8 +7418,8 @@ fn subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope(
     );
     let sibling_completed_at = events
         .iter()
-        .position(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == "work"))
-        .expect("the sibling token is completed by the teardown");
+        .position(|e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id.as_str() == "work"))
+        .expect("the sibling token is terminated by the teardown (#1535)");
     assert!(
         completed_at < sibling_completed_at,
         "the terminate end completes before the sibling's teardown records"

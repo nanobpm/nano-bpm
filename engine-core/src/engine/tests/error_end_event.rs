@@ -63,9 +63,9 @@ fn error_end_event_is_caught_by_an_error_boundary_on_the_enclosing_subprocess() 
     assert!(
         events.iter().any(|e| matches!(
             e,
-            Event::ElementCompleted { element_id, .. } if element_id == "sub"
+            Event::ElementTerminated { element_id, .. } if element_id == "sub"
         )),
-        "the caught sub-process completed (interrupted)"
+        "the caught sub-process is terminated (interrupted, #1535)"
     );
     assert!(
         events.iter().any(|e| matches!(

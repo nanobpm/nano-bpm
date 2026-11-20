@@ -595,6 +595,22 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
     },
+    /// An element instance entered `TERMINATING`: it is being torn down
+    /// without completing — interrupted by an interrupting boundary event or
+    /// event sub-process (#1535, Zeebe parity). Unlike completion, termination
+    /// takes no outgoing flow and opens no compensation subscription.
+    ElementTerminating {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
+    /// An element instance reached `TERMINATED`. Clears the token exactly as
+    /// [`Event::ElementCompleted`] does (one shared reducer).
+    ElementTerminated {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
 
     /// A split gateway (exclusive, or an inclusive fork) selected its outgoing
     /// flow(s) while ACTIVATING (Zeebe `onActivate`, #1402). The selection is
@@ -2087,6 +2103,8 @@ impl Event {
             | Event::ElementActivated { instance_key, .. }
             | Event::ElementCompleting { instance_key, .. }
             | Event::ElementCompleted { instance_key, .. }
+            | Event::ElementTerminating { instance_key, .. }
+            | Event::ElementTerminated { instance_key, .. }
             | Event::GatewayRouteSelected { instance_key, .. }
             | Event::SequenceFlowTaken { instance_key, .. }
             | Event::ParallelJoinOpened { instance_key, .. }
@@ -2380,6 +2398,14 @@ impl Event {
                 ..
             }
             | Event::ElementCompleted {
+                element_instance_key,
+                ..
+            }
+            | Event::ElementTerminating {
+                element_instance_key,
+                ..
+            }
+            | Event::ElementTerminated {
                 element_instance_key,
                 ..
             }

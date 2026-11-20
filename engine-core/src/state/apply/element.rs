@@ -6,8 +6,8 @@ use crate::state::types::*;
 
 pub(super) fn apply_element(state: &mut State, event: &Event) {
     match event {
-        // COMPLETING is a transient transition with no state change.
-        Event::ElementCompleting { .. } => {}
+        // COMPLETING / TERMINATING are transient transitions with no state change.
+        Event::ElementCompleting { .. } | Event::ElementTerminating { .. } => {}
 
         // ACTIVATING registers the live token (an activation-time incident parks
         // it here, before ACTIVATED); ACTIVATED re-registers it idempotently.
@@ -46,7 +46,15 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             }
         }
 
+        // A terminated element (#1535) leaves the token exactly as a completed
+        // one: the difference is only in what the engine does next (no
+        // outgoing flow), never in the state the token leaves behind.
         Event::ElementCompleted {
+            instance_key,
+            element_instance_key,
+            ..
+        }
+        | Event::ElementTerminated {
             instance_key,
             element_instance_key,
             ..

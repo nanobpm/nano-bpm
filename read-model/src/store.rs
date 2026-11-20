@@ -5323,6 +5323,24 @@ fn project_event(
             )?;
         }
 
+        Event::ElementTerminated {
+            element_instance_key,
+            ..
+        } => {
+            // An element interrupted by a boundary / event sub-process /
+            // teardown (#1535) ends TERMINATED, not COMPLETED (Camunda parity).
+            tx.cexecute(
+                "UPDATE element_instances SET state = ?2, end_date_ms = ?3 \
+                 WHERE element_instance_key = ?1 AND state = ?4",
+                params![
+                    *element_instance_key as i64,
+                    element_instance_state_code(ElementInstanceState::Terminated),
+                    now_ms as i64,
+                    element_instance_state_code(ElementInstanceState::Active),
+                ],
+            )?;
+        }
+
         // --- Timer / signal / conditional waits (TIMER/SIGNAL/CONDITION) -----
         Event::TimerCreated {
             timer_key,
@@ -7099,6 +7117,7 @@ fn project_event(
         | Event::CompensationTriggered { .. }
         | Event::DeploymentCreated { .. }
         | Event::ElementCompleting { .. }
+        | Event::ElementTerminating { .. }
         | Event::GatewayRouteSelected { .. }
         | Event::MessagePublished { .. }
         | Event::MessageSubscriptionClosing { .. }
@@ -12128,6 +12147,39 @@ mod element_instance_tests {
 
         store
             .export(&[&Event::ProcessInstanceTerminated { instance_key: INST }])
+            .unwrap();
+        let row = store.element_instance(TASK_EI).unwrap();
+        assert_eq!(row.state, ElementInstanceState::Terminated);
+        assert!(row.end_date_ms.is_some());
+    }
+
+    #[test]
+    fn an_interrupted_element_is_terminated_not_completed() {
+        // #1535: a boundary-interrupted element journals ElementTerminated;
+        // the element-instance query must report TERMINATED (Camunda parity).
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store
+            .export(&[&Event::ElementActivated {
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "t".to_string(),
+                scope: 0,
+            }])
+            .unwrap();
+        store
+            .export(&[
+                &Event::ElementTerminating {
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                },
+                &Event::ElementTerminated {
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                },
+            ])
             .unwrap();
         let row = store.element_instance(TASK_EI).unwrap();
         assert_eq!(row.state, ElementInstanceState::Terminated);
