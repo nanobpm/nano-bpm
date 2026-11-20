@@ -337,7 +337,15 @@ pub fn verify_journal_chain(
                         rec.chain.base
                     )));
                 }
-                if n > pos && complete {
+                // A cutover whose frame overruns this window is verifiable
+                // ONLY when its predecessor is unknown (the window opened
+                // after a snapshot base whose chain we do not hold — the
+                // `Coverage::Window` adoption rule). With a KNOWN predecessor
+                // (the seed, or an in-window record) the frame is provably
+                // incomplete: adopting the cutover unchecked would accept a
+                // missing cutover event and verify every later record against
+                // the recorded hash (#1715 review).
+                if n > pos && (complete || prev.is_some()) {
                     return Err(reject(format!(
                         "<no verifiable cutover: {n} events claimed, {pos} present>"
                     )));
@@ -718,6 +726,42 @@ mod tests {
         assert_eq!(
             verify_journal_chain(None, &bad, Coverage::Complete).map_err(|e| e.index),
             Err(3)
+        );
+    }
+
+    #[test]
+    fn seeded_window_rejects_an_incomplete_cutover_frame() {
+        // #1715 review: under `Coverage::Window` with a KNOWN snapshot
+        // predecessor (the seed), a cutover claiming more events than the
+        // window holds must be REJECTED — adopting it unchecked would accept a
+        // missing cutover event and verify every later record against the
+        // recorded hash.
+        let mut j = journal(1, &[&[1], &[2]]);
+        let c = cutover_entry_digest(3, rr(3), &[ev(3)]);
+        j.push(ev(3));
+        j.push(record(3, Some(c)));
+        let seed = match &j[3] {
+            Event::RaftEntryApplied { raft_state, .. } => chain_of_raft_state(raft_state),
+            _ => None,
+        };
+        assert_eq!(j.len(), 6, "two entries + the cutover frame");
+        // The tail opens INSIDE the cutover frame (the record survives, its
+        // journaled event does not — a snapshot base that ends mid-frame): the
+        // frame is provably incomplete, so with the seed known the cutover is
+        // unverifiable and must be rejected, not adopted as an anchor.
+        let tail = &j[5..];
+        assert_eq!(tail.len(), 1, "the tail holds only the cutover record");
+        assert_eq!(
+            verify_journal_chain(seed, tail, Coverage::Window).map_err(|e| e.index),
+            Err(3)
+        );
+        // The same tail with the predecessor UNKNOWN (no seed) may adopt the
+        // cutover as the window's anchor — the `Coverage::Window` rule.
+        assert!(verify_journal_chain(None, tail, Coverage::Window).is_ok());
+        // And the complete cutover frame with the seed verifies fully.
+        assert_eq!(
+            verify_journal_chain(seed, &j[4..], Coverage::Window).map(|v| v.0),
+            Ok(1)
         );
     }
 
