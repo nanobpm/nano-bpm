@@ -5515,6 +5515,7 @@ fn project_event(
             instance_key,
             element_instance_key,
             element_id,
+            ..
         }
         | Event::RemoteMessageCorrelation {
             subscription_key,
@@ -11802,6 +11803,8 @@ mod decision_deletion_tests {
             instance_key: 7,
             element_instance_key: 72,
             element_id: "catch".into(),
+            variables: std::collections::BTreeMap::new(),
+            boundary_element_id: None,
         };
         let created = Event::ProcessInstanceCreated {
             instance_key: 7,
@@ -12475,6 +12478,8 @@ mod element_instance_tests {
                 instance_key: INST,
                 element_instance_key: TASK_EI,
                 element_id: "await".to_string(),
+                variables: BTreeMap::new(),
+                boundary_element_id: None,
             }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
@@ -14301,6 +14306,8 @@ mod element_instance_tests {
             instance_key: INST,
             element_instance_key: 0,
             element_id: "esp_start".to_string(),
+            variables: BTreeMap::new(),
+            boundary_element_id: None,
         };
         store
             .export(&[&created_sub(5001, false), &created_sub(5002, true)])
@@ -14542,6 +14549,8 @@ mod element_instance_tests {
                 instance_key: INST,
                 element_instance_key: TASK_EI,
                 element_id: "task".to_string(),
+                variables: BTreeMap::new(),
+                boundary_element_id: None,
             }])
             .unwrap();
         assert_eq!(
@@ -14559,6 +14568,8 @@ mod element_instance_tests {
                 instance_key: INST,
                 element_instance_key: TASK_EI,
                 element_id: "task".to_string(),
+                variables: BTreeMap::new(),
+                boundary_element_id: None,
             }])
             .unwrap();
         assert_eq!(store.message_subscriptions().len(), 1);
@@ -14649,6 +14660,8 @@ mod element_instance_tests {
                 instance_key: INST,
                 element_instance_key: TASK_EI,
                 element_id: "await".to_string(),
+                variables: BTreeMap::new(),
+                boundary_element_id: None,
             }])
             .unwrap();
         assert!(

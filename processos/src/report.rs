@@ -534,6 +534,7 @@ mod tests {
             }],
             started_at: 0,
             creation_variables: None,
+            terminal_variables: None,
             stimuli: None,
             stimuli_truncated: false,
             domain_signals: vec![],

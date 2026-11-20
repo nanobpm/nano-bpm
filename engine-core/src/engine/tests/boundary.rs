@@ -1997,3 +1997,73 @@ fn non_interrupting_message_boundary_does_not_terminate_the_activity() {
         "the uninterrupted host completes, it is not terminated: {charge_lifecycle:?}"
     );
 }
+
+/// #1739: `MessageCorrelated` records the correlated message's payload and the
+/// triggered boundary event ON THE EVENT, for every subscription kind, so a
+/// consumer never has to infer the payload from the variable writes that
+/// follow. Covers an interrupting boundary with payload, a non-interrupting
+/// boundary, a payload-less message and an intermediate catch.
+#[test]
+fn message_correlated_records_payload_and_boundary_on_the_event() {
+    fn correlated(events: &[Event]) -> (BTreeMap<String, Value>, Option<String>) {
+        events
+            .iter()
+            .find_map(|e| match e {
+                Event::MessageCorrelated {
+                    variables,
+                    boundary_element_id,
+                    ..
+                } => Some((variables.clone(), boundary_element_id.clone())),
+                _ => None,
+            })
+            .expect("a MessageCorrelated event")
+    }
+    let payload = vars(&[("reason", Value::Str("fraud".into()))]);
+
+    // Interrupting boundary, with payload.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_boundary()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "cancellable",
+            vars(&[("orderId", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    let fired = engine.correlate_message("order-cancelled", "A", payload.clone(), 0);
+    assert_eq!(correlated(&fired), (payload.clone(), Some("cancel".into())));
+
+    // Non-interrupting boundary, with payload.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            process_with_non_interrupting_message_boundary(),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "notifiable",
+            vars(&[("orderId", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    let fired = engine.correlate_message("reminder", "A", payload.clone(), 0);
+    assert_eq!(correlated(&fired), (payload.clone(), Some("notify".into())));
+    // Payload-less message on the same (still open) subscription.
+    let fired = engine.correlate_message("reminder", "A", BTreeMap::new(), 0);
+    assert_eq!(correlated(&fired), (BTreeMap::new(), Some("notify".into())));
+
+    // Intermediate catch: no boundary.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_catch()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "await-payment",
+            vars(&[("orderId", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    let fired = engine.correlate_message("payment-received", "A", payload.clone(), 0);
+    assert_eq!(correlated(&fired), (payload, None));
+}

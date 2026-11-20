@@ -7120,6 +7120,17 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id: element_id.clone(),
+                variables: variables.clone(),
+                boundary_element_id: match &kind {
+                    state::MessageSubscriptionKind::InterruptingBoundary {
+                        boundary_element_id,
+                    }
+                    | state::MessageSubscriptionKind::NonInterruptingBoundary {
+                        boundary_element_id,
+                    } => Some(boundary_element_id.clone()),
+                    state::MessageSubscriptionKind::IntermediateCatch
+                    | state::MessageSubscriptionKind::EventSubProcess { .. } => None,
+                },
             },
         );
         // The message's variables (if any) are merged into the correlated

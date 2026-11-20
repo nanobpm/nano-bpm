@@ -1401,12 +1401,36 @@ pub enum Event {
     /// the boundary's outgoing flow runs (the job-cancellation, element-completion
     /// and sequence-flow events follow). `message_key` ties it back to the
     /// [`Event::MessagePublished`] that produced it.
+    ///
+    /// `variables` is the correlated message's payload, recorded **on the event**
+    /// (#1739) so consumers (the trace store's recorded-input log) read it
+    /// directly instead of inferring it from the variable writes that follow —
+    /// those writes cannot distinguish a payload from a mapping write. Empty
+    /// for a payload-less message and on a record written before #1739.
+    ///
+    /// `boundary_element_id` is the boundary event the correlation triggers
+    /// (interrupting or non-interrupting message boundary), `None` for an
+    /// intermediate catch / event sub-process start and on a pre-#1739 record.
+    /// Here `element_instance_key` / `element_id` name the subscription's host
+    /// (the attached activity for a boundary); the boundary event's own element
+    /// instance is minted by the `ElementActivating` this correlation enqueues,
+    /// which names `boundary_element_id` in the same command.
     MessageCorrelated {
         subscription_key: Key,
         message_key: Key,
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "BTreeMap::is_empty")
+        )]
+        variables: BTreeMap<String, Value>,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        boundary_element_id: Option<ElementId>,
     },
     /// A published message matched a subscription on the **message** partition
     /// whose instance lives on another partition. Settles the canonical
