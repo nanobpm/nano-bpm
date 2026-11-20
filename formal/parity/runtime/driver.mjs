@@ -25,7 +25,8 @@ import { join } from "node:path";
  *       { "op": "correlateMessage", "name": "M", "correlationKey": "k", "variables": {} },
  *       { "op": "publishMessage", "name": "M", "correlationKey": "k", "variables": {} },
  *       { "op": "broadcastSignal", "name": "S", "variables": {} },
- *       { "op": "advanceTime", "ms": 1000 }
+ *       { "op": "advanceTime", "ms": 1000 },
+ *       { "op": "cancelInstance" }
  *     ],
  *     "expect": { "completed": true, "variables": { }, "completedElements": { } }
  *   }
@@ -64,6 +65,8 @@ async function dispatchStep(backend, handle, step) {
       return backend.broadcastSignal(handle, step.name, step.variables ?? {});
     case "advanceTime":
       return backend.advanceTime(handle, step.ms);
+    case "cancelInstance":
+      return backend.cancelInstance(handle);
     default:
       throw new Error(`unknown scenario step op: ${JSON.stringify(step.op)}`);
   }

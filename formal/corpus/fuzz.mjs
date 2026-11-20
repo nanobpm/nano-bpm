@@ -5,12 +5,14 @@
 // graph up to a small bound. This fuzzer reaches beyond it: seeded RANDOM
 // well-formed process graphs larger than the bound (more gateways, more flows)
 // driven by a seeded RANDOM command order (job completions, message
-// correlations, per-activation routing choices), run against both engines and
+// correlations, timer ticks, instance cancellations, per-activation routing
+// choices) over subprocesses, boundary events and timers too (#1673), run against both engines and
 // checked by the SAME differential oracle (exhaustive.mjs `checkScenario`:
 // the reference outcome, nano, and — when reachable — live Camunda 8).
 //
 //   node formal/corpus/fuzz.mjs --seed S [--cases N]
 //        [--min-gateways A] [--max-gateways B] [--kinds xor,and,or,evt]
+//        [--labels task,timer,sub,btimer,bmsg] [--cancel-rate R]
 //        [--backend nano|camunda|both] [--require-camunda]
 //        [--record] [--file-issues] [--replay-only] [--out DIR]
 //
@@ -36,7 +38,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { GATEWAY_KINDS, wellFormed, materialize, randomRun, exploreOrders, scenariosFor } from './enumerate.mjs'
+import { GATEWAY_KINDS, EDGE_LABELS, BOUNDARY_LABELS, wellFormed, materialize, randomRun, exploreOrders, scenariosFor } from './enumerate.mjs'
 import { bpmnFor } from './generate.mjs'
 import { openBackends, checkScenario } from './exhaustive.mjs'
 import { prng } from '../traces/fuzz/generate.mjs'
@@ -50,7 +52,7 @@ export const MAX_GATEWAYS = 7
 // Arguments
 
 export function parseArgs (argv) {
-  const a = { seed: null, cases: 200, minGateways: 3, maxGateways: 5, kinds: GATEWAY_KINDS, backend: 'nano', requireCamunda: false, record: false, fileIssues: false, replayOnly: false, out: null }
+  const a = { seed: null, cases: 200, minGateways: 3, maxGateways: 5, kinds: GATEWAY_KINDS, labels: WAIT_LABELS, cancelRate: DEFAULT_CANCEL_RATE, backend: 'nano', requireCamunda: false, record: false, fileIssues: false, replayOnly: false, out: null }
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i]
     const val = () => { if (i + 1 >= argv.length) throw new Error(`${x} needs a value`); return argv[++i] }
@@ -60,6 +62,8 @@ export function parseArgs (argv) {
     else if (x === '--min-gateways') a.minGateways = int()
     else if (x === '--max-gateways') a.maxGateways = int()
     else if (x === '--kinds') a.kinds = val().split(',')
+    else if (x === '--labels') a.labels = val().split(',')
+    else if (x === '--cancel-rate') { const v = Number(val()); if (!(v >= 0 && v <= 1)) throw new Error('--cancel-rate needs a number in [0, 1]'); a.cancelRate = v }
     else if (x === '--backend') a.backend = val()
     else if (x === '--require-camunda') a.requireCamunda = true
     else if (x === '--record') a.record = true
@@ -75,6 +79,8 @@ export function parseArgs (argv) {
   if (a.minGateways > a.maxGateways) throw new Error('--min-gateways exceeds --max-gateways')
   if (a.maxGateways > MAX_GATEWAYS) throw new Error(`--max-gateways is capped at ${MAX_GATEWAYS}`)
   for (const k of a.kinds) if (!GATEWAY_KINDS.includes(k)) throw new Error(`unknown gateway kind ${JSON.stringify(k)}`)
+  for (const l of a.labels) if (!WAIT_LABELS.includes(l)) throw new Error(`unknown wait-state label ${JSON.stringify(l)} (known: ${WAIT_LABELS.join(', ')})`)
+  if (a.labels.length === 0) throw new Error('--labels needs at least one wait-state label')
   return a
 }
 
@@ -88,6 +94,15 @@ export function caseSeed (seed, i) {
   return (h ^ (h >>> 15)) >>> 0
 }
 
+/**
+ * The wait-state edge labels a random skeleton draws from (#1673): every
+ * enumerate.mjs label except `direct` (drawn by `taskBias`) and `msg` (forced
+ * by an event-based gateway).
+ */
+export const WAIT_LABELS = EDGE_LABELS.filter((l) => l !== 'direct' && l !== 'msg')
+/** The default per-step probability a random walk cancels the instance (#1673). */
+export const DEFAULT_CANCEL_RATE = 0.05
+
 /** `pick(n)`: a uniform integer in [0, n) from a seeded PRNG. */
 export const picker = (rng) => (n) => Math.floor(rng.next() * n)
 
@@ -98,7 +113,7 @@ export const picker = (rng) => (n) => Math.floor(rng.next() * n)
  * mixed gateway and every event-based gateway a pure split — then checked
  * against `wellFormed`, the one definition of well-formedness.
  */
-export function randomSkeleton (pick, { minGateways = 3, maxGateways = 5, kinds = GATEWAY_KINDS, taskBias = 0.5 } = {}) {
+export function randomSkeleton (pick, { minGateways = 3, maxGateways = 5, kinds = GATEWAY_KINDS, labels = WAIT_LABELS, taskBias = 0.5 } = {}) {
   const k = minGateways + pick(maxGateways - minGateways + 1)
   const ks = Array.from({ length: k }, () => kinds[pick(kinds.length)])
   const E = k + 1
@@ -138,7 +153,14 @@ export function randomSkeleton (pick, { minGateways = 3, maxGateways = 5, kinds 
   if (deg().inD[E] === 0) raw.push([k, E])
   const edges = raw.map(([i, j]) => {
     const fromEvt = i > 0 && ks[i - 1] === 'evt'
-    return [i, j, fromEvt ? 'msg' : pick(1000) < taskBias * 1000 ? 'task' : 'direct']
+    if (fromEvt) return [i, j, 'msg']
+    if (pick(1000) >= taskBias * 1000) return [i, j, 'direct']
+    // A boundary edge needs a merge-capable target (enumerate.mjs
+    // `wellFormed`); off one, a drawn boundary label degrades to a plain wait
+    // state of the same family (`task`, or the first non-boundary label).
+    const label = labels[pick(labels.length)]
+    if (!BOUNDARY_LABELS.includes(label) || j === E || ks[j - 1] !== 'evt') return [i, j, label]
+    return [i, j, labels.find((l) => !BOUNDARY_LABELS.includes(l)) ?? 'direct']
   })
   if (!wellFormed(ks, edges)) throw new Error(`randomSkeleton produced an ill-formed skeleton: ${JSON.stringify({ kinds: ks, edges })}`)
   return { kinds: ks, edges }
@@ -152,10 +174,11 @@ export function entryFor (skel, runs, name) {
 }
 
 /** Fuzz case `seed`: one random graph, one random command order. */
-export function fuzzCase (seed, opts) {
+export function fuzzCase (seed, opts = {}) {
   const pick = picker(prng(seed))
   const skel = randomSkeleton(pick, opts)
-  return entryFor(skel, (graph) => [randomRun(graph, pick)], `s${seed}`)
+  const cancelRate = opts.cancelRate ?? DEFAULT_CANCEL_RATE
+  return entryFor(skel, (graph) => [randomRun(graph, pick, { cancelRate })], `s${seed}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +186,8 @@ export function fuzzCase (seed, opts) {
 
 /**
  * Every one-step reduction of a skeleton that stays well-formed: drop a
- * gateway (with its flows), drop a flow, turn a task flow into a direct one.
+ * gateway (with its flows), drop a flow, simplify a wait-state flow (a
+ * boundary flow to a task one, any wait-state flow to a direct one).
  * Ordered most-reducing first, so the greedy pass removes gateways first.
  */
 export function reductions (skel) {
@@ -187,9 +211,12 @@ export function reductions (skel) {
     if (wellFormed(skel.kinds, edges)) out.push({ kinds: skel.kinds, edges })
   }
   for (let e = 0; e < skel.edges.length; e++) {
-    if (skel.edges[e][2] !== 'task') continue
-    const edges = skel.edges.map((x, i) => (i === e ? [x[0], x[1], 'direct'] : x))
-    if (wellFormed(skel.kinds, edges)) out.push({ kinds: skel.kinds, edges })
+    const l = skel.edges[e][2]
+    if (l === 'direct' || l === 'msg') continue
+    for (const simpler of BOUNDARY_LABELS.includes(l) ? ['task', 'direct'] : ['direct']) {
+      const edges = skel.edges.map((x, i) => (i === e ? [x[0], x[1], simpler] : x))
+      if (wellFormed(skel.kinds, edges)) out.push({ kinds: skel.kinds, edges })
+    }
   }
   return out
 }
@@ -222,8 +249,10 @@ export const SHRINK_WALKS = 32
 
 /** The candidate runs of a graph during shrinking (deterministic). */
 export function shrinkRuns (graph) {
-  const runs = exploreOrders(graph, {}, { limit: SHRINK_ORDERS })
-  for (let w = 0; w < SHRINK_WALKS; w++) runs.push(randomRun(graph, picker(prng(w + 1))))
+  // Cancellation is in the vocabulary (#1673), so a cancel-dependent
+  // divergence must stay reproducible while shrinking.
+  const runs = exploreOrders(graph, {}, { limit: SHRINK_ORDERS, cancel: true })
+  for (let w = 0; w < SHRINK_WALKS; w++) runs.push(randomRun(graph, picker(prng(w + 1)), { cancelRate: DEFAULT_CANCEL_RATE }))
   const seen = new Set()
   return runs.filter((r) => {
     const key = JSON.stringify([r.route, r.steps])
@@ -397,7 +426,7 @@ async function main () {
     if (args.replayOnly) return finish()
 
     // 2. Fuzz.
-    const opts = { minGateways: args.minGateways, maxGateways: args.maxGateways, kinds: args.kinds }
+    const opts = { minGateways: args.minGateways, maxGateways: args.maxGateways, kinds: args.kinds, labels: args.labels, cancelRate: args.cancelRate }
     for (let i = 0; i < args.cases; i++) {
       const s = caseSeed(args.seed, i)
       const entry = fuzzCase(s, opts)
