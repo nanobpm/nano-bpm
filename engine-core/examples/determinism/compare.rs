@@ -15,7 +15,7 @@
 //!   be explained by a shape the golden serde corpus records as added since
 //!   that release (#1698).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nanobpmn_engine_core::EngineSnapshot;
 use serde_json::Value as Json;
@@ -884,48 +884,104 @@ fn diverges_only_as(
 
 /// The comparison identity of a matched event: its JSON with every key
 /// reference canonicalized through `ids` when `remint` is declared (so a
-/// re-minted join activation matches across sides), raw otherwise. An event
-/// that MINTS the matched element's key is normalized to a single
-/// `ElementMinted` projection — `ElementActivating` / `ElementActivated` /
-/// `ParallelJoinOpened` all mint the same `element:<instance>:<element_id>`
-/// identity, and the ratified change (#1244) is precisely that a parked join
-/// mints its key at the open (`ParallelJoinOpened`) where the previous
-/// release minted it at the visible activation — so the mint-event kind must
-/// not distinguish the two sides' projections.
-fn pattern_projection(event: &Json, ids: &KeyIds, remint: bool) -> Option<String> {
+/// re-minted join activation matches across sides), raw otherwise. Lifecycle
+/// kind, entity and scope are all preserved.
+fn pattern_projection(event: &Json, ids: &KeyIds, remint: bool) -> Json {
     let mut v = event.clone();
     if remint {
         canonicalize_keys(&mut v, ids);
     }
-    // Normalize the mint event's own variant + key fields.
-    if let Json::Object(map) = &v {
-        if map.len() == 1 {
-            let (variant, body) = map.iter().next()?;
-            if matches!(
-                variant.as_str(),
-                "ElementActivating" | "ElementActivated" | "ParallelJoinOpened"
-            ) && body.get("element_instance_key").is_some()
-            {
-                let Some(b) = body.as_object().cloned() else {
-                    return Some(v.to_string());
-                };
-                let mut b = b;
-                // The minted key is the identity token after
-                // canonicalization (or the raw key without a remint); either
-                // way it must not distinguish the projection — the ENTITY
-                // (element_id + instance) is what reconciles.
-                b.remove("element_instance_key");
-                // `ElementActivated` carries `scope`; the parked open carries
-                // `scope: Some(..)`; `ElementActivating` carries the flow
-                // scope — all name the same mint, so drop the scope too.
-                b.remove("scope");
-                let mut out = serde_json::Map::new();
-                out.insert("ElementMinted".to_owned(), Json::Object(b));
-                return Some(Json::Object(out).to_string());
+    v
+}
+
+/// Adds every event of `events` matching one of `patterns` to the multiset
+/// `out`, projected by [`pattern_projection`].
+fn collect_matched(
+    events: &[String],
+    patterns: &[EventPattern],
+    ids: &KeyIds,
+    remint: bool,
+    out: &mut BTreeMap<String, usize>,
+) {
+    for e in events {
+        let Ok(v) = serde_json::from_str::<Json>(e) else {
+            continue;
+        };
+        if patterns.iter().any(|p| p.matches(&v)) {
+            *out.entry(pattern_projection(&v, ids, remint).to_string())
+                .or_insert(0) += 1;
+        }
+    }
+}
+
+/// The single-variant body of an externally tagged event.
+fn variant_body(event: &Json) -> Option<(&str, &Json)> {
+    let map = event.as_object()?;
+    if map.len() != 1 {
+        return None;
+    }
+    map.iter().next().map(|(k, v)| (k.as_str(), v))
+}
+
+/// The prev-side activations of PARKED joins (#1244), to be excepted from
+/// the scenario balance. An entity qualifies only when prev carries EXACTLY
+/// one `ElementActivating` and one `ElementActivated` for it, head carries
+/// NO activation of it, and head opens it (`ParallelJoinOpened` with the
+/// same canonical `element_instance_key`). Anything else is left in the
+/// balance, so it fails there.
+fn parked_join_activations(
+    prev: &BTreeMap<String, usize>,
+    head: &BTreeMap<String, usize>,
+    head_all: &[Json],
+) -> BTreeMap<String, usize> {
+    let entity_of = |s: &str| -> Option<(String, String)> {
+        let v: Json = serde_json::from_str(s).ok()?;
+        let (kind, body) = variant_body(&v)?;
+        if !matches!(kind, "ElementActivating" | "ElementActivated") {
+            return None;
+        }
+        Some((
+            kind.to_owned(),
+            body.get("element_instance_key")?.to_string(),
+        ))
+    };
+    let opened: BTreeSet<String> = head_all
+        .iter()
+        .filter_map(|v| match variant_body(v) {
+            Some(("ParallelJoinOpened", b)) => b.get("element_instance_key").map(Json::to_string),
+            _ => None,
+        })
+        .collect();
+    let head_activated: BTreeSet<String> = head
+        .keys()
+        .filter_map(|s| entity_of(s).map(|(_, e)| e))
+        .collect();
+    // entity -> (kind -> [(event, count)])
+    let mut by_entity: BTreeMap<String, Vec<(String, String, usize)>> = BTreeMap::new();
+    for (s, n) in prev {
+        if let Some((kind, e)) = entity_of(s) {
+            by_entity.entry(e).or_default().push((kind, s.clone(), *n));
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (entity, events) in by_entity {
+        if !opened.contains(&entity) || head_activated.contains(&entity) {
+            continue;
+        }
+        let count = |k: &str| {
+            events
+                .iter()
+                .filter(|(kind, _, _)| kind == k)
+                .map(|(_, _, n)| n)
+                .sum::<usize>()
+        };
+        if events.len() == 2 && count("ElementActivating") == 1 && count("ElementActivated") == 1 {
+            for (_, s, n) in events {
+                out.insert(s, n);
             }
         }
     }
-    Some(v.to_string())
+    out
 }
 
 /// A ratified behavioural change in one corpus scenario.
@@ -1293,11 +1349,10 @@ pub fn cross_release_checked(
     // join's activation in a later entry than the first token's) and may
     // change WHICH event mints the entity (a parked join mints its key at
     // `ParallelJoinOpened`, where the previous release minted it at the
-    // visible `ElementActivating`). So a matched event reconciles against the
-    // other side's SAME-ENTITY record: a non-mint event against the other
-    // side's declared patterns, and a MINT (`ElementMinted` projection)
-    // against the other side's mints of the same entity — whether the other
-    // side mints it by activating (prev) or by opening parked (head). A
+    // visible `ElementActivating`). So the matched events of each side are
+    // balanced as a MULTISET of full canonical events (lifecycle kind,
+    // entity and scope preserved, occurrences counted); the parked-join
+    // shape is the only exception and is validated exactly, per entity. A
     // pattern removed but never re-added (a real loss) still fails.
     let mut ratified_scenarios: BTreeSet<&str> = BTreeSet::new();
     for (scenario, pend) in &pending {
@@ -1305,18 +1360,15 @@ pub fn cross_release_checked(
         let expected = &d.expected;
         let remint = expected.remint_keys;
         // Accumulate, over the scenario's divergent entries, each side's
-        // matched events split into mints (compared as a set of entities) and
-        // other matched events (a multiset).
-        let mut head_mints: BTreeSet<String> = BTreeSet::new();
-        let mut prev_mints: BTreeSet<String> = BTreeSet::new();
-        let mut head_other: std::collections::BTreeMap<String, usize> = Default::default();
-        let mut prev_other: std::collections::BTreeMap<String, usize> = Default::default();
-        // Every event of the scenario's divergent entries, per side, so a
-        // mint can find its same-entity counterpart on the other side even
-        // when that counterpart is NOT itself a declared pattern (a parked
-        // join's `ParallelJoinOpened` is not in `only_in_head`).
-        let mut head_all: Vec<String> = Vec::new();
-        let mut prev_all: Vec<String> = Vec::new();
+        // declared-pattern events as a MULTISET of full canonical events:
+        // lifecycle kind, canonical entity identity and scope all preserved,
+        // and occurrences counted — so a deleted, duplicated or re-scoped
+        // lifecycle event never balances.
+        let mut head_matched: BTreeMap<String, usize> = BTreeMap::new();
+        let mut prev_matched: BTreeMap<String, usize> = BTreeMap::new();
+        // Every head event of the divergent entries, canonical — the parked
+        // join exception below looks up head's `ParallelJoinOpened` here.
+        let mut head_all: Vec<Json> = Vec::new();
         for (i, hc, pc) in &pend.entries {
             let (Some(hs), Some(ps)) = (hc, pc) else {
                 return Err(format!(
@@ -1335,69 +1387,42 @@ pub fn cross_release_checked(
                     render(ps)
                 ));
             }
-            head_all.extend(hs.iter().cloned());
-            prev_all.extend(ps.iter().cloned());
-            // Each side's declared-pattern events, projected.
-            let collect =
-                |events: &[String],
-                 patterns: &[EventPattern],
-                 ids: &KeyIds,
-                 mints: &mut BTreeSet<String>,
-                 other: &mut std::collections::BTreeMap<String, usize>| {
-                    for e in events {
-                        let Ok(v) = serde_json::from_str::<Json>(e) else {
-                            continue;
-                        };
-                        if patterns.iter().any(|p| p.matches(&v)) {
-                            if let Some(proj) = pattern_projection(&v, ids, remint) {
-                                if let Some(entity) = proj.strip_prefix("{\"ElementMinted\":") {
-                                    mints.insert(entity.to_owned());
-                                } else {
-                                    *other.entry(proj).or_insert(0) += 1;
-                                }
-                            }
-                        }
-                    }
-                };
-            collect(
+            for e in hs {
+                if let Ok(v) = serde_json::from_str::<Json>(e) {
+                    head_all.push(pattern_projection(&v, &head_ids, remint));
+                }
+            }
+            collect_matched(
                 hs,
                 &expected.only_in_head,
                 &head_ids,
-                &mut head_mints,
-                &mut head_other,
+                remint,
+                &mut head_matched,
             );
-            collect(
+            collect_matched(
                 ps,
                 &expected.only_in_prev,
                 &prev_ids,
-                &mut prev_mints,
-                &mut prev_other,
+                remint,
+                &mut prev_matched,
             );
         }
-        // A mint on one side reconciles iff the OTHER side mints the same
-        // entity anywhere in the scenario's divergent entries — by whatever
-        // event (a visible activation or a parked open). Project every event
-        // of the other side and take its minted entities.
-        let minted_entities = |events: &[String], ids: &KeyIds| -> BTreeSet<String> {
-            let mut out = BTreeSet::new();
-            for e in events {
-                let Ok(v) = serde_json::from_str::<Json>(e) else {
-                    continue;
-                };
-                if let Some(proj) = pattern_projection(&v, ids, remint) {
-                    if let Some(entity) = proj.strip_prefix("{\"ElementMinted\":") {
-                        out.insert(entity.to_owned());
-                    }
+        // The one ratified exception (#1244): a PARKED join. The previous
+        // release activated it visibly (exactly one `ElementActivating` +
+        // one `ElementActivated`); head mints the same entity only by
+        // `ParallelJoinOpened` and never activates it. Validate that shape
+        // exactly, per entity, and only then drop prev's pair.
+        let parked = parked_join_activations(&prev_matched, &head_matched, &head_all);
+        for (event, n) in &parked {
+            if let Some(c) = prev_matched.get_mut(event) {
+                *c -= n;
+                if *c == 0 {
+                    prev_matched.remove(event);
                 }
             }
-            out
-        };
-        let head_entities = minted_entities(&head_all, &head_ids);
-        let prev_entities = minted_entities(&prev_all, &prev_ids);
-        let lost_prev: Vec<_> = prev_mints.difference(&head_entities).collect();
-        let lost_head: Vec<_> = head_mints.difference(&prev_entities).collect();
-        if !lost_prev.is_empty() || !lost_head.is_empty() || head_other != prev_other {
-            let show = |m: &std::collections::BTreeMap<String, usize>| {
+        }
+        if head_matched != prev_matched {
+            let show = |m: &BTreeMap<String, usize>| {
                 m.iter()
                     .map(|(k, n)| format!("{n} x {k}"))
                     .collect::<Vec<_>>()
@@ -1406,15 +1431,12 @@ pub fn cross_release_checked(
             return Err(format!(
                 "scenario {scenario}: unbalanced ratified only_in_prev/only_in_head patterns \
                  ({}, {:?}) — an event removed on one side never re-appears on the other \
-                 (a real loss, not a move):\n  minted only in prev: {:?}\n  minted only in \
-                 head: {:?}\n  head-only patterns matched:\n{}\n  prev-side patterns \
-                 matched:\n{}",
+                 (a real loss, not a move):\n  head-side patterns matched:\n{}\n  \
+                 prev-side patterns matched (parked joins excepted):\n{}",
                 d.issue,
                 expected,
-                lost_prev,
-                lost_head,
-                show(&head_other),
-                show(&prev_other)
+                show(&head_matched),
+                show(&prev_matched)
             ));
         }
         ratified_entries += pend.entries.len();

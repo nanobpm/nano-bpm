@@ -23,9 +23,10 @@
 //     extension (nano-extensions.json) or a MISSING SCENARIO.
 //
 // Ratchet (baseline.json): each side has a `floorPercent`. `--check` fails
-// when a measured side drops below its floor (or measures in a different unit).
-// `--update` raises floors to the measured values (minus the side's optional
-// `slackPercent`, truncated to 0.1 %); it
+// when a measured side drops below its floor minus the side's optional
+// `slackPercent` (or measures in a different unit). `--update` raises floors
+// to the measured values (truncated to 0.1 %) — the slack is applied ONCE, at
+// check time, never also subtracted when seeding; it
 // refuses to LOWER a floor unless `--allow-lower` is passed, so a drop is
 // always an explicit, reviewed baseline change.
 //
@@ -240,8 +241,9 @@ export function updateBaseline(measured, baseline, { allowLower = false } = {}) 
     const m = measured[side];
     if (!m) continue;
     const b = baseline[side];
-    const slackPercent = b?.slackPercent ?? 0;
-    const floorPercent = floor1(m.percent - slackPercent);
+    // The slack is applied once, at CHECK time (checkRatchet); seeding the
+    // floor from `measured − slack` as well would widen the band to 2×slack.
+    const floorPercent = floor1(m.percent);
     if (b && !allowLower && (b.unit !== m.unit || floorPercent < b.floorPercent)) {
       errors.push(`${side}: refusing to lower the floor ${b.floorPercent}% (${b.unit}) to ${floorPercent}% (${m.unit}) without --allow-lower`);
       continue;

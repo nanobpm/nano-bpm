@@ -1429,8 +1429,7 @@ fn prev_release_gate_ratified_patterns_reconcile_across_entries() {
     // unbalanced ratified pattern still fails — the guard against hiding a
     // real loss. Head drops the join activation at entry `from` and never
     // re-adds it, so head's divergent entries mint the join one fewer time
-    // than prev's: the scenario-level balance reports it as minted only in
-    // prev.
+    // than prev's: the scenario-level balance reports it unbalanced.
     let mut removed = head.clone();
     if let Some(serde_json::Value::Array(events)) =
         entries_mut(&mut removed)[from].get_mut("events")
@@ -1439,9 +1438,54 @@ fn prev_release_gate_ratified_patterns_reconcile_across_entries() {
     }
     let err = checked(&removed, &head, allow.clone(), &[]).unwrap_err();
     assert!(
-        err.contains("unbalanced") && err.contains("minted only in prev"),
+        err.contains("unbalanced"),
         "a removed-but-never-re-added pattern must fail as unbalanced: {err}"
     );
+
+    // (d)-(f) Lifecycle and scope identity are preserved by the balance
+    // (Copilot, #1700): on top of the valid move (a), deleting the moved
+    // `ElementActivated`, duplicating it, or re-scoping the moved
+    // `ElementActivating` must each fail as unbalanced.
+    let mutate_moved = |f: &dyn Fn(&mut Vec<serde_json::Value>)| {
+        let mut m = moved.clone();
+        if let Some(serde_json::Value::Array(events)) = entries_mut(&mut m)[to].get_mut("events") {
+            f(events);
+        }
+        m
+    };
+    let is = |e: &serde_json::Value, v: &str| {
+        e.get(v)
+            .and_then(|b| b.get("element_id"))
+            .and_then(|id| id.as_str())
+            == Some("join")
+    };
+    let deleted = mutate_moved(&|evs| evs.retain(|e| !is(e, "ElementActivated")));
+    let duplicated = mutate_moved(&|evs| {
+        let dup = evs.iter().find(|e| is(e, "ElementActivated")).cloned();
+        evs.extend(dup);
+    });
+    let rescoped = mutate_moved(&|evs| {
+        for e in evs.iter_mut().filter(|e| is(e, "ElementActivating")) {
+            if let Some(b) = e
+                .get_mut("ElementActivating")
+                .and_then(|b| b.as_object_mut())
+            {
+                b.insert("scope".to_owned(), serde_json::json!(8_888_888u64));
+            }
+        }
+    });
+    for (label, mutated) in [
+        ("deleted ElementActivated", deleted),
+        ("duplicated ElementActivated", duplicated),
+        ("re-scoped ElementActivating", rescoped),
+    ] {
+        assert_ne!(mutated, moved, "{label}: the mutation must apply");
+        let err = checked(&mutated, &head, allow.clone(), &[]).unwrap_err();
+        assert!(
+            err.contains("unbalanced") || err.contains("UNDECLARED"),
+            "{label} must fail the gate: {err}"
+        );
+    }
 
     // (c) An unrelated EXTRA event in the allowlisted scenario: not matched
     // by any declared pattern, so it fails even with the scenario-level

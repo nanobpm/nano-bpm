@@ -30,7 +30,12 @@ ignored silently:
      move an event across entries (#1244 fires a parallel join's activation
      in a later entry than the first arriving token's), so the multiset of
      matched events on one side must equal the other side's — a cross-entry
-     move balances, a pattern removed but never re-added still fails.
+     move balances, a pattern removed but never re-added still fails. The
+     balance keeps lifecycle kind, canonical entity, scope and occurrence
+     counts, so a deleted, duplicated or re-scoped event fails. The one
+     exception is a #1244 *parked* join: prev's exactly-one
+     `ElementActivating` + `ElementActivated` for an entity head only opens
+     (`ParallelJoinOpened`) and never activates.
 
    Every entry names its `issue`, the `introduced_in` release, an `upgrade`
    mode and a `rationale` that names that mode and says why it applies.

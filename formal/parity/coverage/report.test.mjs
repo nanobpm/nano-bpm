@@ -116,9 +116,10 @@ test('ratchet: a drop below the floor or a unit switch fails; at/above passes', 
 test('ratchet: the documented slack absorbs live-broker scheduling variance (#1679)', () => {
   // zeebe JaCoCo measures against a live Camunda 8, so its branch count swings
   // run to run; `slackPercent` is the absorption band, applied at CHECK time
-  // (effective floor = floorPercent − slackPercent). The observed 12.45% vs a
-  // 12.5% floor (13 branches) is inside the 0.1% band; 12.39% is beyond it.
-  const base = { zeebe: { unit: 'branch', floorPercent: 12.5, slackPercent: 0.1 } };
+  // (effective floor = floorPercent − slackPercent), exactly once. The
+  // observed 12.45% vs a 12.6% floor is inside the 0.2% band; 12.39% is
+  // beyond it.
+  const base = { zeebe: { unit: 'branch', floorPercent: 12.6, slackPercent: 0.2 } };
   assert.deepEqual(
     checkRatchet({ zeebe: { unit: 'branch', percent: 12.45, covered: 1033, total: 8296 } }, base),
     [],
@@ -142,9 +143,13 @@ test('update: floors only rise unless --allow-lower', () => {
   assert.match(updateBaseline({ nano: { unit: 'region', percent: 40 } }, base).errors[0], /refusing/);
   assert.equal(updateBaseline({ nano: { unit: 'region', percent: 40 } }, base, { allowLower: true }).next.nano.floorPercent, 40);
   assert.equal(floor1(33.3399), 33.3);
-  // a side's documented slack is kept and lowers the floor it seeds
+  // a side's documented slack is kept but NOT subtracted from the floor it
+  // seeds: checkRatchet applies it once, so seeding with it too would double it
   const slack = updateBaseline({ zeebe: { unit: 'branch', percent: 12.61 } }, { zeebe: { unit: 'branch', floorPercent: 12.0, slackPercent: 0.1 } });
-  assert.deepEqual(slack.next.zeebe, { unit: 'branch', floorPercent: 12.5, slackPercent: 0.1 });
+  assert.deepEqual(slack.next.zeebe, { unit: 'branch', floorPercent: 12.6, slackPercent: 0.1 });
+  // seed-then-check: the effective band below the measurement is exactly the slack
+  assert.deepEqual(checkRatchet({ zeebe: { unit: 'branch', percent: 12.5 } }, slack.next), []);
+  assert.match(checkRatchet({ zeebe: { unit: 'branch', percent: 12.49 } }, slack.next)[0], /dropped below/);
 });
 
 test('the committed baseline seeds a floor for both engines', () => {
