@@ -17929,12 +17929,17 @@ impl Engine {
     }
 
     /// Whether `instance_key` can own a call-activity child: `false` only when
-    /// its definition is known and contains no call activity.
+    /// its definition is known, contains no call activity in `elements`, and
+    /// has no ad-hoc catalog. Ad-hoc tools (call activities and their
+    /// follow-ups included) are pruned from `elements` into `d.adhoc`, so any
+    /// ad-hoc container is conservatively a possible owner (r4642693352) —
+    /// fail closed.
     fn may_own_call_activity_child(&self, instance_key: Key) -> bool {
         self.process_of_instance(instance_key).is_none_or(|d| {
-            d.elements
-                .values()
-                .any(|e| matches!(e.kind, ElementKind::CallActivity { .. }))
+            !d.adhoc.is_empty()
+                || d.elements
+                    .values()
+                    .any(|e| matches!(e.kind, ElementKind::CallActivity { .. }))
         })
     }
 

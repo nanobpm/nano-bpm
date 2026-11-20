@@ -4870,3 +4870,67 @@ fn adhoc_tool_output_mapping_restoring_collection_after_append_is_kept() {
         "the tool's restoring output mapping must win over the same-batch append"
     );
 }
+
+/// #1712 review (r4642693352): a parent whose ONLY call activity is an ad-hoc
+/// tool (pruned from `elements` into the `adhoc` catalog) can still own a live
+/// child. Cancelling that parent must terminate the tool's child — the
+/// post-command cascade's "can this instance own a child?" pruning must see
+/// catalog-only call activities, not just `elements`.
+#[test]
+fn cancelling_a_parent_terminates_its_catalog_only_call_activity_child() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            BTreeMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let child_key = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id,
+                ..
+            } if process_id == "child" => Some(*instance_key),
+            _ => None,
+        })
+        .expect("the call-activity tool spawned a child process instance");
+
+    engine
+        .apply_command(Command::CancelInstance { instance_key: inst })
+        .expect("cancel the parent");
+
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated,
+        "the catalog-only call-activity child is terminated with its parent"
+    );
+    assert!(
+        engine
+            .activate_jobs("probe-child", "W", 10, 1_000, 0)
+            .is_empty(),
+        "no orphaned child job remains activatable"
+    );
+}
