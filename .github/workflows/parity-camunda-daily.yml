@@ -100,7 +100,12 @@ jobs:
       - name: Measure zeebe/engine coverage while the corpus runs
         run: formal/parity/coverage/zeebe-coverage.sh "$RUNNER_TEMP/zeebe-jacoco.xml" ci
       - name: Report (tagged against the coverage matrix) + ratchet
-        run: node formal/parity/coverage/report.mjs --zeebe "$RUNNER_TEMP/zeebe-jacoco.xml" --out "$RUNNER_TEMP/zeebe-coverage-report.json" --check
+        # --self-test 3 (#1707): re-parses the identical JaCoCo XML 3× and fails
+        # loudly with the differing branches if the measurement is not
+        # byte-identical — the gate must never flip on a nondeterministic
+        # measurement. The timing-dependent surface is excluded via
+        # coverage/zeebe-excludes.json, so identical inputs measure identically.
+        run: node formal/parity/coverage/report.mjs --zeebe "$RUNNER_TEMP/zeebe-jacoco.xml" --out "$RUNNER_TEMP/zeebe-coverage-report.json" --self-test 3 --check
       - name: Upload the tagged uncovered-branch report
         if: always()
         uses: actions/upload-artifact@v6
