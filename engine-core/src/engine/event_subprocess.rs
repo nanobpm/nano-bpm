@@ -503,7 +503,7 @@ impl Engine {
                 self.emit(log, event);
             }
             let members = self.event_subprocess_scope_members(instance_key, scope_eik);
-            for event in self.element_teardown_events(instance_key, &members) {
+            for event in self.element_teardown_events(instance_key, &members, None) {
                 self.emit(log, event);
             }
             // A still-queued activation inside a torn-down nested scope must

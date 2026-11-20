@@ -699,7 +699,7 @@ impl Engine {
         // queued behind the interrupting boundary cannot recreate a token inside
         // it (mirrors the scoped terminate-end path; see [`torn_down_scopes`]).
         self.torn_down_scopes.insert(scope_eik);
-        for event in self.scope_teardown_events(instance_key, scope_eik) {
+        for event in self.scope_teardown_events(instance_key, scope_eik, None) {
             self.emit(log, event);
         }
     }
@@ -725,7 +725,12 @@ impl Engine {
     /// (its own grandchildren are then reaped by the post-drain
     /// [`cascade_cancel_children`](crate::engine::Engine::cascade_cancel_children)
     /// sweep, which sees the `ProcessInstanceTerminated` this emits).
-    pub(crate) fn scope_teardown_events(&self, instance_key: Key, scope_eik: Key) -> Vec<Event> {
+    pub(crate) fn scope_teardown_events(
+        &self,
+        instance_key: Key,
+        scope_eik: Key,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+    ) -> Vec<Event> {
         let descendants = self.scope_descendants(instance_key, scope_eik);
         // An event sub-process trigger rests on its host **scope** (#1555) —
         // on `scope_eik` itself, not on a descendant — so the descendant sweep
@@ -734,7 +739,7 @@ impl Engine {
         // boundary, modification terminate, error / terminate-end throw)
         // routes through here, so disarm the scope's own triggers first.
         let mut events = self.disarm_event_subprocess_events(instance_key, scope_eik);
-        events.extend(self.element_teardown_events(instance_key, &descendants));
+        events.extend(self.element_teardown_events(instance_key, &descendants, user_tasks_by_eik));
         self.push_scoped_compensation_cleared(&mut events, instance_key, scope_eik);
         events
     }
@@ -744,18 +749,51 @@ impl Engine {
     /// completing it) without touching compensation state. An interrupting
     /// event sub-process uses it directly, so compensable activities completed
     /// in the scope stay compensable from inside the event sub-process.
-    pub(crate) fn element_teardown_events(&self, instance_key: Key, members: &[Key]) -> Vec<Event> {
+    ///
+    /// `user_tasks_by_eik` is the caller's per-teardown element-instance →
+    /// `Created` user-task index, when it already built one. When it is `None`
+    /// (an interrupting boundary, an interrupting event sub-process, a thrown
+    /// error / terminate end), the fallback is built ONCE here and shared across
+    /// every member, so tearing down N members with open user tasks is
+    /// O(total user tasks + N) rather than rescanning the whole
+    /// `state.user_tasks` map once per member (#1528 review). The index buckets
+    /// preserve key order, so the emitted events are identical either way.
+    pub(crate) fn element_teardown_events(
+        &self,
+        instance_key: Key,
+        members: &[Key],
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+    ) -> Vec<Event> {
         // Zeebe terminates a container depth-first (#1535): the container's
         // TERMINATING, then each child's whole termination, then the
         // container's TERMINATED. `members` is key-ordered and may hold whole
         // subtrees (a scope's transitive descendants), so visit the members
         // whose flow scope is not itself a member as roots, recursing into the
         // members nested under each.
+        // A no-op teardown must not pay for (scan + allocate) the user-task
+        // index it would never read (#1528 review).
+        if members.is_empty() {
+            return Vec::new();
+        }
         let member_set: BTreeSet<Key> = members.iter().copied().collect();
+        let fallback_index;
+        let user_tasks_by_eik = match user_tasks_by_eik {
+            Some(index) => Some(index),
+            None => {
+                fallback_index = self.created_user_tasks_by_element_instance(instance_key);
+                Some(&fallback_index)
+            }
+        };
         let mut events = Vec::new();
         for &eik in members {
             if !member_set.contains(&self.scope_of(instance_key, eik)) {
-                self.push_member_teardown(&mut events, instance_key, eik, members);
+                self.push_member_teardown(
+                    &mut events,
+                    instance_key,
+                    eik,
+                    members,
+                    user_tasks_by_eik,
+                );
             }
         }
         events
@@ -769,6 +807,7 @@ impl Engine {
         instance_key: Key,
         eik: Key,
         members: &[Key],
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
     ) {
         {
             let element_id = self
@@ -797,7 +836,7 @@ impl Engine {
             events.extend(self.cancel_all_subscriptions_on(eik));
             events.extend(self.cancel_all_signal_subscriptions_on(eik));
             events.extend(self.cancel_all_conditional_subscriptions_on(eik));
-            events.extend(self.cancel_created_user_tasks_on(eik));
+            events.extend(self.cancel_created_user_tasks_on(eik, user_tasks_by_eik));
             // Resolve any incident parked on this element instance. Unlike the
             // whole-instance `ProcessInstanceTerminated` reducer (which closes
             // every open incident on the instance), scope teardown only removes
@@ -857,7 +896,13 @@ impl Engine {
             }
             for &child in members {
                 if child != eik && self.scope_of(instance_key, child) == eik {
-                    self.push_member_teardown(events, instance_key, child, members);
+                    self.push_member_teardown(
+                        events,
+                        instance_key,
+                        child,
+                        members,
+                        user_tasks_by_eik,
+                    );
                 }
             }
             events.push(terminated);
@@ -959,17 +1004,44 @@ impl Engine {
     /// cancel it explicitly — mirroring the whole-instance
     /// [`discard_instance_events`](crate::engine::Engine::discard_instance_events)
     /// sweep, per element instance.
-    pub(crate) fn cancel_created_user_tasks_on(&self, element_instance_key: Key) -> Vec<Event> {
-        let mut tasks: Vec<&state::UserTask> = self
-            .state
-            .user_tasks
-            .values()
-            .filter(|t| {
-                t.element_instance_key == element_instance_key
-                    && t.state == state::UserTaskState::Created
-            })
-            .collect();
-        tasks.sort_by_key(|t| t.key);
+    ///
+    /// `user_tasks_by_eik` is the per-teardown element-instance → `Created`
+    /// user-task index built once by the enclosing teardown (see
+    /// [`crate::engine::Engine::created_user_tasks_by_element_instance`]); `None`
+    /// (the default for callers outside such a teardown) falls back to scanning
+    /// `state.user_tasks`. The index bucket is already key-ordered, so the emitted
+    /// events are identical either way.
+    pub(crate) fn cancel_created_user_tasks_on(
+        &self,
+        element_instance_key: Key,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+    ) -> Vec<Event> {
+        let tasks: Vec<&state::UserTask> = match user_tasks_by_eik {
+            Some(index) => index
+                .get(&element_instance_key)
+                .cloned()
+                .unwrap_or_default(),
+            None => {
+                // The `None` fallback scans every retained user task; a caller
+                // tearing down N members must not pay it N times — it builds the
+                // shared index once (`element_teardown_events`, #1528 review).
+                // The probe lets a regression test assert that scan count.
+                #[cfg(test)]
+                self.user_task_scan_count
+                    .set(self.user_task_scan_count.get() + 1);
+                let mut scanned: Vec<&state::UserTask> = self
+                    .state
+                    .user_tasks
+                    .values()
+                    .filter(|t| {
+                        t.element_instance_key == element_instance_key
+                            && t.state == state::UserTaskState::Created
+                    })
+                    .collect();
+                scanned.sort_by_key(|t| t.key);
+                scanned
+            }
+        };
         tasks
             .into_iter()
             .map(|t| Event::UserTaskCanceled {
@@ -1723,7 +1795,7 @@ impl Engine {
         // token removal alone leaves the task `Created` — still listed,
         // claimable and completable against a vanished element. A non-user-task
         // element yields nothing.
-        for ev in self.cancel_created_user_tasks_on(element_instance_key) {
+        for ev in self.cancel_created_user_tasks_on(element_instance_key, None) {
             self.emit(log, ev);
         }
         // Resolve every ACTIVE incident parked on the interrupted element

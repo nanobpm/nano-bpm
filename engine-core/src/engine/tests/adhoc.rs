@@ -2421,10 +2421,10 @@ fn adhoc_cancel_remaining_tears_down_an_open_subprocess_tool_body() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            Event::ElementCompleted { element_instance_key, element_id, .. }
+            Event::ElementTerminated { element_instance_key, element_id, .. }
                 if *element_instance_key == ask && element_id == "ask"
         )),
-        "the open body user-task element instance is torn down, not orphaned; events: {events:?}"
+        "the open body user-task element instance is torn down (TERMINATED — cancelled, not completed; #1528 review), not orphaned; events: {events:?}"
     );
     // The parked human task inside the body must be explicitly cancelled, not
     // just its element instance completed — otherwise the `user_tasks` entry
@@ -3804,15 +3804,16 @@ fn nested_adhoc_parent_cancel_recursively_tears_down_nested_container() {
         )),
         "the nested container's in-flight leaf job was cancelled; events: {events:?}"
     );
-    // The leaf descendant's element instance was completed — not left orphaned in
-    // the read-model element-instance tree.
+    // The leaf descendant's element instance was terminated (cancelled, not
+    // completed — #1528 review) — not left orphaned in the read-model
+    // element-instance tree.
     assert!(
         events.iter().any(|e| matches!(
             e,
-            Event::ElementCompleted { element_instance_key, element_id, .. }
+            Event::ElementTerminated { element_instance_key, element_id, .. }
                 if *element_instance_key == leaf && element_id == "leaf"
         )),
-        "the nested container's leaf element instance was completed; events: {events:?}"
+        "the nested container's leaf element instance was terminated; events: {events:?}"
     );
     assert!(engine.is_completed(inst), "the whole instance completes");
     assert!(
@@ -3895,7 +3896,7 @@ fn nested_adhoc_cancel_child_skips_already_completed_inner_instance() {
         "but its scopes mapping still resolves it"
     );
 
-    let events = engine.cancel_adhoc_active_child(inst, outer, nested);
+    let events = engine.cancel_adhoc_active_child(inst, outer, nested, None);
 
     // No element-completion event may carry an empty element_id.
     assert!(
@@ -4933,4 +4934,99 @@ fn cancelling_a_parent_terminates_its_catalog_only_call_activity_child() {
             .is_empty(),
         "no orphaned child job remains activatable"
     );
+}
+
+#[test]
+fn adhoc_cancel_remaining_terminates_a_two_level_subprocess_tool_depth_first() {
+    // #1528 review: a subprocess tool containing ANOTHER subprocess with an
+    // active task must terminate depth-first — every element's TERMINATING
+    // precedes all of its descendants' termination events and its TERMINATED
+    // follows them (#1535), at every nesting level.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:subProcess id="review">
+              <bpmn:startEvent id="r_s" />
+              <bpmn:subProcess id="inner">
+                <bpmn:startEvent id="i_s" />
+                <bpmn:userTask id="ask" />
+                <bpmn:endEvent id="i_e" />
+                <bpmn:sequenceFlow id="if1" sourceRef="i_s" targetRef="ask" />
+                <bpmn:sequenceFlow id="if2" sourceRef="ask" targetRef="i_e" />
+              </bpmn:subProcess>
+              <bpmn:endEvent id="r_e" />
+              <bpmn:sequenceFlow id="rf1" sourceRef="r_s" targetRef="inner" />
+              <bpmn:sequenceFlow id="rf2" sourceRef="inner" targetRef="r_e" />
+            </bpmn:subProcess>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            BTreeMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("review")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    engine.scope_scan_count.set(0);
+    let events = engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: container,
+            activate_elements: Vec::new(),
+            cancel_remaining: true,
+        })
+        .expect("cancel-remaining completes the container");
+    // Scaling guard (#1528 review): the nested teardown builds its
+    // parent → children index in ONE scope-map pass, never once per level.
+    assert_eq!(
+        engine.scope_scan_count.get(),
+        1,
+        "scope map rescanned per level"
+    );
+    let pos = |id: &str, terminating: bool| {
+        events
+            .iter()
+            .position(|e| match e {
+                Event::ElementTerminating { element_id, .. } if terminating => element_id == id,
+                Event::ElementTerminated { element_id, .. } if !terminating => element_id == id,
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("{id} terminating={terminating} missing; {events:?}"))
+    };
+    let order = [
+        pos("review", true),
+        pos("inner", true),
+        pos("ask", true),
+        pos("ask", false),
+        pos("inner", false),
+        pos("review", false),
+    ];
+    assert!(
+        order.windows(2).all(|w| w[0] < w[1]),
+        "depth-first termination order {order:?}; events: {events:?}"
+    );
+    assert!(engine.is_completed(inst));
 }

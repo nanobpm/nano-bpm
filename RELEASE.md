@@ -51,6 +51,18 @@ Do this from a clean `main` after all release-worthy PRs have merged.
 
 If the FFI ABI changed on this train, also update `EXPECTED_ABI_VERSION` in `clients/nano-bernd/src/index.ts` and `EmbeddedEngine.EXPECTED_ABI_VERSION` in `clients/nano-bernd-jvm/src/main/java/io/github/jwulf/nano/bernd/EmbeddedEngine.java`, and bump `ABI_VERSION` in `engine-core/scripts/emit-dist.mjs` + `engine-core/scripts/verify-wasm-ffi.mjs`. CI enforces the match.
 
+**Upgrade boundaries (mandatory).** Every `upgrade-boundary` entry in
+`engine-core/examples/determinism/divergence-allowlist.json` means the release
+must **not** be rolled across a cluster (Raft members re-execute committed
+commands, so a mixed-version window leaves replicas permanently divergent).
+List them — the `prev-release` determinism gate prints each as an
+`UPGRADE BOUNDARY` line (`scripts/determinism-ci.sh prev-release OUTDIR`) —
+and paste the operator-facing warning from the "Release-note line" in
+`engine-core/examples/determinism/README.md` into the release PR description
+**and** the published GitHub release notes for the gateway. The console
+changelog is generated from commit subjects and does not carry it. A release
+with an unpublished boundary warning must not be distributed.
+
 Open a PR titled e.g. `chore(release): gateway v0.0.24 + nano-bernd 0.3.0 + engine-wasm 0.10.0`, converge review, merge.
 
 ### 1a. Call out every determinism upgrade boundary in the release notes

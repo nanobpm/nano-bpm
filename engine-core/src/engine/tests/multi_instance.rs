@@ -166,6 +166,80 @@ fn early_multi_instance_completion_tears_down_a_running_subprocess_child_scope()
     );
 }
 
+/// Depth-first termination order guard (#1535, #1528 review): when an early MI
+/// completion cancels a still-running sub-process child, the child's
+/// `ElementTerminating` must precede every event of its subtree teardown (the
+/// inner job's cancellation and the inner element's termination), and its
+/// `ElementTerminated` must follow them. Previously the parent pair was appended
+/// AFTER the descendant cleanup, so the journal reported descendants terminating
+/// before their parent began terminating.
+#[test]
+fn early_multi_instance_completion_terminates_a_subprocess_child_parent_first() {
+    let def = ProcessBuilder::new("mi-sub-order")
+        .start_event("start")
+        .sub_process("each", "sub_start")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "each")
+        .service_task("inner", "work")
+        .contained_in("inner", "each")
+        .end_event("sub_end")
+        .contained_in("sub_end", "each")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("each", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub-order",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let jobs = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 2);
+    let events = engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+
+    let pos = |pred: &dyn Fn(&Event) -> bool| events.iter().position(pred);
+    let child_terminating =
+        pos(&|e| matches!(e, Event::ElementTerminating { element_id, .. } if element_id == "each"))
+            .expect("the cancelled sub-process child terminates");
+    let child_terminated =
+        pos(&|e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "each"))
+            .expect("the cancelled sub-process child terminates");
+    let job_canceled = pos(&|e| matches!(e, Event::JobCanceled { .. }))
+        .expect("the sibling inner job is cancelled");
+    let inner_terminated =
+        pos(&|e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "inner"))
+            .expect("the sibling inner task is terminated");
+    assert!(
+        child_terminating < job_canceled && child_terminating < inner_terminated,
+        "parent TERMINATING precedes its subtree teardown: {events:#?}"
+    );
+    assert!(
+        job_canceled < child_terminated && inner_terminated < child_terminated,
+        "parent TERMINATED follows its subtree teardown: {events:#?}"
+    );
+}
+
 /// Defect-class guard (dead-scope guard, multi-instance retry branches): a
 /// resolved MI input-mapping incident re-drives the *already-activated* child /
 /// body via `RetryMiChildActivation` / `RetryMiBodyActivation`, reusing existing
@@ -1892,4 +1966,158 @@ fn mi_body_output_mapping_of_child_local_output_element_does_not_publish_null() 
         Some(&Value::Null),
         "body completion published the child-local outputElement as null"
     );
+}
+
+/// #1528 (review): cancelling an MI body with N parallel user-task children must
+/// emit exactly one `UserTaskCanceled` per child — and do so from a SINGLE
+/// element-instance → user-task index built once for the teardown, not by
+/// rescanning the whole `state.user_tasks` map once per child (an O(N × tasks)
+/// blow-up that stalls the engine on a large completion condition). This test
+/// drives a 64-child cancel-remaining completion and asserts the emitted
+/// cancellation set is exactly the children's tasks (no duplicates, no orphans),
+/// which is the behaviour the shared index must preserve byte-for-byte.
+#[test]
+fn multi_instance_teardown_cancels_every_child_user_task_once() {
+    const N: i64 = 64;
+    // start -> each(MI userTask, completionCondition=true, cancelRemaining) -> done
+    let def = ProcessBuilder::new("mi-ut-teardown")
+        .start_event("start")
+        .user_task("each")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let items = Value::List((0..N).map(Value::Int).collect());
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-ut-teardown",
+            vars(&[("items", items)]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Every child parked on its own user task.
+    let created_tasks: std::collections::BTreeSet<Key> = engine
+        .state()
+        .user_tasks
+        .values()
+        .filter(|t| t.state == state::UserTaskState::Created)
+        .map(|t| t.key)
+        .collect();
+    assert_eq!(created_tasks.len(), N as usize, "one user task per child");
+
+    // Completing ONE child's task satisfies the completion condition, so the body
+    // tears the other N-1 children down.
+    let first = *created_tasks.iter().next().unwrap();
+    let events = engine
+        .apply_command(Command::complete_user_task(first))
+        .unwrap();
+
+    let canceled_events: Vec<Key> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::UserTaskCanceled { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .collect();
+    let canceled: std::collections::BTreeSet<Key> = canceled_events.iter().copied().collect();
+    assert_eq!(
+        canceled_events.len(),
+        canceled.len(),
+        "no child's task may be cancelled twice in the journal"
+    );
+    // The torn-down children are every task except the one we completed.
+    let mut expected = created_tasks.clone();
+    expected.remove(&first);
+    assert_eq!(
+        canceled, expected,
+        "each still-running child's task is cancelled exactly once (no duplicate, none missed)"
+    );
+    assert!(
+        engine
+            .state()
+            .user_tasks
+            .values()
+            .all(|t| t.state != state::UserTaskState::Created),
+        "no child user task is left Created after the teardown"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the loop's runtime record is cleared"
+    );
+
+    // The cancelled children are torn down WITHOUT completing: each reports
+    // `ElementTerminating`/`ElementTerminated` and NEVER
+    // `ElementCompleting`/`ElementCompleted` — the completed lifecycle drives
+    // completion listeners, metrics and compensation eligibility for work that
+    // did not finish (#1535; #1528 review). The COMPLETED child is only the one
+    // whose task we completed.
+    let task_to_eik: std::collections::BTreeMap<Key, Key> = engine
+        .state()
+        .user_tasks
+        .values()
+        .map(|t| (t.key, t.element_instance_key))
+        .collect();
+    let mut torn_down: Vec<Key> = expected
+        .iter()
+        .map(|task| task_to_eik[task])
+        .collect::<Vec<_>>();
+    torn_down.sort_unstable();
+    let mut terminated: Vec<Key> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ElementTerminated {
+                element_instance_key,
+                ..
+            } => Some(*element_instance_key),
+            _ => None,
+        })
+        .collect();
+    terminated.sort_unstable();
+    assert_eq!(
+        terminated, torn_down,
+        "every cancelled child is reported TERMINATED (one per torn-down child)"
+    );
+    let terminating: std::collections::BTreeSet<Key> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ElementTerminating {
+                element_instance_key,
+                ..
+            } => Some(*element_instance_key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        terminating,
+        torn_down.iter().copied().collect(),
+        "every cancelled child is reported TERMINATING"
+    );
+    for child_eik in &torn_down {
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                Event::ElementCompleting { element_instance_key, .. }
+                | Event::ElementCompleted { element_instance_key, .. }
+                if element_instance_key == child_eik
+            )),
+            "a cancelled child must never be reported COMPLETING/COMPLETED ({child_eik})"
+        );
+    }
 }

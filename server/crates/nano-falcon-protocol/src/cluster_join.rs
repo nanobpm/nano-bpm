@@ -480,8 +480,17 @@ mod tests {
             check_join(4, Some("4"), Some(&features), &[], "0.0.28", Some("0.0.28")),
             Ok(())
         );
+        // Past the NEWEST declared boundary, two adjacent releases share a
+        // region. Derived from the ledger (not a hard-coded pair) so a later
+        // boundary — e.g. one declared at v0.0.29 — cannot stale this check.
+        let newest = UPGRADE_BOUNDARIES
+            .last()
+            .and_then(|b| parse_release_triple(b.version))
+            .expect("the ledger declares at least the v0.0.28 boundary");
+        let past = format!("{}.{}.{}", newest.0, newest.1, newest.2 + 1);
+        let past_next = format!("{}.{}.{}", newest.0, newest.1, newest.2 + 2);
         assert_eq!(
-            check_join(4, Some("4"), Some(&features), &[], "0.0.29", Some("0.0.28")),
+            check_join(4, Some("4"), Some(&features), &[], &past_next, Some(&past)),
             Ok(())
         );
         assert_eq!(

@@ -207,6 +207,17 @@ pub struct Engine {
     /// Per-command scratch: reset by every `plan_command_at`. Never
     /// snapshotted.
     operation_reference: Option<i64>,
+    /// Test-only probe (#1528 review): counts every linear scan of
+    /// `state.user_tasks` a teardown performs — both the per-element `None`
+    /// fallback and every shared-index construction — so a
+    /// regression test can assert an N-member teardown scans ONCE (the shared
+    /// fallback index), never once per member. Never snapshotted; always 0 in
+    /// production builds.
+    #[cfg(test)]
+    pub(crate) user_task_scan_count: std::cell::Cell<usize>,
+    /// Test-only count of scope-map scans by `cancel_scope_tree_events`.
+    #[cfg(test)]
+    pub(crate) scope_scan_count: std::cell::Cell<usize>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -720,6 +731,10 @@ impl Engine {
             legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
+            #[cfg(test)]
+            user_task_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            scope_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
@@ -893,6 +908,10 @@ impl Engine {
             legacy_lenient_completion: false,
             terminal_deadline_stamp: None,
             operation_reference: None,
+            #[cfg(test)]
+            user_task_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            scope_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
@@ -9581,157 +9600,16 @@ impl Engine {
             // expressions declared on the element are resolved against the
             // element's scoped view at creation time.
             Some(ElementKind::UserTask(props)) => {
-                // Zeebe `BpmnUserTaskBehavior.evaluateUserTaskExpressions`: any
-                // failure is an EXTRACT_VALUE_ERROR and no task is created.
-                let ResolvedUserTask {
-                    assignee,
-                    candidate_groups,
-                    candidate_users,
-                    due_date,
-                    follow_up_date,
-                    priority,
-                } = self.resolve_user_task_props(&element_vars, &props)?;
-                let user_task_key = self.mint_key();
-                // Resolve the form linkage, enforcing the Zeebe invariant that
-                // `formId` and `externalReference` are mutually exclusive (an
-                // external reference wins and suppresses `form_key` resolution)
-                // and dispatching on the declared binding (Zeebe
-                // `BpmnUserTaskBehavior.findLinkedForm`, #1193). A
-                // `deployment`/`versionTag` miss raises a resolvable incident
-                // and creates no task: the element stays parked in ACTIVATING
-                // (the token only advances on task completion) and resolving
-                // the incident re-runs the activation body.
-                let (form_key, external_form_reference) =
-                    match self.resolve_user_task_form_linkage(instance_key, &props) {
-                        crate::engine::resolve::FormLinkage::Unbound {
-                            external_form_reference,
-                        } => (None, external_form_reference),
-                        crate::engine::resolve::FormLinkage::Resolved { form_key } => {
-                            (Some(form_key), None)
-                        }
-                        crate::engine::resolve::FormLinkage::Miss { reason } => {
-                            events.push(Event::IncidentRaised {
-                                incident_key: self.mint_key(),
-                                instance_key,
-                                element_instance_key,
-                                element_id: element_id.clone(),
-                                kind: state::IncidentKind::CalledElementError,
-                                // The form lookup runs AFTER the element's input
-                                // mappings and `start` listeners already succeeded
-                                // (#1193 review): resolution must re-run ONLY the
-                                // activation body, never re-apply the (possibly
-                                // non-idempotent, e.g. `=counter + 1 -> counter`)
-                                // inputs or re-fire the completed start listeners.
-                                // `gate_activated` re-tags this
-                                // `ActivationBodyPending` and withholds
-                                // `ElementActivated` when the token is still
-                                // ACTIVATING.
-                                redrive: Some(state::IoMappingRedrive::ActivationBody),
-                                reason,
-                                job_key: None,
-                                created_at: self.now,
-                            });
-                            return Ok((events, followups));
-                        }
-                    };
-                // An initial assignee (zeebe:assignmentDefinition) must fire the
-                // `assigning` listeners exactly as a runtime assign does (Zeebe
-                // parity: the assignee is stripped off the CREATED record and
-                // routed through an assigning transition once the task is
-                // available). With no assigning listeners the assignee stays on
-                // CREATED, keeping listener-free/plain-assignee tasks
-                // byte-identical.
-                let has_assigning_listeners = !self
-                    .task_listeners_of(
-                        instance_key,
-                        &element_id,
-                        crate::model::TaskListenerEventType::Assigning,
-                    )
-                    .is_empty();
-                let route_initial_assignee = assignee.is_some() && has_assigning_listeners;
-                let (created_assignee, deferred_initial_assignee) = if route_initial_assignee {
-                    (None, assignee)
-                } else {
-                    (assignee, None)
-                };
-                events.push(Event::UserTaskCreated {
-                    user_task_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                    created_at: self.now,
-                    assignee: created_assignee,
-                    candidate_groups,
-                    candidate_users,
-                    due_date,
-                    follow_up_date,
-                    priority,
-                    form_key,
-                    external_form_reference,
-                });
-                // Creating task listeners (ADR 0037 §6): the task record exists
-                // but is not yet available for work until the creating chain
-                // drains. The pending transition blocks assign/complete/update
-                // meanwhile. Listener-free user tasks skip this entirely.
-                let creating = self.task_listeners_of(
+                if !self.activate_user_task(
+                    &mut events,
                     instance_key,
                     &element_id,
-                    crate::model::TaskListenerEventType::Creating,
-                );
-                if let Some(first) = creating.first().cloned() {
-                    let pending = state::PendingUserTaskTransition {
-                        event_type: crate::model::TaskListenerEventType::Creating,
-                        // Carried through the creating chain, then routed into an
-                        // assigning transition when creating drains.
-                        assignee: deferred_initial_assignee,
-                        update: None,
-                        variables: std::collections::BTreeMap::new(),
-                        corrections: crate::model::UserTaskCorrections::default(),
-                    };
-                    events.extend(self.start_task_listener_chain(
-                        user_task_key,
-                        instance_key,
-                        element_instance_key,
-                        &element_id,
-                        crate::model::TaskListenerEventType::Creating,
-                        pending,
-                        &first,
-                        // The task's input mappings were staged but not yet
-                        // applied when this chain starts: the first listener's
-                        // `type`/`retries` resolve against the post-input view
-                        // (#1398 review).
-                        Some(&element_vars),
-                    ));
-                } else if let Some(initial) = deferred_initial_assignee {
-                    // No creating listeners: the task is available at once, so the
-                    // initial assignee's assigning transition starts immediately.
-                    let assigning = self.task_listeners_of(
-                        instance_key,
-                        &element_id,
-                        crate::model::TaskListenerEventType::Assigning,
-                    );
-                    if let Some(first) = assigning.first().cloned() {
-                        let pending = state::PendingUserTaskTransition {
-                            event_type: crate::model::TaskListenerEventType::Assigning,
-                            assignee: Some(initial),
-                            update: None,
-                            variables: std::collections::BTreeMap::new(),
-                            corrections: crate::model::UserTaskCorrections::default(),
-                        };
-                        events.extend(self.start_task_listener_chain(
-                            user_task_key,
-                            instance_key,
-                            element_instance_key,
-                            &element_id,
-                            crate::model::TaskListenerEventType::Assigning,
-                            pending,
-                            &first,
-                            // Same staged post-input view as the creating chain
-                            // above (the initial assignee's assigning chain also
-                            // starts before the input writes land).
-                            Some(&element_vars),
-                        ));
-                    }
+                    element_instance_key,
+                    &element_vars,
+                    &props,
+                    state::IoMappingRedrive::ActivationBody,
+                )? {
+                    return Ok((events, followups));
                 }
                 self.arm_boundaries_preserving_host(
                     &mut events,
@@ -10618,7 +10496,14 @@ impl Engine {
         child_vars: &BTreeMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let key_mark = self.next_local;
-        match self.try_mi_child_behaviour(instance_key, element_id.clone(), child_key, child_vars) {
+        match self.try_mi_child_behaviour(
+            instance_key,
+            element_id.clone(),
+            body_key,
+            child_key,
+            child_index,
+            child_vars,
+        ) {
             Ok(planned) => planned,
             Err(failure) => {
                 self.next_local = key_mark;
@@ -10637,11 +10522,187 @@ impl Engine {
         }
     }
 
+    /// Creates the user task for an activated `userTask` element instance —
+    /// resolving its assignment/scheduling/priority expressions and form
+    /// linkage against `element_vars`, emitting `UserTaskCreated`, and starting
+    /// the creating (or initial-assigning) task-listener chain. Shared by the
+    /// normal activation path and multi-instance children (#1528) so both
+    /// create the identical record. Boundary arming is the caller's concern.
+    ///
+    /// Returns `Ok(false)` when a form-linkage miss raised an incident (tagged
+    /// with `form_miss_redrive`) and no task was created.
+    #[allow(clippy::too_many_arguments)]
+    fn activate_user_task(
+        &mut self,
+        events: &mut Vec<Event>,
+        instance_key: Key,
+        element_id: &str,
+        element_instance_key: Key,
+        element_vars: &BTreeMap<String, Value>,
+        props: &crate::model::UserTaskProps,
+        form_miss_redrive: state::IoMappingRedrive,
+    ) -> Result<bool, expression::Failure> {
+        // Zeebe `BpmnUserTaskBehavior.evaluateUserTaskExpressions`: any
+        // failure is an EXTRACT_VALUE_ERROR and no task is created.
+        let ResolvedUserTask {
+            assignee,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
+        } = self.resolve_user_task_props(element_vars, props)?;
+        let user_task_key = self.mint_key();
+        // Resolve the form linkage, enforcing the Zeebe invariant that
+        // `formId` and `externalReference` are mutually exclusive (an
+        // external reference wins and suppresses `form_key` resolution)
+        // and dispatching on the declared binding (Zeebe
+        // `BpmnUserTaskBehavior.findLinkedForm`, #1193). A
+        // `deployment`/`versionTag` miss raises a resolvable incident
+        // and creates no task: the element stays parked in ACTIVATING
+        // (the token only advances on task completion) and resolving
+        // the incident re-runs the activation body.
+        let (form_key, external_form_reference) = match self
+            .resolve_user_task_form_linkage(instance_key, props)
+        {
+            crate::engine::resolve::FormLinkage::Unbound {
+                external_form_reference,
+            } => (None, external_form_reference),
+            crate::engine::resolve::FormLinkage::Resolved { form_key } => (Some(form_key), None),
+            crate::engine::resolve::FormLinkage::Miss { reason } => {
+                events.push(Event::IncidentRaised {
+                    incident_key: self.mint_key(),
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.to_string(),
+                    kind: state::IncidentKind::CalledElementError,
+                    // The form lookup runs AFTER the element's input
+                    // mappings and `start` listeners already succeeded
+                    // (#1193 review): resolution must re-run ONLY the
+                    // activation body, never re-apply the (possibly
+                    // non-idempotent, e.g. `=counter + 1 -> counter`)
+                    // inputs or re-fire the completed start listeners.
+                    // `gate_activated` re-tags this
+                    // `ActivationBodyPending` and withholds
+                    // `ElementActivated` when the token is still
+                    // ACTIVATING.
+                    redrive: Some(form_miss_redrive),
+                    reason,
+                    job_key: None,
+                    created_at: self.now,
+                });
+                return Ok(false);
+            }
+        };
+        // An initial assignee (zeebe:assignmentDefinition) must fire the
+        // `assigning` listeners exactly as a runtime assign does (Zeebe
+        // parity: the assignee is stripped off the CREATED record and
+        // routed through an assigning transition once the task is
+        // available). With no assigning listeners the assignee stays on
+        // CREATED, keeping listener-free/plain-assignee tasks
+        // byte-identical.
+        let has_assigning_listeners = !self
+            .task_listeners_of(
+                instance_key,
+                element_id,
+                crate::model::TaskListenerEventType::Assigning,
+            )
+            .is_empty();
+        let route_initial_assignee = assignee.is_some() && has_assigning_listeners;
+        let (created_assignee, deferred_initial_assignee) = if route_initial_assignee {
+            (None, assignee)
+        } else {
+            (assignee, None)
+        };
+        events.push(Event::UserTaskCreated {
+            user_task_key,
+            instance_key,
+            element_instance_key,
+            element_id: element_id.to_string(),
+            created_at: self.now,
+            assignee: created_assignee,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
+            form_key,
+            external_form_reference,
+        });
+        // Creating task listeners (ADR 0037 §6): the task record exists
+        // but is not yet available for work until the creating chain
+        // drains. The pending transition blocks assign/complete/update
+        // meanwhile. Listener-free user tasks skip this entirely.
+        let creating = self.task_listeners_of(
+            instance_key,
+            element_id,
+            crate::model::TaskListenerEventType::Creating,
+        );
+        if let Some(first) = creating.first().cloned() {
+            let pending = state::PendingUserTaskTransition {
+                event_type: crate::model::TaskListenerEventType::Creating,
+                // Carried through the creating chain, then routed into an
+                // assigning transition when creating drains.
+                assignee: deferred_initial_assignee,
+                update: None,
+                variables: std::collections::BTreeMap::new(),
+                corrections: crate::model::UserTaskCorrections::default(),
+            };
+            events.extend(self.start_task_listener_chain(
+                user_task_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                crate::model::TaskListenerEventType::Creating,
+                pending,
+                &first,
+                // The task's input mappings were staged but not yet
+                // applied when this chain starts: the first listener's
+                // `type`/`retries` resolve against the post-input view
+                // (#1398 review).
+                Some(element_vars),
+            ));
+        } else if let Some(initial) = deferred_initial_assignee {
+            // No creating listeners: the task is available at once, so the
+            // initial assignee's assigning transition starts immediately.
+            let assigning = self.task_listeners_of(
+                instance_key,
+                element_id,
+                crate::model::TaskListenerEventType::Assigning,
+            );
+            if let Some(first) = assigning.first().cloned() {
+                let pending = state::PendingUserTaskTransition {
+                    event_type: crate::model::TaskListenerEventType::Assigning,
+                    assignee: Some(initial),
+                    update: None,
+                    variables: std::collections::BTreeMap::new(),
+                    corrections: crate::model::UserTaskCorrections::default(),
+                };
+                events.extend(self.start_task_listener_chain(
+                    user_task_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    crate::model::TaskListenerEventType::Assigning,
+                    pending,
+                    &first,
+                    // Same staged post-input view as the creating chain
+                    // above (the initial assignee's assigning chain also
+                    // starts before the input writes land).
+                    Some(element_vars),
+                ));
+            }
+        }
+        Ok(true)
+    }
+
     fn try_mi_child_behaviour(
         &mut self,
         instance_key: Key,
         element_id: String,
+        body_key: Key,
         child_key: Key,
+        child_index: usize,
         child_vars: &BTreeMap<String, Value>,
     ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let mut events = Vec::new();
@@ -10821,6 +10882,26 @@ impl Engine {
                 );
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
+            }
+            // A multi-instance child that is a USER TASK creates its own user
+            // task and parks on it — exactly like a normally-activated user task
+            // (see `try_activation_body`), minus the per-child boundary arming
+            // (boundaries live on the body). Completing the task routes the child
+            // back through `complete` → `complete_mi_child` (#1528). A form
+            // linkage miss re-runs only this child's behaviour on resolve.
+            Some(ElementKind::UserTask(props)) => {
+                self.activate_user_task(
+                    &mut events,
+                    instance_key,
+                    &element_id,
+                    child_key,
+                    child_vars,
+                    &props,
+                    state::IoMappingRedrive::MiChildBehaviour {
+                        body_key,
+                        index: child_index,
+                    },
+                )?;
             }
             _ => {
                 followups.push(Step::Complete {
@@ -11326,6 +11407,13 @@ impl Engine {
 
         let mut events = Vec::new();
         // Cancel any children still running (reached here via completion condition).
+        // Build the element-instance → `Created` user-task index ONCE for this
+        // teardown and share it across every per-child cancellation below, so an
+        // N-child teardown is O(total user tasks + N) rather than each child
+        // rescanning the whole `state.user_tasks` map (#1528 review). The index
+        // preserves per-bucket key order, so the emitted events are unchanged.
+        let user_tasks_by_eik =
+            (!active.is_empty()).then(|| self.created_user_tasks_by_element_instance(instance_key));
         // An ad-hoc container child (a JOB_WORKER ad-hoc MI child, #1170) owns its
         // OWN active tool scope (`adhoc_instances[child].active`), its agent job,
         // and an `adhoc_instances` runtime record — none of which the leaf-only
@@ -11337,9 +11425,18 @@ impl Engine {
         // `cancel_adhoc_active_child` (recurses tools, emits `AdHocCompleted`)
         // instead, using the body as the enclosing container key; a non-ad-hoc
         // child (service task, sub-process, call activity) keeps the leaf path.
+        // Scopes to flag torn down for this drain; applied AFTER the loop because
+        // `user_tasks_by_eik` borrows `self.state` immutably for its duration, so
+        // the `&mut self.torn_down_scopes` inserts must wait until it is dropped.
+        let mut torn_down: Vec<Key> = Vec::new();
         for child in &active {
             if self.is_adhoc_container(instance_key, *child) {
-                events.extend(self.cancel_adhoc_active_child(instance_key, body_key, *child));
+                events.extend(self.cancel_adhoc_active_child(
+                    instance_key,
+                    body_key,
+                    *child,
+                    user_tasks_by_eik.as_ref(),
+                ));
             } else {
                 // A non-ad-hoc MI child may itself be an embedded SUB-PROCESS that
                 // opened its OWN token scope with an inner flow (inner jobs, timers,
@@ -11359,11 +11456,21 @@ impl Engine {
                 // still-queued inner activation cannot recreate a token inside the
                 // dead scope (the per-drain dead-scope guard), and finally complete
                 // the child element instance itself (#1170).
-                events.extend(self.scope_teardown_events(instance_key, *child));
-                self.torn_down_scopes.insert(*child);
-                events.extend(self.cancel_mi_child_events(instance_key, *child));
+                // The descendants' teardown is nested INSIDE the child's
+                // TERMINATING/TERMINATED pair (Zeebe depth-first order, #1535).
+                let inner =
+                    self.scope_teardown_events(instance_key, *child, user_tasks_by_eik.as_ref());
+                torn_down.push(*child);
+                events.extend(self.cancel_mi_child_events(
+                    instance_key,
+                    *child,
+                    inner,
+                    user_tasks_by_eik.as_ref(),
+                ));
             }
         }
+        drop(user_tasks_by_eik);
+        self.torn_down_scopes.extend(torn_down);
         // Disarm every boundary event armed on the BODY as the loop enters
         // completion (before end listeners, mirroring the sub-process/ad-hoc
         // completion paths). An interrupting boundary on an MI activity is armed
@@ -11562,14 +11669,112 @@ impl Engine {
         (events, followups)
     }
 
+    /// Indexes every `Created` user task by its owning element-instance key, for
+    /// a single teardown pass. Building this once and sharing it across the
+    /// per-child cancellation steps turns an N-child teardown from O(N ×
+    /// total user tasks) — each child rescanning the whole `state.user_tasks`
+    /// map — into O(total user tasks + N) (#1528 review). Each bucket preserves
+    /// ascending key order (the source map is key-ordered), so the events a
+    /// bucket drives stay byte-identical to the per-call scan they replace.
+    ///
+    /// Only tasks of `instance_key` are indexed: a teardown never reaches
+    /// another instance's tasks through this index, so unrelated backlog is not
+    /// copied into it (#1528 review).
+    fn created_user_tasks_by_element_instance(
+        &self,
+        instance_key: Key,
+    ) -> BTreeMap<Key, Vec<&state::UserTask>> {
+        #[cfg(test)]
+        self.user_task_scan_count
+            .set(self.user_task_scan_count.get() + 1);
+        let mut index: BTreeMap<Key, Vec<&state::UserTask>> = BTreeMap::new();
+        for task in self.state.user_tasks.values() {
+            if task.instance_key == instance_key && task.state == state::UserTaskState::Created {
+                index
+                    .entry(task.element_instance_key)
+                    .or_default()
+                    .push(task);
+            }
+        }
+        index
+    }
+
+    /// Tears down `root` and every element instance nested inside it,
+    /// depth-first: each element's TERMINATING precedes the teardown of its
+    /// DIRECT scope children (recursively), and its TERMINATED follows them
+    /// (#1535 / #1528 review). Children are visited in key order.
+    fn cancel_scope_tree_events(
+        &self,
+        instance_key: Key,
+        root: Key,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+    ) -> Vec<Event> {
+        // Build the parent → direct-children index ONCE (a single pass over the
+        // instance's scope map) and recurse over it, so an N-deep tool is
+        // O(scopes + N) rather than rescanning the scope map at every level
+        // (#1528 review). `scopes` is key-ordered, so each child list is too.
+        let mut children: BTreeMap<Key, Vec<Key>> = BTreeMap::new();
+        if let Some(instance) = self.state.instances.get(&instance_key) {
+            #[cfg(test)]
+            self.scope_scan_count.set(self.scope_scan_count.get() + 1);
+            for (child, parent) in &instance.scopes {
+                children.entry(*parent).or_default().push(*child);
+            }
+        }
+        self.cancel_scope_subtree_events(instance_key, root, &children, user_tasks_by_eik)
+    }
+
+    fn cancel_scope_subtree_events(
+        &self,
+        instance_key: Key,
+        root: Key,
+        children: &BTreeMap<Key, Vec<Key>>,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+    ) -> Vec<Event> {
+        let mut inner = Vec::new();
+        for &d in children.get(&root).map(Vec::as_slice).unwrap_or_default() {
+            inner.extend(self.cancel_scope_subtree_events(
+                instance_key,
+                d,
+                children,
+                user_tasks_by_eik,
+            ));
+        }
+        self.cancel_mi_child_events(instance_key, root, inner, user_tasks_by_eik)
+    }
+
     /// Builds the events that cancel a still-running multi-instance child (its job
-    /// and element instance), for an early body completion. Returns events (it
-    /// does not emit) so it composes inside a `process_step` result.
-    fn cancel_mi_child_events(&self, instance_key: Key, child_eik: Key) -> Vec<Event> {
-        let mut events = Vec::new();
+    /// and element instance), for an early body completion. The child is torn down
+    /// WITHOUT completing, so its element lifecycle is
+    /// `ElementTerminating`/`ElementTerminated` (Zeebe writes TERMINATED for a
+    /// cancelled instance, #1535) — never `ElementCompleting`/`ElementCompleted`,
+    /// which would report unfinished work as completed (#1528 review). Returns
+    /// events (it does not emit) so it composes inside a `process_step` result.
+    ///
+    /// `user_tasks_by_eik` is the per-teardown element-instance → `Created`
+    /// user-task index built once by [`Self::complete_multi_instance_body`] (see
+    /// [`Self::created_user_tasks_by_element_instance`]); `None` (the default for
+    /// callers outside that teardown) falls back to scanning `state.user_tasks`.
+    fn cancel_mi_child_events(
+        &self,
+        instance_key: Key,
+        child_eik: Key,
+        inner: Vec<Event>,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+    ) -> Vec<Event> {
         let element_id = self
             .element_id_of_instance(instance_key, child_eik)
             .unwrap_or_default();
+        // Depth-first termination order (#1535): the child's TERMINATING comes
+        // FIRST — before its callee, its `inner` descendant teardown and its own
+        // resource cleanup — and its TERMINATED last, so no descendant/callee
+        // termination is ever reported before its parent began terminating
+        // (#1528 review). `ElementTerminating` is a state no-op, so moving it
+        // ahead of the cleanup changes only the journal order.
+        let [terminating, terminated] =
+            boundary::termination_events(instance_key, child_eik, element_id);
+        let mut events = vec![terminating];
+        events.extend(inner);
         // A call-activity MI child parks its token on a distinct callee PROCESS
         // INSTANCE. The `cancel_all_*_on(child_eik)` sweeps below only reach
         // resources owned by this child element instance, never the separate
@@ -11598,18 +11803,27 @@ impl Engine {
         // not touch it), orphaning the task. This surfaces when an embedded
         // subProcess tool body holds an open user task while its container is
         // cancel-remaining'd (#872). A leaf (non-user-task) child has no such
-        // entry, so this is a no-op there.
-        if let Some(user_task_key) = self
-            .state
-            .user_tasks
-            .values()
-            .find(|t| {
-                t.instance_key == instance_key
-                    && t.element_instance_key == child_eik
-                    && t.state == state::UserTaskState::Created
-            })
-            .map(|t| t.key)
-        {
+        // entry, so this is a no-op there. The lookup uses the per-teardown
+        // index when one was built (the common cancel-remaining path), so an
+        // N-child teardown is O(N) overall rather than scanning every retained
+        // user task once per child (#1528 review).
+        let parked = match user_tasks_by_eik {
+            Some(index) => index
+                .get(&child_eik)
+                .and_then(|tasks| tasks.iter().find(|t| t.instance_key == instance_key))
+                .map(|t| t.key),
+            None => self
+                .state
+                .user_tasks
+                .values()
+                .find(|t| {
+                    t.instance_key == instance_key
+                        && t.element_instance_key == child_eik
+                        && t.state == state::UserTaskState::Created
+                })
+                .map(|t| t.key),
+        };
+        if let Some(user_task_key) = parked {
             events.push(Event::UserTaskCanceled {
                 user_task_key,
                 instance_key,
@@ -11631,16 +11845,14 @@ impl Engine {
         // byte-identical in the common case — mirrors the interrupting-boundary
         // teardown's body-root incident resolution.
         events.extend(self.resolve_incidents_on(instance_key, child_eik));
-        events.push(Event::ElementCompleting {
-            instance_key,
-            element_instance_key: child_eik,
-            element_id: element_id.clone(),
-        });
-        events.push(Event::ElementCompleted {
-            instance_key,
-            element_instance_key: child_eik,
-            element_id,
-        });
+        // The child is CANCELLED (its completion condition's remaining instances,
+        // an ad-hoc container torn down early), not completed: report it with
+        // `ElementTerminating`/`ElementTerminated` — never
+        // `ElementCompleting`/`ElementCompleted`, which drive completion
+        // listeners, metrics and compensation eligibility for work that did not
+        // finish (#1535, Zeebe's TERMINATED lifecycle for torn-down elements;
+        // #1528 review).
+        events.push(terminated);
         events
     }
 
@@ -11663,6 +11875,7 @@ impl Engine {
         instance_key: Key,
         container_key: Key,
         child: Key,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
     ) -> Vec<Event> {
         let mut events = Vec::new();
         // Is this active child itself a nested ad-hoc container (#631)? If so it
@@ -11683,8 +11896,18 @@ impl Engine {
             // may themselves be nested containers), then disarm the nested
             // container's own agent job and any boundary state, complete its
             // element instance, and drop its ad-hoc runtime state.
+            // TERMINATING first: the grandchildren's teardown nests inside the
+            // container's TERMINATING/TERMINATED pair (#1535 depth-first order).
+            let [terminating, terminated] =
+                boundary::termination_events(instance_key, child, nested_element_id);
+            events.push(terminating);
             for grandchild in &nested_active {
-                events.extend(self.cancel_adhoc_active_child(instance_key, child, *grandchild));
+                events.extend(self.cancel_adhoc_active_child(
+                    instance_key,
+                    child,
+                    *grandchild,
+                    user_tasks_by_eik,
+                ));
             }
             if let Some(job_key) = self.active_job_on(child) {
                 events.push(Event::JobCanceled {
@@ -11708,16 +11931,10 @@ impl Engine {
             // keeps it cancelled. Yields nothing when the container has no
             // incident, so the behaviour is byte-identical in the common case.
             events.extend(self.resolve_incidents_on(instance_key, child));
-            events.push(Event::ElementCompleting {
-                instance_key,
-                element_instance_key: child,
-                element_id: nested_element_id.clone(),
-            });
-            events.push(Event::ElementCompleted {
-                instance_key,
-                element_instance_key: child,
-                element_id: nested_element_id,
-            });
+            // The nested container is CANCELLED with its MI body, not completed:
+            // terminate its element instance (#1535) rather than report it as
+            // completed (#1528 review — same class as `cancel_mi_child_events`).
+            events.push(terminated);
             events.push(Event::AdHocCompleted {
                 instance_key,
                 container_key: child,
@@ -11732,10 +11949,12 @@ impl Engine {
             // element instance itself, so cancelling the container leaves nothing
             // dangling. `scope_descendants` is empty for a leaf tool, so this is a
             // no-op there and the leaf behaviour is byte-identical.
-            for descendant in self.scope_descendants(instance_key, child) {
-                events.extend(self.cancel_mi_child_events(instance_key, descendant));
-            }
-            events.extend(self.cancel_mi_child_events(instance_key, child));
+            // The body descendants are torn down INSIDE the subProcess tool's
+            // TERMINATING/TERMINATED pair (#1535 depth-first order).
+            // Each nested scope level's teardown is itself nested inside its own
+            // parent's pair (recursively), so a multi-level tool stays
+            // depth-first (#1528 review).
+            events.extend(self.cancel_scope_tree_events(instance_key, child, user_tasks_by_eik));
         }
         // A `callActivity` tool (issue #1159) is a leaf in the ad-hoc scope tree
         // but drives a distinct CHILD PROCESS INSTANCE hanging off this tool
@@ -13721,11 +13940,14 @@ impl Engine {
             // own live tools down (each hangs off a dedicated inner instance)
             // before the child completes; a natural completion has none active.
             if cancel {
+                let user_tasks_by_eik = (!active.is_empty())
+                    .then(|| self.created_user_tasks_by_element_instance(instance_key));
                 for child in &active {
                     events.extend(self.cancel_adhoc_active_child(
                         instance_key,
                         container_key,
                         *child,
+                        user_tasks_by_eik.as_ref(),
                     ));
                 }
                 // Resolve any incident parked on the CONTAINER itself (a failed
@@ -13781,8 +14003,15 @@ impl Engine {
         // descendants + agent job + ad-hoc state), which `cancel_adhoc_active_child`
         // handles — cancelling it as a leaf would orphan its internals.
         if cancel {
+            let user_tasks_by_eik = (!active.is_empty())
+                .then(|| self.created_user_tasks_by_element_instance(instance_key));
             for child in &active {
-                events.extend(self.cancel_adhoc_active_child(instance_key, container_key, *child));
+                events.extend(self.cancel_adhoc_active_child(
+                    instance_key,
+                    container_key,
+                    *child,
+                    user_tasks_by_eik.as_ref(),
+                ));
             }
             // Resolve any incident parked on the CONTAINER itself (a failed
             // pre-creation tool activation, #1390) before its state is torn
@@ -15103,7 +15332,7 @@ impl Engine {
                 let [terminating, terminated] =
                     boundary::termination_events(instance_key, torn_eik, torn_element_id.clone());
                 events.push(terminating);
-                for event in self.scope_teardown_events(instance_key, torn_eik) {
+                for event in self.scope_teardown_events(instance_key, torn_eik, None) {
                     if matches!(
                         &event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
@@ -15265,7 +15494,7 @@ impl Engine {
                     caught_element_id.clone(),
                 );
                 events.push(terminating);
-                for event in self.scope_teardown_events(instance_key, caught_eik) {
+                for event in self.scope_teardown_events(instance_key, caught_eik, None) {
                     if matches!(
                         &event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
@@ -15882,7 +16111,7 @@ impl Engine {
             element_id,
         }];
         events.extend(
-            self.scope_teardown_events(instance_key, scope)
+            self.scope_teardown_events(instance_key, scope, None)
                 .into_iter()
                 .filter(|event| {
                     !matches!(
