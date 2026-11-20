@@ -32,7 +32,7 @@
 //!   command-commit/ack path. The default (no-`console`) build never compiles this
 //!   module.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
 use nanobpmn_engine_core::{Event, Value};
@@ -221,11 +221,31 @@ struct InstanceTrace {
     /// event is immediately followed by its variable merge, if any). Bounded to
     /// the immediate aftermath: cleared once the token advances past the element.
     pending_stimulus: Option<usize>,
-    /// Message correlations awaiting their payload write, in correlation order.
-    /// One message can match several boundary hosts; every `MessageCorrelated`
-    /// precedes the queued payload writes, so each payload pops the oldest
-    /// (#1535 review). Cleared with `pending_stimulus` once the token advances.
+    /// Boundary message correlations awaiting their boundary's payload SEED, in
+    /// correlation order. One message can match several boundary hosts: every
+    /// `MessageCorrelated` precedes the queued boundary activations, and each
+    /// activation seeds its payload LOCAL to the fresh boundary instance, so
+    /// each seed pops the oldest (#1535 review).
     pending_messages: VecDeque<usize>,
+    /// The correlation just recorded whose payload, if any, is merged
+    /// directly (an intermediate catch): the variable writes immediately after
+    /// `MessageCorrelated`, accumulated. Closed by the next non-variable event;
+    /// a correlation that got no direct payload then awaits a boundary seed.
+    direct_message: Option<(usize, BTreeMap<String, Value>)>,
+    /// The element instance most recently activated — a scope-local write to
+    /// it right after activation is a boundary payload seed.
+    last_activated: Option<u64>,
+    /// Boundary instances whose payload was seeded and that have not exited,
+    /// so their completion can open the output-mapping window.
+    seeded: BTreeSet<u64>,
+    /// Set by a boundary seed: the propagation writes of that same payload
+    /// that immediately follow are engine-internal. Closed by the next
+    /// non-variable event (so a parked boundary never swallows later inputs).
+    propagation_window: bool,
+    /// Set by a seeded boundary's `ElementCompleted`: the output-mapping writes
+    /// that immediately follow are engine-internal. Closed by the next
+    /// non-variable event.
+    mapping_window: bool,
     /// Set once the per-instance stimulus cap is hit.
     stimuli_truncated: bool,
 }
@@ -542,6 +562,15 @@ impl Inner {
     }
 
     fn apply(&mut self, ev: &Event, now: u64) {
+        // Any non-variable event closes the immediate-aftermath windows used to
+        // attribute message payloads (see `InstanceTrace::direct_message`).
+        if !matches!(
+            ev,
+            Event::VariablesUpdated { .. } | Event::ScopedVariablesUpdated { .. }
+        ) && let Some(t) = ev.instance_key().and_then(|k| self.instances.get_mut(&k))
+        {
+            t.close_payload_windows();
+        }
         match ev {
             Event::ProcessDeployed {
                 version, process, ..
@@ -603,6 +632,11 @@ impl Inner {
                     },
                     pending_stimulus: None,
                     pending_messages: VecDeque::new(),
+                    direct_message: None,
+                    last_activated: None,
+                    seeded: BTreeSet::new(),
+                    mapping_window: false,
+                    propagation_window: false,
                     stimuli_truncated: false,
                 };
                 self.insert(*instance_key, trace);
@@ -623,9 +657,11 @@ impl Inner {
                     // Tier 2: attribute this delta to the completion it followed
                     // (a job/user-task output or a message payload). With no
                     // pending completion it is a standalone set-variables delta.
-                    if self.capture_stimuli {
+                    if self.capture_stimuli
+                        && !t.absorb_message_write(variables, self.vars_max_bytes)
+                    {
                         let snap = snapshot_vars(variables, self.vars_max_bytes);
-                        match t.take_pending() {
+                        match t.pending_stimulus.take() {
                             Some(idx) => t.attach_payload(idx, snap),
                             None => {
                                 t.record_stimulus(
@@ -642,8 +678,8 @@ impl Inner {
             }
             Event::ScopedVariablesUpdated {
                 instance_key,
+                scope_key,
                 variables,
-                ..
             } => {
                 // A scope-local payload (Part C hierarchical scoping) — e.g. an
                 // output-mapped message-boundary payload propagated to its flow
@@ -656,12 +692,21 @@ impl Inner {
                     && let Some(t) = self.instances.get_mut(instance_key)
                 {
                     t.last_at = now;
-                    // Only an awaited external payload is captured here: a scoped
-                    // write with nothing pending is an engine-internal local
-                    // (input mapping / initialization), never a replay input.
-                    if let Some(idx) = t.take_pending() {
+                    // Only an external payload is captured here: a boundary seed
+                    // (a write local to the freshly activated boundary instance
+                    // with a correlation awaiting it) or a direct catch merge.
+                    // Anything else — input mappings, propagation, output
+                    // mappings — is engine-internal, never a replay input.
+                    let seed = t.direct_message.is_none()
+                        && t.last_activated == Some(*scope_key)
+                        && !t.seeded.contains(scope_key);
+                    if seed && let Some(idx) = t.pending_messages.pop_front() {
                         let snap = snapshot_vars(variables, self.vars_max_bytes);
                         t.attach_payload(idx, snap);
+                        t.seeded.insert(*scope_key);
+                        t.propagation_window = true;
+                    } else {
+                        t.absorb_message_write(variables, self.vars_max_bytes);
                     }
                 }
             }
@@ -697,6 +742,7 @@ impl Inner {
                     t.last_at = now;
                     let idx = t.element_mut(*element_instance_key, element_id, now);
                     t.elements[idx].scope = *scope;
+                    t.last_activated = Some(*element_instance_key);
                 }
             }
             Event::ElementTerminated {
@@ -710,6 +756,7 @@ impl Inner {
                     if let Some(&idx) = t.by_eik.get(element_instance_key) {
                         t.elements[idx].exited_at = Some(now);
                     }
+                    t.seeded.remove(element_instance_key);
                 }
             }
             Event::ElementCompleted {
@@ -726,7 +773,9 @@ impl Inner {
                     // completion still awaiting an output had none — stop a later
                     // unrelated delta from being mis-attributed to it.
                     t.pending_stimulus = None;
-                    t.pending_messages.clear();
+                    // A seeded boundary's output-mapping writes follow its
+                    // completion; they are engine-internal (#1535 review).
+                    t.mapping_window = t.seeded.remove(element_instance_key);
                 }
             }
             Event::JobCreated {
@@ -908,7 +957,7 @@ impl Inner {
                         now,
                         self.stimuli_max,
                     );
-                    t.pending_messages.extend(idx);
+                    t.direct_message = idx.map(|i| (i, BTreeMap::new()));
                 }
             }
             Event::RemoteMessageCorrelation {
@@ -1146,11 +1195,31 @@ impl InstanceTrace {
     /// Appends a recorded-input stimulus, honouring the per-instance cap. Returns
     /// the new index (so a completion's deferred output can be attached later) or
     /// `None` when capture is off or the cap was reached.
-    /// The oldest awaited message correlation, else the pending completion.
-    fn take_pending(&mut self) -> Option<usize> {
-        self.pending_messages
-            .pop_front()
-            .or_else(|| self.pending_stimulus.take())
+    /// Closes the immediate-aftermath windows on a non-variable event: a
+    /// correlation that received no direct payload now awaits a boundary seed.
+    fn close_payload_windows(&mut self) {
+        self.mapping_window = false;
+        self.propagation_window = false;
+        if let Some((idx, raw)) = self.direct_message.take()
+            && raw.is_empty()
+        {
+            self.pending_messages.push_back(idx);
+        }
+    }
+
+    /// Consumes a variable write that belongs to message-payload handling:
+    /// a direct catch merge (accumulated onto its correlation, since a split
+    /// scope merge may emit several writes) or an engine-internal propagation /
+    /// output mapping of a seeded boundary payload (dropped). Returns whether
+    /// the write was consumed.
+    fn absorb_message_write(&mut self, vars: &BTreeMap<String, Value>, max: usize) -> bool {
+        if let Some((idx, raw)) = self.direct_message.as_mut() {
+            raw.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+            let (idx, snap) = (*idx, snapshot_vars(raw, max));
+            self.attach_payload(idx, snap);
+            return true;
+        }
+        self.mapping_window || self.propagation_window
     }
 
     fn attach_payload(&mut self, idx: usize, snap: VarSnapshot) {
@@ -1796,49 +1865,116 @@ mod tests {
         assert!(stimuli[2].variables.is_none(), "timer carries no payload");
     }
 
-    /// #1535 (review): an output-mapped message boundary propagates its payload
-    /// to the flow scope as `ScopedVariablesUpdated` (not `VariablesUpdated`).
-    /// The stimulus attribution must capture that delta, or the payload is lost
-    /// from the recorded inputs and the trace cannot reproduce the mapping.
-    #[test]
-    fn output_mapped_message_boundary_payload_is_captured() {
-        let store = TraceStore::with_capture(8, 16 * 1024, 1024);
-        store.ingest(&[&created(1, &[("a", Value::Int(1))])], 1000);
-        // A message boundary correlates, then its output-mapped payload lands
-        // in the boundary's flow scope via ScopedVariablesUpdated.
-        store.ingest(
-            &[
-                &Event::MessageCorrelated {
-                    subscription_key: 5,
-                    message_key: 6,
-                    instance_key: 1,
-                    element_instance_key: 3,
-                    element_id: "msg-boundary".into(),
-                },
-                &scoped_vars_updated(1, 3, &[("mappedReason", Value::Str("r-1".into()))]),
-            ],
-            1030,
-        );
-
-        let stimuli = store.get(1).unwrap().stimuli.expect("stimuli log");
-        assert_eq!(stimuli.len(), 1);
-        assert_eq!(stimuli[0].kind, "message");
-        assert_eq!(stimuli[0].reference.as_deref(), Some("msg-boundary"));
-        assert_eq!(
-            stimuli[0]
-                .variables
-                .as_ref()
-                .unwrap()
-                .values
-                .as_ref()
-                .unwrap()["mappedReason"],
-            serde_json::json!("r-1"),
-            "the scope-local payload is attributed to the message correlation"
-        );
-    }
-
     fn payload(st: &StimulusDto, k: &str) -> serde_json::Value {
         st.variables.as_ref().unwrap().values.as_ref().unwrap()[k].clone()
+    }
+
+    /// Drives a REAL engine (not a hand-written stream, #1535 review): a task
+    /// `work` guarded by an interrupting message boundary `cancel` (optionally
+    /// output-mapped `=payload -> mapped`), entered by one token or — via a
+    /// parallel fork — by TWO tokens in the same scope, so one message matches
+    /// two boundary hosts. Returns the trace store fed the full event stream
+    /// with the correlation of `{payload: 42}`.
+    fn boundary_run(output_mapped: bool, two_hosts: bool, stimuli_max: usize) -> TraceStore {
+        use nanobpmn_engine_core::{Command, Engine, IoMapping, Mapping, ProcessBuilder};
+        let mut b = ProcessBuilder::new("p").start_event("start");
+        if two_hosts {
+            b = b.parallel_gateway("fork");
+        }
+        b = b
+            .service_task("work", "w")
+            .message_boundary_event("cancel", "work", "m", "=k");
+        if output_mapped {
+            b = b.with_io(
+                "cancel",
+                IoMapping {
+                    inputs: vec![],
+                    outputs: vec![Mapping {
+                        source: "=payload".into(),
+                        target: "mapped".into(),
+                    }],
+                },
+            );
+        }
+        b = b
+            .end_event("aborted")
+            .end_event("done")
+            .connect("work", "done")
+            .connect("cancel", "aborted");
+        b = if two_hosts {
+            b.connect("start", "fork")
+                .connect("fork", "work")
+                .connect("fork", "work")
+        } else {
+            b.connect("start", "work")
+        };
+        let mut engine = Engine::new();
+        let mut all = engine
+            .apply_command(Command::DeployProcess(b.build().unwrap()))
+            .unwrap();
+        all.extend(
+            engine
+                .apply_command(Command::create_instance_with(
+                    "p",
+                    BTreeMap::from([("k".to_string(), Value::Str("x".into()))]),
+                ))
+                .unwrap(),
+        );
+        all.extend(engine.correlate_message(
+            "m",
+            "x",
+            BTreeMap::from([("payload".to_string(), Value::Int(42))]),
+            5,
+        ));
+        let store = TraceStore::with_capture(8, 16 * 1024, stimuli_max);
+        let refs: Vec<&Event> = all.iter().collect();
+        store.ingest(&refs, 1000);
+        store
+    }
+
+    fn only_stimuli(store: &TraceStore) -> Vec<StimulusDto> {
+        let list = store.list(8);
+        assert_eq!(list.len(), 1);
+        store
+            .get(list[0].instance_key.parse().unwrap())
+            .unwrap()
+            .stimuli
+            .expect("stimuli log")
+    }
+
+    /// Every boundary shape records exactly one `message` stimulus per host,
+    /// each carrying the RAW payload, and nothing else: neither the boundary's
+    /// root propagation nor its output-mapping writes are external inputs.
+    #[test]
+    fn engine_boundary_streams_record_one_raw_payload_per_host() {
+        for output_mapped in [false, true] {
+            for two_hosts in [false, true] {
+                let store = boundary_run(output_mapped, two_hosts, 1024);
+                let stimuli = only_stimuli(&store);
+                let hosts = if two_hosts { 2 } else { 1 };
+                let case = format!("output_mapped={output_mapped} two_hosts={two_hosts}");
+                assert_eq!(stimuli.len(), hosts, "{case}");
+                for st in &stimuli {
+                    assert_eq!(st.kind, "message", "{case}");
+                    assert_eq!(payload(st, "payload"), serde_json::json!(42), "{case}");
+                    let vals = st.variables.as_ref().unwrap().values.as_ref().unwrap();
+                    assert!(vals.get("mapped").is_none(), "{case}: mapping captured");
+                }
+            }
+        }
+    }
+
+    /// A single message into a single boundary is ONE stimulus: with a cap of
+    /// one, the trace must not be marked truncated by a spurious propagation.
+    #[test]
+    fn single_boundary_message_does_not_truncate_a_cap_of_one() {
+        for output_mapped in [false, true] {
+            let store = boundary_run(output_mapped, false, 1);
+            let key = store.list(8)[0].instance_key.parse().unwrap();
+            let trace = store.get(key).unwrap();
+            assert_eq!(trace.stimuli.as_ref().map(Vec::len), Some(1));
+            assert!(!trace.stimuli_truncated, "output_mapped={output_mapped}");
+        }
     }
 
     fn correlated(instance: u64, eik: u64, element_id: &str) -> Event {
@@ -1851,28 +1987,24 @@ mod tests {
         }
     }
 
-    /// #1535 (review): one message matching TWO boundary hosts emits both
-    /// correlations before the queued payload writes. Each payload must attach
-    /// to its own correlation, in order — not all to the last one.
+    /// An intermediate catch merges its payload directly after the correlation,
+    /// possibly split across scopes; every part belongs to that one stimulus.
     #[test]
-    fn message_matching_two_hosts_attributes_each_payload_in_order() {
+    fn direct_catch_payload_split_across_scopes_is_one_stimulus() {
         let store = TraceStore::with_capture(8, 16 * 1024, 1024);
         store.ingest(&[&created(1, &[("a", Value::Int(1))])], 1000);
         store.ingest(
             &[
-                &correlated(1, 3, "b1"),
-                &correlated(1, 4, "b2"),
-                &scoped_vars_updated(1, 3, &[("p", Value::Int(1))]),
-                &scoped_vars_updated(1, 4, &[("p", Value::Int(2))]),
+                &correlated(1, 3, "catch"),
+                &scoped_vars_updated(1, 9, &[("p", Value::Int(1))]),
+                &vars_updated(1, &[("q", Value::Int(2))]),
             ],
             1030,
         );
         let stimuli = store.get(1).unwrap().stimuli.expect("stimuli log");
-        assert_eq!(stimuli.len(), 2, "no payload becomes a standalone set");
-        assert_eq!(stimuli[0].reference.as_deref(), Some("b1"));
+        assert_eq!(stimuli.len(), 1);
         assert_eq!(payload(&stimuli[0], "p"), serde_json::json!(1));
-        assert_eq!(stimuli[1].reference.as_deref(), Some("b2"));
-        assert_eq!(payload(&stimuli[1], "p"), serde_json::json!(2));
+        assert_eq!(payload(&stimuli[0], "q"), serde_json::json!(2));
     }
 
     /// #1535 (review): an engine-internal scope-local write (e.g. an input
