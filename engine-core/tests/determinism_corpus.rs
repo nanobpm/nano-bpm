@@ -861,14 +861,49 @@ fn prev_release_gate_remint_identity_carries_across_entries() {
         })
     };
     // An entry in `scenario` minting two distinct elements, the first of
-    // which a later entry references.
+    // which a later entry references. The pair must be COLLISION-FREE under
+    // the identity space: identities are unique per side, not across sides,
+    // so swapping k1<->k2 must not make prev's base for k2
+    // (`element:I2:e2`) equal an identity head mints elsewhere
+    // (`element:I1:e2` with I2's element minted in an earlier entry) — that
+    // would misattribute later same-element references. Require that no
+    // EARLIER entry mints an element instance for `e2` in a different
+    // process instance than k2's.
+    let minted_earlier = |upto: usize, element: &str, instance: u64| {
+        entries[..upto].iter().any(|r| {
+            activations(r).iter().any(|(_, e)| e == element)
+                && r.get("events")
+                    .and_then(|ev| ev.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.get("ElementActivating"))
+                    .any(|b| {
+                        b.get("element_id").and_then(|x| x.as_str()) == Some(element)
+                            && b.get("instance_key").and_then(|x| x.as_u64()) != Some(instance)
+                    })
+        })
+    };
     let (x, scenario, k1, k2) = entries
         .iter()
         .enumerate()
         .find_map(|(i, r)| {
             let acts = activations(r);
             let (k1, e1) = acts.iter().find(|(k, _)| referenced_later(i, *k))?.clone();
-            let (k2, _) = acts.iter().find(|(k, e)| *k != k1 && *e != e1)?.clone();
+            let (k2, e2) = acts.iter().find(|(k, e)| *k != k1 && *e != e1)?.clone();
+            let instance_of = |key: u64| {
+                r.get("events")
+                    .and_then(|ev| ev.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.get("ElementActivating"))
+                    .find(|b| b.get("element_instance_key").and_then(|k| k.as_u64()) == Some(key))
+                    .and_then(|b| b.get("instance_key"))
+                    .and_then(|k| k.as_u64())
+            };
+            let i2 = instance_of(k2)?;
+            if minted_earlier(i, &e2, i2) {
+                return None; // a cross-side identity collision; keep looking
+            }
             Some((i, scenarios[i].clone(), k1, k2))
         })
         .expect("an entry minting two elements, one referenced later");
@@ -1309,6 +1344,118 @@ fn prev_release_gate_erases_listed_root_state_fields() {
         with_map,
         serde_json::json!({"processes": {"now": {"key": 1}}}),
         "the listed root field is erased but the same-named map key survives"
+    );
+}
+
+/// #1700 (maintainer): a ratified `reorder` divergence may MOVE an event
+/// across entries — #1244 activates a parallel join's element instance when
+/// the join FIRES, so its `ElementActivating`/`ElementActivated` leave the
+/// first arriving token's entry and appear in the firing entry. Per-entry
+/// `only_in_prev`/`only_in_head` matching cannot reconcile that, so the
+/// patterns reconcile at SCENARIO level: the multiset of matched events over
+/// the whole scenario must balance (each pattern removed from prev appears in
+/// head, same scenario, same element, same instance after remint) while every
+/// entry stays strict per entry otherwise.
+#[test]
+fn prev_release_gate_ratified_patterns_reconcile_across_entries() {
+    let head = head_records();
+    let scenario = "messages-signals-conditional";
+    let scenarios = labels();
+    let join_activation = |e: &serde_json::Value| {
+        ["ElementActivating", "ElementActivated"].iter().any(|v| {
+            e.get(v)
+                .and_then(|b| b.get("element_id"))
+                .and_then(|id| id.as_str())
+                == Some("join")
+        })
+    };
+    let entries: Vec<&serde_json::Value> =
+        head.iter().filter(|r| r.get("state").is_none()).collect();
+    let has_join_activation = |r: &serde_json::Value| {
+        r.get("events")
+            .and_then(|e| e.as_array())
+            .is_some_and(|evs| evs.iter().any(join_activation))
+    };
+    // The scenario must exercise a join activation at all, and a LATER entry
+    // of the same scenario must exist to move it into (the #1244 shape: the
+    // join fires on a later command than the first arriving token).
+    let from = entries
+        .iter()
+        .enumerate()
+        .find(|(i, r)| scenarios[*i] == scenario && has_join_activation(r))
+        .map(|(i, _)| i)
+        .expect("a join activation in the scenario");
+    let to = (from + 1..entries.len())
+        .find(|&i| scenarios[i] == scenario && !has_join_activation(entries[i]))
+        .expect("a later entry of the same scenario without a join activation");
+
+    let allow = serde_json::json!({"divergences": [{
+        "scenario": scenario,
+        "expected": {
+            "reorder": true, "remint_keys": true,
+            "only_in_prev": [
+                {"variant": "ElementActivating", "element_id": "join"},
+                {"variant": "ElementActivated", "element_id": "join"}
+            ],
+            "only_in_head": [
+                {"variant": "ElementActivating", "element_id": "join"},
+                {"variant": "ElementActivated", "element_id": "join"}
+            ]
+        },
+        "introduced_in": "v0.0.28", "issue": "#1244",
+        "upgrade": "upgrade-boundary", "rationale": "upgrade-boundary: test"
+    }]});
+
+    // (a) A cross-entry move of the ratified pattern: prev keeps the join
+    // activation at entry `from`; head drops it there and emits it (with the
+    // same keys) at entry `to`. The scenario-level balance reconciles it.
+    let mut moved = head.clone();
+    let mut moved_events: Vec<serde_json::Value> = Vec::new();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut moved)[from].get_mut("events")
+    {
+        moved_events = events.extract_if(.., |e| join_activation(e)).collect();
+    }
+    assert_eq!(moved_events.len(), 2, "join activating + activated");
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut moved)[to].get_mut("events") {
+        events.extend(moved_events.iter().cloned());
+    }
+    let report = checked(&moved, &head, allow.clone(), &[]).unwrap();
+    assert!(
+        report.ratified_divergent_entries >= 2,
+        "both the source and the target entry diverge and reconcile: {report:?}"
+    );
+
+    // (b) The same pattern only REMOVED (never re-added in the scenario): an
+    // unbalanced ratified pattern still fails — the guard against hiding a
+    // real loss. Head drops the join activation at entry `from` and never
+    // re-adds it, so head's divergent entries mint the join one fewer time
+    // than prev's: the scenario-level balance reports it as minted only in
+    // prev.
+    let mut removed = head.clone();
+    if let Some(serde_json::Value::Array(events)) =
+        entries_mut(&mut removed)[from].get_mut("events")
+    {
+        events.retain(|e| !join_activation(e));
+    }
+    let err = checked(&removed, &head, allow.clone(), &[]).unwrap_err();
+    assert!(
+        err.contains("unbalanced") && err.contains("minted only in prev"),
+        "a removed-but-never-re-added pattern must fail as unbalanced: {err}"
+    );
+
+    // (c) An unrelated EXTRA event in the allowlisted scenario: not matched
+    // by any declared pattern, so it fails even with the scenario-level
+    // reconciliation in place.
+    let mut extra = moved.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut extra)[to].get_mut("events") {
+        events.push(serde_json::json!({"JobCanceled": {
+            "job_key": 9_999_999u64, "instance_key": 9_999_999u64, "canceled_at": 0
+        }}));
+    }
+    let err = checked(&extra, &head, allow, &[]).unwrap_err();
+    assert!(
+        err.contains("UNDECLARED extra divergence"),
+        "an unrelated extra event must fail: {err}"
     );
 }
 

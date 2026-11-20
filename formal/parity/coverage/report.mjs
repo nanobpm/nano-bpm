@@ -214,10 +214,18 @@ export function checkRatchet(measured, baseline) {
       errors.push(`${side}: measured in ${m.unit}s but the baseline floor is in ${b.unit}s — re-baseline explicitly (--update --allow-lower)`);
       continue;
     }
-    if (m.percent < b.floorPercent) {
+    // The floor is a hard ratchet on the DETERMINISTIC side; a side measured
+    // against a live broker (zeebe JaCoCo) carries irreducible
+    // broker-scheduling variance (#1679), so its `slackPercent` is the
+    // documented absorption band: the effective floor is `floorPercent −
+    // slackPercent`. A drop beyond the band is a real coverage loss and fails.
+    const slackPercent = b.slackPercent ?? 0;
+    const effectiveFloor = floor1(b.floorPercent - slackPercent);
+    if (m.percent < effectiveFloor) {
       errors.push(
-        `${side}: ${m.unit} coverage ${m.percent.toFixed(2)}% dropped below the ratchet floor ${b.floorPercent}% ` +
-          `(${m.covered}/${m.total}) — add a parity scenario for the uncovered code, or register a Nano-only extension`,
+        `${side}: ${m.unit} coverage ${m.percent.toFixed(2)}% dropped below the ratchet floor ${b.floorPercent}%` +
+          (slackPercent ? ` (effective ${effectiveFloor}% after the ${slackPercent}% scheduling-variance slack, #1679)` : '') +
+          ` (${m.covered}/${m.total}) — add a parity scenario for the uncovered code, or register a Nano-only extension`,
       );
     }
   }

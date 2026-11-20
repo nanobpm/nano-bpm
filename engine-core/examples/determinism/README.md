@@ -25,7 +25,12 @@ ignored silently:
    * `divergences` — per corpus scenario (`Gen::scenario`), the declared
      `expected` normalizations (`reorder`, `remint_keys`, `only_in_prev` /
      `only_in_head` event patterns). An entry still differing after them is
-     an *undeclared extra divergence* and fails.
+     an *undeclared extra divergence* and fails. The `only_in_*` patterns
+     reconcile at **scenario level**: a ratified `reorder` divergence may
+     move an event across entries (#1244 fires a parallel join's activation
+     in a later entry than the first arriving token's), so the multiset of
+     matched events on one side must equal the other side's — a cross-entry
+     move balances, a pattern removed but never re-added still fails.
 
    Every entry names its `issue`, the `introduced_in` release, an `upgrade`
    mode and a `rationale` that names that mode and says why it applies.

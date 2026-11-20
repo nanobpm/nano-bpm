@@ -589,7 +589,14 @@ pub struct ObservationalVariant {
 
 /// What a ratified scenario divergence is allowed to change — and nothing
 /// else: per entry, after these normalizations the two event streams must be
-/// identical, so any undeclared extra divergence still fails.
+/// identical, so any undeclared extra divergence still fails. The
+/// `only_in_prev` / `only_in_head` patterns are the one relaxation of "per
+/// entry": a ratified `reorder` divergence may MOVE an event across entries
+/// (#1244 fires a parallel join's activation in a later entry than the first
+/// arriving token's), so the matched events reconcile at SCENARIO level — the
+/// multiset matched on one side must equal the multiset matched on the other
+/// (same scenario, same element, same instance after the ratified remint). An
+/// unbalanced pattern (removed but never re-added, or the reverse) fails.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expected {
@@ -608,7 +615,10 @@ pub struct Expected {
     /// reconcile.
     #[serde(default)]
     pub remint_keys: bool,
-    /// Events only the previous release emits (dropped from its side).
+    /// Events only the previous release emits (dropped from its side). With
+    /// `reorder`, matched events reconcile at SCENARIO level against
+    /// `only_in_head` (see the type doc): a cross-entry move balances, a real
+    /// loss fails.
     #[serde(default)]
     pub only_in_prev: Vec<EventPattern>,
     /// Events only the head build emits (dropped from its side).
@@ -652,10 +662,17 @@ impl EventPattern {
 /// already-minted same-element key cannot canonicalize to the right one.
 /// Mints:
 /// * `ElementActivating`/`ElementActivated` → `element:<instance>:<element_id>#n`;
+/// * `ParallelJoinOpened` → the same element identity: since #1244 a not-ready
+///   join is PARKED — it mints its element-instance key here, without
+///   activating (no `ElementActivating` until it fires), so this event is the
+///   key's only mint sighting on a head build while a previous release
+///   activates the join visibly. Registering it keeps the parked join's key
+///   from canonicalizing to an orphan;
 /// * `JobCreated` / `ExecutionListenerJobCreated` / `TaskListenerJobCreated`
 ///   → `job:<owning element identity>#n`;
-/// * `MessageSubscriptionCreated`/`SignalSubscriptionCreated`
-///   → `subscription:<owning element identity>#n`.
+/// * `TimerCreated` → `timer:<owning element identity>#n`;
+/// * `MessageSubscriptionCreated` / `SignalSubscriptionCreated` /
+///   `ConditionalSubscriptionCreated` → `subscription:<owning element identity>#n`.
 #[derive(Debug, Default, Clone)]
 struct KeyIds {
     ids: std::collections::BTreeMap<u64, String>,
@@ -715,7 +732,11 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
         let u64_of = |f: &str| body.get(f).and_then(Json::as_u64);
         let str_of = |f: &str| body.get(f).and_then(Json::as_str);
         let minted = match variant.as_str() {
-            "ElementActivating" | "ElementActivated" => {
+            "ElementActivating" | "ElementActivated" | "ParallelJoinOpened" => {
+                // `ParallelJoinOpened` mints the (parked, #1244) join's
+                // element-instance key without activating it; the firing
+                // entry's `ElementActivating` re-sights the same key for the
+                // same base (idempotent).
                 u64_of("element_instance_key").zip(str_of("element_id").map(|id| {
                     let instance =
                         u64_of("instance_key").map_or_else(|| "?".to_owned(), |k| k.to_string());
@@ -729,13 +750,18 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
                     (k, format!("job:{variant}:{owner}"))
                 })
             }
-            "MessageSubscriptionCreated" | "SignalSubscriptionCreated" => {
-                u64_of("subscription_key").map(|k| {
-                    let owner = u64_of("element_instance_key")
-                        .map_or_else(|| "?".to_owned(), |o| ids.owner(o));
-                    (k, format!("subscription:{owner}"))
-                })
-            }
+            "TimerCreated" => u64_of("timer_key").map(|k| {
+                let owner =
+                    u64_of("element_instance_key").map_or_else(|| "?".to_owned(), |o| ids.owner(o));
+                (k, format!("timer:{owner}"))
+            }),
+            "MessageSubscriptionCreated"
+            | "SignalSubscriptionCreated"
+            | "ConditionalSubscriptionCreated" => u64_of("subscription_key").map(|k| {
+                let owner =
+                    u64_of("element_instance_key").map_or_else(|| "?".to_owned(), |o| ids.owner(o));
+                (k, format!("subscription:{owner}"))
+            }),
             _ => None,
         };
         if let Some((k, base)) = minted {
@@ -838,6 +864,68 @@ fn diverges_only_as(
         (Some(h), Some(p)) => h == p,
         _ => false,
     }
+}
+
+// ---- Scenario-level reconciliation of ratified patterns (#1700) -----------
+//
+// A ratified `reorder` divergence may MOVE an event across entries: #1244
+// activates a parallel join's element instance when the join FIRES, so its
+// `ElementActivating`/`ElementActivated` leave the first arriving token's
+// entry and appear in the firing entry. Per-entry `only_in_prev` /
+// `only_in_head` matching cannot reconcile that — the events are absent from
+// one entry on one side and present in a LATER entry on the other. The
+// patterns therefore reconcile at SCENARIO level: over the whole scenario,
+// the multiset of events matching `only_in_prev` on the prev side must equal
+// the multiset matching `only_in_head` on the head side (each pattern removed
+// from prev appears in head, same scenario, same element, same instance after
+// the ratified remint), while everything else stays strict per entry. An
+// unbalanced pattern — removed but never re-added, or the reverse — still
+// FAILS: that is the guard against hiding a real loss.
+
+/// The comparison identity of a matched event: its JSON with every key
+/// reference canonicalized through `ids` when `remint` is declared (so a
+/// re-minted join activation matches across sides), raw otherwise. An event
+/// that MINTS the matched element's key is normalized to a single
+/// `ElementMinted` projection — `ElementActivating` / `ElementActivated` /
+/// `ParallelJoinOpened` all mint the same `element:<instance>:<element_id>`
+/// identity, and the ratified change (#1244) is precisely that a parked join
+/// mints its key at the open (`ParallelJoinOpened`) where the previous
+/// release minted it at the visible activation — so the mint-event kind must
+/// not distinguish the two sides' projections.
+fn pattern_projection(event: &Json, ids: &KeyIds, remint: bool) -> Option<String> {
+    let mut v = event.clone();
+    if remint {
+        canonicalize_keys(&mut v, ids);
+    }
+    // Normalize the mint event's own variant + key fields.
+    if let Json::Object(map) = &v {
+        if map.len() == 1 {
+            let (variant, body) = map.iter().next()?;
+            if matches!(
+                variant.as_str(),
+                "ElementActivating" | "ElementActivated" | "ParallelJoinOpened"
+            ) && body.get("element_instance_key").is_some()
+            {
+                let Some(b) = body.as_object().cloned() else {
+                    return Some(v.to_string());
+                };
+                let mut b = b;
+                // The minted key is the identity token after
+                // canonicalization (or the raw key without a remint); either
+                // way it must not distinguish the projection — the ENTITY
+                // (element_id + instance) is what reconciles.
+                b.remove("element_instance_key");
+                // `ElementActivated` carries `scope`; the parked open carries
+                // `scope: Some(..)`; `ElementActivating` carries the flow
+                // scope — all name the same mint, so drop the scope too.
+                b.remove("scope");
+                let mut out = serde_json::Map::new();
+                out.insert("ElementMinted".to_owned(), Json::Object(b));
+                return Some(Json::Object(out).to_string());
+            }
+        }
+    }
+    Some(v.to_string())
 }
 
 /// A ratified behavioural change in one corpus scenario.
@@ -1098,9 +1186,20 @@ pub fn cross_release_checked(
         .map(|o| o.variant.as_str())
         .collect();
     let mut observed: BTreeSet<String> = BTreeSet::new();
-    let mut ratified_scenarios: BTreeSet<&str> = BTreeSet::new();
     let (mut filtered, mut ratified_entries) = (0, 0);
     let (mut head_ids, mut prev_ids) = (KeyIds::new(), KeyIds::new());
+    // Per-scenario accumulator for the scenario-level reconciliation: the
+    // canonical events of every divergent entry, plus the scenario's ratified
+    // divergence. Reconciled after the loop, once both sides' corpus-wide key
+    // identities are complete (an event a ratified pattern moves ACROSS
+    // entries reconciles against the whole scenario, not its own entry).
+    struct Pending<'a> {
+        divergence: &'a Divergence,
+        /// `(entry index, head events, prev events)` of each divergent entry.
+        entries: Vec<PendingEntry>,
+    }
+    type PendingEntry = (usize, Option<Vec<String>>, Option<Vec<String>>);
+    let mut pending: std::collections::BTreeMap<&str, Pending> = Default::default();
     for (i, (h, p)) in head_entries.iter().zip(&prev_entries).enumerate() {
         let scenario = ctx.scenarios[i].as_str();
         // Ratified observational variants leave the head stream; any OTHER
@@ -1158,15 +1257,17 @@ pub fn cross_release_checked(
             .divergences
             .iter()
             .find(|d| d.scenario == scenario);
-        let explained = match (declared, &hc, &pc) {
-            (Some(d), Some(hs), Some(ps)) => {
-                diverges_only_as(&d.expected, hs, ps, &head_ids, &prev_ids)
-            }
-            _ => false,
-        };
-        if explained {
-            ratified_scenarios.insert(scenario);
-            ratified_entries += 1;
+        if let (Some(d), Some(_), Some(_)) = (declared, &hc, &pc) {
+            // A divergent entry of an allowlisted scenario reconciles after
+            // the loop, at scenario level: a ratified `reorder` divergence
+            // may move an event ACROSS entries (#1244 fires a parallel join's
+            // activation in a later entry than the first token's), which no
+            // per-entry normalization can see.
+            let entry = pending.entry(scenario).or_insert(Pending {
+                divergence: d,
+                entries: Vec::new(),
+            });
+            entry.entries.push((i, hc, pc));
             continue;
         }
         let render = |c: &Option<Vec<String>>| c.as_ref().map_or("err".into(), |v| v.join("\n"));
@@ -1183,6 +1284,141 @@ pub fn cross_release_checked(
             render(&hc),
             render(&pc)
         ));
+    }
+    // Reconcile each scenario's divergent entries. Per entry the declared
+    // normalizations apply STRICTLY (an undeclared extra difference in one
+    // entry fails, wherever it sits); the `only_in_prev` / `only_in_head`
+    // patterns then reconcile at SCENARIO level. A ratified `reorder`
+    // divergence may MOVE an event across entries (#1244 fires a parallel
+    // join's activation in a later entry than the first token's) and may
+    // change WHICH event mints the entity (a parked join mints its key at
+    // `ParallelJoinOpened`, where the previous release minted it at the
+    // visible `ElementActivating`). So a matched event reconciles against the
+    // other side's SAME-ENTITY record: a non-mint event against the other
+    // side's declared patterns, and a MINT (`ElementMinted` projection)
+    // against the other side's mints of the same entity — whether the other
+    // side mints it by activating (prev) or by opening parked (head). A
+    // pattern removed but never re-added (a real loss) still fails.
+    let mut ratified_scenarios: BTreeSet<&str> = BTreeSet::new();
+    for (scenario, pend) in &pending {
+        let d = pend.divergence;
+        let expected = &d.expected;
+        let remint = expected.remint_keys;
+        // Accumulate, over the scenario's divergent entries, each side's
+        // matched events split into mints (compared as a set of entities) and
+        // other matched events (a multiset).
+        let mut head_mints: BTreeSet<String> = BTreeSet::new();
+        let mut prev_mints: BTreeSet<String> = BTreeSet::new();
+        let mut head_other: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut prev_other: std::collections::BTreeMap<String, usize> = Default::default();
+        // Every event of the scenario's divergent entries, per side, so a
+        // mint can find its same-entity counterpart on the other side even
+        // when that counterpart is NOT itself a declared pattern (a parked
+        // join's `ParallelJoinOpened` is not in `only_in_head`).
+        let mut head_all: Vec<String> = Vec::new();
+        let mut prev_all: Vec<String> = Vec::new();
+        for (i, hc, pc) in &pend.entries {
+            let (Some(hs), Some(ps)) = (hc, pc) else {
+                return Err(format!(
+                    "entry {i} (scenario {scenario}): a divergent entry without events on \
+                     both sides cannot reconcile"
+                ));
+            };
+            if !diverges_only_as(expected, hs, ps, &head_ids, &prev_ids) {
+                let render = |v: &[String]| v.join("\n");
+                return Err(format!(
+                    "entry {i}, an UNDECLARED extra divergence in allowlisted scenario \
+                     {scenario} (ratified only as {expected:?}, {}) — the declared \
+                     normalizations do not reconcile it:\n  head: {}\n  prev: {}",
+                    d.issue,
+                    render(hs),
+                    render(ps)
+                ));
+            }
+            head_all.extend(hs.iter().cloned());
+            prev_all.extend(ps.iter().cloned());
+            // Each side's declared-pattern events, projected.
+            let collect =
+                |events: &[String],
+                 patterns: &[EventPattern],
+                 ids: &KeyIds,
+                 mints: &mut BTreeSet<String>,
+                 other: &mut std::collections::BTreeMap<String, usize>| {
+                    for e in events {
+                        let Ok(v) = serde_json::from_str::<Json>(e) else {
+                            continue;
+                        };
+                        if patterns.iter().any(|p| p.matches(&v)) {
+                            if let Some(proj) = pattern_projection(&v, ids, remint) {
+                                if let Some(entity) = proj.strip_prefix("{\"ElementMinted\":") {
+                                    mints.insert(entity.to_owned());
+                                } else {
+                                    *other.entry(proj).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                };
+            collect(
+                hs,
+                &expected.only_in_head,
+                &head_ids,
+                &mut head_mints,
+                &mut head_other,
+            );
+            collect(
+                ps,
+                &expected.only_in_prev,
+                &prev_ids,
+                &mut prev_mints,
+                &mut prev_other,
+            );
+        }
+        // A mint on one side reconciles iff the OTHER side mints the same
+        // entity anywhere in the scenario's divergent entries — by whatever
+        // event (a visible activation or a parked open). Project every event
+        // of the other side and take its minted entities.
+        let minted_entities = |events: &[String], ids: &KeyIds| -> BTreeSet<String> {
+            let mut out = BTreeSet::new();
+            for e in events {
+                let Ok(v) = serde_json::from_str::<Json>(e) else {
+                    continue;
+                };
+                if let Some(proj) = pattern_projection(&v, ids, remint) {
+                    if let Some(entity) = proj.strip_prefix("{\"ElementMinted\":") {
+                        out.insert(entity.to_owned());
+                    }
+                }
+            }
+            out
+        };
+        let head_entities = minted_entities(&head_all, &head_ids);
+        let prev_entities = minted_entities(&prev_all, &prev_ids);
+        let lost_prev: Vec<_> = prev_mints.difference(&head_entities).collect();
+        let lost_head: Vec<_> = head_mints.difference(&prev_entities).collect();
+        if !lost_prev.is_empty() || !lost_head.is_empty() || head_other != prev_other {
+            let show = |m: &std::collections::BTreeMap<String, usize>| {
+                m.iter()
+                    .map(|(k, n)| format!("{n} x {k}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            return Err(format!(
+                "scenario {scenario}: unbalanced ratified only_in_prev/only_in_head patterns \
+                 ({}, {:?}) — an event removed on one side never re-appears on the other \
+                 (a real loss, not a move):\n  minted only in prev: {:?}\n  minted only in \
+                 head: {:?}\n  head-only patterns matched:\n{}\n  prev-side patterns \
+                 matched:\n{}",
+                d.issue,
+                expected,
+                lost_prev,
+                lost_head,
+                show(&head_other),
+                show(&prev_other)
+            ));
+        }
+        ratified_entries += pend.entries.len();
+        ratified_scenarios.insert(scenario);
     }
     for o in &ctx.allowlist.observational_variants {
         if !observed.contains(&o.variant) {
