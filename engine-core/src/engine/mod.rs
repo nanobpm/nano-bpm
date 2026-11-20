@@ -11311,6 +11311,12 @@ impl Engine {
 
         let mut events = Vec::new();
         // Cancel any children still running (reached here via completion condition).
+        // Build the element-instance → `Created` user-task index ONCE for this
+        // teardown and share it across every per-child cancellation below, so an
+        // N-child teardown is O(total user tasks + N) rather than each child
+        // rescanning the whole `state.user_tasks` map (#1528 review). The index
+        // preserves per-bucket key order, so the emitted events are unchanged.
+        let user_tasks_by_eik = self.created_user_tasks_by_element_instance();
         // An ad-hoc container child (a JOB_WORKER ad-hoc MI child, #1170) owns its
         // OWN active tool scope (`adhoc_instances[child].active`), its agent job,
         // and an `adhoc_instances` runtime record — none of which the leaf-only
@@ -11322,9 +11328,18 @@ impl Engine {
         // `cancel_adhoc_active_child` (recurses tools, emits `AdHocCompleted`)
         // instead, using the body as the enclosing container key; a non-ad-hoc
         // child (service task, sub-process, call activity) keeps the leaf path.
+        // Scopes to flag torn down for this drain; applied AFTER the loop because
+        // `user_tasks_by_eik` borrows `self.state` immutably for its duration, so
+        // the `&mut self.torn_down_scopes` inserts must wait until it is dropped.
+        let mut torn_down: Vec<Key> = Vec::new();
         for child in &active {
             if self.is_adhoc_container(instance_key, *child) {
-                events.extend(self.cancel_adhoc_active_child(instance_key, body_key, *child));
+                events.extend(self.cancel_adhoc_active_child(
+                    instance_key,
+                    body_key,
+                    *child,
+                    Some(&user_tasks_by_eik),
+                ));
             } else {
                 // A non-ad-hoc MI child may itself be an embedded SUB-PROCESS that
                 // opened its OWN token scope with an inner flow (inner jobs, timers,
@@ -11344,11 +11359,21 @@ impl Engine {
                 // still-queued inner activation cannot recreate a token inside the
                 // dead scope (the per-drain dead-scope guard), and finally complete
                 // the child element instance itself (#1170).
-                events.extend(self.scope_teardown_events(instance_key, *child));
-                self.torn_down_scopes.insert(*child);
-                events.extend(self.cancel_mi_child_events(instance_key, *child));
+                events.extend(self.scope_teardown_events(
+                    instance_key,
+                    *child,
+                    Some(&user_tasks_by_eik),
+                ));
+                torn_down.push(*child);
+                events.extend(self.cancel_mi_child_events(
+                    instance_key,
+                    *child,
+                    Some(&user_tasks_by_eik),
+                ));
             }
         }
+        drop(user_tasks_by_eik);
+        self.torn_down_scopes.extend(torn_down);
         // Disarm every boundary event armed on the BODY as the loop enters
         // completion (before end listeners, mirroring the sub-process/ad-hoc
         // completion paths). An interrupting boundary on an MI activity is armed
@@ -11547,10 +11572,40 @@ impl Engine {
         (events, followups)
     }
 
+    /// Indexes every `Created` user task by its owning element-instance key, for
+    /// a single teardown pass. Building this once and sharing it across the
+    /// per-child cancellation steps turns an N-child teardown from O(N ×
+    /// total user tasks) — each child rescanning the whole `state.user_tasks`
+    /// map — into O(total user tasks + N) (#1528 review). Each bucket preserves
+    /// ascending key order (the source map is key-ordered), so the events a
+    /// bucket drives stay byte-identical to the per-call scan they replace.
+    fn created_user_tasks_by_element_instance(&self) -> BTreeMap<Key, Vec<&state::UserTask>> {
+        let mut index: BTreeMap<Key, Vec<&state::UserTask>> = BTreeMap::new();
+        for task in self.state.user_tasks.values() {
+            if task.state == state::UserTaskState::Created {
+                index
+                    .entry(task.element_instance_key)
+                    .or_default()
+                    .push(task);
+            }
+        }
+        index
+    }
+
     /// Builds the events that cancel a still-running multi-instance child (its job
     /// and element instance), for an early body completion. Returns events (it
     /// does not emit) so it composes inside a `process_step` result.
-    fn cancel_mi_child_events(&self, instance_key: Key, child_eik: Key) -> Vec<Event> {
+    ///
+    /// `user_tasks_by_eik` is the per-teardown element-instance → `Created`
+    /// user-task index built once by [`Self::complete_multi_instance_body`] (see
+    /// [`Self::created_user_tasks_by_element_instance`]); `None` (the default for
+    /// callers outside that teardown) falls back to scanning `state.user_tasks`.
+    fn cancel_mi_child_events(
+        &self,
+        instance_key: Key,
+        child_eik: Key,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+    ) -> Vec<Event> {
         let mut events = Vec::new();
         let element_id = self
             .element_id_of_instance(instance_key, child_eik)
@@ -11583,18 +11638,27 @@ impl Engine {
         // not touch it), orphaning the task. This surfaces when an embedded
         // subProcess tool body holds an open user task while its container is
         // cancel-remaining'd (#872). A leaf (non-user-task) child has no such
-        // entry, so this is a no-op there.
-        if let Some(user_task_key) = self
-            .state
-            .user_tasks
-            .values()
-            .find(|t| {
-                t.instance_key == instance_key
-                    && t.element_instance_key == child_eik
-                    && t.state == state::UserTaskState::Created
-            })
-            .map(|t| t.key)
-        {
+        // entry, so this is a no-op there. The lookup uses the per-teardown
+        // index when one was built (the common cancel-remaining path), so an
+        // N-child teardown is O(N) overall rather than scanning every retained
+        // user task once per child (#1528 review).
+        let parked = match user_tasks_by_eik {
+            Some(index) => index
+                .get(&child_eik)
+                .and_then(|tasks| tasks.iter().find(|t| t.instance_key == instance_key))
+                .map(|t| t.key),
+            None => self
+                .state
+                .user_tasks
+                .values()
+                .find(|t| {
+                    t.instance_key == instance_key
+                        && t.element_instance_key == child_eik
+                        && t.state == state::UserTaskState::Created
+                })
+                .map(|t| t.key),
+        };
+        if let Some(user_task_key) = parked {
             events.push(Event::UserTaskCanceled {
                 user_task_key,
                 instance_key,
@@ -11648,6 +11712,7 @@ impl Engine {
         instance_key: Key,
         container_key: Key,
         child: Key,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
     ) -> Vec<Event> {
         let mut events = Vec::new();
         // Is this active child itself a nested ad-hoc container (#631)? If so it
@@ -11669,7 +11734,12 @@ impl Engine {
             // container's own agent job and any boundary state, complete its
             // element instance, and drop its ad-hoc runtime state.
             for grandchild in &nested_active {
-                events.extend(self.cancel_adhoc_active_child(instance_key, child, *grandchild));
+                events.extend(self.cancel_adhoc_active_child(
+                    instance_key,
+                    child,
+                    *grandchild,
+                    user_tasks_by_eik,
+                ));
             }
             if let Some(job_key) = self.active_job_on(child) {
                 events.push(Event::JobCanceled {
@@ -11718,9 +11788,13 @@ impl Engine {
             // dangling. `scope_descendants` is empty for a leaf tool, so this is a
             // no-op there and the leaf behaviour is byte-identical.
             for descendant in self.scope_descendants(instance_key, child) {
-                events.extend(self.cancel_mi_child_events(instance_key, descendant));
+                events.extend(self.cancel_mi_child_events(
+                    instance_key,
+                    descendant,
+                    user_tasks_by_eik,
+                ));
             }
-            events.extend(self.cancel_mi_child_events(instance_key, child));
+            events.extend(self.cancel_mi_child_events(instance_key, child, user_tasks_by_eik));
         }
         // A `callActivity` tool (issue #1159) is a leaf in the ad-hoc scope tree
         // but drives a distinct CHILD PROCESS INSTANCE hanging off this tool
@@ -13703,11 +13777,13 @@ impl Engine {
             // own live tools down (each hangs off a dedicated inner instance)
             // before the child completes; a natural completion has none active.
             if cancel {
+                let user_tasks_by_eik = self.created_user_tasks_by_element_instance();
                 for child in &active {
                     events.extend(self.cancel_adhoc_active_child(
                         instance_key,
                         container_key,
                         *child,
+                        Some(&user_tasks_by_eik),
                     ));
                 }
                 // Resolve any incident parked on the CONTAINER itself (a failed
@@ -13763,8 +13839,14 @@ impl Engine {
         // descendants + agent job + ad-hoc state), which `cancel_adhoc_active_child`
         // handles — cancelling it as a leaf would orphan its internals.
         if cancel {
+            let user_tasks_by_eik = self.created_user_tasks_by_element_instance();
             for child in &active {
-                events.extend(self.cancel_adhoc_active_child(instance_key, container_key, *child));
+                events.extend(self.cancel_adhoc_active_child(
+                    instance_key,
+                    container_key,
+                    *child,
+                    Some(&user_tasks_by_eik),
+                ));
             }
             // Resolve any incident parked on the CONTAINER itself (a failed
             // pre-creation tool activation, #1390) before its state is torn
@@ -15077,7 +15159,7 @@ impl Engine {
                 let [terminating, terminated] =
                     boundary::termination_events(instance_key, torn_eik, torn_element_id.clone());
                 events.push(terminating);
-                for event in self.scope_teardown_events(instance_key, torn_eik) {
+                for event in self.scope_teardown_events(instance_key, torn_eik, None) {
                     if matches!(
                         &event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
@@ -15238,7 +15320,7 @@ impl Engine {
                     caught_element_id.clone(),
                 );
                 events.push(terminating);
-                for event in self.scope_teardown_events(instance_key, caught_eik) {
+                for event in self.scope_teardown_events(instance_key, caught_eik, None) {
                     if matches!(
                         &event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
@@ -15847,7 +15929,7 @@ impl Engine {
             element_id,
         }];
         events.extend(
-            self.scope_teardown_events(instance_key, scope)
+            self.scope_teardown_events(instance_key, scope, None)
                 .into_iter()
                 .filter(|event| {
                     !matches!(

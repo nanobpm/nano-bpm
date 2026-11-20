@@ -1893,3 +1893,92 @@ fn mi_body_output_mapping_of_child_local_output_element_does_not_publish_null() 
         "body completion published the child-local outputElement as null"
     );
 }
+
+/// #1528 (review): cancelling an MI body with N parallel user-task children must
+/// emit exactly one `UserTaskCanceled` per child — and do so from a SINGLE
+/// element-instance → user-task index built once for the teardown, not by
+/// rescanning the whole `state.user_tasks` map once per child (an O(N × tasks)
+/// blow-up that stalls the engine on a large completion condition). This test
+/// drives a 64-child cancel-remaining completion and asserts the emitted
+/// cancellation set is exactly the children's tasks (no duplicates, no orphans),
+/// which is the behaviour the shared index must preserve byte-for-byte.
+#[test]
+fn multi_instance_teardown_cancels_every_child_user_task_once() {
+    const N: i64 = 64;
+    // start -> each(MI userTask, completionCondition=true, cancelRemaining) -> done
+    let def = ProcessBuilder::new("mi-ut-teardown")
+        .start_event("start")
+        .user_task("each")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let items = Value::List((0..N).map(Value::Int).collect());
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-ut-teardown",
+            vars(&[("items", items)]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Every child parked on its own user task.
+    let created_tasks: std::collections::BTreeSet<Key> = engine
+        .state()
+        .user_tasks
+        .values()
+        .filter(|t| t.state == state::UserTaskState::Created)
+        .map(|t| t.key)
+        .collect();
+    assert_eq!(created_tasks.len(), N as usize, "one user task per child");
+
+    // Completing ONE child's task satisfies the completion condition, so the body
+    // tears the other N-1 children down.
+    let first = *created_tasks.iter().next().unwrap();
+    let events = engine
+        .apply_command(Command::complete_user_task(first))
+        .unwrap();
+
+    let canceled: std::collections::BTreeSet<Key> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::UserTaskCanceled { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .collect();
+    // The torn-down children are every task except the one we completed.
+    let mut expected = created_tasks.clone();
+    expected.remove(&first);
+    assert_eq!(
+        canceled, expected,
+        "each still-running child's task is cancelled exactly once (no duplicate, none missed)"
+    );
+    assert!(
+        engine
+            .state()
+            .user_tasks
+            .values()
+            .all(|t| t.state != state::UserTaskState::Created),
+        "no child user task is left Created after the teardown"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the loop's runtime record is cleared"
+    );
+}

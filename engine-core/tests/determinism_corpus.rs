@@ -1884,6 +1884,67 @@ fn prev_release_gate_remint_rejects_unrelated_key_collisions() {
     );
 }
 
+/// #1528 (review): the mint bypass for an MI child's generic re-sighting is
+/// restricted to the child's OWN `ElementActivating`/`ElementActivated` — a
+/// sighting naming the SAME owning instance and element id the child was
+/// registered with. An `ElementActivating` for a DIFFERENT element, or a
+/// `ParallelJoinOpened` parking on the child's key, also produces an
+/// `element:` base but is NOT that lifecycle re-sighting, so it must fall
+/// through to `mint` and fail as the collision it is.
+#[test]
+fn prev_release_gate_remint_rejects_mi_child_key_reuse_by_other_elements() {
+    let head = head_records();
+    let i = mi_create_entry(&head);
+    let child_key = head
+        .iter()
+        .filter(|r| r.get("state").is_none())
+        .nth(i)
+        .and_then(|r| r.get("events").cloned())
+        .and_then(|e| e.as_array().cloned())
+        .and_then(|events| {
+            events.iter().find_map(|e| {
+                e.get("MultiInstanceChildActivated")?
+                    .get("child_key")?
+                    .as_u64()
+            })
+        })
+        .expect("a child key");
+
+    // (1) An `ElementActivating` for a DIFFERENT element reusing the child's key.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        for e in events.iter_mut() {
+            if let Some(ea) = e.get_mut("ElementActivating") {
+                if ea.get("element_instance_key").and_then(|k| k.as_u64()) == Some(child_key) {
+                    ea["element_id"] = serde_json::json!("approve"); // the child is `review`
+                    break;
+                }
+            }
+        }
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("minted for two entities"),
+        "an ElementActivating for a different element reusing the child's key must collide: {err}"
+    );
+
+    // (2) A parked `ParallelJoinOpened` reusing the child's key.
+    let mut prev = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut prev)[i].get_mut("events") {
+        events.push(serde_json::json!({"ParallelJoinOpened":{
+            "instance_key":10,
+            "element_instance_key":child_key,
+            "element_id":"join",
+            "scope":0
+        }}));
+    }
+    let err = checked(&head, &prev, mi_declaration(), &[]).unwrap_err();
+    assert!(
+        err.contains("minted for two entities"),
+        "a parked ParallelJoinOpened reusing the child's key must collide: {err}"
+    );
+}
+
 /// #1528 (review): an `unbalanced` declaration must not ratify a WRONG
 /// one-sided event. A surplus `UserTaskCreated` whose owning
 /// `element_instance_key` its own side never minted (a wrong-child /

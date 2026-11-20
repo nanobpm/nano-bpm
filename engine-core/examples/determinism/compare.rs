@@ -1214,7 +1214,15 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
             }
         }
     }
-    // Pass 2b: the children.
+    // Pass 2b: the children. For each, ALSO record the (instance, element_id)
+    // its own generic `ElementActivating`/`ElementActivated` will name, so
+    // pass 3 can tell that lifecycle re-sighting apart from an UNRELATED
+    // entity (a `ParallelJoinOpened`, or a different element's activation)
+    // reusing the child's key — the latter must mint and collide, not be
+    // skipped (#1528 review). The element id comes from the child's generic
+    // activation (the `mi-child:…` identity string is not parseable — its
+    // instance and body segments themselves contain `:`/`#`).
+    let mut mi_child_activations: BTreeMap<u64, (String, String)> = BTreeMap::new();
     for (_, body) in parsed
         .iter()
         .filter(|(variant, _)| *variant == "MultiInstanceChildActivated")
@@ -1225,6 +1233,15 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
             let instance = u64_of(body, "instance_key")
                 .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
             ids.resight(k, &format!("mi-child:{instance}:{body_id}#{index}"))?;
+            let child_element_id = parsed
+                .iter()
+                .filter(|(variant, _)| {
+                    *variant == "ElementActivating" || *variant == "ElementActivated"
+                })
+                .find(|(_, b)| u64_of(b, "element_instance_key") == Some(k))
+                .and_then(|(_, b)| str_of(b, "element_id"))
+                .unwrap_or("?");
+            mi_child_activations.insert(k, (instance, child_element_id.to_owned()));
         }
     }
     // Pass 3: every other mint, in corpus order.
@@ -1278,16 +1295,27 @@ fn extend_identities(events: &[String], ids: &mut KeyIds) -> Result<(), String> 
             // under its distinct `mi-child:…` identity; its generic
             // `ElementActivating`/`ElementActivated` is a lifecycle
             // re-sighting of THAT identity (the generic base cannot tell the
-            // children apart), so it is skipped — but only when the key
-            // already carries a `mi-child:…` identity. Every other sighting
-            // goes through `mint`, which rejects a key reused for an
-            // unrelated entity (a `UserTaskCreated` reusing its child's key,
-            // a child reusing a job key) as the collision it is (#1528
-            // review).
+            // children apart), so it is skipped — but only when the sighting
+            // IS that child's own activation: the variant is
+            // `ElementActivating`/`ElementActivated`, and the sighting names
+            // the SAME owning instance and element id the child was
+            // registered with (captured structurally at pass 2, since the
+            // `mi-child:…` identity string is not parseable — its instance
+            // and body segments themselves contain `:`/`#`). Every other
+            // sighting — a `ParallelJoinOpened` parking on the child's key,
+            // or an activation for a DIFFERENT element reusing it — goes
+            // through `mint`, which rejects the key reuse for an unrelated
+            // entity as the collision it is (#1528 review).
             let generic_child_resight = base.starts_with("element:")
-                && ids
+                && matches!(variant.as_str(), "ElementActivating" | "ElementActivated")
+                && mi_child_activations
                     .get(&k)
-                    .is_some_and(|existing| existing.starts_with("mi-child:"));
+                    .is_some_and(|(reg_instance, reg_element)| {
+                        let instance = u64_of(body, "instance_key")
+                            .map_or_else(|| "?".to_owned(), |ik| ids.owner(ik).clone());
+                        let element_id = str_of(body, "element_id").unwrap_or("?");
+                        reg_instance == &instance && reg_element == element_id
+                    });
             if !generic_child_resight {
                 ids.mint(k, base)?;
             }

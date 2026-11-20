@@ -3895,7 +3895,7 @@ fn nested_adhoc_cancel_child_skips_already_completed_inner_instance() {
         "but its scopes mapping still resolves it"
     );
 
-    let events = engine.cancel_adhoc_active_child(inst, outer, nested);
+    let events = engine.cancel_adhoc_active_child(inst, outer, nested, None);
 
     // No element-completion event may carry an empty element_id.
     assert!(
