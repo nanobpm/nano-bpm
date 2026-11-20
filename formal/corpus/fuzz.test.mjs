@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { test } from 'node:test'
 
-import { Reference, wellFormed, materialize, randomRun, flowCount } from './enumerate.mjs'
+import { Reference, wellFormed, materialize, randomRun, flowCount, stepSignatures, commandSignature } from './enumerate.mjs'
 import {
   parseArgs,
   caseSeed,
@@ -18,6 +18,7 @@ import {
   shrinkRuns,
   corpusProblems,
   rederive,
+  rederivedScenarios,
   canonJson,
   judgeCase,
   caseRunnable,
@@ -256,4 +257,18 @@ test('shrinkGraph checkpoints each accepted reduction, so an aborted shrink keep
   assert.ok(latest, 'a reproducer was checkpointed before the failure')
   assert.equal(latest.d.signature, 's')
   assert.ok(latest.d.cand, 'the checkpoint is the accepted reduction, not just the initial case')
+})
+
+test('guided rederive (#1747 review): following the recorded order finds exactly what exhaustive search finds', () => {
+  for (const c of loadCorpus()) {
+    const steps = canonJson(c.scenario.steps)
+    const pick = (ss) => ss.filter((s) => canonJson(s.steps) === steps).map((s) => canonJson(s.expect))
+    assert.deepEqual(pick(rederivedScenarios(c)), pick(rederivedScenarios(c, { exhaustive: true })), `${c.signature} (${c.graph?.id})`)
+  }
+})
+
+test('stepSignatures / commandSignature fail closed on an unknown op', () => {
+  assert.throws(() => stepSignatures([{ op: 'teleport' }]), /unknown scenario step op/)
+  assert.throws(() => commandSignature({ id: 'g' }, { op: 'teleport' }), /unknown command op/)
+  assert.deepEqual(stepSignatures([{ op: 'setVariables', variables: {} }, { op: 'advanceTime', ms: 1 }, { op: 'cancelInstance' }]), ['tick', 'cancel'])
 })

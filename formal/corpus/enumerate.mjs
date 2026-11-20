@@ -839,7 +839,7 @@ export class Reference {
  * that ends with wait states still held is stuck (left to TLC / the nano-only
  * scenarios).
  */
-export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = false } = {}) {
+export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = false, follow = null } = {}) {
   const runs = []
   // Instance cancellation (#1673) is opt-in: with `cancel`, every settled
   // state after the first command may also end the run with a `cancel`.
@@ -856,6 +856,17 @@ export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = f
     }
     const cmds = state.commands()
     if (cancel && steps.length > 0 && cmds.length > 0) cmds.push({ op: 'cancel' })
+    if (follow) {
+      // Guided: only a run whose command signatures ARE `follow` can yield a
+      // scenario with those driver steps, so prune every other command (and
+      // any run that ends early or would run past the followed sequence).
+      if (steps.length === follow.length) {
+        if (cmds.length === 0) runs.push(runOf(state, steps))
+        return
+      }
+      for (const c of cmds) if (commandSignature(graph, c) === follow[steps.length]) rec(state.apply(c), [...steps, c])
+      return
+    }
     if (cmds.length === 0) {
       runs.push(runOf(state, steps))
       return
@@ -864,6 +875,41 @@ export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = f
   }
   rec(new Reference(graph, route), [])
   return runs
+}
+
+/**
+ * The driver-visible signature of a Reference command: what `scenariosFor`
+ * turns it into, minus route deliveries. Fails closed on an unknown op.
+ */
+export function commandSignature (graph, c) {
+  switch (c.op) {
+    case 'complete': return `job:${c.node}`
+    case 'tick': return 'tick'
+    case 'cancel': return 'cancel'
+    case 'correlate': return `msg:${messageName(graph.id, c.catch)}`
+    case 'correlateBoundary': return `msg:${messageName(graph.id, c.node)}`
+    default: throw new Error(`commandSignature: unknown command op ${JSON.stringify(c.op)}`)
+  }
+}
+
+/**
+ * The command signatures a scenario's driver steps record (the inverse of
+ * `commandSignature`; `setVariables` deliveries carry no command). Fails
+ * closed on an unknown step op, so a new step kind cannot be silently skipped.
+ */
+export function stepSignatures (steps) {
+  const out = []
+  for (const s of steps) {
+    switch (s.op) {
+      case 'setVariables': break
+      case 'completeOneJob': out.push(`job:${s.jobType}`); break
+      case 'advanceTime': out.push('tick'); break
+      case 'cancelInstance': out.push('cancel'); break
+      case 'publishMessage': out.push(`msg:${s.name}`); break
+      default: throw new Error(`stepSignatures: unknown scenario step op ${JSON.stringify(s.op)}`)
+    }
+  }
+  return out
 }
 
 /** A finished reference walk in the `exploreOrders` run shape. */

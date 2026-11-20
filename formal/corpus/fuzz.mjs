@@ -38,7 +38,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { GATEWAY_KINDS, EDGE_LABELS, BOUNDARY_LABELS, wellFormed, materialize, randomRun, exploreOrders, scenariosFor } from './enumerate.mjs'
+import { GATEWAY_KINDS, EDGE_LABELS, BOUNDARY_LABELS, wellFormed, materialize, randomRun, exploreOrders, scenariosFor, stepSignatures } from './enumerate.mjs'
 import { bpmnFor } from './generate.mjs'
 import { openBackends, checkScenario } from './exhaustive.mjs'
 import { prng } from '../traces/fuzz/generate.mjs'
@@ -316,14 +316,19 @@ export function canonJson (v) {
 
 /**
  * Every scenario the CURRENT Reference derives for a committed case's graph
- * under the case's own route variables (all command orders, cancellation
- * included), whose start variables equal the case's.
+ * under the case's own route variables, whose start variables equal the
+ * case's — restricted to runs following the case's recorded command sequence
+ * unless `exhaustive` (every command order, cancellation included).
  */
-export function rederivedScenarios (c) {
+export function rederivedScenarios (c, { exhaustive = false } = {}) {
   const graph = materialize(c.skeleton)
   const vars = c.scenario.variables ?? {}
   const route = Object.fromEntries(Object.entries(vars).filter(([k]) => k.startsWith('route_')))
-  const { scenarios } = scenariosFor(graph, exploreOrders(graph, route, { cancel: true }))
+  // By default follow only the case's own recorded command sequence: every
+  // other order yields different steps, and enumerating them all grows
+  // factorially with independent parallel jobs (#1747 review).
+  const follow = exhaustive ? null : stepSignatures(c.scenario.steps)
+  const { scenarios } = scenariosFor(graph, exploreOrders(graph, route, { cancel: true, follow }))
   return scenarios.filter((s) => canonJson(s.variables ?? {}) === canonJson(vars))
 }
 
