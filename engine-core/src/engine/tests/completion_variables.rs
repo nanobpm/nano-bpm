@@ -131,3 +131,87 @@ fn deferred_user_task_completion_variables_stay_task_local_when_the_task_has_out
     complete_job(&mut engine, "lis", BTreeMap::new());
     assert_task_local(&engine, inst);
 }
+
+/// A top-level ad-hoc container whose tools carry `OUTPUT`. Ad-hoc tools keep
+/// their `zeebe:ioMapping` only in the container's catalog (the tool element is
+/// pruned from the flat graph), so this guards the routing reading the
+/// catalog-backed mappings rather than the flat graph.
+fn adhoc_process_with_mapped_tools() -> ProcessDefinition {
+    let xml = format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+          <bpmn:process id="p" isExecutable="true">
+            <bpmn:startEvent id="s" />
+            <bpmn:adHocSubProcess id="agent">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="agent-worker" />
+              </bpmn:extensionElements>
+              <bpmn:serviceTask id="toolA">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="tool" />{OUTPUT}
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:userTask id="ask">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />{OUTPUT}
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+            </bpmn:adHocSubProcess>
+            <bpmn:endEvent id="e" />
+            <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+            <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+          </bpmn:process>
+        </bpmn:definitions>"#
+    );
+    crate::bpmn::parse_bpmn(&xml).unwrap().remove(0)
+}
+
+/// Starts the ad-hoc fixture and externally activates `tool` (the agent job
+/// stays open, so the instance keeps running for inspection).
+fn start_adhoc_tool(tool: &str) -> (Engine, Key) {
+    let (mut engine, inst) = start(adhoc_process_with_mapped_tools());
+    let container = engine
+        .activate_jobs("agent-worker", "w", 1, 60_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job")
+        .element_instance_key;
+    engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: container,
+            activate_elements: vec![crate::model::AdHocActivateElement {
+                element_id: tool.to_string(),
+                variables: BTreeMap::new(),
+            }],
+            cancel_remaining: false,
+        })
+        .unwrap();
+    (engine, inst)
+}
+
+fn assert_adhoc_tool_local(engine: &Engine, inst: Key) {
+    assert!(!engine.is_completed(inst));
+    assert_eq!(io_var(engine, inst, "o1"), Some(Value::Int(33)));
+    assert_eq!(
+        io_var(engine, inst, "result"),
+        None,
+        "ad-hoc tool completion variable leaked past its output mapping"
+    );
+}
+
+#[test]
+fn adhoc_job_tool_completion_variables_stay_task_local_when_the_tool_has_output_mappings() {
+    let (mut engine, inst) = start_adhoc_tool("toolA");
+    complete_job(&mut engine, "tool", result_vars());
+    assert_adhoc_tool_local(&engine, inst);
+}
+
+#[test]
+fn adhoc_user_task_tool_completion_variables_stay_task_local_when_the_tool_has_output_mappings() {
+    let (mut engine, inst) = start_adhoc_tool("ask");
+    let key = only_user_task(&engine);
+    engine
+        .apply_command(Command::complete_user_task_with(key, result_vars()))
+        .unwrap();
+    assert_adhoc_tool_local(&engine, inst);
+}

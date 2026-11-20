@@ -143,12 +143,46 @@ impl Engine {
         if variables.is_empty() {
             return Vec::new();
         }
-        if self.io_outputs(instance_key, element_id).is_empty() {
+        if !self.element_has_output_mappings(instance_key, element_instance_key, element_id) {
             let flow_scope = self.completion_scope(instance_key, element_instance_key);
             self.propagated_updates(instance_key, flow_scope, variables, false)
         } else {
             self.local_element_variable_events(instance_key, element_instance_key, variables)
         }
+    }
+
+    /// Whether the element instance declares output mappings, resolving them
+    /// from wherever they live: an ad-hoc tool is pruned from the flat graph and
+    /// keeps its `zeebe:ioMapping` only in the container's catalog, so the flat
+    /// [`Self::io_outputs`] lookup alone would miss it and leak raw completion
+    /// variables past the mapping (#1533 review).
+    fn element_has_output_mappings(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+    ) -> bool {
+        if !self.io_outputs(instance_key, element_id).is_empty() {
+            return true;
+        }
+        let Some((container_key, _)) =
+            self.adhoc_tool_container_of(instance_key, element_instance_key)
+        else {
+            return false;
+        };
+        let Some(container_element_id) = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+            .map(|a| a.element_id.clone())
+        else {
+            return false;
+        };
+        !self
+            .adhoc_tool_io(instance_key, &container_element_id, element_id)
+            .outputs
+            .is_empty()
     }
 
     /// Every ancestor scope element instance of `element_instance_key`,
