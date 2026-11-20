@@ -1896,3 +1896,104 @@ fn interrupting_boundary_terminates_the_activity_and_cancels_its_user_task() {
     )));
     assert!(engine.is_completed(instance_key));
 }
+
+/// The lifecycle records an element emits between activation and its final
+/// rest, in order: Completing/Completed/Terminating/Terminated only.
+fn lifecycle_of<'e>(events: &'e [Event], id: &str) -> Vec<&'e Event> {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::ElementCompleting { element_id, .. }
+                    | Event::ElementCompleted { element_id, .. }
+                    | Event::ElementTerminating { element_id, .. }
+                    | Event::ElementTerminated { element_id, .. }
+                    if element_id == id
+            )
+        })
+        .collect()
+}
+
+/// #1535 (Zeebe parity): an activity interrupted by an interrupting MESSAGE
+/// boundary is TERMINATED, never COMPLETED — the same teardown contract as an
+/// interrupting timer boundary.
+#[test]
+fn interrupting_message_boundary_terminates_the_activity() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_boundary()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "cancellable",
+            vars(&[("orderId", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+
+    let fired = engine.correlate_message("order-cancelled", "A", BTreeMap::new(), 0);
+    let charge_lifecycle = lifecycle_of(&fired, "charge");
+    assert!(
+        matches!(
+            charge_lifecycle.as_slice(),
+            [
+                Event::ElementTerminating { .. },
+                Event::ElementTerminated { .. }
+            ]
+        ),
+        "the message-interrupted task is terminated, not completed: {charge_lifecycle:?}"
+    );
+}
+
+/// #1535 (Zeebe parity): a NON-interrupting boundary does NOT terminate its
+/// host — the host completes normally once its work finishes; only the
+/// boundary's own parallel token runs.
+#[test]
+fn non_interrupting_message_boundary_does_not_terminate_the_activity() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            process_with_non_interrupting_message_boundary(),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "notifiable",
+            vars(&[("orderId", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    let job_key = engine.pending_jobs()[0].key;
+
+    // The boundary fires: the host task must NOT be terminated.
+    let fired = engine.correlate_message("reminder", "A", BTreeMap::new(), 0);
+    let charge_lifecycle = lifecycle_of(&fired, "charge");
+    assert!(
+        charge_lifecycle.is_empty(),
+        "a non-interrupting boundary emits no host lifecycle record: {charge_lifecycle:?}"
+    );
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::ElementTerminating { .. } | Event::ElementTerminated { .. }
+        )),
+        "a non-interrupting boundary terminates nothing: {fired:?}"
+    );
+
+    // The host then completes NORMALLY (Completing -> Completed) once its job
+    // finishes — never Terminating/Terminated.
+    engine.activate_jobs("payment", "w", 1, 60_000, 0);
+    let completed = engine
+        .apply_command(Command::complete_job(job_key))
+        .unwrap();
+    let charge_lifecycle = lifecycle_of(&completed, "charge");
+    assert!(
+        matches!(
+            charge_lifecycle.as_slice(),
+            [
+                Event::ElementCompleting { .. },
+                Event::ElementCompleted { .. }
+            ]
+        ),
+        "the uninterrupted host completes, it is not terminated: {charge_lifecycle:?}"
+    );
+}
