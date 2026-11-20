@@ -256,6 +256,7 @@ mod tests {
             started_at: 1000,
             creation_variables: map(creation),
             stimuli,
+            terminal_variables: None,
         }
     }
 

@@ -475,6 +475,7 @@ mod tests {
             elements: vec![job_el("Task_CreditCheck", "credit-check", queue, 1000)],
             incidents: vec![],
             creation_variables: None,
+            terminal_variables: None,
             stimuli: None,
             stimuli_truncated: false,
             domain_signals: vec![],

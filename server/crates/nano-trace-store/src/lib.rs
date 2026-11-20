@@ -213,6 +213,12 @@ struct InstanceTrace {
     /// an incident can snapshot the state the failing expression saw. Not
     /// serialized directly — only sampled into `IncidentRec::variables`.
     current_variables: Option<BTreeMap<String, Value>>,
+    /// The instance's terminal ROOT variable state (#1739), snapshotted from
+    /// `current_variables` when the instance ends (capture on only). This is
+    /// what a replay's terminal output is compared against — separately from
+    /// the stimulus inputs, which are not a faithful fold of root state (a
+    /// boundary message's payload is local to the boundary unless propagated).
+    terminal_variables: Option<VarSnapshot>,
     /// Ordered recorded-input log (Tier 2), kept only when stimulus capture is on.
     /// Each entry is one external stimulus the instance consumed; replaying the
     /// creation inputs then these deltas in order reproduces the run's inputs.
@@ -591,6 +597,7 @@ impl Inner {
                     path: Vec::new(),
                     creation_variables,
                     current_variables,
+                    terminal_variables: None,
                     stimuli: if self.capture_stimuli {
                         Some(Vec::new())
                     } else {
@@ -606,16 +613,27 @@ impl Inner {
                 variables,
             } => {
                 if !self.capture_vars {
+                    // An update we do not observe makes the running root state
+                    // incomplete for good: invalidate it so neither a terminal
+                    // nor an incident snapshot can publish stale values, even
+                    // if capture is re-enabled later (#1759).
+                    if let Some(t) = self.instances.get_mut(instance_key) {
+                        t.current_variables = None;
+                    }
                     return;
                 }
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
-                    let running = t.current_variables.get_or_insert_with(BTreeMap::new);
-                    for (k, v) in variables {
-                        running.insert(k.clone(), v.clone());
+                    // `None` means the history is incomplete (capture was off at
+                    // creation or was interrupted): never rebuild a partial map.
+                    if let Some(running) = t.current_variables.as_mut() {
+                        for (k, v) in variables {
+                            running.insert(k.clone(), v.clone());
+                        }
                     }
                     // Tier 2: attribute this delta to the completion it followed
-                    // (a job/user-task output or a message payload). With no
+                    // (a job/user-task output; a message payload is read from
+                    // its own event, #1739). With no
                     // pending completion it is a standalone set-variables delta.
                     if self.capture_stimuli {
                         let snap = snapshot_vars(variables, self.vars_max_bytes);
@@ -867,20 +885,29 @@ impl Inner {
             Event::MessageCorrelated {
                 instance_key,
                 element_id,
+                variables,
                 ..
             } => {
-                if self.capture_stimuli
-                    && let Some(t) = self.instances.get_mut(instance_key)
-                {
+                // The payload is read FROM THE EVENT (#1739) — never inferred
+                // from the variable writes that follow, which cannot tell a
+                // payload from a mapping/propagation write. The message claims
+                // no later write (and none is suppressed): any pending
+                // completion is closed, and the engine's own merge/propagation
+                // writes that follow are recorded like any other root write.
+                if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
-                    let idx = t.record_stimulus(
-                        "message",
-                        Some(element_id.clone()),
-                        None,
-                        now,
-                        self.stimuli_max,
-                    );
-                    t.pending_stimulus = idx;
+                    t.pending_stimulus = None;
+                    if self.capture_stimuli {
+                        let snap = (!variables.is_empty())
+                            .then(|| snapshot_vars(variables, self.vars_max_bytes));
+                        t.record_stimulus(
+                            "message",
+                            Some(element_id.clone()),
+                            snap,
+                            now,
+                            self.stimuli_max,
+                        );
+                    }
                 }
             }
             Event::RemoteMessageCorrelation {
@@ -981,6 +1008,10 @@ impl Inner {
             t.last_at = now;
             t.ended_at = Some(now);
             t.outcome = outcome;
+            t.terminal_variables = t
+                .current_variables
+                .as_ref()
+                .map(|m| snapshot_vars(m, self.vars_max_bytes));
         }
         self.finish_instance(key);
     }
@@ -1216,6 +1247,7 @@ impl InstanceTrace {
                 .collect(),
             path: self.path.clone(),
             creation_variables: self.creation_variables.as_ref().map(VarSnapshot::dto),
+            terminal_variables: self.terminal_variables.as_ref().map(VarSnapshot::dto),
             stimuli: self.stimuli.as_ref().map(|log| {
                 log.iter()
                     .map(|s| StimulusDto {
@@ -1394,6 +1426,10 @@ pub struct InstanceTraceDto {
     /// from the JSON entirely when capture is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creation_variables: Option<VariablesDto>,
+    /// The instance's terminal root variable state (#1739), when variable
+    /// capture is enabled and the instance has ended. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_variables: Option<VariablesDto>,
     /// The ordered recorded-input log (Tier 2), when stimulus capture is enabled.
     /// Omitted from the JSON entirely when capture is off.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1687,16 +1723,15 @@ mod tests {
         );
         // A message correlation with payload.
         store.ingest(
-            &[
-                &Event::MessageCorrelated {
-                    subscription_key: 5,
-                    message_key: 6,
-                    instance_key: 1,
-                    element_instance_key: 3,
-                    element_id: "catch".into(),
-                },
-                &vars_updated(1, &[("approved", Value::Bool(true))]),
-            ],
+            &[&Event::MessageCorrelated {
+                subscription_key: 5,
+                message_key: 6,
+                instance_key: 1,
+                element_instance_key: 3,
+                element_id: "catch".into(),
+                variables: [("approved".to_string(), Value::Bool(true))].into(),
+                boundary_element_id: None,
+            }],
             1030,
         );
         // A timer fire (no payload).
@@ -2584,5 +2619,228 @@ mod tests {
             "the newest rotated segment is not overwritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #1739: the message payload is read from the event ------------------
+
+    fn stimulus_values(s: &StimulusDto) -> Option<serde_json::Value> {
+        s.variables.as_ref().and_then(|v| v.values.clone())
+    }
+
+    /// Drive a real engine and feed every command's events to the store, so the
+    /// tests exercise the engine's actual emission order, not a hand-written one.
+    struct Run {
+        engine: nanobpmn_engine_core::Engine,
+        store: TraceStore,
+        now: u64,
+    }
+
+    impl Run {
+        fn new(def: nanobpmn_engine_core::ProcessDefinition) -> Self {
+            let mut run = Run {
+                engine: nanobpmn_engine_core::Engine::new(),
+                store: TraceStore::with_capture(8, 16 * 1024, 1024),
+                now: 1000,
+            };
+            run.cmd(nanobpmn_engine_core::Command::DeployProcess(def));
+            run
+        }
+        fn cmd(&mut self, c: nanobpmn_engine_core::Command) -> Vec<Event> {
+            self.now += 10;
+            let evs = self.engine.apply_command_at(c, self.now).unwrap();
+            let refs: Vec<&Event> = evs.iter().collect();
+            self.store.ingest(&refs, self.now);
+            evs
+        }
+        fn create(&mut self, process_id: &str) -> u64 {
+            let evs = self.cmd(nanobpmn_engine_core::Command::CreateInstance {
+                process_id: process_id.into(),
+                variables: [("orderId".to_string(), Value::Str("A".into()))].into(),
+                tags: Vec::new(),
+                business_id: None,
+                process_definition_key: None,
+                version: None,
+            });
+            evs.iter()
+                .find_map(|e| match e {
+                    Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                    _ => None,
+                })
+                .unwrap()
+        }
+        fn correlate(&mut self, name: &str, vars: &[(&str, Value)]) {
+            self.cmd(nanobpmn_engine_core::Command::CorrelateMessage {
+                message_name: name.into(),
+                correlation_key: "A".into(),
+                variables: vars
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect(),
+                business_id: None,
+            });
+        }
+        fn set(&mut self, instance_key: u64, vars: &[(&str, Value)]) {
+            self.cmd(nanobpmn_engine_core::Command::SetVariables {
+                scope_key: instance_key,
+                variables: vars
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect(),
+                local: false,
+            });
+        }
+        fn stimuli(&self, instance_key: u64) -> Vec<StimulusDto> {
+            self.store.get(instance_key).unwrap().stimuli.unwrap()
+        }
+    }
+
+    fn boundary_process(interrupting: bool) -> nanobpmn_engine_core::ProcessDefinition {
+        let b = nanobpmn_engine_core::ProcessBuilder::new("p")
+            .start_event("start")
+            .service_task("charge", "payment");
+        let b = if interrupting {
+            b.message_boundary_event("onMsg", "charge", "msg", "orderId")
+        } else {
+            b.non_interrupting_message_boundary_event("onMsg", "charge", "msg", "orderId")
+        };
+        b.end_event("done")
+            .end_event("handled")
+            .connect("start", "charge")
+            .connect("charge", "done")
+            .connect("onMsg", "handled")
+            .build()
+            .unwrap()
+    }
+
+    fn kinds(stimuli: &[StimulusDto]) -> Vec<&'static str> {
+        stimuli.iter().map(|s| s.kind).collect()
+    }
+
+    #[test]
+    fn interrupting_boundary_payload_is_read_from_the_event_not_an_overlapping_write() {
+        let mut run = Run::new(boundary_process(true));
+        let ik = run.create("p");
+        // An external write to the payload's key just before the message.
+        run.set(ik, &[("reason", Value::Str("pre".into()))]);
+        run.correlate("msg", &[("reason", Value::Str("fraud".into()))]);
+        let stimuli = run.stimuli(ik);
+        let msg: Vec<_> = stimuli.iter().filter(|s| s.kind == "message").collect();
+        assert_eq!(msg.len(), 1, "one message stimulus: {:?}", kinds(&stimuli));
+        assert_eq!(
+            stimulus_values(msg[0]),
+            Some(serde_json::json!({"reason": "fraud"})),
+            "the payload is the message's own, not a neighbouring write"
+        );
+        assert_eq!(msg[0].reference.as_deref(), Some("charge"));
+    }
+
+    #[test]
+    fn payload_less_message_does_not_claim_a_later_write() {
+        let mut run = Run::new(boundary_process(false));
+        let ik = run.create("p");
+        run.correlate("msg", &[]);
+        run.set(ik, &[("note", Value::Str("later".into()))]);
+        let stimuli = run.stimuli(ik);
+        assert_eq!(kinds(&stimuli), ["message", "variablesSet"]);
+        assert_eq!(stimulus_values(&stimuli[0]), None, "payload-less message");
+        assert_eq!(
+            stimulus_values(&stimuli[1]),
+            Some(serde_json::json!({"note": "later"}))
+        );
+    }
+
+    #[test]
+    fn non_interrupting_boundary_payloads_are_read_from_each_event() {
+        let mut run = Run::new(boundary_process(false));
+        let ik = run.create("p");
+        run.correlate("msg", &[("n", Value::Int(1))]);
+        run.correlate("msg", &[("n", Value::Int(2))]);
+        let stimuli = run.stimuli(ik);
+        let msgs: Vec<_> = stimuli
+            .iter()
+            .filter(|s| s.kind == "message")
+            .map(stimulus_values)
+            .collect();
+        assert_eq!(
+            msgs,
+            [
+                Some(serde_json::json!({"n": 1})),
+                Some(serde_json::json!({"n": 2}))
+            ],
+            "each correlation carries its own payload: {:?}",
+            kinds(&stimuli)
+        );
+    }
+
+    #[test]
+    fn terminal_root_state_is_recorded_separately_from_stimuli() {
+        let mut run = Run::new(boundary_process(true));
+        let ik = run.create("p");
+        run.correlate("msg", &[("reason", Value::Str("fraud".into()))]);
+        let dto = run.store.get(ik).unwrap();
+        assert_eq!(dto.outcome, "completed");
+        let terminal = dto
+            .terminal_variables
+            .and_then(|v| v.values)
+            .expect("terminal root state");
+        assert_eq!(terminal["orderId"], serde_json::json!("A"));
+        // The interrupting boundary's payload is local to the boundary and
+        // propagated to the process scope on its completion (Zeebe parity).
+        assert_eq!(terminal["reason"], serde_json::json!("fraud"));
+    }
+
+    /// Class guard (#1739): the trace store must never reconstruct a message
+    /// payload from variable writes. A payload-less `MessageCorrelated`
+    /// immediately followed by a write keeps an EMPTY payload; the write is its
+    /// own stimulus.
+    #[test]
+    fn message_payload_is_never_reconstructed_from_variable_writes() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 1024);
+        store.ingest(&[&created(1, &[])], 1000);
+        store.ingest(
+            &[
+                &Event::MessageCorrelated {
+                    subscription_key: 5,
+                    message_key: 6,
+                    instance_key: 1,
+                    element_instance_key: 3,
+                    element_id: "catch".into(),
+                    variables: BTreeMap::new(),
+                    boundary_element_id: None,
+                },
+                &vars_updated(1, &[("x", Value::Int(1))]),
+            ],
+            1010,
+        );
+        let stimuli = store.get(1).unwrap().stimuli.unwrap();
+        assert_eq!(kinds(&stimuli), ["message", "variablesSet"]);
+        assert_eq!(stimulus_values(&stimuli[0]), None);
+    }
+
+    /// Class guard (#1759): a root-state history interrupted by a capture
+    /// toggle is incomplete, so no terminal snapshot may publish stale values —
+    /// even after capture is re-enabled.
+    #[test]
+    fn interrupted_capture_publishes_no_stale_terminal_state() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 1024);
+        store.ingest(&[&created(1, &[("x", Value::Int(0))])], 1000);
+        store.set_capture(Some(false), None);
+        store.ingest(&[&vars_updated(1, &[("x", Value::Int(1))])], 1010);
+        store.set_capture(Some(true), None);
+        store.ingest(&[&vars_updated(1, &[("y", Value::Int(2))])], 1020);
+        store.ingest(&[&completed(1)], 1030);
+        assert!(store.get(1).unwrap().terminal_variables.is_none());
+    }
+
+    /// Sibling (#1759): an instance created while capture was off has no root
+    /// baseline; enabling capture mid-flight must not build a partial terminal.
+    #[test]
+    fn capture_enabled_mid_instance_publishes_no_partial_terminal_state() {
+        let store = TraceStore::new(8);
+        store.ingest(&[&created(1, &[("x", Value::Int(0))])], 1000);
+        store.set_capture(Some(true), None);
+        store.ingest(&[&vars_updated(1, &[("y", Value::Int(2))])], 1010);
+        store.ingest(&[&completed(1)], 1020);
+        assert!(store.get(1).unwrap().terminal_variables.is_none());
     }
 }
