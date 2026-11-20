@@ -66,6 +66,10 @@ pub enum SchemaError {
     /// not have: an invalid projection, rejected rather than weakened to an
     /// unconstrained optional field.
     UnknownProjectedField,
+    /// A `project` targets a locally declared shape that is already being
+    /// expanded (a reference cycle): its fields cannot be resolved, so the
+    /// projection is rejected rather than weakened to unconstrained fields.
+    CyclicProjection,
 }
 
 impl std::fmt::Display for SchemaError {
@@ -80,6 +84,10 @@ impl std::fmt::Display for SchemaError {
             Self::UnknownProjectedField => write!(
                 f,
                 "it projects a field that the referenced shape does not declare"
+            ),
+            Self::CyclicProjection => write!(
+                f,
+                "it projects fields from a shape that is part of a reference cycle"
             ),
         }
     }
@@ -315,6 +323,15 @@ impl<'a> Resolver<'a> {
                 }
                 ShapeOp::Project { r#ref, fields, .. } => {
                     let inner = self.resolve(r#ref, stack);
+                    // A local shape that did not resolve without a recorded
+                    // limit error closes a cycle: reject, never pass through.
+                    if inner.is_none()
+                        && self.error.get().is_none()
+                        && stack.iter().any(|s| s == r#ref)
+                    {
+                        self.fail(SchemaError::CyclicProjection);
+                        break;
+                    }
                     for field in fields {
                         let found = inner.as_ref().and_then(|o| {
                             o.properties.get(field).map(|s| (s, o.is_required(field)))
@@ -439,6 +456,20 @@ mod tests {
         assert_eq!(
             message_input_schema(&xml, "placeOrder", None),
             Err(("Order".into(), SchemaError::UnknownProjectedField))
+        );
+    }
+
+    #[test]
+    fn projecting_from_a_local_cycle_is_rejected_not_weakened() {
+        let xml = shapes_doc(
+            r#"<nano:shape id="Order">
+                 <nano:extend name="qty" type="integer" />
+                 <nano:project ref="Order" fields="qty" />
+               </nano:shape>"#,
+        );
+        assert_eq!(
+            message_input_schema(&xml, "placeOrder", None),
+            Err(("Order".into(), SchemaError::CyclicProjection))
         );
     }
 
