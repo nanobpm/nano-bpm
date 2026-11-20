@@ -3654,6 +3654,13 @@ pub struct ServerImpl {
     /// (`reconcile_lenient_completion_via_raft` honours it as the leader's own
     /// feature support).
     advertise_cluster_features: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this node's `/cluster` handshake response advertises its
+    /// release version (#1702). Always `true` in production; a test clears it
+    /// to model a pre-#1702 binary. Separate from
+    /// [`advertise_cluster_features`](Self::advertise_cluster_features) so
+    /// feature-negotiation fixtures stay version-compatible on a stamped
+    /// release build (a versionless peer fails closed at every boundary).
+    advertise_cluster_version: Arc<std::sync::atomic::AtomicBool>,
     /// The Raft groups this node hosts (one per partition it replicates), empty
     /// unless per-partition Raft is enabled. The falcon handler dispatches
     /// inbound RPCs through it; the write path proposes through it. An empty
@@ -4392,6 +4399,7 @@ impl ServerImpl {
             pipeline_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes_watermark,
             advertise_cluster_features: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            advertise_cluster_version: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             drain_guard: Arc::new(crate::drain_guard::DrainGuard::new(
                 crate::drain_guard::DrainGuardCfg::from_env(),
             )),
@@ -35028,10 +35036,11 @@ mod clustered_startup_tests {
         let server =
             build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
         let (_, port) = serve_router(peer_facing_app(server, falcon::Registry::new())).await;
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/cluster"))
-                .await
-                .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(versioned_cluster_request(&format!(
+            "ws://127.0.0.1:{port}/cluster"
+        )))
+        .await
+        .unwrap();
         for (corr, key, status) in [
             (1, "not-a-key", 400),
             (2, "", 400),
@@ -35137,13 +35146,33 @@ mod clustered_startup_tests {
         drop(ws);
     }
 
-    /// Builds a WS handshake request carrying the cluster secret header.
+    /// Builds a `/cluster` WS handshake request carrying THIS build's release
+    /// version, as a real peer of the same release does. A versionless
+    /// joiner fails closed at every determinism boundary on a stamped release
+    /// build (#1702), so every raw handshake that is meant to SUCCEED must go
+    /// through here (versionless-rejection tests build their own request).
+    fn versioned_cluster_request(
+        url: &str,
+    ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        use nano_falcon_protocol::cluster_join;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = url.into_client_request().expect("client request");
+        req.headers_mut().insert(
+            cluster_join::CLUSTER_VERSION_HEADER,
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_str(
+                &cluster_join::local_version_header(),
+            )
+            .expect("version header"),
+        );
+        req
+    }
+
+    /// Builds a versioned WS handshake request carrying the cluster secret header.
     fn build_secret_request(
         url: &str,
         secret: &str,
     ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let mut req = url.into_client_request().expect("client request");
+        let mut req = versioned_cluster_request(url);
         req.headers_mut().insert(
             tokio_tungstenite::tungstenite::http::HeaderName::from_static(
                 falcon::CLUSTER_SECRET_HEADER,
