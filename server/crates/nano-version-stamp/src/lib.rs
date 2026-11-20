@@ -17,6 +17,31 @@ use std::process::Command;
 /// crate and watch the git state the fallback derivation reads. Call this once
 /// from a crate's `build.rs` `main`.
 pub fn emit() {
+    emit_with(resolve_version());
+}
+
+/// Placeholder [`emit_cluster_identity`] stamps when neither `NANOBPM_VERSION`
+/// nor git metadata names the build. Deliberately NOT a `MAJOR.MINOR.PATCH`
+/// release tag, so a cluster-join version check treats it as a dev build.
+pub const UNSTAMPED_VERSION: &str = "unstamped";
+
+/// Like [`emit`], but for a crate whose stamp is a **cluster identity** (the
+/// #1702 determinism upgrade-boundary check): it never falls back to the
+/// compiling crate's own `CARGO_PKG_VERSION`, which is a crate version, not
+/// the gateway release, and would masquerade as a release tag (e.g. a source
+/// tarball build advertising `0.0.16`). Without an explicit or git-derived
+/// version it stamps [`UNSTAMPED_VERSION`] instead.
+pub fn emit_cluster_identity() {
+    emit_with(cluster_identity_version(resolve_explicit_or_git()));
+}
+
+/// The cluster-identity stamp for an explicit/git-derived version (pure, so
+/// the no-`CARGO_PKG_VERSION`-fallback rule is unit-testable).
+pub fn cluster_identity_version(explicit_or_git: Option<String>) -> String {
+    explicit_or_git.unwrap_or_else(|| UNSTAMPED_VERSION.to_string())
+}
+
+fn emit_with(version: String) {
     println!("cargo:rerun-if-env-changed=NANOBPM_VERSION");
     // Emitting *any* `rerun-if-*` opts this build script out of Cargo's default
     // "rerun when any package file changes" heuristic, so unless we say otherwise
@@ -34,7 +59,6 @@ pub fn emit() {
             println!("cargo:rerun-if-changed={path}");
         }
     }
-    let version = resolve_version();
     println!("cargo:rustc-env=NANOBPM_VERSION={version}");
 }
 
@@ -60,14 +84,21 @@ fn git_path(rel: &str) -> Option<String> {
 /// Resolves the reported version from `NANOBPM_VERSION`, then `git describe`,
 /// then the compiling crate's `CARGO_PKG_VERSION`, stripping a leading `v`.
 pub fn resolve_version() -> String {
+    resolve_explicit_or_git()
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string()))
+}
+
+/// The version from `NANOBPM_VERSION` or `git describe` (leading `v`
+/// stripped), or `None` when neither names the build.
+pub fn resolve_explicit_or_git() -> Option<String> {
     if let Ok(v) = env::var("NANOBPM_VERSION") {
         let v = v.trim().trim_start_matches('v');
         if !v.is_empty() {
-            return v.to_string();
+            return Some(v.to_string());
         }
     }
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let git = Command::new("git")
+    Command::new("git")
         .args(["describe", "--tags", "--always", "--dirty"])
         .current_dir(&manifest)
         .output()
@@ -79,9 +110,21 @@ pub fn resolve_version() -> String {
                 .trim_start_matches('v')
                 .to_string()
         })
-        .filter(|v| !v.is_empty());
-    if let Some(v) = git {
-        return v;
+        .filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_identity_never_falls_back_to_a_crate_version() {
+        assert_eq!(cluster_identity_version(None), UNSTAMPED_VERSION);
+        assert_eq!(
+            cluster_identity_version(Some("0.0.28".into())),
+            "0.0.28".to_string()
+        );
+        // The placeholder must not look like a MAJOR.MINOR.PATCH release.
+        assert_ne!(UNSTAMPED_VERSION.split('.').count(), 3);
     }
-    env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string())
 }

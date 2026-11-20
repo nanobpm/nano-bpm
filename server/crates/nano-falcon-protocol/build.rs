@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 mod boundary_ledger;
 
 fn main() {
-    nano_version_stamp::emit();
+    // Cluster identity: never advertise this crate's own CARGO_PKG_VERSION as
+    // a release (#1702) — an unstamped source build stamps a non-release.
+    nano_version_stamp::emit_cluster_identity();
 
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     let dir = Path::new(&manifest).join("../../../engine-core/examples/determinism");
