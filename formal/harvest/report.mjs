@@ -32,6 +32,8 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { harvestedByClass, unparseableByClass } from './unparseable-ratchet.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const PIN = JSON.parse(readFileSync(join(here, 'zeebe-test-pin.json'), 'utf8'));
 
@@ -78,6 +80,20 @@ export function buildReport(corpusDir) {
       normalise: outOfScopeNorm.length,
       run: runOutOfScope.length,
     },
+    // Per-Zeebe-test-class view of the unparseable list (#1525), ratcheted
+    // shrink-only by unparseable-ratchet.mjs against unparseable-baseline.json.
+    // `fullyUnparseable` marks classes where NO model was harvested — a whole
+    // family of Zeebe behaviours invisible to the differential run.
+    unparseableByClass: (() => {
+      const unp = unparseableByClass(corpusDir);
+      const harv = harvestedByClass(corpusDir);
+      return Object.entries(unp).map(([testClass, n]) => ({
+        testClass,
+        unparseable: n,
+        harvested: harv[testClass] ?? 0,
+        fullyUnparseable: (harv[testClass] ?? 0) === 0,
+      }));
+    })(),
     runnableIds: runnable.map((r) => r.id),
   };
   return report;
@@ -111,6 +127,13 @@ function main() {
   if (report.unverified.length) {
     lines.push(``, `## Unverified (non-clean Nano runs — no Zeebe oracle, investigate before treating as parity issues)`, ``);
     for (const d of report.unverified) lines.push(`- \`${d.processId}\` — ${d.detail}`);
+  }
+  const fully = report.unparseableByClass.filter((c) => c.fullyUnparseable);
+  lines.push(``, `## Unparseable by Zeebe test class (${report.unparseableByClass.length} classes, ${fully.length} fully unparseable)`, ``,
+    `| Test class | Unparseable | Harvested |`, `|---|---|---|`);
+  for (const c of report.unparseableByClass) {
+    const name = c.testClass.replace(/^.*\/engine\/processing\//, '');
+    lines.push(`| ${c.fullyUnparseable ? '**' + name + '**' : name} | ${c.unparseable} | ${c.harvested} |`);
   }
   const text = lines.join('\n') + '\n';
   console.log(text);

@@ -37,3 +37,5 @@ node "$here/normalise.mjs" --corpus "$corpus"
 node "$here/run.mjs" --corpus "$corpus"
 # Emit the acceptance report.
 node "$here/report.mjs" --corpus "$corpus" --out "$here/report.json"
+# Ratchet the unparseable list per Zeebe test class (#1525): shrink-only.
+node "$here/unparseable-ratchet.mjs" --corpus "$corpus"
