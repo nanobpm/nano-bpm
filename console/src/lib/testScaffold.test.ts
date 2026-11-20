@@ -134,6 +134,59 @@ test("scaffoldStartVars yields {} when the start fans out and only one target is
   assert.equal(scaffoldStartVars(m), "{}");
 });
 
+// --- none-start-event envelopes (process start inputs) ---------------------
+
+test("parseModelEnvelopes lifts a none start event's input envelope", () => {
+  const xml = XML.replace(
+    '<bpmn:startEvent id="Start">',
+    '<bpmn:startEvent id="Start"><bpmn:extensionElements><zeebe:properties>' +
+      '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="ReviewIn" />' +
+      "</zeebe:properties></bpmn:extensionElements>",
+  );
+  const m = parseModelEnvelopes(xml);
+  assert.equal(m.startEnvelopes.get("p"), "ReviewIn");
+});
+
+test("scaffoldStartVars prefers the declared start envelope over the entry task's", () => {
+  // The start event declares `ReviewOut` while the entry task declares
+  // `ReviewIn`: the start event is the authoritative start-input carrier.
+  const xml = XML.replace(
+    '<bpmn:startEvent id="Start">',
+    '<bpmn:startEvent id="Start"><bpmn:extensionElements><zeebe:properties>' +
+      '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="ReviewOut" />' +
+      "</zeebe:properties></bpmn:extensionElements>",
+  );
+  const m = parseModelEnvelopes(xml);
+  assert.deepEqual(JSON.parse(scaffoldStartVars(m)), {
+    status: "",
+    summary: "",
+  });
+});
+
+test("a message/timer start event is not a none start and carries no start envelope", () => {
+  for (const def of [
+    '<bpmn:messageEventDefinition messageRef="Msg_1" />',
+    "<bpmn:timerEventDefinition><bpmn:timeCycle>R/PT1H</bpmn:timeCycle></bpmn:timerEventDefinition>",
+  ]) {
+    const xml = XML.replace(
+      '<bpmn:startEvent id="Start">',
+      '<bpmn:startEvent id="Start"><bpmn:extensionElements><zeebe:properties>' +
+        '<zeebe:property name="io.nanobpm.dataEnvelope.in" value="ReviewIn" />' +
+        `</zeebe:properties></bpmn:extensionElements>${def}`,
+    );
+    const m = parseModelEnvelopes(xml);
+    assert.equal(m.startEnvelopes.size, 0);
+  }
+});
+
+test("a none start with no envelope leaves the entry-task heuristic in place", () => {
+  // Sanity: the none start carries no envelope here, so the heuristic still
+  // applies (the lone entry task's input envelope).
+  const m = parseModelEnvelopes(XML);
+  assert.equal(m.startEnvelopes.size, 0);
+  assert.equal(JSON.parse(scaffoldStartVars(m)).prUrl, "");
+});
+
 test("scaffoldStartVars scopes to the selected process in a multi-process model", () => {
   // Two processes, each with its own start → entry task and distinct input
   // envelope. Unscoped, the union of start targets is ambiguous → "{}"; scoped

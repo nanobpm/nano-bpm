@@ -30,6 +30,7 @@ import {
   emitDomainModelJson,
   emitDomainTypeRegistry,
   emitMeta,
+  emitStartBindings,
   emitWorkerBindings,
   emitWorkerBindingsRuntime,
   foldMeta,
@@ -578,6 +579,46 @@ test("emitWorkerBindingsRuntime is a taskType-keyed typed defineWorker wrapper",
   // File basenames are stable.
   assertEquals(WORKER_BINDINGS_TS, "workers.ts");
   assertEquals(WORKER_BINDINGS_DTS, "worker-io.d.ts");
+});
+
+// --- none-start-event envelopes: emitStartBindings (process start inputs) ----
+
+test("emitStartBindings maps process → declared input type", () => {
+  const out = emitStartBindings(
+    [
+      { process: "feature", inputType: "featureRequest" },
+      { process: "plan-fanout" }, // no declared type → StartVars fallback
+      { process: "ghost", inputType: "undeclared" }, // undeclared id → absent
+    ],
+    ["featureRequest"],
+  );
+  assertStringIncludes(out, `import type { DomainTypes } from "./${DOMAIN_DTS}";`);
+  assertStringIncludes(out, "export interface StartPayloads {");
+  assertStringIncludes(out, `"feature": DomainTypes["featureRequest"];`);
+  // Every process carrying a none start event is in the model-derived union,
+  // including type-less and undeclared-type ones…
+  assertStringIncludes(
+    out,
+    `export type StartableProcess = "feature" | "plan-fanout" | "ghost";`,
+  );
+  // …but only a declared, known type maps a payload entry.
+  assertEquals(out.includes('"plan-fanout": DomainTypes'), false);
+  assertEquals(out.includes('"ghost": DomainTypes'), false);
+  assertStringIncludes(out, "export type StartVars = Record<string, unknown>;");
+});
+
+test("emitStartBindings with no declared start types is a valid empty map", () => {
+  const out = emitStartBindings([{ process: "noop" }], []);
+  assertStringIncludes(out, "export interface StartPayloads {}");
+  assertStringIncludes(out, `export type StartableProcess = "noop";`);
+  // No registry import when nothing references it.
+  assertEquals(out.includes("import type { DomainTypes }"), false);
+});
+
+test("emitStartBindings with no start events at all yields a permissive StartableProcess", () => {
+  const out = emitStartBindings([], []);
+  assertStringIncludes(out, "export type StartableProcess = string;");
+  assertStringIncludes(out, "export interface StartPayloads {}");
 });
 
 // --- model-level metadata: foldMeta / emitMeta (ADR 0040 §5) -----------------

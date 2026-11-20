@@ -75,6 +75,23 @@ pub struct MessageIo {
     pub output_type: Option<String>,
 }
 
+/// A model-derived start-envelope binding: the input type a **none start event**
+/// (a `bpmn:startEvent` with no event definition — how a process started over the
+/// API or from a call activity begins) declares for the process's initial
+/// variables. Serializes to `{ process, inputType? }` — the shape the reifier's
+/// start-IO codegen reads — so it can be injected straight into the `domaintypes`
+/// op request. Input only: a start event produces the process's initial
+/// variables, so there is no `.out`. A message/timer/… start is not a carrier —
+/// a message start's envelope stays on the referenced `bpmn:message`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StartIo {
+    /// The enclosing `bpmn:process` id (the start event's process is what a
+    /// start-instance call keys on).
+    pub process: String,
+    #[serde(rename = "inputType", skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
+}
+
 /// A model-level metadata entry (`nano:meta`), lifted from a `nano:meta` key/value
 /// sibling of the `nano:shapes` container on a `bpmn:process` (ADR 0040 §5).
 /// Serializes to `{ process?, key, value }` — the `MetaDecl` the reifier folds into
@@ -89,13 +106,15 @@ pub struct MetaDecl {
 
 /// Everything one model scan lifts from a BPMN document: the service-task worker
 /// I/O map (slice 1), the message payload map (slice 2), the composed motion
-/// shapes (§9/§10), and the model-level metadata (§5).
+/// shapes (§9/§10), the model-level metadata (§5), and the none-start-event
+/// input envelopes (the process start-input declarations).
 #[derive(Default)]
 pub struct BpmnScan {
     pub workers: Vec<WorkerIo>,
     pub messages: Vec<MessageIo>,
     pub shapes: Vec<ShapeDecl>,
     pub meta: Vec<MetaDecl>,
+    pub starts: Vec<StartIo>,
 }
 
 /// One composition operation of a `nano:shape`, in author (XML) order. Serializes
@@ -152,17 +171,32 @@ enum Kind {
     Worker,
     /// A `bpmn:message`; `key` is its `name`.
     Message,
+    /// A `bpmn:startEvent`; `key` is the enclosing `bpmn:process` id. The entry
+    /// is kept only when the start event turns out to be a **none** start (no
+    /// event-definition child) — decided when the element closes.
+    Start,
 }
+
+/// An event-definition child element (`messageEventDefinition`,
+/// `timerEventDefinition`, `signalEventDefinition`, …) disqualifies a start
+/// event from being a *none* start. Matched by the `EventDefinition` suffix,
+/// mirroring the engine parser's start-event trigger count (`bpmn/walk.rs`).
+const EVENT_DEFINITION_SUFFIX: &str = "EventDefinition";
 
 struct Accum {
     kind: Kind,
-    /// The map key: a worker's `taskDefinition` type (set while open), or a
-    /// message's `name` (set at open).
+    /// The map key: a worker's `taskDefinition` type (set while open), a
+    /// message's `name` (set at open), or a start event's process id (set at
+    /// open from the enclosing process).
     key: Option<String>,
     input_type: Option<String>,
     output_type: Option<String>,
     /// A worker's declared `zeebe:header` keys, in author order (deduped).
     header_keys: Vec<String>,
+    /// A start event's event-definition child count: zero at close = a none
+    /// start (an envelope carrier); any definition = a typed start whose
+    /// envelope lives elsewhere (a message start's on the `bpmn:message`).
+    event_defs: usize,
 }
 
 impl Accum {
@@ -173,6 +207,7 @@ impl Accum {
             input_type: None,
             output_type: None,
             header_keys: Vec::new(),
+            event_defs: 0,
         }
     }
 }
@@ -208,23 +243,28 @@ fn message_name(value: Option<&str>) -> Option<String> {
     value.filter(|v| !v.is_empty()).map(str::to_string)
 }
 
-/// Scan a single BPMN document into its worker- and message-IO maps. Every
-/// service-ish task carrying a literal job type contributes a worker entry (even
-/// with no envelope, so a stale manifest projection is *cleared* on rebuild), and
-/// every named `bpmn:message` contributes a message entry (envelope optional, so
-/// the derived `MessageName` union is complete). A malformed document yields an
-/// empty scan.
+/// Scan a single BPMN document into its worker-, message- and start-IO maps.
+/// Every service-ish task carrying a literal job type contributes a worker entry
+/// (even with no envelope, so a stale manifest projection is *cleared* on
+/// rebuild), every named `bpmn:message` contributes a message entry (envelope
+/// optional, so the derived `MessageName` union is complete), and every **none
+/// start event** (a `bpmn:startEvent` with no event definition) contributes a
+/// start entry keyed by its process (envelope optional, so a cleared start
+/// envelope clears the derived binding on rebuild). A malformed document yields
+/// an empty scan.
 pub fn scan_bpmn(xml: &str) -> BpmnScan {
     let tokens = match tokenize(xml) {
         Ok(t) => t,
         Err(_) => return BpmnScan::default(),
     };
 
-    // Entries keyed by job type / message name so a rebuild is deterministic and
-    // duplicates fold to one entry (the first non-empty envelope on each side
-    // wins; the fuse-conflict diagnostic of ADR 0040 §6 is a later slice).
+    // Entries keyed by job type / message name / process id so a rebuild is
+    // deterministic and duplicates fold to one entry (the first non-empty
+    // envelope on each side wins; the fuse-conflict diagnostic of ADR 0040 §6 is
+    // a later slice).
     let mut workers: BTreeMap<String, WorkerIo> = BTreeMap::new();
     let mut messages: BTreeMap<String, MessageIo> = BTreeMap::new();
+    let mut starts: BTreeMap<String, StartIo> = BTreeMap::new();
 
     // Depth of the currently-open carrier's start tag; `None` when not inside one.
     // Sub-elements (`extensionElements`, `zeebe:taskDefinition`, `zeebe:properties`,
@@ -236,6 +276,8 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
     // above: `nano:shape` declarations live under `bpmn:process` extension elements,
     // never inside a service task, so the two states never overlap. `process_id`
     // tags each shape's provenance; `cur_shape` accumulates the open shape's ops.
+    // `process_id` also keys a start event's entry (the process is the start's
+    // identity for a start-instance call).
     let mut process_id: Option<String> = None;
     let mut shapes: Vec<ShapeDecl> = Vec::new();
     let mut cur_shape: Option<(usize, ShapeDecl)> = None;
@@ -267,7 +309,21 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         // union (ADR 0040 slice 2), so flush it straight away.
                         let acc = Accum::new(Kind::Message, message_name(attr(attrs, "name")));
                         if *self_closing {
-                            flush(&mut workers, &mut messages, acc);
+                            flush(&mut workers, &mut messages, &mut starts, acc);
+                        } else {
+                            cur = Some((depth, acc));
+                        }
+                    } else if ln == "startEvent" {
+                        // A `bpmn:startEvent` keys by its enclosing process (read
+                        // from the most recent open `<process>`). Whether it is a
+                        // *none* start (an envelope carrier) is only decidable at
+                        // the close tag — an event-definition child disqualifies
+                        // it — so the accumulator stays open and `flush` decides.
+                        // A self-closing `<startEvent/>` has no children, so it is
+                        // a none start by construction: flush it straight away.
+                        let acc = Accum::new(Kind::Start, process_id.clone());
+                        if *self_closing {
+                            flush(&mut workers, &mut messages, &mut starts, acc);
                         } else {
                             cur = Some((depth, acc));
                         }
@@ -278,6 +334,13 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                             if let Some(t) = attr(attrs, "type") {
                                 acc.key = Some(t.to_string());
                             }
+                        }
+                        // An event-definition child of a start event makes it a
+                        // typed (non-none) start — not an envelope carrier.
+                        _ if matches!(acc.kind, Kind::Start)
+                            && ln.ends_with(EVENT_DEFINITION_SUFFIX) =>
+                        {
+                            acc.event_defs += 1;
                         }
                         "property" => match attr(attrs, "name") {
                             Some(ENVELOPE_IN) => {
@@ -351,7 +414,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                 depth = depth.saturating_sub(1);
                 if let Some((open_depth, acc)) = cur.take() {
                     if depth == open_depth {
-                        flush(&mut workers, &mut messages, acc);
+                        flush(&mut workers, &mut messages, &mut starts, acc);
                     } else {
                         cur = Some((open_depth, acc));
                     }
@@ -375,6 +438,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
         messages: messages.into_values().collect(),
         shapes,
         meta,
+        starts: starts.into_values().collect(),
     }
 }
 
@@ -445,11 +509,13 @@ fn bool_attr(attrs: &[(String, String)], local: &str) -> Option<bool> {
 
 /// Fold one closed carrier's accumulator into the right map. Workers are keyed by
 /// their literal job type (non-literal or missing types are dropped); messages by
-/// their name. On a duplicate key, fill any still-empty envelope side so a binding
-/// is not lost.
+/// their name; start events by their process — and only when the start event
+/// closed with no event-definition child (a *none* start). On a duplicate key,
+/// fill any still-empty envelope side so a binding is not lost.
 fn flush(
     workers: &mut BTreeMap<String, WorkerIo>,
     messages: &mut BTreeMap<String, MessageIo>,
+    starts: &mut BTreeMap<String, StartIo>,
     acc: Accum,
 ) {
     let Some(raw) = acc.key.as_deref() else {
@@ -488,6 +554,19 @@ fn flush(
             fill(&mut entry.input_type, acc.input_type);
             fill(&mut entry.output_type, acc.output_type);
         }
+        Kind::Start => {
+            // Only a none start carries an envelope on the event itself; a typed
+            // start's envelope lives elsewhere (a message start's on the
+            // referenced `bpmn:message`, scanned as a `Message` carrier).
+            if acc.event_defs > 0 {
+                return;
+            }
+            let entry = starts.entry(raw.to_string()).or_insert_with(|| StartIo {
+                process: raw.to_string(),
+                input_type: None,
+            });
+            fill(&mut entry.input_type, acc.input_type);
+        }
     }
 }
 
@@ -499,8 +578,8 @@ fn fill(slot: &mut Option<String>, incoming: Option<String>) {
 }
 
 /// Scan every `resources/processes/*.bpmn` under `project_dir` into the merged
-/// worker- and message-IO maps. Unreadable or malformed files are skipped; a
-/// project with no processes yields an empty scan.
+/// worker-, message- and start-IO maps. Unreadable or malformed files are
+/// skipped; a project with no processes yields an empty scan.
 pub fn scan_project(project_dir: &Path) -> BpmnScan {
     let processes = project_dir.join("resources").join("processes");
     let entries = match std::fs::read_dir(&processes) {
@@ -509,6 +588,7 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
     };
     let mut workers: BTreeMap<String, WorkerIo> = BTreeMap::new();
     let mut messages: BTreeMap<String, MessageIo> = BTreeMap::new();
+    let mut starts: BTreeMap<String, StartIo> = BTreeMap::new();
     let mut shapes: Vec<ShapeDecl> = Vec::new();
     let mut meta: Vec<MetaDecl> = Vec::new();
     let mut files: Vec<std::path::PathBuf> = entries
@@ -553,6 +633,16 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
             fill(&mut entry.input_type, io.input_type);
             fill(&mut entry.output_type, io.output_type);
         }
+        // Start envelopes are keyed by process id; a process spanning files folds
+        // to one entry (first non-empty envelope wins), so a cleared envelope in
+        // a re-saved model clears the derived binding on rebuild.
+        for io in scan.starts {
+            let entry = starts.entry(io.process.clone()).or_insert_with(|| StartIo {
+                process: io.process.clone(),
+                input_type: None,
+            });
+            fill(&mut entry.input_type, io.input_type);
+        }
         // Shapes are model-scoped declarations; gather them across every model so
         // the reifier resolves references (including cross-model carries) against
         // the combined set (ADR 0040 §10 second pass). Deterministic file order
@@ -567,6 +657,7 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
         messages: messages.into_values().collect(),
         shapes,
         meta,
+        starts: starts.into_values().collect(),
     }
 }
 
@@ -926,6 +1017,158 @@ mod tests {
         assert_eq!(v["messageName"], "orderPlaced");
         assert_eq!(v["inputType"], "Order");
         assert!(v.get("outputType").is_none());
+    }
+
+    // --- none-start-event envelopes (process start inputs) ------------------
+
+    /// Test helper: the start-IO map derived from a single document.
+    fn starts(xml: &str) -> Vec<StartIo> {
+        scan_bpmn(xml).starts
+    }
+
+    /// A `bpmn:startEvent` carrying the given extension-children body (event
+    /// definitions and/or a `zeebe:properties` envelope), inside `doc`'s process.
+    fn start_event(id: &str, body: &str) -> String {
+        format!(r#"<bpmn:startEvent id="{id}" name="{id}">{body}</bpmn:startEvent>"#)
+    }
+
+    #[test]
+    fn lifts_a_none_start_events_input_envelope_keyed_by_process() {
+        let xml = doc(&start_event(
+            "s",
+            &format!(
+                "<bpmn:extensionElements><zeebe:properties>{IN_ORDER}</zeebe:properties>\
+                 </bpmn:extensionElements><bpmn:outgoing>f1</bpmn:outgoing>"
+            ),
+        ));
+        assert_eq!(
+            starts(&xml),
+            vec![StartIo {
+                process: "p".into(),
+                input_type: Some("Order".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_self_closing_start_event_is_a_none_start_with_no_envelope() {
+        // `<startEvent/>` has no children, so it is a none start by construction;
+        // it still contributes an entry (envelope-less) so a cleared envelope
+        // clears the derived binding on rebuild.
+        let xml = doc(r#"<bpmn:startEvent id="s" />"#);
+        assert_eq!(
+            starts(&xml),
+            vec![StartIo {
+                process: "p".into(),
+                input_type: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_message_start_event_is_not_a_none_start() {
+        // The message start's envelope stays on the referenced `bpmn:message`;
+        // an `.in` property on the start event itself is not lifted.
+        let body = format!(
+            "{}{}",
+            message("orderPlaced", IN_ORDER),
+            "<bpmn:process id=\"p\">".to_string()
+                + &start_event(
+                    "s",
+                    &format!(
+                        "<bpmn:extensionElements><zeebe:properties>{OUT_RECEIPT}</zeebe:properties>\
+                         </bpmn:extensionElements>\
+                         <bpmn:messageEventDefinition messageRef=\"Msg_orderPlaced\" />"
+                    ),
+                )
+                + "</bpmn:process>",
+        );
+        let scan = scan_bpmn(&defs(&body));
+        assert!(scan.starts.is_empty());
+        // …while the message itself is still scanned unchanged.
+        assert_eq!(
+            scan.messages,
+            vec![MessageIo {
+                message_name: "orderPlaced".into(),
+                input_type: Some("Order".into()),
+                output_type: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_timer_start_event_is_not_a_none_start() {
+        let xml = doc(&start_event(
+            "s",
+            "<bpmn:timerEventDefinition><bpmn:timeCycle>R/PT1H</bpmn:timeCycle>\
+             </bpmn:timerEventDefinition>",
+        ));
+        assert!(starts(&xml).is_empty());
+    }
+
+    #[test]
+    fn a_none_start_keeps_its_envelope_alongside_documentation_and_flow_refs() {
+        // `documentation`/`outgoing` children are not event definitions.
+        let xml = doc(&start_event(
+            "s",
+            &format!(
+                "<bpmn:documentation>starts it</bpmn:documentation>\
+                 <bpmn:extensionElements><zeebe:properties>{IN_ORDER}</zeebe:properties>\
+                 </bpmn:extensionElements><bpmn:outgoing>f1</bpmn:outgoing>"
+            ),
+        ));
+        assert_eq!(
+            starts(&xml),
+            vec![StartIo {
+                process: "p".into(),
+                input_type: Some("Order".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_start_event_outside_a_process_has_no_key_and_is_dropped() {
+        let xml = defs(&start_event("s", ""));
+        assert!(starts(&xml).is_empty());
+    }
+
+    #[test]
+    fn multiple_none_starts_in_one_process_fold_to_one_entry() {
+        let body = format!(
+            "{}{}",
+            start_event(
+                "s1",
+                &format!(
+                    "<bpmn:extensionElements><zeebe:properties>{IN_ORDER}</zeebe:properties>\
+                     </bpmn:extensionElements>"
+                ),
+            ),
+            start_event("s2", ""),
+        );
+        assert_eq!(
+            starts(&doc(&body)),
+            vec![StartIo {
+                process: "p".into(),
+                input_type: Some("Order".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn serializes_to_start_decl_shape() {
+        let io = StartIo {
+            process: "orders".into(),
+            input_type: Some("Order".into()),
+        };
+        let v = serde_json::to_value(&io).unwrap();
+        assert_eq!(v["process"], "orders");
+        assert_eq!(v["inputType"], "Order");
+        let bare = serde_json::to_value(&StartIo {
+            process: "orders".into(),
+            input_type: None,
+        })
+        .unwrap();
+        assert!(bare.get("inputType").is_none());
     }
 
     // --- composed motion shapes (ADR 0040 §9/§10) --------------------------
