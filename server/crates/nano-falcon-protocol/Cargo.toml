@@ -13,6 +13,15 @@ nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 
+[build-dependencies]
+# Stamps `NANOBPM_VERSION` (the release version the join handshake advertises,
+# #1702) from the same single source of truth as the gateway binary (ADR 0064).
+nano-version-stamp = { path = "../nano-version-stamp" }
+# The build script parses the divergence allowlist to derive the upgrade
+# boundary table (#1702).
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+
 [lints.rust]
 # Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
 # warning (unused code, deprecations, future-incompat lints, etc.).
@@ -24,3 +33,9 @@ warnings = "deny"
 # `clippy.toml` (`allow-unwrap-in-tests` / `allow-expect-in-tests`).
 unwrap_used = "deny"
 expect_used = "deny"
+
+[features]
+# Test-only hooks (e.g. `cluster_join::set_advertised_version_override`) for
+# the gateway binary's mixed-version join tests (#1702), which link this crate
+# as a normal library. Production builds never enable it.
+test-hooks = []

@@ -53,6 +53,32 @@ If the FFI ABI changed on this train, also update `EXPECTED_ABI_VERSION` in `cli
 
 Open a PR titled e.g. `chore(release): gateway v0.0.24 + nano-bernd 0.3.0 + engine-wasm 0.10.0`, converge review, merge.
 
+### 1a. Call out every determinism upgrade boundary in the release notes
+
+Raft members **re-execute** committed commands (ADR 0066, "Rolling upgrade",
+option C), so a release whose previous-release determinism allowlist
+(`engine-core/examples/determinism/divergence-allowlist.json`) carries any
+`"upgrade": "upgrade-boundary"` entry **forbids rolling upgrades across it**:
+a mixed-version cluster spanning that release would journal different events
+for the same command. Since #1702 the cluster-join handshake **enforces** this
+— a member whose version straddles a declared boundary is refused at join with
+a typed `JoinRejection::UpgradeBoundary` error naming both versions and the
+boundary (the boundary table is derived from the allowlist at build time, so
+it can never drift from it).
+
+Every `upgrade-boundary` entry **must be called out in the release notes** as:
+"no rolling upgrade across this release; quiesce and upgrade all nodes". The
+`determinism_corpus cross-release` CLI already prints the lines to source this
+from — one per boundary entry:
+
+```
+determinism_corpus: UPGRADE BOUNDARY (no rolling upgrade across this release; call out in the release notes): <entry>
+```
+
+Run it (CI's previous-release determinism gate does) and copy each
+`UPGRADE BOUNDARY` line into the release notes verbatim, with the entry's
+issue link.
+
 ### 2. Tag every bumped train from the merge commit
 
 ```bash

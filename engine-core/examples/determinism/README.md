@@ -47,7 +47,10 @@ ignored silently:
      advertisement); the old behaviour runs until then.
    * `upgrade-boundary` — the release requires an all-nodes-same-version
      (quiesced) upgrade; no rolling upgrade across it. Every such entry must
-     be called out in the release notes.
+     be called out in the release notes (RELEASE.md §1a). Since #1702 the
+     cluster-join handshake ENFORCES the boundary: the gateway build derives
+     a boundary table from this file (`nano-falcon-protocol/build.rs`) and a
+     member whose version straddles a declared boundary is refused at join.
 
    An entry **expires** (must be removed) once the
    previous release is at or past `introduced_in`, and a **stale** entry —

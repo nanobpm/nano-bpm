@@ -333,14 +333,21 @@ impl PeerLink {
                 value,
             );
         }
-        // Join handshake (#1661): advertise our replicated-command features and
-        // (when known) our partition count, so the peer can refuse a mismatch.
+        // Join handshake (#1661): advertise our replicated-command features,
+        // our release version (#1702), and (when known) our partition count,
+        // so the peer can refuse a mismatch.
         {
             use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
             let headers = request.headers_mut();
             if let Ok(value) = HeaderValue::from_str(&cluster_join::local_features_header()) {
                 headers.insert(
                     HeaderName::from_static(cluster_join::CLUSTER_FEATURES_HEADER),
+                    value,
+                );
+            }
+            if let Ok(value) = HeaderValue::from_str(&cluster_join::local_version_header()) {
+                headers.insert(
+                    HeaderName::from_static(cluster_join::CLUSTER_VERSION_HEADER),
                     value,
                 );
             }
@@ -365,9 +372,11 @@ impl PeerLink {
                 )));
             }
         };
-        // The peer answers with its own partition count + features: refuse the
-        // link from this side too when the counts differ, or when the peer
-        // lacks a feature this node's replicated state requires (#1661).
+        // The peer answers with its own partition count + features + version:
+        // refuse the link from this side too when the counts differ, when the
+        // peer lacks a feature this node's replicated state requires (#1661),
+        // or when the two versions straddle a determinism upgrade boundary
+        // (#1702).
         let header = |name: &str| {
             resp.headers()
                 .get(name)
@@ -383,6 +392,8 @@ impl PeerLink {
                 .as_deref(),
             features_header.as_deref(),
             required_features,
+            &cluster_join::local_version_header(),
+            header(cluster_join::CLUSTER_VERSION_HEADER).as_deref(),
         )
         .map_err(|e| PeerError::Connect(e.to_string()))?;
         // Disable Nagle on the peer socket: the Falcon protocol carries small,

@@ -1401,6 +1401,7 @@ dependencies = [
 name = "nano-falcon-protocol"
 version = "0.0.16"
 dependencies = [
+ "nano-version-stamp",
  "nanobpmn-engine-core",
  "serde",
  "serde_json",

@@ -614,6 +614,178 @@ async fn join_from_incompatible_binary_is_rejected_once_feature_is_in_use() {
         .expect("legacy binary joins before the feature is in use");
 }
 
+/// #1702: a mixed-version join ACROSS a declared determinism upgrade boundary
+/// is refused at the handshake — in BOTH directions — with a typed,
+/// operator-actionable error naming both versions and the boundary. The
+/// checked-in allowlist (`divergence-allowlist.json`, the single source of
+/// truth the boundary table is derived from at build time) declares v0.0.28
+/// `upgrade-boundary` entries (#1244 fork/join order, #1402
+/// `GatewayRouteSelected`), so 0.0.27 and 0.0.28 members must never share a
+/// cluster. A join WITHIN one boundary region still succeeds.
+///
+/// Drives the `/cluster` handshake at the HTTP level so each side presents
+/// its own version header: the acceptor's answer always carries this build's
+/// stamped version, the dial carries the override.
+#[tokio::test]
+async fn a_mixed_version_join_across_an_upgrade_boundary_is_refused() {
+    use nano_falcon_protocol::cluster_join as cj;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+
+    // The version-override hook is process-global, so the acceptor-side and
+    // dialer-side cases each need their OWN server, brought up while the
+    // override names that side's version. The acceptor-side server is the
+    // boundary release (v0.0.28); the dialer-side server answers the NEWER
+    // release (v0.0.29), so a v0.0.27 dialer straddles the boundary against
+    // it.
+    cj::set_advertised_version_override(Some("0.0.28"));
+    let base = serve_peer().await;
+    let url = format!("{}/cluster", base.replacen("http://", "ws://", 1));
+
+    async fn dial_with_version(
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<
+        (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+        ),
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        let mut request = url.into_client_request().expect("request");
+        let headers = request.headers_mut();
+        headers.insert(
+            HeaderName::from_static(cj::CLUSTER_FEATURES_HEADER),
+            HeaderValue::from_str(&cj::local_features_header()).expect("features header"),
+        );
+        headers.insert(
+            HeaderName::from_static(cj::CLUSTER_PARTITIONS_HEADER),
+            HeaderValue::from(1),
+        );
+        if let Some(v) = version {
+            headers.insert(
+                HeaderName::from_static(cj::CLUSTER_VERSION_HEADER),
+                HeaderValue::from_str(v).expect("version header"),
+            );
+        }
+        tokio_tungstenite::connect_async(request).await
+    }
+
+    // Acceptor at the boundary release (v0.0.28) refuses a v0.0.27 joiner
+    // with 409 and the typed error naming both versions and the boundary.
+    let err = match dial_with_version(&url, Some("0.0.27")).await {
+        Ok(_) => panic!("a join across the v0.0.28 boundary must be refused (acceptor side)"),
+        Err(e) => e,
+    };
+    let tokio_tungstenite::tungstenite::Error::Http(resp) = &err else {
+        panic!("a refused join is an HTTP error response, got {err:?}");
+    };
+    assert_eq!(resp.status(), 409, "refused with 409 Conflict");
+    let msg = String::from_utf8_lossy(resp.body().as_deref().unwrap_or_default()).into_owned();
+    for needle in ["0.0.28", "0.0.27", "no rolling upgrade", "quiesce"] {
+        assert!(msg.contains(needle), "the refusal names {needle:?}: {msg}");
+    }
+    // Within the same boundary region the join still succeeds (both at the
+    // boundary release), and a NEWER release joins this boundary-release
+    // acceptor (no declared boundary above v0.0.28).
+    dial_with_version(&url, Some("0.0.28"))
+        .await
+        .expect("same-version members join");
+    dial_with_version(&url, Some("0.0.29"))
+        .await
+        .expect("no boundary above v0.0.28: a newer member joins");
+    // A pre-#1702 binary (no version header) dialing the boundary release is
+    // refused closed: it may be pre-boundary, and the boundary release cannot
+    // tell (it is the first release that advertises versions).
+    let err = match dial_with_version(&url, None).await {
+        Ok(_) => panic!("a versionless binary joining the boundary release must be refused"),
+        Err(e) => e,
+    };
+    let tokio_tungstenite::tungstenite::Error::Http(resp) = &err else {
+        panic!("a refused join is an HTTP error response, got {err:?}");
+    };
+    assert_eq!(resp.status(), 409, "refused with 409 Conflict");
+    let msg = String::from_utf8_lossy(resp.body().as_deref().unwrap_or_default()).into_owned();
+    for needle in ["unknown", "0.0.28"] {
+        assert!(msg.contains(needle), "the refusal names {needle:?}: {msg}");
+    }
+
+    // Dialer side: a v0.0.27 dialer must refuse the link itself when the
+    // acceptor answers a version across the boundary (PeerLink runs the same
+    // check against the handshake response). The override is process-global
+    // and read at REQUEST time, so the acceptor is served fresh while the
+    // override names ITS version (v0.0.29), and the dialer's side is driven
+    // by a raw handshake: the dialer-side `check_join` in `PeerLink::dial`
+    // runs against the acceptor's answer, which is what is asserted here.
+    cj::set_advertised_version_override(Some("0.0.29"));
+    let new_base = serve_peer().await;
+    let new_url = format!("{new_base}/cluster").replacen("http://", "ws://", 1);
+    // The acceptor answers its overridden version (v0.0.29) on the wire.
+    let (_ws, resp) = dial_with_version(&new_url, Some("0.0.29"))
+        .await
+        .expect("0.0.29 joins the 0.0.29 acceptor");
+    let peer_version = resp
+        .headers()
+        .get(cj::CLUSTER_VERSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(peer_version.as_deref(), Some("0.0.29"));
+    // The dialer-side check (exactly as `PeerLink::dial` runs it) refuses a
+    // 0.0.27 local against that answer, naming both versions + the boundary.
+    let rejection = cj::check_join(
+        1,
+        Some("1"),
+        resp.headers()
+            .get(cj::CLUSTER_FEATURES_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        &[],
+        "0.0.27",
+        peer_version.as_deref(),
+    )
+    .expect_err("a 0.0.27 dialer refuses a 0.0.29 peer across the v0.0.28 boundary");
+    let msg = rejection.to_string();
+    for needle in ["0.0.29", "0.0.27", "0.0.28", "no rolling upgrade"] {
+        assert!(
+            msg.contains(needle),
+            "the dialer-side error names {needle:?}: {msg}"
+        );
+    }
+
+    // A versionless (pre-#1702) acceptor: the dialer at the boundary release
+    // fails closed (the peer may be pre-boundary); past the boundary it
+    // admits the peer (it is at-or-past the newest boundary too). Clearing
+    // `advertise_cluster_features` suppresses the acceptor's version header,
+    // modelling a pre-#1702 binary.
+    let legacy = crate::ServerImpl::default();
+    legacy
+        .advertise_cluster_features
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let legacy_base = serve(legacy).await;
+    let legacy_url = format!("{legacy_base}/cluster").replacen("http://", "ws://", 1);
+    let (_ws, legacy_resp) = dial_with_version(&legacy_url, Some("0.0.28"))
+        .await
+        .expect("a versionless acceptor still upgrades the socket");
+    assert!(
+        legacy_resp
+            .headers()
+            .get(cj::CLUSTER_VERSION_HEADER)
+            .is_none(),
+        "the legacy acceptor answers no version header"
+    );
+    let rejection = cj::check_join(1, Some("1"), None, &[], "0.0.28", None)
+        .expect_err("a versionless peer of the boundary release is refused (fail closed)");
+    let msg = rejection.to_string();
+    assert!(
+        msg.contains("unknown") && msg.contains("0.0.28"),
+        "the fail-closed error names the boundary: {msg}"
+    );
+    cj::check_join(1, Some("1"), None, &[], "0.0.29", None)
+        .expect("a post-boundary release admits a versionless (at-or-past-boundary) peer");
+    cj::set_advertised_version_override(None);
+}
+
 /// #1661 (outbound direction): once this node's replicated state requires a
 /// feature, it must not DIAL a member that restarted on an older binary — on
 /// either lane — or Raft would stream it entries it cannot decode.
