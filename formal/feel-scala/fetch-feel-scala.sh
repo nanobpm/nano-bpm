@@ -24,7 +24,7 @@ read -r repo sha < <(node -e '
 mkdir -p "$cache"
 pom="$cache/parent-pom-$sha.xml"
 if [ ! -s "$pom" ]; then
-  curl -fsSL --retry 3 "https://raw.githubusercontent.com/$repo/$sha/parent/pom.xml" -o "$pom.tmp"
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://raw.githubusercontent.com/$repo/$sha/parent/pom.xml" -o "$pom.tmp"
   mv "$pom.tmp" "$pom"
 fi
 version="$(sed -n 's|.*<version.feel-scala>\(.*\)</version.feel-scala>.*|\1|p' "$pom")"
@@ -36,10 +36,10 @@ fi
 base="https://repo1.maven.org/maven2/org/camunda/feel/feel-engine/$version/feel-engine-$version-complete.jar"
 jar="$cache/feel-engine-$version-complete.jar"
 if [ ! -s "$jar.sha1" ]; then
-  curl -fsSL --retry 3 "$base.sha1" -o "$jar.sha1.tmp" && mv "$jar.sha1.tmp" "$jar.sha1"
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$base.sha1" -o "$jar.sha1.tmp" && mv "$jar.sha1.tmp" "$jar.sha1"
 fi
 if [ ! -s "$jar" ]; then
-  curl -fsSL --retry 3 "$base" -o "$jar.tmp" && mv "$jar.tmp" "$jar"
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$base" -o "$jar.tmp" && mv "$jar.tmp" "$jar"
 fi
 want="$(cut -c1-40 "$jar.sha1")"
 got="$( (command -v sha1sum >/dev/null && sha1sum "$jar" || shasum -a 1 "$jar") | cut -c1-40)"

@@ -54,7 +54,7 @@ sha256() {
 fetch_tla2tools() {
   mkdir -p "$(dirname "$1")"
   echo "fetching tla2tools $TLA_VERSION -> $1"
-  curl -fsSL -o "$1.tmp" \
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$1.tmp" \
     "https://github.com/tlaplus/tlaplus/releases/download/v$TLA_VERSION/tla2tools.jar"
   # Verify before the jar enters the cache, so a bad download is never kept.
   if [[ "$(sha256 "$1.tmp")" != "$TLA_SHA256" ]]; then

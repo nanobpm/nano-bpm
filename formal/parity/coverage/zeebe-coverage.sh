@@ -18,7 +18,13 @@ repo="$(cd "$here/../../.." && pwd)"
 out="${1:-$repo/target/parity-coverage/zeebe-jacoco.xml}"
 bound="${2:-ci}"
 port="${PARITY_CAMUNDA_PORT:-8080}"
-JACOCO_VERSION="${JACOCO_VERSION:-0.8.13}"
+# Pinned, immutable artifacts (#1770): fetched once into a cache keyed on the
+# version (the workflow caches this dir with actions/cache) and SHA-256
+# verified, so a run makes no network request and fails closed on a mismatch.
+# Bump the version and both hashes together.
+JACOCO_VERSION="0.8.13"
+JACOCO_AGENT_SHA256="47e700ccb0fdb9e27c5241353f8161938f4e53c3561dd35e063c5fe88dc3349b"
+JACOCO_CLI_SHA256="8f748683833d4dc4d72cea5d6b43f49344687b831e0582c97bcb9b984e3de0a3"
 mkdir -p "$(dirname "$out")"
 out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
 
@@ -28,10 +34,36 @@ mkdir -p "$repo/target"
 work="$(mktemp -d "$repo/target/parity-zeebe.XXXXXX")"
 trap 'docker rm -f parity-camunda >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
 
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# fetch_pinned <url> <dest> <sha256>: reuse a cached jar that verifies, else
+# download (curl --retry on the FETCH of an immutable artifact — not a test
+# retry) and verify before it enters the cache, so a bad download is never kept.
+fetch_pinned() {
+  local url="$1" dest="$2" want="$3"
+  if [[ -f "$dest" && "$(sha256 "$dest")" == "$want" ]]; then return; fi
+  rm -f "$dest"
+  echo "fetching $url"
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$dest.tmp" "$url"
+  if [[ "$(sha256 "$dest.tmp")" != "$want" ]]; then
+    rm -f "$dest.tmp"
+    echo "error: $url does not match the pinned SHA-256" >&2
+    exit 1
+  fi
+  mv "$dest.tmp" "$dest"
+}
+
 base="https://repo1.maven.org/maven2/org/jacoco"
-mkdir -p "$work/jacoco"
-curl -fsSL "$base/org.jacoco.agent/$JACOCO_VERSION/org.jacoco.agent-$JACOCO_VERSION-runtime.jar" -o "$work/jacoco/jacocoagent.jar"
-curl -fsSL "$base/org.jacoco.cli/$JACOCO_VERSION/org.jacoco.cli-$JACOCO_VERSION-nodeps.jar" -o "$work/jacococli.jar"
+cache="${JACOCO_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/nanobpm-jacoco/$JACOCO_VERSION}"
+mkdir -p "$cache" "$work/jacoco"
+fetch_pinned "$base/org.jacoco.agent/$JACOCO_VERSION/org.jacoco.agent-$JACOCO_VERSION-runtime.jar" "$cache/jacocoagent.jar" "$JACOCO_AGENT_SHA256"
+fetch_pinned "$base/org.jacoco.cli/$JACOCO_VERSION/org.jacoco.cli-$JACOCO_VERSION-nodeps.jar" "$cache/jacococli.jar" "$JACOCO_CLI_SHA256"
+# Copy (not mount) the agent: /jacoco is bind-mounted and written by the container.
+cp "$cache/jacocoagent.jar" "$work/jacoco/jacocoagent.jar"
+cp "$cache/jacococli.jar" "$work/jacococli.jar"
 # The container user must be able to write the exec dump.
 chmod 0777 "$work/jacoco"
 
