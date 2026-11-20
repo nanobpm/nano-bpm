@@ -73,6 +73,9 @@ chrono = "0.4"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
 headers = "0.4"
 http = "1"
+# `Body::size_hint` on the response body, used by the response-contract guard to
+# detect an oversized body before consuming it (issue #1594).
+http-body = "1"
 # Windows-safe canonicalize. `std::fs::canonicalize` returns a `\\?\` verbatim
 # path on Windows that Node's ESM loader and some CLI tools reject; `dunce`
 # strips it when possible and is a transparent passthrough to std on Unix.
