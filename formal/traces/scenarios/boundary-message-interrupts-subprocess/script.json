@@ -1,0 +1,16 @@
+{
+  "description": "An interrupting message boundary on a sub-process fires (#1535): the inner service task and the sub-process are TERMINATED (never COMPLETED), the job is CANCELED, and the message variables are created LOCAL to the boundary event before being propagated to the process scope.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "boundary-message-subprocess",
+      "variables": { "orderId": "o-1" }
+    },
+    {
+      "op": "publishMessage",
+      "name": "cancel",
+      "correlationKey": "o-1",
+      "variables": { "reason": "customer" }
+    }
+  ]
+}

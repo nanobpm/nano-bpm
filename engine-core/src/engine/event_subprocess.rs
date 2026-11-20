@@ -648,6 +648,22 @@ impl Engine {
             }
         }
         let flow_scope = self.event_payload_scope(instance_key, element_instance_key, kind);
+        // A boundary event's payload is created LOCAL to the boundary instance
+        // when it activates later in this drain (#1535); see
+        // `boundary_payloads`.
+        if let state::MessageSubscriptionKind::InterruptingBoundary {
+            boundary_element_id,
+        }
+        | state::MessageSubscriptionKind::NonInterruptingBoundary {
+            boundary_element_id,
+        } = kind
+        {
+            self.boundary_payloads.insert(
+                (instance_key, flow_scope, boundary_element_id.clone()),
+                variables.clone(),
+            );
+            return;
+        }
         for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false) {
             self.emit(log, event);
         }

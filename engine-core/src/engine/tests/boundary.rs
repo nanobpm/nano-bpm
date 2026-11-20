@@ -868,7 +868,7 @@ fn should_interrupt_an_embedded_subprocess_via_its_error_boundary() {
     // normal flow, and the boundary routes to the sad-flow path.
     assert!(events.iter().any(|e| matches!(
         e,
-        Event::ElementCompleted { element_id, .. } if element_id == "inner"
+        Event::ElementTerminated { element_id, .. } if element_id == "inner"
     )));
     assert!(events.iter().any(|e| matches!(
         e,
@@ -989,7 +989,7 @@ fn should_interrupt_an_embedded_subprocess_via_a_timer_boundary() {
     );
     assert!(fired.iter().any(|e| matches!(
         e,
-        Event::ElementCompleted { element_id, .. } if element_id == "inner"
+        Event::ElementTerminated { element_id, .. } if element_id == "inner"
     )));
     assert!(fired.iter().any(|e| matches!(
         e,
@@ -1033,7 +1033,7 @@ fn should_interrupt_an_embedded_subprocess_via_a_message_boundary() {
     );
     assert!(fired.iter().any(|e| matches!(
         e,
-        Event::ElementCompleted { element_id, .. } if element_id == "inner"
+        Event::ElementTerminated { element_id, .. } if element_id == "inner"
     )));
     assert!(fired.iter().any(|e| matches!(
         e,
@@ -1668,4 +1668,75 @@ fn error_boundary_caught_at_a_subprocess_resolves_a_root_incident() {
         e,
         Event::SequenceFlowTaken { from, to, .. } if from == "catch" && to == "sad"
     )));
+}
+
+/// #1535 (Zeebe parity): an activity interrupted by an interrupting boundary
+/// is TERMINATED, never COMPLETED — completion and termination drive
+/// different listeners, metrics and compensation eligibility — and a resting
+/// user task on it is CANCELED (it must not stay claimable/completable
+/// against a vanished element).
+#[test]
+fn interrupting_boundary_terminates_the_activity_and_cancels_its_user_task() {
+    let def = ProcessBuilder::new("ut-timeout")
+        .start_event("start")
+        .user_task("review")
+        .timer_boundary_event("timeout", "review", 5_000)
+        .end_event("end")
+        .end_event("timed-out")
+        .connect("start", "review")
+        .connect("review", "end")
+        .connect("timeout", "timed-out")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("ut-timeout"), 1_000)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let user_task_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("the user task is created");
+
+    let fired = engine.trigger_timers(6_000);
+    let review_lifecycle: Vec<&Event> = fired
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::ElementCompleting { element_id, .. }
+                    | Event::ElementCompleted { element_id, .. }
+                    | Event::ElementTerminating { element_id, .. }
+                    | Event::ElementTerminated { element_id, .. }
+                    if element_id == "review"
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            review_lifecycle.as_slice(),
+            [Event::ElementTerminating { .. }, Event::ElementTerminated { .. }]
+        ),
+        "the interrupted task is terminated, not completed: {review_lifecycle:?}"
+    );
+    let canceled_at = fired
+        .iter()
+        .position(|e| {
+            matches!(e, Event::UserTaskCanceled { user_task_key: k, .. } if *k == user_task_key)
+        })
+        .expect("the interrupted user task is canceled");
+    let terminated_at = fired
+        .iter()
+        .position(|e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "review"))
+        .unwrap();
+    assert!(canceled_at < terminated_at, "USER_TASK CANCELED precedes TERMINATED");
+    assert!(fired.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "timed-out"
+    )));
+    assert!(engine.is_completed(instance_key));
 }

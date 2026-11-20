@@ -29,12 +29,6 @@
       "nanoTrace": "99d19b69dfb04a3b"
     },
     {
-      "scenario": "g-3",
-      "issue": "#1535",
-      "reason": "interrupting boundary: attached activity COMPLETED instead of TERMINATED",
-      "nanoTrace": "d6a409458df42591"
-    },
-    {
       "scenario": "g-4",
       "issue": "#1711",
       "reason": "a null completion value equal to the MI child's null-valued local is not propagated (Zeebe updates the process-scope result)",
@@ -47,28 +41,10 @@
       "nanoTrace": "26426ba3d10a6d8b"
     },
     {
-      "scenario": "g-6",
-      "issue": "#1535",
-      "reason": "interrupting message boundary: attached activity COMPLETED instead of TERMINATED; message variables not boundary-local",
-      "nanoTrace": "6f535e747cd59cbc"
-    },
-    {
-      "scenario": "g-8",
-      "issue": "#1535",
-      "reason": "interrupting timer boundary: attached activity COMPLETED instead of TERMINATED",
-      "nanoTrace": "e1b16ffacf038916"
-    },
-    {
       "scenario": "g-9",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
       "nanoTrace": "d517e6bf427fc8c7"
-    },
-    {
-      "scenario": "g-10",
-      "issue": "#1535",
-      "reason": "interrupting message boundary on a user task: COMPLETED instead of TERMINATED, no USER_TASK CANCELED",
-      "nanoTrace": "f3fecc5338d83ccc"
     },
     {
       "scenario": "g-11",
@@ -77,22 +53,10 @@
       "nanoTrace": "1aaa9b1ec6023f35"
     },
     {
-      "scenario": "g-12",
-      "issue": "#1535",
-      "reason": "a task interrupted by a message boundary completes instead of terminating",
-      "nanoTrace": "f205c6a5cc974a5a"
-    },
-    {
       "scenario": "g-13",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local (#1534) + #1518; #1533 (output-mapped completion leak) fixed",
       "nanoTrace": "71b6de1fec0753b8"
-    },
-    {
-      "scenario": "g-15",
-      "issue": "#1535",
-      "reason": "interrupting message boundary: attached activity COMPLETED instead of TERMINATED",
-      "nanoTrace": "aa52e4955dbd913e"
     },
     {
       "scenario": "g-18",
@@ -111,60 +75,6 @@
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
       "nanoTrace": "69af519d14988e10"
-    },
-    {
-      "scenario": "esp-message-interrupting",
-      "issue": "#1535",
-      "reason": "interrupting message event sub-process: the interrupted service task `work` is torn down as ELEMENT_COMPLETING/COMPLETED instead of Zeebe's TERMINATING/TERMINATED (same teardown defect as interrupting boundaries, #1535). Narrowed with ignoreRecords to `work`'s lifecycle records only (it has no other lifecycle in the interrupting step); every other record — EVENT_SUB_PROCESS lifecycle, subscription/timer, variables, process completion — must equal Zeebe.",
-      "ignoreRecords": [
-        {
-          "valueType": "PROCESS_INSTANCE",
-          "elementId": "work",
-          "intent": "ELEMENT_TERMINATING"
-        },
-        {
-          "valueType": "PROCESS_INSTANCE",
-          "elementId": "work",
-          "intent": "ELEMENT_TERMINATED"
-        },
-        {
-          "valueType": "PROCESS_INSTANCE",
-          "elementId": "work",
-          "intent": "ELEMENT_COMPLETING"
-        },
-        {
-          "valueType": "PROCESS_INSTANCE",
-          "elementId": "work",
-          "intent": "ELEMENT_COMPLETED"
-        }
-      ]
-    },
-    {
-      "scenario": "esp-timer-interrupting",
-      "issue": "#1535",
-      "reason": "interrupting timer event sub-process: the interrupted service task `work` is torn down as ELEMENT_COMPLETING/COMPLETED instead of Zeebe's TERMINATING/TERMINATED (same teardown defect as interrupting boundaries, #1535). Narrowed with ignoreRecords to `work`'s lifecycle records only (it has no other lifecycle in the interrupting step); every other record — EVENT_SUB_PROCESS lifecycle, subscription/timer, variables, process completion — must equal Zeebe.",
-      "ignoreRecords": [
-        {
-          "valueType": "PROCESS_INSTANCE",
-          "elementId": "work",
-          "intent": "ELEMENT_TERMINATING"
-        },
-        {
-          "valueType": "PROCESS_INSTANCE",
-          "elementId": "work",
-          "intent": "ELEMENT_TERMINATED"
-        },
-        {
-          "valueType": "PROCESS_INSTANCE",
-          "elementId": "work",
-          "intent": "ELEMENT_COMPLETING"
-        },
-        {
-          "valueType": "PROCESS_INSTANCE",
-          "elementId": "work",
-          "intent": "ELEMENT_COMPLETED"
-        }
-      ]
     }
   ]
 }

@@ -1,0 +1,13 @@
+{
+  "description": "An interrupting timer boundary (PT1M) on a user task fires (#1535): the user task is CANCELED and its element TERMINATED (never COMPLETED), then the boundary's flow runs.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "boundary-timer-user-task"
+    },
+    {
+      "op": "advanceClock",
+      "millis": 60000
+    }
+  ]
+}
