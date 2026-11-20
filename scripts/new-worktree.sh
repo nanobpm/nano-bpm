@@ -99,6 +99,10 @@ if [[ "$wt" = *" "* ]]; then
             printf '\n# Pinned by scripts/new-worktree.sh: the worktree path contains a\n# space, which breaks tikv-jemalloc-sys (#1716). Build into a space-free dir.\n[build]\ntarget-dir = "%s"\n' "$wt_target_dir"
         } > "$wt/.cargo/config.toml.new"
         mv "$wt/.cargo/config.toml.new" "$wt/.cargo/config.toml"
+        # The merged file holds a machine-specific absolute path: mark it
+        # skip-worktree so it never shows as a tracked modification, is never
+        # staged by `git add -A`, and does not block `git worktree remove`.
+        git -C "$wt" update-index --skip-worktree .cargo/config.toml
         echo "note: worktree path contains a space; pinned a space-free CARGO_TARGET_DIR via $wt/.cargo/config.toml (#1716)" >&2
     fi
 fi
@@ -123,6 +127,12 @@ seed_target() {
     local from="$seed/server/target/debug" to="$target_root/debug"
     if [ ! -d "$from/deps" ]; then
         echo "seed: no $from/deps; building cold" >&2
+        return 0
+    fi
+    # The redirected dir outlives `git worktree remove`; recreating the same
+    # path must not clone into an existing cache (cp -R would nest dirs).
+    if [ -e "$to" ]; then
+        echo "seed: $to already exists; reusing it, not reseeding" >&2
         return 0
     fi
     mkdir -p "$to"

@@ -12,26 +12,32 @@
 //   1. CARGO_TARGET_DIR from the environment (wins over config);
 //   2. `cargo metadata --no-deps` (applies .cargo/config.toml build.target-dir,
 //      resolved relative to the config file like Cargo does);
-//   3. <crateDir>/target (fallback when cargo cannot run).
+// Fails CLOSED: if neither source resolves the directory, throw. Guessing
+// <crateDir>/target could package a stale artifact as current.
 
 import { execFileSync } from 'node:child_process';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 
 export function resolveTargetDir(crateDir) {
   const fromEnv = process.env.CARGO_TARGET_DIR;
   if (fromEnv) {
     return isAbsolute(fromEnv) ? fromEnv : resolve(crateDir, fromEnv);
   }
+  let out;
   try {
-    const out = execFileSync(
+    out = execFileSync(
       'cargo',
       ['metadata', '--no-deps', '--format-version', '1'],
-      { cwd: crateDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+      { cwd: crateDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
-    const dir = JSON.parse(out).target_directory;
-    if (dir) return dir;
-  } catch {
-    // cargo unavailable or metadata failed — fall through to the default.
+  } catch (e) {
+    throw new Error(
+      `cannot resolve Cargo's effective target dir in ${crateDir}: cargo metadata failed (#1716): ${e.stderr || e.message}`,
+    );
   }
-  return join(crateDir, 'target');
+  const dir = JSON.parse(out).target_directory;
+  if (typeof dir !== 'string' || dir === '') {
+    throw new Error(`cargo metadata in ${crateDir} reported no target_directory (#1716)`);
+  }
+  return dir;
 }

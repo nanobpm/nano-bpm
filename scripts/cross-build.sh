@@ -50,6 +50,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib-cargo-target-dir.sh
+. "$SCRIPT_DIR/lib-cargo-target-dir.sh"
 BIN_NAME="nanobpm-gateway-rest-server"
 
 die() { echo "cross-build: $*" >&2; exit 1; }
@@ -149,6 +151,8 @@ fi
 # masks this (the archive was built before the host toolchain changed); a fresh
 # worktree or clean build hits it. llvm-ar handles host (Mach-O/ELF) objects
 # too, so build scripts compiled for the host are unaffected.
+# Cargo's EFFECTIVE target dir (may be redirected for a spaced checkout, #1716).
+server_target="$(cargo_target_dir "$PROJECT_ROOT/server")" || die "cannot resolve server target dir"
 if [ "$WINDOWS" = 0 ]; then
   zig_tools="$PROJECT_ROOT/server/target/zig-tools"
   mkdir -p "$zig_tools"
@@ -164,7 +168,7 @@ if [ "$WINDOWS" = 0 ]; then
   # Self-heal a target dir poisoned before this fix: cargo won't re-run the
   # jemalloc build script for an env change, so drop any empty archive's build
   # dir and let it rebuild. A real libjemalloc.a is megabytes.
-  for archive in "$PROJECT_ROOT"/server/target/"$TARGET"/release/build/tikv-jemalloc-sys-*/out/lib/libjemalloc.a; do
+  for archive in "$server_target"/"$TARGET"/release/build/tikv-jemalloc-sys-*/out/lib/libjemalloc.a; do
     [ -f "$archive" ] || continue
     if [ "$(wc -c <"$archive")" -lt 1024 ]; then
       stale="${archive%/out/lib/libjemalloc.a}"
@@ -192,7 +196,7 @@ secs=$(( $(date +%s) - start ))
 
 bin_file="$BIN_NAME"
 [ "$WINDOWS" = 1 ] && bin_file="$BIN_NAME.exe"
-built="$PROJECT_ROOT/server/target/$TARGET/release/$bin_file"
+built="$server_target/$TARGET/release/$bin_file"
 [ -f "$built" ] || die "expected binary not found at $built"
 mkdir -p "$(dirname "$OUT")"
 cp "$built" "$OUT"
