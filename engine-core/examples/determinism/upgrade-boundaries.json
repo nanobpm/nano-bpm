@@ -11,6 +11,13 @@
         "timers-and-job-expiry (#1535, #1712)",
         "adhoc-agents-quarantine (#1632)"
       ]
+    },
+    {
+      "version": "0.0.29",
+      "entries": [
+        "multi-instance-user-tasks (#1528)",
+        "newest-variants (#1528)"
+      ]
     }
   ]
 }
