@@ -4991,6 +4991,7 @@ fn adhoc_cancel_remaining_terminates_a_two_level_subprocess_tool_depth_first() {
             },
         ))
         .unwrap();
+    engine.scope_scan_count.set(0);
     let events = engine
         .apply_command(Command::ActivateAdHocActivities {
             ad_hoc_instance_key: container,
@@ -4998,6 +4999,13 @@ fn adhoc_cancel_remaining_terminates_a_two_level_subprocess_tool_depth_first() {
             cancel_remaining: true,
         })
         .expect("cancel-remaining completes the container");
+    // Scaling guard (#1528 review): the nested teardown builds its
+    // parent → children index in ONE scope-map pass, never once per level.
+    assert_eq!(
+        engine.scope_scan_count.get(),
+        1,
+        "scope map rescanned per level"
+    );
     let pos = |id: &str, terminating: bool| {
         events
             .iter()

@@ -2185,3 +2185,31 @@ fn message_correlated_records_payload_and_boundary_on_the_event() {
     let fired = engine.correlate_message("payment-received", "A", payload.clone(), 0);
     assert_eq!(correlated(&fired), (payload, None));
 }
+
+/// #1528 review: the per-teardown user-task index holds only the tearing-down
+/// instance's tasks, so an unrelated backlog in OTHER instances is never copied
+/// into it (no per-teardown allocation proportional to the global backlog).
+#[test]
+fn created_user_task_index_is_scoped_to_the_teardown_instance() {
+    let def = ProcessBuilder::new("ut-idx")
+        .start_event("start")
+        .user_task("ask")
+        .end_event("done")
+        .connect("start", "ask")
+        .connect("ask", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let mut keys = Vec::new();
+    for _ in 0..3 {
+        let created = engine
+            .apply_command(Command::create_instance_with("ut-idx", vars(&[])))
+            .unwrap();
+        keys.push(created.iter().find_map(|e| e.instance_key()).unwrap());
+    }
+    let index = engine.created_user_tasks_by_element_instance(keys[0]);
+    let tasks: Vec<_> = index.values().flatten().collect();
+    assert_eq!(tasks.len(), 1, "only the target instance's task is indexed");
+    assert!(tasks.iter().all(|t| t.instance_key == keys[0]));
+}

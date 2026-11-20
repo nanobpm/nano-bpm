@@ -523,18 +523,66 @@ fn prev_release_gate_variant_substitution_and_field_override() {
     let err = checked(&head, &prev, no_allowlist(), &[]).unwrap_err();
     assert!(err.contains(&format!("scenario {scenario}")), "{err}");
     // Declared via only_in_head/only_in_prev + variant_substitutions: passes.
-    let allow = serde_json::json!({"divergences": [{
-        "scenario": scenario,
-        "expected": {
-            "only_in_prev": [{"variant": "ElementTerminated"}],
-            "only_in_head": [{"variant": "ElementCompleted"}],
+    let substituted = entries_mut(&mut head.clone())[i]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e.get("ElementCompleted").is_some())
+        .count();
+    let allow_with = |count: Option<usize>| {
+        // Both lifecycle kinds on both sides, as the real MI cancel entry
+        // declares (the patterns cannot single out the substituted events).
+        let both =
+            serde_json::json!([{"variant": "ElementTerminated"}, {"variant": "ElementCompleted"}]);
+        let mut expected = serde_json::json!({
+            "only_in_prev": both.clone(),
+            "only_in_head": both,
             "variant_substitutions": [{"prev": "ElementTerminated", "head": "ElementCompleted"}]
-        },
-        "introduced_in": "v0.0.2", "issue": "#0", "upgrade": "upgrade-boundary",
-        "rationale": "upgrade-boundary: test"
-    }]});
-    let report = checked(&head, &prev, allow, &["ElementTerminated"]).unwrap();
+        });
+        if let Some(n) = count {
+            expected["substituted_head_events"] = serde_json::json!(n);
+        }
+        serde_json::json!({"divergences": [{
+            "scenario": scenario,
+            "expected": expected,
+            "introduced_in": "v0.0.2", "issue": "#0", "upgrade": "upgrade-boundary",
+            "rationale": "upgrade-boundary: test"
+        }]})
+    };
+    let report = checked(
+        &head,
+        &prev,
+        allow_with(Some(substituted)),
+        &["ElementTerminated"],
+    )
+    .unwrap();
     assert_eq!(report.ratified_divergent_entries, 1);
+    // #1528 review: a substitution without the pinned head-form count fails
+    // closed (a regression to the prev kind would otherwise balance).
+    let err = checked(&head, &prev, allow_with(None), &["ElementTerminated"]).unwrap_err();
+    assert!(err.contains("substituted_head_events"), "{err}");
+    // #1528 review: ONE substituted event regressing to the prev lifecycle
+    // kind on head still balances under the projection, but the pinned count
+    // catches it.
+    let mut regressed = head.clone();
+    if let Some(serde_json::Value::Array(events)) = entries_mut(&mut regressed)[i].get_mut("events")
+    {
+        let e = events
+            .iter_mut()
+            .find(|e| e.get("ElementCompleted").is_some())
+            .unwrap();
+        let obj = e.as_object_mut().unwrap();
+        let body = obj.remove("ElementCompleted").unwrap();
+        obj.insert("ElementTerminated".to_owned(), body);
+    }
+    let err = checked(
+        &regressed,
+        &prev,
+        allow_with(Some(substituted)),
+        &["ElementTerminated"],
+    )
+    .unwrap_err();
+    assert!(err.contains("regressed"), "{err}");
 
     // --- field_overrides: head populates a golden-added field prev decodes
     // to the default. Give head's ElementActivated a non-zero scope where prev

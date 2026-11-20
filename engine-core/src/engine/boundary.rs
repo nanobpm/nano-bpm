@@ -780,7 +780,7 @@ impl Engine {
         let user_tasks_by_eik = match user_tasks_by_eik {
             Some(index) => Some(index),
             None => {
-                fallback_index = self.created_user_tasks_by_element_instance();
+                fallback_index = self.created_user_tasks_by_element_instance(instance_key);
                 Some(&fallback_index)
             }
         };

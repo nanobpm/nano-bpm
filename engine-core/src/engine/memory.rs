@@ -102,6 +102,8 @@ impl Engine {
             operation_reference: None,
             #[cfg(test)]
             user_task_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            scope_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: std::collections::BTreeSet::new(),
             forgotten_vars: std::collections::BTreeSet::new(),

@@ -934,6 +934,15 @@ pub struct Expected {
     /// events are rewritten — the per-entry strict comparison is unaffected.
     #[serde(default)]
     pub variant_substitutions: Vec<VariantSubstitution>,
+    /// The EXACT number of head-side `only_in_head`-matched events whose raw
+    /// variant is a substitution's `head` variant (#1528 review). Because the
+    /// substitution projects both lifecycle kinds onto one form, the balance
+    /// alone cannot tell a legitimately substituted event from a REGRESSION
+    /// back to the `prev` kind (e.g. a cancelled child completing again): both
+    /// balance. Pinning the head-form count fails closed on any such
+    /// regression. Required whenever `variant_substitutions` is non-empty.
+    #[serde(default)]
+    pub substituted_head_events: Option<usize>,
     /// The explicit ratification for a scenario whose declared
     /// `only_in_prev` / `only_in_head` patterns do NOT balance (#1528): the
     /// behavioural change emits (or stops emitting) events that have no
@@ -2314,6 +2323,8 @@ pub fn cross_release_checked(
         // key positions, which no longer decode).
         let mut head_matched_raw: BTreeMap<String, usize> = BTreeMap::new();
         let mut prev_matched_raw: BTreeMap<String, usize> = BTreeMap::new();
+        // Head-side matched events in a substitution's `head` (raw) form.
+        let mut head_substituted = 0usize;
         // Every head event of the divergent entries, canonical — the parked
         // join exception below looks up head's `ParallelJoinOpened` here.
         let mut head_all: Vec<Json> = Vec::new();
@@ -2343,6 +2354,13 @@ pub fn cross_release_checked(
             prev_entry_events.extend(ps.iter());
             for e in hs {
                 if let Ok(v) = serde_json::from_str::<Json>(e) {
+                    if expected.only_in_head.iter().any(|p| p.matches(&v))
+                        && variant_body(&v).is_some_and(|(tag, _)| {
+                            expected.variant_substitutions.iter().any(|s| s.head == tag)
+                        })
+                    {
+                        head_substituted += 1;
+                    }
                     head_all.push(pattern_projection(
                         &v,
                         &head_ids,
@@ -2384,6 +2402,32 @@ pub fn cross_release_checked(
                 &expected.variant_substitutions,
                 &mut prev_matched_raw,
             );
+        }
+        // Fail closed on a lifecycle-kind regression the substitution would
+        // otherwise mask (#1528 review): pin the head-form count exactly.
+        if !expected.variant_substitutions.is_empty() {
+            let Some(want) = expected.substituted_head_events else {
+                return Err(format!(
+                    "scenario {scenario}: variant_substitutions require \
+                     substituted_head_events (the exact head-form event count) — \
+                     without it a regression to the prev lifecycle kind balances ({})",
+                    d.issue
+                ));
+            };
+            let got = head_substituted;
+            if got != want {
+                return Err(format!(
+                    "scenario {scenario}: expected exactly {want} head-side substituted \
+                     lifecycle events ({:?}), found {got} — a substituted event \
+                     regressed to (or newly diverged from) the prev lifecycle kind ({})",
+                    expected
+                        .variant_substitutions
+                        .iter()
+                        .map(|s| s.head.as_str())
+                        .collect::<Vec<_>>(),
+                    d.issue
+                ));
+            }
         }
         // The one ratified exception (#1244): a PARKED join. The previous
         // release activated it visibly (exactly one `ElementActivating` +

@@ -107,6 +107,7 @@
             "element_id": "slow"
           }
         ],
+        "substituted_head_events": 10,
         "variant_substitutions": [
           {
             "prev": "ElementCompleting",
@@ -294,6 +295,7 @@
             "element_id": "inner"
           }
         ],
+        "substituted_head_events": 12,
         "variant_substitutions": [
           {
             "prev": "ElementCompleting",
@@ -308,7 +310,7 @@
       "introduced_in": "v0.0.29",
       "issue": "#1528",
       "upgrade": "upgrade-boundary",
-      "rationale": "upgrade-boundary: not feature-gated. Zeebe parity (#1535, #1528 review): when a satisfied completion condition cancels a multi-instance loop's remaining children (cancelRemainingInstances), each cancelled child now TERMINATES (ElementTerminating/ElementTerminated) instead of COMPLETING (ElementCompleting/ElementCompleted) - completion would report unfinished work as done and drive completion listeners, metrics and compensation eligibility. Termination is depth-first: a sub-process child's ElementTerminating precedes its inner teardown (inner job cancellation, inner element termination) and its ElementTerminated follows it, so those events move within the entry (reorder). The scenario drives both a leaf (service task) child and an embedded sub-process child; prev journals each cancelled `each` child's completion pair where head journals the termination pair. The sub-process child's inner task (`inner`), cancelled with its child, likewise terminates where prev completed it. The patterns name every `each`/`inner` completion/termination event on both sides (the completing child and body complete on both builds, so the patterns cannot single out the cancelled children); variant_substitutions project both lifecycle kinds onto one form, so the scenario-level balance still checks that every `each`/`inner` element instance appears exactly as often, with the same entity and scope, on both builds. The children's ElementActivating also records the real enclosing scope (the MI body key) where the previous release's journal decodes the absent field to 0, normalized as for #1632. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C): a previous-release member journals completion where a new member journals termination for the same command, so a mixed-version cluster diverges. The release therefore requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
+      "rationale": "upgrade-boundary: not feature-gated. Zeebe parity (#1535, #1528 review): when a satisfied completion condition cancels a multi-instance loop's remaining children (cancelRemainingInstances), each cancelled child now TERMINATES (ElementTerminating/ElementTerminated) instead of COMPLETING (ElementCompleting/ElementCompleted) - completion would report unfinished work as done and drive completion listeners, metrics and compensation eligibility. Termination is depth-first: a sub-process child's ElementTerminating precedes its inner teardown (inner job cancellation, inner element termination) and its ElementTerminated follows it, so those events move within the entry (reorder). The scenario drives both a leaf (service task) child and an embedded sub-process child; prev journals each cancelled `each` child's completion pair where head journals the termination pair. The sub-process child's inner task (`inner`), cancelled with its child, likewise terminates where prev completed it. The patterns name every `each`/`inner` completion/termination event on both sides (the completing child and body complete on both builds, so the patterns cannot single out the cancelled children); variant_substitutions project both lifecycle kinds onto one form, so the scenario-level balance still checks that every `each`/`inner` element instance appears exactly as often, with the same entity and scope, on both builds; substituted_head_events pins the exact head-side termination count, so a cancelled child regressing to completion (which would still balance) fails. The children's ElementActivating also records the real enclosing scope (the MI body key) where the previous release's journal decodes the absent field to 0, normalized as for #1632. Raft members RE-EXECUTE committed commands (ADR 0066, Rolling upgrade, option C): a previous-release member journals completion where a new member journals termination for the same command, so a mixed-version cluster diverges. The release therefore requires an all-nodes-same-version (quiesced) upgrade; no rolling upgrade across it."
     }
   ]
 }

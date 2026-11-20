@@ -215,6 +215,9 @@ pub struct Engine {
     /// production builds.
     #[cfg(test)]
     pub(crate) user_task_scan_count: std::cell::Cell<usize>,
+    /// Test-only count of scope-map scans by `cancel_scope_tree_events`.
+    #[cfg(test)]
+    pub(crate) scope_scan_count: std::cell::Cell<usize>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -730,6 +733,8 @@ impl Engine {
             operation_reference: None,
             #[cfg(test)]
             user_task_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            scope_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
@@ -905,6 +910,8 @@ impl Engine {
             operation_reference: None,
             #[cfg(test)]
             user_task_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            scope_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
@@ -11406,7 +11413,7 @@ impl Engine {
         // rescanning the whole `state.user_tasks` map (#1528 review). The index
         // preserves per-bucket key order, so the emitted events are unchanged.
         let user_tasks_by_eik =
-            (!active.is_empty()).then(|| self.created_user_tasks_by_element_instance());
+            (!active.is_empty()).then(|| self.created_user_tasks_by_element_instance(instance_key));
         // An ad-hoc container child (a JOB_WORKER ad-hoc MI child, #1170) owns its
         // OWN active tool scope (`adhoc_instances[child].active`), its agent job,
         // and an `adhoc_instances` runtime record — none of which the leaf-only
@@ -11669,13 +11676,20 @@ impl Engine {
     /// map — into O(total user tasks + N) (#1528 review). Each bucket preserves
     /// ascending key order (the source map is key-ordered), so the events a
     /// bucket drives stay byte-identical to the per-call scan they replace.
-    fn created_user_tasks_by_element_instance(&self) -> BTreeMap<Key, Vec<&state::UserTask>> {
+    ///
+    /// Only tasks of `instance_key` are indexed: a teardown never reaches
+    /// another instance's tasks through this index, so unrelated backlog is not
+    /// copied into it (#1528 review).
+    fn created_user_tasks_by_element_instance(
+        &self,
+        instance_key: Key,
+    ) -> BTreeMap<Key, Vec<&state::UserTask>> {
         #[cfg(test)]
         self.user_task_scan_count
             .set(self.user_task_scan_count.get() + 1);
         let mut index: BTreeMap<Key, Vec<&state::UserTask>> = BTreeMap::new();
         for task in self.state.user_tasks.values() {
-            if task.state == state::UserTaskState::Created {
+            if task.instance_key == instance_key && task.state == state::UserTaskState::Created {
                 index
                     .entry(task.element_instance_key)
                     .or_default()
@@ -11695,14 +11709,36 @@ impl Engine {
         root: Key,
         user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
     ) -> Vec<Event> {
-        let direct: Vec<Key> = self
-            .scope_descendants(instance_key, root)
-            .into_iter()
-            .filter(|d| self.scope_of(instance_key, *d) == root)
-            .collect();
+        // Build the parent → direct-children index ONCE (a single pass over the
+        // instance's scope map) and recurse over it, so an N-deep tool is
+        // O(scopes + N) rather than rescanning the scope map at every level
+        // (#1528 review). `scopes` is key-ordered, so each child list is too.
+        let mut children: BTreeMap<Key, Vec<Key>> = BTreeMap::new();
+        if let Some(instance) = self.state.instances.get(&instance_key) {
+            #[cfg(test)]
+            self.scope_scan_count.set(self.scope_scan_count.get() + 1);
+            for (child, parent) in &instance.scopes {
+                children.entry(*parent).or_default().push(*child);
+            }
+        }
+        self.cancel_scope_subtree_events(instance_key, root, &children, user_tasks_by_eik)
+    }
+
+    fn cancel_scope_subtree_events(
+        &self,
+        instance_key: Key,
+        root: Key,
+        children: &BTreeMap<Key, Vec<Key>>,
+        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+    ) -> Vec<Event> {
         let mut inner = Vec::new();
-        for d in direct {
-            inner.extend(self.cancel_scope_tree_events(instance_key, d, user_tasks_by_eik));
+        for &d in children.get(&root).map(Vec::as_slice).unwrap_or_default() {
+            inner.extend(self.cancel_scope_subtree_events(
+                instance_key,
+                d,
+                children,
+                user_tasks_by_eik,
+            ));
         }
         self.cancel_mi_child_events(instance_key, root, inner, user_tasks_by_eik)
     }
@@ -13904,8 +13940,8 @@ impl Engine {
             // own live tools down (each hangs off a dedicated inner instance)
             // before the child completes; a natural completion has none active.
             if cancel {
-                let user_tasks_by_eik =
-                    (!active.is_empty()).then(|| self.created_user_tasks_by_element_instance());
+                let user_tasks_by_eik = (!active.is_empty())
+                    .then(|| self.created_user_tasks_by_element_instance(instance_key));
                 for child in &active {
                     events.extend(self.cancel_adhoc_active_child(
                         instance_key,
@@ -13967,8 +14003,8 @@ impl Engine {
         // descendants + agent job + ad-hoc state), which `cancel_adhoc_active_child`
         // handles — cancelling it as a leaf would orphan its internals.
         if cancel {
-            let user_tasks_by_eik =
-                (!active.is_empty()).then(|| self.created_user_tasks_by_element_instance());
+            let user_tasks_by_eik = (!active.is_empty())
+                .then(|| self.created_user_tasks_by_element_instance(instance_key));
             for child in &active {
                 events.extend(self.cancel_adhoc_active_child(
                     instance_key,
