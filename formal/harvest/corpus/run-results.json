@@ -692,7 +692,7 @@
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-10-processId",
     "processId": "processId",
     "status": "out-of-scope",
-    "detail": "nano-rejects-deploy: parse error: process processId: end event 'endEvent_1' is invalid: an end event must have no outgoing sequence flow"
+    "detail": "driver-capability: sub-process"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-4-processId",
@@ -704,12 +704,12 @@
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-8-processId",
     "processId": "processId",
     "status": "out-of-scope",
-    "detail": "nano-rejects-deploy: parse error: process processId: end event 'endEvent_1' is invalid: an end event must have no outgoing sequence flow"
+    "detail": "driver-capability: sub-process"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-9-processId",
     "processId": "processId",
     "status": "out-of-scope",
-    "detail": "nano-rejects-deploy: parse error: process processId: end event 'endEvent_1' is invalid: an end event must have no outgoing sequence flow"
+    "detail": "driver-capability: sub-process"
   }
 ]

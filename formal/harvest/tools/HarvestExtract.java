@@ -309,7 +309,7 @@ public final class HarvestExtract {
         } else {
           next = invoke(builder, m, args);
         }
-        if (opensNestedScope(m)) {
+        if (opensNestedScope(m) || returnsSubProcessBuilder(next)) {
           stack.push(builder);
         }
         builder = next;
@@ -334,6 +334,20 @@ public final class HarvestExtract {
   // becomes the current builder (the normal fluent chain).
   private static boolean opensNestedScope(String m) {
     return m.equals("multiInstance") || m.equals("message") || m.equals("signal");
+  }
+
+  // `subProcess(id, sp -> …)` returns a SubProcessBuilder — a nested builder the
+  // flattened Consumer body runs on. The harvester emits a `pop` after that body
+  // (harvest.mjs opensNestedScope), so the enclosing builder must be on the
+  // stack. Detecting the return type (rather than the method name) also covers
+  // the plain `subProcess(id)` form when a `pop` follows, and is harmless when
+  // none does (the chain simply continues on the returned builder). Without the
+  // push, `pop` underflows and the outer chain continues inside the sub-process
+  // scope — an outer `.endEvent()` then draws an outgoing flow from the body's
+  // last end event, an invalid model rejected at deployment (#1714 review).
+  private static boolean returnsSubProcessBuilder(Object next) {
+    return next
+        instanceof io.camunda.zeebe.model.bpmn.builder.SubProcessBuilder;
   }
 
   public static void main(String[] argv) throws Exception {

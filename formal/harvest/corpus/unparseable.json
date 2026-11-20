@@ -1546,6 +1546,48 @@
     "reason": "unresolved-arg:endEvent(EndEventBuilder::terminate)"
   },
   {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-TerminateEndEventTest-2-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/TerminateEndEventTest.java",
+    "processId": "process",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "parallelGateway",
+        "args": [
+          "process_fork"
+        ]
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "A"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "A"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end_after_A"
+        ]
+      },
+      {
+        "m": "moveToNode",
+        "args": [
+          "process_fork"
+        ]
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(subprocessBuilder)"
+  },
+  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-TerminateEndEventTest-3-process",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/TerminateEndEventTest.java",
     "processId": "process",
@@ -1560,16 +1602,9 @@
       {
         "m": "startEvent",
         "args": []
-      },
-      {
-        "m": "subProcess",
-        "args": [
-          "subprocess",
-          "subprocessBuilder"
-        ]
       }
     ],
-    "reason": "unresolved-arg:multiInstance(multiInstance ->\n                    mul)"
+    "reason": "unresolved-arg:subProcess(subprocessBuilder)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-TerminateEndEventTest-5-childProcessId",
@@ -2997,6 +3032,18 @@
     "reason": "unresolved-arg:subProcess(subprocess ->\n                    subpro)"
   },
   {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-4-compensation-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventExecutionTest.java",
+    "processId": "compensation-process",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(subprocessBuilder)"
+  },
+  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-5-compensation-process",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventExecutionTest.java",
     "processId": "compensation-process",
@@ -3294,9 +3341,47 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "subProcess",
+        "args": [
+          "subprocess"
+        ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "A"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "A"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "boundaryEvent",
+        "args": []
       }
     ],
-    "reason": "unresolved-arg:subProcess(subprocess ->\n                    subpro)"
+    "reason": "unsupported-method:compensation"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-19-compensation-process",
@@ -3437,28 +3522,9 @@
         "args": [
           "fork"
         ]
-      },
-      {
-        "m": "subProcess",
-        "args": [
-          "subprocess",
-          "subprocessBuilder"
-        ]
-      },
-      {
-        "m": "parallelGateway",
-        "args": [
-          "join"
-        ]
-      },
-      {
-        "m": "moveToNode",
-        "args": [
-          "fork"
-        ]
       }
     ],
-    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
+    "reason": "unresolved-arg:subProcess(subprocessBuilder)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-32-compensation-process",
@@ -3713,6 +3779,10 @@
       {
         "m": "endEvent",
         "args": []
+      },
+      {
+        "m": "pop",
+        "args": []
       }
     ],
     "reason": "unresolved-arg:boundaryEvent(b -> b.error(ERROR_CODE))"
@@ -3768,6 +3838,10 @@
       },
       {
         "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "pop",
         "args": []
       }
     ],
@@ -4049,6 +4123,10 @@
       },
       {
         "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "pop",
         "args": []
       }
     ],
@@ -4537,45 +4615,9 @@
       {
         "m": "startEvent",
         "args": []
-      },
-      {
-        "m": "subProcess",
-        "args": [
-          "sub-process"
-        ]
-      },
-      {
-        "m": "multiInstance",
-        "args": []
-      },
-      {
-        "m": "zeebeInputCollectionExpression",
-        "args": [
-          "items"
-        ]
-      },
-      {
-        "m": "zeebeInputElement",
-        "args": [
-          "item"
-        ]
-      },
-      {
-        "m": "pop",
-        "args": []
-      },
-      {
-        "m": "embeddedSubProcess",
-        "args": []
-      },
-      {
-        "m": "startEvent",
-        "args": [
-          "sub-process-start"
-        ]
       }
     ],
-    "reason": "chain-ended-without-done"
+    "reason": "unresolved-arg:subProcess(SUB_PROCESS_ELEMENT_ID)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceSubProcessTest-1-process",
@@ -4665,6 +4707,32 @@
     "reason": "chain-ended-without-done"
   },
   {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-InterruptingEventSubprocessTest-0-proc",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessTest.java",
+    "processId": "proc",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": [
+          "proc_start"
+        ]
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(embeddedSubprocess)"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-InterruptingEventSubprocessTest-1-proc",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessTest.java",
+    "processId": "proc",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(embeddedSubprocess)"
+  },
+  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-InterruptingEventSubprocessTest-2-proc",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessTest.java",
     "processId": "proc",
@@ -4672,20 +4740,9 @@
       {
         "m": "startEvent",
         "args": []
-      },
-      {
-        "m": "subProcess",
-        "args": [
-          "sub_proc",
-          "embeddedSubprocess"
-        ]
-      },
-      {
-        "m": "boundaryEvent",
-        "args": []
       }
     ],
-    "reason": "unsupported-method:cancelActivity"
+    "reason": "unresolved-arg:subProcess(embeddedSubprocess)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-InterruptingEventSubprocessTest-3-proc",
@@ -4695,20 +4752,21 @@
       {
         "m": "startEvent",
         "args": []
-      },
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(embeddedSubprocess)"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-InterruptingEventSubprocessTest-4-proc",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessTest.java",
+    "processId": "proc",
+    "calls": [
       {
-        "m": "subProcess",
-        "args": [
-          "sub_proc",
-          "embeddedSubprocess"
-        ]
-      },
-      {
-        "m": "boundaryEvent",
+        "m": "startEvent",
         "args": []
       }
     ],
-    "reason": "unsupported-method:cancelActivity"
+    "reason": "unresolved-arg:subProcess(embeddedSubprocess)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-InterruptingEventSubprocessTest-5-proc",
@@ -5327,67 +5385,6 @@
     "reason": "serialise:IllegalArgumentException: argument type mismatch"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-TerminateEndEventTest-2-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/TerminateEndEventTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "parallelGateway",
-        "args": [
-          "process_fork"
-        ]
-      },
-      {
-        "m": "serviceTask",
-        "args": [
-          "A"
-        ]
-      },
-      {
-        "m": "zeebeJobType",
-        "args": [
-          "A"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end_after_A"
-        ]
-      },
-      {
-        "m": "moveToNode",
-        "args": [
-          "process_fork"
-        ]
-      },
-      {
-        "m": "subProcess",
-        "args": [
-          "subprocess",
-          "subprocessBuilder"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "to_end_after_subprocess"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end_after_subprocess"
-        ]
-      }
-    ],
-    "reason": "serialise:NoSuchMethodException: ParallelGatewayBuilder.subProcess(2 args)"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventLegacyCorrelationKeyScopeTest-0-boundaryCorrelationScopeLegacyIncident",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventLegacyCorrelationKeyScopeTest.java",
     "processId": "boundaryCorrelationScopeLegacyIncident",
@@ -5777,6 +5774,10 @@
         "args": []
       },
       {
+        "m": "pop",
+        "args": []
+      },
+      {
         "m": "boundaryEvent",
         "args": [
           "event"
@@ -5817,30 +5818,7 @@
         "args": []
       }
     ],
-    "reason": "serialise:NoSuchMethodException: EndEventBuilder.boundaryEvent(1 args)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-4-compensation-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventExecutionTest.java",
-    "processId": "compensation-process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "subProcess",
-        "args": [
-          "subprocess",
-          "subprocessBuilder"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:NoSuchMethodException: StartEventBuilder.subProcess(2 args)"
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-2-PROCESS_WITH_MESSAGES",
@@ -6917,103 +6895,6 @@
       }
     ],
     "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-InterruptingEventSubprocessTest-0-proc",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessTest.java",
-    "processId": "proc",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": [
-          "proc_start"
-        ]
-      },
-      {
-        "m": "subProcess",
-        "args": [
-          "sub_proc",
-          "embeddedSubprocess"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end_proc"
-        ]
-      }
-    ],
-    "reason": "serialise:NoSuchMethodException: StartEventBuilder.subProcess(2 args)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-InterruptingEventSubprocessTest-1-proc",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessTest.java",
-    "processId": "proc",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "subProcess",
-        "args": [
-          "sub_proc",
-          "embeddedSubprocess"
-        ]
-      },
-      {
-        "m": "boundaryEvent",
-        "args": []
-      },
-      {
-        "m": "message",
-        "args": []
-      },
-      {
-        "m": "name",
-        "args": [
-          "boundary"
-        ]
-      },
-      {
-        "m": "zeebeCorrelationKeyExpression",
-        "args": [
-          "key"
-        ]
-      },
-      {
-        "m": "pop",
-        "args": []
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:NoSuchMethodException: StartEventBuilder.subProcess(2 args)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-InterruptingEventSubprocessTest-4-proc",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessTest.java",
-    "processId": "proc",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "subProcess",
-        "args": [
-          "sub_proc",
-          "embeddedSubprocess"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:NoSuchMethodException: StartEventBuilder.subProcess(2 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-18-childProcessId",

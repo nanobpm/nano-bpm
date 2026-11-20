@@ -288,6 +288,141 @@ test('parseChain leaves a runtime-parameterised Consumer composition unparseable
   assert.match(chains[0].reason, /^unresolved-arg:serviceTask/);
 });
 
+// --- subProcess Consumer scope restoration (#1714 review) --------------------
+// The defect class: a flattened `subProcess(id, sp -> …)` Consumer body left the
+// replay inside the SubProcessBuilder scope, so the outer `.endEvent()` chained
+// off the body's LAST end event — an outgoing flow from an end event, an invalid
+// model rejected at deployment (ContainerElementVariablePropagationTest-8/-9/-10).
+// `subProcess` is a scope-opening method: the Consumer body is followed by a
+// `pop` that restores the enclosing builder, exactly like multiInstance/message.
+
+test('parseChain restores the enclosing scope after a subProcess Consumer body', () => {
+  // The ContainerElementVariablePropagationTest-10 shape: the sub-process body
+  // ends with `.endEvent()` and the OUTER chain continues with `.endEvent()`.
+  // Without the scope-closing `pop` the outer endEvent replays inside `sp`.
+  const src = `
+    BpmnModelInstance m = Bpmn.createExecutableProcess("processId")
+        .startEvent()
+        .subProcess("sp", sp -> sp
+            .zeebeInputExpression("={p:0}", "a")
+            .zeebeOutputExpression("1", "a.b")
+            .embeddedSubProcess()
+            .startEvent()
+            .endEvent())
+        .endEvent()
+        .done();
+  `;
+  const chains = parseFile(src);
+  assert.equal(chains.length, 1);
+  assert.equal(chains[0].reason, null);
+  assert.deepEqual(chains[0].calls.map((c) => c.m), [
+    'startEvent', 'subProcess', 'zeebeInputExpression', 'zeebeOutputExpression',
+    'embeddedSubProcess', 'startEvent', 'endEvent', 'pop', 'endEvent',
+  ]);
+});
+
+test('parseChain pops the subProcess scope before an outer moveTo* navigation call', () => {
+  // Same class, different continuation: the outer chain navigates after the
+  // sub-process body. The `pop` must precede it so the navigation targets the
+  // process scope, not the sub-process body.
+  const src = `
+    BpmnModelInstance m = Bpmn.createExecutableProcess("processId")
+        .startEvent()
+        .subProcess("sp", sp -> sp.embeddedSubProcess().startEvent().endEvent())
+        .moveToNode("start")
+        .serviceTask("task", t -> t.zeebeJobType("type1"))
+        .endEvent()
+        .done();
+  `;
+  const chains = parseFile(src);
+  assert.equal(chains[0].reason, null);
+  assert.deepEqual(chains[0].calls.map((c) => c.m), [
+    'startEvent', 'subProcess', 'embeddedSubProcess', 'startEvent', 'endEvent',
+    'pop', 'moveToNode', 'serviceTask', 'zeebeJobType', 'endEvent',
+  ]);
+});
+
+test('parseChain resolves a named Consumer field as the subProcess argument', () => {
+  // Same scope-restoration class, Consumer-field form: `subProcess("sp", BODY)`
+  // where BODY is a collected `Consumer<SubProcessBuilder>` field. The flattened
+  // body must still close with `pop` before the outer chain continues.
+  const src = `
+    private static final Consumer<SubProcessBuilder> BODY =
+        sp -> sp.embeddedSubProcess().startEvent().endEvent();
+    BpmnModelInstance p = Bpmn.createExecutableProcess("process")
+        .startEvent()
+        .subProcess("sp", BODY)
+        .endEvent()
+        .done();
+  `;
+  const chains = parseFile(src);
+  assert.equal(chains[0].reason, null);
+  assert.deepEqual(chains[0].calls.map((c) => c.m), [
+    'startEvent', 'subProcess', 'embeddedSubProcess', 'startEvent', 'endEvent',
+    'pop', 'endEvent',
+  ]);
+});
+
+test('parseChain resolves a Consumer .andThen composition as the subProcess argument', () => {
+  // `subProcess("sp", BODY.andThen(sp -> …))`: the composition's parts flatten
+  // in order and the scope closes once, after the last part.
+  const src = `
+    private static final Consumer<SubProcessBuilder> BODY =
+        sp -> sp.embeddedSubProcess();
+    BpmnModelInstance p = Bpmn.createExecutableProcess("process")
+        .startEvent()
+        .subProcess("sp", BODY.andThen(sp -> sp.startEvent().endEvent()))
+        .endEvent()
+        .done();
+  `;
+  const chains = parseFile(src);
+  assert.equal(chains[0].reason, null);
+  assert.deepEqual(chains[0].calls.map((c) => c.m), [
+    'startEvent', 'subProcess', 'embeddedSubProcess', 'startEvent', 'endEvent',
+    'pop', 'endEvent',
+  ]);
+});
+
+test('parseChain keeps a helper-call Consumer argument on subProcess unparseable', () => {
+  // `subProcess("sp", customize(sp))`: the Consumer body is a helper call the
+  // harvester cannot see into, so the scope would never be restored — the chain
+  // stays unparseable rather than emit a `pop` that underflows the replay stack.
+  const src = `
+    BpmnModelInstance p = Bpmn.createExecutableProcess("process")
+        .startEvent()
+        .subProcess("sp", customize(sp))
+        .endEvent()
+        .done();
+  `;
+  const chains = parseFile(src);
+  assert.match(chains[0].reason, /^unresolved-arg:subProcess/);
+});
+
+test('parseChain flattens a multiInstance scope nested inside a subProcess Consumer', () => {
+  // The ContainerElementVariablePropagationTest MI shape: the subProcess
+  // Consumer body opens a FURTHER scope (multiInstance with its own config
+  // lambda). Both scopes close, in order: the MI pop before the rest of the
+  // body, the subProcess pop before the outer chain continues.
+  const src = `
+    BpmnModelInstance m = Bpmn.createExecutableProcess("processId")
+        .startEvent()
+        .subProcess("sp", sp -> sp
+            .multiInstance(mi -> mi.sequential().zeebeInputCollectionExpression("=[1]"))
+            .embeddedSubProcess()
+            .startEvent()
+            .endEvent())
+        .endEvent()
+        .done();
+  `;
+  const chains = parseFile(src);
+  assert.equal(chains[0].reason, null);
+  assert.deepEqual(chains[0].calls.map((c) => c.m), [
+    'startEvent', 'subProcess', 'multiInstance', 'sequential',
+    'zeebeInputCollectionExpression', 'pop', 'embeddedSubProcess', 'startEvent',
+    'endEvent', 'pop', 'endEvent',
+  ]);
+});
+
 // --- parseChain / parseFile --------------------------------------------------
 
 test('parseChain harvests a simple linear process', () => {

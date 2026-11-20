@@ -13,20 +13,20 @@
         </ns0:ioMapping>
       </extensionElements>
       <incoming>sequenceFlow_1</incoming>
+      <outgoing>sequenceFlow_2</outgoing>
       <startEvent id="startEvent_2">
-        <outgoing>sequenceFlow_2</outgoing>
+        <outgoing>sequenceFlow_3</outgoing>
       </startEvent>
       <endEvent id="endEvent_1">
-        <incoming>sequenceFlow_2</incoming>
-        <outgoing>sequenceFlow_3</outgoing>
-      </endEvent>
-      <sequenceFlow id="sequenceFlow_2" sourceRef="startEvent_2" targetRef="endEvent_1"/>
-      <endEvent id="endEvent_2">
         <incoming>sequenceFlow_3</incoming>
       </endEvent>
-      <sequenceFlow id="sequenceFlow_3" sourceRef="endEvent_1" targetRef="endEvent_2"/>
+      <sequenceFlow id="sequenceFlow_3" sourceRef="startEvent_2" targetRef="endEvent_1"/>
     </subProcess>
     <sequenceFlow id="sequenceFlow_1" sourceRef="startEvent_1" targetRef="sp"/>
+    <endEvent id="endEvent_2">
+      <incoming>sequenceFlow_2</incoming>
+    </endEvent>
+    <sequenceFlow id="sequenceFlow_2" sourceRef="sp" targetRef="endEvent_2"/>
   </process>
   <bpmndi:BPMNDiagram id="BPMNDiagram_1">
     <bpmndi:BPMNPlane bpmnElement="processId" id="BPMNPlane_1">
@@ -46,16 +46,16 @@
       <bpmndi:BPMNShape bpmnElement="endEvent_1" id="BPMNShape_4">
         <dc:Bounds height="36.0" width="36.0" x="322.0" y="100.0"/>
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2" id="BPMNEdge_2">
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_3" id="BPMNEdge_2">
         <di:waypoint x="272.0" y="118.0"/>
         <di:waypoint x="322.0" y="118.0"/>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNShape bpmnElement="endEvent_2" id="BPMNShape_5">
-        <dc:Bounds height="36.0" width="36.0" x="408.0" y="100.0"/>
+        <dc:Bounds height="36.0" width="36.0" x="586.0" y="100.0"/>
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_3" id="BPMNEdge_3">
-        <di:waypoint x="358.0" y="118.0"/>
-        <di:waypoint x="408.0" y="118.0"/>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2" id="BPMNEdge_3">
+        <di:waypoint x="536.0" y="118.0"/>
+        <di:waypoint x="586.0" y="118.0"/>
       </bpmndi:BPMNEdge>
     </bpmndi:BPMNPlane>
   </bpmndi:BPMNDiagram>

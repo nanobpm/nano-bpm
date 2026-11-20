@@ -4,31 +4,31 @@
   <process id="processId" isExecutable="true">
     <startEvent id="startEvent_1">
       <outgoing>sequenceFlow_1</outgoing>
+      <outgoing>sequenceFlow_2</outgoing>
     </startEvent>
     <subProcess id="sp" name="sp">
       <incoming>sequenceFlow_1</incoming>
       <startEvent id="startEvent_2">
-        <outgoing>sequenceFlow_2</outgoing>
+        <outgoing>sequenceFlow_3</outgoing>
       </startEvent>
       <serviceTask id="task" name="task">
         <extensionElements>
           <ns0:taskDefinition type="boundaryStopJobType"/>
         </extensionElements>
-        <incoming>sequenceFlow_2</incoming>
-        <outgoing>sequenceFlow_3</outgoing>
-      </serviceTask>
-      <sequenceFlow id="sequenceFlow_2" sourceRef="startEvent_2" targetRef="task"/>
-      <endEvent id="endEvent_1">
         <incoming>sequenceFlow_3</incoming>
         <outgoing>sequenceFlow_4</outgoing>
-      </endEvent>
-      <sequenceFlow id="sequenceFlow_3" sourceRef="task" targetRef="endEvent_1"/>
-      <endEvent id="endEvent_2">
+      </serviceTask>
+      <sequenceFlow id="sequenceFlow_3" sourceRef="startEvent_2" targetRef="task"/>
+      <endEvent id="endEvent_1">
         <incoming>sequenceFlow_4</incoming>
       </endEvent>
-      <sequenceFlow id="sequenceFlow_4" sourceRef="endEvent_1" targetRef="endEvent_2"/>
+      <sequenceFlow id="sequenceFlow_4" sourceRef="task" targetRef="endEvent_1"/>
     </subProcess>
     <sequenceFlow id="sequenceFlow_1" sourceRef="startEvent_1" targetRef="sp"/>
+    <endEvent id="endEvent_2">
+      <incoming>sequenceFlow_2</incoming>
+    </endEvent>
+    <sequenceFlow id="sequenceFlow_2" sourceRef="startEvent_1" targetRef="endEvent_2"/>
   </process>
   <bpmndi:BPMNDiagram id="BPMNDiagram_1">
     <bpmndi:BPMNPlane bpmnElement="processId" id="BPMNPlane_1">
@@ -36,7 +36,7 @@
         <dc:Bounds height="36.0" width="36.0" x="100.0" y="100.0"/>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape bpmnElement="sp" id="BPMNShape_2" isExpanded="true">
-        <dc:Bounds height="200.0" width="458.0" x="186.0" y="18.0"/>
+        <dc:Bounds height="200.0" width="372.0" x="186.0" y="18.0"/>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNEdge bpmnElement="sequenceFlow_1" id="BPMNEdge_1">
         <di:waypoint x="136.0" y="118.0"/>
@@ -48,23 +48,24 @@
       <bpmndi:BPMNShape bpmnElement="task" id="BPMNShape_4">
         <dc:Bounds height="80.0" width="100.0" x="322.0" y="78.0"/>
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2" id="BPMNEdge_2">
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_3" id="BPMNEdge_2">
         <di:waypoint x="272.0" y="118.0"/>
         <di:waypoint x="322.0" y="118.0"/>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNShape bpmnElement="endEvent_1" id="BPMNShape_5">
         <dc:Bounds height="36.0" width="36.0" x="472.0" y="100.0"/>
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_3" id="BPMNEdge_3">
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_4" id="BPMNEdge_3">
         <di:waypoint x="422.0" y="118.0"/>
         <di:waypoint x="472.0" y="118.0"/>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNShape bpmnElement="endEvent_2" id="BPMNShape_6">
-        <dc:Bounds height="36.0" width="36.0" x="558.0" y="100.0"/>
+        <dc:Bounds height="36.0" width="36.0" x="186.0" y="268.0"/>
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_4" id="BPMNEdge_4">
-        <di:waypoint x="508.0" y="118.0"/>
-        <di:waypoint x="558.0" y="118.0"/>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2" id="BPMNEdge_4">
+        <di:waypoint x="118.0" y="136.0"/>
+        <di:waypoint x="118.0" y="286.0"/>
+        <di:waypoint x="186.0" y="286.0"/>
       </bpmndi:BPMNEdge>
     </bpmndi:BPMNPlane>
   </bpmndi:BPMNDiagram>
