@@ -106,6 +106,9 @@ impl Engine {
             retired_tombstones: std::collections::BTreeSet::new(),
             torn_down_scopes: std::collections::BTreeSet::new(),
             esp_start_payloads: std::collections::BTreeMap::new(),
+            boundary_payloads: std::collections::BTreeMap::new(),
+            pending_timer_fires: std::collections::VecDeque::new(),
+            sweep_from: 0,
             raft_applied: snapshot.raft_applied,
         }
     }

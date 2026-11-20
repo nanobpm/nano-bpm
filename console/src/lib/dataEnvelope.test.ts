@@ -143,6 +143,86 @@ test("envelopeContext: a plain gateway/task with no boundary has no envelope", (
   assert.equal(envelopeContext(undefined), undefined);
 });
 
+// A none start event (no event definition) carries the process's input envelope
+// on the start event itself.
+function noneStartEvent(props: EnvModdleElement[] = []): EnvModdleElement {
+  return {
+    $type: "bpmn:StartEvent",
+    extensionElements: {
+      $type: "bpmn:ExtensionElements",
+      values: [{ $type: "zeebe:Properties", properties: props }],
+    },
+  };
+}
+
+test("envelopeContext: a none start event targets itself, input only", () => {
+  const bo = noneStartEvent();
+  const ctx = envelopeContext({ type: "bpmn:StartEvent", businessObject: bo });
+  assert.ok(ctx);
+  assert.equal(ctx.target, bo);
+  assert.equal(ctx.inputOnly, true);
+  assert.equal(ctx.taskType, undefined);
+  assert.equal(ctx.formId, undefined);
+});
+
+test("envelopeContext: a message start event keeps its envelope on the bpmn:Message", () => {
+  const msg: EnvModdleElement = {
+    $type: "bpmn:Message",
+    id: "Msg_1",
+    name: "OrderPlaced",
+  };
+  const bo: EnvModdleElement = {
+    $type: "bpmn:StartEvent",
+    eventDefinitions: [
+      { $type: "bpmn:MessageEventDefinition", messageRef: msg },
+    ],
+  };
+  const ctx = envelopeContext({ type: "bpmn:StartEvent", businessObject: bo });
+  assert.ok(ctx);
+  assert.equal(ctx.target, msg);
+  assert.equal(ctx.inputOnly, undefined);
+});
+
+test("envelopeContext: a timer start event has no envelope", () => {
+  assert.equal(
+    envelopeContext({
+      type: "bpmn:StartEvent",
+      businessObject: {
+        $type: "bpmn:StartEvent",
+        eventDefinitions: [{ $type: "bpmn:TimerEventDefinition" }],
+      },
+    }),
+    undefined,
+  );
+});
+
+test("envelopeContext: a none start event with an empty eventDefinitions array is still none", () => {
+  const bo: EnvModdleElement = {
+    $type: "bpmn:StartEvent",
+    eventDefinitions: [],
+  };
+  const ctx = envelopeContext({ type: "bpmn:StartEvent", businessObject: bo });
+  assert.ok(ctx);
+  assert.equal(ctx.target, bo);
+  assert.equal(ctx.inputOnly, true);
+});
+
+test("collectEnvelopeTypeRefs: picks up a none start event's input envelope", () => {
+  const start = {
+    type: "bpmn:StartEvent",
+    businessObject: noneStartEvent([
+      { name: ENVELOPE_KEY.inputType, value: "FeatureRequest" },
+      // A stray `.out` on a start event is not part of the contract, but the
+      // collector reads both fields off the carrier, so it is still surfaced.
+      { name: ENVELOPE_KEY.outputType, value: "Stray" },
+    ]),
+  };
+  assert.deepEqual(collectEnvelopeTypeRefs([start]), [
+    "FeatureRequest",
+    "Stray",
+  ]);
+});
+
 test("referencedMessage: receiveTask uses messageRef, non-message events return undefined", () => {
   const msg: EnvModdleElement = { $type: "bpmn:Message", id: "M" };
   assert.equal(

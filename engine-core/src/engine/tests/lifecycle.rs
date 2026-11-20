@@ -1055,6 +1055,62 @@ fn inline_script_task_result_is_visible_to_output_mappings() {
     );
 }
 
+/// #1743 review: the script result and the output mappings are planned in one
+/// batch before either applies, so the equal-value filter (#1537) must compare
+/// against the earlier planned write, not only committed state. Root `x=0`:
+/// the result writes `x=1`, then the output mapping restores `x=0` — the
+/// restoring write must survive (variant 1). Repeating the pending value
+/// (`x=1` again) is the redundant write that may be dropped (variant 2).
+#[test]
+fn output_mapping_after_script_result_compares_against_the_pending_write() {
+    for (restore_to, expected) in [(0, 0), (1, 1)] {
+        let def = ProcessBuilder::new("pending-cmp")
+            .start_event("start")
+            .script_task("calc", "=1", "x")
+            .with_io(
+                "calc",
+                crate::model::IoMapping {
+                    inputs: Vec::new(),
+                    outputs: vec![crate::model::Mapping {
+                        source: format!("={restore_to}"),
+                        target: "x".to_string(),
+                    }],
+                },
+            )
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "calc")
+            .connect("calc", "work")
+            .connect("work", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "pending-cmp",
+                vars(&[("x", Value::Int(0))]),
+            ))
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        assert_eq!(
+            engine.instance(key).unwrap().variables.get("x"),
+            Some(&Value::Int(expected)),
+            "restore_to={restore_to}"
+        );
+        let x_writes = created
+            .iter()
+            .filter(|e| match e {
+                Event::VariablesUpdated { variables, .. } => variables.contains_key("x"),
+                Event::ScopedVariablesUpdated { variables, .. } => variables.contains_key("x"),
+                _ => false,
+            })
+            .count();
+        let want = if restore_to == 0 { 2 } else { 1 };
+        assert_eq!(x_writes, want, "restore_to={restore_to}");
+    }
+}
+
 /// Cancelling an instance whose catch subscription is canonically placed on
 /// another partition emits a routable `MessageSubscriptionClosing` (carrying
 /// the message name + correlation key the host needs to address the message
@@ -4257,6 +4313,7 @@ fn variable_propagation_updates_nearest_defining_scope_else_root() {
             ("c", Value::Int(9)),
         ]),
         false,
+        &[],
     );
     let mut by_scope: std::collections::BTreeMap<Key, Vec<String>> =
         std::collections::BTreeMap::new();
@@ -4302,10 +4359,96 @@ fn local_variable_write_stays_in_the_target_scope() {
 
     // A local write pins every value to the child scope even though `a` is
     // defined at root (Zeebe `local=true` / input-mapping semantics).
-    let writes = engine.propagate_variables(key, child, vars(&[("a", Value::Int(9))]), true);
+    let writes = engine.propagate_variables(key, child, vars(&[("a", Value::Int(9))]), true, &[]);
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].0, child);
     assert!(writes[0].1.contains_key("a"));
+}
+
+#[test]
+fn an_equal_value_local_does_not_capture_a_propagating_write() {
+    // #1711 / Zeebe `VariableBehavior.mergeDocument`: a scope consumes a
+    // propagating entry only when it holds the name with a DIFFERENT value. An
+    // equal-valued local emits no record AND does not stop the walk — the
+    // write propagates to the nearest ancestor holding a different value.
+    // Scenario: a parallel-MI child seeds a local `result: null`
+    // (outputElement) while the process scope holds `result: 85`; the child
+    // completes with `{"result": null}` and Zeebe emits
+    // `VARIABLE UPDATED result = null` at the PROCESS scope.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("result", Value::Int(85))]),
+        },
+    );
+    let child: Key = 900_005;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("result", Value::Null)]),
+        },
+    );
+
+    // The child's null local equals the written null: no child-scope record,
+    // and the write reaches the root, which holds a different value (85).
+    let writes =
+        engine.propagate_variables(key, child, vars(&[("result", Value::Null)]), false, &[]);
+    assert_eq!(
+        writes,
+        vec![(key, vars(&[("result", Value::Null)]))],
+        "the null write must update the root scope, not die at the equal-valued child local"
+    );
+}
+
+#[test]
+fn an_equal_value_at_every_scope_emits_no_write() {
+    // The same walk must still drop a write when NO scope on the chain would
+    // change: an equal value at the root, no descendant re-defining it — the
+    // root would be rewritten with the same value, so nothing is emitted
+    // (Zeebe `setLocalVariable` writes no record for an equal value, #1537).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("x", Value::Int(7))]),
+        },
+    );
+    let child: Key = 900_006;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+
+    let events = engine.propagated_updates(key, child, vars(&[("x", Value::Int(7))]), false, &[]);
+    assert!(
+        events.is_empty(),
+        "an equal value at every scope emits no record, got {events:?}"
+    );
 }
 
 #[test]
@@ -4533,10 +4676,10 @@ fn local_write_shadows_an_inherited_root_variable_until_the_scope_is_destroyed()
     );
 
     // local=true pins the write to the child scope even though `x` is a root var.
-    let writes = engine.propagate_variables(key, child, vars(&[("x", Value::Int(99))]), true);
+    let writes = engine.propagate_variables(key, child, vars(&[("x", Value::Int(99))]), true, &[]);
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].0, child);
-    for event in engine.propagated_updates(key, child, vars(&[("x", Value::Int(99))]), true) {
+    for event in engine.propagated_updates(key, child, vars(&[("x", Value::Int(99))]), true, &[]) {
         apply_raw(&mut engine, event);
     }
 
@@ -7418,8 +7561,8 @@ fn subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope(
     );
     let sibling_completed_at = events
         .iter()
-        .position(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == "work"))
-        .expect("the sibling token is completed by the teardown");
+        .position(|e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id.as_str() == "work"))
+        .expect("the sibling token is terminated by the teardown (#1535)");
     assert!(
         completed_at < sibling_completed_at,
         "the terminate end completes before the sibling's teardown records"
@@ -8499,4 +8642,45 @@ fn inclusive_join_ignores_its_own_queued_activation_as_a_live_path() {
         1,
         "the join must fire exactly once"
     );
+}
+
+#[test]
+fn inclusive_join_reached_by_a_fork_sibling_still_in_transit_waits_like_zeebe() {
+    // The #1693 fuzz reproducer (`Gen_a0e9274136`): the inclusive split `g1`
+    // takes both `g1 -> g2` and `g1 -> g3`. Zeebe takes a fork's flows in
+    // reverse document order, so `g3`'s ACTIVATE is processed while `g2`'s is
+    // still in transit, and `g2` can still reach `g3` over the untaken
+    // `g2 -> g3`: the join is rejected. `g2` then routes to `e` only, nothing
+    // else arrives at `g3`, and the instance stays active — exactly what live
+    // Camunda 8 does (verified against camunda/camunda:8.10.6).
+    let def = ProcessBuilder::new("inc-in-transit")
+        .start_event("s")
+        .inclusive_gateway("g1")
+        .inclusive_gateway("g2")
+        .inclusive_gateway("g3")
+        .service_task("t1", "T1")
+        .end_event("e")
+        .connect("s", "g1")
+        .connect_when("g1", "g2", "true")
+        .connect_when("g1", "g3", "true")
+        .connect_when("g2", "g3", "false")
+        .connect_when("g2", "e", "true")
+        .connect("g3", "t1")
+        .connect("t1", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-in-transit"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(join_fire_count(&created, "g3"), 0);
+    assert!(
+        !created
+            .iter()
+            .any(|e| matches!(e, Event::JobCreated { .. })),
+        "no T1 job: the join never activates"
+    );
+    assert!(!engine.is_completed(instance_key));
 }

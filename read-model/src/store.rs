@@ -5323,6 +5323,24 @@ fn project_event(
             )?;
         }
 
+        Event::ElementTerminated {
+            element_instance_key,
+            ..
+        } => {
+            // An element interrupted by a boundary / event sub-process /
+            // teardown (#1535) ends TERMINATED, not COMPLETED (Camunda parity).
+            tx.cexecute(
+                "UPDATE element_instances SET state = ?2, end_date_ms = ?3 \
+                 WHERE element_instance_key = ?1 AND state = ?4",
+                params![
+                    *element_instance_key as i64,
+                    element_instance_state_code(ElementInstanceState::Terminated),
+                    now_ms as i64,
+                    element_instance_state_code(ElementInstanceState::Active),
+                ],
+            )?;
+        }
+
         // --- Timer / signal / conditional waits (TIMER/SIGNAL/CONDITION) -----
         Event::TimerCreated {
             timer_key,
@@ -5497,6 +5515,7 @@ fn project_event(
             instance_key,
             element_instance_key,
             element_id,
+            ..
         }
         | Event::RemoteMessageCorrelation {
             subscription_key,
@@ -7099,6 +7118,7 @@ fn project_event(
         | Event::CompensationTriggered { .. }
         | Event::DeploymentCreated { .. }
         | Event::ElementCompleting { .. }
+        | Event::ElementTerminating { .. }
         | Event::GatewayRouteSelected { .. }
         | Event::MessagePublished { .. }
         | Event::MessageSubscriptionClosing { .. }
@@ -11783,6 +11803,8 @@ mod decision_deletion_tests {
             instance_key: 7,
             element_instance_key: 72,
             element_id: "catch".into(),
+            variables: std::collections::BTreeMap::new(),
+            boundary_element_id: None,
         };
         let created = Event::ProcessInstanceCreated {
             instance_key: 7,
@@ -12135,6 +12157,39 @@ mod element_instance_tests {
     }
 
     #[test]
+    fn an_interrupted_element_is_terminated_not_completed() {
+        // #1535: a boundary-interrupted element journals ElementTerminated;
+        // the element-instance query must report TERMINATED (Camunda parity).
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store
+            .export(&[&Event::ElementActivated {
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "t".to_string(),
+                scope: 0,
+            }])
+            .unwrap();
+        store
+            .export(&[
+                &Event::ElementTerminating {
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                },
+                &Event::ElementTerminated {
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                },
+            ])
+            .unwrap();
+        let row = store.element_instance(TASK_EI).unwrap();
+        assert_eq!(row.state, ElementInstanceState::Terminated);
+        assert!(row.end_date_ms.is_some());
+    }
+
+    #[test]
     fn unresolved_element_type_falls_back_to_unknown() {
         let store = ReadStore::open(None).unwrap();
         store.export(&[&deploy(), &created()]).unwrap();
@@ -12423,6 +12478,8 @@ mod element_instance_tests {
                 instance_key: INST,
                 element_instance_key: TASK_EI,
                 element_id: "await".to_string(),
+                variables: BTreeMap::new(),
+                boundary_element_id: None,
             }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
@@ -14249,6 +14306,8 @@ mod element_instance_tests {
             instance_key: INST,
             element_instance_key: 0,
             element_id: "esp_start".to_string(),
+            variables: BTreeMap::new(),
+            boundary_element_id: None,
         };
         store
             .export(&[&created_sub(5001, false), &created_sub(5002, true)])
@@ -14490,6 +14549,8 @@ mod element_instance_tests {
                 instance_key: INST,
                 element_instance_key: TASK_EI,
                 element_id: "task".to_string(),
+                variables: BTreeMap::new(),
+                boundary_element_id: None,
             }])
             .unwrap();
         assert_eq!(
@@ -14507,6 +14568,8 @@ mod element_instance_tests {
                 instance_key: INST,
                 element_instance_key: TASK_EI,
                 element_id: "task".to_string(),
+                variables: BTreeMap::new(),
+                boundary_element_id: None,
             }])
             .unwrap();
         assert_eq!(store.message_subscriptions().len(), 1);
@@ -14597,6 +14660,8 @@ mod element_instance_tests {
                 instance_key: INST,
                 element_instance_key: TASK_EI,
                 element_id: "await".to_string(),
+                variables: BTreeMap::new(),
+                boundary_element_id: None,
             }])
             .unwrap();
         assert!(

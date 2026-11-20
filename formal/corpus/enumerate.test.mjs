@@ -126,6 +126,23 @@ test('reference: an exclusive split into a parallel join gets stuck, on every ro
   }
 })
 
+test('reference: a fork takes its flows in Zeebe\'s reverse document order, so an inclusive join is guarded AFTER the sibling branch routes away (#1694, #1695)', () => {
+  // Gen_a0e091fa90 (fuzz seed 3666021433): parallel fork G1 -> {inclusive join
+  // G2 (f2), exclusive G3 (f3)}; G3 -> {G2 (f6), E (f7)}; G2 -> T1 -> E. Zeebe
+  // (live 8.10.6) takes f3 BEFORE f2 (ExecutableFlowNode.getOutgoing() is
+  // reverse declaration order), so G3 has already routed to E when G2's
+  // ACTIVATE is guarded: no live path remains, G2 fires and T1's job is
+  // created. Taking f2 first would park G2 forever (the defect).
+  const skel = { kinds: ['and', 'xor', 'or'], edges: [[1, 2, 'direct'], [2, 4, 'direct'], [1, 3, 'direct'], [3, 4, 'task'], [0, 1, 'direct'], [2, 3, 'direct']] }
+  const g = materialize(skel)
+  assert.equal(g.key, 'and,or,xor|0>1d,1>2d,1>3d,2>4t,3>2d,3>4d')
+  const ref = new Reference(g, { route_G3: [['f7']] })
+  assert.deepEqual({ ...ref.jobsCreated }, { T1: 1 })
+  assert.deepEqual({ ...ref.joinsFired }, { G2: 1 })
+  assert.deepEqual({ ...ref.takenFlows }, { f1: 1, f2: 1, f3: 1, f7: 1, f4: 1 })
+  assert.equal(ref.completed, false)
+})
+
 test('reference: an inclusive split routes every non-empty subset and its join waits for each', () => {
   const g = graphOf(['or', 'or'], [[0, 1, 'direct'], [1, 2, 'task'], [1, 2, 'task'], [2, 3, 'direct']])
   const routes = routesFor(g)
@@ -147,7 +164,10 @@ test('reference: a gateway reached twice routes PER ACTIVATION, not per instance
   // route (all activations share one choice) can only make zero or two.
   const g = graphOf(['and', 'xor'], [[0, 1, 'direct'], [1, 2, 'task'], [1, 2, 'task'], [2, 3, 'task'], [2, 3, 'direct']])
   const runs = exploreOrders(g)
-  const byJobs = new Map(runs.map((r) => [JSON.stringify(r.jobsCreated), r]))
+  // Key-order-insensitive: a fork queues its tasks in Zeebe's reverse document
+  // order (#1694), so the multiset — not its insertion order — is the oracle.
+  const jobsKey = (jobs) => JSON.stringify(Object.fromEntries(Object.entries(jobs).sort(([a], [b]) => (a < b ? -1 : 1))))
+  const byJobs = new Map(runs.map((r) => [jobsKey(r.jobsCreated), r]))
   assert.ok(byJobs.has('{"T1":1,"T2":1}'), 'route both to E: no T3')
   assert.ok(byJobs.has('{"T1":1,"T2":1,"T3":1}'), 'route one to T3, one to E: exactly one T3 job')
   assert.ok(byJobs.has('{"T1":1,"T2":1,"T3":2}'), 'route both to T3: two T3 jobs')
@@ -565,4 +585,21 @@ test('the committed divergence corpus is well-formed: every case is filed and re
 test('error classes mask ids and numbers so one defect is one signature', () => {
   assert.equal(errorClass(new Error("no 'T1' job became activatable within 30000ms\nmore")),
     errorClass(new Error("no 'T7' job became activatable within 5ms")))
+})
+
+test('Reference takes a fork\'s flows in reverse document order, as Zeebe (#1693, #1675)', () => {
+  // Gen_a0e9274136: G1 forks to G2 (f2) and G3 (f3); G2 can reach the inclusive
+  // join G3 over f4 but routes to E (f5). Zeebe takes f3 BEFORE f2, so G3 is
+  // evaluated while G2's activation is still in transit and is rejected; G2
+  // then routes away and G3 is never re-evaluated — live Camunda 8 strands the
+  // instance with no T1 job. A document-order (f2 first) reference drains G2
+  // before G3 and wrongly expects completion.
+  const g = materialize({ kinds: ['or', 'or', 'or'], edges: [[0, 1, 'direct'], [1, 2, 'direct'], [1, 3, 'direct'], [2, 3, 'direct'], [2, 4, 'direct'], [3, 4, 'task']] })
+  const ref = new Reference(g, { route_G1: [['f2', 'f3']], route_G2: [['f5']] })
+  assert.equal(ref.completed, false)
+  assert.equal(ref.jobsCreated.T1, undefined)
+  assert.equal(ref.joinsFired.G3, undefined)
+  assert.deepEqual(ref.commands(), [])
+  // The order is per element: the reversed fork still takes BOTH flows.
+  assert.deepEqual({ ...ref.takenFlows }, { f1: 1, f2: 1, f3: 1, f5: 1 })
 })

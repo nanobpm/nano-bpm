@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  id="Definitions_boundary-message-subprocess" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:message id="cancel_msg" name="cancel">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=orderId" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+  <bpmn:process id="boundary-message-subprocess" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="sub-start" />
+      <bpmn:serviceTask id="work">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="work" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="sub-end" />
+      <bpmn:sequenceFlow id="s1" sourceRef="sub-start" targetRef="work" />
+      <bpmn:sequenceFlow id="s2" sourceRef="work" targetRef="sub-end" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="cancelled" attachedToRef="sub" cancelActivity="true">
+      <bpmn:messageEventDefinition id="cancelled_def" messageRef="cancel_msg" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="end" />
+    <bpmn:endEvent id="cancelled-end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end" />
+    <bpmn:sequenceFlow id="f3" sourceRef="cancelled" targetRef="cancelled-end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="boundary-message-subprocess">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="160" y="140" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sub_di" bpmnElement="sub" isExpanded="true">
+        <dc:Bounds x="250" y="60" width="400" height="200" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sub-start_di" bpmnElement="sub-start">
+        <dc:Bounds x="280" y="140" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="work_di" bpmnElement="work">
+        <dc:Bounds x="380" y="118" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sub-end_di" bpmnElement="sub-end">
+        <dc:Bounds x="560" y="140" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="cancelled_di" bpmnElement="cancelled">
+        <dc:Bounds x="432" y="242" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="712" y="140" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="cancelled-end_di" bpmnElement="cancelled-end">
+        <dc:Bounds x="712" y="320" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="s1_di" bpmnElement="s1">
+        <di:waypoint x="316" y="158" />
+        <di:waypoint x="380" y="158" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="s2_di" bpmnElement="s2">
+        <di:waypoint x="480" y="158" />
+        <di:waypoint x="560" y="158" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="196" y="158" />
+        <di:waypoint x="250" y="158" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="650" y="158" />
+        <di:waypoint x="712" y="158" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="450" y="278" />
+        <di:waypoint x="450" y="338" />
+        <di:waypoint x="712" y="338" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

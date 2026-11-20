@@ -753,14 +753,14 @@ impl<'a> NanoRun<'a> {
         instance: Key,
     ) -> Vec<J> {
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
+        // Every variable the engine's event carries is rendered — the adapter
+        // must NOT drop an equal-value rewrite (it once did, hiding #1537): Zeebe
+        // skips such writes in `VariableBehavior`, so the engine must never emit
+        // them, and a regression has to surface as a trace divergence.
         sorted
             .into_iter()
-            .filter_map(|(name, v)| {
-                let value = to_json(v);
-                let unchanged = self.values.get(&(scope_key, name.clone())) == Some(&value);
-                (!unchanged).then(|| {
-                    self.variable_record(scope_key, scope_label.clone(), name, value, instance)
-                })
+            .map(|(name, v)| {
+                self.variable_record(scope_key, scope_label.clone(), name, to_json(v), instance)
             })
             .collect()
     }
@@ -1035,6 +1035,35 @@ impl<'a> NanoRun<'a> {
                 }
                 vec![self.lifecycle(
                     "ELEMENT_COMPLETED",
+                    element_id,
+                    *element_instance_key,
+                    *instance_key,
+                )]
+            }
+            // An interrupted / torn-down element (#1535): rendered 1:1, and it
+            // leaves the active set exactly as a completion does (so a later
+            // process-level termination does not re-terminate it).
+            Event::ElementTerminating {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                vec![self.lifecycle(
+                    "ELEMENT_TERMINATING",
+                    element_id,
+                    *element_instance_key,
+                    *instance_key,
+                )]
+            }
+            Event::ElementTerminated {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                self.active_elements
+                    .retain(|(eik, _, _)| eik != element_instance_key);
+                vec![self.lifecycle(
+                    "ELEMENT_TERMINATED",
                     element_id,
                     *element_instance_key,
                     *instance_key,

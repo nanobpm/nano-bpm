@@ -259,6 +259,22 @@ pub struct Engine {
     /// container instance (durable from then on). Cleared per command, like
     /// [`torn_down_scopes`](Self::torn_down_scopes).
     esp_start_payloads: BTreeMap<(Key, Key, String), BTreeMap<String, Value>>,
+    /// Event payloads (message / signal variables) of a boundary event that
+    /// just fired, keyed by `(instance_key, flow_scope_key,
+    /// boundary_element_id)` (#1535, Zeebe parity): Zeebe creates the payload
+    /// LOCAL to the boundary event instance, then propagates it (or only its
+    /// output-mapped targets). The boundary's activation is queued in the SAME
+    /// drain as the correlation, so this in-drain scratch bridges the two;
+    /// cleared per command like [`esp_start_payloads`](Self::esp_start_payloads).
+    ///
+    /// The value is a FIFO **queue**, not a single payload: one broadcast can
+    /// reach several instances of the same activity in one flow scope (e.g. a
+    /// signal caught by the same boundary on two concurrent multi-instance
+    /// hosts sharing a scope). Each queued boundary activation pops exactly one
+    /// payload, so every host gets its own copy — a single overwritten entry
+    /// would hand the whole payload to the first activation and leave the rest
+    /// reading a missing (or, for output-mapped boundaries, stale) payload.
+    boundary_payloads: BTreeMap<(Key, Key, String), VecDeque<BTreeMap<String, Value>>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -267,6 +283,29 @@ pub struct Engine {
     /// without a snapshot seeds `last_applied` from it so journaled entries are
     /// never re-applied. `None` on a non-replicated engine.
     raft_applied: Option<(u64, String)>,
+    /// Due timers of the current `TriggerTimers` batch not yet fired (#1712).
+    /// The fixpoint loop pops one at quiescence and drains it to completion
+    /// before the next, mirroring Zeebe's one-TRIGGER-command-per-timer
+    /// processing. Per-command scratch: cleared by every `plan_command_at`.
+    pending_timer_fires: VecDeque<PendingTimerFire>,
+    /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
+    /// `complete_finished_instances`) derive their touched-instance set from.
+    /// `0` for a whole command; advanced to the fire point each time the
+    /// fixpoint loop fires the next timer of a batch (#1712), because every
+    /// instance touched before that point already swept to a fixpoint at
+    /// quiescence, and any later state change to it emits an event carrying
+    /// its key into the new window. Keeps an N-timer batch linear instead of
+    /// rescanning the growing prefix after every fire. Per-command scratch.
+    sweep_from: usize,
+}
+
+/// One due timer awaiting its fire in a `TriggerTimers` batch (#1712).
+#[derive(Clone, Copy, Debug)]
+enum PendingTimerFire {
+    /// An in-instance timer (catch, boundary, event sub-process start).
+    Timer(Key),
+    /// A process-level start timer.
+    Start(Key),
 }
 
 /// A `zeebe:ioMapping` source expression that failed to evaluate. Carries a
@@ -682,6 +721,9 @@ impl Engine {
             retired_tombstones: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
+            boundary_payloads: BTreeMap::new(),
+            pending_timer_fires: VecDeque::new(),
+            sweep_from: 0,
             raft_applied: None,
         }
     }
@@ -852,6 +894,9 @@ impl Engine {
             retired_tombstones: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
+            boundary_payloads: BTreeMap::new(),
+            pending_timer_fires: VecDeque::new(),
+            sweep_from: 0,
             raft_applied,
         }
     }
@@ -2480,7 +2525,7 @@ impl Engine {
         self.operation_reference = operation_reference;
         let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
             self.run(&mut log, queue);
-            self.cascade_cancel_children(&mut log);
+            self.cascade_cancel_children(&mut log, 0);
             self.finish_command(&log);
             log
         });
@@ -2560,6 +2605,9 @@ impl Engine {
         // this one's dead-scope guard.
         self.torn_down_scopes.clear();
         self.esp_start_payloads.clear();
+        self.boundary_payloads.clear();
+        self.pending_timer_fires.clear();
+        self.sweep_from = 0;
         // Per-command terminal-deadline stamp (#1494): set from THIS command
         // only (or cleared), never inherited from a previous one.
         self.terminal_deadline_stamp = match &command {
@@ -3030,6 +3078,7 @@ impl Engine {
                             instance_key,
                             element_instance_key,
                             variables,
+                            &[],
                         ) {
                             self.emit(&mut log, event);
                         }
@@ -3043,6 +3092,7 @@ impl Engine {
                             element_instance_key,
                             &element_id,
                             variables,
+                            &[],
                         ) {
                             self.emit(&mut log, event);
                         }
@@ -3412,6 +3462,7 @@ impl Engine {
                             element_instance_key,
                             &element_id,
                             variables,
+                            &[],
                         ) {
                             self.emit(&mut log, event);
                         }
@@ -3482,10 +3533,17 @@ impl Engine {
             }
 
             Command::TriggerTimers { now } => {
-                // Fire every due timer (deterministic order by key). An
-                // intermediate catch resumes its parked token; an interrupting
-                // boundary timer interrupts its activity and routes out the
-                // boundary event.
+                // Collect every due timer (deterministic order by key) and fire
+                // them ONE AT A TIME, each drained to quiescence before the next
+                // fires (#1712, Zeebe parity): Zeebe writes one TIMER TRIGGER
+                // command per due timer and processes each to completion in key
+                // order, so an earlier-due catch timer's follow-ups (its
+                // completion, the next element's activation and job) precede a
+                // later boundary timer's interruption of its activity. The
+                // fixpoint loop pops the next fire only at quiescence (see
+                // `pending_timer_fires`). A boundary timer whose activity an
+                // earlier fire interrupted is disarmed by then and skipped
+                // (Zeebe rejects that second TRIGGER).
                 let mut due: Vec<Key> = self
                     .state
                     .timers
@@ -3500,126 +3558,8 @@ impl Engine {
                     .map(|t| t.key)
                     .collect();
                 due.sort_unstable();
-                for timer_key in due {
-                    // A boundary timer earlier in this batch may have interrupted
-                    // an activity that disarmed this one; re-check it is still due.
-                    let timer = match self.state.timers.get(&timer_key) {
-                        Some(t) if t.state == state::TimerState::Created => t,
-                        _ => continue,
-                    };
-                    let instance_key = timer.instance_key;
-                    let element_instance_key = timer.element_instance_key;
-                    let element_id = timer.element_id.clone();
-                    let due_at = timer.due_at;
-                    let kind = timer.kind.clone();
-                    let repetitions = timer.repetitions;
-
-                    self.emit(
-                        &mut log,
-                        Event::TimerTriggered {
-                            timer_key,
-                            instance_key,
-                            element_instance_key,
-                            element_id: element_id.clone(),
-                        },
-                    );
-
-                    match kind {
-                        // Catch event: completing it resumes the token along its
-                        // own outgoing flow.
-                        state::TimerKind::IntermediateCatch => {
-                            queue.push_back(Step::Complete {
-                                instance_key,
-                                element_instance_key,
-                                element_id,
-                            });
-                        }
-                        // Boundary timer: interrupt the attached activity (a
-                        // service task or sub-process) and run the boundary
-                        // event's outgoing flow. `element_instance_key`/
-                        // `element_id` are the activity here.
-                        state::TimerKind::InterruptingBoundary {
-                            boundary_element_id,
-                        } => {
-                            let scope = self.scope_of(instance_key, element_instance_key);
-                            self.interrupt_activity_via_boundary(
-                                &mut log,
-                                instance_key,
-                                element_instance_key,
-                                &element_id,
-                            );
-                            queue.push_back(Step::Activate {
-                                instance_key,
-                                element_id: boundary_element_id,
-                                scope,
-                                via: None,
-                            });
-                        }
-                        // Non-interrupting boundary timer: leave the activity (and
-                        // its job) running and spawn a parallel token along the
-                        // boundary event's outgoing flow, in the activity's scope.
-                        // A repeating (cycle) timer re-arms for the next interval.
-                        state::TimerKind::NonInterruptingBoundary {
-                            boundary_element_id,
-                        } => {
-                            queue.push_back(Step::Activate {
-                                instance_key,
-                                element_id: boundary_element_id.clone(),
-                                scope: self.scope_of(instance_key, element_instance_key),
-                                via: None,
-                            });
-                            // A repeating cycle re-arms for the next interval; a
-                            // bounded `Rn/…` cycle stops after its n-th fire
-                            // (Zeebe parity, #1596).
-                            self.rearm_fired_cycle(
-                                &mut log,
-                                instance_key,
-                                element_instance_key,
-                                element_id,
-                                state::TimerKind::NonInterruptingBoundary {
-                                    boundary_element_id,
-                                },
-                                due_at,
-                                repetitions,
-                            );
-                        }
-                        // Event sub-process timer: `element_instance_key` is the
-                        // enclosing scope, `element_id` the ESP start event. A
-                        // non-interrupting cycle re-arms for the next interval.
-                        state::TimerKind::EventSubProcess {
-                            esp_element_id,
-                            interrupting,
-                        } => {
-                            if !interrupting {
-                                self.rearm_fired_cycle(
-                                    &mut log,
-                                    instance_key,
-                                    element_instance_key,
-                                    element_id.clone(),
-                                    state::TimerKind::EventSubProcess {
-                                        esp_element_id: esp_element_id.clone(),
-                                        interrupting,
-                                    },
-                                    due_at,
-                                    repetitions,
-                                );
-                            }
-                            self.trigger_event_subprocess(
-                                &mut log,
-                                &mut queue,
-                                instance_key,
-                                element_instance_key,
-                                esp_element_id,
-                                interrupting,
-                            );
-                        }
-                    }
-                }
-
-                // Process-level start timers: fire every due one (deterministic
-                // by key), creating a new instance. A cycle re-arms for the next
-                // interval; a one-shot is retained with no due time so it never
-                // fires again.
+                // Process-level start timers fire after the in-instance timers
+                // (deterministic by key), each creating a new instance.
                 let mut due_starts: Vec<Key> = self
                     .state
                     .start_timers
@@ -3628,43 +3568,11 @@ impl Engine {
                     .map(|t| t.timer_key)
                     .collect();
                 due_starts.sort_unstable();
-                for timer_key in due_starts {
-                    let timer = match self.state.start_timers.get(&timer_key) {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    let process_id = timer.process_id.clone();
-                    let start_element_id = timer.start_element_id.clone();
-                    let due_at = match timer.due_at {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    // A bounded `Rn/…` start cycle stops re-arming after its
-                    // n-th fire (#1596).
-                    let next_due_at =
-                        if timer.repeating && rearm_repetitions(timer.repetitions).is_some() {
-                            Some(due_at.saturating_add(timer.interval_millis))
-                        } else {
-                            None
-                        };
-                    self.emit(
-                        &mut log,
-                        Event::ProcessStartTimerFired {
-                            timer_key,
-                            next_due_at,
-                        },
-                    );
-                    self.start_or_dispatch_instance(
-                        &mut log,
-                        &mut queue,
-                        process_id,
-                        start_element_id,
-                        BTreeMap::new(),
-                        Vec::new(),
-                        None,
-                        None,
-                    );
-                }
+                self.pending_timer_fires.extend(
+                    due.into_iter()
+                        .map(PendingTimerFire::Timer)
+                        .chain(due_starts.into_iter().map(PendingTimerFire::Start)),
+                );
             }
 
             Command::FailJob {
@@ -3866,9 +3774,13 @@ impl Engine {
                             true,
                         );
                         if !variables.is_empty() {
-                            for event in
-                                self.propagated_updates(instance_key, scope_eik, variables, true)
-                            {
+                            for event in self.propagated_updates(
+                                instance_key,
+                                scope_eik,
+                                variables,
+                                true,
+                                &[],
+                            ) {
                                 self.emit(&mut log, event);
                             }
                         }
@@ -3888,6 +3800,12 @@ impl Engine {
                         let boundary_scope = self.scope_of(instance_key, caught_eik);
                         // When caught at an enclosing sub-process, terminate its
                         // whole inner scope (including the throwing task) first.
+                        let [terminating, terminated] = boundary::termination_events(
+                            instance_key,
+                            caught_eik,
+                            caught_element_id,
+                        );
+                        self.emit(&mut log, terminating);
                         if caught_eik != element_instance_key {
                             self.terminate_subprocess_scope(&mut log, instance_key, caught_eik);
                         }
@@ -3932,22 +3850,7 @@ impl Engine {
                                 },
                             );
                         }
-                        self.emit(
-                            &mut log,
-                            Event::ElementCompleting {
-                                instance_key,
-                                element_instance_key: caught_eik,
-                                element_id: caught_element_id.clone(),
-                            },
-                        );
-                        self.emit(
-                            &mut log,
-                            Event::ElementCompleted {
-                                instance_key,
-                                element_instance_key: caught_eik,
-                                element_id: caught_element_id,
-                            },
-                        );
+                        self.emit(&mut log, terminated);
                         // An error boundary interrupting the activity also disarms
                         // any timer boundaries and message subscriptions on it.
                         for event in self.cancel_boundary_timers_on(caught_eik) {
@@ -3972,6 +3875,7 @@ impl Engine {
                                 boundary_scope,
                                 variables,
                                 true,
+                                &[],
                             ) {
                                 self.emit(&mut log, event);
                             }
@@ -4792,7 +4696,8 @@ impl Engine {
                     // propagate to the nearest ancestor defining each name, else
                     // root. A root-scoped (or root-only-instance) write collapses
                     // to the flat `VariablesUpdated`.
-                    for event in self.propagated_updates(instance_key, scope_key, variables, local)
+                    for event in
+                        self.propagated_updates(instance_key, scope_key, variables, local, &[])
                     {
                         self.emit(&mut log, event);
                     }
@@ -6555,6 +6460,171 @@ impl Engine {
         Ok((log, queue))
     }
 
+    /// Fires one due in-instance timer (#1712): emits its `TimerTriggered` and
+    /// queues / applies the trigger's behaviour. Called by the fixpoint loop at
+    /// quiescence, one timer per drain, so each trigger runs to completion
+    /// before the next (Zeebe processes each TIMER TRIGGER command fully).
+    fn fire_due_timer(&mut self, log: &mut Vec<Event>, queue: &mut VecDeque<Step>, timer_key: Key) {
+        // An earlier fire in this batch may have interrupted an activity and
+        // disarmed this timer; re-check it is still armed.
+        let timer = match self.state.timers.get(&timer_key) {
+            Some(t) if t.state == state::TimerState::Created => t,
+            _ => return,
+        };
+        let instance_key = timer.instance_key;
+        let element_instance_key = timer.element_instance_key;
+        let element_id = timer.element_id.clone();
+        let due_at = timer.due_at;
+        let kind = timer.kind.clone();
+        let repetitions = timer.repetitions;
+
+        self.emit(
+            log,
+            Event::TimerTriggered {
+                timer_key,
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+            },
+        );
+
+        match kind {
+            // Catch event: completing it resumes the token along its
+            // own outgoing flow.
+            state::TimerKind::IntermediateCatch => {
+                queue.push_back(Step::Complete {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                });
+            }
+            // Boundary timer: interrupt the attached activity (a
+            // service task or sub-process) and run the boundary
+            // event's outgoing flow. `element_instance_key`/
+            // `element_id` are the activity here.
+            state::TimerKind::InterruptingBoundary {
+                boundary_element_id,
+            } => {
+                let scope = self.scope_of(instance_key, element_instance_key);
+                self.interrupt_activity_via_boundary(
+                    log,
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                );
+                queue.push_back(Step::Activate {
+                    instance_key,
+                    element_id: boundary_element_id,
+                    scope,
+                    via: None,
+                });
+            }
+            // Non-interrupting boundary timer: leave the activity (and
+            // its job) running and spawn a parallel token along the
+            // boundary event's outgoing flow, in the activity's scope.
+            // A repeating (cycle) timer re-arms for the next interval.
+            state::TimerKind::NonInterruptingBoundary {
+                boundary_element_id,
+            } => {
+                queue.push_back(Step::Activate {
+                    instance_key,
+                    element_id: boundary_element_id.clone(),
+                    scope: self.scope_of(instance_key, element_instance_key),
+                    via: None,
+                });
+                // A repeating cycle re-arms for the next interval; a
+                // bounded `Rn/…` cycle stops after its n-th fire
+                // (Zeebe parity, #1596).
+                self.rearm_fired_cycle(
+                    log,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    state::TimerKind::NonInterruptingBoundary {
+                        boundary_element_id,
+                    },
+                    due_at,
+                    repetitions,
+                );
+            }
+            // Event sub-process timer: `element_instance_key` is the
+            // enclosing scope, `element_id` the ESP start event. A
+            // non-interrupting cycle re-arms for the next interval.
+            state::TimerKind::EventSubProcess {
+                esp_element_id,
+                interrupting,
+            } => {
+                if !interrupting {
+                    self.rearm_fired_cycle(
+                        log,
+                        instance_key,
+                        element_instance_key,
+                        element_id.clone(),
+                        state::TimerKind::EventSubProcess {
+                            esp_element_id: esp_element_id.clone(),
+                            interrupting,
+                        },
+                        due_at,
+                        repetitions,
+                    );
+                }
+                self.trigger_event_subprocess(
+                    log,
+                    queue,
+                    instance_key,
+                    element_instance_key,
+                    esp_element_id,
+                    interrupting,
+                );
+            }
+        }
+    }
+
+    /// Fires one due process-level start timer (#1712), creating a new
+    /// instance. A cycle re-arms for the next interval; a one-shot is retained
+    /// with no due time so it never fires again.
+    fn fire_start_timer(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        timer_key: Key,
+    ) {
+        let timer = match self.state.start_timers.get(&timer_key) {
+            Some(t) => t,
+            None => return,
+        };
+        let process_id = timer.process_id.clone();
+        let start_element_id = timer.start_element_id.clone();
+        let due_at = match timer.due_at {
+            Some(d) => d,
+            None => return,
+        };
+        // A bounded `Rn/…` start cycle stops re-arming after its
+        // n-th fire (#1596).
+        let next_due_at = if timer.repeating && rearm_repetitions(timer.repetitions).is_some() {
+            Some(due_at.saturating_add(timer.interval_millis))
+        } else {
+            None
+        };
+        self.emit(
+            log,
+            Event::ProcessStartTimerFired {
+                timer_key,
+                next_due_at,
+            },
+        );
+        self.start_or_dispatch_instance(
+            log,
+            queue,
+            process_id,
+            start_element_id,
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+            None,
+        )
+    }
+
     /// Drains the work queue, applying events and enqueuing follow-up steps until
     /// the instance is quiescent. This is the production run-to-completion (RTC)
     /// path: a thin wrapper over [`Engine::run_with`] with a driver that never
@@ -6755,6 +6825,40 @@ impl Engine {
             // completion (and any cascade up the parent chain) before quiescing.
             if !followups.is_empty() {
                 queue.extend(followups);
+                continue;
+            }
+            // Quiescent: fire the next due timer of a `TriggerTimers` batch, if
+            // any, and drain it to completion before the one after (#1712).
+            if !self.pending_timer_fires.is_empty() {
+                // An earlier fire may have ended an instance (a top-level
+                // terminate end, an interrupted call activity's child): tear its
+                // call-activity descendants down NOW, transitively, so a later
+                // timer of the batch never fires inside a dead child
+                // (r4642239002). Idempotent on resume (terminated children are
+                // no longer swept), so a pause here is safe.
+                let window = self.sweep_from;
+                let cascade_from = log.len();
+                self.cascade_cancel_children(log, window);
+                if log.len() > cascade_from {
+                    if let Drive::Pause = driver.after_step(&log[cascade_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                }
+            }
+            if let Some(fire) = self.pending_timer_fires.pop_front() {
+                let fired_from = log.len();
+                // Everything before this point is at a fixpoint: later sweeps
+                // need only consider instances this fire touches.
+                self.sweep_from = fired_from;
+                match fire {
+                    PendingTimerFire::Timer(key) => self.fire_due_timer(log, &mut queue, key),
+                    PendingTimerFire::Start(key) => self.fire_start_timer(log, &mut queue, key),
+                }
+                if log.len() > fired_from {
+                    if let Drive::Pause = driver.after_step(&log[fired_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                }
                 continue;
             }
             self.debug_assert_join_bookkeeping_coherent(log);
@@ -7016,6 +7120,17 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id: element_id.clone(),
+                variables: variables.clone(),
+                boundary_element_id: match &kind {
+                    state::MessageSubscriptionKind::InterruptingBoundary {
+                        boundary_element_id,
+                    }
+                    | state::MessageSubscriptionKind::NonInterruptingBoundary {
+                        boundary_element_id,
+                    } => Some(boundary_element_id.clone()),
+                    state::MessageSubscriptionKind::IntermediateCatch
+                    | state::MessageSubscriptionKind::EventSubProcess { .. } => None,
+                },
             },
         );
         // The message's variables (if any) are merged into the correlated
@@ -7177,7 +7292,10 @@ impl Engine {
         // active instance instead made this O(total active backlog) per command:
         // under a large undrained backlog that scan dominated the engine thread
         // (per-command cost grew linearly with the backlog).
-        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log[self.sweep_from..]
+            .iter()
+            .filter_map(|e| e.instance_key())
+            .collect();
         let mut drained: Vec<(Key, Key, ElementId)> = Vec::new();
         for instance_key in &touched {
             let Some(instance) = self.state.instances.get(instance_key) else {
@@ -7401,7 +7519,7 @@ impl Engine {
                     }
                     if !output_updates.is_empty() {
                         for event in
-                            self.propagated_updates(instance_key, scope, output_updates, false)
+                            self.propagated_updates(instance_key, scope, output_updates, false, &[])
                         {
                             self.emit(log, event);
                         }
@@ -7454,7 +7572,9 @@ impl Engine {
                 self.emit(log, event);
             }
             if !output_updates.is_empty() {
-                for event in self.propagated_updates(instance_key, scope, output_updates, false) {
+                for event in
+                    self.propagated_updates(instance_key, scope, output_updates, false, &[])
+                {
                     self.emit(log, event);
                 }
             }
@@ -8343,7 +8463,26 @@ impl Engine {
         // visible to its own activation-time expressions (listener job types,
         // input mappings) as well.
         let mut view_overlay = None;
-        if let Some(payload) = self.held_esp_start_payload(instance_key, &element_id, scope) {
+        // A boundary event's trigger payload (#1535) is likewise LOCAL to the
+        // boundary instance; with no output mappings Zeebe then propagates the
+        // whole payload to the flow scope (an output-mapped boundary
+        // propagates only its mapped targets, on completion). Each queued
+        // boundary activation pops ONE payload from the per-key FIFO (several
+        // same-scope hosts of one activity each queue their own), so a broadcast
+        // hands every host its own copy.
+        let boundary_payload = self
+            .boundary_payloads
+            .get_mut(&(instance_key, scope, element_id.clone()))
+            .and_then(VecDeque::pop_front);
+        let propagate_boundary_payload = boundary_payload.clone().filter(|_| {
+            !self
+                .process_of_instance(instance_key)
+                .and_then(|p| p.element(&element_id))
+                .is_some_and(|e| !e.io.outputs.is_empty())
+        });
+        if let Some(payload) = boundary_payload
+            .or_else(|| self.held_esp_start_payload(instance_key, &element_id, scope))
+        {
             if !(is_sub_process || is_adhoc_container || has_listeners) {
                 events.push(Event::VariableScopeCreated {
                     instance_key,
@@ -8357,6 +8496,9 @@ impl Engine {
                 variables: payload.clone(),
             });
             view_overlay = Some(payload);
+        }
+        if let Some(payload) = propagate_boundary_payload {
+            events.extend(self.propagated_updates(instance_key, scope, payload, false, &events));
         }
         let (body_events, body_followups) = match view_overlay {
             None => self.activate_body(
@@ -11161,7 +11303,13 @@ impl Engine {
         // scope — for a top-level loop that is the root, collapsing to the flat
         // `VariablesUpdated`, byte-identical to the pre-scoping engine.
         if let Some(map) = &collection_map {
-            events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
+            events.extend(self.propagated_updates(
+                instance_key,
+                scope,
+                map.clone(),
+                false,
+                &events,
+            ));
         }
         events.push(Event::ElementCompleting {
             instance_key,
@@ -11204,6 +11352,7 @@ impl Engine {
                         scope,
                         output_updates,
                         false,
+                        &events,
                     ));
                 }
                 events.push(job);
@@ -11234,7 +11383,13 @@ impl Engine {
         // mapped result is visible before its throw resumes (matching the
         // end-listener path, which propagated them when the body parked).
         if !output_updates.is_empty() {
-            events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
+            events.extend(self.propagated_updates(
+                instance_key,
+                scope,
+                output_updates,
+                false,
+                &events,
+            ));
         }
         if let Some(throw_eik) = self
             .pending_compensation_handler_by_instance(instance_key, body_key)
@@ -12855,6 +13010,7 @@ impl Engine {
                 container_key,
                 output_updates.clone(),
                 false,
+                &events,
             ));
         }
         // Completion condition (ADR 0023 seam 4): a declared `<completionCondition>`
@@ -13074,6 +13230,7 @@ impl Engine {
                 container_key,
                 output_updates.clone(),
                 false,
+                &events,
             ));
         }
         // Completion condition (ADR 0023 seam 4) is evaluated after EVERY tool
@@ -13588,7 +13745,13 @@ impl Engine {
         });
         if let Some(map) = &collection_map {
             if !is_nested_tool {
-                events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
+                events.extend(self.propagated_updates(
+                    instance_key,
+                    scope,
+                    map.clone(),
+                    false,
+                    &events,
+                ));
             }
         }
 
@@ -14120,7 +14283,13 @@ impl Engine {
         // `VariablesUpdated`, keeping their journals byte-identical.
         if let Some(update) = &script_update {
             let flow_scope = self.completion_scope(instance_key, element_instance_key);
-            events.extend(self.propagated_updates(instance_key, flow_scope, update.clone(), false));
+            events.extend(self.propagated_updates(
+                instance_key,
+                flow_scope,
+                update.clone(),
+                false,
+                &events,
+            ));
         }
         // Output mappings (zeebe:output): merge the projection evaluated above
         // (before the completion events) into the element's enclosing (flow) scope
@@ -14131,7 +14300,13 @@ impl Engine {
         // to a single flat `VariablesUpdated`, unchanged from the flat engine.
         if !output_updates.is_empty() {
             let flow_scope = self.scope_of(instance_key, element_instance_key);
-            events.extend(self.propagated_updates(instance_key, flow_scope, output_updates, false));
+            events.extend(self.propagated_updates(
+                instance_key,
+                flow_scope,
+                output_updates,
+                false,
+                &events,
+            ));
         }
         let scope = self.scope_of(instance_key, element_instance_key);
 
@@ -14363,7 +14538,13 @@ impl Engine {
                 match projected {
                     Ok(updates) => {
                         vars.extend(updates.clone());
-                        events.extend(self.propagated_updates(instance_key, scope, updates, false));
+                        events.extend(self.propagated_updates(
+                            instance_key,
+                            scope,
+                            updates,
+                            false,
+                            &events,
+                        ));
                     }
                     Err(failure) => {
                         return vec![self.io_mapping_incident(
@@ -14829,11 +15010,18 @@ impl Engine {
                     (caught_eik, caught_element_id)
                 };
                 let boundary_scope = self.scope_of(instance_key, torn_eik);
+                // TERMINATING before the inner scope's teardown, TERMINATED
+                // after it (#1535, Zeebe parity).
+                let [terminating, terminated] =
+                    boundary::termination_events(instance_key, torn_eik, torn_element_id.clone());
+                events.push(terminating);
                 for event in self.scope_teardown_events(instance_key, torn_eik) {
                     if matches!(
                         &event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
                             | Event::ElementCompleted { element_instance_key: eik, .. }
+                            | Event::ElementTerminating { element_instance_key: eik, .. }
+                            | Event::ElementTerminated { element_instance_key: eik, .. }
                             if *eik == throw_eik
                     ) {
                         continue;
@@ -14853,16 +15041,7 @@ impl Engine {
                     events.push(event);
                 }
                 self.torn_down_scopes.insert(torn_eik);
-                events.push(Event::ElementCompleting {
-                    instance_key,
-                    element_instance_key: torn_eik,
-                    element_id: torn_element_id.clone(),
-                });
-                events.push(Event::ElementCompleted {
-                    instance_key,
-                    element_instance_key: torn_eik,
-                    element_id: torn_element_id,
-                });
+                events.push(terminated);
                 for event in self.cancel_boundary_timers_on(torn_eik) {
                     events.push(event);
                 }
@@ -14989,11 +15168,21 @@ impl Engine {
                 // already in `events` (and it already rests in COMPLETING, so a
                 // duplicate `ElementCompleting` is dropped — one per element
                 // instance, as in Zeebe).
+                // TERMINATING before the inner scope's teardown, TERMINATED
+                // after it (#1535, Zeebe parity).
+                let [terminating, terminated] = boundary::termination_events(
+                    instance_key,
+                    caught_eik,
+                    caught_element_id.clone(),
+                );
+                events.push(terminating);
                 for event in self.scope_teardown_events(instance_key, caught_eik) {
                     if matches!(
                         &event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
                         | Event::ElementCompleted { element_instance_key: eik, .. }
+                        | Event::ElementTerminating { element_instance_key: eik, .. }
+                        | Event::ElementTerminated { element_instance_key: eik, .. }
                             if *eik == throw_eik
                     ) {
                         continue;
@@ -15008,16 +15197,7 @@ impl Engine {
                     events.push(event);
                 }
                 self.torn_down_scopes.insert(caught_eik);
-                events.push(Event::ElementCompleting {
-                    instance_key,
-                    element_instance_key: caught_eik,
-                    element_id: caught_element_id.clone(),
-                });
-                events.push(Event::ElementCompleted {
-                    instance_key,
-                    element_instance_key: caught_eik,
-                    element_id: caught_element_id,
-                });
+                events.push(terminated);
                 // Interrupting the activity also disarms any sibling boundary
                 // timers and message/signal/conditional subscriptions on it.
                 for event in self.cancel_boundary_timers_on(caught_eik) {
@@ -15503,6 +15683,7 @@ impl Engine {
                     flow_scope,
                     output_updates,
                     false,
+                    &events,
                 ));
             }
             // The chain always (re)starts at listener 0 (#1406); the outputs were
@@ -15611,6 +15792,8 @@ impl Engine {
                         event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
                         | Event::ElementCompleted { element_instance_key: eik, .. }
+                        | Event::ElementTerminating { element_instance_key: eik, .. }
+                        | Event::ElementTerminated { element_instance_key: eik, .. }
                             if *eik == element_instance_key
                     )
                 }),
@@ -16082,18 +16265,20 @@ impl Engine {
             crate::model::TaskListenerEventType::Completing
         ) && !pending.variables.is_empty()
         {
+            // Insert variable merges just before the completion event so the
+            // completing token sees them; they are compared against the writes
+            // planned ahead of that point.
+            let insert_at = events
+                .iter()
+                .position(|e| matches!(e, Event::UserTaskCompleted { .. }))
+                .unwrap_or(events.len());
             let var_events = self.completion_variable_events(
                 instance_key,
                 element_instance_key,
                 &element_id,
                 pending.variables,
+                &events[..insert_at],
             );
-            // Insert variable merges just before the completion event so the
-            // completing token sees them.
-            let insert_at = events
-                .iter()
-                .position(|e| matches!(e, Event::UserTaskCompleted { .. }))
-                .unwrap_or(events.len());
             for (offset, ev) in var_events.into_iter().enumerate() {
                 events.insert(insert_at + offset, ev);
             }
@@ -17014,7 +17199,10 @@ impl Engine {
     /// completion — currently the [`Step::CompleteCallActivity`] that releases a
     /// parent's parked call-activity token when its spawned child finishes.
     fn complete_finished_instances(&mut self, log: &mut Vec<Event>) -> Vec<Step> {
-        let touched: BTreeSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        let touched: BTreeSet<Key> = log[self.sweep_from..]
+            .iter()
+            .filter_map(|e| e.instance_key())
+            .collect();
         let mut finished: Vec<Key> = touched
             .into_iter()
             .filter(|k| {
@@ -17318,6 +17506,7 @@ impl Engine {
                 container_key,
                 child_variables,
                 false,
+                &events,
             ));
         }
         // Hand off to the shared ad-hoc tool completion leaf path, passing the
@@ -17350,8 +17539,10 @@ impl Engine {
     ///   is a **top-level terminate end event** (#1085), which completes the
     ///   instance while its sibling call-activity children are still live and
     ///   must be terminated here.
-    fn cascade_cancel_children(&mut self, log: &mut Vec<Event>) {
-        let mut ended: BTreeSet<Key> = log
+    ///
+    /// Only `log[from..]` seeds the sweep (`0` for the whole command).
+    fn cascade_cancel_children(&mut self, log: &mut Vec<Event>, from: usize) {
+        let mut ended: BTreeSet<Key> = log[from..]
             .iter()
             .filter_map(|e| match e {
                 Event::ProcessInstanceTerminated { instance_key }
@@ -17359,6 +17550,12 @@ impl Engine {
                 _ => None,
             })
             .collect();
+        // Only an instance whose definition contains a call activity can own a
+        // child, so prune the rest before the resident-instance scan: a batch
+        // of N independent `start → timer → end` fires then costs O(1) per
+        // fire instead of an O(resident) scan each (r4642363545). An instance
+        // no longer resident (unknown definition) is kept — fail safe.
+        ended.retain(|k| self.may_own_call_activity_child(*k));
         if ended.is_empty() {
             return;
         }
@@ -17394,7 +17591,9 @@ impl Engine {
             children.sort_unstable();
             for child in children {
                 self.discard_and_terminate_instance(log, child);
-                ended.insert(child);
+                if self.may_own_call_activity_child(child) {
+                    ended.insert(child);
+                }
             }
         }
     }
@@ -17738,6 +17937,21 @@ impl Engine {
         if let Some((instance_key, job_key, lease, commit)) = resolution {
             self.settle_job_history(log, instance_key, job_key, &lease, commit);
         }
+    }
+
+    /// Whether `instance_key` can own a call-activity child: `false` only when
+    /// its definition is known, contains no call activity in `elements`, and
+    /// has no ad-hoc catalog. Ad-hoc tools (call activities and their
+    /// follow-ups included) are pruned from `elements` into `d.adhoc`, so any
+    /// ad-hoc container is conservatively a possible owner (r4642693352) —
+    /// fail closed.
+    fn may_own_call_activity_child(&self, instance_key: Key) -> bool {
+        self.process_of_instance(instance_key).is_none_or(|d| {
+            !d.adhoc.is_empty()
+                || d.elements
+                    .values()
+                    .any(|e| matches!(e.kind, ElementKind::CallActivity { .. }))
+        })
     }
 
     fn process_of_instance(&self, instance_key: Key) -> Option<&crate::model::ProcessDefinition> {

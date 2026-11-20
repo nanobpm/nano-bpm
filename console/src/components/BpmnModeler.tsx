@@ -840,25 +840,30 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           return (groups: unknown[]): unknown[] => {
             const binding = domainTypeBindingRef.current;
             if (!binding?.enabled) return groups;
-            if (!envelopeContext(element)) return groups;
+            const ctx = envelopeContext(element);
+            if (!ctx) return groups;
+            const entries: unknown[] = [
+              {
+                id: "urban-envelope-in",
+                component: DataEnvelopeEntry,
+                isEdited: isSelectEntryEdited,
+                field: "inputType",
+              },
+            ];
+            // An input-only carrier (a none start event) produces the process's
+            // initial variables, so it has no output envelope.
+            if (!ctx.inputOnly)
+              entries.push({
+                id: "urban-envelope-out",
+                component: DataEnvelopeEntry,
+                isEdited: isSelectEntryEdited,
+                field: "outputType",
+              });
             groups.push({
               id: "urban-data-envelope",
               label: "Data envelope",
               component: Group,
-              entries: [
-                {
-                  id: "urban-envelope-in",
-                  component: DataEnvelopeEntry,
-                  isEdited: isSelectEntryEdited,
-                  field: "inputType",
-                },
-                {
-                  id: "urban-envelope-out",
-                  component: DataEnvelopeEntry,
-                  isEdited: isSelectEntryEdited,
-                  field: "outputType",
-                },
-              ],
+              entries,
             });
             return groups;
           };

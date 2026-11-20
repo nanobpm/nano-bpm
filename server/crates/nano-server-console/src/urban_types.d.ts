@@ -32860,6 +32860,18 @@ interface MessageIo {
  * apart only because its scan output is Rust and its emitter input is TS). */
 type MessageBindingDecl = MessageIo;
 
+/** One start-IO entry scanned from a model: the `bpmn:process` id plus the input
+ * envelope its **none start event** (a `bpmn:startEvent` with no event definition)
+ * declares for the process's initial variables. Input only — a start event produces
+ * the initial variables, so there is no `outputType`. Mirrors the Rust `StartIo`. */
+interface StartIo {
+    process: string;
+    inputType?: string;
+}
+/** The binding shape the emitter reads. Identical to a scanned `StartIo`, so it is an
+ * alias — one canonical shape, no second declaration to drift. */
+type StartBindingDecl = StartIo;
+
 /** One model-level metadata entry (`nano:meta`), tagged with its defining process for
  * the `model:<processId>` provenance (ADR 0040 §5). `process` is carried for the fuse;
  * the emitted `meta.ts` folds on key/value only. */
@@ -32900,6 +32912,11 @@ interface DataRequest {
     /** `domaintypes`: the model-derived model-level metadata (`nano:meta`). Folded into `meta.ts` and
      * the structured `domain.json`. Absent → no metadata. */
     derivedMeta?: MetaDecl[];
+    /** `domaintypes`: the model-derived start-envelope map (`process → {in}`), scanned from the
+     * models' none start events (`bpmn:startEvent` with no event definition). Authoritative for the
+     * typed start-payload registry (`start-io.d.ts`); no manifest projection. Absent → no start
+     * registry is derived. */
+    derivedStarts?: StartBindingDecl[];
 }
 /** One datasource the manifest declares, resolved against the environment (env templates in
  * `driver`/`url` are already expanded by `loadManifest`). Mirrors the console's `ResolvedSource`

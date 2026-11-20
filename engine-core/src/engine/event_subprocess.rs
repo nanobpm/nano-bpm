@@ -648,7 +648,28 @@ impl Engine {
             }
         }
         let flow_scope = self.event_payload_scope(instance_key, element_instance_key, kind);
-        for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false) {
+        // A boundary event's payload is created LOCAL to the boundary instance
+        // when it activates later in this drain (#1535); see
+        // `boundary_payloads`.
+        if let state::MessageSubscriptionKind::InterruptingBoundary {
+            boundary_element_id,
+        }
+        | state::MessageSubscriptionKind::NonInterruptingBoundary {
+            boundary_element_id,
+        } = kind
+        {
+            // One broadcast can queue several same-scope boundary activations
+            // (concurrent hosts of one activity); push each trigger's payload so
+            // every activation pops its own (FIFO) rather than sharing one entry.
+            self.boundary_payloads
+                .entry((instance_key, flow_scope, boundary_element_id.clone()))
+                .or_default()
+                .push_back(variables.clone());
+            return;
+        }
+        for event in
+            self.propagated_updates(instance_key, flow_scope, variables.clone(), false, &[])
+        {
             self.emit(log, event);
         }
     }

@@ -25,6 +25,7 @@ export const MAX_JOBS_TO_ACTIVATE = 100;
 /** The canonical field set an observation can carry. */
 export const OBSERVATION_FIELDS = Object.freeze([
   "completed",
+  "cancelled",
   "variables",
   "completedElements",
   "sequenceFlows",
@@ -65,6 +66,7 @@ export function bump(multiset, key, by = 1) {
 export function emptyObservation() {
   return {
     completed: false,
+    cancelled: false,
     variables: {},
     completedElements: {},
     sequenceFlows: {},

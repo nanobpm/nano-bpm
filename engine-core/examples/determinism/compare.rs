@@ -624,6 +624,65 @@ pub struct Expected {
     /// Events only the head build emits (dropped from its side).
     #[serde(default)]
     pub only_in_head: Vec<EventPattern>,
+    /// A field whose value head newly populates where the previous release's
+    /// journal decodes to the serde default — a behavioural refinement on a
+    /// golden-added field, declared per (variant, field) with the value the
+    /// field is normalized to on BOTH sides. Normalization rewrites the
+    /// field to `value` wherever the variant carries it, so a head that
+    /// records the real value and a prev that decodes to the default
+    /// reconcile. This is the ONLY sanctioned relaxation of value equality:
+    /// it is scoped to one variant's one field, so any other value
+    /// difference still fails closed. (#1632: `ElementActivating.scope` for
+    /// an ad-hoc tool's `#innerInstance` and its child is the real container
+    /// scope on head, `0` on the previous release.)
+    #[serde(default)]
+    pub field_overrides: Vec<FieldOverride>,
+    /// A lifecycle-kind substitution: head emits `head` where the previous
+    /// release emitted `prev` for the SAME element instance (#1535 terminates
+    /// an interrupted activity — `ElementTerminating`/`ElementTerminated` —
+    /// where the previous release completed it —
+    /// `ElementCompleting`/`ElementCompleted`). During scenario-level
+    /// reconciliation the matched events' variant tag is rewritten through
+    /// this mapping on BOTH sides, so a substituted event balances against
+    /// its counterpart (same entity, same scope, same keys). An event whose
+    /// variant is not mapped keeps its tag, so an undeclared substitution
+    /// still fails the balance. Only `only_in_prev`/`only_in_head`-matched
+    /// events are rewritten — the per-entry strict comparison is unaffected.
+    #[serde(default)]
+    pub variant_substitutions: Vec<VariantSubstitution>,
+}
+
+/// Renames one event variant to another for scenario-level reconciliation
+/// (see [`Expected::variant_substitutions`]).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VariantSubstitution {
+    /// The variant the previous release emitted.
+    pub prev: String,
+    /// The variant head emits in its place.
+    pub head: String,
+}
+
+/// Normalizes one variant's field to a fixed value on both sides (see
+/// [`Expected::field_overrides`]).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldOverride {
+    pub variant: String,
+    pub field: String,
+    /// The value the field is rewritten to on both sides before comparison.
+    pub value: Json,
+}
+
+impl FieldOverride {
+    /// Rewrites `event`'s `field` to `value` when `event` is `variant`.
+    fn apply(&self, event: &mut Json) {
+        if let Some(body) = event.get_mut(&self.variant).and_then(Json::as_object_mut) {
+            if body.contains_key(&self.field) {
+                body.insert(self.field.clone(), self.value.clone());
+            }
+        }
+    }
 }
 
 /// Matches an event by variant and, optionally, its `element_id`.
@@ -847,6 +906,9 @@ fn diverges_only_as(
                 if drop.iter().any(|p| p.matches(&v)) {
                     continue;
                 }
+                for o in &expected.field_overrides {
+                    o.apply(&mut v);
+                }
                 if let Some(ids) = ids {
                     canonicalize_keys(&mut v, ids);
                 }
@@ -884,12 +946,32 @@ fn diverges_only_as(
 
 /// The comparison identity of a matched event: its JSON with every key
 /// reference canonicalized through `ids` when `remint` is declared (so a
-/// re-minted join activation matches across sides), raw otherwise. Lifecycle
-/// kind, entity and scope are all preserved.
-fn pattern_projection(event: &Json, ids: &KeyIds, remint: bool) -> Json {
+/// re-minted join activation matches across sides), the variant tag rewritten
+/// through `subs` (so a ratified lifecycle-kind substitution balances), raw
+/// otherwise. Lifecycle kind (absent a ratified substitution), entity and
+/// scope are all preserved.
+fn pattern_projection(
+    event: &Json,
+    ids: &KeyIds,
+    remint: bool,
+    subs: &[VariantSubstitution],
+) -> Json {
     let mut v = event.clone();
     if remint {
         canonicalize_keys(&mut v, ids);
+    }
+    // Rewrite the externally-tagged variant through the ratified
+    // substitutions, mapping BOTH `prev` and `head` to `head` so a
+    // substituted event's identity is its head form.
+    if let Json::Object(map) = &mut v {
+        if map.len() == 1 {
+            let tag = map.keys().next().cloned().unwrap();
+            if let Some(s) = subs.iter().find(|s| s.prev == tag || s.head == tag) {
+                if let Some(body) = map.remove(&tag) {
+                    map.insert(s.head.clone(), body);
+                }
+            }
+        }
     }
     v
 }
@@ -901,6 +983,7 @@ fn collect_matched(
     patterns: &[EventPattern],
     ids: &KeyIds,
     remint: bool,
+    subs: &[VariantSubstitution],
     out: &mut BTreeMap<String, usize>,
 ) {
     for e in events {
@@ -908,7 +991,7 @@ fn collect_matched(
             continue;
         };
         if patterns.iter().any(|p| p.matches(&v)) {
-            *out.entry(pattern_projection(&v, ids, remint).to_string())
+            *out.entry(pattern_projection(&v, ids, remint, subs).to_string())
                 .or_insert(0) += 1;
         }
     }
@@ -1229,10 +1312,26 @@ pub fn cross_release_checked(
             shape_tokens(events, &mut prev_emitted);
         }
     }
+    // Variants a ratified divergence declares in `only_in_head` keep their
+    // fields: erasure is for an additive field on a variant BOTH builds emit,
+    // but a variant only head emits would erase to an empty object — and the
+    // `EventPattern` match (by variant + optional `element_id`) in the
+    // divergence reconciliation needs the fields intact.
+    let only_in_head_variants: BTreeSet<&str> = ctx
+        .allowlist
+        .divergences
+        .iter()
+        .flat_map(|d| d.expected.only_in_head.iter().map(|p| p.variant.as_str()))
+        .collect();
     let erasable: Vocab = ctx
         .added
         .iter()
-        .filter(|t| t.contains('.') && !prev_emitted.contains(*t))
+        .filter(|t| {
+            t.contains('.')
+                && !prev_emitted.contains(*t)
+                && t.split_once('.')
+                    .is_none_or(|(variant, _)| !only_in_head_variants.contains(variant))
+        })
         .cloned()
         .collect();
     let observational: BTreeSet<&str> = ctx
@@ -1271,9 +1370,27 @@ pub fn cross_release_checked(
                 }
                 _ => true,
             });
+            // A variant a ratified divergence of THIS scenario declares in
+            // `only_in_head` is declared, not undeclared: the scenario-level
+            // reconciliation below is exactly where a behavioural change that
+            // REPLACES one event with another (#1535 terminates an
+            // interrupted activity where the previous release completed it)
+            // is ratified. Filtering such a variant observationally would
+            // drop it from EVERY scenario's stream, including ones whose
+            // comparison must carry it.
+            let declared_here: BTreeSet<&str> = ctx
+                .allowlist
+                .divergences
+                .iter()
+                .filter(|d| d.scenario == scenario)
+                .flat_map(|d| d.expected.only_in_head.iter().map(|p| p.variant.as_str()))
+                .collect();
             for e in events.iter() {
                 if let Some(tag) = event_tag(e) {
-                    if ctx.added.contains(tag) && !prev_emitted.contains(tag) {
+                    if ctx.added.contains(tag)
+                        && !prev_emitted.contains(tag)
+                        && !declared_here.contains(tag)
+                    {
                         return Err(format!(
                             "entry {i} (scenario {scenario}): UNDECLARED new event variant `{tag}` \
                              (golden-recorded as added since {}, never emitted by it) — ratify it \
@@ -1389,7 +1506,12 @@ pub fn cross_release_checked(
             }
             for e in hs {
                 if let Ok(v) = serde_json::from_str::<Json>(e) {
-                    head_all.push(pattern_projection(&v, &head_ids, remint));
+                    head_all.push(pattern_projection(
+                        &v,
+                        &head_ids,
+                        remint,
+                        &expected.variant_substitutions,
+                    ));
                 }
             }
             collect_matched(
@@ -1397,6 +1519,7 @@ pub fn cross_release_checked(
                 &expected.only_in_head,
                 &head_ids,
                 remint,
+                &expected.variant_substitutions,
                 &mut head_matched,
             );
             collect_matched(
@@ -1404,6 +1527,7 @@ pub fn cross_release_checked(
                 &expected.only_in_prev,
                 &prev_ids,
                 remint,
+                &expected.variant_substitutions,
                 &mut prev_matched,
             );
         }

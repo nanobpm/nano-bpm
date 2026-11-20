@@ -608,8 +608,9 @@ impl Engine {
         scope: Key,
         variables: BTreeMap<String, Value>,
         local: bool,
+        pending: &[crate::Event],
     ) -> Vec<crate::Event> {
-        let mut writes = self.propagate_variables(instance_key, scope, variables, local);
+        let mut writes = self.propagate_variables(instance_key, scope, variables, local, pending);
         writes.sort_by_key(|(dest, _)| *dest);
         writes
             .into_iter()
@@ -638,12 +639,21 @@ impl Engine {
     /// ancestor scope (from the target upward) that already defines it; a name
     /// defined nowhere is created in the root scope. Root-only instances collapse
     /// to a single root write, matching the flat engine.
+    ///
+    /// The walk mirrors Zeebe `VariableBehavior.mergeDocument` exactly: at each
+    /// scope, from the target up to (and including) the root, a name the scope
+    /// holds with a DIFFERENT value is written there (UPDATED) and stops; a name
+    /// the scope holds with an EQUAL value is NOT consumed — no record, and the
+    /// name keeps propagating to the parent (#1711: a null completion value
+    /// equal to an MI child's null-valued local still updates the process-scope
+    /// `result` above it). A name no ancestor holds is CREATED at the root.
     pub(crate) fn propagate_variables(
         &self,
         instance_key: Key,
         target_scope: Key,
         variables: BTreeMap<String, Value>,
         local: bool,
+        pending: &[crate::Event],
     ) -> Vec<(Key, BTreeMap<String, Value>)> {
         if variables.is_empty() {
             return Vec::new();
@@ -653,51 +663,215 @@ impl Engine {
         };
         let root = instance.key;
         let target = self.variable_scope_of(instance, target_scope);
+        // Zeebe `VariableBehavior` skips a write whose value equals the one the
+        // destination scope already holds: no VARIABLE record at all (#1537).
+        // Applied here — the single resolver every propagated merge goes
+        // through — so no caller can emit an unchanged write.
+        // The comparison is against the value the scope will hold once the
+        // earlier `pending` writes of the same batch apply, not only committed
+        // state: a restoring write must not be dropped because the committed
+        // value matches while a planned write changes it.
+        let suppress = self.may_suppress_equal_writes(instance_key);
+        let unchanged = |dest: Key, name: &str, value: &Value| {
+            suppress && Self::value_in_scope(instance, pending, dest, name) == Ok(Some(value))
+        };
         // Fast path: local write, or a root-only instance — one scope, no walk.
-        if local {
-            return vec![(target, variables)];
-        }
-        if instance.scope_variables.is_empty() && instance.scope_parents.is_empty() {
-            return vec![(root, variables)];
+        if local || (instance.scope_variables.is_empty() && instance.scope_parents.is_empty()) {
+            let dest = if local { target } else { root };
+            let changed: BTreeMap<String, Value> = variables
+                .into_iter()
+                .filter(|(name, value)| !unchanged(dest, name, value))
+                .collect();
+            return vec![(dest, changed)];
         }
         let mut by_scope: BTreeMap<Key, BTreeMap<String, Value>> = BTreeMap::new();
         for (name, value) in variables {
-            let dest = self.scope_defining(instance, target, &name).unwrap_or(root);
-            by_scope.entry(dest).or_default().insert(name, value);
+            // Walk from the target scope upward. A scope holding the name with
+            // an equal value does NOT capture the write (Zeebe consumes an
+            // entry only when its value differs, #1711); the name keeps
+            // propagating until a scope holds it with a different value, or
+            // the root creates it. With suppression disabled (a job of the
+            // instance still holds secret provenance, #1640) an equal value
+            // DOES capture — the write is kept so revocation stays a
+            // replayable effect.
+            let mut dest = None;
+            let mut cur = target;
+            loop {
+                let holds = if cur == root {
+                    instance.variables.contains_key(&name)
+                } else {
+                    instance
+                        .scope_variables
+                        .get(&cur)
+                        .is_some_and(|m| m.contains_key(&name))
+                };
+                if holds && !unchanged(cur, &name, &value) {
+                    dest = Some(cur);
+                    break;
+                }
+                if cur == root {
+                    break;
+                }
+                match instance.scope_parents.get(&cur) {
+                    Some(&parent) if parent != cur => cur = parent,
+                    _ => break,
+                }
+            }
+            // No scope captured the write. Either the name is new everywhere —
+            // the root creates it — or the walk ended at the ROOT holding an
+            // equal value (suppression on), in which case nothing is emitted
+            // (Zeebe `setLocalVariable` writes no record for an equal value,
+            // #1537). With suppression disabled an equal value captures at its
+            // scope, so a `None` there can only mean "new everywhere".
+            let dest = match dest {
+                Some(scope) => Some(scope),
+                None if suppress && unchanged(root, &name, &value) => None,
+                None => Some(root),
+            };
+            if let Some(dest) = dest {
+                by_scope.entry(dest).or_default().insert(name, value);
+            }
         }
         by_scope.into_iter().collect()
     }
 
-    /// The nearest scope (from `scope` upward to the root) that already defines
-    /// `name`, or `None` if no scope in the chain holds it.
-    fn scope_defining(
+    /// `variables` minus every name whose value `scope` already holds
+    /// (directly, not via an ancestor). Zeebe's `VariableBehavior` writes no
+    /// record for an equal-value write (#1537); every engine merge path that
+    /// writes into a known scope filters through here.
+    pub(crate) fn drop_unchanged(
         &self,
-        instance: &crate::state::ProcessInstance,
+        instance_key: Key,
+        scope: Key,
+        variables: BTreeMap<String, Value>,
+        pending: &[crate::Event],
+    ) -> BTreeMap<String, Value> {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return variables;
+        };
+        // The exact scope written — NOT `variable_scope_of`, which would map a
+        // not-yet-registered element scope up to its parent and compare against
+        // a value the write does not replace.
+        let scope = if scope == 0 { instance.key } else { scope };
+        if !self.may_suppress_equal_writes(instance_key) {
+            return variables;
+        }
+        variables
+            .into_iter()
+            .filter(|(name, value)| {
+                Self::value_in_scope(instance, pending, scope, name) != Ok(Some(value))
+            })
+            .collect()
+    }
+
+    /// Whether an equal-value write of `instance_key` may be suppressed. A
+    /// variable write is also a security effect: applying it revokes the
+    /// mapping-time secret provenance (#1640) of every job that can see it,
+    /// even when the value text is equal (an untrusted writer may restate a
+    /// trusted reference). While any job of the instance still holds
+    /// provenance, every write is kept so that revocation stays a replayable
+    /// effect — fail closed.
+    fn may_suppress_equal_writes(&self, instance_key: Key) -> bool {
+        self.state
+            .jobs_by_instance
+            .get(&instance_key)
+            .is_none_or(|keys| {
+                keys.iter().all(|k| {
+                    self.state
+                        .jobs
+                        .get(k)
+                        .is_none_or(|job| job.secret_provenance.is_empty())
+                })
+            })
+    }
+
+    /// The value `name` holds directly in `scope` (the root scope reads the
+    /// instance's root variables), without walking ancestors — as seen after
+    /// the not-yet-applied `pending` events of the current batch (the latest
+    /// pending write to `scope` wins over committed state).
+    ///
+    /// Fails closed: `Err(())` when a pending event mutates `scope`'s variables
+    /// through any path other than a plain variable write (an ad-hoc tool's
+    /// `outputCollection` append, a scope being opened/re-seeded/torn down,
+    /// the instance's payload being cleared). The value after the batch is
+    /// then not known here, so the caller must keep the write rather than
+    /// risk dropping a restoring one.
+    fn value_in_scope<'a>(
+        instance: &'a crate::state::ProcessInstance,
+        pending: &'a [crate::Event],
         scope: Key,
         name: &str,
-    ) -> Option<Key> {
+    ) -> Result<Option<&'a Value>, ()> {
+        use crate::Event as E;
         let root = instance.key;
-        let mut cur = scope;
-        loop {
-            let holds = if cur == root {
-                instance.variables.contains_key(name)
-            } else {
-                instance
-                    .scope_variables
-                    .get(&cur)
-                    .is_some_and(|m| m.contains_key(name))
+        let norm = |k: Key| if k == 0 { root } else { k };
+        for event in pending.iter().rev() {
+            let written = match event {
+                E::VariablesUpdated {
+                    instance_key,
+                    variables,
+                } if *instance_key == root && scope == root => variables.get(name),
+                E::ScopedVariablesUpdated {
+                    instance_key,
+                    scope_key,
+                    variables,
+                } if *instance_key == root && norm(*scope_key) == scope => variables.get(name),
+                E::AdHocToolCompleted {
+                    instance_key,
+                    container_key: k,
+                    ..
+                }
+                | E::AdHocToolActivated {
+                    instance_key,
+                    child_key: k,
+                    ..
+                }
+                | E::MultiInstanceChildActivated {
+                    instance_key,
+                    child_key: k,
+                    ..
+                }
+                | E::VariableScopeCreated {
+                    instance_key,
+                    scope_key: k,
+                    ..
+                }
+                | E::VariableScopeDestroyed {
+                    instance_key,
+                    scope_key: k,
+                }
+                | E::ElementCompleted {
+                    instance_key,
+                    element_instance_key: k,
+                    ..
+                }
+                | E::ElementTerminated {
+                    instance_key,
+                    element_instance_key: k,
+                    ..
+                } if *instance_key == root && norm(*k) == scope => return Err(()),
+                E::ParallelJoinReset { instance_key, .. }
+                | E::ProcessInstanceCompleted { instance_key }
+                | E::ProcessInstanceTerminated { instance_key }
+                | E::ProcessInstanceMigrated { instance_key, .. }
+                    if *instance_key == root =>
+                {
+                    return Err(());
+                }
+                _ => None,
             };
-            if holds {
-                return Some(cur);
-            }
-            if cur == root {
-                return None;
-            }
-            match instance.scope_parents.get(&cur) {
-                Some(&parent) if parent != cur => cur = parent,
-                _ => return None,
+            if written.is_some() {
+                return Ok(written);
             }
         }
+        Ok(if scope == instance.key {
+            instance.variables.get(name)
+        } else {
+            instance
+                .scope_variables
+                .get(&scope)
+                .and_then(|m| m.get(name))
+        })
     }
 
     /// Resolves a job's type at job-creation time (Zeebe

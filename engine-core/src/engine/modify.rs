@@ -775,7 +775,9 @@ impl Engine {
             required.push(scope);
 
             for variables in planned.global {
-                for event in self.propagated_updates(instance_key, instance_key, variables, true) {
+                for event in
+                    self.propagated_updates(instance_key, instance_key, variables, true, &[])
+                {
                     self.emit(log, event);
                 }
             }
@@ -791,7 +793,8 @@ impl Engine {
                     .map(|(_, k)| *k)
                     .or_else(|| self.existing_scope_instance(instance_key, scope, &scope_id));
                 if let Some(target) = target {
-                    for event in self.propagated_updates(instance_key, target, variables, true) {
+                    for event in self.propagated_updates(instance_key, target, variables, true, &[])
+                    {
                         self.emit(log, event);
                     }
                 }
@@ -1081,7 +1084,7 @@ impl Engine {
             },
         );
         for variables in locals {
-            for event in self.propagated_updates(instance_key, eik, variables, true) {
+            for event in self.propagated_updates(instance_key, eik, variables, true, &[]) {
                 self.emit(log, event);
             }
         }
@@ -1152,7 +1155,7 @@ impl Engine {
             );
         }
         for variables in locals {
-            for event in self.propagated_updates(instance_key, eik, variables, true) {
+            for event in self.propagated_updates(instance_key, eik, variables, true, &[]) {
                 self.emit(log, event);
             }
         }
