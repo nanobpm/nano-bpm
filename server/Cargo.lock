@@ -1398,6 +1398,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-data-envelope"
+version = "0.1.0"
+dependencies = [
+ "nanobpmn-engine-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nano-falcon-protocol"
 version = "0.0.16"
 dependencies = [
@@ -1433,6 +1442,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "mime_guess",
+ "nano-data-envelope",
  "nano-server-net",
  "nano-server-runtime",
  "nano-server-storage",
@@ -1593,6 +1603,7 @@ dependencies = [
  "http",
  "http-body",
  "libc",
+ "nano-data-envelope",
  "nano-falcon-protocol",
  "nano-provisioning-advisor",
  "nano-server-console",

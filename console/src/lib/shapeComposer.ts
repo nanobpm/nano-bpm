@@ -73,6 +73,11 @@ export function changeOpKind(op: ShapeOp, kind: OpKind): ShapeOp {
   const name = "name" in op ? op.name : "";
   if (OP_HAS_REF[kind] && ref && "ref" in next) next.ref = ref;
   if (OP_HAS_NAME[kind] && name && "name" in next) next.name = name;
+  // extend <-> reference both carry a field description (MCP docs, #1738).
+  const description = "description" in op ? op.description : undefined;
+  if (description && (next.op === "extend" || next.op === "reference")) {
+    next.description = description;
+  }
   return next;
 }
 
