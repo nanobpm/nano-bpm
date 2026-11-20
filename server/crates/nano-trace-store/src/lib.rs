@@ -221,6 +221,11 @@ struct InstanceTrace {
     /// event is immediately followed by its variable merge, if any). Bounded to
     /// the immediate aftermath: cleared once the token advances past the element.
     pending_stimulus: Option<usize>,
+    /// Message correlations awaiting their payload write, in correlation order.
+    /// One message can match several boundary hosts; every `MessageCorrelated`
+    /// precedes the queued payload writes, so each payload pops the oldest
+    /// (#1535 review). Cleared with `pending_stimulus` once the token advances.
+    pending_messages: VecDeque<usize>,
     /// Set once the per-instance stimulus cap is hit.
     stimuli_truncated: bool,
 }
@@ -597,6 +602,7 @@ impl Inner {
                         None
                     },
                     pending_stimulus: None,
+                    pending_messages: VecDeque::new(),
                     stimuli_truncated: false,
                 };
                 self.insert(*instance_key, trace);
@@ -619,12 +625,8 @@ impl Inner {
                     // pending completion it is a standalone set-variables delta.
                     if self.capture_stimuli {
                         let snap = snapshot_vars(variables, self.vars_max_bytes);
-                        match t.pending_stimulus.take() {
-                            Some(idx) => {
-                                if let Some(s) = t.stimuli.as_mut().and_then(|v| v.get_mut(idx)) {
-                                    s.variables = Some(snap);
-                                }
-                            }
+                        match t.take_pending() {
+                            Some(idx) => t.attach_payload(idx, snap),
                             None => {
                                 t.record_stimulus(
                                     "variablesSet",
@@ -654,22 +656,12 @@ impl Inner {
                     && let Some(t) = self.instances.get_mut(instance_key)
                 {
                     t.last_at = now;
-                    let snap = snapshot_vars(variables, self.vars_max_bytes);
-                    match t.pending_stimulus.take() {
-                        Some(idx) => {
-                            if let Some(s) = t.stimuli.as_mut().and_then(|v| v.get_mut(idx)) {
-                                s.variables = Some(snap);
-                            }
-                        }
-                        None => {
-                            t.record_stimulus(
-                                "variablesSet",
-                                None,
-                                Some(snap),
-                                now,
-                                self.stimuli_max,
-                            );
-                        }
+                    // Only an awaited external payload is captured here: a scoped
+                    // write with nothing pending is an engine-internal local
+                    // (input mapping / initialization), never a replay input.
+                    if let Some(idx) = t.take_pending() {
+                        let snap = snapshot_vars(variables, self.vars_max_bytes);
+                        t.attach_payload(idx, snap);
                     }
                 }
             }
@@ -734,6 +726,7 @@ impl Inner {
                     // completion still awaiting an output had none — stop a later
                     // unrelated delta from being mis-attributed to it.
                     t.pending_stimulus = None;
+                    t.pending_messages.clear();
                 }
             }
             Event::JobCreated {
@@ -915,7 +908,7 @@ impl Inner {
                         now,
                         self.stimuli_max,
                     );
-                    t.pending_stimulus = idx;
+                    t.pending_messages.extend(idx);
                 }
             }
             Event::RemoteMessageCorrelation {
@@ -1153,6 +1146,19 @@ impl InstanceTrace {
     /// Appends a recorded-input stimulus, honouring the per-instance cap. Returns
     /// the new index (so a completion's deferred output can be attached later) or
     /// `None` when capture is off or the cap was reached.
+    /// The oldest awaited message correlation, else the pending completion.
+    fn take_pending(&mut self) -> Option<usize> {
+        self.pending_messages
+            .pop_front()
+            .or_else(|| self.pending_stimulus.take())
+    }
+
+    fn attach_payload(&mut self, idx: usize, snap: VarSnapshot) {
+        if let Some(s) = self.stimuli.as_mut().and_then(|v| v.get_mut(idx)) {
+            s.variables = Some(snap);
+        }
+    }
+
     fn record_stimulus(
         &mut self,
         kind: &'static str,
@@ -1828,6 +1834,60 @@ mod tests {
                 .unwrap()["mappedReason"],
             serde_json::json!("r-1"),
             "the scope-local payload is attributed to the message correlation"
+        );
+    }
+
+    fn payload(st: &StimulusDto, k: &str) -> serde_json::Value {
+        st.variables.as_ref().unwrap().values.as_ref().unwrap()[k].clone()
+    }
+
+    fn correlated(instance: u64, eik: u64, element_id: &str) -> Event {
+        Event::MessageCorrelated {
+            subscription_key: eik + 100,
+            message_key: 6,
+            instance_key: instance,
+            element_instance_key: eik,
+            element_id: element_id.into(),
+        }
+    }
+
+    /// #1535 (review): one message matching TWO boundary hosts emits both
+    /// correlations before the queued payload writes. Each payload must attach
+    /// to its own correlation, in order — not all to the last one.
+    #[test]
+    fn message_matching_two_hosts_attributes_each_payload_in_order() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 1024);
+        store.ingest(&[&created(1, &[("a", Value::Int(1))])], 1000);
+        store.ingest(
+            &[
+                &correlated(1, 3, "b1"),
+                &correlated(1, 4, "b2"),
+                &scoped_vars_updated(1, 3, &[("p", Value::Int(1))]),
+                &scoped_vars_updated(1, 4, &[("p", Value::Int(2))]),
+            ],
+            1030,
+        );
+        let stimuli = store.get(1).unwrap().stimuli.expect("stimuli log");
+        assert_eq!(stimuli.len(), 2, "no payload becomes a standalone set");
+        assert_eq!(stimuli[0].reference.as_deref(), Some("b1"));
+        assert_eq!(payload(&stimuli[0], "p"), serde_json::json!(1));
+        assert_eq!(stimuli[1].reference.as_deref(), Some("b2"));
+        assert_eq!(payload(&stimuli[1], "p"), serde_json::json!(2));
+    }
+
+    /// #1535 (review): an engine-internal scope-local write (e.g. an input
+    /// mapping shadowing a root variable) is NOT an external input and must
+    /// never be recorded as a standalone `variablesSet` stimulus.
+    #[test]
+    fn internal_scoped_write_is_not_recorded_as_stimulus() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 1024);
+        store.ingest(&[&created(1, &[("x", Value::Int(1))])], 1000);
+        store.ingest(&[&scoped_vars_updated(1, 7, &[("x", Value::Int(2))])], 1010);
+        let stimuli = store.get(1).unwrap().stimuli.expect("stimuli log");
+        assert!(
+            stimuli.is_empty(),
+            "internal local write recorded: {}",
+            stimuli.len()
         );
     }
 
