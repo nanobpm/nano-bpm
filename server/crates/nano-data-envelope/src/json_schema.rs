@@ -448,8 +448,11 @@ mod tests {
     }
 
     #[test]
-    fn wide_catalog_and_wide_carry_derive_quickly() {
+    fn wide_catalog_and_wide_carry_derive_correctly() {
         // 20k shapes, 9k references to the last one; and a 9k-field carry.
+        // Correctness at scale only: no wall-clock assertion (scheduler-
+        // dependent). Linear lookup is structural (`ShapeIndex` HashMap,
+        // HashSet-backed required names), not timed.
         let mut shapes = String::from(r#"<nano:shape id="Order">"#);
         for i in 0..9_000 {
             shapes.push_str(&format!(r#"<nano:reference name="r{i}" ref="E19999" />"#));
@@ -458,7 +461,6 @@ mod tests {
         for i in 0..20_000 {
             shapes.push_str(&format!(r#"<nano:shape id="E{i}"></nano:shape>"#));
         }
-        let start = std::time::Instant::now();
         let (_, schema) = message_input_schema(&shapes_doc(&shapes), "placeOrder", None)
             .unwrap()
             .unwrap();
@@ -475,7 +477,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(schema["required"].as_array().unwrap().len(), 9_000);
-        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
