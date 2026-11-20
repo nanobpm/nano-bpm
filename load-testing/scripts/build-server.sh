@@ -85,7 +85,8 @@ say "Building server: profile=$PROFILE --features console"
 # spaced checkout, #1716) — never a guessed server/target that may be stale.
 # shellcheck source=scripts/lib-cargo-target-dir.sh
 . "$SCRIPT_DIR/../../scripts/lib-cargo-target-dir.sh"
-SERVER_TARGET="$(cargo_target_dir server)" || die "cannot resolve server target dir"
+# Same cwd ($REPO_ROOT), "$CARGO" and manifest as the build above.
+SERVER_TARGET="$(cargo_target_dir server/Cargo.toml "$CARGO")" || die "cannot resolve server target dir"
 
 BIN_SUBDIR="$PROFILE"
 [ "$PROFILE" = "dev" ] && BIN_SUBDIR="debug"

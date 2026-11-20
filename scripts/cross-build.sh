@@ -152,7 +152,8 @@ fi
 # worktree or clean build hits it. llvm-ar handles host (Mach-O/ELF) objects
 # too, so build scripts compiled for the host are unaffected.
 # Cargo's EFFECTIVE target dir (may be redirected for a spaced checkout, #1716).
-server_target="$(cargo_target_dir "$PROJECT_ROOT/server")" || die "cannot resolve server target dir"
+# Same cwd + cargo as the build below (`cd server && cargo ...`).
+server_target="$(cd "$PROJECT_ROOT/server" && cargo_target_dir Cargo.toml cargo)" || die "cannot resolve server target dir"
 if [ "$WINDOWS" = 0 ]; then
   zig_tools="$PROJECT_ROOT/server/target/zig-tools"
   mkdir -p "$zig_tools"
