@@ -634,10 +634,148 @@
       "note": "No Nano test raises this Zeebe incident type yet."
     },
     {
-      "match": "lifecycle:*",
+      "match": "lifecycle:AD_HOC_SUB_PROCESS:*",
       "status": "gap",
       "issue": 1249,
-      "note": "Per-element lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+      "note": "AD_HOC_SUB_PROCESS lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:AD_HOC_SUB_PROCESS_INNER_INSTANCE:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "AD_HOC_SUB_PROCESS_INNER_INSTANCE lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:BOUNDARY_EVENT:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "BOUNDARY_EVENT lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:BUSINESS_RULE_TASK:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "BUSINESS_RULE_TASK lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:CALL_ACTIVITY:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "CALL_ACTIVITY lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:END_EVENT:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "END_EVENT lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:EVENT_BASED_GATEWAY:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "EVENT_BASED_GATEWAY lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:EVENT_SUB_PROCESS:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "EVENT_SUB_PROCESS lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:EXCLUSIVE_GATEWAY:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "EXCLUSIVE_GATEWAY lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:INCLUSIVE_GATEWAY:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "INCLUSIVE_GATEWAY lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:INTERMEDIATE_CATCH_EVENT:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "INTERMEDIATE_CATCH_EVENT lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:INTERMEDIATE_THROW_EVENT:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "INTERMEDIATE_THROW_EVENT lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:MANUAL_TASK:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "MANUAL_TASK lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:MULTI_INSTANCE_BODY:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "MULTI_INSTANCE_BODY lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:PARALLEL_GATEWAY:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "PARALLEL_GATEWAY lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:PROCESS:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "PROCESS lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:RECEIVE_TASK:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "RECEIVE_TASK lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:SCRIPT_TASK:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "SCRIPT_TASK lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:SEND_TASK:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "SEND_TASK lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:SERVICE_TASK:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "SERVICE_TASK lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:START_EVENT:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "START_EVENT lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:SUB_PROCESS:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "SUB_PROCESS lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:TASK:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "TASK lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "lifecycle:USER_TASK:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "USER_TASK lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
     },
     {
       "match": "guard:*",

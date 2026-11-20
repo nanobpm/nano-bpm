@@ -64,6 +64,24 @@ const RULE_KEYS = new Set(['match', 'status', 'evidence', 'issue', 'note']);
  */
 export const PER_SITE_FAMILIES = new Set(['failure', 'rejection']);
 
+/**
+ * Cell families keyed by a BPMN element type (`lifecycle:<BpmnElementType>:…`).
+ * A family-wide wildcard (`lifecycle:*`) once hid every element's lifecycle —
+ * including all multi-instance cells — behind one line (#1526), so nothing
+ * flagged that a whole element family was unverified. These cells may only be
+ * claimed by a rule whose element segment is literal (wildcards are allowed
+ * only after it, e.g. `lifecycle:SERVICE_TASK:*`), so each element's gap is an
+ * explicit, separately-burnable line.
+ */
+export const PER_ELEMENT_FAMILIES = new Set(['lifecycle']);
+
+/** True when `match` names its second (element) segment literally. */
+export function namesElement(match) {
+  if (typeof match !== 'string') return false;
+  const parts = match.split(':');
+  return parts.length >= 3 && !parts[0].includes('*') && parts[1].length > 0 && !parts[1].includes('*');
+}
+
 /** True when `match` contains no `*` wildcard. */
 export function isExactMatch(match) {
   return typeof match === 'string' && !match.includes('*');
@@ -343,6 +361,13 @@ export function evaluate(surface, coverage, fs, gaps, pin, nanoTested, normalise
       errors.push(
         `per-site cell ${id} is claimed by wildcard rule ${JSON.stringify(rules[k].match)}: ` +
           `${family}: cells need an exact (wildcard-free) match`,
+      );
+      continue;
+    }
+    if (PER_ELEMENT_FAMILIES.has(family) && !namesElement(rules[k].match)) {
+      errors.push(
+        `per-element cell ${id} is claimed by rule ${JSON.stringify(rules[k].match)}: ` +
+          `${family}: cells need a rule naming the element type (e.g. ${family}:<ELEMENT>:*)`,
       );
       continue;
     }

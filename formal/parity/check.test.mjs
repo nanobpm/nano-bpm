@@ -216,6 +216,25 @@ test('the gap ratchet: a new cell cannot hide under a wildcard gap, and the base
   ]);
 });
 
+test('a lifecycle: cell must be claimed by a rule that names its element type (#1526)', () => {
+  const ids = ['lifecycle:MULTI_INSTANCE_BODY:activate', 'lifecycle:SERVICE_TASK:complete'];
+  // A family wildcard hides every element's lifecycle behind one line…
+  const errors = check(ids, [{ match: 'lifecycle:*', ...gap }], []);
+  assert.match(errors[0], /per-element cell lifecycle:MULTI_INSTANCE_BODY:activate is claimed by rule "lifecycle:\*"/);
+  assert.match(errors[1], /per-element cell lifecycle:SERVICE_TASK:complete is claimed by rule "lifecycle:\*"/);
+  // …and so does a wildcard inside the element segment.
+  const partial = check(['lifecycle:MULTI_INSTANCE_BODY:activate'], [{ match: 'lifecycle:MULTI*', ...gap }], []);
+  assert.match(partial[0], /claimed by rule "lifecycle:MULTI\*"/);
+  // A per-element rule (wildcard only over the command) claims cleanly.
+  assert.deepEqual(
+    check(ids, [
+      { match: 'lifecycle:MULTI_INSTANCE_BODY:*', ...gap },
+      { match: 'lifecycle:SERVICE_TASK:*', ...gap },
+    ]),
+    [],
+  );
+});
+
 test('a wildcard rule can never claim a per-site failure:/rejection: cell', () => {
   const ids = ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR', 'rejection:JobProcessor.processRecord:NOT_FOUND'];
   // A family wildcard is rejected for both per-site families…
