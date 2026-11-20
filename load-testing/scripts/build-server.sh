@@ -81,11 +81,16 @@ say "Frontend OK: index.html + $JS_NAME ($(find "$DIST" -type f | wc -l | tr -d 
 say "Building server: profile=$PROFILE --features console"
 "$CARGO" build --manifest-path server/Cargo.toml --profile "$PROFILE" --features console
 
-# Locate the produced binary. `server` is a standalone crate, so its target dir is
-# server/target/<profile> (dev -> server/target/debug).
+# Locate the produced binary in Cargo's EFFECTIVE target dir (redirected for a
+# spaced checkout, #1716) — never a guessed server/target that may be stale.
+# shellcheck source=scripts/lib-cargo-target-dir.sh
+. "$SCRIPT_DIR/../../scripts/lib-cargo-target-dir.sh"
+# Same cwd ($REPO_ROOT), "$CARGO" and manifest as the build above.
+SERVER_TARGET="$(cargo_target_dir server/Cargo.toml "$CARGO")" || die "cannot resolve server target dir"
+
 BIN_SUBDIR="$PROFILE"
 [ "$PROFILE" = "dev" ] && BIN_SUBDIR="debug"
-BIN="server/target/$BIN_SUBDIR/nanobpm-gateway-rest-server"
+BIN="$SERVER_TARGET/$BIN_SUBDIR/nanobpm-gateway-rest-server"
 [ -x "$BIN" ] || die "expected binary not found at $BIN"
 
 # 5. HARD VERIFICATION: for an OPTIMIZED build (the kind we deploy) the console

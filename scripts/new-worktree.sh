@@ -54,6 +54,59 @@ else
     git -C "$main_checkout" worktree add -b "$branch" "$wt" "$base"
 fi
 
+# A spaced worktree path breaks tikv-jemalloc-sys's autoconf configure when
+# CARGO_TARGET_DIR resolves under it (#1716). Default the target dir for this
+# worktree to a space-free path via the worktree's .cargo/config.toml — Cargo
+# reads build.target-dir from config on EVERY invocation, so direct `cargo`
+# runs honor it (a direnv .envrc would not: nothing sources it without a
+# configured direnv hook) — unless the caller already exported a
+# CARGO_TARGET_DIR (which overrides config). A caller-set value that is
+# relative or contains a space is rejected with a clear message instead of an
+# autoconf error that looks like a toolchain bug.
+wt_target_dir=""
+if [[ "$wt" = *" "* ]]; then
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        # Cargo resolves a RELATIVE CARGO_TARGET_DIR under the workspace root,
+        # which is the spaced worktree here — so it must be absolute as well as
+        # space-free, or jemalloc's configure still word-splits it (#1716).
+        if [[ "$CARGO_TARGET_DIR" != /* ]]; then
+            echo "error: CARGO_TARGET_DIR ($CARGO_TARGET_DIR) is relative, so Cargo resolves it under the spaced worktree ($wt)" >&2
+            echo "       and tikv-jemalloc-sys still cannot build (#1716). Use an ABSOLUTE space-free CARGO_TARGET_DIR." >&2
+            exit 1
+        fi
+        if [[ "$CARGO_TARGET_DIR" = *" "* ]]; then
+            echo "error: CARGO_TARGET_DIR ($CARGO_TARGET_DIR) contains a space and the worktree path ($wt) does too;" >&2
+            echo "       tikv-jemalloc-sys cannot build with a spaced target dir (#1716). Use a space-free CARGO_TARGET_DIR." >&2
+            exit 1
+        fi
+    else
+        hash=$(printf '%s' "$wt" | cksum | cut -d' ' -f1)
+        wt_target_dir="$HOME/.local/share/nanobpm/target/$hash"
+        mkdir -p "$wt/.cargo"
+        # MERGE [build].target-dir into the worktree's .cargo/config.toml rather
+        # than overwrite it: the tracked config also carries the Linux mold
+        # link flags and the wasm32 wsqlite3 build-script override (epic #796),
+        # and clobbering the file would silently drop both. The tracked config
+        # has no [build] table today, so appending one cannot collide; if it
+        # ever gains one, fail loudly instead of writing a duplicate-table TOML
+        # error into the file.
+        if grep -qE '^\[build\]' "$wt/.cargo/config.toml"; then
+            echo "error: $wt/.cargo/config.toml already has a [build] table; merge target-dir into it by hand (#1716)" >&2
+            exit 1
+        fi
+        {
+            cat "$wt/.cargo/config.toml"
+            printf '\n# Pinned by scripts/new-worktree.sh: the worktree path contains a\n# space, which breaks tikv-jemalloc-sys (#1716). Build into a space-free dir.\n[build]\ntarget-dir = "%s"\n' "$wt_target_dir"
+        } > "$wt/.cargo/config.toml.new"
+        mv "$wt/.cargo/config.toml.new" "$wt/.cargo/config.toml"
+        # The merged file holds a machine-specific absolute path: mark it
+        # skip-worktree so it never shows as a tracked modification, is never
+        # staged by `git add -A`, and does not block `git worktree remove`.
+        git -C "$wt" update-index --skip-worktree .cargo/config.toml
+        echo "note: worktree path contains a space; pinned a space-free CARGO_TARGET_DIR via $wt/.cargo/config.toml (#1716)" >&2
+    fi
+fi
+
 # Copy-on-write clone of one directory; returns non-zero if the filesystem
 # can't clone (never falls back to a real copy).
 cow_clone() {
@@ -64,13 +117,26 @@ cow_clone() {
 }
 
 seed_target() {
-    local from="$seed/server/target/debug" to="$wt/server/target/debug"
+    # When the worktree's target dir is redirected to a space-free path
+    # (#1716), Cargo writes <target-dir>/debug directly (no workspace subdir),
+    # so seed the REDIRECTED dir and keep the two aligned.
+    local target_root="$wt/server/target"
+    if [ -n "$wt_target_dir" ]; then
+        target_root="$wt_target_dir"
+    fi
+    local from="$seed/server/target/debug" to="$target_root/debug"
     if [ ! -d "$from/deps" ]; then
         echo "seed: no $from/deps; building cold" >&2
         return 0
     fi
+    # The redirected dir outlives `git worktree remove`; recreating the same
+    # path must not clone into an existing cache (cp -R would nest dirs).
+    if [ -e "$to" ]; then
+        echo "seed: $to already exists; reusing it, not reseeding" >&2
+        return 0
+    fi
     mkdir -p "$to"
-    [ -f "$seed/server/target/CACHEDIR.TAG" ] && cp "$seed/server/target/CACHEDIR.TAG" "$wt/server/target/"
+    [ -f "$seed/server/target/CACHEDIR.TAG" ] && cp "$seed/server/target/CACHEDIR.TAG" "$target_root/"
     # Skip incremental/: it is keyed by absolute path, so another checkout's
     # session cache is never reused.
     local d
@@ -78,11 +144,11 @@ seed_target() {
         [ -d "$from/$d" ] || continue
         if ! cow_clone "$from/$d" "$to/$d"; then
             echo "seed: filesystem can't copy-on-write clone; building cold" >&2
-            rm -rf "$wt/server/target"
+            rm -rf "$target_root"
             return 0
         fi
     done
-    echo "seed: cloned server/target/debug from $seed" >&2
+    echo "seed: cloned server/target/debug from $seed into $target_root" >&2
 }
 
 seed_target &
