@@ -54,6 +54,26 @@ else
     git -C "$main_checkout" worktree add -b "$branch" "$wt" "$base"
 fi
 
+# A spaced worktree path breaks tikv-jemalloc-sys's autoconf configure when
+# CARGO_TARGET_DIR resolves under it (#1716). Default the target dir for this
+# worktree to a space-free path via a direnv-style .envrc the agent shell
+# sources, unless the caller already exported a CARGO_TARGET_DIR. A caller-set
+# value with a space is rejected with a clear message instead of an autoconf
+# error that looks like a toolchain bug.
+if [[ "$wt" = *" "* ]]; then
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        if [[ "$CARGO_TARGET_DIR" = *" "* ]]; then
+            echo "error: CARGO_TARGET_DIR ($CARGO_TARGET_DIR) contains a space and the worktree path ($wt) does too;" >&2
+            echo "       tikv-jemalloc-sys cannot build with a spaced target dir (#1716). Use a space-free CARGO_TARGET_DIR." >&2
+            exit 1
+        fi
+    else
+        hash=$(printf '%s' "$wt" | cksum | cut -d' ' -f1)
+        printf 'export CARGO_TARGET_DIR=%s\n' "$HOME/.local/share/nanobpm/target/$hash" > "$wt/.envrc"
+        echo "note: worktree path contains a space; wrote $wt/.envrc with a space-free CARGO_TARGET_DIR (#1716)" >&2
+    fi
+fi
+
 # Copy-on-write clone of one directory; returns non-zero if the filesystem
 # can't clone (never falls back to a real copy).
 cow_clone() {

@@ -53,7 +53,7 @@ bad_vars='PROJECT_ROOT|GENERATED_DIR|CONSOLE_GENERATED_DIR|STUB_IMPLS|RESPONSE_C
 # make directive (ifeq/$(if)/… at line start are make-expanded, not shell).
 in_recipe=$(grep -nP '^\t' "${MAKEFILE}" \
 	| grep -vP '^\d+:\t\S+\s*[:+?]?=' \
-	| grep -vP '^\d+:\t(\S+\s+)*\$\((if|else|endif|wildcard|shell|patsubst|lastword|abspath|dir|filter)\b' \
+	| grep -vP '^\d+:\t(\S+\s+)*\$\((if|else|endif|wildcard|shell|patsubst|lastword|abspath|dir|filter|call|foreach|subst|findstring)\b' \
 	| grep -vP '^\d+:\t\S+/\S+\.(yaml|yml|sh|py|mjs|json)\b' \
 	|| true)
 # A $(VAR) is unsafe only when some shell word character follows it before the
@@ -89,23 +89,36 @@ fi
 # --- 2. Functional probe: run fmt-check from a directory whose path has a ----
 # --- space. Opt-in: needs the pinned nightly rustfmt + codegen stubs.      ---
 if [ "${NANOBPMN_SPACED_PROBE:-0}" = 1 ]; then
+	command -v git >/dev/null 2>&1 || fail "probe needs git"
 	probe_parent="$(mktemp -d "${TMPDIR:-/tmp}/nanobpmn spaced probe.XXXXXX")"
 	trap 'rm -rf "${probe_parent}"' EXIT
 	probe="${probe_parent}/checkout with space"
 	mkdir -p "${probe}"
 	# A functional fmt-check needs the real crate sources (rustfmt parses the
-	# module trees). Copy the formatted crates + rustfmt.toml; stub the codegen
-	# inputs exactly as the CI fmt job does.
+	# module trees) and the Makefile. Copy the formatted crates + rustfmt.toml;
+	# the codegen inputs are stubbed below exactly as the CI fmt job does.
 	cp "${ROOT}/rustfmt.toml" "${probe}/"
-	for d in engine-core server processos engine-wasm read-model; do
-		mkdir -p "${probe}/${d}"
-		cp "${ROOT}/${d}/Cargo.toml" "${probe}/${d}/"
-		# src trees: needed so rustfmt resolves the module tree.
-		[ -d "${ROOT}/${d}/src" ] && cp -R "${ROOT}/${d}/src" "${probe}/${d}/"
-	done
 	cp "${ROOT}/Makefile" "${probe}/"
 	mkdir -p "${probe}/scripts"
 	cp "${ROOT}/scripts/fmt-stub-codegen.sh" "${probe}/scripts/"
+	for d in engine-core server processos engine-wasm read-model; do
+		mkdir -p "${probe}/${d}"
+		cp "${ROOT}/${d}/Cargo.toml" "${probe}/${d}/"
+		[ -f "${ROOT}/${d}/Cargo.lock" ] && cp "${ROOT}/${d}/Cargo.lock" "${probe}/${d}/" || true
+		[ -d "${ROOT}/${d}/src" ] && cp -R "${ROOT}/${d}/src" "${probe}/${d}/"
+		[ -d "${ROOT}/${d}/crates" ] && cp -R "${ROOT}/${d}/crates" "${probe}/${d}/"
+		[ -d "${ROOT}/${d}/tests" ] && cp -R "${ROOT}/${d}/tests" "${probe}/${d}/"
+		[ -d "${ROOT}/${d}/examples" ] && cp -R "${ROOT}/${d}/examples" "${probe}/${d}/"
+		[ -d "${ROOT}/${d}/benches" ] && cp -R "${ROOT}/${d}/benches" "${probe}/${d}/"
+	done
+	# fmt-stub-codegen.sh locates the repo root via git, so the probe dir must
+	# be a git work tree.
+	git -C "${probe}" init -q
+	if [ "${NANOBPMN_SPACED_DEBUG:-0}" = 1 ]; then
+		echo "--- probe Makefile fmt-check recipe ---" >&2
+		make -C "${probe}" -n fmt-check 2>/dev/null | grep -A3 'for d in' >&2 || true
+		echo "--- end ---" >&2
+	fi
 	(
 		cd "${probe}"
 		./scripts/fmt-stub-codegen.sh
