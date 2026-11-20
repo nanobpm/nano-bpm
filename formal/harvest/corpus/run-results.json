@@ -1,9 +1,44 @@
 [
   {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-0-process",
+    "processId": "process",
+    "status": "runnable",
+    "detail": "completed-cleanly",
+    "observed": {
+      "completed": [
+        "task"
+      ]
+    }
+  },
+  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-1-process",
     "processId": "process",
     "status": "out-of-scope",
     "detail": "driver-capability: catch-event, event-definition"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-3-process",
+    "processId": "process",
+    "status": "runnable",
+    "detail": "completed-cleanly",
+    "observed": {
+      "completed": [
+        "task1",
+        "task2",
+        "task3"
+      ]
+    }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-1-processId",
+    "processId": "processId",
+    "status": "runnable",
+    "detail": "completed-cleanly",
+    "observed": {
+      "completed": [
+        "task"
+      ]
+    }
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityBusinessIdTest-1-child-process",
@@ -21,6 +56,17 @@
     "detail": "completed-cleanly",
     "observed": {
       "completed": []
+    }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityInterruptionTest-0-wf-child",
+    "processId": "wf-child",
+    "status": "runnable",
+    "detail": "completed-cleanly",
+    "observed": {
+      "completed": [
+        "child-task"
+      ]
     }
   },
   {
@@ -75,6 +121,36 @@
     "observed": {
       "completed": []
     }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-20-wf-root-three-levels",
+    "processId": "wf-root-three-levels",
+    "status": "out-of-scope",
+    "detail": "driver-capability: call-activity"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-21-wf-root-three-levels",
+    "processId": "wf-root-three-levels",
+    "status": "out-of-scope",
+    "detail": "driver-capability: call-activity"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-22-wf-root-three-levels",
+    "processId": "wf-root-three-levels",
+    "status": "out-of-scope",
+    "detail": "driver-capability: call-activity"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-24-wf-root-three-levels",
+    "processId": "wf-root-three-levels",
+    "status": "out-of-scope",
+    "detail": "driver-capability: call-activity"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-26-processWithCallActivityId",
+    "processId": "processWithCallActivityId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: call-activity"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-3-wf-child",
@@ -133,6 +209,37 @@
     }
   },
   {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-0-processId",
+    "processId": "processId",
+    "status": "runnable",
+    "detail": "completed-cleanly",
+    "observed": {
+      "completed": [
+        "serviceTaskId"
+      ]
+    }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-1-processId",
+    "processId": "processId",
+    "status": "runnable",
+    "detail": "completed-cleanly",
+    "observed": {
+      "completed": []
+    }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-2-processId",
+    "processId": "processId",
+    "status": "runnable",
+    "detail": "completed-cleanly",
+    "observed": {
+      "completed": [
+        "userTaskId"
+      ]
+    }
+  },
+  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-2-process",
     "processId": "process",
     "status": "runnable",
@@ -141,6 +248,21 @@
       "completed": [
         "task"
       ]
+    }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-TerminateEndEventTest-6-process",
+    "processId": "process",
+    "status": "out-of-scope",
+    "detail": "driver-capability: call-activity"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-behavior-BpmnProcessDeletionBehaviorTest-0-processId",
+    "processId": "processId",
+    "status": "runnable",
+    "detail": "completed-cleanly",
+    "observed": {
+      "completed": []
     }
   },
   {
@@ -243,6 +365,60 @@
     "processId": "PROCESS_WITH_CONDITIONAL_FALSE",
     "status": "out-of-scope",
     "detail": "driver-capability: event-based-gateway, catch-event, event-definition"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-0-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-1-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-2-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-3-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-4-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-5-processId",
+    "processId": "processId",
+    "status": "unverified",
+    "detail": "instance-did-not-complete",
+    "observed": {
+      "completed": [],
+      "openIncidents": 1,
+      "activeLeft": 1,
+      "allDone": false
+    }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-6-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-7-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-10-process",
@@ -362,6 +538,24 @@
     "detail": "driver-capability: variables"
   },
   {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-5-processId",
+    "processId": "processId",
+    "status": "unverified",
+    "detail": "instance-did-not-complete",
+    "observed": {
+      "completed": [],
+      "openIncidents": 1,
+      "activeLeft": 1,
+      "allDone": false
+    }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-6-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-0-process",
     "processId": "process",
     "status": "runnable",
@@ -458,5 +652,64 @@
       "activeLeft": 1,
       "allDone": false
     }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceBatchedSubProcessesTest-0-process",
+    "processId": "process",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables, sub-process"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceCallActivityTest-1-wf-child",
+    "processId": "wf-child",
+    "status": "runnable",
+    "detail": "completed-cleanly",
+    "observed": {
+      "completed": [
+        "task"
+      ]
+    }
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceConcurrencyTest-0-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceInputCollectionTest-0-process",
+    "processId": "process",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceReceiveTaskTest-0-process",
+    "processId": "process",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-10-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: sub-process"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-4-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: variables"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-8-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: sub-process"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-9-processId",
+    "processId": "processId",
+    "status": "out-of-scope",
+    "detail": "driver-capability: sub-process"
   }
 ]

@@ -1,0 +1,13 @@
+{
+  "generated": "formal/harvest/normalise.mjs",
+  "process": "wf-root-three-levels",
+  "jobs": [],
+  "jobCompletionOrder": [],
+  "userTasks": [],
+  "userTaskCompletionOrder": [],
+  "messageCorrelation": [],
+  "timerTicks": [],
+  "needs": [
+    "call-activity"
+  ]
+}

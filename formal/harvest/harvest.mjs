@@ -92,6 +92,11 @@ const REPLAYABLE = new Set([
   'moveToNode', 'moveToActivity', 'moveToLastGateway',
   'moveToLastExclusiveGateway', 'moveToLastParallelGateway',
   'moveToLastInclusiveGateway', 'connectTo', 'sequenceFlowId',
+  // sub-process body entry (the `subProcess(id, s -> s.multiInstance(…)
+  //   .embeddedSubProcess().startEvent()…)` shape — the MI config lambda
+  // returns the sub-process builder, then `.embeddedSubProcess()` opens the
+  // body the rest of the chain builds into)
+  'embeddedSubProcess', 'subProcessDone',
   // flow / element configuration
   'conditionExpression', 'condition', 'defaultFlow', 'name',
   // event definitions (no-arg / string)
@@ -99,6 +104,8 @@ const REPLAYABLE = new Set([
   'errorEventDefinition', 'escalationEventDefinition', 'compensateEventDefinition',
   'terminateEventDefinition', 'cancelEventDefinition', 'linkEventDefinition',
   'messageEventDefinition', 'signalEventDefinition', 'conditionalEventDefinition',
+  // message config (inside a `message(m -> …)` lambda)
+  'zeebeCorrelationKey', 'zeebeCorrelationKeyExpression', 'nameExpression',
   // zeebe extensions (string)
   'zeebeJobType', 'zeebeJobRetries', 'zeebeTaskHeader',
   'zeebeCalledElement', 'zeebeProcessId', 'zeebeAssignee', 'zeebeCandidateGroups',
@@ -110,6 +117,19 @@ const REPLAYABLE = new Set([
   'zeebeCalledDecision', 'zeebeDecisionId', 'zeebeVersionTag',
   'zeebeBindingType', 'zeebePriority', 'zeebeExecutionListener',
   'zeebeTaskListener', 'zeebeUserTaskFormId', 'zeebeIsStartableViaMessage',
+  // multi-instance loop characteristics (#1524). `multiInstance` takes the
+  // nested config lambda (resolved one level deep — see resolveLambda); the
+  // rest are its flat config calls, replayed onto the MI builder the
+  // `multiInstance` invoke returns (sequential/parallel/cardinality/
+  // completionCondition are the standard BPMN attributes, the zeebe* ones the
+  // `zeebe:loopCharacteristics` extension).
+  'multiInstance', 'sequential', 'parallel', 'cardinality', 'completionCondition',
+  'zeebeInputCollection', 'zeebeInputCollectionExpression', 'zeebeInputElement',
+  'zeebeOutputCollection', 'zeebeOutputElement', 'zeebeOutputElementExpression',
+  // activity-level io-mapping input/output with a FEEL expression source (the
+  // MI loopCounter export + container-variable propagation tests use them); the
+  // two-arg (expression, target) form.
+  'zeebeInputExpression', 'zeebeOutputExpression',
   // generic element-scoped
   'id', 'documentation', 'camundaAsyncBefore', 'camundaAsyncAfter',
 ]);
@@ -190,9 +210,20 @@ export function javaUnescape(body) {
 
 /**
  * Resolve one argument expression to a replayable value (string / number /
- * boolean), or return UNRESOLVED. Only string literals, numeric literals,
- * booleans, concatenations of string literals, and identifiers bound to a
- * `static final` constant in the same file are replayable.
+ * boolean), or return UNRESOLVED. String literals, numeric literals, booleans,
+ * concatenations of string literals, and identifiers bound to a `static final`
+ * constant (or a `final` local) in the same file are replayable.
+ *
+ * A bare lowercase identifier that is NOT a declared constant (e.g. `jobType` —
+ * in the Zeebe tests an instance field assigned in `@Before`, or a helper
+ * parameter) resolves to a PLACEHOLDER equal to its own name: its exact runtime
+ * value cannot influence the harvested MODEL's structure (it is only ever a job
+ * type / element id / variable name the scenario driver treats as opaque), so
+ * reproducing it faithfully is not required — but dropping the whole chain over
+ * it (the pre-#1524 behaviour) needlessly unparseables the model. An UPPERCASE
+ * identifier (the constant naming convention) that is NOT declared stays
+ * UNRESOLVED: it names a constant the harvester failed to resolve, which is a
+ * real fidelity gap, not a runtime value.
  */
 const UNRESOLVED = Symbol('unresolved');
 export function resolveArg(expr, constants = {}) {
@@ -224,23 +255,91 @@ export function resolveArg(expr, constants = {}) {
   if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(t) && Object.hasOwn(constants, t)) {
     return constants[t];
   }
+  // A non-constant lowercase identifier (a runtime value like `jobType`):
+  // placeholder, per the doc comment. camelCase / lowercase only — an UPPERCASE
+  // identifier is the constant convention and stays UNRESOLVED when undeclared.
+  if (/^[a-z_$][A-Za-z0-9_$]*$/.test(t)) {
+    return t;
+  }
   return UNRESOLVED;
 }
 
 /**
  * Collect the `static final String`/`int` constants a test file declares, so a
  * chain that names `PROCESS_ID` (the overwhelmingly common pattern) resolves to
- * its literal. Only single-literal initialisers are collected.
+ * its literal. Also collects `final String x = "..."` LOCALS (the Zeebe tests
+ * bind the process id / job type / variable names to `final` locals before the
+ * builder chain — e.g. MultiInstanceActivityTest's nested-MI test). Only
+ * single-literal initialisers are collected.
  */
 export function collectConstants(src) {
   const constants = {};
-  const re = /\bstatic\s+final\s+(?:String|int|long|boolean)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*("(?:[^"\\]|\\.)*"|-?\d+|true|false)\s*;/g;
+  // static final fields (class level) and plain final locals (method level).
+  // The local form also covers `final var x = "..."`.
+  const re = /\b(?:static\s+)?final\s+(?:String|int|long|boolean|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*("(?:[^"\\]|\\.)*"|-?\d+|true|false)\s*;/g;
   let m;
   while ((m = re.exec(src))) {
     const v = resolveArg(m[2]);
     if (v !== UNRESOLVED) constants[m[1]] = v;
   }
   return constants;
+}
+
+/**
+ * Collect the named `Consumer<…>` fields a test file declares as a single
+ * config lambda — the Zeebe MI tests bind the shared multi-instance config to a
+ * `private static final Consumer<MultiInstanceLoopCharacteristicsBuilder>
+ * INPUT_VARIABLE_BUILDER = m -> m.zeebeInputCollectionExpression(..)…;` and then
+ * reference it by name (or `.andThen(...)`-compose it) inside the builder chain.
+ * Returns `{ name: <lambda expr text> }` so resolveArg can substitute the lambda
+ * where the chain references the field. Only a single-lambda initialiser is
+ * collected; anything else (a method reference, an `.andThen` at declaration) is
+ * not statically replayable and is skipped.
+ */
+export function collectConsumers(src) {
+  const consumers = {};
+  // `Consumer<...> NAME = <lambda>;` — the lambda runs to the terminating `;`
+  // at depth 0 (the field initializer). Capture the raw lambda expression.
+  const re = /\bConsumer\s*<[^>]*>\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*/g;
+  let m;
+  while ((m = re.exec(src))) {
+    const start = m.index + m[0].length;
+    // The lambda must begin here (identifier or `(` then `->`); scan to the
+    // top-level `;` that ends the initialiser.
+    let i = start;
+    let depth = 0;
+    let end = -1;
+    for (; i < src.length; i++) {
+      const c = src[i];
+      if (c === '"' || c === "'") {
+        const q = c;
+        i++;
+        while (i < src.length && src[i] !== q) i += src[i] === '\\' ? 2 : 1;
+      } else if (c === '(' || c === '{' || c === '[') depth++;
+      else if (c === ')' || c === '}' || c === ']') depth--;
+      else if (c === ';' && depth === 0) { end = i; break; }
+    }
+    if (end < 0) continue;
+    let expr = src.slice(start, end).trim();
+    // The Zeebe MI tests route the field through an identity helper —
+    //   INPUT_VARIABLE_BUILDER = multiInstance(m -> m.zeebeInput…)
+    // where `private static Consumer<…> multiInstance(Consumer<…> b) { return b; }`.
+    // Unwrap that single-method wrapper to reach the lambda it returns.
+    const wrap = /^[A-Za-z_$][A-Za-z0-9_$]*\s*\(/.exec(expr);
+    if (wrap && !expr.includes('->', 0)) { /* no lambda at all */ }
+    if (wrap) {
+      const open = expr.indexOf('(');
+      const ca = callArgs(expr, open);
+      if (ca && ca.end === expr.length) {
+        const inner = ca.args.trim();
+        if (inner.includes('->')) expr = inner;
+      }
+    }
+    // Only a bare lambda (contains `->`, no top-level `.andThen` composition).
+    if (!expr.includes('->')) continue;
+    consumers[m[1]] = expr;
+  }
+  return consumers;
 }
 
 // Sentinel marking that a lambda argument already pushed its calls (see parseChain).
@@ -251,9 +350,19 @@ const LAMBDA_CONSUMED = Symbol('lambda-consumed');
  * builder calls on the parameter: `b -> b.zeebeJobType("x").name("y")` (or the
  * block form `b -> { b.zeebeJobType("x"); }` with one statement). Returns the
  * ordered list of `{m, args}` config calls, or UNRESOLVED when the body nests a
- * further lambda, references a non-literal, or calls an unsupported method.
+ * lambda on an unsupported method, references a non-literal, or calls an
+ * unsupported method.
+ *
+ * ONE level of nesting is resolved (#1524): a call whose argument is itself a
+ * flat config lambda — `multiInstance(b -> b.zeebeInputCollectionExpression(..)…)`
+ * or `message(m -> m.name(..)…)` — is flattened as the outer call (with its
+ * resolvable leading args) followed by the nested lambda's own calls, replayed
+ * onto the builder the outer call returns (the Zeebe fluent API returns the
+ * nested builder from `multiInstance`/`message`, so the flat IR replays
+ * faithfully). A lambda nested DEEPER than one level, or a nested lambda on a
+ * method that does not return a configurable builder, stays UNRESOLVED.
  */
-export function resolveLambda(expr, constants = {}) {
+export function resolveLambda(expr, constants = {}, depth = 0, consumers = {}) {
   const arrow = expr.indexOf('->');
   if (arrow < 0) return UNRESOLVED;
   const param = expr.slice(0, arrow).trim().replace(/^\(|\)$/g, '').trim();
@@ -263,10 +372,16 @@ export function resolveLambda(expr, constants = {}) {
   // Block body: strip braces; only a single `return`-less statement chain.
   if (body.startsWith('{') && body.endsWith('}')) body = body.slice(1, -1).trim();
   // The body must be `param.method(...).method(...)` — i.e. every call is on the
-  // parameter or on the value the previous call returned. We require the body to
-  // START with `<param>.` and contain no further `->` (no nested lambda).
-  if (!body.startsWith(param + '.')) return UNRESOLVED;
-  if (body.includes('->')) return UNRESOLVED;
+  // parameter or on the value the previous call returned. Collapse whitespace
+  // runs so a chain the source wraps (`sp ->\n  sp.zeebeInput…` or
+  // `sp.zeebeInput(…)\n  .zeebeOutput(…)`) parses like its single-line form; a
+  // newline is insignificant to the Java grammar, so it must be insignificant
+  // to the harvester (the ContainerElementVariablePropagationTest models wrap
+  // this way — #1714 review).
+  body = body.replace(/\s+/g, ' ');
+  // The chain walker skips whitespace, but requires `.` immediately after the
+  // parameter — so only the param-to-first-dot gap needs the space removed.
+  if (!body.startsWith(param + '.') && !body.startsWith(param + ' .')) return UNRESOLVED;
   // Strip a trailing semicolon.
   if (body.endsWith(';')) body = body.slice(0, -1).trim();
   // Walk the call chain on the parameter.
@@ -290,11 +405,122 @@ export function resolveLambda(expr, constants = {}) {
     const args = [];
     for (const a of rawArgs) {
       if (a === '') continue;
+      // A Consumer-valued argument that is a named field reference or an
+      // `.andThen(...)` composition (possibly mixing a named field and inline
+      // lambdas — `INPUT_VARIABLE_BUILDER.andThen(m -> m.parallel())`). Check
+      // this BEFORE the bare-lambda branch: the composition CONTAINS `->` but is
+      // not itself a single lambda. Only scope-opening methods take a Consumer.
+      const at = a.trim();
+      if (opensNestedScope(name) &&
+          (Object.hasOwn(consumers, at) || at.includes('.andThen('))) {
+        if (depth >= 1) return UNRESOLVED;
+        const nested = resolveConsumerArg(at, constants, consumers, depth + 1);
+        if (nested === UNRESOLVED) return UNRESOLVED;
+        calls.push({ m: name, args: [...args] });
+        for (const c of nested) calls.push(c);
+        // Close the scope this call opened — but only at depth 0. At depth ≥ 1
+        // the caller (parseChain) emits the closing pop for the whole element
+        // call once ALL its args are flattened; popping here would restore the
+        // enclosing scope before a LATER argument's own nested scope (a
+        // receiveTask whose Consumer carries BOTH a message and a
+        // multiInstance config).
+        if (depth === 0) calls.push({ m: 'pop', args: [] });
+        args.length = 0;
+        args.push(LAMBDA_CONSUMED);
+        break;
+      }
+      if (/->/.test(a)) {
+        // A nested config lambda: resolve it one level deeper and flatten its
+        // calls after this one (replayed onto the builder this call returns).
+        if (depth >= 1) return UNRESOLVED; // no deeper than one level
+        const nested = resolveLambda(a, constants, depth + 1, consumers);
+        if (nested === UNRESOLVED) return UNRESOLVED;
+        calls.push({ m: name, args: [...args] });
+        for (const c of nested) calls.push(c);
+        // Close the scope this call opened. Only a SCOPE-OPENING method
+        // (multiInstance/message/signal/subProcess — returns a nested config
+        // builder) needs a `pop` to return to the enclosing builder. An ELEMENT
+        // call with a config lambda (serviceTask("id", t -> …)) returns the
+        // element's own builder and the chain simply continues on it — no pop.
+        // The pop is emitted at ANY depth: a scope opened by a call inside a
+        // Consumer body (e.g. multiInstance within a subProcess body) must be
+        // closed before the body's next call, or the rest of the body replays
+        // inside the nested scope (#1714 review).
+        if (opensNestedScope(name)) calls.push({ m: 'pop', args: [] });
+        // The element call is pushed; any further args after the lambda are not
+        // part of the same call, so stop processing this call's args.
+        args.length = 0;
+        args.push(LAMBDA_CONSUMED);
+        break;
+      }
+      // A non-lambda Consumer argument: a named Consumer field reference or an
+      // `.andThen(...)` composition (the Zeebe MI tests bind the shared MI config
+      // to INPUT_VARIABLE_BUILDER and compose it). Resolve to its flat calls.
+      if (opensNestedScope(name) && /[A-Za-z_$]/.test(a[0] ?? '') &&
+          (Object.hasOwn(consumers, a.trim()) || a.includes('.andThen('))) {
+        if (depth >= 1) return UNRESOLVED;
+        const nested = resolveConsumerArg(a, constants, consumers, depth + 1);
+        if (nested === UNRESOLVED) return UNRESOLVED;
+        calls.push({ m: name, args: [...args] });
+        for (const c of nested) calls.push(c);
+        if (depth === 0) calls.push({ m: 'pop', args: [] });
+        args.length = 0;
+        args.push(LAMBDA_CONSUMED);
+        break;
+      }
       const v = resolveArg(a, constants);
       if (v === UNRESOLVED) return UNRESOLVED;
       args.push(v);
     }
-    calls.push({ m: name, args });
+    if (args[0] !== LAMBDA_CONSUMED) calls.push({ m: name, args });
+  }
+  return calls;
+}
+
+/**
+ * Resolve a Consumer-valued argument — a named `Consumer<…>` field reference or
+ * an `.andThen(...)` composition of one — into the flat list of `{m, args}`
+ * config calls it applies. Used for `multiInstance(INPUT_VARIABLE_BUILDER…)`
+ * where the MI config is bound to a named field (#1524). Returns UNRESOLVED when
+ * the reference is not a collected consumer or the composition is not statically
+ * replayable. `pop` markers are stripped: the caller flattens these calls into
+ * the ENCLOSING scope (the scope `multiInstance` opened), so they must not close
+ * it themselves.
+ */
+function resolveConsumerArg(expr, constants, consumers, depth) {
+  const t = expr.trim();
+  // Split a top-level `.andThen(` composition: `BASE.andThen(X).andThen(Y)`.
+  // Each part is either a collected consumer name or an inline lambda.
+  const parts = [];
+  let rest = t;
+  for (;;) {
+    const at = rest.indexOf('.andThen(');
+    if (at < 0) { parts.push(rest); break; }
+    parts.push(rest.slice(0, at));
+    // find the matching close paren of this andThen(
+    const open = at + '.andThen'.length;
+    const ca = callArgs(rest, open);
+    if (!ca) return UNRESOLVED;
+    parts.push(rest.slice(open + 1, ca.end - 1)); // the andThen argument
+    rest = rest.slice(ca.end);
+    if (rest === '') break;
+    if (!rest.startsWith('.andThen(')) return UNRESOLVED; // trailing junk
+  }
+  const calls = [];
+  for (const part of parts) {
+    const p = part.trim();
+    if (p === '') continue;
+    let lam;
+    if (p.includes('->')) {
+      lam = p; // an inline lambda
+    } else if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(p) && Object.hasOwn(consumers, p)) {
+      lam = consumers[p]; // a named Consumer field
+    } else {
+      return UNRESOLVED; // a helper parameter (e.g. `builder`) or unknown ref
+    }
+    const resolved = resolveLambda(lam, constants, depth, consumers);
+    if (resolved === UNRESOLVED) return UNRESOLVED;
+    for (const c of resolved) if (c.m !== 'pop') calls.push(c);
   }
   return calls;
 }
@@ -305,7 +531,7 @@ export function resolveLambda(expr, constants = {}) {
  *   { processId, calls: [{m, args}], end, reason? }
  * where `reason` is set when the chain is UNPARSEABLE (calls may be partial).
  */
-export function parseChain(src, start, constants = {}) {
+export function parseChain(src, start, constants = {}, consumers = {}) {
   const calls = [];
   let i = start + 'Bpmn.createExecutableProcess'.length;
   // skip whitespace to the opening paren of createExecutableProcess
@@ -355,18 +581,48 @@ export function parseChain(src, start, constants = {}) {
     let bad = null;
     for (const a of rawArgs) {
       if (a === '') continue;
+      const at2 = a.trim();
+      // A trailing Consumer argument of a scope-opening method: a collected
+      // field name or an `.andThen(...)` composition of collected fields and
+      // inline lambdas. It is not a value arg at all — leave it out of `args`;
+      // the branch below flattens its resolved calls and closes the scope.
+      // Check BEFORE both the lambda branch (the composition CONTAINS `->` but
+      // is not itself a single lambda) and resolveArg (an UPPERCASE Consumer
+      // field name is UNRESOLVED as a value but resolvable as a Consumer).
+      const isConsumerRef = opensNestedScope(name) &&
+        (Object.hasOwn(consumers, at2) ||
+          (at2.includes('.andThen(') &&
+            at2.split(/\.andThen\(/).every((part, idx) => {
+              const p = idx === 0 ? part.trim() : part.replace(/\)\s*$/, '').trim();
+              return p === '' || Object.hasOwn(consumers, p) ||
+                /^[A-Za-z_$][A-Za-z0-9_$]*\s*->/.test(p) || /^\(.*\)\s*->/.test(p);
+            })));
+      if (isConsumerRef) continue;
       // A trailing configuration lambda: `name("id", b -> b.zeebeJobType("x")…)`.
       // Replayed as the element call with its resolvable leading args followed by
       // the lambda body's own builder calls (flattened into the chain). Only a
       // SINGLE-PARAMETER lambda whose body is a flat chain of string-literal
       // calls on the parameter is resolvable; anything nested stays unresolved.
       if (/->/.test(a)) {
-        const lam = resolveLambda(a, constants);
+        const lam = resolveLambda(a, constants, 0, consumers);
         if (lam === UNRESOLVED) { bad = a; break; }
         // push the element call itself first (a SNAPSHOT of the leading args —
         // `args` is reused below), then the lambda's config calls.
         calls.push({ m: name, args: [...args] });
         for (const c of lam) calls.push(c);
+        // If this element call itself opens a nested scope (it IS a
+        // multiInstance/message/subProcess with a nested lambda), resolveLambda
+        // emitted the nested calls but the scope opened by THIS call stays open
+        // — close it so the chain returns to the enclosing builder.
+        // (resolveLambda's own `pop` only closes scopes one level deeper, and
+        // only when it emitted one at all: a lambda whose body contains NO
+        // scope-opening call — `m -> m.sequential()…` — emits no pop, so the
+        // `?.m !== 'pop'` check must not mistake that for "already closed".)
+        if (opensNestedScope(name)) {
+          const ownScopeClosed = lam.some((c) => opensNestedScope(c.m)) &&
+            calls[calls.length - 1]?.m === 'pop';
+          if (!ownScopeClosed) calls.push({ m: 'pop', args: [] });
+        }
         // signal the element call was already pushed
         bad = null;
         // mark that we consumed args (so we don't re-push below)
@@ -376,7 +632,39 @@ export function parseChain(src, start, constants = {}) {
       }
       const v = resolveArg(a, constants);
       if (v === UNRESOLVED) { bad = a; break; }
+      // A scope-opening method (subProcess) whose trailing argument is a
+      // NON-lambda, NON-Consumer expression (a helper call like
+      // `customize(sp)`): it resolves to a placeholder string but the Consumer
+      // body is invisible to static replay, so the scope would never be
+      // restored. Keep the chain unparseable rather than emit a `pop` that
+      // underflows the replay stack. A quoted literal is the element id
+      // (`subProcess("sp")`).
+      if (opensNestedScope(name) && !at2.startsWith('"')) { bad = a; break; }
       args.push(v);
+    }
+    // A top-level scope-opening call (multiInstance/message/subProcess) whose
+    // argument is a named Consumer field or `.andThen(...)` composition rather
+    // than an inline lambda — `multiInstance(INPUT_VARIABLE_BUILDER.andThen(m
+    // -> …))`, `subProcess("sp", BODY)`. Resolve the Consumer to its flat calls
+    // and flatten them, then close the scope.
+    if (bad === null && args[0] !== LAMBDA_CONSUMED && opensNestedScope(name)) {
+      const lastRaw = rawArgs[rawArgs.length - 1]?.trim() ?? '';
+      // The arg loop already vetted the composition's parts (collected fields
+      // and inline lambdas only) — here it is enough that the arg is one.
+      const isConsumerArg = Object.hasOwn(consumers, lastRaw) ||
+        lastRaw.includes('.andThen(');
+      if (isConsumerArg) {
+        const nested = resolveConsumerArg(lastRaw, constants, consumers, 1);
+        if (nested === UNRESOLVED) {
+          return { processId: pid, calls, end: i, reason: `unresolved-arg:${name}(${lastRaw.slice(0, 40)})` };
+        }
+        // the Consumer name was never pushed into args (see the arg loop), so
+        // `args` here is exactly the resolvable leading args (the element id).
+        calls.push({ m: name, args });
+        for (const c of nested) calls.push(c);
+        calls.push({ m: 'pop', args: [] });
+        continue;
+      }
     }
     if (bad !== null) {
       return { processId: pid, calls, end: i, reason: `unresolved-arg:${name}(${bad.slice(0, 40)})` };
@@ -384,19 +672,42 @@ export function parseChain(src, start, constants = {}) {
     // If a lambda already pushed the element call + its config, skip re-pushing.
     if (args[0] === LAMBDA_CONSUMED) continue;
     calls.push({ m: name, args });
+    // A top-level scope-opening call with NO lambda/Consumer argument —
+    // `multiInstance()` (its config came from an earlier Consumer call in the
+    // same body) or `subProcess("id")` — returns a NESTED builder the following
+    // calls build on until an explicit scope-closing marker. The harvester
+    // emits no `pop` for these (there is no flattened body to bound it), so the
+    // replay relies on the chain's own navigation (`subProcessDone`/`moveTo*`)
+    // — do NOT add a pop here. (Calls WITH a lambda arg take the `continue`
+    // above; their pop was emitted at the LAMBDA_CONSUMED branch.)
   }
+}
+
+// Builder methods that take a nested config lambda and return a NESTED builder
+// (mirrors HarvestExtract.opensNestedScope). Kept in sync with the Java side.
+// `subProcess(id, sp -> …)` belongs here: the Consumer receives a
+// SubProcessBuilder, so the flattened body calls must be followed by a `pop`
+// that restores the enclosing builder — otherwise the outer chain continues
+// inside the sub-process scope and an outer `.endEvent()` draws an outgoing
+// flow from the body's last end event (an invalid model, #1714 review). The
+// Java side detects the SAME scope by the invoke's return type
+// (returnsSubProcessBuilder) rather than this name list, because the no-arg
+// `subProcess(id)` form must also push when a `pop` follows.
+function opensNestedScope(m) {
+  return m === 'multiInstance' || m === 'message' || m === 'signal' || m === 'subProcess';
 }
 
 /** Find every createExecutableProcess chain in a source file. */
 export function parseFile(src) {
   const clean = stripComments(src);
   const constants = collectConstants(clean);
+  const consumers = collectConsumers(clean);
   const chains = [];
   let idx = 0;
   for (;;) {
     const at = clean.indexOf('Bpmn.createExecutableProcess', idx);
     if (at < 0) break;
-    chains.push(parseChain(clean, at, constants));
+    chains.push(parseChain(clean, at, constants, consumers));
     idx = at + 'Bpmn.createExecutableProcess'.length;
   }
   return chains;

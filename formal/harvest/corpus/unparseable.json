@@ -355,18 +355,6 @@
     "reason": "unsupported-method:zeebeFormId"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:serviceTask(b ->\n                  b.zeebeJobType(\"t)"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-2-process",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest.java",
     "processId": "process",
@@ -379,20 +367,6 @@
     "reason": "unresolved-arg:serviceTask(b ->\n                  b.zeebeJobType(\"t)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-3-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": [
-          "start"
-        ]
-      }
-    ],
-    "reason": "unresolved-arg:serviceTask(b -> b.zeebeJobType(\"type1\").zeebeTaskHe)"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AdHocSubProcessElementsVariableTest-0-process",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AdHocSubProcessElementsVariableTest.java",
     "processId": "process",
@@ -403,18 +377,6 @@
       }
     ],
     "reason": "unresolved-arg:adHocSubProcess(scenario::modify)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AdHocSubProcessTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AdHocSubProcessTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:adHocSubProcess(modifier)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AdHocSubProcessTest-1-process",
@@ -445,58 +407,52 @@
     "reason": "unresolved-arg:timerWithDuration(Duration.ZERO)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-0-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-0-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-1-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-2-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-3-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-4-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-5-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-BusinessRuleTaskTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/BusinessRuleTaskTest.java",
-    "processId": "process",
+    "processId": "processId",
     "calls": [
       {
         "m": "startEvent",
         "args": []
       }
     ],
-    "reason": "unresolved-arg:businessRuleTask(modifier)"
+    "reason": "unresolved-arg:serviceTask(t -> t.zeebeJobType(\"jobType\").zeebeAiAg)"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-2-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:adHocSubProcess(ahsp ->\n                        ahsp.zee)"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-4-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:serviceTask(t ->\n                        t.zeebeJobT)"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-5-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:serviceTask(t ->\n                        t.zeebeJobT)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-BusinessRuleTaskTest-1-process",
@@ -565,18 +521,6 @@
     "reason": "chain-ended-without-done"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityInterruptionTest-0-wf-child",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityInterruptionTest.java",
-    "processId": "wf-child",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:serviceTask(t -> t.zeebeJobType(jobType))"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityInterruptionTest-1-wf-parent",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityInterruptionTest.java",
     "processId": "wf-parent",
@@ -632,9 +576,21 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "child-task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "jobType"
+        ]
       }
     ],
-    "reason": "unresolved-arg:serviceTask(t -> t.zeebeJobType(jobType))"
+    "reason": "chain-ended-without-done"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-8-wf-child",
@@ -672,83 +628,6 @@
     "reason": "chain-ended-without-done"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-17-level1",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
-    "processId": "level1",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "callActivity",
-        "args": [
-          "call-level2"
-        ]
-      },
-      {
-        "m": "zeebeProcessId",
-        "args": [
-          "level2"
-        ]
-      },
-      {
-        "m": "boundaryEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:message(m -> m.name(\"cancel\").zeebeCorrelationKe)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-18-level2",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
-    "processId": "level2",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "callActivity",
-        "args": [
-          "call-level3"
-        ]
-      },
-      {
-        "m": "zeebeProcessId",
-        "args": [
-          "level3"
-        ]
-      },
-      {
-        "m": "boundaryEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:message(m -> m.name(\"cancel\").zeebeCorrelationKe)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-20-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-21-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-22-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-23-Loop",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
     "processId": "Loop",
@@ -771,25 +650,16 @@
     "reason": "unresolved-arg:callActivity(b ->\n                        b.zeebeProc)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-24-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-25-processUnderTestId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-25-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-26-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processUnderTestId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:userTask(AbstractUserTaskBuilder::zeebeUserTask)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CamundaUserTaskTest-0-process",
@@ -854,9 +724,22 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "adHocSubProcess",
+        "args": [
+          "ad-hoc",
+          "modifier"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "ahsp-agent-task"
+        ]
       }
     ],
-    "reason": "unresolved-arg:adHocSubProcess(modifier)"
+    "reason": "unresolved-arg:boundaryEvent(b -> b.error(ERROR_CODE))"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-JobBasedAdHocSubProcessTest-1-process",
@@ -884,9 +767,15 @@
         "args": [
           "A2"
         ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "ahsp-agent-task"
+        ]
       }
     ],
-    "reason": "unresolved-arg:zeebeJobType(jobType)"
+    "reason": "unsupported-method:zeebeAiAgentSubProcessDefinition"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-JobBasedUserTaskFormTest-0-process",
@@ -1416,42 +1305,6 @@
     "reason": "unsupported-method:zeebeFormId"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-0-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/OutputMappingTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:serviceTask(b -> b.zeebeJobType(\"type\").zeebeOutputE)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-1-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/OutputMappingTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:intermediateThrowEvent(b -> b.zeebeOutputExpression(\"foo\", \"bar)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-2-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/OutputMappingTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:userTask(b -> b.zeebeOutputExpression(\"foo\", \"bar)"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-3-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/OutputMappingTest.java",
     "processId": "processId",
@@ -1459,75 +1312,22 @@
       {
         "m": "startEvent",
         "args": []
-      }
-    ],
-    "reason": "unresolved-arg:userTask(b -> b.zeebeOutputExpression(\"foo\", \"bar)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ScriptTaskExpressionTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ScriptTaskExpressionTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:scriptTask(modifier)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
       },
       {
-        "m": "sendTask",
+        "m": "userTask",
         "args": [
-          "task"
+          "nativeUserTaskId"
+        ]
+      },
+      {
+        "m": "zeebeOutputExpression",
+        "args": [
+          "foo",
+          "bar"
         ]
       }
     ],
-    "reason": "unresolved-arg:message(m -> m.name(\"msg\").zeebeCorrelationKeyEx)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-1-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "sendTask",
-        "args": [
-          "task"
-        ]
-      }
-    ],
-    "reason": "unresolved-arg:message(m -> m.name(\"msg\").zeebeCorrelationKeyEx)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-3-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "sendTask",
-        "args": [
-          "task"
-        ]
-      }
-    ],
-    "reason": "unresolved-arg:message(m -> m.name(\"msg\").zeebeCorrelationKeyEx)"
+    "reason": "unsupported-method:zeebeUserTask"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ServiceTaskTest-0-process",
@@ -1807,23 +1607,52 @@
     "reason": "unresolved-arg:subProcess(subprocessBuilder)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-TerminateEndEventTest-5-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-TerminateEndEventTest-5-childProcessId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/TerminateEndEventTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-TerminateEndEventTest-6-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/TerminateEndEventTest.java",
-    "processId": "process",
+    "processId": "childProcessId",
     "calls": [
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "parallelGateway",
+        "args": [
+          "fork"
+        ]
+      },
+      {
+        "m": "userTask",
+        "args": [
+          "A"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "none-end"
+        ]
+      },
+      {
+        "m": "moveToNode",
+        "args": [
+          "fork"
+        ]
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "B"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "B"
+        ]
       }
     ],
-    "reason": "unresolved-arg:callActivity(callActivity -> callActivity.zeebeProces)"
+    "reason": "unresolved-arg:endEvent(EndEventBuilder::terminate)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-TerminateEndEventTest-7-process",
@@ -2443,7 +2272,7 @@
         "args": []
       }
     ],
-    "reason": "unresolved-arg:serviceTask(elementId)"
+    "reason": "unresolved-arg:serviceTask(t -> {\n              t.zeebeJobType(SERV)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-listeners-execution-ExecutionListenerProcessInstanceTest-0-unknown",
@@ -2831,13 +2660,6 @@
     "reason": "chain-ended-without-done"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-behavior-BpmnProcessDeletionBehaviorTest-0-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnProcessDeletionBehaviorTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventElementTest-0-process",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventElementTest.java",
     "processId": "process",
@@ -2848,20 +2670,6 @@
       }
     ],
     "reason": "chain-ended-without-done"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventLegacyCorrelationKeyScopeTest-0-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventLegacyCorrelationKeyScopeTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventLegacyCorrelationKeyScopeTest-1-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventLegacyCorrelationKeyScopeTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-0-process",
@@ -2924,7 +2732,7 @@
     "reason": "unsupported-method:cancelActivity"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-2-process",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-3-process",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest.java",
     "processId": "process",
     "calls": [
@@ -2945,25 +2753,20 @@
         ]
       },
       {
+        "m": "zeebeInputExpression",
+        "args": [
+          "oof",
+          "baz"
+        ]
+      },
+      {
         "m": "boundaryEvent",
         "args": [
-          "event"
+          "timer"
         ]
       }
     ],
-    "reason": "unresolved-arg:message(m -> m.name(\"message\").zeebeCorrelationK)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-3-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:serviceTask(b -> b.zeebeJobType(\"type\").zeebeInputEx)"
+    "reason": "unsupported-method:cancelActivity"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-4-process",
@@ -3003,9 +2806,34 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "type"
+        ]
+      },
+      {
+        "m": "zeebeOutputExpression",
+        "args": [
+          "score",
+          "result"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "timer"
+        ]
       }
     ],
-    "reason": "unresolved-arg:serviceTask(b -> b.zeebeJobType(\"type\").zeebeOutputE)"
+    "reason": "unsupported-method:cancelActivity"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-6-process",
@@ -3021,30 +2849,43 @@
         "args": [
           "sub"
         ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "type"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "subProcessDone",
+        "args": []
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "timer"
+        ]
       }
     ],
-    "reason": "unsupported-method:embeddedSubProcess"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-7-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-8-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-9-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "reason": "unsupported-method:cancelActivity"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-10-process",
@@ -3054,16 +2895,49 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "waiting"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "moveToActivity",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "boundary-event-1"
+        ]
       }
     ],
-    "reason": "unresolved-arg:serviceTask(t -> t.zeebeJobType(jobType))"
+    "reason": "unsupported-method:cancelActivity"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventWithoutOutgoingSequenceFlowTest-0-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventWithoutOutgoingSequenceFlowTest-0-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventWithoutOutgoingSequenceFlowTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "chain-ended-without-done"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventCompatibilityTest-1-process",
@@ -3207,9 +3081,24 @@
         "args": [
           "subprocess"
         ]
+      },
+      {
+        "m": "zeebeInputExpression",
+        "args": [
+          "0",
+          "local"
+        ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
       }
     ],
-    "reason": "unsupported-method:zeebeInputExpression"
+    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-8-compensation-process",
@@ -3255,9 +3144,16 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "zeebeOutputExpression",
+        "args": [
+          "0",
+          "iteration"
+        ]
       }
     ],
-    "reason": "unsupported-method:zeebeOutputExpression"
+    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-11-compensation-process",
@@ -3309,9 +3205,17 @@
         "args": [
           "subprocess"
         ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
       }
     ],
-    "reason": "unsupported-method:embeddedSubProcess"
+    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-14-compensation-process",
@@ -3333,9 +3237,31 @@
         "args": [
           "subprocess"
         ]
+      },
+      {
+        "m": "multiInstance",
+        "args": []
+      },
+      {
+        "m": "zeebeInputCollectionExpression",
+        "args": [
+          "[1,2,3]"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
       }
     ],
-    "reason": "unsupported-method:multiInstance"
+    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-15-compensation-process",
@@ -3351,9 +3277,17 @@
         "args": [
           "subprocess"
         ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
       }
     ],
-    "reason": "unsupported-method:embeddedSubProcess"
+    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-16-compensation-process",
@@ -3375,9 +3309,17 @@
         "args": [
           "subprocess"
         ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
       }
     ],
-    "reason": "unsupported-method:embeddedSubProcess"
+    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-17-compensation-process",
@@ -3399,9 +3341,47 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "subProcess",
+        "args": [
+          "subprocess"
+        ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "A"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "A"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "boundaryEvent",
+        "args": []
       }
     ],
-    "reason": "unresolved-arg:subProcess(subprocess ->\n                    subpro)"
+    "reason": "unsupported-method:compensation"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-19-compensation-process",
@@ -3607,9 +3587,23 @@
         "args": [
           "subprocess"
         ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "parallelGateway",
+        "args": [
+          "inner-fork"
+        ]
       }
     ],
-    "reason": "unsupported-method:embeddedSubProcess"
+    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-39-compensation-process",
@@ -3625,9 +3619,23 @@
         "args": [
           "subprocess"
         ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "parallelGateway",
+        "args": [
+          "inner-fork"
+        ]
       }
     ],
-    "reason": "unsupported-method:embeddedSubProcess"
+    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-40-compensation-process",
@@ -3643,9 +3651,13 @@
         "args": [
           "subprocess"
         ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
       }
     ],
-    "reason": "unsupported-method:embeddedSubProcess"
+    "reason": "unsupported-method:eventSubProcess"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-41-compensation-process",
@@ -3661,9 +3673,37 @@
         "args": [
           "outer"
         ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "parallelGateway",
+        "args": [
+          "outer-fork"
+        ]
+      },
+      {
+        "m": "subProcess",
+        "args": [
+          "inner"
+        ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
       }
     ],
-    "reason": "unsupported-method:embeddedSubProcess"
+    "reason": "unresolved-arg:serviceTask(task ->\n                    task.zeebeJo)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventTest-0-compensation-process",
@@ -3709,9 +3749,43 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "subProcess",
+        "args": [
+          "subprocess"
+        ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "error-throwing-element"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "test"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "pop",
+        "args": []
       }
     ],
-    "reason": "unresolved-arg:subProcess(s ->\n                    s.embeddedSubPr)"
+    "reason": "unresolved-arg:boundaryEvent(b -> b.error(ERROR_CODE))"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-error-ErrorCatchEventTest-2-wf",
@@ -3721,9 +3795,57 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "subProcess",
+        "args": [
+          "subprocess"
+        ]
+      },
+      {
+        "m": "multiInstance",
+        "args": []
+      },
+      {
+        "m": "zeebeInputCollectionExpression",
+        "args": [
+          "[1]"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "error-throwing-element"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "test"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "pop",
+        "args": []
       }
     ],
-    "reason": "unresolved-arg:subProcess(s ->\n                    s.multiInstance)"
+    "reason": "unresolved-arg:boundaryEvent(b -> b.error(ERROR_CODE))"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-error-ErrorCatchEventTest-3-wf",
@@ -3733,9 +3855,35 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "error-throwing-element"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "test"
+        ]
+      },
+      {
+        "m": "multiInstance",
+        "args": []
+      },
+      {
+        "m": "zeebeInputCollectionExpression",
+        "args": [
+          "[1]"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
       }
     ],
-    "reason": "unresolved-arg:serviceTask(t ->\n                    t.zeebeJobType()"
+    "reason": "unresolved-arg:boundaryEvent(b -> b.error(ERROR_CODE))"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-error-ErrorCatchEventTest-4-wf",
@@ -3795,11 +3943,34 @@
     "reason": "unsupported-method:eventSubProcess"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-error-ErrorCatchEventTest-10-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-error-ErrorCatchEventTest-10-error-boundary-with-output-mapping",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/error/ErrorCatchEventTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "error-boundary-with-output-mapping",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "error-throwing-element"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "test"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "error-boundary"
+        ]
+      }
+    ],
+    "reason": "unsupported-method:error"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-error-ErrorEventTest-0-wf",
@@ -3909,9 +4080,57 @@
       {
         "m": "startEvent",
         "args": []
+      },
+      {
+        "m": "subProcess",
+        "args": [
+          "subprocess"
+        ]
+      },
+      {
+        "m": "multiInstance",
+        "args": []
+      },
+      {
+        "m": "zeebeInputCollectionExpression",
+        "args": [
+          "[1]"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "test"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "pop",
+        "args": []
       }
     ],
-    "reason": "unresolved-arg:subProcess(s ->\n                    s.multiInstance)"
+    "reason": "unresolved-arg:boundaryEvent(b -> b.error(ERROR_CODE))"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-error-ErrorEventTest-11-wf",
@@ -4244,301 +4463,6 @@
     "reason": "unsupported-method:eventSubProcess"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-2-PROCESS_WITH_MESSAGES",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
-    "processId": "PROCESS_WITH_MESSAGES",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": [
-          "start"
-        ]
-      },
-      {
-        "m": "eventBasedGateway",
-        "args": []
-      },
-      {
-        "m": "id",
-        "args": [
-          "gateway"
-        ]
-      }
-    ],
-    "reason": "unresolved-arg:intermediateCatchEvent(c -> c.message(m -> m.name(\"msg-1\").zeeb)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-3-PROCESS_WITH_TIMER_AND_MESSAGE",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
-    "processId": "PROCESS_WITH_TIMER_AND_MESSAGE",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": [
-          "start"
-        ]
-      },
-      {
-        "m": "eventBasedGateway",
-        "args": []
-      },
-      {
-        "m": "id",
-        "args": [
-          "gateway"
-        ]
-      },
-      {
-        "m": "intermediateCatchEvent",
-        "args": [
-          "timer"
-        ]
-      },
-      {
-        "m": "timerWithDuration",
-        "args": [
-          "PT10S"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "to-end1"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToLastGateway",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:intermediateCatchEvent(c -> c.message(m -> m.name(\"msg\").zeebeC)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-6-PROCESS_WITH_CONDITIONAL_AND_MESSAGE",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
-    "processId": "PROCESS_WITH_CONDITIONAL_AND_MESSAGE",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "eventBasedGateway",
-        "args": []
-      },
-      {
-        "m": "id",
-        "args": [
-          "gateway"
-        ]
-      },
-      {
-        "m": "intermediateCatchEvent",
-        "args": [
-          "conditional"
-        ]
-      },
-      {
-        "m": "condition",
-        "args": [
-          "x > 5"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "to-end1"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToLastGateway",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:intermediateCatchEvent(c -> c.message(m -> m.name(\"msg\").zeebeC)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-7-PROCESS_WITH_CONDITIONAL_AND_MESSAGE_FALSE",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
-    "processId": "PROCESS_WITH_CONDITIONAL_AND_MESSAGE_FALSE",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "eventBasedGateway",
-        "args": []
-      },
-      {
-        "m": "id",
-        "args": [
-          "gateway"
-        ]
-      },
-      {
-        "m": "intermediateCatchEvent",
-        "args": [
-          "conditional"
-        ]
-      },
-      {
-        "m": "condition",
-        "args": [
-          "x > 100"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "to-end1"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToLastGateway",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:intermediateCatchEvent(c -> c.message(m -> m.name(\"msg\").zeebeC)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-0-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-1-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-2-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-3-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-4-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-5-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-6-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-7-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-8-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-9-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-1-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-2-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-5-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-6-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-7-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-8-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-9-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-22-process",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
     "processId": "process",
@@ -4648,23 +4572,16 @@
     "reason": "unresolved-arg:serviceTask(t ->\n                    t.zeebeJobType()"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceActivityTest-3-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceActivityTest-3-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceActivityTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceBatchedSubProcessesTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceBatchedSubProcessesTest.java",
-    "processId": "process",
+    "processId": "processId",
     "calls": [
       {
         "m": "startEvent",
         "args": []
       }
     ],
-    "reason": "unsupported-method:zeebeOutputExpression"
+    "reason": "unresolved-arg:subProcess(outer ->\n                    outer\n     )"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceCallActivityTest-0-wf-parent",
@@ -4691,84 +4608,6 @@
     "reason": "chain-ended-without-done"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceCallActivityTest-1-wf-child",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceCallActivityTest.java",
-    "processId": "wf-child",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:serviceTask(t -> t.zeebeJobType(jobType))"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceConcurrencyTest-0-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceConcurrencyTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "serviceTask",
-        "args": [
-          "serviceTask1"
-        ]
-      },
-      {
-        "m": "zeebeJobType",
-        "args": [
-          "jobType1"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "task1-to-task2"
-        ]
-      },
-      {
-        "m": "serviceTask",
-        "args": [
-          "serviceTask2"
-        ]
-      },
-      {
-        "m": "zeebeJobType",
-        "args": [
-          "jobType2"
-        ]
-      }
-    ],
-    "reason": "unsupported-method:multiInstance"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceInputCollectionTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceInputCollectionTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:serviceTask(t ->\n                  t.zeebeJobType(\"t)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceReceiveTaskTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceReceiveTaskTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:receiveTask(t ->\n                  t.message(m -> m.)"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceSubProcessTest-0-process",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceSubProcessTest.java",
     "processId": "process",
@@ -4778,7 +4617,7 @@
         "args": []
       }
     ],
-    "reason": "unresolved-arg:subProcess(s ->\n                    s.multiInstance)"
+    "reason": "unresolved-arg:subProcess(SUB_PROCESS_ELEMENT_ID)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceSubProcessTest-1-process",
@@ -4806,9 +4645,33 @@
         "args": [
           "subprocess"
         ]
+      },
+      {
+        "m": "multiInstance",
+        "args": []
+      },
+      {
+        "m": "zeebeInputCollectionExpression",
+        "args": [
+          "[1,2,3]"
+        ]
+      },
+      {
+        "m": "zeebeInputElement",
+        "args": [
+          "item"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
       }
     ],
-    "reason": "unsupported-method:multiInstance"
+    "reason": "unsupported-method:eventSubProcess"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-subprocess-EmbeddedSubProcessConcurrencyTest-0-process-with-sub-process",
@@ -5004,179 +4867,1328 @@
     "reason": "chain-ended-without-done"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-0-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-0-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.multiInstan)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-1-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-1-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.multiInstan)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-2-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-2-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.multiInstan)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-3-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-3-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.multiInstan)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-4-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-5-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.zeebeInputE)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-5-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-6-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.zeebeInputE)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-6-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-7-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.zeebeInputE)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-7-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-11-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:adHocSubProcess(ahsp -> {\n                  ahsp.zeebeIn)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-8-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-12-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:adHocSubProcess(ahsp -> {\n                  ahsp.zeebeIn)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-9-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-13-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:adHocSubProcess(ahsp -> {\n                  ahsp.zeebeIn)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-10-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-14-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
+    "processId": "processId",
     "calls": [],
-    "reason": "process-id-not-literal"
+    "reason": "chain-ended-without-done"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-11-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-15-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
+    "processId": "processId",
     "calls": [],
-    "reason": "process-id-not-literal"
+    "reason": "chain-ended-without-done"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-12-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-16-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
+    "processId": "processId",
     "calls": [],
-    "reason": "process-id-not-literal"
+    "reason": "chain-ended-without-done"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-13-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-17-parentProcessId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "parentProcessId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:callActivity(c ->\n                    c.zeebeProcessI)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-14-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-19-parentProcessId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "parentProcessId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:callActivity(c ->\n                    c.zeebeProcessI)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-15-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-21-parentProcessId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "parentProcessId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:callActivity(c ->\n                    c.zeebeProcessI)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-16-unknown",
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-23-parentProcessId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "processId": "parentProcessId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      }
+    ],
+    "reason": "unresolved-arg:callActivity(c -> c.zeebeProcessId(childProcessId).ze)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-17-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AdHocSubProcessTest-0-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AdHocSubProcessTest.java",
+    "processId": "process",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "adHocSubProcess",
+        "args": [
+          "ad-hoc",
+          "modifier"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:NoSuchMethodException: StartEventBuilder.adHocSubProcess(2 args)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-18-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-3-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "adHocSubProcess",
+        "args": [
+          "ad-hoc"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "jobType"
+        ]
+      },
+      {
+        "m": "task",
+        "args": [
+          "inner"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:NoSuchMethodException: StartEventBuilder.adHocSubProcess(1 args)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-19-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-BusinessRuleTaskTest-0-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/BusinessRuleTaskTest.java",
+    "processId": "process",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "businessRuleTask",
+        "args": [
+          "task",
+          "modifier"
+        ]
+      }
+    ],
+    "reason": "serialise:NoSuchMethodException: StartEventBuilder.businessRuleTask(2 args)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-20-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-17-level1",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "level1",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "callActivity",
+        "args": [
+          "call-level2"
+        ]
+      },
+      {
+        "m": "zeebeProcessId",
+        "args": [
+          "level2"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": []
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "cancel"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "key"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-21-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-18-level2",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "level2",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "callActivity",
+        "args": [
+          "call-level3"
+        ]
+      },
+      {
+        "m": "zeebeProcessId",
+        "args": [
+          "level3"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": []
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "cancel"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "key"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-22-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ScriptTaskExpressionTest-0-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ScriptTaskExpressionTest.java",
+    "processId": "process",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "scriptTask",
+        "args": [
+          "task",
+          "modifier"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:NoSuchMethodException: StartEventBuilder.scriptTask(2 args)"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-23-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-0-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
+    "processId": "process",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "sendTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "msg"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "123"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-24-unknown",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": null,
-    "calls": [],
-    "reason": "process-id-not-literal"
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-1-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
+    "processId": "process",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "sendTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "msg"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "123"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-3-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
+    "processId": "process",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "sendTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "msg"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "123"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventLegacyCorrelationKeyScopeTest-0-boundaryCorrelationScopeLegacyIncident",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventLegacyCorrelationKeyScopeTest.java",
+    "processId": "boundaryCorrelationScopeLegacyIncident",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "type"
+        ]
+      },
+      {
+        "m": "zeebeInputExpression",
+        "args": [
+          "bar",
+          "foo"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "event"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "foo"
+        ]
+      },
+      {
+        "m": "name",
+        "args": [
+          "message"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "moveToActivity",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventLegacyCorrelationKeyScopeTest-1-boundaryCorrelationScopeLegacyIncident",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventLegacyCorrelationKeyScopeTest.java",
+    "processId": "boundaryCorrelationScopeLegacyIncident",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "type"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "event"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "orderId"
+        ]
+      },
+      {
+        "m": "name",
+        "args": [
+          "message"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "moveToActivity",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-2-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest.java",
+    "processId": "process",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "type"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "event"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "message"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "key"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "zeebeOutputExpression",
+        "args": [
+          "foo",
+          "bar"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "endTimer"
+        ]
+      },
+      {
+        "m": "moveToActivity",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-7-boundarySubProcessCorrelationScope",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest.java",
+    "processId": "boundarySubProcessCorrelationScope",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "type"
+        ]
+      },
+      {
+        "m": "zeebeInputExpression",
+        "args": [
+          "bar",
+          "foo"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "event"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "foo"
+        ]
+      },
+      {
+        "m": "name",
+        "args": [
+          "message"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "moveToActivity",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-8-boundarySubProcessCorrelationScope",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest.java",
+    "processId": "boundarySubProcessCorrelationScope",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "type"
+        ]
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "event"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "orderId"
+        ]
+      },
+      {
+        "m": "name",
+        "args": [
+          "message"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "moveToActivity",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-9-boundarySubProcessCorrelationScope",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventTest.java",
+    "processId": "boundarySubProcessCorrelationScope",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "subProcess",
+        "args": [
+          "sub"
+        ]
+      },
+      {
+        "m": "zeebeInputExpression",
+        "args": [
+          "bar",
+          "foo"
+        ]
+      },
+      {
+        "m": "embeddedSubProcess",
+        "args": []
+      },
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "serviceTask",
+        "args": [
+          "task"
+        ]
+      },
+      {
+        "m": "zeebeJobType",
+        "args": [
+          "type"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "boundaryEvent",
+        "args": [
+          "event"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "foo"
+        ]
+      },
+      {
+        "m": "name",
+        "args": [
+          "message"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      },
+      {
+        "m": "moveToActivity",
+        "args": [
+          "sub"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-2-PROCESS_WITH_MESSAGES",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
+    "processId": "PROCESS_WITH_MESSAGES",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": [
+          "start"
+        ]
+      },
+      {
+        "m": "eventBasedGateway",
+        "args": []
+      },
+      {
+        "m": "id",
+        "args": [
+          "gateway"
+        ]
+      },
+      {
+        "m": "intermediateCatchEvent",
+        "args": [
+          "message-1"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "msg-1"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "key"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "to-end1"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastGateway",
+        "args": []
+      },
+      {
+        "m": "intermediateCatchEvent",
+        "args": [
+          "message-2"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "msg-2"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "key"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "to-end2"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-3-PROCESS_WITH_TIMER_AND_MESSAGE",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
+    "processId": "PROCESS_WITH_TIMER_AND_MESSAGE",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": [
+          "start"
+        ]
+      },
+      {
+        "m": "eventBasedGateway",
+        "args": []
+      },
+      {
+        "m": "id",
+        "args": [
+          "gateway"
+        ]
+      },
+      {
+        "m": "intermediateCatchEvent",
+        "args": [
+          "timer"
+        ]
+      },
+      {
+        "m": "timerWithDuration",
+        "args": [
+          "PT10S"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "to-end1"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastGateway",
+        "args": []
+      },
+      {
+        "m": "intermediateCatchEvent",
+        "args": [
+          "message"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "msg"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "key"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "to-end2"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-6-PROCESS_WITH_CONDITIONAL_AND_MESSAGE",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
+    "processId": "PROCESS_WITH_CONDITIONAL_AND_MESSAGE",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "eventBasedGateway",
+        "args": []
+      },
+      {
+        "m": "id",
+        "args": [
+          "gateway"
+        ]
+      },
+      {
+        "m": "intermediateCatchEvent",
+        "args": [
+          "conditional"
+        ]
+      },
+      {
+        "m": "condition",
+        "args": [
+          "x > 5"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "to-end1"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastGateway",
+        "args": []
+      },
+      {
+        "m": "intermediateCatchEvent",
+        "args": [
+          "message"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "msg"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "key"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "to-end2"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-7-PROCESS_WITH_CONDITIONAL_AND_MESSAGE_FALSE",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
+    "processId": "PROCESS_WITH_CONDITIONAL_AND_MESSAGE_FALSE",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "eventBasedGateway",
+        "args": []
+      },
+      {
+        "m": "id",
+        "args": [
+          "gateway"
+        ]
+      },
+      {
+        "m": "intermediateCatchEvent",
+        "args": [
+          "conditional"
+        ]
+      },
+      {
+        "m": "condition",
+        "args": [
+          "x > 100"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "to-end1"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastGateway",
+        "args": []
+      },
+      {
+        "m": "intermediateCatchEvent",
+        "args": [
+          "message"
+        ]
+      },
+      {
+        "m": "message",
+        "args": []
+      },
+      {
+        "m": "name",
+        "args": [
+          "msg"
+        ]
+      },
+      {
+        "m": "zeebeCorrelationKeyExpression",
+        "args": [
+          "key"
+        ]
+      },
+      {
+        "m": "pop",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "to-end2"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      }
+    ],
+    "reason": "serialise:IllegalArgumentException: argument type mismatch"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-8-PROCESS_WITH_MULTIPLE_CONDITIONALS",
@@ -5259,6 +6271,152 @@
       }
     ],
     "reason": "serialise:NoSuchMethodException: IntermediateCatchEventBuilder.condition(0 args)"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-8-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "exclusiveGateway",
+        "args": [
+          "xor"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s1"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,a)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastExclusiveGateway",
+        "args": []
+      },
+      {
+        "m": "defaultFlow",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s2"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,\b)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-9-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "exclusiveGateway",
+        "args": [
+          "xor"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s1"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,a)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastGateway",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s2"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,\b)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      },
+      {
+        "m": "moveToLastExclusiveGateway",
+        "args": []
+      },
+      {
+        "m": "defaultFlow",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s3"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= nonexisting_variable"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end3"
+        ]
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-0-process",
@@ -5362,6 +6520,494 @@
         "args": [
           "end3"
         ]
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-1-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "inclusiveGateway",
+        "args": [
+          "inclusive"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s1"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,a)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastGateway",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s2"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,\b)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      },
+      {
+        "m": "moveToLastInclusiveGateway",
+        "args": []
+      },
+      {
+        "m": "defaultFlow",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s3"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= true"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end3"
+        ]
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-2-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "inclusiveGateway",
+        "args": [
+          "inclusive"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s1"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,a)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "a"
+        ]
+      },
+      {
+        "m": "moveToLastInclusiveGateway",
+        "args": []
+      },
+      {
+        "m": "defaultFlow",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s2"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,\b)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "b"
+        ]
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-7-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "inclusiveGateway",
+        "args": [
+          "inclusive"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s1"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,a)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastInclusiveGateway",
+        "args": []
+      },
+      {
+        "m": "defaultFlow",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s2"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,\b)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-8-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "inclusiveGateway",
+        "args": [
+          "inclusive"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s1"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,a)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastGateway",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s2"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,\b)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      },
+      {
+        "m": "moveToLastInclusiveGateway",
+        "args": []
+      },
+      {
+        "m": "defaultFlow",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s3"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= true"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end3"
+        ]
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-9-processId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "processId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "inclusiveGateway",
+        "args": [
+          "inclusive"
+        ]
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s1"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,a)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end1"
+        ]
+      },
+      {
+        "m": "moveToLastGateway",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s2"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= contains(str,\b)"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end2"
+        ]
+      },
+      {
+        "m": "moveToLastInclusiveGateway",
+        "args": []
+      },
+      {
+        "m": "sequenceFlowId",
+        "args": [
+          "s3"
+        ]
+      },
+      {
+        "m": "conditionExpression",
+        "args": [
+          "= true"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": [
+          "end3"
+        ]
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-18-childProcessId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
+    "processId": "childProcessId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "intermediateThrowEvent",
+        "args": [
+          "nestedElement"
+        ]
+      },
+      {
+        "m": "zeebeOutputExpression",
+        "args": [
+          "= \barundefined",
+          "localVar"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-20-childProcessId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
+    "processId": "childProcessId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "intermediateThrowEvent",
+        "args": [
+          "nestedElement"
+        ]
+      },
+      {
+        "m": "zeebeOutputExpression",
+        "args": [
+          "= \fooundefined",
+          "localVar"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-22-childProcessId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
+    "processId": "childProcessId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "intermediateThrowEvent",
+        "args": [
+          "nestedElement"
+        ]
+      },
+      {
+        "m": "zeebeOutputExpression",
+        "args": [
+          "= \barundefined",
+          "localVar"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
+      }
+    ],
+    "reason": "serialise:ModelIoException: Unable to transform model to xml"
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-24-childProcessId",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
+    "processId": "childProcessId",
+    "calls": [
+      {
+        "m": "startEvent",
+        "args": []
+      },
+      {
+        "m": "intermediateThrowEvent",
+        "args": [
+          "nestedElement"
+        ]
+      },
+      {
+        "m": "zeebeOutputExpression",
+        "args": [
+          "= \barundefined",
+          "localVar"
+        ]
+      },
+      {
+        "m": "endEvent",
+        "args": []
       }
     ],
     "reason": "serialise:ModelIoException: Unable to transform model to xml"
