@@ -80,6 +80,36 @@
             "G3->E": 1,
             "G2->E": 1
           }
+        },
+        "run": {
+          "steps": [],
+          "route": {
+            "route_G3": [
+              [
+                "f6"
+              ]
+            ]
+          },
+          "completed": true,
+          "cancelled": false,
+          "jobsCreated": {},
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "G3": 1,
+            "G2": 1,
+            "E": 2
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f3": 1,
+            "f2": 1,
+            "f6": 1,
+            "f4": 1
+          },
+          "joinsFired": {
+            "G2": 1
+          }
         }
       },
       "detail": [
@@ -120,7 +150,8 @@
             "G2->E": 1
           }
         }
-      ]
+      ],
+      "note": "False divergence: the reference scheduler took a fork's flows in document order; Zeebe takes them in reverse document order (ExecutableFlowNode.getOutgoing(), confirmed on live Camunda 8.10.6), so the sibling branch routes away before the inclusive join is guarded and the join fires (#1694). Regenerated scenario kept as a regression guard."
     },
     {
       "signature": "nano:error:no '_' job was activatable — the nano engine reached RTC quiescence without creating this job (the Camunda adapter throw",
@@ -1411,6 +1442,272 @@
           }
         }
       ]
+    },
+    {
+      "signature": "nano:completedElements,jobsCreated,sequenceFlows:completed=false/false",
+      "kind": "nano",
+      "issue": "#1694",
+      "seed": 3666021433,
+      "graph": {
+        "id": "Gen_a0e091fa90",
+        "key": "and,or,xor|0>1d,1>2d,1>3d,2>4t,3>2d,3>4d"
+      },
+      "skeleton": {
+        "kinds": [
+          "and",
+          "xor",
+          "or"
+        ],
+        "edges": [
+          [
+            1,
+            2,
+            "direct"
+          ],
+          [
+            2,
+            4,
+            "direct"
+          ],
+          [
+            1,
+            3,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "task"
+          ],
+          [
+            0,
+            1,
+            "direct"
+          ],
+          [
+            2,
+            3,
+            "direct"
+          ]
+        ]
+      },
+      "fixed": true,
+      "note": "False divergence: the reference scheduler took a fork's flows in document order; Zeebe takes them in reverse document order (ExecutableFlowNode.getOutgoing(), confirmed on live Camunda 8.10.6), so the sibling branch routes away before the inclusive join is guarded and the join fires (#1694). Regenerated scenario kept as a regression guard.",
+      "scenario": {
+        "name": "Gen_a0e091fa90-shrinkr6x15-o1",
+        "graph": "Gen_a0e091fa90",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_a0e091fa90",
+        "variables": {
+          "route_G3": [
+            [
+              "f7"
+            ]
+          ]
+        },
+        "steps": [
+          {
+            "op": "completeOneJob",
+            "jobType": "T1"
+          }
+        ],
+        "expect": {
+          "completed": true,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "variables": {},
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "G3": 1,
+            "G2": 1,
+            "E": 2,
+            "T1": 1
+          },
+          "sequenceFlows": {
+            "S->G1": 1,
+            "G1->G3": 1,
+            "G1->G2": 1,
+            "G3->E": 1,
+            "G2->T1": 1,
+            "T1->E": 1
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "complete",
+              "node": "T1"
+            }
+          ],
+          "route": {
+            "route_G3": [
+              [
+                "f7"
+              ]
+            ]
+          },
+          "completed": true,
+          "cancelled": false,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "G3": 1,
+            "G2": 1,
+            "E": 2,
+            "T1": 1
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f3": 1,
+            "f2": 1,
+            "f7": 1,
+            "f4": 1,
+            "f5": 1
+          },
+          "joinsFired": {
+            "G2": 1
+          }
+        }
+      },
+      "detail": null
+    },
+    {
+      "signature": "spec-oracle:jobsCreated,sequenceFlows",
+      "kind": "spec-oracle",
+      "issue": "#1695",
+      "seed": 3666021433,
+      "graph": {
+        "id": "Gen_a0e091fa90",
+        "key": "and,or,xor|0>1d,1>2d,1>3d,2>4t,3>2d,3>4d"
+      },
+      "skeleton": {
+        "kinds": [
+          "and",
+          "xor",
+          "or"
+        ],
+        "edges": [
+          [
+            1,
+            2,
+            "direct"
+          ],
+          [
+            2,
+            4,
+            "direct"
+          ],
+          [
+            1,
+            3,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "task"
+          ],
+          [
+            0,
+            1,
+            "direct"
+          ],
+          [
+            2,
+            3,
+            "direct"
+          ]
+        ]
+      },
+      "fixed": true,
+      "note": "False divergence: the reference scheduler took a fork's flows in document order; Zeebe takes them in reverse document order (ExecutableFlowNode.getOutgoing(), confirmed on live Camunda 8.10.6), so the sibling branch routes away before the inclusive join is guarded and the join fires (#1694). Regenerated scenario kept as a regression guard.",
+      "scenario": {
+        "name": "Gen_a0e091fa90-shrinkr6x26-o1",
+        "graph": "Gen_a0e091fa90",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_a0e091fa90",
+        "variables": {
+          "route_G3": [
+            [
+              "f7"
+            ]
+          ]
+        },
+        "steps": [
+          {
+            "op": "completeOneJob",
+            "jobType": "T1"
+          }
+        ],
+        "expect": {
+          "completed": true,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "variables": {},
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "G3": 1,
+            "G2": 1,
+            "E": 2,
+            "T1": 1
+          },
+          "sequenceFlows": {
+            "S->G1": 1,
+            "G1->G3": 1,
+            "G1->G2": 1,
+            "G3->E": 1,
+            "G2->T1": 1,
+            "T1->E": 1
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "complete",
+              "node": "T1"
+            }
+          ],
+          "route": {
+            "route_G3": [
+              [
+                "f7"
+              ]
+            ]
+          },
+          "completed": true,
+          "cancelled": false,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "G3": 1,
+            "G2": 1,
+            "E": 2,
+            "T1": 1
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f3": 1,
+            "f2": 1,
+            "f7": 1,
+            "f4": 1,
+            "f5": 1
+          },
+          "joinsFired": {
+            "G2": 1
+          }
+        }
+      },
+      "detail": null
     },
     {
       "signature": "camunda:error:no '_' job became activatable within Nms — the published message did not correlate into the expected job (a correlation ",

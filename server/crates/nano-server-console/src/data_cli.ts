@@ -45,6 +45,9 @@ import {
   resolveShapes,
   type ShapeDecl,
   type SourceSchema,
+  START_BINDINGS_DTS,
+  type StartBindingDecl,
+  emitStartBindings,
   WORKER_BINDINGS_DTS,
   WORKER_BINDINGS_TS,
 } from "./domain-types.ts";
@@ -90,6 +93,16 @@ interface Request {
    * Absent → no metadata is derived.
    */
   derivedMeta?: MetaDecl[];
+  /**
+   * `domaintypes`: the model-derived start-envelope map (`process -> {in}`),
+   * scanned from the process models' **none start events** (`bpmn:startEvent`
+   * with no event definition — how a process started over the API or from a call
+   * activity begins) by the server. It is authoritative for the typed
+   * start-payload registry (`start-io.d.ts`: `StartableProcess` +
+   * `StartPayloads`) — there is no manifest projection for process starts.
+   * Absent → no start registry is derived.
+   */
+  derivedStarts?: StartBindingDecl[];
 }
 
 /**
@@ -481,10 +494,18 @@ async function run(req: Request): Promise<unknown> {
       const messages = req.derivedMessages ?? [];
       const messageBindings = emitMessageBindings(messages, Object.keys(types));
       const messageRuntime = emitMessageBindingsRuntime();
+      // The start-payload registry: `process -> {in}`, scanned from the process
+      // models' none-start-event envelopes. Like messages, there is no manifest
+      // projection for process starts, so the model-derived map is authoritative
+      // and emitted directly (no overlay). Feeds the typed start-instance call
+      // surface (`StartableProcess` / `StartPayloads` in `start-io.d.ts`).
+      const starts = req.derivedStarts ?? [];
+      const startBindings = emitStartBindings(starts, Object.keys(types));
       let path: string | null = null;
       let bindingsPath: string | null = null;
       let workerBindingsPath: string | null = null;
       let messageBindingsPath: string | null = null;
+      let startBindingsPath: string | null = null;
       let metaPath: string | null = null;
       let domainModelPath: string | null = null;
       let domainModelJson: string | null = null;
@@ -500,6 +521,8 @@ async function run(req: Request): Promise<unknown> {
         messageBindingsPath = `${GEN_DIR}/${MESSAGE_BINDINGS_DTS}`;
         await RT.writeTextFile(messageBindingsPath, messageBindings);
         await RT.writeTextFile(`${GEN_DIR}/${MESSAGE_BINDINGS_TS}`, messageRuntime);
+        startBindingsPath = `${GEN_DIR}/${START_BINDINGS_DTS}`;
+        await RT.writeTextFile(startBindingsPath, startBindings);
         metaPath = `${GEN_DIR}/${META_TS}`;
         await RT.writeTextFile(metaPath, metaAccessor);
         domainModelJson = emitDomainModelJson({
@@ -524,6 +547,8 @@ async function run(req: Request): Promise<unknown> {
         workerBindings,
         messageBindingsPath,
         messageBindings,
+        startBindingsPath,
+        startBindings,
         metaPath,
         meta: metaAccessor,
         domainModelPath,

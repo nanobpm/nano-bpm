@@ -667,7 +667,9 @@ impl Engine {
                 .push_back(variables.clone());
             return;
         }
-        for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false) {
+        for event in
+            self.propagated_updates(instance_key, flow_scope, variables.clone(), false, &[])
+        {
             self.emit(log, event);
         }
     }

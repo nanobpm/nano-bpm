@@ -1,0 +1,15 @@
+{
+  "description": "#1537: a call activity with propagateAllChildVariables=true propagates the child's variables back to the parent. The copied parent variable `cfg`, whose value did not change, produces NO VARIABLE UPDATED record (Zeebe's VariableBehavior skips an equal-value write); only the new `result` is CREATED. Single-variable documents keep Zeebe's hash-ordered document iteration out of the trace.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "parent",
+      "variables": { "cfg": { "ck": "k1" } }
+    },
+    {
+      "op": "completeJob",
+      "jobType": "ct3",
+      "variables": { "result": 38 }
+    }
+  ]
+}

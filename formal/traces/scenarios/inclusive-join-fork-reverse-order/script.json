@@ -1,0 +1,7 @@
+{
+  "description": "Fuzz reproducer Gen_a0e091fa90 (seed 3666021433, #1694/#1695): parallel fork G1 -> {inclusive join G2 (f2), exclusive G3 (f3)}; G3 -> {G2 (f6), E (f7)}. Zeebe takes the fork's flows in REVERSE document order, so G3 activates first and routes to E before G2's activation is guarded: no live path can reach G2, the join fires on f2 alone and creates T1's job.",
+  "steps": [
+    { "op": "createInstance", "bpmnProcessId": "Gen_a0e091fa90", "variables": { "route_G3": [["f7"]] } },
+    { "op": "completeJob", "jobType": "T1" }
+  ]
+}

@@ -1103,6 +1103,58 @@ fn call_activity_propagate_all_child_false_without_output_mappings_copies_nothin
 }
 
 #[test]
+fn call_activity_propagate_all_child_skips_unchanged_parent_variables() {
+    // #1537: propagateAllChildVariables copies the child's whole scope back,
+    // including the parent variables it received on the way in. Zeebe's
+    // `VariableBehavior` writes nothing for a value equal to the one the parent
+    // already holds, so only the genuinely changed/new variables may cross back.
+    let mut engine =
+        deploy_native_call_with_propagation(Default::default(), propagating_child(), true, true);
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[
+                ("orderId", Value::Int(42)),
+                ("shared", Value::Str("parent".into())),
+            ]),
+        ))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+    assert!(engine.is_completed(parent_key));
+    let writes: Vec<&BTreeMap<String, Value>> = created
+        .iter()
+        .filter_map(|e| match e {
+            Event::VariablesUpdated {
+                instance_key,
+                variables,
+            }
+            | Event::ScopedVariablesUpdated {
+                instance_key,
+                variables,
+                ..
+            } if *instance_key == parent_key => Some(variables),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        writes.iter().all(|v| !v.contains_key("orderId")),
+        "the unchanged orderId must not be rewritten to the parent: {writes:?}"
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|v| v.get("childOnly") == Some(&Value::Int(99))),
+        "the child's new variable still crosses back: {writes:?}"
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|v| v.get("shared") == Some(&Value::Str("child".into()))),
+        "the child's changed variable still crosses back: {writes:?}"
+    );
+}
+
+#[test]
 fn call_activity_propagate_all_child_false_still_applies_output_mappings() {
     // propagateAllChildVariables="false" but WITH an output mapping: only the
     // mapped output crosses back (output mappings always apply), the child's raw

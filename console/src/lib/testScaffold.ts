@@ -36,6 +36,13 @@ export interface ModelEnvelopes {
    * can scope to the selected process instead of conflating them.
    */
   startTargetsByProcess: Map<string, Set<string>>;
+  /**
+   * Process id → the input envelope declared on its **none start event** (a
+   * `bpmn:startEvent` with no event definition). This is the process's declared
+   * start-input type; when present it wins over the entry-task heuristic
+   * `scaffoldStartVars` falls back to.
+   */
+  startEnvelopes: Map<string, string>;
 }
 
 const TASK_TAGS = [
@@ -47,6 +54,10 @@ const TASK_TAGS = [
   "userTask",
   "task",
 ];
+
+/** A `*EventDefinition` tag (`messageEventDefinition`, `timerEventDefinition`,
+ * …) marks its start event as a *typed* start — not a none start. */
+const EVENT_DEFINITION_RE = /<[\w-]*:?[\w-]*EventDefinition\b/;
 
 /** Read an XML attribute off an opening-tag string (`id="x" type="y"`). */
 function attr(tag: string, name: string): string | undefined {
@@ -66,6 +77,7 @@ export function parseModelEnvelopes(xml: string): ModelEnvelopes {
   const shapes = new Map<string, ScaffoldField[]>();
   const startTargets = new Set<string>();
   const startTargetsByProcess = new Map<string, Set<string>>();
+  const startEnvelopes = new Map<string, string>();
 
   // Shapes: <…:shape id="X"> … <…:extend name=".." type=".." optional=".." /> …
   const shapeRe = /<[\w-]*:?shape\b([^>]*)>([\s\S]*?)<\/[\w-]*:?shape>/g;
@@ -117,13 +129,62 @@ export function parseModelEnvelopes(xml: string): ModelEnvelopes {
     const pid = attr(pm[1], "id");
     const targets = collectStartTargets(pm[2]);
     for (const t of targets) startTargets.add(t);
-    if (pid) startTargetsByProcess.set(pid, targets);
+    if (pid) {
+      startTargetsByProcess.set(pid, targets);
+      // The process's declared start input: the `.in` envelope on its none
+      // start event (first one wins, mirroring the server-side scan).
+      const startIn = noneStartEnvelope(pm[2]);
+      if (startIn && !startEnvelopes.has(pid)) startEnvelopes.set(pid, startIn);
+    }
   }
   // Fallback for a fragment with no <process> wrapper: scan the whole xml.
   if (!sawProcess)
     for (const t of collectStartTargets(xml)) startTargets.add(t);
 
-  return { tasks, shapes, startTargets, startTargetsByProcess };
+  return { tasks, shapes, startTargets, startTargetsByProcess, startEnvelopes };
+}
+
+/**
+ * The input envelope declared on a **none start event** within a process body:
+ * the `.in` reserved property of the first `startEvent` carrying no event
+ * definition. A typed start (message/timer/…) is skipped — its envelope lives
+ * on the referenced `bpmn:message`, not the event.
+ */
+function noneStartEnvelope(processBody: string): string | undefined {
+  // Only a *direct* process-level start is the process's entry point; a start
+  // nested in a subprocess must never supply it (mirrors the server-side scan
+  // and engine-core's model). Strip nested subprocess bodies, innermost first.
+  const scope = stripSubProcesses(processBody);
+  const startRe = /<[\w-]*:?startEvent\b([^>]*?)(\/?)>/g;
+  for (let m = startRe.exec(scope); m; m = startRe.exec(scope)) {
+    if (m[2] === "/") {
+      // Self-closing `<startEvent/>`: no children, so a none start — but it can
+      // carry no envelope either; keep looking for an open one.
+      continue;
+    }
+    const rest = scope.slice(startRe.lastIndex);
+    const cm = /<\/[\w-]*:?startEvent>/.exec(rest);
+    // No close tag → malformed; skip rather than scan the rest of the process
+    // as this event's body.
+    if (!cm) continue;
+    const body = rest.slice(0, cm.index);
+    if (EVENT_DEFINITION_RE.test(body)) continue; // a typed start, not none
+    const inVal = propValue(body, ENVELOPE_KEY.inputType);
+    if (inVal) return inVal;
+  }
+  return undefined;
+}
+
+const SUBPROCESS_RE =
+  /<([\w-]*:?(?:subProcess|adHocSubProcess|transaction))\b[^>]*?(?:\/>|>(?:(?!<[\w-]*:?(?:subProcess|adHocSubProcess|transaction)\b)[\s\S])*?<\/\1>)/g;
+
+/** A process body with every (possibly nested) subprocess element removed. */
+function stripSubProcesses(body: string): string {
+  for (;;) {
+    const next = body.replace(SUBPROCESS_RE, "");
+    if (next === body) return next;
+    body = next;
+  }
 }
 
 /** Element ids that a start event flows directly into, within a scope of xml. */
@@ -199,7 +260,9 @@ export function scaffoldJobOutput(
 }
 
 /**
- * The start-instance skeleton: the input envelope of the single service task the
+ * The start-instance skeleton: the input envelope declared on the process's
+ * **none start event** when there is one (the process's authoritative start
+ * input type); otherwise the input envelope of the single service task the
  * start event flows into. Only a lone, unambiguous entry task is scaffolded —
  * otherwise the process input is not model-typed and we yield `"{}"`.
  *
@@ -212,6 +275,14 @@ export function scaffoldStartVars(
   model: ModelEnvelopes,
   processId?: string,
 ): string {
+  // A declared start envelope on the process's none start event is the
+  // authoritative start-input type — it wins over the entry-task heuristic.
+  const declared = processId
+    ? model.startEnvelopes.get(processId)
+    : model.startEnvelopes.size === 1
+      ? [...model.startEnvelopes.values()][0]
+      : undefined;
+  if (declared) return scaffoldForType(model, declared);
   const scoped = processId
     ? model.startTargetsByProcess.get(processId)
     : undefined;
