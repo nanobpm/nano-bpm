@@ -17,7 +17,16 @@
 # output under generated/ and server/src/stub_impls.rs is git-ignored.
 
 SHELL := /usr/bin/env bash
-PROJECT_ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+# Resolve the project root whitespace-safely (#1716). $(CURDIR) is the
+# directory make is running in, set by make itself with the spaced path intact
+# — unlike $(abspath)/$(dir)/$(lastword $(MAKEFILE_LIST)), which word-split a
+# checkout path containing a space (make lists are whitespace-separated). The
+# supported invocation is `make -C <dir>` / `cd <dir> && make`, which chdir
+# into the checkout so $(CURDIR) IS the project root. (`make -f <spaced
+# path>/Makefile` from a space-free cwd is NOT a supported workflow: GNU make
+# cannot express a spaced path in a prerequisite, so the codegen file targets
+# already cannot work from a spaced checkout — see the note below.)
+PROJECT_ROOT := $(CURDIR)
 GENERATED_DIR := $(PROJECT_ROOT)/generated
 CONSOLE_GENERATED_DIR := $(PROJECT_ROOT)/generated-console
 STUB_IMPLS := $(PROJECT_ROOT)/server/src/stub_impls.rs
@@ -90,9 +99,12 @@ FMT_CRATES := $(call encode,$(ENGINE_DIR)) $(call encode,$(PROJECT_ROOT)/server)
 #    workspaces live under `~/Library/Application Support/…`). When the
 #    checkout path contains a space and the caller has NOT chosen a target
 #    dir, we redirect cargo's target dir to a space-free per-checkout hash
-#    under the (space-free) XDG data home. An explicit CARGO_TARGET_DIR with
-#    a space fails fast with a clear message instead of an autoconf error
-#    that looks like a toolchain bug.
+#    under the (space-free) XDG data home. Consumers of a built artifact
+#    (engine-core/scripts/verify-wasm-ffi.mjs, emit-dist.mjs) resolve Cargo's
+#    EFFECTIVE target dir via lib-cargo-target-dir.mjs rather than assuming
+#    engine-core/target. An explicit CARGO_TARGET_DIR with a space fails fast
+#    with a clear message instead of an autoconf error that looks like a
+#    toolchain bug.
 # 2. GNU make cannot express a prerequisite whose path contains a space
 #    (whitespace is the prerequisite separator and backslash-escaping is not
 #    honored on target/prerequisite lines), so the file-target rules for the

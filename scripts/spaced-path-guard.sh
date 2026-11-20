@@ -86,6 +86,27 @@ if grep -nP '^\t' "${MAKEFILE}" | grep -qP '\bcd \$\$d\b'; then
 	fail "fmt/fmt-check loop uses 'cd \$\$d' unquoted — quote it (cd \"\$\$d\") so a spaced FMT_CRATES entry survives (#1716)"
 fi
 
+# PROJECT_ROOT must be resolved whitespace-safely via $(CURDIR) (set by make
+# with the spaced path intact). The whitespace-sensitive make functions
+# $(abspath), $(dir …), and $(lastword $(MAKEFILE_LIST)) word-split a spaced
+# checkout path — guard against a regression to any of them.
+project_root_line=$(grep -nP '^PROJECT_ROOT\s*:?=' "${MAKEFILE}" || true)
+if printf '%s' "${project_root_line}" | grep -qP 'abspath|MAKEFILE_LIST|\$\(dir\b'; then
+	fail "PROJECT_ROOT derives from \$(abspath)/\$(dir)/\$(MAKEFILE_LIST), which word-split a spaced checkout path (#1716) — use PROJECT_ROOT := \$(CURDIR) (make sets it with the spaced path intact)"
+fi
+if ! printf '%s' "${project_root_line}" | grep -qP 'CURDIR'; then
+	fail "PROJECT_ROOT is not \$(CURDIR) (#1716) — use PROJECT_ROOT := \$(CURDIR) so a spaced checkout path survives"
+fi
+
+# new-worktree.sh must pin the space-free target dir via .cargo/config.toml
+# (read by every direct cargo invocation), not a direnv .envrc that nothing
+# sources without a configured direnv hook. Match an actual .envrc WRITE
+# (> …/.envrc), not a comment mentioning the word.
+NEW_WORKTREE="${ROOT}/scripts/new-worktree.sh"
+if [ -f "${NEW_WORKTREE}" ] && grep -qP '>\s*\S*\.envrc' "${NEW_WORKTREE}"; then
+	fail "scripts/new-worktree.sh writes a direnv .envrc for CARGO_TARGET_DIR — nothing sources it, so direct cargo runs still build under the spaced worktree (#1716). Pin [build] target-dir in the worktree's .cargo/config.toml instead"
+fi
+
 # --- 2. Functional probe: run fmt-check from a directory whose path has a ----
 # --- space. Opt-in: needs the pinned nightly rustfmt + codegen stubs.      ---
 if [ "${NANOBPMN_SPACED_PROBE:-0}" = 1 ]; then
@@ -122,9 +143,12 @@ if [ "${NANOBPMN_SPACED_PROBE:-0}" = 1 ]; then
 	(
 		cd "${probe}"
 		./scripts/fmt-stub-codegen.sh
-		make fmt-check
+		# Exercise the supported invocation against the spaced path (#1716):
+		# `make -C <spaced dir>` (make chdirs, so $(CURDIR) is the spaced
+		# project root). `cd "${probe}" && make fmt-check` is the same thing.
+		make -C "${probe}" fmt-check
 	)
-	echo "spaced-path-guard: fmt-check passed from '${probe}'"
+	echo "spaced-path-guard: fmt-check passed from '${probe}' (make -C)"
 else
 	echo "spaced-path-guard: textual guard passed (set NANOBPMN_SPACED_PROBE=1 for the functional fmt-check probe)"
 fi

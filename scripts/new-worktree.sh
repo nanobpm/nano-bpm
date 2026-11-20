@@ -56,10 +56,14 @@ fi
 
 # A spaced worktree path breaks tikv-jemalloc-sys's autoconf configure when
 # CARGO_TARGET_DIR resolves under it (#1716). Default the target dir for this
-# worktree to a space-free path via a direnv-style .envrc the agent shell
-# sources, unless the caller already exported a CARGO_TARGET_DIR. A caller-set
-# value with a space is rejected with a clear message instead of an autoconf
-# error that looks like a toolchain bug.
+# worktree to a space-free path via the worktree's .cargo/config.toml — Cargo
+# reads build.target-dir from config on EVERY invocation, so direct `cargo`
+# runs honor it (a direnv .envrc would not: nothing sources it without a
+# configured direnv hook) — unless the caller already exported a
+# CARGO_TARGET_DIR (which overrides config). A caller-set value with a space
+# is rejected with a clear message instead of an autoconf error that looks
+# like a toolchain bug.
+wt_target_dir=""
 if [[ "$wt" = *" "* ]]; then
     if [ -n "${CARGO_TARGET_DIR:-}" ]; then
         if [[ "$CARGO_TARGET_DIR" = *" "* ]]; then
@@ -69,8 +73,10 @@ if [[ "$wt" = *" "* ]]; then
         fi
     else
         hash=$(printf '%s' "$wt" | cksum | cut -d' ' -f1)
-        printf 'export CARGO_TARGET_DIR=%s\n' "$HOME/.local/share/nanobpm/target/$hash" > "$wt/.envrc"
-        echo "note: worktree path contains a space; wrote $wt/.envrc with a space-free CARGO_TARGET_DIR (#1716)" >&2
+        wt_target_dir="$HOME/.local/share/nanobpm/target/$hash"
+        mkdir -p "$wt/.cargo"
+        printf '[build]\ntarget-dir = "%s"\n' "$wt_target_dir" > "$wt/.cargo/config.toml"
+        echo "note: worktree path contains a space; pinned a space-free CARGO_TARGET_DIR via $wt/.cargo/config.toml (#1716)" >&2
     fi
 fi
 
@@ -84,13 +90,20 @@ cow_clone() {
 }
 
 seed_target() {
-    local from="$seed/server/target/debug" to="$wt/server/target/debug"
+    # When the worktree's target dir is redirected to a space-free path
+    # (#1716), Cargo writes <target-dir>/debug directly (no workspace subdir),
+    # so seed the REDIRECTED dir and keep the two aligned.
+    local target_root="$wt/server/target"
+    if [ -n "$wt_target_dir" ]; then
+        target_root="$wt_target_dir"
+    fi
+    local from="$seed/server/target/debug" to="$target_root/debug"
     if [ ! -d "$from/deps" ]; then
         echo "seed: no $from/deps; building cold" >&2
         return 0
     fi
     mkdir -p "$to"
-    [ -f "$seed/server/target/CACHEDIR.TAG" ] && cp "$seed/server/target/CACHEDIR.TAG" "$wt/server/target/"
+    [ -f "$seed/server/target/CACHEDIR.TAG" ] && cp "$seed/server/target/CACHEDIR.TAG" "$target_root/"
     # Skip incremental/: it is keyed by absolute path, so another checkout's
     # session cache is never reused.
     local d
@@ -98,11 +111,11 @@ seed_target() {
         [ -d "$from/$d" ] || continue
         if ! cow_clone "$from/$d" "$to/$d"; then
             echo "seed: filesystem can't copy-on-write clone; building cold" >&2
-            rm -rf "$wt/server/target"
+            rm -rf "$target_root"
             return 0
         fi
     done
-    echo "seed: cloned server/target/debug from $seed" >&2
+    echo "seed: cloned server/target/debug from $seed into $target_root" >&2
 }
 
 seed_target &
