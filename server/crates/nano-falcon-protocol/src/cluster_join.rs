@@ -166,10 +166,7 @@ pub fn parse_release_triple(tag: &str) -> Option<(u64, u64, u64)> {
 /// The boundary `local_version` and `peer_version` straddle, if any: the
 /// first declared boundary at or above the HIGHER of the two versions that
 /// the LOWER sits below. `None` when either version is not a release tag.
-fn straddled_boundary<'v>(
-    local_version: &'v str,
-    peer_version: &'v str,
-) -> Option<&'static UpgradeBoundary> {
+fn straddled_boundary(local_version: &str, peer_version: &str) -> Option<&'static UpgradeBoundary> {
     let local = parse_release_triple(local_version)?;
     let peer = parse_release_triple(peer_version)?;
     if local == peer {
