@@ -672,6 +672,19 @@ impl Inner {
                     t.elements[idx].scope = *scope;
                 }
             }
+            Event::ElementTerminated {
+                instance_key,
+                element_instance_key,
+                ..
+            } => {
+                // Interrupted (#1535): the element exits without completing.
+                if let Some(t) = self.instances.get_mut(instance_key) {
+                    t.last_at = now;
+                    if let Some(&idx) = t.by_eik.get(element_instance_key) {
+                        t.elements[idx].exited_at = Some(now);
+                    }
+                }
+            }
             Event::ElementCompleted {
                 instance_key,
                 element_instance_key,

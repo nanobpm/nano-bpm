@@ -259,6 +259,22 @@ pub struct Engine {
     /// container instance (durable from then on). Cleared per command, like
     /// [`torn_down_scopes`](Self::torn_down_scopes).
     esp_start_payloads: BTreeMap<(Key, Key, String), BTreeMap<String, Value>>,
+    /// Event payloads (message / signal variables) of a boundary event that
+    /// just fired, keyed by `(instance_key, flow_scope_key,
+    /// boundary_element_id)` (#1535, Zeebe parity): Zeebe creates the payload
+    /// LOCAL to the boundary event instance, then propagates it (or only its
+    /// output-mapped targets). The boundary's activation is queued in the SAME
+    /// drain as the correlation, so this in-drain scratch bridges the two;
+    /// cleared per command like [`esp_start_payloads`](Self::esp_start_payloads).
+    ///
+    /// The value is a FIFO **queue**, not a single payload: one broadcast can
+    /// reach several instances of the same activity in one flow scope (e.g. a
+    /// signal caught by the same boundary on two concurrent multi-instance
+    /// hosts sharing a scope). Each queued boundary activation pops exactly one
+    /// payload, so every host gets its own copy — a single overwritten entry
+    /// would hand the whole payload to the first activation and leave the rest
+    /// reading a missing (or, for output-mapped boundaries, stale) payload.
+    boundary_payloads: BTreeMap<(Key, Key, String), VecDeque<BTreeMap<String, Value>>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -682,6 +698,7 @@ impl Engine {
             retired_tombstones: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
+            boundary_payloads: BTreeMap::new(),
             raft_applied: None,
         }
     }
@@ -852,6 +869,7 @@ impl Engine {
             retired_tombstones: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
+            boundary_payloads: BTreeMap::new(),
             raft_applied,
         }
     }
@@ -2560,6 +2578,7 @@ impl Engine {
         // this one's dead-scope guard.
         self.torn_down_scopes.clear();
         self.esp_start_payloads.clear();
+        self.boundary_payloads.clear();
         // Per-command terminal-deadline stamp (#1494): set from THIS command
         // only (or cleared), never inherited from a previous one.
         self.terminal_deadline_stamp = match &command {
@@ -3888,6 +3907,12 @@ impl Engine {
                         let boundary_scope = self.scope_of(instance_key, caught_eik);
                         // When caught at an enclosing sub-process, terminate its
                         // whole inner scope (including the throwing task) first.
+                        let [terminating, terminated] = boundary::termination_events(
+                            instance_key,
+                            caught_eik,
+                            caught_element_id,
+                        );
+                        self.emit(&mut log, terminating);
                         if caught_eik != element_instance_key {
                             self.terminate_subprocess_scope(&mut log, instance_key, caught_eik);
                         }
@@ -3932,22 +3957,7 @@ impl Engine {
                                 },
                             );
                         }
-                        self.emit(
-                            &mut log,
-                            Event::ElementCompleting {
-                                instance_key,
-                                element_instance_key: caught_eik,
-                                element_id: caught_element_id.clone(),
-                            },
-                        );
-                        self.emit(
-                            &mut log,
-                            Event::ElementCompleted {
-                                instance_key,
-                                element_instance_key: caught_eik,
-                                element_id: caught_element_id,
-                            },
-                        );
+                        self.emit(&mut log, terminated);
                         // An error boundary interrupting the activity also disarms
                         // any timer boundaries and message subscriptions on it.
                         for event in self.cancel_boundary_timers_on(caught_eik) {
@@ -8343,7 +8353,26 @@ impl Engine {
         // visible to its own activation-time expressions (listener job types,
         // input mappings) as well.
         let mut view_overlay = None;
-        if let Some(payload) = self.held_esp_start_payload(instance_key, &element_id, scope) {
+        // A boundary event's trigger payload (#1535) is likewise LOCAL to the
+        // boundary instance; with no output mappings Zeebe then propagates the
+        // whole payload to the flow scope (an output-mapped boundary
+        // propagates only its mapped targets, on completion). Each queued
+        // boundary activation pops ONE payload from the per-key FIFO (several
+        // same-scope hosts of one activity each queue their own), so a broadcast
+        // hands every host its own copy.
+        let boundary_payload = self
+            .boundary_payloads
+            .get_mut(&(instance_key, scope, element_id.clone()))
+            .and_then(VecDeque::pop_front);
+        let propagate_boundary_payload = boundary_payload.clone().filter(|_| {
+            !self
+                .process_of_instance(instance_key)
+                .and_then(|p| p.element(&element_id))
+                .is_some_and(|e| !e.io.outputs.is_empty())
+        });
+        if let Some(payload) = boundary_payload
+            .or_else(|| self.held_esp_start_payload(instance_key, &element_id, scope))
+        {
             if !(is_sub_process || is_adhoc_container || has_listeners) {
                 events.push(Event::VariableScopeCreated {
                     instance_key,
@@ -8357,6 +8386,9 @@ impl Engine {
                 variables: payload.clone(),
             });
             view_overlay = Some(payload);
+        }
+        if let Some(payload) = propagate_boundary_payload {
+            events.extend(self.propagated_updates(instance_key, scope, payload, false));
         }
         let (body_events, body_followups) = match view_overlay {
             None => self.activate_body(
@@ -14829,11 +14861,18 @@ impl Engine {
                     (caught_eik, caught_element_id)
                 };
                 let boundary_scope = self.scope_of(instance_key, torn_eik);
+                // TERMINATING before the inner scope's teardown, TERMINATED
+                // after it (#1535, Zeebe parity).
+                let [terminating, terminated] =
+                    boundary::termination_events(instance_key, torn_eik, torn_element_id.clone());
+                events.push(terminating);
                 for event in self.scope_teardown_events(instance_key, torn_eik) {
                     if matches!(
                         &event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
                             | Event::ElementCompleted { element_instance_key: eik, .. }
+                            | Event::ElementTerminating { element_instance_key: eik, .. }
+                            | Event::ElementTerminated { element_instance_key: eik, .. }
                             if *eik == throw_eik
                     ) {
                         continue;
@@ -14853,16 +14892,7 @@ impl Engine {
                     events.push(event);
                 }
                 self.torn_down_scopes.insert(torn_eik);
-                events.push(Event::ElementCompleting {
-                    instance_key,
-                    element_instance_key: torn_eik,
-                    element_id: torn_element_id.clone(),
-                });
-                events.push(Event::ElementCompleted {
-                    instance_key,
-                    element_instance_key: torn_eik,
-                    element_id: torn_element_id,
-                });
+                events.push(terminated);
                 for event in self.cancel_boundary_timers_on(torn_eik) {
                     events.push(event);
                 }
@@ -14989,11 +15019,21 @@ impl Engine {
                 // already in `events` (and it already rests in COMPLETING, so a
                 // duplicate `ElementCompleting` is dropped — one per element
                 // instance, as in Zeebe).
+                // TERMINATING before the inner scope's teardown, TERMINATED
+                // after it (#1535, Zeebe parity).
+                let [terminating, terminated] = boundary::termination_events(
+                    instance_key,
+                    caught_eik,
+                    caught_element_id.clone(),
+                );
+                events.push(terminating);
                 for event in self.scope_teardown_events(instance_key, caught_eik) {
                     if matches!(
                         &event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
                         | Event::ElementCompleted { element_instance_key: eik, .. }
+                        | Event::ElementTerminating { element_instance_key: eik, .. }
+                        | Event::ElementTerminated { element_instance_key: eik, .. }
                             if *eik == throw_eik
                     ) {
                         continue;
@@ -15008,16 +15048,7 @@ impl Engine {
                     events.push(event);
                 }
                 self.torn_down_scopes.insert(caught_eik);
-                events.push(Event::ElementCompleting {
-                    instance_key,
-                    element_instance_key: caught_eik,
-                    element_id: caught_element_id.clone(),
-                });
-                events.push(Event::ElementCompleted {
-                    instance_key,
-                    element_instance_key: caught_eik,
-                    element_id: caught_element_id,
-                });
+                events.push(terminated);
                 // Interrupting the activity also disarms any sibling boundary
                 // timers and message/signal/conditional subscriptions on it.
                 for event in self.cancel_boundary_timers_on(caught_eik) {
@@ -15611,6 +15642,8 @@ impl Engine {
                         event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
                         | Event::ElementCompleted { element_instance_key: eik, .. }
+                        | Event::ElementTerminating { element_instance_key: eik, .. }
+                        | Event::ElementTerminated { element_instance_key: eik, .. }
                             if *eik == element_instance_key
                     )
                 }),

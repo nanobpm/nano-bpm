@@ -1040,6 +1040,35 @@ impl<'a> NanoRun<'a> {
                     *instance_key,
                 )]
             }
+            // An interrupted / torn-down element (#1535): rendered 1:1, and it
+            // leaves the active set exactly as a completion does (so a later
+            // process-level termination does not re-terminate it).
+            Event::ElementTerminating {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                vec![self.lifecycle(
+                    "ELEMENT_TERMINATING",
+                    element_id,
+                    *element_instance_key,
+                    *instance_key,
+                )]
+            }
+            Event::ElementTerminated {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                self.active_elements
+                    .retain(|(eik, _, _)| eik != element_instance_key);
+                vec![self.lifecycle(
+                    "ELEMENT_TERMINATED",
+                    element_id,
+                    *element_instance_key,
+                    *instance_key,
+                )]
+            }
             Event::MultiInstanceActivated {
                 instance_key,
                 body_key,

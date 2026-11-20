@@ -79,7 +79,11 @@ export function foldSimTrace(
       case "ElementActivated":
         element(s(e.element_instance_key), s(e.element_id), at);
         break;
-      case "ElementCompleted": {
+      case "ElementCompleted":
+      case "ElementTerminated": {
+        // A boundary/event-sub-process interruption ends the lane TERMINATED
+        // (#1535); close it exactly like a completion so the timeline stops the
+        // element's clock instead of leaving `exitedAt`/`durationMs` null.
         const idx = byEik.get(s(e.element_instance_key));
         if (idx !== undefined) elements[idx].exitedAt = at;
         break;

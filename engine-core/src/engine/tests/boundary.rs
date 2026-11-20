@@ -868,7 +868,7 @@ fn should_interrupt_an_embedded_subprocess_via_its_error_boundary() {
     // normal flow, and the boundary routes to the sad-flow path.
     assert!(events.iter().any(|e| matches!(
         e,
-        Event::ElementCompleted { element_id, .. } if element_id == "inner"
+        Event::ElementTerminated { element_id, .. } if element_id == "inner"
     )));
     assert!(events.iter().any(|e| matches!(
         e,
@@ -989,7 +989,7 @@ fn should_interrupt_an_embedded_subprocess_via_a_timer_boundary() {
     );
     assert!(fired.iter().any(|e| matches!(
         e,
-        Event::ElementCompleted { element_id, .. } if element_id == "inner"
+        Event::ElementTerminated { element_id, .. } if element_id == "inner"
     )));
     assert!(fired.iter().any(|e| matches!(
         e,
@@ -1033,7 +1033,7 @@ fn should_interrupt_an_embedded_subprocess_via_a_message_boundary() {
     );
     assert!(fired.iter().any(|e| matches!(
         e,
-        Event::ElementCompleted { element_id, .. } if element_id == "inner"
+        Event::ElementTerminated { element_id, .. } if element_id == "inner"
     )));
     assert!(fired.iter().any(|e| matches!(
         e,
@@ -1109,6 +1109,154 @@ fn interrupting_a_call_activity_via_a_boundary_cancels_its_child() {
     assert!(engine.is_completed(parent_key));
     // No orphaned job survives.
     assert!(engine.pending_jobs().is_empty());
+}
+
+/// Review round-2 (#1535): when a boundary interrupt tears down a scope that
+/// holds a NESTED call activity (a sub-process whose inner call activity parks a
+/// child process instance), the parent's `ElementTerminating` must be emitted
+/// BEFORE the descendant call-child's teardown (`discard_instance_events(child)`
+/// emits the child's `ProcessInstanceTerminated`). Emitting the child's
+/// termination first reverses Zeebe's parent-before-child termination order.
+#[test]
+fn boundary_teardown_emits_parent_terminating_before_nested_call_child() {
+    // mid: start -> sub [ sub_start -> callInner(call activity -> leaf) ]
+    //      sub --(interrupting timer boundary "timeout")--> escaped
+    let leaf = ProcessBuilder::new("leaf")
+        .start_event("lstart")
+        .service_task("leafwork", "leaf-job")
+        .end_event("lend")
+        .connect("lstart", "leafwork")
+        .connect("leafwork", "lend")
+        .build()
+        .unwrap();
+    let mid = ProcessBuilder::new("mid")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .call_activity("callInner", "leaf")
+        .contained_in("callInner", "sub")
+        .timer_boundary_event("timeout", "sub", 5_000)
+        .end_event("done")
+        .end_event("escaped")
+        .connect("start", "sub")
+        .connect("sub_start", "callInner")
+        .connect("sub", "done")
+        .connect("timeout", "escaped")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(leaf)).unwrap();
+    engine.apply_command(Command::DeployProcess(mid)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("mid"), 1_000)
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // The nested call activity spawned a grandchild "leaf" instance parked on
+    // its job.
+    let leaf_key = engine
+        .pending_jobs()
+        .first()
+        .expect("leaf child parked on its job")
+        .instance_key;
+    assert_ne!(leaf_key, parent_key);
+
+    // Fire the boundary: it interrupts `sub`, tearing down the nested call
+    // activity and its parked "leaf" child instance.
+    let fired = engine.trigger_timers(6_000);
+
+    // `sub`'s TERMINATING must precede the leaf child instance's TERMINATED.
+    let sub_terminating = fired
+        .iter()
+        .position(
+            |e| matches!(e, Event::ElementTerminating { element_id, .. } if element_id == "sub"),
+        )
+        .expect("sub emits ElementTerminating");
+    let leaf_terminated = fired
+        .iter()
+        .position(|e| matches!(e, Event::ProcessInstanceTerminated { instance_key } if *instance_key == leaf_key))
+        .expect("the nested call child is terminated");
+    assert!(
+        sub_terminating < leaf_terminated,
+        "parent TERMINATING (idx {sub_terminating}) precedes the descendant call-child's termination (idx {leaf_terminated}): {fired:?}"
+    );
+    // And `sub`'s own TERMINATED lands after the child's teardown.
+    let sub_terminated = fired
+        .iter()
+        .position(
+            |e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "sub"),
+        )
+        .expect("sub emits ElementTerminated");
+    assert!(
+        leaf_terminated < sub_terminated,
+        "the child's teardown completes before the parent's TERMINATED"
+    );
+}
+
+/// Review round-2 (#1535): one signal broadcast can reach the SAME boundary
+/// event on two concurrent instances of one activity in the SAME flow scope (a
+/// parallel split routing two tokens into the same task). Each queued boundary
+/// activation must carry its OWN trigger payload: keying the hold by
+/// `(flow_scope, boundary_id)` and removing it on the first activation leaves
+/// the second activation reading a missing payload — and for an output-mapped
+/// boundary its mappings then read stale/absent values. The hold is a per-key
+/// FIFO, so each activation pops one.
+#[test]
+fn one_broadcast_hands_each_same_scope_boundary_host_its_payload() {
+    // fork routes TWO tokens into the SAME task "work" (two parallel instances
+    // in the root scope), each arming the interrupting signal boundary "abort"
+    // (output-mapped `=payload -> mapped`). One broadcast interrupts BOTH.
+    let def = ProcessBuilder::new("same-scope-hosts")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("work", "w")
+        .signal_boundary_event("abort", "work", "kill-switch")
+        .with_io(
+            "abort",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=payload".to_string(),
+                    target: "mapped".to_string(),
+                }],
+            },
+        )
+        .service_task("after", "after-work")
+        .connect("start", "fork")
+        .connect("fork", "work")
+        .connect("fork", "work")
+        .connect("abort", "after")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("same-scope-hosts"))
+        .unwrap();
+    // Two parallel instances of "work" in the root scope each opened a boundary
+    // signal subscription.
+    let subs = engine.signal_subscriptions();
+    assert_eq!(
+        subs.len(),
+        2,
+        "two live same-scope boundary hosts: {subs:?}"
+    );
+
+    let fired = engine.broadcast_signal("kill-switch", vars(&[("payload", Value::Int(42))]), 0);
+
+    // Each of the two boundary activations received the payload LOCALLY (the
+    // `payload` variable seeded on its own boundary element-instance scope) —
+    // not one shared, first-come-only entry.
+    let local_payloads = fired
+        .iter()
+        .filter(|e| matches!(e, Event::ScopedVariablesUpdated { variables, .. } if variables.get("payload") == Some(&Value::Int(42))))
+        .count();
+    assert_eq!(
+        local_payloads, 2,
+        "both same-scope boundary hosts received their own payload: {fired:?}"
+    );
 }
 
 #[test]
@@ -1668,4 +1816,184 @@ fn error_boundary_caught_at_a_subprocess_resolves_a_root_incident() {
         e,
         Event::SequenceFlowTaken { from, to, .. } if from == "catch" && to == "sad"
     )));
+}
+
+/// #1535 (Zeebe parity): an activity interrupted by an interrupting boundary
+/// is TERMINATED, never COMPLETED — completion and termination drive
+/// different listeners, metrics and compensation eligibility — and a resting
+/// user task on it is CANCELED (it must not stay claimable/completable
+/// against a vanished element).
+#[test]
+fn interrupting_boundary_terminates_the_activity_and_cancels_its_user_task() {
+    let def = ProcessBuilder::new("ut-timeout")
+        .start_event("start")
+        .user_task("review")
+        .timer_boundary_event("timeout", "review", 5_000)
+        .end_event("end")
+        .end_event("timed-out")
+        .connect("start", "review")
+        .connect("review", "end")
+        .connect("timeout", "timed-out")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("ut-timeout"), 1_000)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let user_task_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("the user task is created");
+
+    let fired = engine.trigger_timers(6_000);
+    let review_lifecycle: Vec<&Event> = fired
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::ElementCompleting { element_id, .. }
+                    | Event::ElementCompleted { element_id, .. }
+                    | Event::ElementTerminating { element_id, .. }
+                    | Event::ElementTerminated { element_id, .. }
+                    if element_id == "review"
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            review_lifecycle.as_slice(),
+            [
+                Event::ElementTerminating { .. },
+                Event::ElementTerminated { .. }
+            ]
+        ),
+        "the interrupted task is terminated, not completed: {review_lifecycle:?}"
+    );
+    let canceled_at = fired
+        .iter()
+        .position(|e| {
+            matches!(e, Event::UserTaskCanceled { user_task_key: k, .. } if *k == user_task_key)
+        })
+        .expect("the interrupted user task is canceled");
+    let terminated_at = fired
+        .iter()
+        .position(
+            |e| matches!(e, Event::ElementTerminated { element_id, .. } if element_id == "review"),
+        )
+        .unwrap();
+    assert!(
+        canceled_at < terminated_at,
+        "USER_TASK CANCELED precedes TERMINATED"
+    );
+    assert!(fired.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "timed-out"
+    )));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// The lifecycle records an element emits between activation and its final
+/// rest, in order: Completing/Completed/Terminating/Terminated only.
+fn lifecycle_of<'e>(events: &'e [Event], id: &str) -> Vec<&'e Event> {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::ElementCompleting { element_id, .. }
+                    | Event::ElementCompleted { element_id, .. }
+                    | Event::ElementTerminating { element_id, .. }
+                    | Event::ElementTerminated { element_id, .. }
+                    if element_id == id
+            )
+        })
+        .collect()
+}
+
+/// #1535 (Zeebe parity): an activity interrupted by an interrupting MESSAGE
+/// boundary is TERMINATED, never COMPLETED — the same teardown contract as an
+/// interrupting timer boundary.
+#[test]
+fn interrupting_message_boundary_terminates_the_activity() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_boundary()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "cancellable",
+            vars(&[("orderId", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+
+    let fired = engine.correlate_message("order-cancelled", "A", BTreeMap::new(), 0);
+    let charge_lifecycle = lifecycle_of(&fired, "charge");
+    assert!(
+        matches!(
+            charge_lifecycle.as_slice(),
+            [
+                Event::ElementTerminating { .. },
+                Event::ElementTerminated { .. }
+            ]
+        ),
+        "the message-interrupted task is terminated, not completed: {charge_lifecycle:?}"
+    );
+}
+
+/// #1535 (Zeebe parity): a NON-interrupting boundary does NOT terminate its
+/// host — the host completes normally once its work finishes; only the
+/// boundary's own parallel token runs.
+#[test]
+fn non_interrupting_message_boundary_does_not_terminate_the_activity() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            process_with_non_interrupting_message_boundary(),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "notifiable",
+            vars(&[("orderId", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    let job_key = engine.pending_jobs()[0].key;
+
+    // The boundary fires: the host task must NOT be terminated.
+    let fired = engine.correlate_message("reminder", "A", BTreeMap::new(), 0);
+    let charge_lifecycle = lifecycle_of(&fired, "charge");
+    assert!(
+        charge_lifecycle.is_empty(),
+        "a non-interrupting boundary emits no host lifecycle record: {charge_lifecycle:?}"
+    );
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::ElementTerminating { .. } | Event::ElementTerminated { .. }
+        )),
+        "a non-interrupting boundary terminates nothing: {fired:?}"
+    );
+
+    // The host then completes NORMALLY (Completing -> Completed) once its job
+    // finishes — never Terminating/Terminated.
+    engine.activate_jobs("payment", "w", 1, 60_000, 0);
+    let completed = engine
+        .apply_command(Command::complete_job(job_key))
+        .unwrap();
+    let charge_lifecycle = lifecycle_of(&completed, "charge");
+    assert!(
+        matches!(
+            charge_lifecycle.as_slice(),
+            [
+                Event::ElementCompleting { .. },
+                Event::ElementCompleted { .. }
+            ]
+        ),
+        "the uninterrupted host completes, it is not terminated: {charge_lifecycle:?}"
+    );
 }

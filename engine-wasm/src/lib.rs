@@ -2452,7 +2452,7 @@ impl TestEngine {
 
     /// The debug state DTO returned by every `debug*` method: whether the run is
     /// paused, the current event count, and the elements currently active (an
-    /// `ElementActivated` with no matching `ElementCompleted`) — the set a diagram
+    /// `ElementActivated` with no matching `ElementCompleted`/`ElementTerminated`) — the set a diagram
     /// view highlights while paused.
     fn debug_state(&self) -> serde_json::Value {
         serde_json::json!({
