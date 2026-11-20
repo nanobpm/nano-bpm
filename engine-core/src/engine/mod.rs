@@ -10133,6 +10133,19 @@ impl Engine {
             completion_condition: mi.completion_condition.clone(),
             cancel_remaining_instances: mi.cancel_remaining_instances,
         });
+        // Zeebe `MultiInstanceBodyProcessor.onActivate` →
+        // `initializeOutputCollection` (#1534): a named `outputCollection` is
+        // created LOCAL to the body, one `null` slot per input element, so the
+        // children (and exporters) observe it while the loop runs. Each child
+        // completion rewrites its slot (`complete_mi_child`); body completion
+        // propagates the aggregate to the flow scope.
+        if let Some(name) = &mi.output_collection {
+            events.push(Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key: body_key,
+                variables: BTreeMap::from([(name.clone(), Value::List(vec![Value::Null; total]))]),
+            });
+        }
 
         // Arm timers/subscriptions for every boundary event attached to the
         // multi-instance activity, ON THE BODY. A boundary on an MI activity
@@ -11225,8 +11238,16 @@ impl Engine {
             body_key,
             child_key: child_eik,
             index,
-            output,
+            output: output.clone(),
         });
+        // Zeebe `MultiInstanceBodyProcessor.updateOutputCollection` (#1534):
+        // the completing child's slot is written into the BODY-local
+        // `outputCollection` — only when it actually changes (Zeebe's
+        // `VariableBehavior` writes no record for a same-value merge).
+        if let Some(update) = self.mi_body_collection_update(instance_key, body_key, index, output)
+        {
+            events.push(update);
+        }
 
         let mut followups = Vec::new();
         // `active_now` still counts this child (its removal event above is not yet
@@ -11341,6 +11362,43 @@ impl Engine {
                         .collect(),
                 ),
             )])
+        })
+    }
+
+    /// The body-local `outputCollection` write for child `index` completing
+    /// with `output` (#1534): the collection as it stands (`output_values`,
+    /// the single authority the body-scope binding mirrors) with slot `index`
+    /// replaced — `None` when the body names no collection or the slot value
+    /// is unchanged.
+    fn mi_body_collection_update(
+        &self,
+        instance_key: Key,
+        body_key: Key,
+        index: usize,
+        output: Option<Value>,
+    ) -> Option<Event> {
+        let mi = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .multi_instances
+            .get(&body_key)?;
+        let name = mi.output_collection.clone()?;
+        let mut slots: Vec<Value> = mi
+            .output_values
+            .iter()
+            .map(|o| o.clone().unwrap_or(Value::Null))
+            .collect();
+        let new = output.unwrap_or(Value::Null);
+        let slot = slots.get_mut(index)?;
+        if *slot == new {
+            return None;
+        }
+        *slot = new;
+        Some(Event::ScopedVariablesUpdated {
+            instance_key,
+            scope_key: body_key,
+            variables: BTreeMap::from([(name, Value::List(slots))]),
         })
     }
 

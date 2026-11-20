@@ -606,6 +606,64 @@ fn parallel_multi_instance_collects_output_collection_in_order() {
 }
 
 #[test]
+fn multi_instance_output_collection_is_body_local_while_looping() {
+    // Zeebe `MultiInstanceBodyProcessor.onActivate` creates the named
+    // `outputCollection` LOCAL to the body as `[null, ...]` (#1534), and each
+    // completing child rewrites its slot there; the flow scope sees the
+    // collection only once the body completes. A child must observe it.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(true)))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let body_seed = created.iter().any(|e| {
+        matches!(e, Event::ScopedVariablesUpdated { scope_key, variables, .. }
+            if *scope_key != key
+                && variables.get("results")
+                    == Some(&Value::List(vec![Value::Null, Value::Null])))
+    });
+    assert!(
+        body_seed,
+        "body-local results seeded with nulls: {created:?}"
+    );
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        None,
+        "not on the flow scope while the body runs"
+    );
+
+    let first = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].variables.get("results"),
+        Some(&Value::List(vec![Value::Null, Value::Null]))
+    );
+    engine
+        .apply_command(Command::complete_job(first[0].key))
+        .unwrap();
+    let second = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        second[0].variables.get("results"),
+        Some(&Value::List(vec![Value::Int(2), Value::Null])),
+        "first child's slot written into the body-local collection"
+    );
+    engine
+        .apply_command(Command::complete_job(second[0].key))
+        .unwrap();
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(2), Value::Int(4)]))
+    );
+}
+
+#[test]
 fn multi_instance_input_mapping_cannot_clobber_loop_counter() {
     // A malicious/careless `zeebe:input` mapping targeting the reserved
     // `loopCounter` binding must not corrupt the engine-owned loop counter:

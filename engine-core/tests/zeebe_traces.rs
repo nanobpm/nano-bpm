@@ -515,15 +515,6 @@ struct NanoRun<'a> {
     /// non-interrupting message carrying the same payload, #1555); nano's
     /// merge event still names it, so the general path suppresses the no-op.
     values: BTreeMap<(Key, String), J>,
-    /// Each live multi-instance body's `outputCollection` accumulator:
-    /// body element-instance key -> (collection variable name, per-index slots).
-    /// Zeebe seeds the collection on the BODY scope as a list of nulls when the
-    /// body activates (VARIABLE CREATED) and rewrites slot `index` as each child
-    /// completes (VARIABLE UPDATED on the body scope); nano records the same
-    /// values in `MultiInstanceActivated` / `MultiInstanceChildCompleted`, so the
-    /// adapter renders Zeebe's records from them. Only bodies NAMING an
-    /// `outputCollection` appear here.
-    mi_output: BTreeMap<Key, (String, Vec<J>)>,
     /// Each multi-instance body's `inputElement` name: Zeebe creates the
     /// child's `inputElement` variable FIRST, then the `outputElement` seed,
     /// then `loopCounter` (#1528), so the child renderer needs it to order.
@@ -569,7 +560,6 @@ impl<'a> NanoRun<'a> {
             subscription_scopes: BTreeMap::new(),
             known: BTreeMap::new(),
             values: BTreeMap::new(),
-            mi_output: BTreeMap::new(),
             mi_input_element: BTreeMap::new(),
         }
     }
@@ -1095,9 +1085,7 @@ impl<'a> NanoRun<'a> {
             Event::MultiInstanceActivated {
                 instance_key,
                 body_key,
-                items,
                 input_element,
-                output_collection,
                 ..
             } => {
                 if let Some(name) = input_element {
@@ -1109,32 +1097,10 @@ impl<'a> NanoRun<'a> {
                 // by the `ElementActivating` arm above; kept as the belt-and-
                 // braces record for a listener-deferred fan-out.
                 self.mi_bodies.insert(*body_key, *instance_key);
-                // Zeebe seeds a named `outputCollection` on the BODY scope as a
-                // list of nulls (one per child) when the body activates
-                // (`MultiInstanceBodyProcessor` — either a nil variable or an
-                // `=results` expression initialised from nil), so the golden has
-                // a body-scope VARIABLE CREATED nano has no event for. Render it
-                // here and track the accumulator for the per-child updates.
-                match output_collection {
-                    Some(name) => {
-                        let slots = vec![J::Null; items.len()];
-                        self.mi_output
-                            .insert(*body_key, (name.clone(), slots.clone()));
-                        let label = self
-                            .element_ids
-                            .get(body_key)
-                            .cloned()
-                            .unwrap_or_else(|| format!("?{body_key}"));
-                        vec![self.variable_record(
-                            *body_key,
-                            label,
-                            name,
-                            J::Array(slots),
-                            *instance_key,
-                        )]
-                    }
-                    None => Vec::new(),
-                }
+                // The body-local `outputCollection` seed (#1534) is a real
+                // engine `ScopedVariablesUpdated` on the body scope, rendered
+                // by the general variable path.
+                Vec::new()
             }
             Event::SequenceFlowTaken {
                 instance_key,
@@ -1200,45 +1166,6 @@ impl<'a> NanoRun<'a> {
                     input_element.as_deref(),
                     *instance_key,
                 )
-            }
-            // A multi-instance child's completion records its output at `index`
-            // in the body's `outputCollection`: Zeebe writes the updated
-            // collection to the BODY scope (VARIABLE UPDATED) — but only when
-            // the completing child actually CHANGES its slot. A null output
-            // into a slot still holding its seeded null is no write in Zeebe
-            // (the `g-9` golden has no body-scope update for it), so emitting
-            // one here would fabricate a divergence. Nano carries the same
-            // value in the event, so the adapter renders Zeebe's record from
-            // the tracked accumulator.
-            Event::MultiInstanceChildCompleted {
-                instance_key,
-                body_key,
-                index,
-                output,
-                ..
-            } => {
-                let Some((name, slots)) = self.mi_output.get_mut(body_key) else {
-                    return Vec::new();
-                };
-                let new = output.as_ref().map(to_json).unwrap_or(J::Null);
-                let changed = match slots.get_mut(*index) {
-                    Some(slot) => {
-                        let changed = *slot != new;
-                        *slot = new;
-                        changed
-                    }
-                    None => true,
-                };
-                if !changed {
-                    return Vec::new();
-                }
-                let (name, slots) = (name.clone(), slots.clone());
-                let label = self
-                    .element_ids
-                    .get(body_key)
-                    .cloned()
-                    .unwrap_or_else(|| format!("?{body_key}"));
-                vec![self.variable_record(*body_key, label, &name, J::Array(slots), *instance_key)]
             }
             Event::ScopedVariablesUpdated {
                 instance_key,
@@ -2882,9 +2809,8 @@ const MI_OUTPUT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 /// Zeebe seeds a named `outputCollection` on the multi-instance BODY scope as a
 /// list of nulls when the body activates, and writes each completing child's
-/// slot as a body-scope UPDATE. The adapter must render both from
-/// `MultiInstanceActivated` / `MultiInstanceChildCompleted` (nano has no
-/// discrete event for the body-local write), and must order each child's local
+/// slot as a body-scope UPDATE. The engine records both as body-scope
+/// `ScopedVariablesUpdated` events (#1534), and the adapter must order each child's local
 /// bindings with `loopCounter` LAST (Zeebe binds the input/output elements
 /// before the counter).
 #[test]
