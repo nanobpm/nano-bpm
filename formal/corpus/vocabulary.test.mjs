@@ -230,3 +230,23 @@ test('a message boundary correlation carries a settlement barrier like a catch',
   assert.ok(fired.length > 0)
   for (const sc of fired) assert.ok(sc.steps[0].settled, `${sc.name}: boundary publish has no settled barrier`)
 })
+
+test('a boundary-bearing task still reaches the join through its boundary (inclusive-join liveness)', () => {
+  const g = graphOf([[0, 1, 'bmsg']])
+  const ref = new Reference(g)
+  // Block the task's own outgoing flow: the only remaining way out is the
+  // attached boundary, which must still count as a live path to E.
+  const taskOut = g.edges.find((e) => e.from === 'T1').id
+  assert.equal(ref.pathReaches('T1', 'E', new Set([taskOut])), true)
+})
+
+test('a message boundary interrupts EVERY waiting activation of its task', () => {
+  const g = graphOf([[0, 1, 'bmsg']])
+  const ref = new Reference(g)
+  ref.settle()
+  ref.waiting.T1 = 2 // two activations of the same task (repeated activation)
+  const next = ref.apply({ op: 'correlateBoundary', node: 'B1', task: 'T1' })
+  assert.equal(next.waiting.T1, 0)
+  assert.equal(next.completedElements.B1, 2)
+  assert.equal(next.commands().some((c) => c.node === 'T1' || c.task === 'T1'), false)
+})

@@ -553,6 +553,13 @@ export class Reference {
       for (const e of this.out[n]) {
         if (!blocked.has(e.id) && !seen.has(e.to)) { seen.add(e.to); stack.push(e.to) }
       }
+      // A waiting task can also leave via an attached boundary event (#1673):
+      // its boundary is an alternative path out, so traverse the attachment
+      // too — otherwise a live boundary-bearing activation looks unable to
+      // reach the join and an inclusive join fires prematurely.
+      for (const [bd, task] of Object.entries(this.graph.boundaryOf ?? {})) {
+        if (task === n && !seen.has(bd)) { seen.add(bd); stack.push(bd) }
+      }
     }
     return false
   }
@@ -765,9 +772,15 @@ export class Reference {
       // An interrupting message boundary (#1673): the attached task is
       // TERMINATED (its job cancelled, never completed) and the boundary event
       // completes, routing its outgoing flow.
-      next.waiting[cmd.task] -= 1
-      next.complete(cmd.node)
-      next.take(next.out[cmd.node])
+      // The message correlates EVERY open subscription of this boundary, so
+      // every waiting activation of the task is interrupted and each boundary
+      // activation routes its outgoing flow — not just one.
+      const count = next.waiting[cmd.task]
+      next.waiting[cmd.task] = 0
+      for (let i = 0; i < count; i++) {
+        next.complete(cmd.node)
+        next.take(next.out[cmd.node])
+      }
       next.settle()
       return next
     }
