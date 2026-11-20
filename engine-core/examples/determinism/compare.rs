@@ -1545,6 +1545,9 @@ struct MatchedSide<'a> {
     /// Whether the declaration remints keys — the `canonical` multiset was
     /// projected with this setting, so the surplus lookup must be too.
     remint: bool,
+    /// The ratified lifecycle-kind substitutions the `canonical` multiset was
+    /// projected with, so the surplus lookup projects identically.
+    subs: &'a [VariantSubstitution],
     /// Every raw event of this side's divergent entries.
     entries: &'a [&'a String],
 }
@@ -1590,7 +1593,7 @@ fn validate_unbalanced_surplus(
                     continue;
                 }
             };
-            let proj = pattern_projection(&v, side.ids, side.remint).to_string();
+            let proj = pattern_projection(&v, side.ids, side.remint, side.subs).to_string();
             let extra = side
                 .canonical
                 .get(&proj)
@@ -2216,6 +2219,7 @@ pub fn cross_release_checked(
                 &expected.only_in_head,
                 &head_ids,
                 false,
+                &expected.variant_substitutions,
                 &mut head_matched_raw,
             );
             collect_matched(
@@ -2223,6 +2227,7 @@ pub fn cross_release_checked(
                 &expected.only_in_prev,
                 &prev_ids,
                 false,
+                &expected.variant_substitutions,
                 &mut prev_matched_raw,
             );
         }
@@ -2265,6 +2270,7 @@ pub fn cross_release_checked(
                     raw: &head_matched_raw,
                     ids: &head_ids,
                     remint,
+                    subs: &expected.variant_substitutions,
                     entries: &head_entry_events,
                 },
                 MatchedSide {
@@ -2272,6 +2278,7 @@ pub fn cross_release_checked(
                     raw: &prev_matched_raw,
                     ids: &prev_ids,
                     remint,
+                    subs: &expected.variant_substitutions,
                     entries: &prev_entry_events,
                 },
                 &expected.only_in_head,
