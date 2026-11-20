@@ -166,6 +166,9 @@ impl Engine {
         // (via `complete_call_activity`'s MI-child detection).
         let eval_scope = element_instance_key;
         let element_vars = (*self.variables_for_element(instance_key, eval_scope)).clone();
+        // The call activity is already applied here, so its own registered
+        // scope (if any) and its enclosing scope are both readable from state.
+        let parent_scope = self.scope_of(instance_key, element_instance_key);
         self.spawn_call_activity_child(
             instance_key,
             element_instance_key,
@@ -173,6 +176,7 @@ impl Engine {
             &called,
             propagate_all_parent,
             &element_vars,
+            CallScope::Under(parent_scope),
         )
     }
 
@@ -186,6 +190,7 @@ impl Engine {
     /// mappings applied on top (isolated child scope). An unknown callee, or
     /// exceeding the recursion depth cap, parks the token on a recoverable
     /// incident instead.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_call_activity_child(
         &mut self,
         parent_instance: Key,
@@ -194,6 +199,7 @@ impl Engine {
         called_process_id: &str,
         propagate_all_parent: bool,
         element_vars: &BTreeMap<String, Value>,
+        call_scope: CallScope,
     ) -> (Vec<Event>, Vec<Step>) {
         // Input mappings are evaluated into the call activity's local scope
         // regardless (Zeebe: they seed the child's local variables). With
@@ -203,11 +209,24 @@ impl Engine {
         // (child-local wins). With it off, only the input-mapping results cross —
         // an isolated child seeded purely by the mappings.
         let inputs = self.io_inputs(parent_instance, element_id);
+        let is_multi_instance = self
+            .multi_instance_of(parent_instance, element_id)
+            .is_some();
         let input_results = if inputs.is_empty() {
             BTreeMap::new()
         } else {
             match self.eval_io_mappings_in(element_vars, &inputs) {
-                Ok(updates) => updates,
+                Ok(mut updates) => {
+                    // `loopCounter` is a reserved MI binding on the call
+                    // activity's local scope (read back by `complete_mi_child`
+                    // for `outputElement`). Drop a user input mapping targeting
+                    // it, exactly as the regular MI input path does, so the
+                    // local projection can never clobber the engine-owned counter.
+                    if is_multi_instance {
+                        updates.remove("loopCounter");
+                    }
+                    updates
+                }
                 Err(failure) => {
                     // A call-activity input mapping that fails to evaluate halts the
                     // call activity with an `IO_MAPPING_ERROR` incident rather than
@@ -227,6 +246,25 @@ impl Engine {
                 }
             }
         };
+        // Zeebe parity (#1536): the input-mapping results are first created as
+        // variables LOCAL to the call activity's element instance, then copied
+        // into the child. Journaled ahead of the spawn so the order matches
+        // Zeebe's record stream (call-activity VARIABLE CREATED, then the child's).
+        //
+        // The call activity's activation may still be pending in this same batch
+        // (not yet applied to state), so its scope parent is taken from the caller
+        // (`call_scope`) rather than looked up — a lookup would see no registered
+        // scope and fall back to the process root, cutting a nested call off from
+        // its enclosing locals or clobbering a multi-instance child's body parent.
+        let mut local_events = self.local_element_variable_events_under(
+            parent_instance,
+            call_eik,
+            match call_scope {
+                CallScope::Under(parent) => Some(parent),
+                CallScope::PreRegistered => None,
+            },
+            input_results.clone(),
+        );
         let child_vars = if propagate_all_parent {
             let mut merged = element_vars.clone();
             merged.extend(input_results);
@@ -234,7 +272,7 @@ impl Engine {
         } else {
             input_results
         };
-        self.spawn_call_activity_instance(
+        let (events, steps) = self.spawn_call_activity_instance(
             parent_instance,
             call_eik,
             element_id,
@@ -242,7 +280,21 @@ impl Engine {
             element_vars,
             child_vars,
             None,
-        )
+        );
+        // A recoverable spawn incident (unresolvable callee expression, unknown
+        // callee, depth cap) creates no child. Its input-local writes are dropped
+        // with it: the spawn retry re-evaluates the input mappings from the same
+        // pre-input view, so committing them now would feed the retry its own
+        // results (`n := n + 1` seeding `n + 2`) and could change how a
+        // `=calledElement` expression resolves on retry.
+        if !events
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+        {
+            return (events, steps);
+        }
+        local_events.extend(events);
+        (local_events, steps)
     }
 
     /// Shared child-process spawn for a call activity, whether it is reached on
@@ -517,7 +569,37 @@ impl Engine {
             );
         }
 
-        let mut events = vec![
+        // With output mappings declared, Zeebe merges the child's variables
+        // LOCAL to the call activity's element instance (`mergeLocalDocument`,
+        // #1536) — only the output mappings then write to the flow scope. Names
+        // whose value is unchanged IN THE CALL ACTIVITY'S OWN SCOPE (e.g. an input
+        // mapping round-tripped through the child) produce no write; an ancestor's
+        // equal value does not count, as the call activity has no local binding
+        // for it. Planned BEFORE `ElementCompleted`, whose applier tears the call
+        // activity's scope down — a write after it would resurrect the scope of
+        // an already-completed element.
+        let outputs = self.io_outputs(instance_key, &element_id);
+        let mut events = Vec::new();
+        if !outputs.is_empty() {
+            let changed: BTreeMap<String, Value> = {
+                let local = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| i.scope_variables.get(&element_instance_key));
+                child_variables
+                    .iter()
+                    .filter(|(name, value)| local.and_then(|l| l.get(*name)) != Some(*value))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            };
+            events.extend(self.local_element_variable_events(
+                instance_key,
+                element_instance_key,
+                changed,
+            ));
+        }
+        events.extend([
             Event::ElementCompleting {
                 instance_key,
                 element_instance_key,
@@ -528,16 +610,15 @@ impl Engine {
                 element_instance_key,
                 element_id: element_id.clone(),
             },
-        ];
+        ]);
         events.extend(self.cancel_boundary_timers_on(element_instance_key));
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_conditional_subscriptions_on(element_instance_key));
-        // propagateAllChildVariables: merge every variable the child finished with
-        // back into the parent scope (child wins on collision) *before* the output
-        // mappings, so an explicit output mapping still overrides a propagated
-        // value.
-        if propagate_all_child && !child_variables.is_empty() {
+        // propagateAllChildVariables (no output mappings): merge every variable
+        // the child finished with back into the parent scope (child wins on
+        // collision).
+        if outputs.is_empty() && propagate_all_child && !child_variables.is_empty() {
             events.extend(self.propagated_updates(
                 instance_key,
                 scope,
@@ -545,7 +626,6 @@ impl Engine {
                 false,
             ));
         }
-        let outputs = self.io_outputs(instance_key, &element_id);
         if !outputs.is_empty() {
             match self.eval_io_mappings_in(&child_variables, &outputs) {
                 Ok(updates) => {
@@ -582,4 +662,16 @@ impl Engine {
         }
         (events, followups)
     }
+}
+
+/// Where an activating call activity's input-local variable scope hangs, as
+/// known by the caller at spawn time (the activation may not be applied yet).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CallScope {
+    /// Register the call activity's scope under this enclosing scope (unless
+    /// state already has it registered).
+    Under(Key),
+    /// An event planned earlier in this batch already registers the scope
+    /// (listener scope, multi-instance child under its body).
+    PreRegistered,
 }
