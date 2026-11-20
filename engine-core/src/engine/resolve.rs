@@ -608,8 +608,9 @@ impl Engine {
         scope: Key,
         variables: BTreeMap<String, Value>,
         local: bool,
+        pending: &[crate::Event],
     ) -> Vec<crate::Event> {
-        let mut writes = self.propagate_variables(instance_key, scope, variables, local);
+        let mut writes = self.propagate_variables(instance_key, scope, variables, local, pending);
         writes.sort_by_key(|(dest, _)| *dest);
         writes
             .into_iter()
@@ -644,6 +645,7 @@ impl Engine {
         target_scope: Key,
         variables: BTreeMap<String, Value>,
         local: bool,
+        pending: &[crate::Event],
     ) -> Vec<(Key, BTreeMap<String, Value>)> {
         if variables.is_empty() {
             return Vec::new();
@@ -657,8 +659,13 @@ impl Engine {
         // destination scope already holds: no VARIABLE record at all (#1537).
         // Applied here — the single resolver every propagated merge goes
         // through — so no caller can emit an unchanged write.
+        // The comparison is against the value the scope will hold once the
+        // earlier `pending` writes of the same batch apply, not only committed
+        // state: a restoring write must not be dropped because the committed
+        // value matches while a planned write changes it.
+        let suppress = self.may_suppress_equal_writes(instance_key);
         let unchanged = |dest: Key, name: &str, value: &Value| {
-            Self::value_in_scope(instance, dest, name) == Some(value)
+            suppress && Self::value_in_scope(instance, pending, dest, name) == Some(value)
         };
         // Fast path: local write, or a root-only instance — one scope, no walk.
         if local || (instance.scope_variables.is_empty() && instance.scope_parents.is_empty()) {
@@ -689,6 +696,7 @@ impl Engine {
         instance_key: Key,
         scope: Key,
         variables: BTreeMap<String, Value>,
+        pending: &[crate::Event],
     ) -> BTreeMap<String, Value> {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return variables;
@@ -697,19 +705,70 @@ impl Engine {
         // not-yet-registered element scope up to its parent and compare against
         // a value the write does not replace.
         let scope = if scope == 0 { instance.key } else { scope };
+        if !self.may_suppress_equal_writes(instance_key) {
+            return variables;
+        }
         variables
             .into_iter()
-            .filter(|(name, value)| Self::value_in_scope(instance, scope, name) != Some(value))
+            .filter(|(name, value)| {
+                Self::value_in_scope(instance, pending, scope, name) != Some(value)
+            })
             .collect()
     }
 
+    /// Whether an equal-value write of `instance_key` may be suppressed. A
+    /// variable write is also a security effect: applying it revokes the
+    /// mapping-time secret provenance (#1640) of every job that can see it,
+    /// even when the value text is equal (an untrusted writer may restate a
+    /// trusted reference). While any job of the instance still holds
+    /// provenance, every write is kept so that revocation stays a replayable
+    /// effect — fail closed.
+    fn may_suppress_equal_writes(&self, instance_key: Key) -> bool {
+        self.state
+            .jobs_by_instance
+            .get(&instance_key)
+            .is_none_or(|keys| {
+                keys.iter().all(|k| {
+                    self.state
+                        .jobs
+                        .get(k)
+                        .is_none_or(|job| job.secret_provenance.is_empty())
+                })
+            })
+    }
+
     /// The value `name` holds directly in `scope` (the root scope reads the
-    /// instance's root variables), without walking ancestors.
+    /// instance's root variables), without walking ancestors — as seen after
+    /// the not-yet-applied `pending` events of the current batch (the latest
+    /// pending write to `scope` wins over committed state).
     fn value_in_scope<'a>(
         instance: &'a crate::state::ProcessInstance,
+        pending: &'a [crate::Event],
         scope: Key,
         name: &str,
     ) -> Option<&'a Value> {
+        let root = instance.key;
+        for event in pending.iter().rev() {
+            let written = match event {
+                crate::Event::VariablesUpdated {
+                    instance_key,
+                    variables,
+                } if *instance_key == root && scope == root => variables.get(name),
+                crate::Event::ScopedVariablesUpdated {
+                    instance_key,
+                    scope_key,
+                    variables,
+                } if *instance_key == root
+                    && (if *scope_key == 0 { root } else { *scope_key }) == scope =>
+                {
+                    variables.get(name)
+                }
+                _ => None,
+            };
+            if written.is_some() {
+                return written;
+            }
+        }
         if scope == instance.key {
             instance.variables.get(name)
         } else {

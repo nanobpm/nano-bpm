@@ -94,6 +94,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         variables: BTreeMap<String, Value>,
+        pending: &[Event],
     ) -> Vec<Event> {
         let parent_scope = self.scope_of(instance_key, element_instance_key);
         self.local_element_variable_events_under(
@@ -101,6 +102,7 @@ impl Engine {
             element_instance_key,
             Some(parent_scope),
             variables,
+            pending,
         )
     }
 
@@ -114,10 +116,11 @@ impl Engine {
         element_instance_key: Key,
         register_under: Option<Key>,
         variables: BTreeMap<String, Value>,
+        pending: &[Event],
     ) -> Vec<Event> {
         // `mergeLocalDocument` skips an equal-value write just like the
         // propagating merge does (#1537).
-        let variables = self.drop_unchanged(instance_key, element_instance_key, variables);
+        let variables = self.drop_unchanged(instance_key, element_instance_key, variables, pending);
         if variables.is_empty() {
             return Vec::new();
         }
@@ -169,15 +172,21 @@ impl Engine {
         element_instance_key: Key,
         element_id: &str,
         variables: BTreeMap<String, Value>,
+        pending: &[Event],
     ) -> Vec<Event> {
         if variables.is_empty() {
             return Vec::new();
         }
         if !self.element_has_output_mappings(instance_key, element_instance_key, element_id) {
             let flow_scope = self.completion_scope(instance_key, element_instance_key);
-            self.propagated_updates(instance_key, flow_scope, variables, false)
+            self.propagated_updates(instance_key, flow_scope, variables, false, pending)
         } else {
-            self.local_element_variable_events(instance_key, element_instance_key, variables)
+            self.local_element_variable_events(
+                instance_key,
+                element_instance_key,
+                variables,
+                pending,
+            )
         }
     }
 
