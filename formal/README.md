@@ -410,8 +410,9 @@ ZeebeTokenFlow families (epic #1224). A future spec author will hit these again:
   (v1.7.4) aborts with `Attempted to check equality of integer N with
   non-integer 'x'` if a value can be *either* a number *or* a string tag (e.g. a
   recovery outcome that is a length **or** `"fail"`). Model the sum type as a
-  **record** so every branch has one type, e.g. `[reject |-> BOOLEAN, len |->
-  Nat]`, and read the tag field instead of comparing the bare value.
+  **record** so every branch has one type, e.g. values `[reject |-> TRUE, len |-> 0]` /
+  `[reject |-> FALSE, len |-> k]` (type `[reject: BOOLEAN, len: Nat]`, as
+  `Reject` / `Rebuilt(k)` in `tla/snapshot/SnapshotReplay.tla`), and read the tag field instead of comparing the bare value.
 - **Compare against a reference spec with an INSTANCE + a state-predicate
   invariant, not a second temporal property.** The harness allows **at most one**
   `PROPERTIES` entry (TLC cannot name temporal violations). To assert Nano

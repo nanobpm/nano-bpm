@@ -445,19 +445,22 @@ whether or not a new BPMN element is involved.
 - This edits `engine-wasm/src/` **source**, which is allowed. Do not commit the
   `engine-wasm/pkg/` artifact (#668).
 - **Verify before opening the PR:**
-  `cargo check -p engine-wasm --target wasm32-unknown-unknown`. `classify` and
+  `cargo check --manifest-path engine-wasm/Cargo.toml --target wasm32-unknown-unknown`
+  (the package is `nanobpmn-engine-wasm` and there is no root workspace). `classify` and
   `classify_read` are separate functions, so parallel write-side and read-side
   slices don't collide.
 
-## Wire-faithful OpenAPI schemas: prefer a flat enum tag over a discriminated `oneOf`
+## Wire-faithful OpenAPI schemas: discriminated `oneOf` wire values
 
-The rust-axum OpenAPI generator serializes a `oneOf` discriminator as the
-schema **struct name** (e.g. `"AgentInstanceTextContent"`), not the `mapping`
-value (e.g. `"TEXT"`), which silently breaks round-tripping.
-`scripts/postprocess-generated.py` only fixes *compilation* of optional
-discriminators, not the wire value. When a tag must match a fixed Camunda/spec
-spelling, model the schema as a **flat object with an explicit enum tag field**,
-and add a contract test that round-trips the exact wire spelling.
+The rust-axum OpenAPI generator, left alone, serializes a `oneOf` discriminator
+as the schema **struct name** (e.g. `"JobWaitStateDetails"`), not the `mapping`
+key (e.g. `"JOB"`). `scripts/postprocess-generated.py` repairs this during
+generation (`fix_discriminator_mapping_values` rewrites each member's tag helper
+to its mapping key, failing closed on ambiguity), so a mapped `oneOf` is fine.
+Whenever a tag must match a fixed Camunda/spec spelling, add a contract test
+that round-trips the exact wire spelling, so a generator change that defeats the
+repair is caught. A flat object with an explicit enum tag field remains a
+simpler alternative when the repair does not apply (e.g. no `mapping`).
 
 The Camunda `c8-orchestration-cluster-e2e-test-suite` Playwright specs (the v2
 API parity harness) run against a live cluster and are **not** vendored here.
