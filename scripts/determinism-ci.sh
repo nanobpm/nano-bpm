@@ -127,11 +127,26 @@ cmd_prev_release() {
   # Regenerate (not line-filter) the corpus without them so later keys are
   # re-harvested; it fails if a kept entry's outcome would change. State
   # checkpoints are compared too whenever the snapshot format matches.
+  #
+  # Every dropped entry must be EXPLAINED by the additive set derived from
+  # the golden corpus — vocabulary(golden @ HEAD) − vocabulary(golden @ $tag)
+  # — and the kept share must clear the coverage floor; behavioural changes
+  # are compared against the ratified divergence allowlist, which expires
+  # once $tag is at or past each entry's introducing release (#1698).
+  local prev_golden="$out/prev-golden"
+  rm -rf "$prev_golden"
+  mkdir -p "$prev_golden"
+  git -C "$ROOT" archive "$tag" engine-core/tests/fixtures/golden | tar -x -C "$prev_golden"
+  local golden=(--golden-head "$ENGINE/tests/fixtures/golden"
+    --golden-prev "$prev_golden/engine-core/tests/fixtures/golden")
   "$prev_bin" "$out/corpus.jsonl" --out "$out/probe.jsonl" --skip-undecodable
-  "$BIN/determinism_corpus" emit-compatible "$out/probe.jsonl" "$out/compat.jsonl" --random "$RANDOM_INSTANCES"
+  "$BIN/determinism_corpus" emit-compatible "$out/probe.jsonl" "$out/compat.jsonl" \
+    --random "$RANDOM_INSTANCES" "${golden[@]}"
   "$prev_bin" "$out/compat.jsonl" --out "$out/prev.jsonl" --state-every "$STATE_EVERY"
   "$BIN/determinism_replay" "$out/compat.jsonl" --out "$out/head.jsonl" --state-every "$STATE_EVERY"
-  "$BIN/determinism_corpus" cross-release "$out/head.jsonl" "$out/prev.jsonl"
+  "$BIN/determinism_corpus" cross-release "$out/head.jsonl" "$out/prev.jsonl" \
+    --corpus "$out/compat.jsonl" --prev-tag "$tag" \
+    --allowlist "$ENGINE/examples/determinism/divergence-allowlist.json" "${golden[@]}"
 }
 
 case "${1:-}" in
