@@ -220,13 +220,34 @@ node formal/corpus/fuzz.mjs --seed 42 --cases 200                        # nano 
 node formal/corpus/fuzz.mjs --seed 42 --backend both --require-camunda   # + live Camunda 8
 node formal/corpus/fuzz.mjs --seed 42 --max-gateways 7 --kinds and,or     # shape the generator
 node formal/corpus/fuzz.mjs --replay-only                                # the committed corpus only
+node formal/corpus/fuzz.mjs --seed 42 --labels task,timer --cancel-rate 0  # narrow the wait-state vocabulary
 ```
+
+- **Extended vocabulary (#1673).** Beyond the exhaustive run's labels, a random
+  wait-state edge may be a **timer** catch (`timer`, resumed by an `advanceTime`
+  tick), an embedded **subprocess** wrapping one inner service task (`sub`,
+  drawn collapsed with its own DI plane), or a service task carrying an
+  interrupting **timer** / **message** boundary event (`btimer` / `bmsg`, whose
+  outgoing flow joins the task's at a merge-capable target). A random walk also
+  **cancels** the instance with probability `--cancel-rate` (default 0.05) per
+  step (`cancelInstance`; a cancelled scenario is nano-only, like a stuck one).
+  A scenario that **ticks** is nano-only too: the bare-gateway Camunda backend
+  has no timer-readiness barrier, so a tick could overtake the timer it fires.
+  A tick that re-activates a routed gateway is preceded by a `setVariables`
+  step carrying that gateway's route suffix, and a message **boundary**
+  correlation takes the same settlement barrier (`settled`) as a catch's.
+  `--labels` picks the wait-state labels drawn (default: all). The Reference
+  models each: a tick fires every due timer atomically, an interrupting boundary
+  terminates its task (never completed), the container completes when its inner
+  end does. The bounded-exhaustive enumeration keeps its legacy vocabulary by
+  default (`enumerateSkeletons({ labels })` opts in).
 
 - **Deterministic from its seed.** Case *i* draws from its own PRNG seeded by
   `caseSeed(seed, i)`; the same seed produces byte-identical graphs, BPMN (with
   DI) and scenarios. No retries anywhere.
 - **Shrinking.** A divergence is greedily reduced (`reductions`: drop a gateway,
-  drop a flow, turn a task flow into a direct one — always staying well-formed)
+  drop a flow, turn a boundary flow into a task one and any wait-state flow into a
+  direct one — always staying well-formed)
   while some command order of the smaller graph (`shrinkRuns`: the first DFS
   orders plus fixed random walks) still shows the **same signature**; the result
   is 1-minimal, and its fewest-step reproducing scenario is kept.
