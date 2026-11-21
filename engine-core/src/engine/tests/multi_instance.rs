@@ -949,6 +949,77 @@ fn mi_completion_condition_preserves_dotted_output_target_shadowing() {
     assert!(engine.is_completed(key));
 }
 
+/// Review 6001985210 follow-up — the seeded-view regression above proves the
+/// listener's FEEL `type` observes the seed, but the type expression cannot
+/// observe the seed's LIST LENGTH distinctly from the ancestor's single
+/// `"audit"` string (`count` returns 1 for both). The listener's `retries`
+/// expression resolves against the same seeded view
+/// (`execution_listener_job_event` -> `resolve_job_props`), so it must shadow
+/// the ancestor binding too: `count(results)` reads the body's TWO seeded
+/// null slots (retries 2), never the ancestor's single-element list
+/// (retries 1). This pins the overlay for the retries half of the listener
+/// view with a length-discriminating read.
+#[test]
+fn mi_body_start_listener_retries_read_the_seeded_output_collection() {
+    let def = ProcessBuilder::new("mi-listener-seed-retries")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: true,
+                sequential: true,
+            },
+        )
+        .with_listeners(
+            "each",
+            vec![crate::model::ExecutionListener {
+                event_type: ListenerEventType::Start,
+                job_type: "audit".to_string(),
+                // Seeded view: count([null, null]) = 2; the ancestor view
+                // would give count(["audit"]) = 1.
+                retries: Some("=count(results)".to_string()),
+            }],
+            Vec::new(),
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-listener-seed-retries",
+            vars(&[
+                ("items", Value::List(vec![Value::Int(1), Value::Int(2)])),
+                (
+                    "results",
+                    Value::List(vec![Value::Str("audit".to_string())]),
+                ),
+            ]),
+        ))
+        .unwrap();
+    let listener = created.iter().find_map(|e| match e {
+        Event::ExecutionListenerJobCreated {
+            job_type, retries, ..
+        } if job_type == "audit" => Some(*retries),
+        _ => None,
+    });
+    assert_eq!(
+        listener,
+        Some(2),
+        "listener retries resolved against the seeded two-slot collection, not the ancestor: {created:?}"
+    );
+}
+
 /// Previously-missed review regression — with `outputElement="=null"` a
 /// worker that overwrites the body-local `results` binding (no output
 /// mappings, so its variables propagate to the body scope) leaves the
