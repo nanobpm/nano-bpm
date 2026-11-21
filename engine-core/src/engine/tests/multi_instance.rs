@@ -888,6 +888,122 @@ fn mi_completion_condition_preserves_child_local_shadowing() {
     assert!(engine.is_completed(key));
 }
 
+/// Review r4649474283 regression — a DOTTED output target (`results.flag`)
+/// binds the collection's name ROOT in the completing child's view, so it
+/// must shadow the prospective-collection overlay exactly like a plain
+/// `results` target. Overlaying the list would make `results.flag` null and
+/// the condition would raise an incident instead of fulfilling.
+#[test]
+fn mi_completion_condition_preserves_dotted_output_target_shadowing() {
+    let mut def = ProcessBuilder::new("mi-cond-dotted")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item".to_string()),
+                completion_condition: Some("=results.flag = true".to_string()),
+                cancel_remaining_instances: true,
+                sequential: true,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap();
+    def.elements.get_mut("each").expect("each element").io = crate::model::IoMapping {
+        inputs: Vec::new(),
+        outputs: vec![crate::model::Mapping {
+            source: "=true".to_string(),
+            target: "results.flag".to_string(),
+        }],
+    };
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-cond-dotted",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let events = complete_one(&mut engine, "handle");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::MultiInstanceCompleted { .. })),
+        "the dotted-target binding fulfils the condition: {events:?}"
+    );
+    assert!(engine
+        .activate_jobs("handle", "w", 10, 60_000, 0)
+        .is_empty());
+    complete_one(&mut engine, "sink-work");
+    assert!(engine.is_completed(key));
+}
+
+/// Previously-missed review regression — with `outputElement="=null"` a
+/// worker that overwrites the body-local `results` binding (no output
+/// mappings, so its variables propagate to the body scope) leaves the
+/// accumulator unchanged. The collection write must still restore the body
+/// binding, so the NEXT child observes `[null, null]`, not the worker's
+/// `[9, 9]`.
+#[test]
+fn mi_collection_write_restores_a_worker_overwritten_body_binding() {
+    let def = ProcessBuilder::new("mi-null-elem")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=null".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: false,
+                sequential: true,
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-null-elem",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+
+    let first = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(first.len(), 1);
+    engine
+        .apply_command(Command::complete_job_with(
+            first[0].key,
+            vars(&[("results", Value::List(vec![Value::Int(9), Value::Int(9)]))]),
+        ))
+        .unwrap();
+    let second = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(second.len(), 1, "the second child is spawned");
+    assert_eq!(
+        second[0].variables.get("results"),
+        Some(&Value::List(vec![Value::Null, Value::Null])),
+        "the next child sees the accumulator, not the worker's overwrite"
+    );
+}
+
 #[test]
 fn multi_instance_input_mapping_cannot_clobber_loop_counter() {
     // A malicious/careless `zeebe:input` mapping targeting the reserved

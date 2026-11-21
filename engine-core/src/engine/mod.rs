@@ -11259,12 +11259,18 @@ impl Engine {
                         // …or a value the child's output mappings projected into
                         // the post-output view (not present in the raw child
                         // scope view).
+                        // Matched on the target ROOT so a dotted target
+                        // (`results.flag`) counts (review r4649474283).
                         let mapped = view.contains_key(name)
-                            && self
-                                .io_outputs(instance_key, &element_id)
-                                .iter()
-                                .any(|m| m.target == name);
-                        local || mapped
+                            && self.io_outputs(instance_key, &element_id).iter().any(|m| {
+                                resolve::io_target_segments(&m.target).first() == Some(&name)
+                            });
+                        // …or a callee-return / job variable supplied through
+                        // the preserved `output_overlay` without a mapping.
+                        let overlaid = output_overlay
+                            .as_ref()
+                            .is_some_and(|o| o.contains_key(name));
+                        local || mapped || overlaid
                     };
                     let condition_view;
                     let view = match &prospective {
@@ -11489,10 +11495,20 @@ impl Engine {
             .collect();
         let new = output.unwrap_or(Value::Null);
         let slot = slots.get_mut(index)?;
-        if *slot == new {
+        *slot = new;
+        let rebuilt = Value::List(slots.clone());
+        // Suppress only when the body-LOCAL binding already equals the rebuilt
+        // collection — a child may have overwritten the binding without
+        // changing the accumulator (review: `outputElement="=null"`).
+        let current = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.scope_variables.get(&body_key))
+            .and_then(|vars| vars.get(&name));
+        if current == Some(&rebuilt) {
             return None;
         }
-        *slot = new;
         Some(Event::ScopedVariablesUpdated {
             instance_key,
             scope_key: body_key,
