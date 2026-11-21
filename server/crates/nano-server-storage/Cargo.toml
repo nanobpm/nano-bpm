@@ -73,3 +73,5 @@ warnings = "deny"
 # (`allow-unwrap-in-tests` / `allow-expect-in-tests`).
 unwrap_used = "deny"
 expect_used = "deny"
+
+[workspace]

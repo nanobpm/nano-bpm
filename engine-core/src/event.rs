@@ -2106,6 +2106,17 @@ pub enum Event {
         /// The superseded loss-episode id (the stamp's `episode`), recorded so
         /// the journal can correlate the reissue with the report it parked.
         episode: Key,
+        /// The off-heap tier the pending report was detected against (#1608).
+        /// The supersede is the DURABLE record that a loss report is pending,
+        /// so recovery and snapshot-adoption rebuild the in-memory backlog
+        /// from the surviving event history — a crash or failover between the
+        /// supersede and the re-stamped retry otherwise loses the report and
+        /// `VariablesLost` is never raised for a dormant lost instance.
+        /// `None` for a frame written before this field existed: the rebuild
+        /// then derives the tier at re-stamp time from the recovered routing
+        /// state. Additive: `serde(default)`, no snapshot-format bump.
+        #[cfg_attr(feature = "serde", serde(default))]
+        kind: Option<crate::command::OrphanKind>,
     },
 }
 
