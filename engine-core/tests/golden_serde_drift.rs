@@ -1142,10 +1142,12 @@ fn build_event_witnesses() -> Vec<Event> {
         // The #1587-review orphan-stamp supersede signal (additive variant, no
         // version bump): emitted when a stamped quarantine's episode no longer
         // matches the allocator's position, so the report is re-stamped and
-        // re-proposed rather than silently dropped.
+        // re-proposed rather than silently dropped. The #1608 `kind` field is
+        // additive (`serde(default)`), pinned here non-default.
         Event::OrphanStampSuperseded {
             instance_key: 27,
             episode: 26,
+            kind: Some(nanobpmn_engine_core::OrphanKind::Resident),
         },
         // #1657 cluster-variable lifecycle (additive variants, no version
         // bump): replicated configuration state, every field non-default.

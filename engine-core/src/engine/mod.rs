@@ -6476,6 +6476,12 @@ impl Engine {
                                 Event::OrphanStampSuperseded {
                                     instance_key,
                                     episode,
+                                    // #1608: the tier the pending report was
+                                    // detected against, so recovery and
+                                    // snapshot-adoption can rebuild the
+                                    // in-memory backlog from this journaled
+                                    // supersede alone.
+                                    kind: Some(stamp.kind),
                                 },
                             );
                             return Ok((log, queue));
