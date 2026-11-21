@@ -4491,11 +4491,54 @@ fn seed_versions<'a, T>(
 /// envelope overhead (and JSON escaping) never pushes a batch over it.
 const SEED_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum JSON-serialized size of ONE deployed resource (#1504). A deployed
+/// resource replicates to peers as a single `*Deployed` event inside an
+/// `InstallDeployment` frame (live broadcast and startup seed alike); the event
+/// adds keys/version/name metadata and the frame adds its envelope. Bounding
+/// the resource's *serialized* form (not its raw byte length — JSON escaping
+/// can expand content up to 6x) at the batch budget keeps every such event —
+/// and therefore every frame [`chunk_seed_events`] produces — far below the
+/// peer's 16 MiB WebSocket frame limit, so a peer can never reject it (which
+/// made the seed broadcast retry forever).
+const DEPLOY_RESOURCE_MAX_SERIALIZED_BYTES: usize = SEED_BATCH_MAX_BYTES;
+
+/// Rejects (before anything is committed) a deployment bundle any of whose
+/// resources would serialize into a replication event too large for one
+/// peer frame (#1504). `Err` carries the 400 detail.
+fn check_deploy_bundle_replicable(
+    bundle: &nanobpmn_engine_core::DeploymentBundle,
+) -> Result<(), String> {
+    fn check<T: serde::Serialize>(kind: &str, id: &str, item: &T) -> Result<(), String> {
+        let size = serde_json::to_vec(item).map_or(usize::MAX, |v| v.len());
+        if size > DEPLOY_RESOURCE_MAX_SERIALIZED_BYTES {
+            return Err(format!(
+                "{kind} '{id}' is too large to replicate: its serialized size is {size} \
+                 bytes, exceeding the {DEPLOY_RESOURCE_MAX_SERIALIZED_BYTES}-byte limit"
+            ));
+        }
+        Ok(())
+    }
+    for p in &bundle.processes {
+        check("process", &p.id, p)?;
+    }
+    for d in &bundle.decisions {
+        check("decision requirements", &d.id, d)?;
+    }
+    for f in &bundle.forms {
+        check("form", &f.id, f)?;
+    }
+    for r in &bundle.resources {
+        check("resource", &r.resource_id, r)?;
+    }
+    Ok(())
+}
+
 /// Splits ordered seed events into consecutive batches whose JSON-serialized
 /// size stays within `max_bytes`, preserving order (so DRG-before-decision
 /// ordering survives batch boundaries). An event that alone exceeds the budget
-/// is sent in its own batch — it cannot be split, and it was already accepted
-/// as a single deployment, so it fits the frame limit on its own.
+/// is sent in its own batch — it cannot be split; deploy-time admission
+/// ([`check_deploy_bundle_replicable`]) bounds every single event far below
+/// the frame limit, so it still fits one frame on its own.
 fn chunk_seed_events(events: Vec<Event>, max_bytes: usize) -> Vec<Vec<Event>> {
     let mut batches: Vec<Vec<Event>> = Vec::new();
     let mut current: Vec<Event> = Vec::new();
@@ -17720,15 +17763,17 @@ impl ServerImpl {
                     // shared by every co-deployed resource, so
                     // `bindingType: deployment` forms / linked resources resolve
                     // (#1193). Never split it into per-kind commands.
+                    let bundle = nanobpmn_engine_core::DeploymentBundle {
+                        processes,
+                        decisions,
+                        forms,
+                        resources: generic_resources,
+                    };
+                    // #1504: refuse, before committing, a resource whose
+                    // replication event could not fit one peer frame.
+                    check_deploy_bundle_replicable(&bundle)?;
                     let (events, commit) = engine
-                        .apply_command(Command::DeployBundle(
-                            nanobpmn_engine_core::DeploymentBundle {
-                                processes,
-                                decisions,
-                                forms,
-                                resources: generic_resources,
-                            },
-                        ))
+                        .apply_command(Command::DeployBundle(bundle))
                         .map_err(|e| e.to_string())?;
                     let all_events = (*events).clone();
                     let events = Arc::new(all_events);
@@ -18084,6 +18129,10 @@ impl ServerImpl {
         if deployed.is_empty() {
             return;
         }
+        // #1504: a multi-resource deployment can exceed the peer's frame limit
+        // as ONE frame even when each resource fits; send ordered,
+        // size-bounded batches exactly like the startup seed.
+        let batches = chunk_seed_events(deployed, SEED_BATCH_MAX_BYTES);
         let topology = self.engine.topology();
         for node in 0..topology.num_nodes() {
             if node == topology.node_id {
@@ -18091,11 +18140,14 @@ impl ServerImpl {
             }
             match self.peers.link(node).await {
                 Ok(link) => {
-                    if let Err(e) = link
-                        .install_deployment(deployed.clone(), operation_reference)
-                        .await
-                    {
-                        tracing::warn!("deploy broadcast to node {node} failed: {e}");
+                    for batch in &batches {
+                        if let Err(e) = link
+                            .install_deployment(batch.clone(), operation_reference)
+                            .await
+                        {
+                            tracing::warn!("deploy broadcast to node {node} failed: {e}");
+                            break;
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("deploy broadcast: node {node} unreachable: {e}"),
@@ -33610,6 +33662,79 @@ mod clustered_startup_tests {
     /// owner still resolves those definitions via the index fallback. The seed
     /// must include them, or a freshly-seeded peer cannot resolve what the
     /// owner can.
+    /// #1504: a single resource whose serialized form expands past the budget
+    /// (JSON escaping — raw length is well under the 16 MiB frame limit) must be
+    /// rejected at deploy admission, before anything is committed; within
+    /// budget it is accepted, and every admitted resource's replication event
+    /// plus frame envelope fits the frame limit.
+    #[test]
+    fn deploy_admission_rejects_resources_whose_replication_event_overflows_a_frame() {
+        let resource = |content: String| nanobpmn_engine_core::GenericResource {
+            resource_id: "big.md".into(),
+            resource_name: "big.md".into(),
+            content,
+            version_tag: None,
+        };
+        // 3 MiB raw of control chars → ~18 MiB serialized (`\u0001` each).
+        let expanding = "\u{1}".repeat(3 * 1024 * 1024);
+        let bundle = nanobpmn_engine_core::DeploymentBundle {
+            resources: vec![resource(expanding)],
+            ..Default::default()
+        };
+        let err = check_deploy_bundle_replicable(&bundle).expect_err("must reject");
+        assert!(err.contains("big.md"), "{err}");
+
+        let fits = "x".repeat(DEPLOY_RESOURCE_MAX_SERIALIZED_BYTES - 1024);
+        let bundle = nanobpmn_engine_core::DeploymentBundle {
+            resources: vec![resource(fits.clone())],
+            ..Default::default()
+        };
+        check_deploy_bundle_replicable(&bundle).expect("within budget");
+        // The worst admitted event, framed, still fits the 16 MiB limit.
+        let event = Event::GenericResourceDeployed {
+            deployment_key: Key::MAX,
+            resource_key: Key::MAX,
+            version: i32::MAX,
+            resource_id: "big.md".into(),
+            resource_name: "big.md".into(),
+            content: fits,
+            version_tag: None,
+        };
+        let batches = chunk_seed_events(vec![event], SEED_BATCH_MAX_BYTES);
+        let size = serde_json::to_vec(&batches[0]).map_or(usize::MAX, |v| v.len());
+        assert!(size < 16 * 1024 * 1024 - 64 * 1024, "framed event {size}");
+    }
+
+    /// #1504: deploying an over-budget resource returns a 400-class error and
+    /// commits nothing (no definition exists afterwards).
+    #[tokio::test]
+    async fn deploy_rejects_unreplicable_resource_without_committing() {
+        let server = clustered_node(0);
+        let res = server
+            .deploy_resources_locally_with_forms(
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                Vec::new(),
+                vec![nanobpmn_engine_core::GenericResource {
+                    resource_id: "big.md".into(),
+                    resource_name: "big.md".into(),
+                    content: "\"".repeat(5 * 1024 * 1024),
+                    version_tag: None,
+                }],
+                "<default>",
+            )
+            .await;
+        assert!(res.is_err(), "oversized resource must be rejected");
+        let present = server
+            .engine
+            .deploy_partition()
+            .with(|j| j.state().resources.contains_key("big.md"))
+            .await;
+        assert!(!present, "nothing committed");
+    }
+
     /// #720: an accumulated version history (17 x 1 MiB generic resources)
     /// exceeds the peer's 16 MiB frame limit as ONE `InstallDeployment` frame.
     /// The seed must be split into ordered, size-bounded batches.
