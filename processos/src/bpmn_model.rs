@@ -668,15 +668,24 @@ pub fn merge_definitions(primary: &str, extras: &[&str]) -> Result<String, Strin
 /// Whitespace-insensitive form of a declaration's source text, used to decide
 /// whether two same-id declarations are genuinely the same declaration.
 ///
-/// Only whitespace OUTSIDE quoted attribute values is collapsed: an attribute
+/// Only whitespace OUTSIDE quoted attribute values is touched: an attribute
 /// value (an `errorCode`, a message `name`) is significant byte-for-byte, so
 /// `errorCode="A B"` and `errorCode="A  B"` stay distinct and conflict rather
 /// than being silently conflated.
+///
+/// Outside quotes, whitespace is *dropped* where it can never be significant —
+/// adjacent to `<`, `>`, `/`, `=` or at either end — and collapsed to a single
+/// space elsewhere (between attribute tokens). So `<bpmn:error id="E"/>` and
+/// `<bpmn:error id="E" />`, or `id = "E"` and `id="E"`, are the same
+/// declaration, while `errorCode="A B"` vs `errorCode="A  B"` still conflict.
 fn normalize_declaration(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut quote: Option<char> = None;
     let mut pending_space = false;
     let mut in_tag = false;
+    // Whitespace before/after these characters carries no meaning in XML, so
+    // none is emitted there.
+    let ws_neutral = |c: char| matches!(c, '<' | '>' | '/' | '=');
     for c in text.trim().chars() {
         match quote {
             Some(q) => {
@@ -688,8 +697,12 @@ fn normalize_declaration(text: &str) -> String {
             None if c.is_whitespace() => pending_space = true,
             None => {
                 if pending_space {
-                    out.push(' ');
                     pending_space = false;
+                    // Keep one space only between tokens that need separating
+                    // (`id="E" errorCode="A"`); drop it next to markup.
+                    if !ws_neutral(c) && !out.ends_with(|p: char| ws_neutral(p)) {
+                        out.push(' ');
+                    }
                 }
                 match c {
                     '<' => in_tag = true,
@@ -7521,6 +7534,39 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             1,
             "whitespace-only differences dedupe, got:\n{merged}"
         );
+    }
+
+    #[test]
+    fn merge_definitions_dedupes_markup_adjacent_whitespace_variants() {
+        // Whitespace next to `<`, `>`, `/>` or `=` carries no meaning in XML, so
+        // declarations formatted differently that way are the same declaration —
+        // they must dedupe, not conflict. (Adversarial finding: a pretty-printer
+        // emitting `<bpmn:error id="E" />` against a hand-written
+        // `<bpmn:error id="E"/>` must not break the merge of authored documents
+        // such as the seed_demo phase files.)
+        for (a, b) in [
+            // `/>` vs ` />`
+            (r#"<bpmn:error id="E"/>"#, r#"<bpmn:error id="E" />"#),
+            // whitespace around `=`
+            (r#"<bpmn:error id="E"/>"#, r#"<bpmn:error id = "E"/>"#),
+            // newline after the tag name vs space
+            (
+                "<bpmn:message id=\"M\">\n  <bpmn:extensionElements>x</bpmn:extensionElements>\n</bpmn:message>",
+                "<bpmn:message id=\"M\"><bpmn:extensionElements>x</bpmn:extensionElements></bpmn:message>",
+            ),
+        ] {
+            let primary = defs_with(a, "ProcA");
+            let extra = defs_with(b, "ProcB");
+            let merged = merge_definitions(&primary, &[extra.as_str()])
+                .unwrap_or_else(|e| panic!("{a:?} vs {b:?} must dedupe, got: {e}"));
+            let decl_tag = a.split([' ', '\n', '/']).next().unwrap();
+            assert_eq!(
+                merged.matches(&format!("{decl_tag} ")).count()
+                    + merged.matches(&format!("{decl_tag}/")).count(),
+                1,
+                "{a:?} vs {b:?} dedupes to one declaration, got:\n{merged}"
+            );
+        }
     }
 
     #[test]
