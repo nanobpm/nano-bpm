@@ -606,6 +606,476 @@ fn parallel_multi_instance_collects_output_collection_in_order() {
 }
 
 #[test]
+fn multi_instance_output_collection_is_body_local_while_looping() {
+    // Zeebe `MultiInstanceBodyProcessor.onActivate` creates the named
+    // `outputCollection` LOCAL to the body as `[null, ...]` (#1534), and each
+    // completing child rewrites its slot there; the flow scope sees the
+    // collection only once the body completes. A child must observe it.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(true)))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let body_seed = created.iter().any(|e| {
+        matches!(e, Event::ScopedVariablesUpdated { scope_key, variables, .. }
+            if *scope_key != key
+                && variables.get("results")
+                    == Some(&Value::List(vec![Value::Null, Value::Null])))
+    });
+    assert!(
+        body_seed,
+        "body-local results seeded with nulls: {created:?}"
+    );
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        None,
+        "not on the flow scope while the body runs"
+    );
+
+    let first = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].variables.get("results"),
+        Some(&Value::List(vec![Value::Null, Value::Null]))
+    );
+    engine
+        .apply_command(Command::complete_job(first[0].key))
+        .unwrap();
+    let second = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        second[0].variables.get("results"),
+        Some(&Value::List(vec![Value::Int(2), Value::Null])),
+        "first child's slot written into the body-local collection"
+    );
+    engine
+        .apply_command(Command::complete_job(second[0].key))
+        .unwrap();
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(2), Value::Int(4)]))
+    );
+}
+
+/// Review r4648913482 regression — the MI body's FIRST `start` execution
+/// listener resolves its FEEL `type` against the body view WITH the
+/// `outputCollection` seed already overlaid: Zeebe's
+/// `MultiInstanceBodyProcessor.onActivate` runs `initializeOutputCollection`
+/// before the start listeners fire, so a same-named ANCESTOR binding is
+/// shadowed by the body's local null slots — never observed through the seed.
+#[test]
+fn mi_body_start_listener_type_reads_the_seeded_output_collection() {
+    let def = ProcessBuilder::new("mi-listener-seed")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: true,
+                sequential: true,
+            },
+        )
+        // The seed shadows the ancestor `results = ["audit"]`: `count(results)`
+        // reads the body's freshly-seeded single null slot, so the listener
+        // type resolves to `seeded-1` rather than the ancestor's `ancestor-1`.
+        .with_listeners(
+            "each",
+            vec![el(
+                ListenerEventType::Start,
+                "=\"seeded-\" + string(count(results))",
+            )],
+            Vec::new(),
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-listener-seed",
+            vars(&[
+                ("items", Value::List(vec![Value::Int(1)])),
+                (
+                    "results",
+                    Value::List(vec![Value::Str("audit".to_string())]),
+                ),
+            ]),
+        ))
+        .unwrap();
+    assert!(
+        created.iter().any(|e| matches!(
+            e,
+            Event::ExecutionListenerJobCreated { job_type, .. } if job_type == "seeded-1"
+        )),
+        "start listener type resolved against the seeded collection, not the ancestor: {created:?}"
+    );
+    assert!(
+        !created.iter().any(|e| matches!(
+            e,
+            Event::ExecutionListenerJobCreated { job_type, .. } if job_type == "audit"
+        )),
+        "the pre-seed ancestor binding must be shadowed: {created:?}"
+    );
+
+    // Draining the listener chain fans the loop out; it runs to completion.
+    // The body-completion aggregate propagates to the ROOT scope (the only
+    // ancestor), where it replaces the pre-existing `results = ["audit"]`
+    // binding — Zeebe's propagation writes a same-named ancestor variable.
+    let listener = engine.activate_jobs("seeded-1", "w", 10, 60_000, 0);
+    assert_eq!(listener.len(), 1, "one body start-listener job");
+    engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    complete_one(&mut engine, "handle");
+    // The loop drained; the token parks at the sink with the aggregate
+    // observable in hot state (ADR 0012 clears variables only on instance
+    // completion).
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(!engine.is_completed(key));
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(1)])),
+        "the aggregate replaced the same-named ancestor binding on completion"
+    );
+    complete_one(&mut engine, "sink-work");
+    assert!(engine.is_completed(key));
+}
+
+/// Review r4648913529 regression — the completion condition observes the
+/// completing child's `outputCollection` slot ALREADY WRITTEN: Zeebe's
+/// `MultiInstanceBodyProcessor.updateOutputCollection` runs before
+/// `evaluateCompletionCondition`. A sequential `[1, 2]` loop with output
+/// `=item` and condition `=results[1] = 1` must stop after the FIRST child —
+/// evaluating against the pre-update view (slot still null) would spawn an
+/// unwanted second child. The condition reads the prospective collection
+/// through the CHILD's view, so no ancestor may bind the collection's name
+/// (an ancestor binding shadows the body collection for the child-scope
+/// evaluation, exactly as it does for `outputElement`).
+#[test]
+fn mi_completion_condition_reads_the_prospective_collection_update() {
+    let def = ProcessBuilder::new("mi-cond-prospective")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item".to_string()),
+                completion_condition: Some("=results[1] = 1".to_string()),
+                cancel_remaining_instances: true,
+                sequential: true,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-cond-prospective",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The first child completes with output 1; the condition reads
+    // `results[1] = 1` against the prospective collection `[1, null]` and
+    // fulfils — the body completes WITHOUT spawning the second child, and the
+    // token advances to the sink.
+    let events = complete_one(&mut engine, "handle");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::MultiInstanceCompleted { .. })),
+        "the satisfied condition completes the body after the first child: {events:?}"
+    );
+    assert!(
+        engine
+            .activate_jobs("handle", "w", 10, 60_000, 0)
+            .is_empty(),
+        "no second child is spawned"
+    );
+    // The aggregate propagated to the flow scope with only the first child's
+    // slot collected (the unspawned second slot stays null).
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(1), Value::Null])),
+        "only the first child's slot was collected"
+    );
+    complete_one(&mut engine, "sink-work");
+    assert!(engine.is_completed(key));
+}
+
+/// The prospective-collection overlay must not clobber a binding of the
+/// collection's name produced by the completing child's own output mappings
+/// (review r4648913529): Zeebe applies the inner activity's `zeebe:output`
+/// into the child's scope before the body evaluates the completion condition,
+/// so a mapped `results` shadows the body collection for the condition,
+/// exactly as it does for `outputElement` — child-scope shadowing is
+/// preserved. The mapped value must also win over the body-local seed the
+/// child view would otherwise inherit.
+#[test]
+fn mi_completion_condition_preserves_child_local_shadowing() {
+    let mut def = multi_instance_service_process(true);
+    let each = def.elements.get_mut("each").expect("each element");
+    each.multi_instance
+        .as_mut()
+        .expect("each is multi-instance")
+        .completion_condition = Some("=results = \"child\"".to_string());
+    // A `zeebe:output` mapping projects `results = "child"` into the
+    // completing child's view; the condition must read that mapped value, not
+    // the prospective body collection (`[2, null]`).
+    each.io = crate::model::IoMapping {
+        inputs: Vec::new(),
+        outputs: vec![crate::model::Mapping {
+            source: "=\"child\"".to_string(),
+            target: "results".to_string(),
+        }],
+    };
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The first child's output mapping satisfies the condition via the
+    // in-memory post-output view — the prospective collection overlay ([2,
+    // null]) must NOT replace it.
+    let events = complete_one(&mut engine, "handle");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::MultiInstanceCompleted { .. })),
+        "child-local shadowing fulfils the condition after the first child: {events:?}"
+    );
+    assert!(
+        engine
+            .activate_jobs("handle", "w", 10, 60_000, 0)
+            .is_empty(),
+        "no second child is spawned"
+    );
+    complete_one(&mut engine, "sink-work");
+    assert!(engine.is_completed(key));
+}
+
+/// Review r4649474283 regression — a DOTTED output target (`results.flag`)
+/// binds the collection's name ROOT in the completing child's view, so it
+/// must shadow the prospective-collection overlay exactly like a plain
+/// `results` target. Overlaying the list would make `results.flag` null and
+/// the condition would raise an incident instead of fulfilling.
+#[test]
+fn mi_completion_condition_preserves_dotted_output_target_shadowing() {
+    let mut def = ProcessBuilder::new("mi-cond-dotted")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item".to_string()),
+                completion_condition: Some("=results.flag = true".to_string()),
+                cancel_remaining_instances: true,
+                sequential: true,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap();
+    def.elements.get_mut("each").expect("each element").io = crate::model::IoMapping {
+        inputs: Vec::new(),
+        outputs: vec![crate::model::Mapping {
+            source: "=true".to_string(),
+            target: "results.flag".to_string(),
+        }],
+    };
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-cond-dotted",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let events = complete_one(&mut engine, "handle");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::MultiInstanceCompleted { .. })),
+        "the dotted-target binding fulfils the condition: {events:?}"
+    );
+    assert!(engine
+        .activate_jobs("handle", "w", 10, 60_000, 0)
+        .is_empty());
+    complete_one(&mut engine, "sink-work");
+    assert!(engine.is_completed(key));
+}
+
+/// Review 6001985210 follow-up — the seeded-view regression above proves the
+/// listener's FEEL `type` observes the seed, but the type expression cannot
+/// observe the seed's LIST LENGTH distinctly from the ancestor's single
+/// `"audit"` string (`count` returns 1 for both). The listener's `retries`
+/// expression resolves against the same seeded view
+/// (`execution_listener_job_event` -> `resolve_job_props`), so it must shadow
+/// the ancestor binding too: `count(results)` reads the body's TWO seeded
+/// null slots (retries 2), never the ancestor's single-element list
+/// (retries 1). This pins the overlay for the retries half of the listener
+/// view with a length-discriminating read.
+#[test]
+fn mi_body_start_listener_retries_read_the_seeded_output_collection() {
+    let def = ProcessBuilder::new("mi-listener-seed-retries")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: true,
+                sequential: true,
+            },
+        )
+        .with_listeners(
+            "each",
+            vec![crate::model::ExecutionListener {
+                event_type: ListenerEventType::Start,
+                job_type: "audit".to_string(),
+                // Seeded view: count([null, null]) = 2; the ancestor view
+                // would give count(["audit"]) = 1.
+                retries: Some("=count(results)".to_string()),
+            }],
+            Vec::new(),
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-listener-seed-retries",
+            vars(&[
+                ("items", Value::List(vec![Value::Int(1), Value::Int(2)])),
+                (
+                    "results",
+                    Value::List(vec![Value::Str("audit".to_string())]),
+                ),
+            ]),
+        ))
+        .unwrap();
+    let listener = created.iter().find_map(|e| match e {
+        Event::ExecutionListenerJobCreated {
+            job_type, retries, ..
+        } if job_type == "audit" => Some(*retries),
+        _ => None,
+    });
+    assert_eq!(
+        listener,
+        Some(2),
+        "listener retries resolved against the seeded two-slot collection, not the ancestor: {created:?}"
+    );
+}
+
+/// Previously-missed review regression — with `outputElement="=null"` a
+/// worker that overwrites the body-local `results` binding (no output
+/// mappings, so its variables propagate to the body scope) leaves the
+/// accumulator unchanged. The collection write must still restore the body
+/// binding, so the NEXT child observes `[null, null]`, not the worker's
+/// `[9, 9]`.
+#[test]
+fn mi_collection_write_restores_a_worker_overwritten_body_binding() {
+    let def = ProcessBuilder::new("mi-null-elem")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=null".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: false,
+                sequential: true,
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-null-elem",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+
+    let first = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(first.len(), 1);
+    engine
+        .apply_command(Command::complete_job_with(
+            first[0].key,
+            vars(&[("results", Value::List(vec![Value::Int(9), Value::Int(9)]))]),
+        ))
+        .unwrap();
+    let second = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(second.len(), 1, "the second child is spawned");
+    assert_eq!(
+        second[0].variables.get("results"),
+        Some(&Value::List(vec![Value::Null, Value::Null])),
+        "the next child sees the accumulator, not the worker's overwrite"
+    );
+}
+
+#[test]
 fn multi_instance_input_mapping_cannot_clobber_loop_counter() {
     // A malicious/careless `zeebe:input` mapping targeting the reserved
     // `loopCounter` binding must not corrupt the engine-owned loop counter:
