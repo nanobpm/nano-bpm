@@ -313,10 +313,12 @@ fn element_span(xml: &str, local: &str, from: usize) -> Option<(usize, usize)> {
 }
 
 /// The byte span `[start, end)` of the `<!-- … -->` comment or
-/// `<![CDATA[ … ]]>` section that starts exactly at `from` (an unterminated
-/// one runs to the end of `xml`).
+/// `<![CDATA[ … ]]>` section, or `<? … ?>` processing instruction, that starts
+/// exactly at `from` (an unterminated one runs to the end of `xml`). A
+/// processing instruction ends at `?>`, not the first `>`, so markup-looking
+/// text inside one is never scanned as an element.
 fn non_markup_span(xml: &str, from: usize) -> Option<(usize, usize)> {
-    for (open, close) in [("<!--", "-->"), ("<![CDATA[", "]]>")] {
+    for (open, close) in [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")] {
         if xml[from..].starts_with(open) {
             let start = from;
             let end = xml[start + open.len()..]
@@ -356,13 +358,14 @@ fn nested_element_span(xml: &str, lt: usize) -> Option<(usize, usize)> {
     loop {
         let at = i + xml[i..].find('<')?;
         let after = &xml[at..];
-        if after.starts_with("<!--") || after.starts_with("<![CDATA[") {
-            let (open, close) = if after.starts_with("<!--") {
-                ("<!--", "-->")
-            } else {
-                ("<![CDATA[", "]]>")
-            };
-            i = at + open.len() + after[open.len()..].find(close)? + close.len();
+        if let Some((_, e)) = non_markup_span(xml, at) {
+            // Unterminated comment / CDATA / PI (span ran to EOF without its
+            // closing delimiter): malformed.
+            let closed = ["-->", "]]>", "?>"].iter().any(|c| xml[..e].ends_with(c));
+            if e - at < 4 || !closed {
+                return None;
+            }
+            i = e;
             continue;
         }
         let end = tag_end(xml, at)?;
@@ -515,18 +518,16 @@ fn declaration_spans(body: &str) -> Vec<(usize, usize)> {
         };
         let lt = i + lt_rel;
         let after = &body[lt..];
-        if after.starts_with("<!--") || after.starts_with("<![CDATA[") {
-            match non_markup_span(body, lt) {
-                Some((_, e)) => i = e.max(lt + 1),
-                None => break,
-            }
+        if let Some((_, e)) = non_markup_span(body, lt) {
+            i = e.max(lt + 1);
             continue;
         }
         match after[1..].chars().next() {
             // A close tag at this level can only be the caller's enclosing
             // element (or malformed input): the child list is over.
             Some('/') => break,
-            // A processing instruction or doctype: skip to its `>`.
+            // A doctype-like declaration: skip to its `>` (PIs are handled
+            // above by `non_markup_span`, which ends them at `?>`).
             Some('?') | Some('!') => {
                 i = after.find('>').map(|r| lt + r + 1).unwrap_or(body.len());
                 continue;
@@ -7168,6 +7169,20 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
                 .collect();
             assert_eq!(ids, vec!["E_REAL".to_string()], "body: {body}");
         }
+    }
+
+    #[test]
+    fn declaration_spans_skip_processing_instructions_through_their_terminator() {
+        // A PI ends at `?>`, not the first `>`: markup inside one is not a
+        // declaration, at top level or nested inside a declaration's body.
+        let body = r#"<?note > <bpmn:error id="E_FAKE"/> ?><bpmn:error id="E_REAL"/>"#;
+        let ids: Vec<_> = declaration_spans(body)
+            .into_iter()
+            .filter_map(|(s, _)| declaration_id_at(body, s))
+            .collect();
+        assert_eq!(ids, vec!["E_REAL".to_string()]);
+        let body = r#"<bpmn:message id="M"><?note > </bpmn:message> ?></bpmn:message>"#;
+        assert_eq!(declaration_spans(body), vec![(0, body.len())]);
     }
 
     #[test]
