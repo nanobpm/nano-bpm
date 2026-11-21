@@ -10139,11 +10139,15 @@ impl Engine {
         // children (and exporters) observe it while the loop runs. Each child
         // completion rewrites its slot (`complete_mi_child`); body completion
         // propagates the aggregate to the flow scope.
-        if let Some(name) = &mi.output_collection {
+        let collection_seed: Option<(String, Value)> = mi
+            .output_collection
+            .as_ref()
+            .map(|name| (name.clone(), Value::List(vec![Value::Null; total])));
+        if let Some((name, seed)) = &collection_seed {
             events.push(Event::ScopedVariablesUpdated {
                 instance_key,
                 scope_key: body_key,
-                variables: BTreeMap::from([(name.clone(), Value::List(vec![Value::Null; total]))]),
+                variables: BTreeMap::from([(name.clone(), seed.clone())]),
             });
         }
 
@@ -10207,6 +10211,21 @@ impl Engine {
             crate::model::ListenerEventType::Start,
         );
         if !start_listeners.is_empty() {
+            // The listener's `type`/`retries` resolve against the body view
+            // WITH the outputCollection seed overlaid (review r4648913482):
+            // Zeebe's `initializeOutputCollection` runs before the start
+            // listeners fire, so a same-named ancestor binding is shadowed by
+            // the body's local null slots — never observed through the seed.
+            let listener_vars;
+            let view = match &collection_seed {
+                Some((name, seed)) => {
+                    let mut merged = (*vars).clone();
+                    merged.insert(name.clone(), seed.clone());
+                    listener_vars = merged;
+                    &listener_vars
+                }
+                None => &vars,
+            };
             events.push(self.execution_listener_job_event(
                 instance_key,
                 body_key,
@@ -10214,7 +10233,7 @@ impl Engine {
                 crate::model::ListenerEventType::Start,
                 0,
                 scope,
-                &vars,
+                view,
             ));
             return (events, Vec::new());
         }
@@ -11206,28 +11225,74 @@ impl Engine {
         // Zeebe evaluates the completion condition in the completing CHILD's
         // scope (#1335, `childContext.getElementInstanceKey()`): `inputElement` /
         // `loopCounter`, child locals, and the output-mapped values are visible,
-        // layered over the body's ancestors — the shared `post_view`.
+        // layered over the body's ancestors — the shared `post_view`. Zeebe's
+        // `updateOutputCollection` runs BEFORE `evaluateCompletionCondition`, so
+        // the condition observes the completing child's slot already written
+        // (review r4648913529): overlay the PROSPECTIVE collection (the body's
+        // `output_values` with this child's slot replaced) onto the view. A
+        // binding of the collection's name the child does NOT inherit from the
+        // body — a child-local seed (`zeebe:input` / the #1518 `outputElement`
+        // root) or an output-mapped value — still shadows the body collection;
+        // the overlay replaces only the body scope's own (stale, pre-update)
+        // binding the child view carries.
         let completion_now = if already_fulfilled {
             true
         } else {
             match (completion_condition.as_deref(), &post_view) {
                 (None, _) => false,
-                (Some(c), Some(view)) => match expression::evaluate_bool(c, view) {
-                    Ok(b) => b,
-                    Err(failure) => {
-                        let event = self.expression_incident(
-                            instance_key,
-                            child_eik,
-                            element_id,
-                            failure,
-                            Some(state::IoMappingRedrive::MiChildCompletion {
-                                body_key,
-                                output_overlay: output_overlay.clone(),
-                            }),
-                        );
-                        return (vec![event], Vec::new());
+                (Some(c), Some(view)) => {
+                    let prospective = self.mi_body_prospective_collection(
+                        instance_key,
+                        body_key,
+                        index,
+                        output.clone(),
+                    );
+                    let child_binds_name = |name: &str| {
+                        // A child-scope local of the name (seeded at activation
+                        // or written by a per-child input mapping)…
+                        let local = self
+                            .state
+                            .instances
+                            .get(&instance_key)
+                            .and_then(|i| i.scope_variables.get(&child_eik))
+                            .is_some_and(|locals| locals.contains_key(name));
+                        // …or a value the child's output mappings projected into
+                        // the post-output view (not present in the raw child
+                        // scope view).
+                        let mapped = view.contains_key(name)
+                            && self
+                                .io_outputs(instance_key, &element_id)
+                                .iter()
+                                .any(|m| m.target == name);
+                        local || mapped
+                    };
+                    let condition_view;
+                    let view = match &prospective {
+                        Some((name, collection)) if !child_binds_name(name) => {
+                            let mut merged = (**view).clone();
+                            merged.insert(name.clone(), collection.clone());
+                            condition_view = merged;
+                            &condition_view
+                        }
+                        _ => view,
+                    };
+                    match expression::evaluate_bool(c, view) {
+                        Ok(b) => b,
+                        Err(failure) => {
+                            let event = self.expression_incident(
+                                instance_key,
+                                child_eik,
+                                element_id,
+                                failure,
+                                Some(state::IoMappingRedrive::MiChildCompletion {
+                                    body_key,
+                                    output_overlay: output_overlay.clone(),
+                                }),
+                            );
+                            return (vec![event], Vec::new());
+                        }
                     }
-                },
+                }
                 // A completion condition with no `post_view` cannot occur: the
                 // view is built whenever a completion condition is present.
                 (Some(_), None) => unreachable!(),
@@ -11363,6 +11428,39 @@ impl Engine {
                 ),
             )])
         })
+    }
+
+    /// The PROSPECTIVE body-local `outputCollection` for child `index`
+    /// completing with `output` (review r4648913529): `(name, collection)` with
+    /// slot `index` replaced, mirroring what
+    /// [`Self::mi_body_collection_update`] will commit — `None` when the body
+    /// names no collection or the index is out of range. Zeebe's
+    /// `MultiInstanceBodyProcessor.updateOutputCollection` runs BEFORE
+    /// `evaluateCompletionCondition`, so the completion condition must observe
+    /// the completing child's slot already written; the caller overlays this
+    /// onto the evaluation view.
+    fn mi_body_prospective_collection(
+        &self,
+        instance_key: Key,
+        body_key: Key,
+        index: usize,
+        output: Option<Value>,
+    ) -> Option<(String, Value)> {
+        let mi = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .multi_instances
+            .get(&body_key)?;
+        let name = mi.output_collection.clone()?;
+        let mut slots: Vec<Value> = mi
+            .output_values
+            .iter()
+            .map(|o| o.clone().unwrap_or(Value::Null))
+            .collect();
+        let slot = slots.get_mut(index)?;
+        *slot = output.unwrap_or(Value::Null);
+        Some((name, Value::List(slots)))
     }
 
     /// The body-local `outputCollection` write for child `index` completing
