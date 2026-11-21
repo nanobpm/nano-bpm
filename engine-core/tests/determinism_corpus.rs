@@ -2666,6 +2666,7 @@ fn with_ratified(job_key: u64) -> serde_json::Value {
     inst["key"] = serde_json::json!(10u64);
     inst["process_id"] = serde_json::json!("p");
     inst["state"] = serde_json::json!("Active");
+    inst["terminated_epoch"] = serde_json::json!(0u64);
     state["instances"]
         .as_object_mut()
         .expect("instances")
@@ -2712,6 +2713,7 @@ fn completed_ratified(job_key: u64) -> serde_json::Value {
     }
     let epoch = state["terminal_epoch"].as_u64().expect("terminal_epoch");
     state["terminal_epoch"] = serde_json::json!(epoch + 1);
+    state["instances"]["10"]["terminated_epoch"] = serde_json::json!(epoch + 1);
     state["recently_terminated"]
         .as_array_mut()
         .expect("recently_terminated")
@@ -3012,4 +3014,147 @@ fn state_projection_classifies_every_state_field() {
             .map(str::to_owned)
             .collect::<BTreeSet<_>>()
     );
+}
+
+/// An `ElementActivating` minting element instance `key` (element `x`). Like
+/// [`job_created`] it rides the divergent entry's instance 10 — an event
+/// naming instance 30 would make the boundary exclude 30 wholesale — so the
+/// mint's identity is what instance 30's nested containers reference.
+fn element_activating(key: u64) -> serde_json::Value {
+    serde_json::json!({"ElementActivating": {"element_id": "x",
+        "element_instance_key": key, "instance_key": 10, "scope": 0}})
+}
+
+/// #1764 (review): the engine keys NESTED in a retained instance
+/// (`active`, `scopes`, `scope_parents`, `activating`, `parked_joins`,
+/// `join_instances`) canonicalize through each side's own `KeyIds`, so a
+/// one-sided remint reconciles — while the same raw-key difference with no
+/// mint explaining it, or a swapped association, still fails.
+#[test]
+fn prev_release_gate_boundary_projection_remints_nested_instance_keys() {
+    let with_element = |raw: u64| {
+        let mut s = with_ratified(33);
+        let inst = s["state"]["state"]["instances"]["30"]
+            .as_object_mut()
+            .expect("retained instance 30");
+        inst.insert(
+            "active".to_owned(),
+            serde_json::json!({ raw.to_string(): "x" }),
+        );
+        inst.insert(
+            "scopes".to_owned(),
+            serde_json::json!({ raw.to_string(): raw }),
+        );
+        inst.insert(
+            "scope_parents".to_owned(),
+            serde_json::json!({ raw.to_string(): 30u64 }),
+        );
+        inst.insert("activating".to_owned(), serde_json::json!([raw]));
+        inst.insert("parked_joins".to_owned(), serde_json::json!([raw]));
+        inst.insert(
+            "join_instances".to_owned(),
+            serde_json::json!([{"scope": raw, "element_id": "j", "value": raw}]),
+        );
+        s
+    };
+    let (head, prev) = boundary_streams_with(
+        with_element(540),
+        with_element(440),
+        vec![element_activating(540)],
+        vec![element_activating(440)],
+    );
+    checked_s(&head, &prev, remint_unbalanced_expected())
+        .unwrap_or_else(|e| panic!("a nested retained-instance remint reconciles: {e}"));
+
+    let (head, prev) = boundary_streams(with_element(540), with_element(440));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("outside the ratified"),
+        "an unexplained nested remint must fail: {err}"
+    );
+}
+
+/// #1764 (review): `activated_jobs` is a `BTreeSet<Key>` — a remint that
+/// permutes two jobs' raw-key order compares equal as a set.
+#[test]
+fn prev_release_gate_boundary_projection_activated_jobs_is_a_set() {
+    let activated = |keys: [u64; 2]| {
+        let mut s = with_ratified(33);
+        let mut sorted = keys;
+        sorted.sort_unstable();
+        s["state"]["state"]["activated_jobs"] = serde_json::json!(sorted);
+        s
+    };
+    let (head, prev) = boundary_streams_with(
+        activated([133, 134]),
+        activated([436, 435]),
+        vec![job_created(133), job_created(134)],
+        vec![job_created(436), job_created(435)],
+    );
+    checked_s(&head, &prev, remint_unbalanced_expected())
+        .unwrap_or_else(|e| panic!("a permuting remint of activated jobs reconciles: {e}"));
+}
+
+/// #1764 (review): the ratified instance's terminal transition shifts every
+/// LATER terminal stamp by one on its side only — a subsequent identical
+/// completion of an unrelated instance reconciles, a genuinely different
+/// stamp still fails.
+#[test]
+fn prev_release_gate_boundary_projection_rebases_terminal_stamps() {
+    let later = |mut s: serde_json::Value, shift: i64| {
+        let state = s["state"]["state"].as_object_mut().expect("state");
+        let epoch = state["terminal_epoch"].as_u64().expect("terminal_epoch") + 1;
+        state["terminal_epoch"] = serde_json::json!(epoch);
+        state["instances"]["30"]["terminated_epoch"] =
+            serde_json::json!(epoch.saturating_add_signed(shift));
+        state["recently_terminated"]
+            .as_array_mut()
+            .expect("recently_terminated")
+            .push(serde_json::json!(30u64));
+        s
+    };
+    let (head, prev) = boundary_streams(
+        later(with_ratified(33), 0),
+        later(completed_ratified(33), 0),
+    );
+    checked_s(&head, &prev, unbalanced_expected())
+        .unwrap_or_else(|e| panic!("a later unrelated completion reconciles: {e}"));
+
+    let (head, prev) = boundary_streams(
+        later(with_ratified(33), 0),
+        later(completed_ratified(33), -1),
+    );
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("outside the ratified"),
+        "a wrong unrelated terminal stamp must fail: {err}"
+    );
+}
+
+/// #1764 (review): a job-type bucket emptied ONLY because its last job
+/// belongs to the ratified instance is omitted (the engine drops an emptied
+/// bucket), matching the side where that job already completed.
+#[test]
+fn prev_release_gate_boundary_projection_omits_buckets_emptied_by_exclusion() {
+    let mut pending = with_ratified(33);
+    let state = pending["state"]["state"].as_object_mut().expect("state");
+    let mut job = state["jobs"]["33"].clone();
+    job["key"] = serde_json::json!(77u64);
+    job["instance_key"] = serde_json::json!(10u64);
+    job["job_type"] = serde_json::json!("ratified-only");
+    state["jobs"]
+        .as_object_mut()
+        .expect("jobs")
+        .insert("77".to_owned(), job);
+    state["activatable_jobs"]["ratified-only"] = serde_json::json!([[50, 77]]);
+    let (head, prev) = boundary_streams(pending, completed_ratified(33));
+    checked_s(&head, &prev, unbalanced_expected())
+        .unwrap_or_else(|e| panic!("an excluded-only bucket is omitted: {e}"));
+
+    // An already-empty bucket is still compared.
+    let mut empty = with_ratified(33);
+    empty["state"]["state"]["activatable_jobs"]["idle"] = serde_json::json!([]);
+    let (head, prev) = boundary_streams(empty, completed_ratified(33));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(err.contains("outside the ratified"), "{err}");
 }

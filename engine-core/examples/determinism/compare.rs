@@ -118,7 +118,7 @@ pub enum FieldRule {
     /// A `BTreeMap<String, BTreeSet<(i64, Key)>>` worker-type index: each
     /// member's key is canonicalized and ratified-owned members dropped.
     PriorityKeyIndex,
-    /// An ordered collection of keys (`BTreeSet<Key>` / `VecDeque<Key>`):
+    /// An ordered collection of keys (`VecDeque<Key>` / `Vec<Key>`):
     /// canonicalized in place, ratified-owned keys dropped.
     KeyList,
     /// `created_by_process`: the ratified instances' OWN creations are
@@ -128,10 +128,32 @@ pub enum FieldRule {
     /// `inflight_by_process`: the ratified instances' OWN in-flight
     /// contributions (one per non-terminal ratified instance) are subtracted.
     InflightCount,
-    /// `terminal_epoch`: advanced by the ratified instance's terminal
-    /// transition on one side only and not isolatable, so dropped — but ONLY
-    /// when an instance is ratified; otherwise compared exactly.
+    /// `terminal_epoch`: minus the terminal transitions of ratified
+    /// instances (each advanced it once, on one side only); every other
+    /// transition is still compared exactly.
     TerminalEpoch,
+    /// `instances`: an [`FieldRule::EntityMap`] whose entries are projected
+    /// field by field with [`INSTANCE_FIELD_RULES`].
+    InstanceMap,
+    /// A `BTreeSet<Key>`: canonicalized, ratified-owned keys dropped, and
+    /// re-sorted (raw-key order is permuted by a remint).
+    KeySet,
+    /// A `BTreeMap<Key, T>` held by a retained instance: each entry re-keyed
+    /// by its entity identity (association preserved), values projected.
+    KeyedMap,
+    /// A `BTreeMap<Key, Key>` held by a retained instance: both sides of
+    /// every entry canonicalized (association preserved).
+    KeyToKeyMap,
+    /// A `join_map_serde` list (`[{scope, element_id, value}]`): `scope`
+    /// canonicalized and the list re-sorted by its canonical join key.
+    JoinMap,
+    /// A [`FieldRule::JoinMap`] whose `value` is itself an engine key.
+    JoinKeyMap,
+    /// A single engine-key reference (or `null`): canonicalized.
+    KeyRef,
+    /// `ProcessInstance.terminated_epoch`: re-based past the ratified
+    /// instances' preceding terminal transitions (`0` = never terminated).
+    TerminatedEpoch,
 }
 
 /// Every serialized field of `EngineSnapshot` (`src/engine/mod.rs`).
@@ -150,7 +172,7 @@ pub const SNAPSHOT_FIELD_RULES: &[(&str, FieldRule)] = &[
 pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("processes", FieldRule::Exact),
     ("process_versions", FieldRule::EntityMap),
-    ("instances", FieldRule::EntityMap),
+    ("instances", FieldRule::InstanceMap),
     ("jobs", FieldRule::EntityMap),
     ("settled_jobs", FieldRule::EntityMap),
     ("routed_deliveries", FieldRule::Exact),
@@ -164,7 +186,7 @@ pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("message_start_subscriptions", FieldRule::Exact),
     ("start_timers", FieldRule::EntityMap),
     ("activatable_jobs", FieldRule::PriorityKeyIndex),
-    ("activated_jobs", FieldRule::KeyList),
+    ("activated_jobs", FieldRule::KeySet),
     ("jobs_by_instance", FieldRule::KeyIndex),
     ("inflight_by_process", FieldRule::InflightCount),
     ("created_by_process", FieldRule::CreatedCount),
@@ -180,6 +202,44 @@ pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("recently_terminated", FieldRule::KeyList),
     ("terminal_epoch", FieldRule::TerminalEpoch),
     ("lenient_completion", FieldRule::Exact),
+];
+
+/// Every serialized field of `ProcessInstance` (`src/state/types.rs`): the
+/// engine-key containers a retained instance holds are canonicalized by
+/// shape, business data (`variables`, `scope_variables` values, …) is not.
+pub const INSTANCE_FIELD_RULES: &[(&str, FieldRule)] = &[
+    ("key", FieldRule::KeyRef),
+    ("process_id", FieldRule::Exact),
+    ("process_definition_key", FieldRule::KeyRef),
+    ("state", FieldRule::Exact),
+    ("terminated_epoch", FieldRule::TerminatedEpoch),
+    ("suspended_at", FieldRule::Exact),
+    ("created_at", FieldRule::Exact),
+    ("tags", FieldRule::Exact),
+    ("business_id", FieldRule::Exact),
+    ("parent_process_instance_key", FieldRule::KeyRef),
+    ("parent_element_instance_key", FieldRule::KeyRef),
+    ("active", FieldRule::KeyedMap),
+    ("scopes", FieldRule::KeyToKeyMap),
+    ("variables", FieldRule::Exact),
+    ("join_counts", FieldRule::JoinMap),
+    ("join_flow_arrivals", FieldRule::JoinMap),
+    ("join_instances", FieldRule::JoinKeyMap),
+    ("parked_joins", FieldRule::KeySet),
+    ("activating", FieldRule::KeySet),
+    ("gateway_routes", FieldRule::KeyedMap),
+    ("races", FieldRule::KeyToKeyMap),
+    ("incidents", FieldRule::KeyList),
+    ("variables_spilled", FieldRule::Exact),
+    ("multi_instances", FieldRule::KeyedMap),
+    ("adhoc_instances", FieldRule::KeyedMap),
+    ("scope_parents", FieldRule::KeyToKeyMap),
+    ("scope_variables", FieldRule::KeyedMap),
+    ("esp_held_payloads", FieldRule::KeyedMap),
+    ("compensable", FieldRule::Exact),
+    ("compensation_waits", FieldRule::KeyedMap),
+    ("agent_instances", FieldRule::KeyedMap),
+    ("agent_history", FieldRule::KeyedMap),
 ];
 
 /// The serialized field names of `struct <name> { … }` declared in `source`
@@ -252,6 +312,11 @@ pub fn projection_rule_drift() -> Result<(), String> {
             include_str!("../../src/engine/mod.rs"),
             SNAPSHOT_FIELD_RULES,
         ),
+        (
+            "ProcessInstance",
+            include_str!("../../src/state/types.rs"),
+            INSTANCE_FIELD_RULES,
+        ),
     ] {
         let fields = struct_fields_in(source, name)
             .ok_or_else(|| format!("struct {name} not found in its source"))?;
@@ -282,6 +347,9 @@ struct ProjectionSide<'a> {
     ids: &'a KeyIds,
     excluded: &'a BTreeSet<u64>,
     owned: BTreeSet<u64>,
+    /// The terminal epochs stamped by the ratified instances' own terminal
+    /// transitions on this side (sorted).
+    excluded_epochs: Vec<u64>,
 }
 
 impl ProjectionSide<'_> {
@@ -297,6 +365,11 @@ impl ProjectionSide<'_> {
             .get(&k)
             .cloned()
             .unwrap_or_else(|| format!("#key:{k}"))
+    }
+
+    /// How many ratified terminal transitions happened at or before `epoch`.
+    fn excluded_epochs_upto(&self, epoch: u64) -> u64 {
+        self.excluded_epochs.iter().filter(|e| **e <= epoch).count() as u64
     }
 
     fn owned_by_excluded(&self, map: &serde_json::Map<String, Json>) -> bool {
@@ -339,6 +412,45 @@ fn owned_entity_keys(
     out
 }
 
+/// The terminal epochs of the ratified instances' own terminal transitions:
+/// the instance's `terminated_epoch` stamp, or — once evicted from
+/// `instances` — its position in `recently_terminated` (mirrors
+/// `State::terminated_epoch_of`).
+fn excluded_terminal_epochs(
+    state: &serde_json::Map<String, Json>,
+    excluded: &BTreeSet<u64>,
+) -> Vec<u64> {
+    let terminal_epoch = state
+        .get("terminal_epoch")
+        .and_then(Json::as_u64)
+        .unwrap_or(0);
+    let recent: Vec<u64> = state
+        .get("recently_terminated")
+        .and_then(Json::as_array)
+        .map(|a| a.iter().filter_map(Json::as_u64).collect())
+        .unwrap_or_default();
+    let mut out: Vec<u64> = excluded
+        .iter()
+        .filter_map(|k| {
+            let stamped = state
+                .get("instances")
+                .and_then(|i| i.get(k.to_string()))
+                .and_then(|i| i.get("terminated_epoch"))
+                .and_then(Json::as_u64)
+                .filter(|e| *e > 0);
+            stamped.or_else(|| {
+                let len = recent.len() as u64;
+                recent
+                    .iter()
+                    .position(|r| r == k)
+                    .and_then(|i| (terminal_epoch + 1 + i as u64).checked_sub(len))
+            })
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 /// The post-boundary projection of a canonical `EngineSnapshot` (#1764).
 fn boundary_projection(
     snapshot: &Json,
@@ -352,10 +464,16 @@ fn boundary_projection(
         .and_then(Json::as_object)
         .map(|s| owned_entity_keys(s, excluded))
         .unwrap_or_default();
+    let excluded_epochs = root
+        .get("state")
+        .and_then(Json::as_object)
+        .map(|s| excluded_terminal_epochs(s, excluded))
+        .unwrap_or_default();
     let side = ProjectionSide {
         ids,
         excluded,
         owned,
+        excluded_epochs,
     };
     project_fields(root, SNAPSHOT_FIELD_RULES, "$", &side, root)
 }
@@ -395,19 +513,25 @@ fn project_fields(
                 Some(p) => p,
                 None => continue,
             },
-            FieldRule::EntityMap => project_entity_map(v, side, &format!("{path}.{k}"))?,
+            FieldRule::EntityMap => project_entity_map(v, side, &format!("{path}.{k}"), None)?,
             FieldRule::KeyIndex => project_key_index(v, side, &format!("{path}.{k}"))?,
             FieldRule::PriorityKeyIndex => project_priority_index(v, side),
             FieldRule::KeyList => project_key_list(v, side),
             FieldRule::CreatedCount => project_count(v, side, parent, false),
             FieldRule::InflightCount => project_count(v, side, parent, true),
-            FieldRule::TerminalEpoch => {
-                if side.excluded.is_empty() {
-                    v.clone()
-                } else {
-                    Json::Null
-                }
+            FieldRule::TerminalEpoch | FieldRule::TerminatedEpoch => match v.as_u64() {
+                Some(0) | None => v.clone(),
+                Some(e) => Json::from(e - side.excluded_epochs_upto(e).min(e)),
+            },
+            FieldRule::InstanceMap => {
+                project_entity_map(v, side, &format!("{path}.{k}"), Some(INSTANCE_FIELD_RULES))?
             }
+            FieldRule::KeySet => project_key_set(v, side),
+            FieldRule::KeyRef => key_reference(v, side),
+            FieldRule::KeyedMap => project_keyed_map(v, side, &format!("{path}.{k}"), false)?,
+            FieldRule::KeyToKeyMap => project_keyed_map(v, side, &format!("{path}.{k}"), true)?,
+            FieldRule::JoinMap => project_join_map(v, side, false),
+            FieldRule::JoinKeyMap => project_join_map(v, side, true),
         };
         out.insert(k.clone(), projected);
     }
@@ -467,7 +591,12 @@ fn key_reference(v: &Json, side: &ProjectionSide<'_>) -> Json {
     }
 }
 
-fn project_entity_map(v: &Json, side: &ProjectionSide<'_>, path: &str) -> Result<Json, String> {
+fn project_entity_map(
+    v: &Json,
+    side: &ProjectionSide<'_>,
+    path: &str,
+    entry_rules: Option<&[(&str, FieldRule)]>,
+) -> Result<Json, String> {
     let Some(map) = v.as_object() else {
         return Ok(v.clone());
     };
@@ -479,8 +608,14 @@ fn project_entity_map(v: &Json, side: &ProjectionSide<'_>, path: &str) -> Result
         if side.is_excluded(raw) {
             continue;
         }
-        let Some(projected) = project_value(entry, side) else {
-            continue;
+        let projected = match (entry_rules, entry.as_object()) {
+            (Some(rules), Some(fields)) => {
+                project_fields(fields, rules, &format!("{path}.{k}"), side, fields)?
+            }
+            _ => match project_value(entry, side) {
+                Some(p) => p,
+                None => continue,
+            },
         };
         let token = side.token(raw);
         if out.insert(token.clone(), projected).is_some() {
@@ -513,6 +648,67 @@ fn project_key_index(v: &Json, side: &ProjectionSide<'_>, path: &str) -> Result<
         }
     }
     Ok(Json::Object(out))
+}
+
+/// A key-keyed map held by a retained instance: each entry re-keyed by its
+/// entity identity, its value a key reference (`keyed_values`) or projected.
+fn project_keyed_map(
+    v: &Json,
+    side: &ProjectionSide<'_>,
+    path: &str,
+    keyed_values: bool,
+) -> Result<Json, String> {
+    let Some(map) = v.as_object() else {
+        return Ok(v.clone());
+    };
+    let mut out = serde_json::Map::new();
+    for (k, entry) in map {
+        let raw = k
+            .parse::<u64>()
+            .map_err(|_| format!("{path} entry key {k:?} is not an engine key"))?;
+        let projected = if keyed_values {
+            key_reference(entry, side)
+        } else {
+            match project_value(entry, side) {
+                Some(p) => p,
+                None => continue,
+            }
+        };
+        let token = side.token(raw);
+        if out.insert(token.clone(), projected).is_some() {
+            return Err(format!("{path}: two entries canonicalize to {token}"));
+        }
+    }
+    Ok(Json::Object(out))
+}
+
+/// A `join_map_serde` list: `scope` (and, for `keyed_values`, `value`)
+/// canonicalized, re-sorted by the canonical entry (raw-scope order is
+/// permuted by a remint).
+fn project_join_map(v: &Json, side: &ProjectionSide<'_>, keyed_values: bool) -> Json {
+    let Some(items) = v.as_array() else {
+        return v.clone();
+    };
+    let mut out: Vec<Json> = items
+        .iter()
+        .map(|item| {
+            let Some(entry) = item.as_object() else {
+                return item.clone();
+            };
+            let mut e = serde_json::Map::new();
+            for (f, x) in entry {
+                let p = match f.as_str() {
+                    "scope" => key_reference(x, side),
+                    "value" if keyed_values => key_reference(x, side),
+                    _ => project_value(x, side).unwrap_or(Json::Null),
+                };
+                e.insert(f.clone(), p);
+            }
+            Json::Object(e)
+        })
+        .collect();
+    out.sort_by_key(ToString::to_string);
+    Json::Array(out)
 }
 
 /// A SET of keys: canonicalized, ratified-owned keys dropped, and re-sorted
@@ -574,6 +770,12 @@ fn project_priority_index(v: &Json, side: &ProjectionSide<'_>) -> Json {
                 None => m.clone(),
             })
             .collect();
+        // The engine drops an emptied bucket (`resync_job_index`): a bucket
+        // emptied only by the exclusion is omitted, an already-empty one kept.
+        let was_empty = members.as_array().is_none_or(Vec::is_empty);
+        if items.is_empty() && !was_empty {
+            continue;
+        }
         items.sort_by_key(ToString::to_string);
         out.insert(job_type.clone(), Json::Array(items));
     }
