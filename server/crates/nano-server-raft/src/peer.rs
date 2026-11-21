@@ -993,6 +993,7 @@ impl PeerLink {
     /// publishing request's `operationReference` (#1600), stamped on every
     /// record the publish produces on the peer's partitions. `message_key` is
     /// the publication's already-minted key (#1434), reused by the peer.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_message(
         &self,
         name: String,

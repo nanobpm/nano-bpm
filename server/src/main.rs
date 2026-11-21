@@ -10659,6 +10659,7 @@ impl ServerImpl {
     /// another node (#1434); every local target reuses it. When `None`, the
     /// first locally applied target mints it and the rest reuse that one, so
     /// all records of one publication carry the key the client receives.
+    #[allow(clippy::too_many_arguments)]
     async fn correlate_message_everywhere(
         &self,
         name: String,
@@ -10749,6 +10750,7 @@ impl ServerImpl {
     /// every local target (the legacy behaviour). `operation_reference` is the
     /// publishing request's `operationReference` (#1600), threaded through to
     /// every record the publish produces here.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn correlate_message_local(
         &self,
         name: String,
