@@ -2355,6 +2355,23 @@ impl Event {
         }
     }
 
+    /// Whether this is a partition-agnostic deployment event (a process, DRG,
+    /// decision, form or generic resource definition). The single canonical
+    /// predicate for the deployment broadcast set: the engine's
+    /// `install_deployment*`, the journal's durable replicated copy, and every
+    /// recovery demux (segmented hot tail, cold archive, legacy) must route
+    /// through this so no resource kind is silently dropped on one path (#1500).
+    pub fn is_deployment(&self) -> bool {
+        matches!(
+            self,
+            Event::ProcessDeployed { .. }
+                | Event::DecisionRequirementsDeployed { .. }
+                | Event::DecisionDeployed { .. }
+                | Event::FormDeployed { .. }
+                | Event::GenericResourceDeployed { .. }
+        )
+    }
+
     /// The partition that owns this event when a shared (untagged) journal is
     /// split per partition on recovery. Normally the partition encoded in
     /// [`Event::max_key`]; a [`Event::RoutedDeliveryRecorded`] record instead

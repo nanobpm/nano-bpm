@@ -2946,7 +2946,8 @@ pub fn recover_multi_scoped(
     // `events` (untagged, global order) drives the caller's read-model catch-up.
     let events: Vec<Event> = tagged.iter().map(|(_, e)| e.clone()).collect();
 
-    // Replicated `ProcessDeployed` broadcast set: a durable deployment copy whose
+    // Replicated deployment broadcast set (every `Event::is_deployment` kind —
+    // process, DRG, decision, form, generic resource; #1500): a durable deployment copy whose
     // write tag differs from its key partition (a clustered peer journaled it
     // under its first-owned partition, keyed to the deployment partition). It is
     // partition-agnostic, so every owned partition OTHER than the one that
@@ -2957,7 +2958,7 @@ pub fn recover_multi_scoped(
     let broadcast: Vec<(u64, Event)> = tagged
         .iter()
         .filter(|(tag, e)| {
-            matches!(e, Event::ProcessDeployed { .. })
+            e.is_deployment()
                 && *tag
                     != (partition_of(e.max_key()) as usize).min(num_partitions.saturating_sub(1))
                         as u64
@@ -3062,14 +3063,14 @@ pub fn recover_multi_scoped(
     };
 
     // When migrating, the replicated-deployment broadcast set must also consider
-    // the cold-archived prefix (a cross-partition `ProcessDeployed` may have been
+    // the cold-archived prefix (a cross-partition deployment event may have been
     // compacted out of the hot tail).
     let broadcast: Vec<(u64, Event)> = if migrate {
         cold_tagged
             .iter()
             .chain(tagged.iter())
             .filter(|(tag, e)| {
-                matches!(e, Event::ProcessDeployed { .. })
+                e.is_deployment()
                     && *tag
                         != (partition_of(e.max_key()) as usize)
                             .min(num_partitions.saturating_sub(1)) as u64
@@ -5192,6 +5193,101 @@ mod tests {
             engines[&2].instance(inst2).is_some(),
             "partition 2 instance restored (definition arrived via broadcast)"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1500: the segmented recovery broadcast set must re-install EVERY
+    /// deployment kind — DRG, decision, form and generic resource, not just
+    /// processes — into a clustered peer's other owned partitions (mirroring the
+    /// legacy demux). Partition 2's SOLE source for these definitions is the
+    /// broadcast (no combined snapshot is written), so a kind missing from the
+    /// broadcast predicate is lost on restart.
+    #[test]
+    fn clustered_replicated_deployment_recovers_every_resource_kind() {
+        let dir = temp_dir("cluster-deploy-kinds");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+
+        let deploy_events: Vec<Event> = {
+            let mut p0 = crate::journal::Journal::in_memory_partition(0);
+            let mut evs = Vec::new();
+            let drg = nanobpmn_engine_core::dmn::parse_dmn(
+                r#"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greet" name="greet">
+                  <decision id="base" name="Base">
+                    <literalExpression id="bl"><text>"b"</text></literalExpression>
+                  </decision>
+                </definitions>"#,
+            )
+            .unwrap();
+            for cmd in [
+                Command::DeployDecisionRequirements(vec![drg]),
+                Command::DeployForms(vec![nanobpmn_engine_core::FormResource {
+                    id: "greeting".into(),
+                    resource_name: "greeting.form".into(),
+                    schema: r#"{"id":"greeting","components":[]}"#.into(),
+                    version_tag: None,
+                }]),
+                Command::DeployGenericResources(vec![nanobpmn_engine_core::GenericResource {
+                    resource_id: "prompt.md".into(),
+                    resource_name: "prompt.md".into(),
+                    content: "hello".into(),
+                    version_tag: None,
+                }]),
+            ] {
+                let (e, _) = p0.apply_command(cmd).unwrap();
+                evs.extend(e.iter().filter(|e| e.is_deployment()).cloned());
+            }
+            evs
+        };
+        assert!(deploy_events.iter().all(|e| partition_of(e.max_key()) == 0));
+        assert_eq!(deploy_events.len(), 4, "DRG + decision + form + resource");
+
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[1, 2], 3, None)
+                    .expect("open clustered");
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j2 = crate::journal::Journal::from_engine_shared(
+                2,
+                engines.remove(&2).unwrap(),
+                true,
+                &writer,
+            );
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j2.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            let _ = j1.install_deployment_durable(&deploy_events);
+            j2.install_deployment(&deploy_events);
+            let _ = j1.snapshot_and_rotate().expect("flush via rotate");
+        }
+
+        let recovery = recover_multi(&dir, &[1, 2], 3, None).expect("reopen clustered");
+        assert!(!recovery.fresh);
+        for (p, engine) in recovery.engines {
+            let st = engine.state();
+            assert!(
+                st.decision_requirements.contains_key("greet"),
+                "partition {p}: DRG restored"
+            );
+            assert!(
+                st.decisions.contains_key("base"),
+                "partition {p}: decision restored"
+            );
+            assert!(
+                st.forms.contains_key("greeting"),
+                "partition {p}: form restored"
+            );
+            assert!(
+                st.resources.contains_key("prompt.md"),
+                "partition {p}: generic resource restored"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
