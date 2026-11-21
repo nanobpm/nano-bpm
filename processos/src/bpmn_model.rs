@@ -7449,6 +7449,45 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         );
     }
 
+    fn defs_with(decl: &str, process: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn.io/schema/bpmn">
+  {decl}
+  <bpmn:process id="{process}" isExecutable="true"/>
+</bpmn:definitions>
+"#
+        )
+    }
+
+    #[test]
+    fn merge_definitions_rejects_same_id_declarations_with_different_content() {
+        // Silently dropping the extra's declaration would rebind its refs to
+        // the primary's (different) declaration — the merge must fail closed.
+        let primary = defs_with(r#"<bpmn:error id="E" errorCode="A"/>"#, "ProcA");
+        let extra = defs_with(r#"<bpmn:error id="E" errorCode="B"/>"#, "ProcB");
+        let err = merge_definitions(&primary, &[extra.as_str()])
+            .expect_err("conflicting same-id declarations must be rejected");
+        assert!(err.contains("'E'"), "error names the id, got: {err}");
+        // Also between two extras, not only primary-vs-extra.
+        let p = defs_with("", "ProcP");
+        let err = merge_definitions(&p, &[primary.as_str(), extra.as_str()])
+            .expect_err("conflict across extras must be rejected");
+        assert!(err.contains("'E'"), "error names the id, got: {err}");
+    }
+
+    #[test]
+    fn merge_definitions_dedupes_same_declaration_differing_only_in_whitespace() {
+        let primary = defs_with(r#"<bpmn:error id="E" errorCode="A"/>"#, "ProcA");
+        let extra = defs_with("<bpmn:error  id=\"E\"\n      errorCode=\"A\"/>", "ProcB");
+        let merged = merge_definitions(&primary, &[extra.as_str()]).unwrap();
+        assert_eq!(
+            merged.matches("<bpmn:error ").count(),
+            1,
+            "whitespace-only differences dedupe, got:\n{merged}"
+        );
+    }
+
     #[test]
     fn definition_to_xml_round_trips_an_escalation_throw_with_io() {
         // Regression (#1173): the escalation throw/end serializer must nest a
