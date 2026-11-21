@@ -916,11 +916,15 @@ fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
         let now = g.now;
         let act = g.push(activate(job_type, 10, now));
         // Completing ONE child satisfies the condition and cancels the rest.
-        let first = all(&act, "JobActivated", "job_key")
+        // Complete the LAST-minted job: it is a job key under both the
+        // current lazily-chained parallel scheduler (#1539) and the previous
+        // release's eager one, so the previous-release gate compares the same
+        // accepted command (the minimum key is a job only under the old order).
+        let last = all(&act, "JobActivated", "job_key")
             .into_iter()
-            .min()
+            .max()
             .unwrap_or(0);
-        g.push(Command::complete_job(first));
+        g.push(Command::complete_job(last));
     }
     // ---- Multi-instance user tasks (#1528) --------------------------------
     // A multi-instance on a DIRECT user task creates one user task per child

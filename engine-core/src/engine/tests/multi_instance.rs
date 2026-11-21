@@ -2591,3 +2591,180 @@ fn multi_instance_teardown_cancels_every_child_user_task_once() {
         );
     }
 }
+
+/// A parallel MI over `items` whose per-child input mapping fails for items
+/// `>= fail_from` (`assert` on the item), with an optional body end listener.
+fn parallel_mi_with_failing_input(
+    id: &str,
+    inner: Option<&str>,
+    fail_from: i64,
+    completion_condition: Option<&str>,
+    end_listener: Option<&str>,
+) -> crate::model::ProcessDefinition {
+    let mut b = ProcessBuilder::new(id).start_event("start");
+    b = match inner {
+        Some(job_type) => b.service_task("each", job_type),
+        None => b.task("each"),
+    };
+    b = b
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: completion_condition.map(str::to_string),
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: format!("=assert(item, item < {fail_from} or fixed = true)"),
+                    target: "mapped".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        );
+    if let Some(listener) = end_listener {
+        b = b.with_listeners(
+            "each",
+            Vec::new(),
+            vec![el(ListenerEventType::End, listener)],
+        );
+    }
+    b.end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn parallel_mi_siblings_activate_past_a_failing_child_input_mapping() {
+    // #1539 review r4650213947: with lazily-chained parallel children, a child
+    // whose input mapping parks on an incident must still queue its siblings
+    // (no stranded items), and resolving the incident must re-drive THAT child
+    // (same key) without re-queueing the siblings (no duplicates).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(parallel_mi_with_failing_input(
+            "mi-sib-io",
+            Some("handle"),
+            1,
+            None,
+            None,
+        )))
+        .unwrap();
+    // `fail_from = 1` with items [1, 0, 0]: only index 0's mapping fails.
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sib-io",
+            vars(&[
+                (
+                    "items",
+                    Value::List(vec![Value::Int(1), Value::Int(0), Value::Int(0)]),
+                ),
+                ("fixed", Value::Bool(false)),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(
+        active.len(),
+        1,
+        "only the first child is parked: {active:?}"
+    );
+    let parked_child = active[0].element_instance_key;
+    assert_eq!(
+        engine.state().jobs.len(),
+        2,
+        "the later siblings activate before the incident is resolved"
+    );
+    let incident_key = active[0].key;
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            BTreeMap::from([("fixed".to_string(), Value::Bool(true))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3, "exactly one job per item, no duplicates");
+    assert!(
+        jobs.iter().any(|j| j.element_instance_key == parked_child),
+        "the parked child's key is reused on re-drive"
+    );
+    let body = engine.state.instances[&inst]
+        .multi_instances
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(body.active.len(), 3, "exactly one child per item");
+    assert_eq!(body.spawned, 3);
+    for job in jobs {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Completed
+    );
+}
+
+#[test]
+fn queued_parallel_sibling_is_dropped_once_the_body_starts_completing() {
+    // #1539 review r4650213936: child 1 satisfies the completion condition and
+    // the body enters COMPLETING (resting on its end listener) while child 3 is
+    // still a queued activation. That queued sibling must be dropped — if it
+    // activated (and here its input mapping fails) it would leave an orphaned
+    // token + incident that blocks the process from completing.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(parallel_mi_with_failing_input(
+            "mi-sib-done",
+            None,
+            3,
+            Some("=loopCounter = 1"),
+            Some("audit"),
+        )))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sib-done",
+            vars(&[
+                (
+                    "items",
+                    Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+                ),
+                ("fixed", Value::Bool(false)),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no incident from a sibling queued past body completion: {:?}",
+        engine.active_incidents()
+    );
+    let listener = engine.activate_jobs("audit", "w", 10, 60_000, 0);
+    assert_eq!(listener.len(), 1);
+    engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Completed
+    );
+}
