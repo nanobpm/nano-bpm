@@ -2213,3 +2213,55 @@ fn created_user_task_index_is_scoped_to_the_teardown_instance() {
     assert_eq!(tasks.len(), 1, "only the target instance's task is indexed");
     assert!(tasks.iter().all(|t| t.instance_key == keys[0]));
 }
+
+// zeebe-cells: element:InclusiveGateway element:BoundaryEvent event:boundary:timer
+#[test]
+fn second_boundary_fed_inclusive_join_fires_once_its_boundary_interrupts() {
+    // #1730 (differential fuzzer, case seed 2203747932). Two boundary-fed
+    // inclusive joins in sequence: `t1[msg b1] -> g1(or) -> t2[timer b2] ->
+    // g2(or) -> g3(xor, two flows) -> e`. Completing `t1` reaches `g1`, which
+    // fires; once `b2` fires and terminates `t2`, no token can still reach
+    // `g2` along `t2`, so `g2` must activate and the instance complete.
+    let def = ProcessBuilder::new("chained-boundary-joins")
+        .start_event("s")
+        .service_task("t1", "j1")
+        .message_boundary_event("b1", "t1", "m1", "=\"k\"")
+        .inclusive_gateway("g1")
+        .service_task("t2", "j2")
+        .timer_boundary_event("b2", "t2", 60_000)
+        .inclusive_gateway("g2")
+        .exclusive_gateway("g3")
+        .end_event("e")
+        .connect("s", "t1")
+        .connect("t1", "g1")
+        .connect("b1", "g1")
+        .connect("g1", "t2")
+        .connect("t2", "g2")
+        .connect("b2", "g2")
+        .connect("g2", "g3")
+        .connect("g2", "g3")
+        .connect("g3", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("chained-boundary-joins"), 0)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    complete_one(&mut engine, "j1");
+    assert!(!engine.is_completed(instance_key));
+    let due = engine
+        .timers()
+        .iter()
+        .find(|t| t.state == state::TimerState::Created)
+        .map(|t| t.due_at)
+        .expect("b2 armed");
+    engine.trigger_timers(due);
+    assert!(
+        engine.is_completed(instance_key),
+        "g2 must fire once b2 interrupts t2"
+    );
+}
