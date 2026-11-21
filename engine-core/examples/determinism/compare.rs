@@ -73,6 +73,41 @@ struct RatifiedBoundary {
     from: Option<u64>,
     head_instances: BTreeSet<u64>,
     prev_instances: BTreeSet<u64>,
+    /// Each side's process-instance creations, from its own event stream.
+    head_creations: Creations,
+    prev_creations: Creations,
+}
+
+/// Every process instance a side's event stream creates: instance key →
+/// (entry position of its first `ProcessInstanceCreated`, creating process
+/// id). Derived from the events, so it holds independently of whether the
+/// instance is still resident in a snapshot (eviction) and of its CURRENT
+/// process id (migration) — exactly the attribution of the engine's
+/// cumulative `created_by_process` count (#1764).
+type Creations = BTreeMap<u64, (u64, String)>;
+
+fn creations_of(records: &[Json]) -> Creations {
+    let mut out = Creations::new();
+    for r in records {
+        let (Some(i), Some(events)) = (
+            r.get("i").and_then(Json::as_u64),
+            r.get("events").and_then(Json::as_array),
+        ) else {
+            continue;
+        };
+        for e in events {
+            let Some(body) = e.get("ProcessInstanceCreated") else {
+                continue;
+            };
+            if let (Some(k), Some(pid)) = (
+                body.get("instance_key").and_then(Json::as_u64),
+                body.get("process_id").and_then(Json::as_str),
+            ) {
+                out.entry(k).or_insert_with(|| (i, pid.to_owned()));
+            }
+        }
+    }
+    out
 }
 
 /// Whether a field name holds an entity key (or a list of them).
@@ -154,6 +189,11 @@ pub enum FieldRule {
     /// `ProcessInstance.terminated_epoch`: re-based past the ratified
     /// instances' preceding terminal transitions (`0` = never terminated).
     TerminatedEpoch,
+    /// A `BTreeMap<Key, S>` held by a retained instance whose struct values
+    /// carry nested engine keys: each entry re-keyed by its entity identity
+    /// and its value projected field by field with the given (drift-guarded)
+    /// rules for `S`.
+    StructMap(&'static [(&'static str, FieldRule)]),
 }
 
 /// Every serialized field of `EngineSnapshot` (`src/engine/mod.rs`).
@@ -231,15 +271,61 @@ pub const INSTANCE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("races", FieldRule::KeyToKeyMap),
     ("incidents", FieldRule::KeyList),
     ("variables_spilled", FieldRule::Exact),
-    ("multi_instances", FieldRule::KeyedMap),
-    ("adhoc_instances", FieldRule::KeyedMap),
+    (
+        "multi_instances",
+        FieldRule::StructMap(MULTI_INSTANCE_FIELD_RULES),
+    ),
+    ("adhoc_instances", FieldRule::StructMap(ADHOC_FIELD_RULES)),
     ("scope_parents", FieldRule::KeyToKeyMap),
     ("scope_variables", FieldRule::KeyedMap),
     ("esp_held_payloads", FieldRule::KeyedMap),
     ("compensable", FieldRule::Exact),
-    ("compensation_waits", FieldRule::KeyedMap),
+    (
+        "compensation_waits",
+        FieldRule::StructMap(COMPENSATION_WAIT_FIELD_RULES),
+    ),
     ("agent_instances", FieldRule::KeyedMap),
     ("agent_history", FieldRule::KeyedMap),
+];
+
+/// Every serialized field of `MultiInstanceState` (`src/state/types.rs`).
+pub const MULTI_INSTANCE_FIELD_RULES: &[(&str, FieldRule)] = &[
+    ("element_id", FieldRule::Exact),
+    ("sequential", FieldRule::Exact),
+    ("items", FieldRule::Exact),
+    ("output_collection", FieldRule::Exact),
+    ("output_element", FieldRule::Exact),
+    ("completion_condition", FieldRule::Exact),
+    ("cancel_remaining_instances", FieldRule::Exact),
+    ("input_element", FieldRule::Exact),
+    ("spawned", FieldRule::Exact),
+    ("active", FieldRule::KeySet),
+    ("child_indices", FieldRule::KeyedMap),
+    ("output_values", FieldRule::Exact),
+    ("completion_condition_fulfilled", FieldRule::Exact),
+];
+
+/// Every serialized field of `AdHocState` (`src/state/types.rs`).
+pub const ADHOC_FIELD_RULES: &[(&str, FieldRule)] = &[
+    ("element_id", FieldRule::Exact),
+    ("output_collection", FieldRule::Exact),
+    ("output_element", FieldRule::Exact),
+    ("active", FieldRule::KeySet),
+    ("iterations", FieldRule::Exact),
+    ("completion_condition_fulfilled", FieldRule::Exact),
+];
+
+/// Every serialized field of `CompensationWait` (`src/state/types.rs`). The
+/// `Vec<Key>` lists are positionally aligned with `pending_handlers`, so they
+/// are canonicalized in place ([`FieldRule::KeyRef`]), never re-sorted.
+pub const COMPENSATION_WAIT_FIELD_RULES: &[(&str, FieldRule)] = &[
+    ("throw_element_id", FieldRule::Exact),
+    ("scope", FieldRule::KeyRef),
+    ("pending_handlers", FieldRule::Exact),
+    ("pending_handler_keys", FieldRule::KeyRef),
+    ("pending_scope_subscriptions", FieldRule::KeyRef),
+    ("pending_handler_scopes", FieldRule::KeyRef),
+    ("pending_scope_subscription_parents", FieldRule::KeyRef),
 ];
 
 /// The serialized field names of `struct <name> { … }` declared in `source`
@@ -317,6 +403,21 @@ pub fn projection_rule_drift() -> Result<(), String> {
             include_str!("../../src/state/types.rs"),
             INSTANCE_FIELD_RULES,
         ),
+        (
+            "MultiInstanceState",
+            include_str!("../../src/state/types.rs"),
+            MULTI_INSTANCE_FIELD_RULES,
+        ),
+        (
+            "AdHocState",
+            include_str!("../../src/state/types.rs"),
+            ADHOC_FIELD_RULES,
+        ),
+        (
+            "CompensationWait",
+            include_str!("../../src/state/types.rs"),
+            COMPENSATION_WAIT_FIELD_RULES,
+        ),
     ] {
         let fields = struct_fields_in(source, name)
             .ok_or_else(|| format!("struct {name} not found in its source"))?;
@@ -350,6 +451,9 @@ struct ProjectionSide<'a> {
     /// The terminal epochs stamped by the ratified instances' own terminal
     /// transitions on this side (sorted).
     excluded_epochs: Vec<u64>,
+    /// This side's instance creations, and the checkpoint position.
+    creations: &'a Creations,
+    at: u64,
 }
 
 impl ProjectionSide<'_> {
@@ -456,6 +560,7 @@ fn boundary_projection(
     snapshot: &Json,
     ids: &KeyIds,
     excluded: &BTreeSet<u64>,
+    (creations, at): (&Creations, u64),
 ) -> Result<Json, String> {
     projection_rule_drift()?;
     let root = snapshot.as_object().ok_or("snapshot is not an object")?;
@@ -474,6 +579,8 @@ fn boundary_projection(
         excluded,
         owned,
         excluded_epochs,
+        creations,
+        at,
     };
     project_fields(root, SNAPSHOT_FIELD_RULES, "$", &side, root)
 }
@@ -528,8 +635,15 @@ fn project_fields(
             }
             FieldRule::KeySet => project_key_set(v, side),
             FieldRule::KeyRef => key_reference(v, side),
-            FieldRule::KeyedMap => project_keyed_map(v, side, &format!("{path}.{k}"), false)?,
-            FieldRule::KeyToKeyMap => project_keyed_map(v, side, &format!("{path}.{k}"), true)?,
+            FieldRule::KeyedMap => {
+                project_keyed_map(v, side, &format!("{path}.{k}"), KeyedValues::Projected)?
+            }
+            FieldRule::KeyToKeyMap => {
+                project_keyed_map(v, side, &format!("{path}.{k}"), KeyedValues::Keys)?
+            }
+            FieldRule::StructMap(rules) => {
+                project_keyed_map(v, side, &format!("{path}.{k}"), KeyedValues::Struct(rules))?
+            }
             FieldRule::JoinMap => project_join_map(v, side, false),
             FieldRule::JoinKeyMap => project_join_map(v, side, true),
         };
@@ -650,13 +764,24 @@ fn project_key_index(v: &Json, side: &ProjectionSide<'_>, path: &str) -> Result<
     Ok(Json::Object(out))
 }
 
+/// How [`project_keyed_map`] projects each entry's value.
+#[derive(Clone, Copy)]
+enum KeyedValues {
+    /// Generic nested projection ([`project_value`]).
+    Projected,
+    /// The value is itself an engine-key reference.
+    Keys,
+    /// A struct projected field by field with its typed rules.
+    Struct(&'static [(&'static str, FieldRule)]),
+}
+
 /// A key-keyed map held by a retained instance: each entry re-keyed by its
-/// entity identity, its value a key reference (`keyed_values`) or projected.
+/// entity identity, its value projected per [`KeyedValues`].
 fn project_keyed_map(
     v: &Json,
     side: &ProjectionSide<'_>,
     path: &str,
-    keyed_values: bool,
+    values: KeyedValues,
 ) -> Result<Json, String> {
     let Some(map) = v.as_object() else {
         return Ok(v.clone());
@@ -666,13 +791,18 @@ fn project_keyed_map(
         let raw = k
             .parse::<u64>()
             .map_err(|_| format!("{path} entry key {k:?} is not an engine key"))?;
-        let projected = if keyed_values {
-            key_reference(entry, side)
-        } else {
-            match project_value(entry, side) {
+        let projected = match (values, entry.as_object()) {
+            (KeyedValues::Keys, _) => key_reference(entry, side),
+            (KeyedValues::Struct(rules), Some(fields)) => {
+                project_fields(fields, rules, &format!("{path}.{k}"), side, fields)?
+            }
+            (KeyedValues::Struct(_), None) => {
+                return Err(format!("{path}.{k} is not a struct value"));
+            }
+            (KeyedValues::Projected, _) => match project_value(entry, side) {
                 Some(p) => p,
                 None => continue,
-            }
+            },
         };
         let token = side.token(raw);
         if out.insert(token.clone(), projected).is_some() {
@@ -783,10 +913,15 @@ fn project_priority_index(v: &Json, side: &ProjectionSide<'_>) -> Json {
 }
 
 /// A per-process count minus ONLY the ratified instances' own
-/// contributions: each ratified instance still resident in `instances`
-/// contributed one creation, and one in-flight count while non-terminal. A
-/// count that reaches zero is dropped (the engine drops a zero in-flight
-/// entry). Every other instance's contribution is compared exactly.
+/// contributions. A creation is attributed from this side's own
+/// `ProcessInstanceCreated` at or before the checkpoint (independent of
+/// eviction and migration); an in-flight contribution is the ratified
+/// instance's while it is resident and non-terminal (the in-flight count is
+/// tracked under its current process). Only an entry that the subtraction
+/// itself empties is dropped (the engine drops a zero in-flight entry, and a
+/// process with only ratified creations is absent on the other side); a
+/// pre-existing zero entry is compared exactly. Every other instance's
+/// contribution is compared exactly.
 fn project_count(
     v: &Json,
     side: &ProjectionSide<'_>,
@@ -797,25 +932,35 @@ fn project_count(
         return v.clone();
     };
     let mut out = map.clone();
+    let mut emptied = BTreeSet::new();
     for k in side.excluded {
-        let Some(inst) = state.get("instances").and_then(|i| i.get(k.to_string())) else {
-            continue;
+        let pid = if inflight {
+            let Some(inst) = state.get("instances").and_then(|i| i.get(k.to_string())) else {
+                continue;
+            };
+            let terminal = matches!(
+                inst.get("state").and_then(Json::as_str),
+                Some("Completed" | "Terminated")
+            );
+            match inst.get("process_id").and_then(Json::as_str) {
+                Some(pid) if !terminal => pid.to_owned(),
+                _ => continue,
+            }
+        } else {
+            match side.creations.get(k) {
+                Some((i, pid)) if *i <= side.at => pid.clone(),
+                _ => continue,
+            }
         };
-        let Some(pid) = inst.get("process_id").and_then(Json::as_str) else {
-            continue;
-        };
-        let terminal = matches!(
-            inst.get("state").and_then(Json::as_str),
-            Some("Completed" | "Terminated")
-        );
-        if inflight && terminal {
-            continue;
-        }
-        if let Some(n) = out.get(pid).and_then(Json::as_u64) {
-            out.insert(pid.to_owned(), Json::from(n.saturating_sub(1)));
+        if let Some(n) = out.get(&pid).and_then(Json::as_u64) {
+            let left = n.saturating_sub(1);
+            if left == 0 {
+                emptied.insert(pid.clone());
+            }
+            out.insert(pid, Json::from(left));
         }
     }
-    out.retain(|_, n| n.as_u64() != Some(0));
+    out.retain(|pid, n| !(emptied.contains(pid) && n.as_u64() == Some(0)));
     Json::Object(out)
 }
 
@@ -867,9 +1012,20 @@ fn compare_states(
         // instances — every other state is still checked (#1528 review).
         if let (Some(from), Some(i)) = (boundary.from, at.as_u64()) {
             if i >= from {
-                if boundary_projection(&hs, head_ids, &boundary.head_instances)?
-                    != boundary_projection(&ps, prev_ids, &boundary.prev_instances)?
-                {
+                let mut hp = boundary_projection(
+                    &hs,
+                    head_ids,
+                    &boundary.head_instances,
+                    (&boundary.head_creations, i),
+                )?;
+                let mut pp = boundary_projection(
+                    &ps,
+                    prev_ids,
+                    &boundary.prev_instances,
+                    (&boundary.prev_creations, i),
+                )?;
+                align_terminated_rings(&mut hp, &hs, &mut pp, &ps);
+                if hp != pp {
                     return Err(format!(
                         "durable state diverges at entry {at} outside the ratified \
                          upgrade-boundary instances (same snapshot format {hf:?})"
@@ -892,6 +1048,59 @@ fn compare_states(
         states_skipped_format_bump: skipped,
         states_compared_outside_ratified_boundary: projected,
     })
+}
+
+/// The bounded `recently_terminated` ring evicts its OLDEST key when a
+/// terminal transition lands while it is full (`State::note_terminated`), so a
+/// ratified instance's one-sided terminal transition at capacity also evicts
+/// an unrelated key on that side only. Once the ratified keys are filtered,
+/// the two projected rings then differ only in how far back they reach: when
+/// the SHORTER side's raw ring is at capacity (its missing prefix is
+/// explained by eviction), the longer one is trimmed from the front to the
+/// common covered window — identity and order within it are still compared.
+fn align_terminated_rings(hp: &mut Json, hs: &Json, pp: &mut Json, ps: &Json) {
+    fn raw_len(snapshot: &Json) -> usize {
+        snapshot
+            .pointer("/state/recently_terminated")
+            .and_then(Json::as_array)
+            .map_or(0, Vec::len)
+    }
+    let cap = recently_terminated_cap();
+    let (hl, pl) = (raw_len(hs), raw_len(ps));
+    let len = |p: &Json| {
+        p.pointer("/state/recently_terminated")
+            .and_then(Json::as_array)
+            .map_or(0, Vec::len)
+    };
+    let (hn, pn) = (len(hp), len(pp));
+    let (longer, keep) = if hn > pn && pl >= cap {
+        (hp, pn)
+    } else if pn > hn && hl >= cap {
+        (pp, hn)
+    } else {
+        return;
+    };
+    if let Some(v) = longer
+        .pointer_mut("/state/recently_terminated")
+        .and_then(Json::as_array_mut)
+    {
+        let drop = v.len() - keep;
+        v.drain(..drop);
+    }
+}
+
+/// `RECENTLY_TERMINATED_CAP`, derived from the engine source (the constant
+/// is crate-private) so the comparator cannot drift from the engine's bound.
+fn recently_terminated_cap() -> usize {
+    include_str!("../../src/state/types.rs")
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("pub const RECENTLY_TERMINATED_CAP: usize = ")
+                .and_then(|r| r.strip_suffix(';'))
+                .and_then(|n| n.replace('_', "").parse().ok())
+        })
+        .unwrap_or(usize::MAX)
 }
 
 /// What the state/entry comparison covered.
@@ -3035,6 +3244,8 @@ pub fn cross_release_checked(
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
+            boundary.head_creations = creations_of(head);
+            boundary.prev_creations = creations_of(prev);
             // Exclude the ratified instances by IDENTITY (the union over
             // both sides), so an instance only one side's divergent events
             // name is excluded on both, at its own raw key.

@@ -3158,3 +3158,129 @@ fn prev_release_gate_boundary_projection_omits_buckets_emptied_by_exclusion() {
     let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
     assert!(err.contains("outside the ratified"), "{err}");
 }
+
+/// #1764 (review): the `recently_terminated` ring is bounded — when the
+/// ratified instance's one-sided completion lands on a FULL ring it also
+/// evicts the oldest unrelated key on that side. The common covered window is
+/// compared (identity and order kept), so the eviction reconciles while a
+/// wrong key inside the window still fails.
+#[test]
+fn prev_release_gate_boundary_projection_ring_eviction_at_capacity() {
+    let cap: u64 = include_str!("../src/state/types.rs")
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("pub const RECENTLY_TERMINATED_CAP: usize = ")
+                .and_then(|r| r.strip_suffix(';'))
+                .and_then(|n| n.replace('_', "").parse().ok())
+        })
+        .expect("RECENTLY_TERMINATED_CAP");
+    let ring = |mut s: serde_json::Value, keys: Vec<u64>| {
+        s["state"]["state"]["recently_terminated"] = serde_json::json!(keys);
+        s
+    };
+    let full: Vec<u64> = (100_000..100_000 + cap).collect();
+    let mut evicted: Vec<u64> = full[1..].to_vec();
+    evicted.push(10);
+    let (head, prev) = boundary_streams(
+        ring(with_ratified(33), full.clone()),
+        ring(completed_ratified(33), evicted.clone()),
+    );
+    checked_s(&head, &prev, unbalanced_expected())
+        .unwrap_or_else(|e| panic!("an eviction by the ratified completion reconciles: {e}"));
+
+    let mut wrong = evicted;
+    wrong.swap(3, 4);
+    let (head, prev) = boundary_streams(
+        ring(with_ratified(33), full),
+        ring(completed_ratified(33), wrong),
+    );
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(err.contains("outside the ratified"), "{err}");
+}
+
+/// #1764 (review): engine keys nested INSIDE a retained instance's
+/// multi-instance / ad-hoc / compensation payloads (`active`,
+/// `child_indices`, `pending_scope_subscriptions`, …) canonicalize through
+/// each side's `KeyIds`, so a remint of both body and child keys
+/// reconciles, while an unexplained raw difference still fails.
+#[test]
+fn prev_release_gate_boundary_projection_remints_nested_payload_keys() {
+    let with_payloads = |body: u64, child: u64| {
+        let mut s = with_ratified(33);
+        let inst = s["state"]["state"]["instances"]["30"]
+            .as_object_mut()
+            .expect("retained instance 30");
+        inst.insert(
+            "multi_instances".to_owned(),
+            serde_json::json!({ body.to_string(): {"element_id": "x", "sequential": false, "items": [],
+                "output_collection": null, "output_element": null,
+                "completion_condition": null, "input_element": null, "spawned": 1,
+                "active": [child], "child_indices": { child.to_string(): 0 },
+                "output_values": []}}),
+        );
+        inst.insert(
+            "adhoc_instances".to_owned(),
+            serde_json::json!({ body.to_string(): {"element_id": "x", "output_collection": null,
+                "output_element": null, "iterations": 1, "active": [child]}}),
+        );
+        inst.insert(
+            "compensation_waits".to_owned(),
+            serde_json::json!({ body.to_string(): {"throw_element_id": "t", "scope": body,
+                "pending_handlers": ["h"], "pending_handler_keys": [child],
+                "pending_scope_subscriptions": [child], "pending_handler_scopes": [body],
+                "pending_scope_subscription_parents": [body]}}),
+        );
+        s
+    };
+    let (head, prev) = boundary_streams_with(
+        with_payloads(540, 541),
+        with_payloads(440, 441),
+        vec![element_activating(540), element_activating(541)],
+        vec![element_activating(440), element_activating(441)],
+    );
+    checked_s(&head, &prev, remint_unbalanced_expected())
+        .unwrap_or_else(|e| panic!("a nested payload remint reconciles: {e}"));
+
+    let (head, prev) = boundary_streams(with_payloads(540, 541), with_payloads(440, 441));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(err.contains("outside the ratified"), "{err}");
+}
+
+/// #1764 (review): the ratified instance's creation is attributed from each
+/// side's own `ProcessInstanceCreated`, so it is subtracted even once the
+/// instance is EVICTED from `instances`, and from its CREATING process even
+/// after a migration changed its current process id.
+#[test]
+fn prev_release_gate_boundary_projection_creations_survive_eviction_and_migration() {
+    let mut evicted = completed_ratified(33);
+    evicted["state"]["state"]["instances"]
+        .as_object_mut()
+        .expect("instances")
+        .remove("10");
+    let (head, prev) = boundary_streams(with_ratified(33), evicted);
+    checked_s(&head, &prev, unbalanced_expected())
+        .unwrap_or_else(|e| panic!("an evicted ratified instance reconciles: {e}"));
+
+    let mut migrated = completed_ratified(33);
+    migrated["state"]["state"]["instances"]["10"]["process_id"] = serde_json::json!("q");
+    let (head, prev) = boundary_streams(with_ratified(33), migrated);
+    checked_s(&head, &prev, unbalanced_expected())
+        .unwrap_or_else(|e| panic!("a migrated ratified instance reconciles: {e}"));
+}
+
+/// #1764 (review): only a count entry EMPTIED by the exclusion is dropped —
+/// a pre-existing zero entry for an unrelated process is still compared.
+#[test]
+fn prev_release_gate_boundary_projection_keeps_preexisting_zero_counts() {
+    for counts in ["inflight_by_process", "created_by_process"] {
+        let mut extra = with_ratified(33);
+        extra["state"]["state"][counts]["unrelated"] = serde_json::json!(0u64);
+        let (head, prev) = boundary_streams(extra, completed_ratified(33));
+        let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+        assert!(
+            err.contains("outside the ratified"),
+            "a pre-existing zero {counts} entry must be compared: {err}"
+        );
+    }
+}
