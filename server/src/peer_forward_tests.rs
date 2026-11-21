@@ -190,6 +190,7 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
             None,
             Some(vec![1]),
             None,
+            None,
         )
         .await
         .expect("scoped publish returns a result");
@@ -203,7 +204,15 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
 
     // Unscoped (legacy): the publish reaches partition 0 and starts an instance.
     let res = link
-        .publish_message("order-placed".to_string(), order_id, None, None, None, None)
+        .publish_message(
+            "order-placed".to_string(),
+            order_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("unscoped publish returns a result");
     assert_eq!(res.status, 200);
@@ -304,6 +313,7 @@ async fn forwarded_publish_persists_operation_reference_on_the_peer() {
             None,
             None,
             Some(REF),
+            None,
         )
         .await
         .expect("forwarded publish returns a result");

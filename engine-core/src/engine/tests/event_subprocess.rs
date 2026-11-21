@@ -520,6 +520,7 @@ fn fire(engine: &mut Engine, inst: Key, t: T, due: u64) -> Vec<Event> {
                 correlation_key: "7".into(),
                 variables: vars(&[("payload", Value::Int(42))]),
                 business_id: None,
+                message_key: None,
             })
             .unwrap(),
         T::Timer => engine.trigger_timers(due),
@@ -1388,6 +1389,7 @@ fn esp_output_satisfying_a_sibling_condition_fires_before_the_host_drains() {
             correlation_key: "7".into(),
             variables: BTreeMap::new(),
             business_id: None,
+            message_key: None,
         })
         .unwrap();
     // Complete the HOST's own job first: the host then has no flow-flow child
@@ -1479,6 +1481,7 @@ fn modify_created_flow_scope_arms_its_event_subprocesses() {
             correlation_key: "7".into(),
             variables: BTreeMap::new(),
             business_id: None,
+            message_key: None,
         })
         .unwrap();
     assert_eq!(
@@ -1558,6 +1561,7 @@ fn modify_created_flow_scope_arms_its_event_subprocesses_against_host_locals() {
         correlation_key: "7".into(),
         variables: BTreeMap::new(),
         business_id: None,
+        message_key: None,
     });
     assert_eq!(
         job_count(&mut engine, "esp"),
@@ -1570,6 +1574,7 @@ fn modify_created_flow_scope_arms_its_event_subprocesses_against_host_locals() {
             correlation_key: "99".into(),
             variables: BTreeMap::new(),
             business_id: None,
+            message_key: None,
         })
         .unwrap();
     assert_eq!(
@@ -1880,6 +1885,7 @@ fn container_start_listener_defers_the_start_without_losing_its_payload() {
                     correlation_key: "7".into(),
                     variables: vars(&[("payload", Value::Int(42))]),
                     business_id: None,
+                    message_key: None,
                 })
                 .unwrap(),
         );
@@ -1919,6 +1925,7 @@ fn start_event_activation_expressions_see_the_local_payload() {
                 ("listenerType", Value::Str("dyn".into())),
             ]),
             business_id: None,
+            message_key: None,
         })
         .unwrap();
     assert!(
@@ -1952,6 +1959,7 @@ fn held_esp_payloads_are_dropped_when_the_container_finishes_or_the_instance_end
                     correlation_key: "7".into(),
                     variables: vars(&[("payload", Value::Int(n))]),
                     business_id: None,
+                    message_key: None,
                 })
                 .unwrap();
         }

@@ -46,6 +46,7 @@
   "CorrelateMessage",
   "CorrelateMessage.business_id",
   "CorrelateMessage.correlation_key",
+  "CorrelateMessage.message_key",
   "CorrelateMessage.message_name",
   "CorrelateMessage.variables",
   "CorrelateMessageSubscription",
