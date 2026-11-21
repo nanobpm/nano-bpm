@@ -8736,3 +8736,35 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         assert_eq!(props.form_version_tag, None);
     }
 }
+
+#[cfg(test)]
+mod adversarial_probe {
+    use super::*;
+
+    #[test]
+    fn probe_quote_in_comment_false_conflict() {
+        // Identical declarations differing only in whitespace BEFORE `/>`, where the
+        // body carries a comment containing an unbalanced `"`.
+        let a = r#"<bpmn:message id="M"><!-- " --><bpmn:extensionElements>x</bpmn:extensionElements></bpmn:message>"#;
+        let b = r#"<bpmn:message id="M"><!-- " --><bpmn:extensionElements>x</bpmn:extensionElements></bpmn:message >"#;
+        let na = normalize_declaration(a);
+        let nb = normalize_declaration(b);
+        eprintln!("na={na:?}\nnb={nb:?}");
+        assert_eq!(na, nb, "FALSE CONFLICT: quote inside comment swallowed the rest");
+    }
+
+    #[test]
+    fn probe_merge_definitions_with_commented_quote() {
+        let primary = format!(
+            "<bpmn:definitions xmlns:bpmn=\"m\">\n  {}\n  <bpmn:process id=\"P1\"/>\n</bpmn:definitions>",
+            r#"<bpmn:message id="M"><!-- " --><bpmn:extensionElements>x</bpmn:extensionElements></bpmn:message>"#
+        );
+        let extra = format!(
+            "<bpmn:definitions xmlns:bpmn=\"m\">\n  {}\n  <bpmn:process id=\"P2\"/>\n</bpmn:definitions>",
+            r#"<bpmn:message id="M"><!-- " --><bpmn:extensionElements>x</bpmn:extensionElements></bpmn:message >"#
+        );
+        let r = merge_definitions(&primary, &[extra.as_str()]);
+        eprintln!("result: {r:?}");
+        assert!(r.is_ok(), "false conflict on merge: {r:?}");
+    }
+}
