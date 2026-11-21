@@ -329,6 +329,63 @@ fn non_markup_span(xml: &str, from: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// The byte index just past the `>` that ends the tag starting at `lt`,
+/// honouring quoted attribute values (a `>` inside `"…"`/`'…'` does not end it).
+fn tag_end(xml: &str, lt: usize) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (off, c) in xml[lt..].char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"') | (None, '\'') => quote = Some(c),
+            (None, '>') => return Some(lt + off + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The span `[lt, end)` of the element whose start tag is at `lt`, found by a
+/// nesting-aware scan: comments, CDATA sections, processing instructions and
+/// doctype-like markup at every depth are skipped wholesale (so a closing tag
+/// mentioned inside them is never taken as the boundary), and same-named
+/// descendants are depth-counted. `None` on unterminated / malformed input.
+fn nested_element_span(xml: &str, lt: usize) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut i = lt;
+    loop {
+        let at = i + xml[i..].find('<')?;
+        let after = &xml[at..];
+        if after.starts_with("<!--") || after.starts_with("<![CDATA[") {
+            let (open, close) = if after.starts_with("<!--") {
+                ("<!--", "-->")
+            } else {
+                ("<![CDATA[", "]]>")
+            };
+            i = at + open.len() + after[open.len()..].find(close)? + close.len();
+            continue;
+        }
+        let end = tag_end(xml, at)?;
+        match after[1..].chars().next() {
+            Some('?') | Some('!') => {}
+            Some('/') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some((lt, end));
+                }
+            }
+            _ => {
+                if !xml[at..end].ends_with("/>") {
+                    depth += 1;
+                } else if depth == 0 {
+                    return Some((lt, end));
+                }
+            }
+        }
+        i = end;
+    }
+}
+
 /// The value of attribute `attr` in `s` (the `attr` must be preceded by whitespace,
 /// so `id` doesn't match `processId`).
 fn attr_value_in(s: &str, attr: &str) -> Option<String> {
@@ -478,7 +535,7 @@ fn declaration_spans(body: &str) -> Vec<(usize, usize)> {
         }
         let name = tag_name_at(body, lt);
         let local = name.rsplit(':').next().unwrap_or(name);
-        let Some((s, e)) = element_span(body, local, lt) else {
+        let Some((s, e)) = nested_element_span(body, lt) else {
             // A child left unclosed: malformed — dedup nothing rather than
             // risk deleting a span guessed from raw tag offsets.
             return Vec::new();
@@ -7094,6 +7151,38 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
                 assert_eq!(message_name, "Order_di", "the catch keeps its message name")
             }
             other => panic!("expected MessageIntermediateCatchEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declaration_spans_ignore_closing_tags_inside_comments_and_cdata() {
+        // A closing tag mentioned in a child's comment / CDATA must not end the
+        // child early: otherwise text after it is scanned as top-level markup.
+        for body in [
+            r#"<bpmn:process id="P"><!-- </bpmn:process> <bpmn:error id="E_FAKE"/> --></bpmn:process><bpmn:error id="E_REAL"/>"#,
+            r#"<bpmn:process id="P"><bpmn:documentation><![CDATA[</bpmn:process><bpmn:error id="E_FAKE"/>]]></bpmn:documentation></bpmn:process><bpmn:error id="E_REAL"/>"#,
+        ] {
+            let ids: Vec<_> = declaration_spans(body)
+                .into_iter()
+                .filter_map(|(s, _)| declaration_id_at(body, s))
+                .collect();
+            assert_eq!(ids, vec!["E_REAL".to_string()], "body: {body}");
+        }
+    }
+
+    #[test]
+    fn declaration_spans_cover_whole_declaration_despite_inner_closing_text() {
+        // A duplicate declaration whose body mentions its own closing tag in a
+        // comment / CDATA must be spanned whole, so dedup leaves valid XML.
+        for body in [
+            r#"<bpmn:message id="M"><!-- </bpmn:message> --><bpmn:extensionElements/></bpmn:message>"#,
+            r#"<bpmn:message id="M"><bpmn:documentation><![CDATA[</bpmn:message>]]></bpmn:documentation></bpmn:message>"#,
+        ] {
+            assert_eq!(
+                declaration_spans(body),
+                vec![(0, body.len())],
+                "body: {body}"
+            );
         }
     }
 
