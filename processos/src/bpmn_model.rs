@@ -281,12 +281,16 @@ fn find_tag_open(xml: &str, local: &str, from: usize) -> Option<usize> {
     while let Some(rel) = xml[i..].find('<') {
         let lt = i + rel;
         let after = &xml[lt + 1..];
-        match after.chars().next() {
-            Some('/') | Some('!') | Some('?') => {
-                i = lt + 1;
-                continue;
-            }
-            _ => {}
+        // Comments, CDATA, PIs and `<!…>` declarations are skipped wholesale, so
+        // a tag mentioned inside them is never taken for a real one; unterminated
+        // markup swallows the rest of the document (no match).
+        if let Some(end) = non_element_markup_end(xml, lt) {
+            i = end?;
+            continue;
+        }
+        if after.starts_with('/') {
+            i = lt + 1;
+            continue;
         }
         let name = tag_name_at(xml, lt);
         let local_name = name.rsplit(':').next().unwrap_or(name);
@@ -302,14 +306,20 @@ fn find_tag_open(xml: &str, local: &str, from: usize) -> Option<usize> {
 /// self-closing) element at or after `from`.
 fn element_span(xml: &str, local: &str, from: usize) -> Option<(usize, usize)> {
     let start = find_tag_open(xml, local, from)?;
-    let name = tag_name_at(xml, start);
-    let open_gt = start + xml[start..].find('>')?;
-    if xml[start..=open_gt].trim_end().ends_with("/>") {
-        return Some((start, open_gt + 1));
+    nested_element_span(xml, start)
+}
+
+/// The inner content span `[open_end, close_start)` of the element whose start
+/// tag is at `lt` (markup-aware, via [`nested_element_span`]); `None` for a
+/// self-closing or malformed element.
+fn element_inner_span(xml: &str, lt: usize) -> Option<(usize, usize)> {
+    let open_end = tag_end(xml, lt)?;
+    let (_, end) = nested_element_span(xml, lt)?;
+    if end == open_end {
+        return None;
     }
-    let close = format!("</{name}>");
-    let close_at = xml[open_gt..].find(&close)? + open_gt + close.len();
-    Some((start, close_at))
+    let close_start = xml[..end].rfind("</")?;
+    Some((open_end, close_start))
 }
 
 /// The end (exclusive) of the non-element markup starting exactly at `from` —
@@ -490,11 +500,8 @@ fn process_block(xml: &str, process_id: &str) -> Option<String> {
 /// file keeps a single (the primary's) diagram.
 fn definitions_inner_no_di(xml: &str) -> Option<String> {
     let start = find_tag_open(xml, "definitions", 0)?;
-    let name = tag_name_at(xml, start);
-    let open_gt = start + xml[start..].find('>')? + 1;
-    let close = format!("</{name}>");
-    let close_at = xml[open_gt..].find(&close)? + open_gt;
-    let mut inner = xml[open_gt..close_at].to_string();
+    let (open_end, close_start) = element_inner_span(xml, start)?;
+    let mut inner = xml[open_end..close_start].to_string();
     while let Some((ds, de)) = element_span(&inner, "BPMNDiagram", 0) {
         inner.replace_range(ds..de, "");
     }
@@ -626,8 +633,7 @@ pub fn merge_definitions(primary: &str, extras: &[&str]) -> String {
         .map(|di| primary[..di].rfind('\n').map(|n| n + 1).unwrap_or(di))
         .or_else(|| {
             let start = find_tag_open(primary, "definitions", 0)?;
-            let name = tag_name_at(primary, start);
-            primary.rfind(&format!("</{name}>"))
+            element_inner_span(primary, start).map(|(_, close)| close)
         });
     match insert_at {
         Some(at) => {
@@ -7318,6 +7324,45 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             merged.contains(r#"<bpmn:error id="E" errorCode="BOOM"/>"#),
             "{merged}"
         );
+    }
+
+    #[test]
+    fn merge_definitions_splices_before_the_real_diagram_not_a_commented_one() {
+        let primary = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI">
+  <!-- old <bpmndi:BPMNDiagram id="X"> -->
+  <bpmn:process id="ProcA"/>
+  <bpmndi:BPMNDiagram id="D"/>
+</bpmn:definitions>"#;
+        let extra = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="ProcB"/>
+</bpmn:definitions>"#;
+        let merged = merge_definitions(primary, &[extra]);
+        let at = merged
+            .find(r#"<bpmn:process id="ProcB"/>"#)
+            .expect("spliced");
+        assert!(at > merged.find("-->").expect("comment"), "{merged}");
+        assert!(
+            at < merged.find(r#"<bpmndi:BPMNDiagram id="D""#).expect("di"),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn definitions_body_is_not_truncated_by_markup_mentions() {
+        // A closing `definitions` tag or a diagram mentioned in a comment,
+        // CDATA section or PI must neither end the body nor be stripped as DI.
+        for noise in [
+            "<!-- </bpmn:definitions> <bpmndi:BPMNDiagram id=\"Z\"> -->",
+            "<![CDATA[ </bpmn:definitions> <bpmndi:BPMNDiagram id=\"Z\"> ]]>",
+            "<?pi </bpmn:definitions> <bpmndi:BPMNDiagram id=\"Z\"> ?>",
+        ] {
+            let extra = format!(
+                "<bpmn:definitions xmlns:bpmn=\"m\">\n  {noise}\n  <bpmn:process id=\"ProcB\"/>\n</bpmn:definitions>"
+            );
+            let inner = definitions_inner_no_di(&extra).expect("body");
+            assert!(inner.contains(noise), "{inner}");
+            assert!(inner.contains(r#"<bpmn:process id="ProcB"/>"#), "{inner}");
+        }
     }
 
     #[test]
