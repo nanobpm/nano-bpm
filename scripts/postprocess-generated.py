@@ -266,6 +266,9 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         use axum::response::IntoResponse;
 
+        // Buffer on the ORIGINAL request: `Bytes::from_request` reads the
+        // router's `DefaultBodyLimit` extension from `req.extensions()`, so a
+        // router that raises the limit is respected here.
         let headers = req.headers().clone();
         let bytes = <Bytes as FromRequest<S>>::from_request(req, state)
             .await
@@ -273,8 +276,13 @@ where
         if bytes.is_empty() {
             return Ok(OptionalJson(None));
         }
+        // Rebuild with the original headers for the `Json` decode. The body is
+        // already fully buffered, so disable the body limit on the rebuilt
+        // request: otherwise the inner `Json` extraction re-applies the default
+        // 2 MiB limit and 413s a body the router explicitly permitted.
         let mut rebuilt = Request::new(Body::from(bytes));
         *rebuilt.headers_mut() = headers;
+        DefaultBodyLimit::disable().apply(&mut rebuilt);
         let Json(value) = <Json<Option<T>> as FromRequest<S>>::from_request(rebuilt, state)
             .await
             .map_err(IntoResponse::into_response)?;

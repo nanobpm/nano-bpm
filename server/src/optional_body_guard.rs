@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{Method, Request, StatusCode};
 use serde_yaml::Value;
 use tower::ServiceExt;
@@ -192,6 +193,46 @@ async fn bodyless_job_completion_reaches_the_handler() {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+/// Regression guard for the extension-dropping defect in `OptionalJson`:
+/// rebuilding the request from only its headers loses the router's
+/// `DefaultBodyLimit` extension, so the inner `Json` extraction re-applies the
+/// default 2 MiB limit and 413s a body the router explicitly permits. The
+/// completion request schema has only optional free-form fields, so a body of
+/// `{"variables": {"pad": "<3 MiB>"}}` is schema-valid and must be decoded.
+#[tokio::test]
+async fn optional_body_above_default_limit_is_accepted_when_router_raises_it() {
+    let app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server())
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024));
+    let body = format!(
+        "{{\"variables\": {{\"pad\": \"{}\"}}}}",
+        "x".repeat(3 * 1024 * 1024)
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .header("host", "localhost")
+                .uri("/v2/jobs/2251799813685249/completion")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    // The 3 MiB body is decoded (no 413); the handler's domain answer for an
+    // unknown job is 404.
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
