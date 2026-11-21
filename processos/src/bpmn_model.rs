@@ -686,7 +686,21 @@ fn normalize_declaration(text: &str) -> String {
     // Whitespace before/after these characters carries no meaning in XML, so
     // none is emitted there.
     let ws_neutral = |c: char| matches!(c, '<' | '>' | '/' | '=');
-    for c in text.trim().chars() {
+    let text = text.trim();
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        // Comments, CDATA and PIs are inert: copy them verbatim so a quote
+        // inside them never opens quote mode (and CDATA content stays exact).
+        if quote.is_none() && c == '<' {
+            if let Some(end) = non_element_markup_end(text, i) {
+                let end = end.unwrap_or(text.len());
+                pending_space = false;
+                out.push_str(&text[i..end]);
+                i = end;
+                continue;
+            }
+        }
+        i += c.len_utf8();
         match quote {
             Some(q) => {
                 out.push(c);
@@ -7593,6 +7607,33 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             "ProcB",
         );
         merge_definitions(&primary, &[extra.as_str()]).unwrap();
+    }
+
+    #[test]
+    fn merge_definitions_quote_inside_inert_markup_does_not_open_quote_mode() {
+        // A quote inside a comment / CDATA / PI in a declaration body is inert;
+        // it must not swallow the rest of the element as a quoted value.
+        for inert in ["<!-- \" -->", "<!-- ' -->", "<?pi \" ?>"] {
+            let a =
+                format!("<bpmn:message id=\"M\">{inert}<bpmn:extensionElements/></bpmn:message>");
+            let b =
+                format!("<bpmn:message id=\"M\">{inert}<bpmn:extensionElements/></bpmn:message >");
+            let primary = defs_with(&a, "ProcA");
+            let extra = defs_with(&b, "ProcB");
+            merge_definitions(&primary, &[extra.as_str()])
+                .unwrap_or_else(|e| panic!("{inert:?} must dedupe, got: {e}"));
+        }
+        // CDATA content stays significant.
+        let primary = defs_with(
+            "<bpmn:message id=\"M\"><bpmn:documentation><![CDATA[a  \"b]]></bpmn:documentation></bpmn:message>",
+            "ProcA",
+        );
+        let extra = defs_with(
+            "<bpmn:message id=\"M\"><bpmn:documentation><![CDATA[a \"b]]></bpmn:documentation></bpmn:message>",
+            "ProcB",
+        );
+        merge_definitions(&primary, &[extra.as_str()])
+            .expect_err("CDATA content differing in whitespace must conflict");
     }
 
     #[test]
