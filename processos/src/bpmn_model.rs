@@ -668,6 +668,7 @@ pub fn merge_definitions(primary: &str, extras: &[&str]) -> Result<String, Strin
 /// Whitespace-insensitive form of a declaration's source text, used to decide
 /// whether two same-id declarations are genuinely the same declaration.
 ///
+/// Inside a tag, whitespace adjacent to `<`, `>`, `/` or `=` is dropped.
 /// Only whitespace OUTSIDE quoted attribute values is collapsed: an attribute
 /// value (an `errorCode`, a message `name`) is significant byte-for-byte, so
 /// `errorCode="A B"` and `errorCode="A  B"` stay distinct and conflict rather
@@ -688,7 +689,15 @@ fn normalize_declaration(text: &str) -> String {
             None if c.is_whitespace() => pending_space = true,
             None => {
                 if pending_space {
-                    out.push(' ');
+                    // Inside a tag, whitespace next to a delimiter carries no
+                    // meaning (`id = "E"` == `id="E"`, `"X" />` == `"X"/>`), so
+                    // drop it rather than collapsing it to one space.
+                    let insignificant = in_tag
+                        && (matches!(c, '>' | '/' | '=')
+                            || matches!(out.chars().last(), Some('<' | '=' | '/')));
+                    if !insignificant {
+                        out.push(' ');
+                    }
                     pending_space = false;
                 }
                 match c {
@@ -5101,6 +5110,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn normalize_declaration_ignores_whitespace_next_to_tag_delimiters() {
+        let canon = normalize_declaration(r#"<bpmn:error id="E" errorCode="X"/>"#);
+        for v in [
+            r#"<bpmn:error id="E" errorCode="X" />"#,
+            r#"<bpmn:error id = "E" errorCode= "X"/>"#,
+            "<bpmn:error\n   id=\"E\"\n   errorCode=\"X\"\n/>",
+            r#"< bpmn:error id="E" errorCode="X" / >"#,
+        ] {
+            assert_eq!(normalize_declaration(v), canon, "{v}");
+        }
+        assert_ne!(
+            normalize_declaration(r#"<bpmn:error id="E" errorCode="X Y"/>"#),
+            normalize_declaration(r#"<bpmn:error id="E" errorCode="X  Y"/>"#)
+        );
+    }
 
     // A small loan-approval-shaped model: start -> credit-check (service) -> XOR gateway
     // -> approve / reject -> end. The service task has an error boundary to a reject end.
