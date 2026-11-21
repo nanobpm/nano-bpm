@@ -7886,9 +7886,12 @@ impl Engine {
         // A multi-instance body / ad-hoc container owner teardown removed: its
         // runtime record is gone, so a queued child activation or body/container
         // completion would mint work into a dead loop.
+        // An owner whose completion/teardown was decided this drain (e.g. an MI
+        // body resting in COMPLETING on its end listeners) is likewise dead.
         if let Some(owner) = owner {
-            if !instance.multi_instances.contains_key(&owner)
-                && !instance.adhoc_instances.contains_key(&owner)
+            if self.torn_down_scopes.contains(&owner)
+                || !instance.multi_instances.contains_key(&owner)
+                    && !instance.adhoc_instances.contains_key(&owner)
             {
                 return true;
             }
@@ -11581,6 +11584,13 @@ impl Engine {
             }
         };
 
+        // The body is now committed to completing: mark it dead for this drain so
+        // a still-queued parallel sibling activation (`ActivateMiChild`, chained
+        // lazily per child since #1539) — or a duplicate `CompleteMiBody` — is
+        // dropped by `step_targets_dead_scope`. Without this, a body resting in
+        // COMPLETING on its end listeners still has its runtime record, so the
+        // owner-exists guard would let the queued sibling mint an orphaned child.
+        self.torn_down_scopes.insert(body_key);
         let mut events = Vec::new();
         // Cancel any children still running (reached here via completion condition).
         // Build the element-instance → `Created` user-task index ONCE for this
