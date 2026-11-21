@@ -405,6 +405,27 @@ fn pre_1233_half_open_parallel_join_fires_after_upgrade() {
     );
 }
 
+/// **Pre-#1608 `OrphanStampSuperseded`.** A supersede journaled before the
+/// event carried the report's off-heap tier has no `kind` key: it must decode
+/// with `kind: None` (the additive `serde(default)` contract) and replay as a
+/// state no-op — the storage layer's backlog rebuild derives the tier at
+/// re-stamp time for such a legacy frame.
+#[test]
+fn pre_1608_orphan_stamp_superseded_decodes_with_no_kind() {
+    let legacy_line = r#"{"OrphanStampSuperseded":{"instance_key":27,"episode":26}}"#;
+    let decoded =
+        decode_event_json(legacy_line).expect("pre-#1608 OrphanStampSuperseded (no kind) decodes");
+    match &decoded {
+        Event::OrphanStampSuperseded { kind, .. } => {
+            assert!(kind.is_none(), "a missing kind must default to None")
+        }
+        other => panic!("expected OrphanStampSuperseded, got {other:?}"),
+    }
+    // Replaying a journal that contains it must not error/panic (the reducer
+    // ignores it; the point is decode + replay of the legacy shape succeed).
+    let _engine = Engine::replay(std::iter::once(decoded));
+}
+
 /// **Unknown/removed variant rejection.** A record naming a variant this build
 /// does not define (a renamed/removed event kind, or a newer/foreign journal
 /// format) must surface as the typed [`EventDecodeError::UnknownVariant`] —
