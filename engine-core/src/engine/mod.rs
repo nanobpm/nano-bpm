@@ -1602,14 +1602,7 @@ impl Engine {
             // this counter (partition guard), so the common in-memory fan-out to
             // non-owning partitions is unchanged.
             event.advance_allocator(self.partition_id, &mut self.next_local);
-            if matches!(
-                event,
-                Event::ProcessDeployed { .. }
-                    | Event::DecisionRequirementsDeployed { .. }
-                    | Event::DecisionDeployed { .. }
-                    | Event::FormDeployed { .. }
-                    | Event::GenericResourceDeployed { .. }
-            ) {
+            if event.is_deployed_resource() {
                 state::apply(&mut self.state, event);
             }
         }
@@ -1630,14 +1623,7 @@ impl Engine {
     pub fn install_deployment_if_newer(&mut self, events: &[Event]) {
         for event in events {
             event.advance_allocator(self.partition_id, &mut self.next_local);
-            if matches!(
-                event,
-                Event::ProcessDeployed { .. }
-                    | Event::DecisionRequirementsDeployed { .. }
-                    | Event::DecisionDeployed { .. }
-                    | Event::FormDeployed { .. }
-                    | Event::GenericResourceDeployed { .. }
-            ) {
+            if event.is_deployed_resource() {
                 // Always apply every deployment event: each applier retains every
                 // version in its `*_versions` map and internally guards the
                 // latest-by-id index with a `>=` check, so an out-of-order/older

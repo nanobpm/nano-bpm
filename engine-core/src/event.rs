@@ -2110,6 +2110,28 @@ pub enum Event {
 }
 
 impl Event {
+    /// `true` for a partition-agnostic deployed-resource event — a process,
+    /// DRG, decision, form, or generic resource definition. These are the
+    /// events every owned partition must hold (they are broadcast to / re-
+    /// installed into each partition), and the exact set
+    /// `Engine::install_deployment` applies.
+    ///
+    /// This is the single canonical definition of "the deployment broadcast
+    /// set" (#1500): the segmented-journal restart demux, the legacy restart
+    /// demux, and the durable deployment install all derive from it, so a
+    /// resource kind can no longer be fanned out by one path and silently
+    /// dropped by another.
+    pub fn is_deployed_resource(&self) -> bool {
+        matches!(
+            self,
+            Event::ProcessDeployed { .. }
+                | Event::DecisionRequirementsDeployed { .. }
+                | Event::DecisionDeployed { .. }
+                | Event::FormDeployed { .. }
+                | Event::GenericResourceDeployed { .. }
+        )
+    }
+
     /// The process-instance key of a **terminal** transition (completed or
     /// terminated), if this event is one. Used by the follower-replica apply
     /// path to reclaim the hot-state shell of an instance the moment it reaches

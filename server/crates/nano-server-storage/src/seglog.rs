@@ -2946,7 +2946,8 @@ pub fn recover_multi_scoped(
     // `events` (untagged, global order) drives the caller's read-model catch-up.
     let events: Vec<Event> = tagged.iter().map(|(_, e)| e.clone()).collect();
 
-    // Replicated `ProcessDeployed` broadcast set: a durable deployment copy whose
+    // Replicated deployment broadcast set (every `Event::is_deployed_resource`
+    // kind — processes, DRGs, decisions, forms, generic resources; #1500): a durable deployment copy whose
     // write tag differs from its key partition (a clustered peer journaled it
     // under its first-owned partition, keyed to the deployment partition). It is
     // partition-agnostic, so every owned partition OTHER than the one that
@@ -2957,7 +2958,7 @@ pub fn recover_multi_scoped(
     let broadcast: Vec<(u64, Event)> = tagged
         .iter()
         .filter(|(tag, e)| {
-            matches!(e, Event::ProcessDeployed { .. })
+            e.is_deployed_resource()
                 && *tag
                     != (partition_of(e.max_key()) as usize).min(num_partitions.saturating_sub(1))
                         as u64
@@ -3062,14 +3063,14 @@ pub fn recover_multi_scoped(
     };
 
     // When migrating, the replicated-deployment broadcast set must also consider
-    // the cold-archived prefix (a cross-partition `ProcessDeployed` may have been
+    // the cold-archived prefix (a cross-partition deployment event may have been
     // compacted out of the hot tail).
     let broadcast: Vec<(u64, Event)> = if migrate {
         cold_tagged
             .iter()
             .chain(tagged.iter())
             .filter(|(tag, e)| {
-                matches!(e, Event::ProcessDeployed { .. })
+                e.is_deployed_resource()
                     && *tag
                         != (partition_of(e.max_key()) as usize)
                             .min(num_partitions.saturating_sub(1)) as u64
@@ -5192,6 +5193,122 @@ mod tests {
             engines[&2].instance(inst2).is_some(),
             "partition 2 instance restored (definition arrived via broadcast)"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1500: the segmented restart demux's broadcast set must carry EVERY
+    /// deployed-resource kind, not just processes. A clustered peer durably
+    /// installs a partition-0-keyed deployment of a DRG/decision, a form, and a
+    /// generic resource under its first-owned partition; after a reopen (full
+    /// replay, no combined snapshot) every owned partition — including the one
+    /// whose SOLE source is the broadcast — must resolve all of them.
+    #[test]
+    fn clustered_replicated_non_process_deployments_recover_across_owned_partitions() {
+        let dir = temp_dir("cluster-deploy-resources");
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(
+            r#"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="drg" name="drg">
+              <decision id="greeting" name="Greeting">
+                <decisionTable hitPolicy="UNIQUE">
+                  <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+                  <output id="o1" name="result" typeRef="string" />
+                  <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                    <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+                </decisionTable>
+              </decision>
+            </definitions>"#,
+        )
+        .expect("parse dmn");
+        let deploy_events: Vec<Event> = {
+            let mut p0 = crate::journal::Journal::in_memory_partition(0);
+            let mut evs = Vec::new();
+            for cmd in [
+                Command::DeployDecisionRequirements(vec![drg]),
+                Command::DeployForms(vec![nanobpmn_engine_core::FormResource {
+                    id: "greeting-form".into(),
+                    resource_name: "greeting.form".into(),
+                    schema: r#"{"id":"greeting-form","components":[]}"#.into(),
+                    version_tag: None,
+                }]),
+                Command::DeployGenericResources(vec![nanobpmn_engine_core::GenericResource {
+                    resource_id: "prompt.md".into(),
+                    resource_name: "prompt.md".into(),
+                    content: "# hi".into(),
+                    version_tag: None,
+                }]),
+            ] {
+                let (e, _) = p0.apply_command(cmd).unwrap();
+                evs.extend(e.iter().cloned());
+            }
+            evs
+        };
+        assert!(deploy_events.iter().all(|e| partition_of(e.max_key()) == 0));
+        let key_of = |pred: &dyn Fn(&Event) -> Option<u64>| {
+            deploy_events.iter().find_map(pred).expect("deployed kind")
+        };
+        let decision_key = key_of(&|e| match e {
+            Event::DecisionDeployed { decision_key, .. } => Some(*decision_key),
+            _ => None,
+        });
+        let form_key = key_of(&|e| match e {
+            Event::FormDeployed { form_key, .. } => Some(*form_key),
+            _ => None,
+        });
+        let resource_key = key_of(&|e| match e {
+            Event::GenericResourceDeployed { resource_key, .. } => Some(*resource_key),
+            _ => None,
+        });
+
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[1, 2], 3, None)
+                    .expect("open clustered");
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j2 = crate::journal::Journal::from_engine_shared(
+                2,
+                engines.remove(&2).unwrap(),
+                true,
+                &writer,
+            );
+            let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j2.set_exporter(tx, Arc::new(AtomicU64::new(0)));
+            let _ = j1.install_deployment_durable(&deploy_events);
+            j2.install_deployment(&deploy_events);
+            for j in [&j1, &j2] {
+                let st = j.engine().state();
+                assert!(st.decision_by_key(decision_key).is_some());
+                assert!(st.form_by_key(form_key).is_some());
+                assert!(st.resource_by_key(resource_key).is_some());
+            }
+            let _ = j1.snapshot_and_rotate().expect("flush via rotate");
+        }
+
+        let recovery = recover_multi(&dir, &[1, 2], 3, None).expect("reopen clustered");
+        assert!(!recovery.fresh);
+        for (p, engine) in &recovery.engines {
+            let st = engine.state();
+            assert!(
+                st.decision_by_key(decision_key).is_some(),
+                "partition {p}: decision lost on restart"
+            );
+            assert!(
+                st.form_by_key(form_key).is_some(),
+                "partition {p}: form lost on restart"
+            );
+            assert!(
+                st.resource_by_key(resource_key).is_some(),
+                "partition {p}: generic resource lost on restart"
+            );
+        }
+        assert_eq!(recovery.engines.len(), 2);
 
         let _ = fs::remove_dir_all(&dir);
     }

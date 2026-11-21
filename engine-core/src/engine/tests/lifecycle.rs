@@ -8686,3 +8686,52 @@ fn inclusive_join_reached_by_a_fork_sibling_still_in_transit_waits_like_zeebe() 
     );
     assert!(!engine.is_completed(instance_key));
 }
+
+/// #1500 defect-class guard: every resource-definition event any deploy command
+/// emits must be in the canonical broadcast set (`Event::is_deployed_resource`),
+/// and installing exactly that set into a fresh partition must make every kind
+/// resolvable — so a restart demux / fan-out derived from the predicate cannot
+/// silently drop a resource kind.
+#[test]
+fn every_deploy_command_event_is_in_the_broadcast_set_and_installs() {
+    let mut engine = Engine::new();
+    let mut emitted = Vec::new();
+    for cmd in [
+        Command::DeployProcess(brt_process("greeting", None)),
+        Command::DeployDecisionRequirements(vec![greeting_dmn()]),
+        Command::DeployForms(vec![FormResource {
+            id: "f".to_string(),
+            resource_name: "f.form".to_string(),
+            schema: r#"{"id":"f","components":[]}"#.to_string(),
+            version_tag: None,
+        }]),
+        Command::DeployGenericResources(vec![crate::command::GenericResource {
+            resource_id: "p.md".to_string(),
+            resource_name: "p.md".to_string(),
+            content: "x".to_string(),
+            version_tag: None,
+        }]),
+    ] {
+        emitted.extend(engine.apply_command(cmd).unwrap());
+    }
+    for e in &emitted {
+        assert_eq!(
+            e.is_deployed_resource(),
+            !matches!(e, Event::DeploymentCreated { .. }),
+            "deploy event outside the broadcast set: {e:?}"
+        );
+    }
+    let broadcast: Vec<Event> = emitted
+        .into_iter()
+        .filter(Event::is_deployed_resource)
+        .collect();
+    let mut peer = Engine::new();
+    peer.install_deployment(&broadcast);
+    let (src, dst) = (engine.state(), peer.state());
+    assert_eq!(src.processes.len(), dst.processes.len());
+    assert_eq!(src.decisions.len(), dst.decisions.len());
+    assert_eq!(src.decision_requirements.len(), dst.decision_requirements.len());
+    assert_eq!(src.forms.len(), dst.forms.len());
+    assert_eq!(src.resources.len(), dst.resources.len());
+    assert!(!dst.decisions.is_empty() && !dst.forms.is_empty() && !dst.resources.is_empty());
+}

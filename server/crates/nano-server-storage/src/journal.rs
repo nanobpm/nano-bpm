@@ -1691,16 +1691,7 @@ impl Journal {
         self.engine.install_deployment(events);
         let deployed: Vec<Event> = events
             .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Event::ProcessDeployed { .. }
-                        | Event::DecisionRequirementsDeployed { .. }
-                        | Event::DecisionDeployed { .. }
-                        | Event::FormDeployed { .. }
-                        | Event::GenericResourceDeployed { .. }
-                )
-            })
+            .filter(|e| e.is_deployed_resource())
             .cloned()
             .collect();
         self.persist_with(&Arc::new(deployed), operation_reference)
