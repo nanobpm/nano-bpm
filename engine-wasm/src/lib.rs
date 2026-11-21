@@ -658,6 +658,7 @@ impl TestEngine {
             correlation_key: correlation_key.to_string(),
             variables,
             business_id: None,
+            message_key: None,
         })
         .map_err(|e| js_err(&format!("correlate error: {e}")))?;
         to_json(&self.snapshot_value(None))

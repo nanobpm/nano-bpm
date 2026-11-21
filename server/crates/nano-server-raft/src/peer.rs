@@ -991,7 +991,8 @@ impl PeerLink {
     /// delivered); `None` applies every locally led target partition (legacy
     /// behaviour for a peer predating the field). `operation_reference` is the
     /// publishing request's `operationReference` (#1600), stamped on every
-    /// record the publish produces on the peer's partitions.
+    /// record the publish produces on the peer's partitions. `message_key` is
+    /// the publication's already-minted key (#1434), reused by the peer.
     pub async fn publish_message(
         &self,
         name: String,
@@ -1000,6 +1001,7 @@ impl PeerLink {
         business_id: Option<String>,
         only_partitions: Option<Vec<u64>>,
         operation_reference: Option<i64>,
+        message_key: Option<u64>,
     ) -> Result<PeerResult, PeerError> {
         self.request(|corr| ClientFrame::PublishMessage {
             corr,
@@ -1009,6 +1011,7 @@ impl PeerLink {
             business_id,
             only_partitions,
             operation_reference,
+            message_key: message_key.map(|k| k.to_string()),
         })
         .await
     }

@@ -8249,6 +8249,7 @@ fn message_start_correlation_is_recorded() {
             correlation_key: "c-1".into(),
             variables: BTreeMap::new(),
             business_id: Some("biz-1".into()),
+            message_key: None,
         })
         .unwrap();
     let message_key = events

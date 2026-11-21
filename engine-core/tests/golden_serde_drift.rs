@@ -845,6 +845,7 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
                 correlation_key: "7".into(),
                 variables: payload,
                 business_id: None,
+                message_key: None,
             },
             T0 + 26,
         )

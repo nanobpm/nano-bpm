@@ -10654,6 +10654,11 @@ impl ServerImpl {
     /// (#1556 step 4, #1600): stamped on every record each per-partition apply
     /// produces, and carried onward on the routed follow-ups those records
     /// drive (the routing pump below).
+    ///
+    /// `message_key`, when set, is the publication's key already minted on
+    /// another node (#1434); every local target reuses it. When `None`, the
+    /// first locally applied target mints it and the rest reuse that one, so
+    /// all records of one publication carry the key the client receives.
     async fn correlate_message_everywhere(
         &self,
         name: String,
@@ -10662,6 +10667,7 @@ impl ServerImpl {
         business_id: Option<String>,
         only_partitions: Option<&[u64]>,
         operation_reference: Option<i64>,
+        mut message_key: Option<u64>,
     ) -> Result<Vec<Event>, EngineError> {
         // Reject an out-of-range business id before touching any partition, with
         // the engine's own rule: one partition must not apply the publish while
@@ -10694,12 +10700,21 @@ impl ServerImpl {
                 correlation_key: correlation_key.clone(),
                 variables: variables.clone(),
                 business_id: business_id.clone(),
+                // One publication, one key (#1434): the first applied target
+                // mints it (unless the cluster fan-out already did), every
+                // later target reuses it.
+                message_key,
             };
             match self
                 .apply_routed_command(target, command, operation_reference)
                 .await
             {
-                RoutedApply::Applied(events) => all_events.extend(events),
+                RoutedApply::Applied(events) => {
+                    if message_key.is_none() {
+                        message_key = message_key_of(&events);
+                    }
+                    all_events.extend(events)
+                }
                 RoutedApply::NotHere => {}
                 RoutedApply::Failed(status, message) => {
                     tracing::warn!(
@@ -10742,6 +10757,7 @@ impl ServerImpl {
         business_id: Option<String>,
         only_partitions: Option<Vec<u64>>,
         operation_reference: Option<i64>,
+        message_key: Option<u64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let events = self
             .correlate_message_everywhere(
@@ -10751,6 +10767,7 @@ impl ServerImpl {
                 business_id,
                 only_partitions.as_deref(),
                 operation_reference,
+                message_key,
             )
             .await?;
         let message_key = message_key_of(&events);
@@ -10808,6 +10825,7 @@ impl ServerImpl {
                 business_id.clone(),
                 None,
                 operation_reference,
+                None,
             )
             .await?;
 
@@ -10895,6 +10913,10 @@ impl ServerImpl {
                                 business_id.clone(),
                                 Some(partitions.clone()),
                                 operation_reference,
+                                // Carry the publication's key (minted locally
+                                // or by an earlier send) so the peer's
+                                // partitions record the same one (#1434).
+                                message_key,
                             )
                             .await
                         {
@@ -52041,6 +52063,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -52146,6 +52169,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 Some(REF),
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -52291,6 +52315,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 order.clone(),
                 std::collections::BTreeMap::new(),
+                None,
                 None,
                 None,
                 None,
@@ -52787,6 +52812,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("the publish applies");
@@ -52825,6 +52851,7 @@ mod subscription_placement_tests {
             correlation_key: "k".into(),
             variables: Default::default(),
             business_id: None,
+            message_key: None,
         };
         assert!(!ServerImpl::routed_command_is_idempotent(&publish));
         let num_partitions = 4;
@@ -53074,6 +53101,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -53132,6 +53160,7 @@ mod subscription_placement_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("correlation with a valid business id");
@@ -53155,6 +53184,106 @@ mod subscription_placement_tests {
         assert!(
             per_partition[0] < 16,
             "partition 0 must NOT hold every instance (per-partition counts: {per_partition:?})"
+        );
+    }
+
+    /// #1434: a multi-partition publish applies `CorrelateMessage` on the
+    /// correlation-key hash partition AND partition 0 (message starts). Both
+    /// must record the ONE message key the publish response returns, so the
+    /// correlation history is searchable by it — previously each partition
+    /// minted its own key and the partition-0 message-start row carried a key
+    /// the client never saw.
+    #[tokio::test]
+    async fn multi_partition_publish_records_one_message_key_across_partitions() {
+        use apis::message_subscription::SearchCorrelatedMessageSubscriptionsResponse as Search;
+        let server = single_node_multi_partition();
+        let proc = ProcessBuilder::new("intake")
+            .message_start_event("start", "order-placed")
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("intake".to_string(), "intake.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy the message-start process on every owned partition");
+
+        // A correlation key whose hash partition is NOT partition 0, so the
+        // publish fans out to two partitions.
+        let correlation_key = (0..64)
+            .map(|i| format!("order-{i}"))
+            .find(|k| nanobpmn_engine_core::subscription_partition(k, 4) != 0)
+            .expect("some key hashes off partition 0");
+        let mut request = models::MessagePublicationRequest::new("order-placed".to_string());
+        request.correlation_key = Some(correlation_key);
+        let resp = server
+            .publish_message_impl(&request)
+            .await
+            .expect("publish returns");
+        let apis::message::PublishMessageResponse::Status200_TheMessageWasPublished(published) =
+            resp
+        else {
+            panic!("expected a 200 publication, got {resp:?}");
+        };
+        let message_key = published.message_key.0.clone();
+
+        // The partition-0 message-start correlation is searchable by the key
+        // the client received.
+        let query = models::CorrelatedMessageSubscriptionSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(models::CorrelatedMessageSubscriptionFilter {
+                message_key: Some(models::BasicStringFilterProperty::String(
+                    message_key.clone(),
+                )),
+                ..models::CorrelatedMessageSubscriptionFilter::new()
+            }),
+        };
+        let mut by_key = Vec::new();
+        for _ in 0..200 {
+            let resp = server
+                .search_correlated_message_subscriptions_impl(&Some(query.clone()))
+                .await
+                .expect("search returns");
+            let Search::Status200_TheCorrelatedMessageSubscriptionsSearchResult(result) = resp
+            else {
+                panic!("expected a 200 result");
+            };
+            if !result.items.is_empty() {
+                by_key = result.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            by_key.len(),
+            1,
+            "the message-start correlation is recorded under the returned messageKey {message_key}"
+        );
+        assert_eq!(by_key[0].message_key.0, message_key);
+        assert_eq!(by_key[0].element_id, "start");
+
+        // And no correlation row carries a different (per-partition) key.
+        let resp = server
+            .search_correlated_message_subscriptions_impl(&None)
+            .await
+            .expect("search returns");
+        let Search::Status200_TheCorrelatedMessageSubscriptionsSearchResult(all) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert!(
+            all.items.iter().all(|row| row.message_key.0 == message_key),
+            "every correlation row of one publication shares its key"
         );
     }
 
@@ -53249,6 +53378,7 @@ mod subscription_placement_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("correlation with a valid business id");
@@ -53316,6 +53446,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -53354,6 +53485,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 "order-x".into(),
                 std::collections::BTreeMap::new(),
+                None,
                 None,
                 None,
                 None,

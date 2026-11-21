@@ -1492,6 +1492,7 @@ async fn handle_client_frame(
             business_id,
             only_partitions,
             operation_reference,
+            message_key,
         } => {
             let vars = to_engine_vars(variables);
             let (message_key, instance) = match server
@@ -1502,6 +1503,7 @@ async fn handle_client_frame(
                     business_id,
                     only_partitions,
                     operation_reference,
+                    message_key.and_then(|k| k.parse::<u64>().ok()),
                 )
                 .await
             {
@@ -3426,6 +3428,7 @@ mod registry_tests {
             business_id: Some(business_id),
             only_partitions: None,
             operation_reference: None,
+            message_key: None,
         };
         let status_of = |frame: Option<ServerFrame>| match frame {
             Some(ServerFrame::CommandResult { status, .. }) => status,

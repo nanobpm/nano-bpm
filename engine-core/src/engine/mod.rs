@@ -4735,12 +4735,20 @@ impl Engine {
                 correlation_key,
                 variables,
                 business_id,
+                message_key,
             } => {
                 check_business_id(business_id.as_deref())?;
-                // Always mint a message key (Zeebe records every published
+                // Always record a message key (Zeebe records every published
                 // message); it is returned to the host and, carried on the
                 // MessagePublished event, restores the key generator on replay.
-                let message_key = self.mint_key();
+                // A key pre-minted by another partition of the same publication
+                // (#1434) is reused, so the whole fan-out shares one identity;
+                // a foreign key never advances this partition's allocator
+                // (the replay fold is partition-scoped).
+                let message_key = match message_key {
+                    Some(k) => k,
+                    None => self.mint_key(),
+                };
                 self.emit(
                     &mut log,
                     Event::MessagePublished {
