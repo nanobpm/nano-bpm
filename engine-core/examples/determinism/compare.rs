@@ -84,10 +84,27 @@ struct RatifiedBoundary {
 /// instance is still resident in a snapshot (eviction) and of its CURRENT
 /// process id (migration) — exactly the attribution of the engine's
 /// cumulative `created_by_process` count (#1764).
-type Creations = BTreeMap<u64, (u64, String)>;
+///
+/// Alongside it, the same side's job ownership (job key → (entry position,
+/// owning instance)) and its ordered terminal transitions ((entry position,
+/// instance)), both from the events too, so a ratified instance's settled
+/// jobs and terminal epochs stay attributable after eviction and after its
+/// key has left the bounded `recently_terminated` ring (#1764).
+#[derive(Debug, Default)]
+struct Creations {
+    created: BTreeMap<u64, (u64, String)>,
+    jobs: BTreeMap<u64, (u64, u64)>,
+    terminals: Vec<(u64, u64)>,
+}
+
+impl Creations {
+    fn get(&self, k: &u64) -> Option<&(u64, String)> {
+        self.created.get(k)
+    }
+}
 
 fn creations_of(records: &[Json]) -> Creations {
-    let mut out = Creations::new();
+    let mut out = Creations::default();
     for r in records {
         let (Some(i), Some(events)) = (
             r.get("i").and_then(Json::as_u64),
@@ -96,14 +113,30 @@ fn creations_of(records: &[Json]) -> Creations {
             continue;
         };
         for e in events {
-            let Some(body) = e.get("ProcessInstanceCreated") else {
+            let Some((variant, body)) = variant_body(e) else {
                 continue;
             };
-            if let (Some(k), Some(pid)) = (
-                body.get("instance_key").and_then(Json::as_u64),
-                body.get("process_id").and_then(Json::as_str),
-            ) {
-                out.entry(k).or_insert_with(|| (i, pid.to_owned()));
+            let key = |f: &str| body.get(f).and_then(Json::as_u64);
+            match variant {
+                "ProcessInstanceCreated" => {
+                    if let (Some(k), Some(pid)) = (
+                        key("instance_key"),
+                        body.get("process_id").and_then(Json::as_str),
+                    ) {
+                        out.created.entry(k).or_insert_with(|| (i, pid.to_owned()));
+                    }
+                }
+                "JobCreated" | "ExecutionListenerJobCreated" | "TaskListenerJobCreated" => {
+                    if let (Some(j), Some(k)) = (key("job_key"), key("instance_key")) {
+                        out.jobs.entry(j).or_insert((i, k));
+                    }
+                }
+                "ProcessInstanceCompleted" | "ProcessInstanceTerminated" => {
+                    if let Some(k) = key("instance_key") {
+                        out.terminals.push((i, k));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -333,14 +366,40 @@ pub const COMPENSATION_WAIT_FIELD_RULES: &[(&str, FieldRule)] = &[
 /// `cfg_attr`). Derived from the source so the projection's rule tables
 /// cannot silently drift from the schema (#1764).
 pub fn struct_fields_in(source: &str, name: &str) -> Option<BTreeSet<String>> {
+    struct_field_attrs_in(source, name).map(|fields| {
+        fields
+            .into_iter()
+            .filter(|(_, a)| !(a.contains("serde(skip)") || a.contains("serde(skip,")))
+            .map(|(f, _)| f)
+            .collect()
+    })
+}
+
+/// The serialized fields of `struct <name>` whose serde attributes omit them
+/// when empty (`skip_serializing_if = "…is_empty"`). A projection that
+/// empties such a field must omit it too, exactly as the engine would
+/// serialize the state without the excluded entries (#1764).
+pub fn skip_if_empty_fields_in(source: &str, name: &str) -> Option<BTreeSet<String>> {
+    struct_field_attrs_in(source, name).map(|fields| {
+        fields
+            .into_iter()
+            .filter(|(_, a)| a.contains("skip_serializing_if=") && a.contains("is_empty\""))
+            .map(|(f, _)| f)
+            .collect()
+    })
+}
+
+/// Every named field of `struct <name>` with its (whitespace-free) attribute
+/// text.
+fn struct_field_attrs_in(source: &str, name: &str) -> Option<Vec<(String, String)>> {
     let header = format!("struct {name} {{");
     let mut lines = source
         .lines()
         .skip_while(|l| !l.trim_end().ends_with(&header));
     lines.next()?;
-    let mut out = BTreeSet::new();
+    let mut out = Vec::new();
     let mut depth = 1usize;
-    let mut skipped = false;
+    let mut attrs = String::new();
     let mut attr = String::new();
     for line in lines {
         let t = line.trim();
@@ -351,8 +410,7 @@ pub fn struct_fields_in(source: &str, name: &str) -> Option<BTreeSet<String>> {
             if !attr.is_empty() || t.starts_with("#[") {
                 attr.push_str(t);
                 if attr.matches('[').count() <= attr.matches(']').count() {
-                    let compact: String = attr.chars().filter(|c| !c.is_whitespace()).collect();
-                    skipped |= compact.contains("serde(skip)") || compact.contains("serde(skip,");
+                    attrs.extend(attr.chars().filter(|c| !c.is_whitespace()));
                     attr.clear();
                 }
                 continue;
@@ -364,8 +422,8 @@ pub fn struct_fields_in(source: &str, name: &str) -> Option<BTreeSet<String>> {
                     .or_else(|| t.strip_prefix("pub "))
                     .unwrap_or(t);
                 if let Some((field, _)) = decl.split_once(':') {
-                    if is_field_name(field) && !std::mem::take(&mut skipped) {
-                        out.insert(field.to_owned());
+                    if is_field_name(field) {
+                        out.push((field.to_owned(), std::mem::take(&mut attrs)));
                     }
                 }
             }
@@ -516,13 +574,18 @@ fn owned_entity_keys(
     out
 }
 
-/// The terminal epochs of the ratified instances' own terminal transitions:
-/// the instance's `terminated_epoch` stamp, or — once evicted from
-/// `instances` — its position in `recently_terminated` (mirrors
-/// `State::terminated_epoch_of`).
+/// The terminal epochs of the ratified instances' own terminal transitions.
+/// Preferably derived from this side's OWN ordered terminal events at or
+/// before the checkpoint — the instance's epoch is the snapshot's
+/// `terminal_epoch` minus the terminal transitions after it (mirroring
+/// `State::note_terminated`), which holds after eviction AND after its key
+/// has left the bounded `recently_terminated` ring. Without such an event it
+/// falls back to the snapshot: the instance's `terminated_epoch` stamp, or
+/// its position in `recently_terminated` (mirrors `State::terminated_epoch_of`).
 fn excluded_terminal_epochs(
     state: &serde_json::Map<String, Json>,
     excluded: &BTreeSet<u64>,
+    (history, at): (&Creations, u64),
 ) -> Vec<u64> {
     let terminal_epoch = state
         .get("terminal_epoch")
@@ -533,22 +596,38 @@ fn excluded_terminal_epochs(
         .and_then(Json::as_array)
         .map(|a| a.iter().filter_map(Json::as_u64).collect())
         .unwrap_or_default();
+    let terminals: Vec<u64> = history
+        .terminals
+        .iter()
+        .filter(|(i, _)| *i <= at)
+        .map(|(_, k)| *k)
+        .collect();
     let mut out: Vec<u64> = excluded
         .iter()
         .filter_map(|k| {
-            let stamped = state
-                .get("instances")
-                .and_then(|i| i.get(k.to_string()))
-                .and_then(|i| i.get("terminated_epoch"))
-                .and_then(Json::as_u64)
-                .filter(|e| *e > 0);
-            stamped.or_else(|| {
+            let from_events = terminals
+                .iter()
+                .rposition(|t| t == k)
+                .and_then(|pos| terminal_epoch.checked_sub((terminals.len() - 1 - pos) as u64));
+            let stamped = || {
+                state
+                    .get("instances")
+                    .and_then(|i| i.get(k.to_string()))
+                    .and_then(|i| i.get("terminated_epoch"))
+                    .and_then(Json::as_u64)
+                    .filter(|e| *e > 0)
+            };
+            let in_ring = || {
                 let len = recent.len() as u64;
                 recent
                     .iter()
                     .position(|r| r == k)
                     .and_then(|i| (terminal_epoch + 1 + i as u64).checked_sub(len))
-            })
+            };
+            from_events
+                .filter(|e| *e > 0)
+                .or_else(stamped)
+                .or_else(in_ring)
         })
         .collect();
     out.sort_unstable();
@@ -564,16 +643,22 @@ fn boundary_projection(
 ) -> Result<Json, String> {
     projection_rule_drift()?;
     let root = snapshot.as_object().ok_or("snapshot is not an object")?;
-    let owned = root
+    let empty = serde_json::Map::new();
+    let state = root
         .get("state")
         .and_then(Json::as_object)
-        .map(|s| owned_entity_keys(s, excluded))
-        .unwrap_or_default();
-    let excluded_epochs = root
-        .get("state")
-        .and_then(Json::as_object)
-        .map(|s| excluded_terminal_epochs(s, excluded))
-        .unwrap_or_default();
+        .unwrap_or(&empty);
+    let mut owned = owned_entity_keys(state, excluded);
+    // Job ownership from the side's own events survives eviction (a
+    // settlement entry carries no owner of its own).
+    owned.extend(
+        creations
+            .jobs
+            .iter()
+            .filter(|(_, (i, k))| *i <= at && excluded.contains(k))
+            .map(|(j, _)| *j),
+    );
+    let excluded_epochs = excluded_terminal_epochs(state, excluded, (creations, at));
     let side = ProjectionSide {
         ids,
         excluded,
@@ -608,13 +693,26 @@ fn project_fields(
             FieldRule::Allocator => continue,
             FieldRule::State => {
                 let state = v.as_object().ok_or("snapshot state is not an object")?;
-                project_fields(
+                let mut projected = project_fields(
                     state,
                     STATE_FIELD_RULES,
                     &format!("{path}.{k}"),
                     side,
                     state,
-                )?
+                )?;
+                // A field the engine omits when empty, emptied only by the
+                // exclusion, is omitted from the projection as well.
+                let omit =
+                    skip_if_empty_fields_in(include_str!("../../src/state/types.rs"), "State")
+                        .ok_or("struct State not found in its source")?;
+                if let Json::Object(fields) = &mut projected {
+                    fields.retain(|f, v| {
+                        !(omit.contains(f)
+                            && (v.as_object().is_some_and(serde_json::Map::is_empty)
+                                || v.as_array().is_some_and(Vec::is_empty)))
+                    });
+                }
+                projected
             }
             FieldRule::Exact => match project_value(v, side) {
                 Some(p) => p,
@@ -624,8 +722,8 @@ fn project_fields(
             FieldRule::KeyIndex => project_key_index(v, side, &format!("{path}.{k}"))?,
             FieldRule::PriorityKeyIndex => project_priority_index(v, side),
             FieldRule::KeyList => project_key_list(v, side),
-            FieldRule::CreatedCount => project_count(v, side, parent, false),
-            FieldRule::InflightCount => project_count(v, side, parent, true),
+            FieldRule::CreatedCount => project_count(v, side, parent, false)?,
+            FieldRule::InflightCount => project_count(v, side, parent, true)?,
             FieldRule::TerminalEpoch | FieldRule::TerminatedEpoch => match v.as_u64() {
                 Some(0) | None => v.clone(),
                 Some(e) => Json::from(e - side.excluded_epochs_upto(e).min(e)),
@@ -927,12 +1025,12 @@ fn project_count(
     side: &ProjectionSide<'_>,
     state: &serde_json::Map<String, Json>,
     inflight: bool,
-) -> Json {
+) -> Result<Json, String> {
     let Some(map) = v.as_object() else {
-        return v.clone();
+        return Ok(v.clone());
     };
     let mut out = map.clone();
-    let mut emptied = BTreeSet::new();
+    let mut contributions: BTreeMap<String, u64> = BTreeMap::new();
     for k in side.excluded {
         let pid = if inflight {
             let Some(inst) = state.get("instances").and_then(|i| i.get(k.to_string())) else {
@@ -952,16 +1050,25 @@ fn project_count(
                 _ => continue,
             }
         };
-        if let Some(n) = out.get(&pid).and_then(Json::as_u64) {
-            let left = n.saturating_sub(1);
-            if left == 0 {
-                emptied.insert(pid.clone());
-            }
+        *contributions.entry(pid).or_default() += 1;
+    }
+    // Fail closed on underflow: a count below the ratified contributions it
+    // must contain is a real divergence, never normalized away.
+    for (pid, c) in contributions {
+        let n = out.get(&pid).and_then(Json::as_u64).unwrap_or(0);
+        let left = n.checked_sub(c).ok_or_else(|| {
+            format!(
+                "per-process count for {pid:?} is {n}, below the {c} ratified instance \
+                 contribution(s) it must contain (#1764)"
+            )
+        })?;
+        if left == 0 {
+            out.remove(&pid);
+        } else {
             out.insert(pid, Json::from(left));
         }
     }
-    out.retain(|pid, n| !(emptied.contains(pid) && n.as_u64() == Some(0)));
-    Json::Object(out)
+    Ok(Json::Object(out))
 }
 
 /// Compares state checkpoints (through the head `EngineSnapshot` type) when

@@ -2295,6 +2295,11 @@ fn state_at(i: u64, format: u64) -> serde_json::Value {
         .expect("a state checkpoint");
     s["i"] = serde_json::json!(i);
     s["format"] = serde_json::json!(format);
+    // The synthetic streams create instance 10 of process `p` in entry 0
+    // (`mi_entry`), so — exactly as the engine's cumulative counter would —
+    // every checkpoint counts that creation.
+    let created = &mut s["state"]["state"]["created_by_process"]["p"];
+    *created = serde_json::json!(created.as_u64().unwrap_or(0) + 1);
     s
 }
 
@@ -2649,7 +2654,7 @@ fn prev_release_gate_boundary_projection_preserves_reference_identity() {
 }
 
 /// The post-boundary checkpoint of the ratified-instance scenario: the
-/// ratified instance 10 (process `p`) is added, with its creation counted,
+/// ratified instance 10 (process `p`) is added in flight,
 /// and the retained job `33` of the UNRELATED instance 30 is stored under
 /// `job_key` (a key reminted on one side only must reconcile through that
 /// side's own `KeyIds`, #1764).
@@ -2671,10 +2676,9 @@ fn with_ratified(job_key: u64) -> serde_json::Value {
         .as_object_mut()
         .expect("instances")
         .insert("10".to_owned(), inst);
-    for counts in ["inflight_by_process", "created_by_process"] {
-        let n = state[counts]["p"].as_u64().unwrap_or(0);
-        state[counts]["p"] = serde_json::json!(n + 1);
-    }
+    // Its creation is already counted by `state_at`; it is in flight.
+    let n = state["inflight_by_process"]["p"].as_u64().unwrap_or(0);
+    state["inflight_by_process"]["p"] = serde_json::json!(n + 1);
     let jobs = state["jobs"].as_object_mut().expect("jobs");
     let mut job = jobs.remove("33").expect("job 33");
     job["key"] = serde_json::json!(job_key);
@@ -3283,4 +3287,120 @@ fn prev_release_gate_boundary_projection_keeps_preexisting_zero_counts() {
             "a pre-existing zero {counts} entry must be compared: {err}"
         );
     }
+}
+
+/// #1764 (review): subtracting the ratified creations fails CLOSED on
+/// underflow — a per-process count below the ratified contribution it must
+/// contain is a real divergence, never normalized to an omitted entry.
+#[test]
+fn prev_release_gate_boundary_projection_rejects_count_underflow() {
+    let zero = |mut s: serde_json::Value| {
+        s["state"]["state"]["created_by_process"]["p"] = serde_json::json!(0u64);
+        s
+    };
+    let (head, prev) = boundary_streams(zero(with_ratified(33)), zero(completed_ratified(33)));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("below"),
+        "an underflowing count must fail: {err}"
+    );
+}
+
+fn completed(instance_key: u64) -> serde_json::Value {
+    serde_json::json!({"ProcessInstanceCompleted": {"instance_key": instance_key}})
+}
+
+fn terminated(instance_key: u64) -> serde_json::Value {
+    serde_json::json!({"ProcessInstanceTerminated": {"instance_key": instance_key}})
+}
+
+fn settled(s: &mut serde_json::Value, entries: &[u64]) {
+    let ledger: serde_json::Map<String, serde_json::Value> = entries
+        .iter()
+        .map(|k| {
+            (
+                k.to_string(),
+                serde_json::json!([{"lease_token": "t", "outcome": "completed"}]),
+            )
+        })
+        .collect();
+    s["state"]["state"]["settled_jobs"] = serde_json::Value::Object(ledger);
+}
+
+/// #1764 (review): a settled job of the ratified instance is attributed from
+/// the side's own `JobCreated` (a settlement carries no owner, and eviction
+/// drops the job itself), and a `settled_jobs` ledger EMPTIED by the
+/// exclusion is omitted, as the engine omits an empty ledger.
+#[test]
+fn prev_release_gate_boundary_projection_settled_jobs_of_ratified_instance() {
+    // (a) the exclusion empties the ledger.
+    let mut head_after = with_ratified(33);
+    settled(&mut head_after, &[77]);
+    let (head, prev) = boundary_streams_with(
+        head_after,
+        completed_ratified(33),
+        vec![job_created(77)],
+        vec![job_created(77)],
+    );
+    checked_s(&head, &prev, unbalanced_expected())
+        .unwrap_or_else(|e| panic!("an emptied settled_jobs ledger reconciles: {e}"));
+
+    // (b) the evicted instance's settled job beside an unrelated one.
+    let mut head_after = with_ratified(33);
+    settled(&mut head_after, &[77, 33]);
+    let mut prev_after = completed_ratified(33);
+    settled(&mut prev_after, &[33]);
+    let (head, prev) = boundary_streams_with(
+        head_after,
+        prev_after,
+        vec![job_created(77)],
+        vec![job_created(77)],
+    );
+    checked_s(&head, &prev, unbalanced_expected())
+        .unwrap_or_else(|e| panic!("a ratified settled job reconciles: {e}"));
+
+    // An unrelated settled-job difference still fails.
+    let mut head_after = with_ratified(33);
+    settled(&mut head_after, &[33]);
+    let (head, prev) = boundary_streams(head_after, completed_ratified(33));
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
+    assert!(err.contains("outside the ratified"), "{err}");
+}
+
+/// #1764 (review): the ratified instance's terminal epoch is derived from the
+/// side's own terminal events, so it is re-based even once the instance is
+/// evicted AND its key has wrapped out of `recently_terminated`.
+#[test]
+fn prev_release_gate_boundary_projection_terminal_epoch_after_ring_wrap() {
+    let later = |mut s: serde_json::Value, evict: bool| {
+        let state = s["state"]["state"].as_object_mut().expect("state");
+        if evict {
+            state["instances"]
+                .as_object_mut()
+                .expect("instances")
+                .remove("10");
+            state["recently_terminated"]
+                .as_array_mut()
+                .expect("recently_terminated")
+                .retain(|k| k.as_u64() != Some(10));
+        }
+        let epoch = state["terminal_epoch"].as_u64().expect("terminal_epoch") + 1;
+        state["terminal_epoch"] = serde_json::json!(epoch);
+        state["instances"]["30"]["terminated_epoch"] = serde_json::json!(epoch);
+        state["recently_terminated"]
+            .as_array_mut()
+            .expect("recently_terminated")
+            .push(serde_json::json!(30u64));
+        s
+    };
+    let (head, prev) = boundary_streams_with(
+        later(with_ratified(33), false),
+        later(completed_ratified(33), true),
+        vec![terminated(30)],
+        vec![completed(10), terminated(30)],
+    );
+    let mut expected = unbalanced_expected();
+    expected["only_in_prev"] = serde_json::json!([{"variant": "ProcessInstanceCompleted"}]);
+    checked_s(&head, &prev, expected)
+        .unwrap_or_else(|e| panic!("a wrapped-out ratified completion reconciles: {e}"));
 }
