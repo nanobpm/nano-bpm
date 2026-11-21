@@ -2795,21 +2795,13 @@ fn prev_release_gate_boundary_projection_counts_scoped_to_ratified_instance() {
     }
 }
 
-/// #1764: keys are canonicalized through EACH SIDE's own `KeyIds`: a
-/// retained job reminted on one side only (each side's `JobCreated` mints a
-/// different raw key for the same entity) reconciles, while the same raw-key
-/// difference WITHOUT a mint explaining it still fails.
+/// #1764: a raw-key difference on a retained job WITHOUT a mint explaining
+/// it fails. (A remint is only ever observed in a divergent entry, whose
+/// touched instances are ratified — so a reminted job's owner is excluded,
+/// never compared; per-side `KeyIds` canonicalization of RETAINED keys is
+/// exercised by `prev_release_gate_boundary_projection_remints_nested_instance_keys`.)
 #[test]
 fn prev_release_gate_boundary_projection_canonicalizes_through_key_ids() {
-    let (head, prev) = boundary_streams_with(
-        with_ratified(133),
-        completed_ratified(33),
-        vec![job_created_for(133, 30)],
-        vec![job_created_for(33, 30)],
-    );
-    checked_s(&head, &prev, remint_unbalanced_expected())
-        .unwrap_or_else(|e| panic!("a one-sided remint reconciles through KeyIds: {e}"));
-
     let (head, prev) = boundary_streams(with_ratified(133), completed_ratified(33));
     let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
     assert!(
@@ -3083,36 +3075,31 @@ fn prev_release_gate_boundary_projection_remints_nested_instance_keys() {
     );
 }
 
-/// #1764 (review): `activated_jobs` is a `BTreeSet<Key>` — a remint that
-/// permutes two jobs' raw-key order compares equal as a set.
+/// #1764 (review): `activated_jobs` is a `BTreeSet<Key>` of RETAINED jobs
+/// (no mint touches any instance but the ratified 10): a permuted
+/// serialization compares equal as a set, while a different member fails.
 #[test]
 fn prev_release_gate_boundary_projection_activated_jobs_is_a_set() {
-    let activated = |keys: [u64; 2]| {
+    let activated = |keys: serde_json::Value| {
         let mut s = with_ratified(33);
-        let mut sorted = keys;
-        sorted.sort_unstable();
-        s["state"]["state"]["activated_jobs"] = serde_json::json!(sorted);
+        s["state"]["state"]["activated_jobs"] = keys;
         s
     };
-    let (head, prev) = boundary_streams_with(
-        activated([133, 134]),
-        activated([436, 435]),
-        vec![job_created_for(133, 30), job_created_for(134, 30)],
-        vec![job_created_for(436, 30), job_created_for(435, 30)],
+    let (head, prev) = boundary_streams(
+        activated(serde_json::json!([134, 133])),
+        activated(serde_json::json!([133, 134])),
     );
-    checked_s(&head, &prev, remint_unbalanced_expected())
-        .unwrap_or_else(|e| panic!("a permuting remint of activated jobs reconciles: {e}"));
+    checked_s(&head, &prev, unbalanced_expected())
+        .unwrap_or_else(|e| panic!("a permuted activated-jobs set reconciles: {e}"));
 
-    // The retained entries survive projection: a mismatched pairing fails.
-    let (head, prev) = boundary_streams_with(
-        activated([133, 134]),
-        activated([436, 999]),
-        vec![job_created_for(133, 30), job_created_for(134, 30)],
-        vec![job_created_for(436, 30), job_created_for(435, 30)],
+    let (head, prev) = boundary_streams(
+        activated(serde_json::json!([133, 134])),
+        activated(serde_json::json!([133, 135])),
     );
+    let err = checked_s(&head, &prev, unbalanced_expected()).unwrap_err();
     assert!(
-        checked_s(&head, &prev, remint_unbalanced_expected()).is_err(),
-        "a retained activated job with no matching mint must fail"
+        err.contains("outside the ratified"),
+        "a different retained activated member must fail: {err}"
     );
 }
 
