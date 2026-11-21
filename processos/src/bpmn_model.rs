@@ -312,19 +312,26 @@ fn element_span(xml: &str, local: &str, from: usize) -> Option<(usize, usize)> {
     Some((start, close_at))
 }
 
-/// The byte span `[start, end)` of the `<!-- … -->` comment or
-/// `<![CDATA[ … ]]>` section that starts exactly at `from` (an unterminated
-/// one runs to the end of `xml`).
-fn non_markup_span(xml: &str, from: usize) -> Option<(usize, usize)> {
-    for (open, close) in [("<!--", "-->"), ("<![CDATA[", "]]>")] {
-        if xml[from..].starts_with(open) {
-            let start = from;
-            let end = xml[start + open.len()..]
-                .find(close)
-                .map(|r| start + open.len() + r + close.len())
-                .unwrap_or(xml.len());
-            return Some((start, end));
+/// The end (exclusive) of the non-element markup starting exactly at `from` —
+/// a `<!-- … -->` comment, `<![CDATA[ … ]]>` section, `<? … ?>` processing
+/// instruction (which ends at `?>`, not its first `>`), or other `<! … >`
+/// declaration — or `None` when `from` starts an element tag. The single
+/// canonical markup-skipper for every scanner here, so no scanner can treat
+/// text inside such markup as structure. Unterminated markup yields
+/// `Some(None)`: the caller must treat the input as malformed.
+fn non_element_markup_end(xml: &str, from: usize) -> Option<Option<usize>> {
+    let after = &xml[from..];
+    for (open, close) in [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")] {
+        if let Some(inner) = after.strip_prefix(open) {
+            return Some(
+                inner
+                    .find(close)
+                    .map(|r| from + open.len() + r + close.len()),
+            );
         }
+    }
+    if after.starts_with("<!") {
+        return Some(tag_end(xml, from));
     }
     None
 }
@@ -345,6 +352,34 @@ fn tag_end(xml: &str, lt: usize) -> Option<usize> {
     None
 }
 
+/// The value of attribute `attr` in the start tag `tag` (`<name a="…" …>`),
+/// read by tokenizing the tag's attributes in order — so a lookalike inside
+/// another attribute's quoted value (`name='x id="Y"'`) is never matched, and
+/// every legal spelling (`id="…"`, `id = "…"`, `id='…'`) is. `None` when the
+/// attribute is absent or the tag is malformed.
+fn start_tag_attr(tag: &str, attr: &str) -> Option<String> {
+    let body = tag.strip_prefix('<')?;
+    let mut rest = body.trim_start_matches(|c: char| !c.is_whitespace() && c != '>' && c != '/');
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() || rest.starts_with('>') || rest.starts_with('/') {
+            return None;
+        }
+        let name_end = rest.find(|c: char| c.is_whitespace() || c == '=' || c == '>')?;
+        let name = &rest[..name_end];
+        rest = rest[name_end..]
+            .trim_start()
+            .strip_prefix('=')?
+            .trim_start();
+        let quote = rest.chars().next().filter(|q| *q == '"' || *q == '\'')?;
+        let val_end = rest[1..].find(quote)? + 1;
+        if name == attr {
+            return Some(rest[1..val_end].to_string());
+        }
+        rest = &rest[val_end + 1..];
+    }
+}
+
 /// The span `[lt, end)` of the element whose start tag is at `lt`, found by a
 /// nesting-aware scan: comments, CDATA sections, processing instructions and
 /// doctype-like markup at every depth are skipped wholesale (so a closing tag
@@ -356,18 +391,13 @@ fn nested_element_span(xml: &str, lt: usize) -> Option<(usize, usize)> {
     loop {
         let at = i + xml[i..].find('<')?;
         let after = &xml[at..];
-        if after.starts_with("<!--") || after.starts_with("<![CDATA[") {
-            let (open, close) = if after.starts_with("<!--") {
-                ("<!--", "-->")
-            } else {
-                ("<![CDATA[", "]]>")
-            };
-            i = at + open.len() + after[open.len()..].find(close)? + close.len();
+        if let Some(e) = non_element_markup_end(xml, at) {
+            // Unterminated markup inside an element: the element is unclosed.
+            i = e?;
             continue;
         }
         let end = tag_end(xml, at)?;
         match after[1..].chars().next() {
-            Some('?') | Some('!') => {}
             Some('/') => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
@@ -480,8 +510,8 @@ fn declaration_id_at(xml: &str, start: usize) -> Option<String> {
     let local = name.rsplit(':').next().unwrap_or(name);
     match local {
         "error" | "message" | "signal" | "escalation" => {
-            let gt = start + xml[start..].find('>')?;
-            attr_value_in(&xml[start..=gt], "id")
+            let gt = tag_end(xml, start)?;
+            start_tag_attr(&xml[start..gt], "id")
         }
         _ => None,
     }
@@ -514,24 +544,20 @@ fn declaration_spans(body: &str) -> Vec<(usize, usize)> {
             break;
         };
         let lt = i + lt_rel;
-        let after = &body[lt..];
-        if after.starts_with("<!--") || after.starts_with("<![CDATA[") {
-            match non_markup_span(body, lt) {
-                Some((_, e)) => i = e.max(lt + 1),
+        // Comments, CDATA, processing instructions (through `?>`) and
+        // doctype-like markup are skipped wholesale.
+        if let Some(e) = non_element_markup_end(body, lt) {
+            match e {
+                Some(e) => i = e,
+                // Unterminated markup: nothing past it is structure.
                 None => break,
             }
             continue;
         }
-        match after[1..].chars().next() {
-            // A close tag at this level can only be the caller's enclosing
-            // element (or malformed input): the child list is over.
-            Some('/') => break,
-            // A processing instruction or doctype: skip to its `>`.
-            Some('?') | Some('!') => {
-                i = after.find('>').map(|r| lt + r + 1).unwrap_or(body.len());
-                continue;
-            }
-            _ => {}
+        // A close tag at this level can only be the caller's enclosing
+        // element (or malformed input): the child list is over.
+        if body[lt + 1..].starts_with('/') {
+            break;
         }
         let name = tag_name_at(body, lt);
         let local = name.rsplit(':').next().unwrap_or(name);
@@ -7254,6 +7280,75 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
                 "{label}: the extra's real declaration survives, got:\n{merged}"
             );
         }
+    }
+
+    #[test]
+    fn declaration_spans_skip_processing_instructions_through_their_terminator() {
+        // A PI ends at `?>`, not its first `>`: a declaration mentioned inside
+        // one is not a declaration (top level) and must not truncate an
+        // enclosing element's span (nested).
+        let top = r#"<?note > <bpmn:error id="E"/> ?><bpmn:message id="M"/>"#;
+        let spans = declaration_spans(top);
+        assert_eq!(spans.len(), 1, "only the real message: {spans:?}");
+        assert_eq!(&top[spans[0].0..spans[0].1], r#"<bpmn:message id="M"/>"#);
+
+        let nested =
+            r#"<bpmn:error id="E"><?pi > </bpmn:error> ?></bpmn:error><bpmn:process id="P"/>"#;
+        assert_eq!(
+            declaration_spans(nested),
+            vec![(0, nested.find("<bpmn:process").unwrap())],
+            "the nested PI's `</bpmn:error>` is not the boundary"
+        );
+        // An unterminated PI is malformed: never a guessed span.
+        assert!(declaration_spans(r#"<bpmn:error id="E"><?pi </bpmn:error>"#).is_empty());
+    }
+
+    #[test]
+    fn merge_definitions_ignores_a_declaration_inside_a_processing_instruction() {
+        let primary = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <?note > <bpmn:error id="E"/> ?>
+  <bpmn:process id="ProcA"/>
+</bpmn:definitions>"#;
+        let extra = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="E" errorCode="BOOM"/>
+  <bpmn:process id="ProcB"/>
+</bpmn:definitions>"#;
+        let merged = merge_definitions(primary, &[extra]);
+        assert!(
+            merged.contains(r#"<bpmn:error id="E" errorCode="BOOM"/>"#),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn declaration_ids_are_read_from_real_attributes() {
+        // The id is the tag's real `id` attribute: a lookalike inside another
+        // attribute's value is not it, and every legal spelling is.
+        for (tag, want) in [
+            (
+                r#"<bpmn:message name='order id="Error_SHARED"' id="M1"/>"#,
+                Some("M1"),
+            ),
+            (r#"<bpmn:message name='order id="Error_SHARED"'/>"#, None),
+            (r#"<bpmn:error id='E1'/>"#, Some("E1")),
+            (r#"<bpmn:error id = "E2"/>"#, Some("E2")),
+            (r#"<bpmn:error name="a>b" id="E3"/>"#, Some("E3")),
+            (r#"<bpmn:error errorId="X"/>"#, None),
+        ] {
+            assert_eq!(declaration_id_at(tag, 0).as_deref(), want, "tag: {tag}");
+        }
+        // End to end: a lookalike must not delete a distinct declaration.
+        let primary = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:message id="M1" name='order id="Error_SHARED"'/>
+</bpmn:definitions>"#;
+        let extra = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Error_SHARED" errorCode="S"/>
+</bpmn:definitions>"#;
+        let merged = merge_definitions(primary, &[extra]);
+        assert!(
+            merged.contains(r#"<bpmn:error id="Error_SHARED" errorCode="S"/>"#),
+            "{merged}"
+        );
     }
 
     #[test]
