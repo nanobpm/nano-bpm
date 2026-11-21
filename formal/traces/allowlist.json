@@ -2,21 +2,6 @@
   "doc": "Known nano-vs-Zeebe trace divergences. Each entry: {scenario, issue: \"#N\", reason, ignoreRecords?, reorderRecords?, nanoTrace?}. A listed scenario that no longer diverges is STALE and fails engine-core/tests/zeebe_traces.rs — delete it. `ignoreRecords` (record-field matchers) narrows the entry: only matching records may differ; every other record of every step must still equal Zeebe. `reorderRecords` ({steps: [i..], match: [matchers]}) tolerates only the ORDER of matching records, only in the listed steps — they are still compared as a multiset. `nanoTrace` (#1521) pins the fingerprint of nano's divergent trace: any change in nano's behaviour on that scenario fails until re-reviewed and re-pinned; generated-budget (g-*) entries must carry it (or ignoreRecords).",
   "entries": [
     {
-      "scenario": "mi-parallel-output-element-scope",
-      "issue": "#1539",
-      "reason": "Step 0 (createInstance) only: nano runs each parallel-MI child's inner flow depth-first (child 0's whole flow before child 1 activates); Zeebe's worklist is FIFO (MultiInstanceBodyProcessor activates every child, then drains each behaviour), so the children interleave. Both emit the SAME 27 PROCESS_INSTANCE records (verified multiset-equal) — only their order differs. This is a record-ordering/scheduling difference, not a scoping or correctness defect; the variable scoping (#1518, fixed by #1519) and the body-local outputCollection + per-child updates (#1534, rendered by the trace adapter) all match. Narrowed with reorderRecords: only the ORDER of step-0 PROCESS_INSTANCE records may differ (compared as a multiset, so a missing/changed record still fails); every other record and all of steps 1-4 must still equal Zeebe exactly.",
-      "reorderRecords": {
-        "steps": [
-          0
-        ],
-        "match": [
-          {
-            "valueType": "PROCESS_INSTANCE"
-          }
-        ]
-      }
-    },
-    {
       "scenario": "g-1",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local (#1534) + #1518 outputElement nil seed",
@@ -29,16 +14,10 @@
       "nanoTrace": "99d19b69dfb04a3b"
     },
     {
-      "scenario": "g-3",
-      "issue": "#1539",
-      "reason": "step 6 only (record ordering): a parallel multi-instance sub-process's children run their inner flow depth-first in nano but interleave in Zeebe's FIFO worklist (#1539). The step-4 multi-timer batch ordering (#1712) now matches Zeebe.",
-      "nanoTrace": "8e00f0339bcc57bf"
-    },
-    {
       "scenario": "g-5",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "b653f5d17ff8ccf1"
+      "nanoTrace": "c62210578eaa400b"
     },
     {
       "scenario": "g-6",
@@ -47,28 +26,16 @@
       "nanoTrace": "b8c1d7b5f5b52387"
     },
     {
-      "scenario": "g-11",
-      "issue": "#1534",
-      "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "9a3e5c416d0b5de7"
-    },
-    {
       "scenario": "g-18",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "20ec19ca5b6cb8dc"
-    },
-    {
-      "scenario": "g-26",
-      "issue": "#1534",
-      "reason": "MI outputCollection not body-local",
-      "nanoTrace": "93fd9e6cb78e3071"
+      "nanoTrace": "07450602f7e56bc4"
     },
     {
       "scenario": "g-30",
       "issue": "#1534",
       "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "8fb3ffbc79ce7ea2"
+      "nanoTrace": "652eaf66bc039ec2"
     }
   ]
 }
