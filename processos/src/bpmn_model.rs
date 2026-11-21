@@ -592,17 +592,24 @@ fn declaration_spans(body: &str) -> Vec<(usize, usize)> {
 /// an identical declaration in two processes resolves to the SAME id, and splicing
 /// both in would duplicate the element. A same-id-different-content splice is a
 /// per-process minting bug, not a merge outcome — the registry makes it
-/// unreachable.
-pub fn merge_definitions(primary: &str, extras: &[&str]) -> String {
+/// unreachable on the assembly path. Authored documents (e.g. `seed_demo`'s raw
+/// phase files) carry no such guarantee, so an id is deduped ONLY when the two
+/// declarations are textually identical (whitespace-insensitive): a
+/// same-id-different-content pair is an `Err`, never a silent drop that would
+/// rebind the extra's refs to the primary's (different) declaration.
+pub fn merge_definitions(primary: &str, extras: &[&str]) -> Result<String, String> {
     let mut injected = String::new();
     // Seed `seen` with the primary's own declaration ids — scanned over its
     // `<definitions>` body (diagram stripped, as the extras are), so only
     // direct children count and a commented-out or nested declaration-shaped
     // element can never shadow a real one.
     let primary_inner = definitions_inner_no_di(primary).unwrap_or_default();
-    let mut seen: BTreeSet<String> = declaration_spans(&primary_inner)
+    let mut seen: BTreeMap<String, String> = declaration_spans(&primary_inner)
         .into_iter()
-        .filter_map(|(s, _)| declaration_id_at(&primary_inner, s))
+        .filter_map(|(s, e)| {
+            declaration_id_at(&primary_inner, s)
+                .map(|id| (id, normalize_declaration(&primary_inner[s..e])))
+        })
         .collect();
     for x in extras {
         if let Some(inner) = definitions_inner_no_di(x) {
@@ -613,8 +620,19 @@ pub fn merge_definitions(primary: &str, extras: &[&str]) -> String {
             let spans = declaration_spans(&inner);
             for (s, e) in spans.into_iter().rev() {
                 if let Some(id) = declaration_id_at(&inner, s) {
-                    if !seen.insert(id) {
-                        inner.replace_range(s..e, "");
+                    let text = normalize_declaration(&inner[s..e]);
+                    match seen.get(&id) {
+                        Some(prev) if *prev == text => inner.replace_range(s..e, ""),
+                        Some(_) => {
+                            return Err(format!(
+                                "cannot merge definitions: declaration id '{id}' is declared \
+                                 with different content in two documents; rename one of them \
+                                 (and its refs) so each id names exactly one declaration"
+                            ));
+                        }
+                        None => {
+                            seen.insert(id, text);
+                        }
                     }
                 }
             }
@@ -627,7 +645,7 @@ pub fn merge_definitions(primary: &str, extras: &[&str]) -> String {
         }
     }
     if injected.is_empty() {
-        return primary.to_string();
+        return Ok(primary.to_string());
     }
     let insert_at = find_tag_open(primary, "BPMNDiagram", 0)
         .map(|di| primary[..di].rfind('\n').map(|n| n + 1).unwrap_or(di))
@@ -641,10 +659,16 @@ pub fn merge_definitions(primary: &str, extras: &[&str]) -> String {
             out.push_str(&primary[..at]);
             out.push_str(&injected);
             out.push_str(&primary[at..]);
-            out
+            Ok(out)
         }
-        None => primary.to_string(),
+        None => Ok(primary.to_string()),
     }
+}
+
+/// Whitespace-insensitive form of a declaration's source text, used to decide
+/// whether two same-id declarations are genuinely the same declaration.
+fn normalize_declaration(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Return the raw BPMN XML of the model, or of one named phase within it. `target`
@@ -4908,9 +4932,9 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
 pub(crate) fn assemble_model(
     defs: &[ProcessDefinition],
     names: &BTreeMap<String, String>,
-) -> String {
+) -> Result<String, String> {
     if defs.len() == 1 {
-        definition_to_xml_labeled(&defs[0], names)
+        Ok(definition_to_xml_labeled(&defs[0], names))
     } else {
         let mut registry = DeclRegistry::default();
         // Reserve EVERY definition's emitted ids up front, before any process
@@ -5000,7 +5024,7 @@ pub fn edit_model_in(
     // Serialize. Single-definition models round-trip exactly as before. For a multi-stage model
     // we re-emit the orchestrator (with a fresh diagram) and splice the remaining phase
     // definitions back in, so the file stays self-contained and the overview survives.
-    let xml = assemble_model(&defs, &names);
+    let xml = assemble_model(&defs, &names)?;
 
     // The serializer owns correctness, but re-parse defensively so we never hand back XML that the
     // engine would reject at deploy time — surfacing any logical inconsistency the ops introduced.
@@ -6879,7 +6903,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("StartB", "ThrowB")
             .build()
             .unwrap();
-        let xml = assemble_model(&[a, b], &BTreeMap::new());
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
         let error_ids: std::collections::BTreeSet<&str> = xml
             .lines()
             .filter(|l| l.contains("<bpmn:error "))
@@ -6929,7 +6953,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("StartB", "ThrowB")
             .build()
             .unwrap();
-        let xml = assemble_model(&[a, b], &BTreeMap::new());
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
         assert_eq!(
             xml.matches("<bpmn:error ").count(),
             1,
@@ -6960,7 +6984,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         };
         let a = esc_def("ProcA", "StartA", "ThrowA", "A/B");
         let b = esc_def("ProcB", "StartB", "ThrowB", "A_B");
-        let xml = assemble_model(&[a, b], &BTreeMap::new());
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
         assert_eq!(
             xml.matches("<bpmn:escalation ").count(),
             2,
@@ -6999,7 +7023,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         };
         let a = msg_def("ProcA", "StartA", "CatchA", "EndA", "A/B");
         let b = msg_def("ProcB", "StartB", "CatchB", "EndB", "A.B");
-        let xml = assemble_model(&[a, b], &BTreeMap::new());
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
         assert_eq!(
             xml.matches("<bpmn:message ").count(),
             2,
@@ -7040,7 +7064,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         };
         let a = sig_def("ProcA", "StartA", "CatchA", "EndA", "A/B");
         let b = sig_def("ProcB", "StartB", "CatchB", "EndB", "A.B");
-        let xml = assemble_model(&[a, b], &BTreeMap::new());
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
         assert_eq!(
             xml.matches("<bpmn:signal ").count(),
             2,
@@ -7082,7 +7106,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("StartB", "ThrowB")
             .build()
             .unwrap();
-        let xml = assemble_model(&[a, b], &BTreeMap::new());
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
         assert!(
             xml.contains("<bpmn:process id=\"Error_BOOM\""),
             "the process keeps its id, got:\n{xml}"
@@ -7120,7 +7144,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             (named.clone(), throwing.clone(), "named process first"),
             (throwing.clone(), named.clone(), "throwing process first"),
         ] {
-            let xml = assemble_model(&[first, second], &BTreeMap::new());
+            let xml = assemble_model(&[first, second], &BTreeMap::new()).unwrap();
             assert!(
                 xml.contains("<bpmn:process id=\"Error_BOOM\""),
                 "{order}: the process keeps its id, got:\n{xml}"
@@ -7235,7 +7259,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
   <bpmn:process id="ProcB" isExecutable="true"/>
 </bpmn:definitions>
 "#;
-        let merged = merge_definitions(primary, &[extra]);
+        let merged = merge_definitions(primary, &[extra]).unwrap();
         assert!(
             merged.contains("<bpmn:error id=\"Error_BOOM\" errorCode=\"BOOM\"/>"),
             "the real declaration survives — the commented one must not shadow it, got:\n{merged}"
@@ -7280,7 +7304,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
 </bpmn:definitions>
 "#;
         for (label, p) in [("escaped", primary), ("raw-nested", primary_raw_nested)] {
-            let merged = merge_definitions(p, &[extra]);
+            let merged = merge_definitions(p, &[extra]).unwrap();
             assert!(
                 merged.contains("<bpmn:error id=\"Error_BOOM\" errorCode=\"BOOM\"/>"),
                 "{label}: the extra's real declaration survives, got:\n{merged}"
@@ -7319,7 +7343,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
   <bpmn:error id="E" errorCode="BOOM"/>
   <bpmn:process id="ProcB"/>
 </bpmn:definitions>"#;
-        let merged = merge_definitions(primary, &[extra]);
+        let merged = merge_definitions(primary, &[extra]).unwrap();
         assert!(
             merged.contains(r#"<bpmn:error id="E" errorCode="BOOM"/>"#),
             "{merged}"
@@ -7336,7 +7360,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         let extra = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:process id="ProcB"/>
 </bpmn:definitions>"#;
-        let merged = merge_definitions(primary, &[extra]);
+        let merged = merge_definitions(primary, &[extra]).unwrap();
         let at = merged
             .find(r#"<bpmn:process id="ProcB"/>"#)
             .expect("spliced");
@@ -7389,7 +7413,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         let extra = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:error id="Error_SHARED" errorCode="S"/>
 </bpmn:definitions>"#;
-        let merged = merge_definitions(primary, &[extra]);
+        let merged = merge_definitions(primary, &[extra]).unwrap();
         assert!(
             merged.contains(r#"<bpmn:error id="Error_SHARED" errorCode="S"/>"#),
             "{merged}"
@@ -7413,7 +7437,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
   <bpmn:process id="ProcB" isExecutable="true"/>
 </bpmn:definitions>
 "#;
-        let merged = merge_definitions(primary, &[extra]);
+        let merged = merge_definitions(primary, &[extra]).unwrap();
         assert_eq!(
             merged.matches("<bpmn:error ").count(),
             1,
@@ -8140,7 +8164,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
     ];
 
     fn merged_cdd() -> String {
-        merge_definitions(CDD_ORCH, &CDD_PHASES)
+        merge_definitions(CDD_ORCH, &CDD_PHASES).unwrap()
     }
 
     #[test]
