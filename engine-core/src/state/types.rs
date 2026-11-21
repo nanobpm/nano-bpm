@@ -1517,7 +1517,10 @@ pub enum IoMappingRedrive {
     Completion,
     /// A multi-instance **child** input-mapping failure: re-apply the child's
     /// inputs against its already-bound `inputElement`/`loopCounter` scope and
-    /// re-enact its behaviour for the same (already-activated) child instance.
+    /// re-enact its behaviour for the same child instance. Since #1724 a child
+    /// whose first activation failed is parked in ACTIVATING (its
+    /// `ElementActivated` withheld); the successful re-drive emits the marker
+    /// once. Pre-#1724 journals activated the child first and owe no marker.
     MiChildActivation { body_key: Key, index: usize },
     /// A multi-instance **body** input-collection / body-input failure: re-run the
     /// body's fan-out (re-apply body input mappings, re-evaluate the input

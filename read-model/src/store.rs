@@ -6545,6 +6545,21 @@ fn project_event(
             upsert_variables(tx, *instance_key, *scope_key, variables)?;
         }
 
+        // A multi-instance child's locals (`inputElement`, `loopCounter`, the
+        // seeded `outputElement` root and its input-mapped values) are carried
+        // only on its activation event — never a discrete
+        // `ScopedVariablesUpdated` — so materialize them under the child's own
+        // scope key here (#1724), exactly as the engine reducer seeds the
+        // child scope (and as a snapshot reseed projects `scope_variables`).
+        Event::MultiInstanceChildActivated {
+            instance_key,
+            child_key,
+            local_variables,
+            ..
+        } => {
+            upsert_variables(tx, *instance_key, *child_key, local_variables)?;
+        }
+
         Event::DecisionRequirementsDeployed {
             decision_requirements_key,
             version,
@@ -7126,7 +7141,6 @@ fn project_event(
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }
         | Event::MultiInstanceCompletionConditionFulfilled { .. }
-        | Event::MultiInstanceChildActivated { .. }
         | Event::MultiInstanceChildCompleted { .. }
         | Event::MultiInstanceCompleted { .. }
         | Event::ParallelJoinFired { .. }
@@ -11520,6 +11534,111 @@ mod definition_xml_tests {
             .unwrap();
         assert_eq!(after.key, before, "upsert keeps the variable key");
         assert_eq!(after.value, "99");
+    }
+
+    /// #1724: a multi-instance child's locals (`item`, `loopCounter`, its
+    /// input-mapped values) arrive only in `MultiInstanceChildActivated.local_variables`.
+    /// They must be projected under the child's scope key — searchable exactly
+    /// like any other scoped variable — identically on the live export, a full
+    /// journal replay, and a snapshot-recovery reseed.
+    #[test]
+    fn multi_instance_child_locals_are_projected_live_replayed_and_reseeded() {
+        use nanobpmn_engine_core::{
+            Command, Engine, EngineSnapshot, IoMapping, Mapping, MultiInstance, ProcessBuilder,
+            Value,
+        };
+
+        let def = ProcessBuilder::new("mi-locals")
+            .start_event("start")
+            .service_task("work", "w")
+            .with_multi_instance(
+                "work",
+                MultiInstance {
+                    input_collection: "=items".to_string(),
+                    input_element: Some("item".to_string()),
+                    output_collection: None,
+                    output_element: None,
+                    completion_condition: None,
+                    cancel_remaining_instances: true,
+                    sequential: false,
+                },
+            )
+            .with_io(
+                "work",
+                IoMapping {
+                    inputs: vec![Mapping {
+                        source: "=item * 10".to_string(),
+                        target: "scaled".to_string(),
+                    }],
+                    outputs: Vec::new(),
+                },
+            )
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        let mut journal: Vec<Event> = Vec::new();
+        journal.extend(engine.apply_command(Command::DeployProcess(def)).unwrap());
+        journal.extend(
+            engine
+                .apply_command(Command::create_instance_with(
+                    "mi-locals",
+                    std::collections::BTreeMap::from([(
+                        "items".to_string(),
+                        Value::List(vec![Value::Int(1), Value::Int(2)]),
+                    )]),
+                ))
+                .unwrap(),
+        );
+        let inst = journal.iter().find_map(|e| e.instance_key()).unwrap();
+        let children: Vec<super::Key> = journal
+            .iter()
+            .filter_map(|e| match e {
+                Event::MultiInstanceChildActivated { child_key, .. } => Some(*child_key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(children.len(), 2);
+
+        // (scope, name, value) for the child scopes, sorted.
+        let child_locals = |store: &ReadStore| {
+            let mut rows: Vec<(super::Key, String, String)> = store
+                .instance_variables(inst)
+                .into_iter()
+                .filter(|r| children.contains(&r.scope_key))
+                .map(|r| (r.scope_key, r.name, r.value))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let mut want = Vec::new();
+        for (child, item) in children.iter().zip([1, 2]) {
+            want.push((*child, "item".to_string(), item.to_string()));
+            want.push((*child, "loopCounter".to_string(), item.to_string()));
+            want.push((*child, "scaled".to_string(), (item * 10).to_string()));
+        }
+        want.sort();
+
+        let live = ReadStore::open(None).unwrap();
+        for e in &journal {
+            live.export(&[e]).unwrap();
+        }
+        assert_eq!(child_locals(&live), want, "live export");
+
+        let replayed = ReadStore::open(None).unwrap();
+        let refs: Vec<&Event> = journal.iter().collect();
+        replayed.export(&refs).unwrap();
+        assert_eq!(child_locals(&replayed), want, "journal replay");
+
+        let bytes = serde_json::to_vec(&Engine::replay(journal.clone()).snapshot()).unwrap();
+        let decoded: EngineSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let reseeded = ReadStore::open(None).unwrap();
+        reseeded
+            .seed_from_engine_state(Engine::from_snapshot(decoded).state())
+            .unwrap();
+        assert_eq!(child_locals(&reseeded), want, "snapshot recovery");
     }
 }
 

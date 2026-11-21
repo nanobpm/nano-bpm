@@ -10436,6 +10436,10 @@ impl Engine {
                     // (`MiChildActivation`), re-applying the now-fixed inputs and
                     // re-enacting its behaviour for the same child instance —
                     // without re-emitting its activation events.
+                    // The child parks in ACTIVATING (#1724): Zeebe applies the
+                    // input mappings in `onActivate`, before
+                    // `transitionToActivated`, so `ElementActivated` is owed
+                    // until the redrive succeeds (`retry_mi_child_activation`).
                     let mut events = vec![
                         Event::ElementActivating {
                             instance_key,
@@ -10443,12 +10447,6 @@ impl Engine {
                             element_id: element_id.clone(),
                             scope: body_key,
                             race: None,
-                        },
-                        Event::ElementActivated {
-                            instance_key,
-                            element_instance_key: child_key,
-                            element_id: element_id.clone(),
-                            scope: body_key,
                         },
                         Event::MultiInstanceChildActivated {
                             instance_key,
@@ -10472,19 +10470,13 @@ impl Engine {
             }
         }
 
-        let events = vec![
+        let mut events = vec![
             Event::ElementActivating {
                 instance_key,
                 element_instance_key: child_key,
                 element_id: element_id.clone(),
                 scope: body_key,
                 race: None,
-            },
-            Event::ElementActivated {
-                instance_key,
-                element_instance_key: child_key,
-                element_id: element_id.clone(),
-                scope: body_key,
             },
             Event::MultiInstanceChildActivated {
                 instance_key,
@@ -10494,6 +10486,12 @@ impl Engine {
                 local_variables: locals,
             },
         ];
+        let activated = Event::ElementActivated {
+            instance_key,
+            element_instance_key: child_key,
+            element_id: element_id.clone(),
+            scope: body_key,
+        };
         let (behaviour_events, followups) = self.run_mi_child_behaviour(
             instance_key,
             element_id,
@@ -10502,7 +10500,14 @@ impl Engine {
             index,
             &child_vars,
         );
-        let mut events = events;
+        // #1724: `ElementActivated` only once the behaviour succeeded (Zeebe
+        // `onActivate` precedes `transitionToActivated`). A behaviour incident
+        // parks the child in ACTIVATING; its redrive emits the marker exactly
+        // once (`retry_mi_child_activation`). Inserted right after
+        // `ElementActivating` so the success-path journal order is unchanged.
+        if !parks_mi_child_activation(&behaviour_events, child_key) {
+            events.insert(1, activated);
+        }
         events.extend(behaviour_events);
         let mut followups = followups;
         followups.extend(next_sibling);
@@ -10954,9 +10959,10 @@ impl Engine {
     }
 
     /// Re-drives a multi-instance child's *activation* phase after its
-    /// input-mapping incident is resolved (#946): the child element instance is
-    /// already ACTIVATED (its `ElementActivating`/`ElementActivated`/
-    /// `MultiInstanceChildActivated` were emitted and are not re-emitted). Reads
+    /// input-mapping incident is resolved (#946): the child's
+    /// `ElementActivating`/`MultiInstanceChildActivated` were emitted and are not
+    /// re-emitted; its `ElementActivated` is emitted here, once, when the child
+    /// is still owed it (parked in ACTIVATING, #1724) and the re-run succeeds. Reads
     /// the child's already-bound scope (which carries `inputElement`/`loopCounter`
     /// from `MultiInstanceChildActivated`), re-applies the now-fixed input
     /// mappings — writing them into the child scope — and re-enacts the child's
@@ -11004,6 +11010,12 @@ impl Engine {
                 }
             }
         }
+        let activated = Event::ElementActivated {
+            instance_key,
+            element_instance_key: child_key,
+            element_id: element_id.clone(),
+            scope: body_key,
+        };
         let (behaviour_events, followups) = self.run_mi_child_behaviour(
             instance_key,
             element_id,
@@ -11012,6 +11024,19 @@ impl Engine {
             index,
             &child_vars,
         );
+        // #1724: a child parked in ACTIVATING (its first activation failed
+        // before the marker) is owed exactly one `ElementActivated`, emitted
+        // once the re-driven behaviour succeeds. A legacy child (activated
+        // before its incident, pre-#1724 journals) is not in the set and gets
+        // none — so the marker is never duplicated.
+        let owed = self
+            .state
+            .instances
+            .get(&instance_key)
+            .is_some_and(|i| i.activating.contains(&child_key));
+        if owed && !parks_mi_child_activation(&behaviour_events, child_key) {
+            events.push(activated);
+        }
         events.extend(behaviour_events);
         (events, followups)
     }
@@ -11143,8 +11168,17 @@ impl Engine {
         // `output_overlay` so a call-activity child collects its real
         // (already-projected) result rather than re-deriving — and losing — it
         // (#1398 review).
+        //
+        // The view is skipped only when nothing reads it AND there is nothing
+        // to validate: a child with its own `zeebe:output` mappings evaluates
+        // them even when the body aggregates nothing, so a mapping that fails
+        // over the child-local `item` raises its incident instead of passing
+        // silently (#1724). A call-activity child's (`output_overlay`) outputs
+        // were already applied — and validated — by the caller.
+        let validates_outputs =
+            output_overlay.is_none() && !self.io_outputs(instance_key, &element_id).is_empty();
         let post_view: Option<Arc<BTreeMap<String, Value>>> =
-            if output_element.is_none() && completion_condition.is_none() {
+            if output_element.is_none() && completion_condition.is_none() && !validates_outputs {
                 None
             } else {
                 let visible = self.variables_for_element(instance_key, child_eik);
@@ -11545,6 +11579,16 @@ impl Engine {
             ),
             None => return (Vec::new(), Vec::new()),
         };
+        // #1724: a still-running user-task child is CANCELLED by the early
+        // completion below, and its `canceling` task listeners must run first
+        // (ADR 0037 §6, as for an instance cancellation). Defer the whole body
+        // completion while any child's canceling chain is in flight; the last
+        // chain to drain re-drives `CompleteMiBody` (`finalize_task_listener_chain`).
+        if let Some(waiting) =
+            self.defer_mi_body_for_canceling_listeners(instance_key, &element_id, &active)
+        {
+            return (waiting, Vec::new());
+        }
         let scope = self.scope_of(instance_key, body_key);
 
         // Build the aggregated output collection (padding uncollected slots with
@@ -11927,6 +11971,99 @@ impl Engine {
             ));
         }
         self.cancel_mi_child_events(instance_key, root, inner, user_tasks_by_eik)
+    }
+
+    /// The `canceling` task-listener gate of an early multi-instance body
+    /// completion (#1724). Returns `Some(events)` when the body must wait:
+    /// either a child's canceling chain is already in flight, or one is started
+    /// now (the returned events) for every still-running direct user-task child
+    /// whose task is `Created` with no other transition pending (a task already
+    /// deferring another transition is cancelled immediately, as on instance
+    /// cancellation). `None` when no chain must run — the teardown proceeds
+    /// synchronously, byte-identical to an element without canceling listeners.
+    fn defer_mi_body_for_canceling_listeners(
+        &mut self,
+        instance_key: Key,
+        element_id: &str,
+        active: &[Key],
+    ) -> Option<Vec<Event>> {
+        if active.is_empty() {
+            return None;
+        }
+        let listeners = self.task_listeners_of(
+            instance_key,
+            element_id,
+            crate::model::TaskListenerEventType::Canceling,
+        );
+        let first = listeners.first()?.clone();
+        let mut in_flight = false;
+        let mut starts: Vec<(Key, Key)> = Vec::new();
+        for task in self.state.user_tasks.values() {
+            if task.instance_key != instance_key
+                || task.state != state::UserTaskState::Created
+                || !active.contains(&task.element_instance_key)
+            {
+                continue;
+            }
+            match task.pending.as_ref().map(|p| p.event_type) {
+                Some(crate::model::TaskListenerEventType::Canceling) => in_flight = true,
+                Some(_) => {}
+                None => starts.push((task.key, task.element_instance_key)),
+            }
+        }
+        if starts.is_empty() {
+            return in_flight.then(Vec::new);
+        }
+        let mut events = Vec::new();
+        for (user_task_key, element_instance_key) in starts {
+            let pending = state::PendingUserTaskTransition {
+                event_type: crate::model::TaskListenerEventType::Canceling,
+                assignee: None,
+                update: None,
+                variables: BTreeMap::new(),
+                corrections: crate::model::UserTaskCorrections::default(),
+            };
+            events.extend(self.start_task_listener_chain(
+                user_task_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                crate::model::TaskListenerEventType::Canceling,
+                pending,
+                &first,
+                None,
+            ));
+        }
+        Some(events)
+    }
+
+    /// The multi-instance body whose early completion waits on the canceling
+    /// chain of `user_task_key` (on MI child `child_eik`), when that chain is the
+    /// LAST of the body's children still in flight (#1724) — `None` when the
+    /// task is not a direct MI child, or a sibling's chain is still running.
+    fn mi_body_awaiting_canceling(
+        &self,
+        instance_key: Key,
+        child_eik: Key,
+        user_task_key: Key,
+    ) -> Option<Key> {
+        let (body_key, mi) = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .multi_instances
+            .iter()
+            .find(|(_, mi)| mi.active.contains(&child_eik))?;
+        let others_canceling = self.state.user_tasks.values().any(|t| {
+            t.instance_key == instance_key
+                && t.key != user_task_key
+                && mi.active.contains(&t.element_instance_key)
+                && matches!(
+                    t.pending.as_ref().map(|p| p.event_type),
+                    Some(crate::model::TaskListenerEventType::Canceling)
+                )
+        });
+        (!others_canceling).then_some(*body_key)
     }
 
     /// Builds the events that cancel a still-running multi-instance child (its job
@@ -16718,6 +16855,19 @@ impl Engine {
                         // cleared first.
                         finish_termination = true;
                     }
+                } else if let Some(body_key) = self.mi_body_awaiting_canceling(
+                    instance_key,
+                    element_instance_key,
+                    user_task_key,
+                ) {
+                    // An early multi-instance body completion deferred on this
+                    // child's canceling chain (#1724): the last chain to drain
+                    // resumes the body completion, which now tears the (no
+                    // longer `Created`) children down.
+                    steps.push(Step::CompleteMiBody {
+                        instance_key,
+                        body_key,
+                    });
                 }
             }
         }
@@ -20315,6 +20465,27 @@ fn opens_start_chain(events: &[Event], eik: state::Key) -> bool {
             ..
         } => *element_instance_key == eik,
         _ => false,
+    })
+}
+
+/// Whether `events` raise a multi-instance child activation-phase incident on
+/// `child_key` (an input-mapping [`state::IoMappingRedrive::MiChildActivation`]
+/// or a behaviour [`state::IoMappingRedrive::MiChildBehaviour`] failure — a job
+/// property, user-task expression or form-linkage miss): the child stays in
+/// ACTIVATING and its `ElementActivated` is withheld (#1724).
+fn parks_mi_child_activation(events: &[Event], child_key: state::Key) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            Event::IncidentRaised {
+                element_instance_key,
+                redrive: Some(
+                    state::IoMappingRedrive::MiChildActivation { .. }
+                        | state::IoMappingRedrive::MiChildBehaviour { .. }
+                ),
+                ..
+            } if *element_instance_key == child_key
+        )
     })
 }
 
