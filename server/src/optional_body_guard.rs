@@ -199,3 +199,38 @@ async fn bodyless_job_completion_reaches_the_handler() {
         String::from_utf8_lossy(&bytes)
     );
 }
+
+/// The extractor re-buffers the body and rebuilds the request; it must keep
+/// the request extensions (notably axum's `DefaultBodyLimit`), or a router that
+/// raises the limit gets a spurious 413 from the inner `Json` extraction for a
+/// body above axum's 2 MiB default.
+#[tokio::test]
+async fn present_optional_body_honours_a_raised_body_limit() {
+    let app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server())
+        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024));
+    let padding = "x".repeat(3 * 1024 * 1024);
+    let body = format!(r#"{{"variables":{{"pad":"{padding}"}}}}"#);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .header("host", "localhost")
+                .uri("/v2/jobs/2251799813685249/completion")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    // No such job: the handler's domain answer, not a 413 from the extractor.
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
