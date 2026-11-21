@@ -7886,9 +7886,12 @@ impl Engine {
         // A multi-instance body / ad-hoc container owner teardown removed: its
         // runtime record is gone, so a queued child activation or body/container
         // completion would mint work into a dead loop.
+        // An owner whose completion/teardown was decided this drain (e.g. an MI
+        // body resting in COMPLETING on its end listeners) is likewise dead.
         if let Some(owner) = owner {
-            if !instance.multi_instances.contains_key(&owner)
-                && !instance.adhoc_instances.contains_key(&owner)
+            if self.torn_down_scopes.contains(&owner)
+                || !instance.multi_instances.contains_key(&owner)
+                    && !instance.adhoc_instances.contains_key(&owner)
             {
                 return true;
             }
@@ -10244,22 +10247,17 @@ impl Engine {
                 instance_key,
                 body_key,
             });
-        } else if sequential {
+        } else {
+            // Sequential, or parallel: only the first child is queued here; each child's
+            // activation queues its next sibling AFTER its own behaviour
+            // (`activate_mi_child`), reproducing Zeebe's FIFO interleaving
+            // (#1539).
             followups.push(Step::ActivateMiChild {
                 instance_key,
                 element_id,
                 body_key,
                 index: 0,
             });
-        } else {
-            for index in 0..total {
-                followups.push(Step::ActivateMiChild {
-                    instance_key,
-                    element_id: element_id.clone(),
-                    body_key,
-                    index,
-                });
-            }
         }
         (events, followups)
     }
@@ -10271,13 +10269,13 @@ impl Engine {
     /// be deferred behind the body's `start` execution-listener chain (ADR 0037)
     /// and resumed from [`advance_listener`] once it drains.
     fn spawn_multi_instance_children(&self, instance_key: Key, body_key: Key) -> Vec<Step> {
-        let (element_id, sequential, total) = match self
+        let (element_id, total) = match self
             .state
             .instances
             .get(&instance_key)
             .and_then(|i| i.multi_instances.get(&body_key))
         {
-            Some(mi) => (mi.element_id.clone(), mi.sequential, mi.items.len()),
+            Some(mi) => (mi.element_id.clone(), mi.items.len()),
             None => return Vec::new(),
         };
         let mut followups = Vec::new();
@@ -10286,22 +10284,17 @@ impl Engine {
                 instance_key,
                 body_key,
             });
-        } else if sequential {
+        } else {
+            // Sequential, or parallel: only the first child is queued here; each child's
+            // activation queues its next sibling AFTER its own behaviour
+            // (`activate_mi_child`), reproducing Zeebe's FIFO interleaving
+            // (#1539).
             followups.push(Step::ActivateMiChild {
                 instance_key,
                 element_id,
                 body_key,
                 index: 0,
             });
-        } else {
-            for index in 0..total {
-                followups.push(Step::ActivateMiChild {
-                    instance_key,
-                    element_id: element_id.clone(),
-                    body_key,
-                    index,
-                });
-            }
         }
         followups
     }
@@ -10318,7 +10311,7 @@ impl Engine {
         body_key: Key,
         index: usize,
     ) -> (Vec<Event>, Vec<Step>) {
-        let (item, input_element, output_element) = match self
+        let (item, input_element, output_element, next_sibling) = match self
             .state
             .instances
             .get(&instance_key)
@@ -10328,6 +10321,17 @@ impl Engine {
                 mi.items.get(index).cloned().unwrap_or(Value::Null),
                 mi.input_element.clone(),
                 mi.output_element.clone(),
+                // Zeebe parity (#1539): a parallel body's children are not all
+                // queued up front. Each child's activation queues its own
+                // behaviour first and then its next sibling, so Zeebe's FIFO
+                // interleaving (child 1, child 1's inner start, child 2, ...)
+                // and its lazy child-key minting are reproduced.
+                (!mi.sequential && index + 1 < mi.items.len()).then(|| Step::ActivateMiChild {
+                    instance_key,
+                    element_id: element_id.clone(),
+                    body_key,
+                    index: index + 1,
+                }),
             ),
             None => return (Vec::new(), Vec::new()),
         };
@@ -10462,7 +10466,8 @@ impl Engine {
                         state::IoMappingRedrive::MiChildActivation { body_key, index },
                     );
                     events.push(event);
-                    return (events, Vec::new());
+                    let followups = next_sibling.into_iter().collect();
+                    return (events, followups);
                 }
             }
         }
@@ -10499,6 +10504,8 @@ impl Engine {
         );
         let mut events = events;
         events.extend(behaviour_events);
+        let mut followups = followups;
+        followups.extend(next_sibling);
         (events, followups)
     }
 
@@ -11577,6 +11584,13 @@ impl Engine {
             }
         };
 
+        // The body is now committed to completing: mark it dead for this drain so
+        // a still-queued parallel sibling activation (`ActivateMiChild`, chained
+        // lazily per child since #1539) — or a duplicate `CompleteMiBody` — is
+        // dropped by `step_targets_dead_scope`. Without this, a body resting in
+        // COMPLETING on its end listeners still has its runtime record, so the
+        // owner-exists guard would let the queued sibling mint an orphaned child.
+        self.torn_down_scopes.insert(body_key);
         let mut events = Vec::new();
         // Cancel any children still running (reached here via completion condition).
         // Build the element-instance → `Created` user-task index ONCE for this
