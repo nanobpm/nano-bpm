@@ -2222,6 +2222,12 @@ fn second_boundary_fed_inclusive_join_fires_once_its_boundary_interrupts() {
     // g2(or) -> g3(xor, two flows) -> e`. Completing `t1` reaches `g1`, which
     // fires; once `b2` fires and terminates `t2`, no token can still reach
     // `g2` along `t2`, so `g2` must activate and the instance complete.
+    //
+    // The recorded scenario routes `g2` over exactly ONE of its two outgoing
+    // flows (`route_G2 = ["f7"]`, fuzz-corpus.json:808-817,841-847). Constant
+    // FEEL conditions reproduce that single-route choice without depending on
+    // the fuzzer harness's variable step: the inclusive split takes only the
+    // `true` flow, so exactly one `g2 -> g3` traversal is journaled.
     let def = ProcessBuilder::new("chained-boundary-joins")
         .start_event("s")
         .service_task("t1", "j1")
@@ -2238,8 +2244,8 @@ fn second_boundary_fed_inclusive_join_fires_once_its_boundary_interrupts() {
         .connect("g1", "t2")
         .connect("t2", "g2")
         .connect("b2", "g2")
-        .connect("g2", "g3")
-        .connect("g2", "g3")
+        .connect_when("g2", "g3", "=true")
+        .connect_when("g2", "g3", "=false")
         .connect("g3", "e")
         .build()
         .unwrap();
@@ -2259,9 +2265,20 @@ fn second_boundary_fed_inclusive_join_fires_once_its_boundary_interrupts() {
         .find(|t| t.state == state::TimerState::Created)
         .map(|t| t.due_at)
         .expect("b2 armed");
-    engine.trigger_timers(due);
+    let fired = engine.trigger_timers(due);
     assert!(
         engine.is_completed(instance_key),
         "g2 must fire once b2 interrupts t2"
+    );
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "g2" && to == "g3"
+            ))
+            .count(),
+        1,
+        "g2 selects exactly one outgoing flow, as in the recorded #1730 routing"
     );
 }
