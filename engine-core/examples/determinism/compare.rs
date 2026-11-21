@@ -574,6 +574,40 @@ fn owned_entity_keys(
     out
 }
 
+/// Fails when a resident entity record whose key the creation history
+/// attributes to a ratified instance names a retained (non-ratified) owner.
+fn check_resident_ownership(
+    state: &serde_json::Map<String, Json>,
+    excluded: &BTreeSet<u64>,
+    history_owned: &BTreeSet<u64>,
+) -> Result<(), String> {
+    for (field, rule) in STATE_FIELD_RULES {
+        if *rule != FieldRule::EntityMap {
+            continue;
+        }
+        let Some(map) = state.get(*field).and_then(Json::as_object) else {
+            continue;
+        };
+        for (k, v) in map {
+            let Ok(key) = k.parse::<u64>() else { continue };
+            if !history_owned.contains(&key) {
+                continue;
+            }
+            for f in ["instance_key", "process_instance_key"] {
+                let owner = v.get(f).and_then(Json::as_u64);
+                if let Some(o) = owner.filter(|o| !excluded.contains(o)) {
+                    return Err(format!(
+                        "state.{field}.{key}.{f} = {o}, but this side's creation history \
+                         attributes {key} to ratified instance(s) {excluded:?} — ownership \
+                         mismatch (#1764)"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The terminal epochs of the ratified instances' own terminal transitions.
 /// Preferably derived from this side's OWN ordered terminal events at or
 /// before the checkpoint — the instance's epoch is the snapshot's
@@ -650,14 +684,17 @@ fn boundary_projection(
         .unwrap_or(&empty);
     let mut owned = owned_entity_keys(state, excluded);
     // Job ownership from the side's own events survives eviction (a
-    // settlement entry carries no owner of its own).
-    owned.extend(
-        creations
-            .jobs
-            .iter()
-            .filter(|(_, (i, k))| *i <= at && excluded.contains(k))
-            .map(|(j, _)| *j),
-    );
+    // settlement entry carries no owner of its own). A RESIDENT record must
+    // agree with that history first: otherwise excluding the key would hide
+    // an ownership regression onto a retained instance.
+    let history_owned: BTreeSet<u64> = creations
+        .jobs
+        .iter()
+        .filter(|(_, (i, k))| *i <= at && excluded.contains(k))
+        .map(|(j, _)| *j)
+        .collect();
+    check_resident_ownership(state, excluded, &history_owned)?;
+    owned.extend(history_owned);
     let excluded_epochs = excluded_terminal_epochs(state, excluded, (creations, at));
     let side = ProjectionSide {
         ids,

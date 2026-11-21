@@ -2727,8 +2727,13 @@ fn completed_ratified(job_key: u64) -> serde_json::Value {
 
 /// A `JobCreated` minting `job_key` for the MI child 32 of instance 10.
 fn job_created(job_key: u64) -> serde_json::Value {
+    job_created_for(job_key, 10)
+}
+
+/// A `JobCreated` minting `job_key` for instance `owner`.
+fn job_created_for(job_key: u64, owner: u64) -> serde_json::Value {
     serde_json::json!({"JobCreated": {"created_at": 1, "element_id": "review",
-        "element_instance_key": 32, "instance_key": 10, "job_key": job_key,
+        "element_instance_key": 32, "instance_key": owner, "job_key": job_key,
         "job_type": "payment", "priority": 50, "retries": 3}})
 }
 
@@ -2799,8 +2804,8 @@ fn prev_release_gate_boundary_projection_canonicalizes_through_key_ids() {
     let (head, prev) = boundary_streams_with(
         with_ratified(133),
         completed_ratified(33),
-        vec![job_created(133)],
-        vec![job_created(33)],
+        vec![job_created_for(133, 30)],
+        vec![job_created_for(33, 30)],
     );
     checked_s(&head, &prev, remint_unbalanced_expected())
         .unwrap_or_else(|e| panic!("a one-sided remint reconciles through KeyIds: {e}"));
@@ -3092,11 +3097,41 @@ fn prev_release_gate_boundary_projection_activated_jobs_is_a_set() {
     let (head, prev) = boundary_streams_with(
         activated([133, 134]),
         activated([436, 435]),
-        vec![job_created(133), job_created(134)],
-        vec![job_created(436), job_created(435)],
+        vec![job_created_for(133, 30), job_created_for(134, 30)],
+        vec![job_created_for(436, 30), job_created_for(435, 30)],
     );
     checked_s(&head, &prev, remint_unbalanced_expected())
         .unwrap_or_else(|e| panic!("a permuting remint of activated jobs reconciles: {e}"));
+
+    // The retained entries survive projection: a mismatched pairing fails.
+    let (head, prev) = boundary_streams_with(
+        activated([133, 134]),
+        activated([436, 999]),
+        vec![job_created_for(133, 30), job_created_for(134, 30)],
+        vec![job_created_for(436, 30), job_created_for(435, 30)],
+    );
+    assert!(
+        checked_s(&head, &prev, remint_unbalanced_expected()).is_err(),
+        "a retained activated job with no matching mint must fail"
+    );
+}
+
+/// #1764 (review): a resident record naming a RETAINED owner for a job
+/// this side's creation history attributes to the ratified instance is an
+/// ownership mismatch, not a key to exclude.
+#[test]
+fn prev_release_gate_boundary_projection_rejects_resident_ownership_mismatch() {
+    let (head, prev) = boundary_streams_with(
+        with_ratified(133),
+        completed_ratified(33),
+        vec![job_created(133)],
+        vec![job_created(33)],
+    );
+    let err = checked_s(&head, &prev, remint_unbalanced_expected()).unwrap_err();
+    assert!(
+        err.contains("ownership mismatch"),
+        "a history-vs-resident owner disagreement must fail: {err}"
+    );
 }
 
 /// #1764 (review): the ratified instance's terminal transition shifts every
