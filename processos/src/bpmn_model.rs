@@ -667,8 +667,43 @@ pub fn merge_definitions(primary: &str, extras: &[&str]) -> Result<String, Strin
 
 /// Whitespace-insensitive form of a declaration's source text, used to decide
 /// whether two same-id declarations are genuinely the same declaration.
+///
+/// Only whitespace OUTSIDE quoted attribute values is collapsed: an attribute
+/// value (an `errorCode`, a message `name`) is significant byte-for-byte, so
+/// `errorCode="A B"` and `errorCode="A  B"` stay distinct and conflict rather
+/// than being silently conflated.
 fn normalize_declaration(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut pending_space = false;
+    let mut in_tag = false;
+    for c in text.trim().chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c.is_whitespace() => pending_space = true,
+            None => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    // Quotes only delimit values inside a tag; an apostrophe in
+                    // text content (`don't`) is not an attribute delimiter.
+                    '"' | '\'' if in_tag => quote = Some(c),
+                    _ => {}
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// Return the raw BPMN XML of the model, or of one named phase within it. `target`
@@ -7486,6 +7521,32 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             1,
             "whitespace-only differences dedupe, got:\n{merged}"
         );
+    }
+
+    #[test]
+    fn merge_definitions_whitespace_inside_attribute_values_is_significant() {
+        // Collapsing whitespace inside a quoted value would conflate distinct
+        // error codes / message names and silently drop one declaration.
+        for (a, b) in [
+            (r#"errorCode="A B""#, r#"errorCode="A  B""#),
+            (r#"name='m x'"#, "name='m\tx'"),
+        ] {
+            let primary = defs_with(&format!("<bpmn:error id=\"E\" {a}/>"), "ProcA");
+            let extra = defs_with(&format!("<bpmn:error id=\"E\" {b}/>"), "ProcB");
+            merge_definitions(&primary, &[extra.as_str()])
+                .expect_err("values differing only in inner whitespace must conflict");
+        }
+        // An apostrophe in text content is not a quote: whitespace after it
+        // still collapses.
+        let primary = defs_with(
+            "<bpmn:message id=\"M\"><bpmn:documentation>don't  x</bpmn:documentation></bpmn:message>",
+            "ProcA",
+        );
+        let extra = defs_with(
+            "<bpmn:message  id=\"M\"><bpmn:documentation>don't x</bpmn:documentation></bpmn:message>",
+            "ProcB",
+        );
+        merge_definitions(&primary, &[extra.as_str()]).unwrap();
     }
 
     #[test]
