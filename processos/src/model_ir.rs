@@ -827,7 +827,7 @@ pub fn write_model_ir(
                 crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
             let id = parsed.definition.id.clone();
             defs[target_idx] = parsed.definition;
-            let xml = crate::bpmn_model::assemble_model(&defs, &names);
+            let xml = crate::bpmn_model::assemble_model(&defs, &names)?;
             (xml, analysis_xml, id)
         }
     };

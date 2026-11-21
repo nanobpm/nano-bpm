@@ -2635,7 +2635,7 @@ fn seed_demo(
             .filter(|f| f.rel != dataset.model_rel && f.rel.ends_with(".bpmn"))
             .map(|f| f.contents)
             .collect();
-        merged = crate::bpmn_model::merge_definitions(model_xml, &phases);
+        merged = crate::bpmn_model::merge_definitions(model_xml, &phases)?;
         &merged
     } else {
         model_xml

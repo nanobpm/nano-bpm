@@ -281,12 +281,16 @@ fn find_tag_open(xml: &str, local: &str, from: usize) -> Option<usize> {
     while let Some(rel) = xml[i..].find('<') {
         let lt = i + rel;
         let after = &xml[lt + 1..];
-        match after.chars().next() {
-            Some('/') | Some('!') | Some('?') => {
-                i = lt + 1;
-                continue;
-            }
-            _ => {}
+        // Comments, CDATA, PIs and `<!…>` declarations are skipped wholesale, so
+        // a tag mentioned inside them is never taken for a real one; unterminated
+        // markup swallows the rest of the document (no match).
+        if let Some(end) = non_element_markup_end(xml, lt) {
+            i = end?;
+            continue;
+        }
+        if after.starts_with('/') {
+            i = lt + 1;
+            continue;
         }
         let name = tag_name_at(xml, lt);
         let local_name = name.rsplit(':').next().unwrap_or(name);
@@ -302,14 +306,124 @@ fn find_tag_open(xml: &str, local: &str, from: usize) -> Option<usize> {
 /// self-closing) element at or after `from`.
 fn element_span(xml: &str, local: &str, from: usize) -> Option<(usize, usize)> {
     let start = find_tag_open(xml, local, from)?;
-    let name = tag_name_at(xml, start);
-    let open_gt = start + xml[start..].find('>')?;
-    if xml[start..=open_gt].trim_end().ends_with("/>") {
-        return Some((start, open_gt + 1));
+    nested_element_span(xml, start)
+}
+
+/// The inner content span `[open_end, close_start)` of the element whose start
+/// tag is at `lt` (markup-aware, via [`nested_element_span`]); `None` for a
+/// self-closing or malformed element.
+fn element_inner_span(xml: &str, lt: usize) -> Option<(usize, usize)> {
+    let open_end = tag_end(xml, lt)?;
+    let (_, end) = nested_element_span(xml, lt)?;
+    if end == open_end {
+        return None;
     }
-    let close = format!("</{name}>");
-    let close_at = xml[open_gt..].find(&close)? + open_gt + close.len();
-    Some((start, close_at))
+    let close_start = xml[..end].rfind("</")?;
+    Some((open_end, close_start))
+}
+
+/// The end (exclusive) of the non-element markup starting exactly at `from` —
+/// a `<!-- … -->` comment, `<![CDATA[ … ]]>` section, `<? … ?>` processing
+/// instruction (which ends at `?>`, not its first `>`), or other `<! … >`
+/// declaration — or `None` when `from` starts an element tag. The single
+/// canonical markup-skipper for every scanner here, so no scanner can treat
+/// text inside such markup as structure. Unterminated markup yields
+/// `Some(None)`: the caller must treat the input as malformed.
+fn non_element_markup_end(xml: &str, from: usize) -> Option<Option<usize>> {
+    let after = &xml[from..];
+    for (open, close) in [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")] {
+        if let Some(inner) = after.strip_prefix(open) {
+            return Some(
+                inner
+                    .find(close)
+                    .map(|r| from + open.len() + r + close.len()),
+            );
+        }
+    }
+    if after.starts_with("<!") {
+        return Some(tag_end(xml, from));
+    }
+    None
+}
+
+/// The byte index just past the `>` that ends the tag starting at `lt`,
+/// honouring quoted attribute values (a `>` inside `"…"`/`'…'` does not end it).
+fn tag_end(xml: &str, lt: usize) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (off, c) in xml[lt..].char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"') | (None, '\'') => quote = Some(c),
+            (None, '>') => return Some(lt + off + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The value of attribute `attr` in the start tag `tag` (`<name a="…" …>`),
+/// read by tokenizing the tag's attributes in order — so a lookalike inside
+/// another attribute's quoted value (`name='x id="Y"'`) is never matched, and
+/// every legal spelling (`id="…"`, `id = "…"`, `id='…'`) is. `None` when the
+/// attribute is absent or the tag is malformed.
+fn start_tag_attr(tag: &str, attr: &str) -> Option<String> {
+    let body = tag.strip_prefix('<')?;
+    let mut rest = body.trim_start_matches(|c: char| !c.is_whitespace() && c != '>' && c != '/');
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() || rest.starts_with('>') || rest.starts_with('/') {
+            return None;
+        }
+        let name_end = rest.find(|c: char| c.is_whitespace() || c == '=' || c == '>')?;
+        let name = &rest[..name_end];
+        rest = rest[name_end..]
+            .trim_start()
+            .strip_prefix('=')?
+            .trim_start();
+        let quote = rest.chars().next().filter(|q| *q == '"' || *q == '\'')?;
+        let val_end = rest[1..].find(quote)? + 1;
+        if name == attr {
+            return Some(rest[1..val_end].to_string());
+        }
+        rest = &rest[val_end + 1..];
+    }
+}
+
+/// The span `[lt, end)` of the element whose start tag is at `lt`, found by a
+/// nesting-aware scan: comments, CDATA sections, processing instructions and
+/// doctype-like markup at every depth are skipped wholesale (so a closing tag
+/// mentioned inside them is never taken as the boundary), and same-named
+/// descendants are depth-counted. `None` on unterminated / malformed input.
+fn nested_element_span(xml: &str, lt: usize) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut i = lt;
+    loop {
+        let at = i + xml[i..].find('<')?;
+        let after = &xml[at..];
+        if let Some(e) = non_element_markup_end(xml, at) {
+            // Unterminated markup inside an element: the element is unclosed.
+            i = e?;
+            continue;
+        }
+        let end = tag_end(xml, at)?;
+        match after[1..].chars().next() {
+            Some('/') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some((lt, end));
+                }
+            }
+            _ => {
+                if !xml[at..end].ends_with("/>") {
+                    depth += 1;
+                } else if depth == 0 {
+                    return Some((lt, end));
+                }
+            }
+        }
+        i = end;
+    }
 }
 
 /// The value of attribute `attr` in `s` (the `attr` must be preceded by whitespace,
@@ -386,41 +500,158 @@ fn process_block(xml: &str, process_id: &str) -> Option<String> {
 /// file keeps a single (the primary's) diagram.
 fn definitions_inner_no_di(xml: &str) -> Option<String> {
     let start = find_tag_open(xml, "definitions", 0)?;
-    let name = tag_name_at(xml, start);
-    let open_gt = start + xml[start..].find('>')? + 1;
-    let close = format!("</{name}>");
-    let close_at = xml[open_gt..].find(&close)? + open_gt;
-    let mut inner = xml[open_gt..close_at].to_string();
+    let (open_end, close_start) = element_inner_span(xml, start)?;
+    let mut inner = xml[open_end..close_start].to_string();
     while let Some((ds, de)) = element_span(&inner, "BPMNDiagram", 0) {
         inner.replace_range(ds..de, "");
     }
     Some(inner.trim_matches(['\n', ' ', '\t']).to_string())
 }
 
+/// The `id="…"` value of the top-level declaration element (`error`, `message`,
+/// `signal`, `escalation`) whose span starts at `start`, or `None` when the span
+/// is not one of those kinds or carries no id. Used by [`merge_definitions`] to
+/// dedupe identical declarations an extra document carries.
+fn declaration_id_at(xml: &str, start: usize) -> Option<String> {
+    let name = tag_name_at(xml, start);
+    let local = name.rsplit(':').next().unwrap_or(name);
+    match local {
+        "error" | "message" | "signal" | "escalation" => {
+            let gt = tag_end(xml, start)?;
+            start_tag_attr(&xml[start..gt], "id")
+        }
+        _ => None,
+    }
+}
+
+/// The spans `[start, end)` of every top-level declaration element (`error`,
+/// `message`, `signal`, `escalation`) in `body` — the inner body of a
+/// `<definitions>` element — in document order. [`merge_definitions`] uses
+/// these to dedupe identical declarations an extra document carries.
+///
+/// The scan is driven by the actual nesting structure — not a flat tag search —
+/// so a declaration-shaped element that merely *mentions* one of those local
+/// names is never treated as a declaration:
+///
+/// - a **comment or CDATA section** (`<!-- <bpmn:error id="Error_X"/> -->`,
+///   `<![CDATA[…]]>`) is skipped wholesale, so a commented-out declaration in
+///   the primary cannot shadow the real one an extra carries (which would drop
+///   the real declaration and leave its `errorRef` dangling);
+/// - a **nested** element (inside `<process>`, an `<extensionElements>` block,
+///   or a declaration's own body) is never matched — only direct children of
+///   `<definitions>` are;
+/// - a **malformed** body (a child element left open) yields no spans rather
+///   than guessing at spans from raw tag offsets — dedup is a no-op on input
+///   we cannot structure, never a wrong deletion.
+fn declaration_spans(body: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        let Some(lt_rel) = body[i..].find('<') else {
+            break;
+        };
+        let lt = i + lt_rel;
+        // Comments, CDATA, processing instructions (through `?>`) and
+        // doctype-like markup are skipped wholesale.
+        if let Some(e) = non_element_markup_end(body, lt) {
+            match e {
+                Some(e) => i = e,
+                // Unterminated markup: nothing past it is structure.
+                None => break,
+            }
+            continue;
+        }
+        // A close tag at this level can only be the caller's enclosing
+        // element (or malformed input): the child list is over.
+        if body[lt + 1..].starts_with('/') {
+            break;
+        }
+        let name = tag_name_at(body, lt);
+        let local = name.rsplit(':').next().unwrap_or(name);
+        let Some((s, e)) = nested_element_span(body, lt) else {
+            // A child left unclosed: malformed — dedup nothing rather than
+            // risk deleting a span guessed from raw tag offsets.
+            return Vec::new();
+        };
+        if matches!(local, "error" | "message" | "signal" | "escalation") {
+            out.push((s, e));
+        }
+        i = e;
+    }
+    out
+}
+
 /// Splice the body of each `extra` definitions document into `primary`, just
 /// before `primary`'s diagram (so all root elements precede the BPMNDI, keeping
 /// the document schema-ordered) — or before its closing tag when it has no
 /// diagram. The extras' own diagrams are dropped; `primary`'s is preserved.
-pub fn merge_definitions(primary: &str, extras: &[&str]) -> String {
+///
+/// A top-level `<bpmn:error>`/`<bpmn:message>`/`<bpmn:signal>`/`<bpmn:escalation>`
+/// declaration whose id the merged document already carries is dropped from the
+/// extra (#1625): [`assemble_model`] allocates declaration ids document-wide, so
+/// an identical declaration in two processes resolves to the SAME id, and splicing
+/// both in would duplicate the element. A same-id-different-content splice is a
+/// per-process minting bug, not a merge outcome — the registry makes it
+/// unreachable on the assembly path. Authored documents (e.g. `seed_demo`'s raw
+/// phase files) carry no such guarantee, so an id is deduped ONLY when the two
+/// declarations are textually identical (whitespace-insensitive): a
+/// same-id-different-content pair is an `Err`, never a silent drop that would
+/// rebind the extra's refs to the primary's (different) declaration.
+pub fn merge_definitions(primary: &str, extras: &[&str]) -> Result<String, String> {
     let mut injected = String::new();
+    // Seed `seen` with the primary's own declaration ids — scanned over its
+    // `<definitions>` body (diagram stripped, as the extras are), so only
+    // direct children count and a commented-out or nested declaration-shaped
+    // element can never shadow a real one.
+    let primary_inner = definitions_inner_no_di(primary).unwrap_or_default();
+    let mut seen: BTreeMap<String, String> = declaration_spans(&primary_inner)
+        .into_iter()
+        .filter_map(|(s, e)| {
+            declaration_id_at(&primary_inner, s)
+                .map(|id| (id, normalize_declaration(&primary_inner[s..e])))
+        })
+        .collect();
     for x in extras {
         if let Some(inner) = definitions_inner_no_di(x) {
+            // Drop a declaration the merged document already carries, keeping
+            // everything else (processes, and declarations with a fresh id).
+            // Splice from the back so earlier spans stay valid.
+            let mut inner = inner;
+            let spans = declaration_spans(&inner);
+            for (s, e) in spans.into_iter().rev() {
+                if let Some(id) = declaration_id_at(&inner, s) {
+                    let text = normalize_declaration(&inner[s..e]);
+                    match seen.get(&id) {
+                        Some(prev) if *prev == text => inner.replace_range(s..e, ""),
+                        Some(_) => {
+                            return Err(format!(
+                                "cannot merge definitions: declaration id '{id}' is declared \
+                                 with different content in two documents; rename one of them \
+                                 (and its refs) so each id names exactly one declaration"
+                            ));
+                        }
+                        None => {
+                            seen.insert(id, text);
+                        }
+                    }
+                }
+            }
+            let inner = inner.trim_matches(['\n', ' ', '\t']);
             if !inner.is_empty() {
                 injected.push_str("  ");
-                injected.push_str(inner.trim());
+                injected.push_str(inner);
                 injected.push('\n');
             }
         }
     }
     if injected.is_empty() {
-        return primary.to_string();
+        return Ok(primary.to_string());
     }
     let insert_at = find_tag_open(primary, "BPMNDiagram", 0)
         .map(|di| primary[..di].rfind('\n').map(|n| n + 1).unwrap_or(di))
         .or_else(|| {
             let start = find_tag_open(primary, "definitions", 0)?;
-            let name = tag_name_at(primary, start);
-            primary.rfind(&format!("</{name}>"))
+            element_inner_span(primary, start).map(|(_, close)| close)
         });
     match insert_at {
         Some(at) => {
@@ -428,10 +659,64 @@ pub fn merge_definitions(primary: &str, extras: &[&str]) -> String {
             out.push_str(&primary[..at]);
             out.push_str(&injected);
             out.push_str(&primary[at..]);
-            out
+            Ok(out)
         }
-        None => primary.to_string(),
+        None => Ok(primary.to_string()),
     }
+}
+
+/// Whitespace-insensitive form of a declaration's source text, used to decide
+/// whether two same-id declarations are genuinely the same declaration.
+///
+/// Only whitespace OUTSIDE quoted attribute values is touched: an attribute
+/// value (an `errorCode`, a message `name`) is significant byte-for-byte, so
+/// `errorCode="A B"` and `errorCode="A  B"` stay distinct and conflict rather
+/// than being silently conflated.
+///
+/// Outside quotes, whitespace is *dropped* where it can never be significant —
+/// adjacent to `<`, `>`, `/`, `=` or at either end — and collapsed to a single
+/// space elsewhere (between attribute tokens). So `<bpmn:error id="E"/>` and
+/// `<bpmn:error id="E" />`, or `id = "E"` and `id="E"`, are the same
+/// declaration, while `errorCode="A B"` vs `errorCode="A  B"` still conflict.
+fn normalize_declaration(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut pending_space = false;
+    let mut in_tag = false;
+    // Whitespace before/after these characters carries no meaning in XML, so
+    // none is emitted there.
+    let ws_neutral = |c: char| matches!(c, '<' | '>' | '/' | '=');
+    for c in text.trim().chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c.is_whitespace() => pending_space = true,
+            None => {
+                if pending_space {
+                    pending_space = false;
+                    // Keep one space only between tokens that need separating
+                    // (`id="E" errorCode="A"`); drop it next to markup.
+                    if !ws_neutral(c) && !out.ends_with(|p: char| ws_neutral(p)) {
+                        out.push(' ');
+                    }
+                }
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    // Quotes only delimit values inside a tag; an apostrophe in
+                    // text content (`don't`) is not an attribute delimiter.
+                    '"' | '\'' if in_tag => quote = Some(c),
+                    _ => {}
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// Return the raw BPMN XML of the model, or of one named phase within it. `target`
@@ -1948,17 +2233,92 @@ fn millis_to_iso8601(ms: u64) -> String {
     date
 }
 
+/// A document-wide allocator for definitions-level declaration ids (`<bpmn:error>`,
+/// `<bpmn:escalation>`, `<bpmn:message>`, `<bpmn:signal>`). Single-process
+/// serialization builds a local one seeded with the ids that document will emit;
+/// multi-process assembly ([`assemble_model`]) shares ONE registry across every
+/// process's serialization, so a declaration id is unique across the whole merged
+/// document — not just within the process that minted it (#1625: two codes whose
+/// `id_fragment` collides, e.g. `A.B` vs `A/B` in different processes, used to both
+/// mint `Error_A_B`, and the merged document resolved both refs to one code,
+/// misrouting the throw/catch).
+///
+/// Every accessor is a get-or-mint: the same key always resolves to the same id
+/// (identical declarations in different processes dedupe onto one shared
+/// declaration at merge), while a fresh key whose base id is already taken — by an
+/// earlier declaration of any kind or by a reserved model/DI id — is bumped to the
+/// first free `…_2`, `…_3`, … suffix via [`alloc_unique_id`].
+#[derive(Default)]
+struct DeclRegistry {
+    used: BTreeSet<String>,
+    errors: BTreeMap<String, String>,
+    escalations: BTreeMap<String, String>,
+    signals: BTreeMap<String, String>,
+    messages: BTreeMap<(String, Option<String>), String>,
+}
+
+impl DeclRegistry {
+    /// Reserve every id `reserved` carries (model element ids, the `<bpmn:process>`
+    /// id, sequence-flow ids, preserved DI ids) so no declaration mints one of them.
+    fn reserve(&mut self, reserved: &BTreeSet<String>) {
+        self.used.extend(reserved.iter().cloned());
+    }
+
+    /// The declaration id for `code`, minting a fresh unique one on first use.
+    fn error_id(&mut self, code: &str) -> String {
+        if let Some(id) = self.errors.get(code) {
+            return id.clone();
+        }
+        let id = alloc_unique_id(format!("Error_{}", id_fragment(code)), &mut self.used);
+        self.errors.insert(code.to_string(), id.clone());
+        id
+    }
+
+    /// The declaration id for `code`, minting a fresh unique one on first use.
+    fn escalation_id(&mut self, code: &str) -> String {
+        if let Some(id) = self.escalations.get(code) {
+            return id.clone();
+        }
+        let id = alloc_unique_id(format!("Escalation_{}", id_fragment(code)), &mut self.used);
+        self.escalations.insert(code.to_string(), id.clone());
+        id
+    }
+
+    /// The declaration id for `name`, minting a fresh unique one on first use.
+    fn signal_id(&mut self, name: &str) -> String {
+        if let Some(id) = self.signals.get(name) {
+            return id.clone();
+        }
+        let id = alloc_unique_id(format!("Signal_{}", id_fragment(name)), &mut self.used);
+        self.signals.insert(name.to_string(), id.clone());
+        id
+    }
+
+    /// The declaration id for `(name, correlation_key)`, minting a fresh unique one
+    /// on first use (events differing only in correlation get distinct declarations).
+    fn message_id(&mut self, name: &str, correlation_key: &Option<String>) -> String {
+        let key = (name.to_string(), correlation_key.clone());
+        if let Some(id) = self.messages.get(&key) {
+            return id.clone();
+        }
+        let id = alloc_unique_id(format!("Message_{}", id_fragment(name)), &mut self.used);
+        self.messages.insert(key, id.clone());
+        id
+    }
+}
+
 /// Collect the definitions-level `<bpmn:error>` declarations a model needs: one per distinct
 /// error code carried by an error boundary event, thrown by an error end event (#1592), or caught
 /// by an error event sub-process. Returns a code → synthesized-error-id map.
 ///
 /// `id_fragment` is not injective (`A.B` and `A/B` both normalize to `A_B`), so ids are minted via
-/// [`alloc_unique_id`] in sorted code order against `reserved` — the same scheme as
-/// [`collect_escalations`] — so two distinct codes can never share one `<bpmn:error id>` (which
-/// would reparse both refs onto the last declaration's code and misroute the throw).
+/// the shared [`DeclRegistry`] in sorted code order — the same scheme as [`collect_escalations`] —
+/// so two distinct codes can never share one `<bpmn:error id>` (which would reparse both refs onto
+/// the last declaration's code and misroute the throw), within one process AND across the
+/// processes of a multi-process assembly (#1625).
 fn collect_error_ids(
     def: &ProcessDefinition,
-    reserved: &BTreeSet<String>,
+    registry: &mut DeclRegistry,
 ) -> BTreeMap<String, String> {
     let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
@@ -1986,10 +2346,9 @@ fn collect_error_ids(
             _ => {}
         }
     }
-    let mut used: BTreeSet<String> = reserved.clone();
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for code in codes {
-        let id = alloc_unique_id(format!("Error_{}", id_fragment(&code)), &mut used);
+        let id = registry.error_id(&code);
         out.insert(code, id);
     }
     out
@@ -2008,7 +2367,10 @@ type MessageCollection = (Vec<MessageDecl>, BTreeMap<(String, Option<String>), S
 
 /// Collect the `<bpmn:message>` declarations a model needs, keyed for lookup by
 /// `(name, correlation_key)` so events that differ in correlation get distinct declarations.
-fn collect_messages(def: &ProcessDefinition) -> MessageCollection {
+/// Ids are minted through the shared [`DeclRegistry`], so two names whose `id_fragment`
+/// collides never share one `<bpmn:message id>` — within one process AND across the
+/// processes of a multi-process assembly (#1625).
+fn collect_messages(def: &ProcessDefinition, registry: &mut DeclRegistry) -> MessageCollection {
     let mut decls: Vec<MessageDecl> = Vec::new();
     let mut lookup: BTreeMap<(String, Option<String>), String> = BTreeMap::new();
     let mut want: Vec<(String, Option<String>)> = Vec::new();
@@ -2051,7 +2413,7 @@ fn collect_messages(def: &ProcessDefinition) -> MessageCollection {
         if lookup.contains_key(&entry) {
             continue;
         }
-        let mid = format!("Message_{}_{}", id_fragment(&name), decls.len());
+        let mid = registry.message_id(&name, &key);
         lookup.insert(entry, mid.clone());
         decls.push(MessageDecl {
             id: mid,
@@ -2064,7 +2426,13 @@ fn collect_messages(def: &ProcessDefinition) -> MessageCollection {
 
 /// Collect the `<bpmn:signal>` declarations a model needs, as a lookup from signal name to a
 /// synthesized declaration id. Signals correlate by name only, so one declaration per name.
-fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
+/// Ids are minted through the shared [`DeclRegistry`], so two names whose `id_fragment`
+/// collides never share one `<bpmn:signal id>` — within one process AND across the
+/// processes of a multi-process assembly (#1625).
+fn collect_signals(
+    def: &ProcessDefinition,
+    registry: &mut DeclRegistry,
+) -> BTreeMap<String, String> {
     let mut names: BTreeMap<String, String> = BTreeMap::new();
     for el in def.elements.values() {
         let name = match &el.kind {
@@ -2079,9 +2447,10 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
             _ => None,
         };
         if let Some(name) = name {
-            names
-                .entry(name.clone())
-                .or_insert_with(|| format!("Signal_{}", id_fragment(name)));
+            if !names.contains_key(name) {
+                let id = registry.signal_id(name);
+                names.insert(name.clone(), id);
+            }
         }
     }
     names
@@ -2092,17 +2461,18 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
 /// code. Empty codes (an unnamed throw or a catch-all boundary) carry no `escalationRef`, so they
 /// need no declaration and are skipped.
 ///
-/// Generated ids are allocated **collision-free**: `id_fragment` is not injective (distinct legal
-/// codes such as `A/B` and `A_B` both fragment to `A_B`), and a generated `Escalation_…` id could
-/// also clash with any id the document already emits — a model element id, the `<bpmn:process>` id,
-/// or a (preserved or synthesized) sequence-flow id — either would emit duplicate BPMN ids and
-/// ambiguous `escalationRef`s. `reserved` carries that full set of already-emitted ids. Codes are
-/// assigned in sorted order (deterministic regardless of the element map's iteration order), each
-/// getting the base id or the first free `…_2`, `…_3`, … suffix not already taken by a reserved id
-/// or an earlier escalation id.
+/// Generated ids are allocated **collision-free** through the shared [`DeclRegistry`]:
+/// `id_fragment` is not injective (distinct legal codes such as `A/B` and `A_B` both fragment to
+/// `A_B`), and a generated `Escalation_…` id could also clash with any id the document already
+/// emits — a model element id, the `<bpmn:process>` id, or a (preserved or synthesized)
+/// sequence-flow id — either would emit duplicate BPMN ids and ambiguous `escalationRef`s. The
+/// registry carries that full set of already-emitted ids (seeded per process before collection;
+/// shared across every process of a multi-process assembly, #1625). Codes are assigned in sorted
+/// order (deterministic regardless of the element map's iteration order), each getting the base id
+/// or the first free `…_2`, `…_3`, … suffix not already taken.
 fn collect_escalations(
     def: &ProcessDefinition,
-    reserved: &BTreeSet<String>,
+    registry: &mut DeclRegistry,
 ) -> BTreeMap<String, String> {
     let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
@@ -2128,15 +2498,14 @@ fn collect_escalations(
             _ => {}
         }
     }
-    // Reserve every id this document will emit — model element ids, the
-    // `<bpmn:process>` id, and every (preserved or synthesized) sequence-flow id
-    // — so a generated `Escalation_…` declaration id can never shadow one of
-    // them (a process/flow literally named `Escalation_OVERLOAD` would otherwise
-    // duplicate a `<bpmn:escalation id>`; #1173).
-    let mut used: BTreeSet<String> = reserved.clone();
+    // The caller seeds the registry with every id this document will emit — model
+    // element ids, the `<bpmn:process>` id, and every (preserved or synthesized)
+    // sequence-flow id — so a generated `Escalation_…` declaration id can never
+    // shadow one of them (a process/flow literally named `Escalation_OVERLOAD`
+    // would otherwise duplicate a `<bpmn:escalation id>`; #1173).
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for code in codes {
-        let id = alloc_unique_id(format!("Escalation_{}", id_fragment(&code)), &mut used);
+        let id = registry.escalation_id(&code);
         out.insert(code, id);
     }
     out
@@ -3386,7 +3755,7 @@ pub fn definition_to_xml_labeled(
     def: &ProcessDefinition,
     overrides: &BTreeMap<String, String>,
 ) -> String {
-    let emitted = serialize_definition(def, overrides, None, None);
+    let emitted = serialize_definition(def, overrides, None, None, None);
     let extensions = extract_nano_extensions(&def.xml);
     preserve_nano_extensions_in(emitted, &extensions)
 }
@@ -3403,7 +3772,7 @@ pub fn definition_to_xml_preserving_di(
     di_source: Option<&str>,
 ) -> String {
     let di = di_source.and_then(extract_preserved_di);
-    let emitted = serialize_definition(def, overrides, di.as_ref(), None);
+    let emitted = serialize_definition(def, overrides, di.as_ref(), None, None);
     // Prefer the DI source for nano:* preservation when the caller supplied
     // one (that's the "the customer's authored file" input the DI lens is
     // designed around); fall back to the retained ProcessDefinition.xml.
@@ -3422,7 +3791,7 @@ pub fn definition_to_xml_with_row_bias(
     overrides: &BTreeMap<String, String>,
     row_bias: &BTreeMap<String, f64>,
 ) -> String {
-    let emitted = serialize_definition(def, overrides, None, Some(row_bias));
+    let emitted = serialize_definition(def, overrides, None, Some(row_bias), None);
     let extensions = extract_nano_extensions(&def.xml);
     preserve_nano_extensions_in(emitted, &extensions)
 }
@@ -3514,11 +3883,45 @@ fn flow_id_resolution(
     (flow_ids, default_flows)
 }
 
+/// Every id `def`'s serialized document will emit, so declaration-id allocation
+/// can never mint one of them: the model element ids, the `<bpmn:process>` id,
+/// the (preserved or synthesized) sequence-flow ids, and the diagram ids.
+///
+/// The diagram ids are derived from the same rules diagram emission uses, so a
+/// generated declaration id can never duplicate a DI id:
+///
+/// - with no preserved diagram, [`append_diagram`] synthesizes a
+///   `<bpmndi:BPMNShape id="{element}_di">` per element and a
+///   `<bpmndi:BPMNEdge id="{flow}_di">` per flow — an element literally named
+///   `Message_Order` whose message declaration minted `Message_Order_di` would
+///   otherwise duplicate its own shape id;
+/// - a preserved `<bpmndi:BPMNDiagram>` block is re-attached verbatim by
+///   `definition_to_xml_preserving_di`, so every id it declares (plane, shapes,
+///   edges, labels) is reserved (#1173).
+fn reserved_ids(
+    def: &ProcessDefinition,
+    flow_ids: &[String],
+    preserve: Option<&PreservedDi>,
+) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = def.elements.keys().cloned().collect();
+    out.insert(def.id.clone());
+    out.extend(flow_ids.iter().cloned());
+    match preserve {
+        Some(d) => out.extend(d.di_ids.iter().cloned()),
+        None => {
+            out.extend(def.elements.keys().map(|id| format!("{id}_di")));
+            out.extend(flow_ids.iter().map(|f| format!("{f}_di")));
+        }
+    }
+    out
+}
+
 fn serialize_definition(
     def: &ProcessDefinition,
     overrides: &BTreeMap<String, String>,
     di: Option<&PreservedDi>,
     row_bias: Option<&BTreeMap<String, f64>>,
+    registry: Option<&mut DeclRegistry>,
 ) -> String {
     let mut normalized = def.clone();
     normalized.normalize_legacy_agent_tasks();
@@ -3535,21 +3938,22 @@ fn serialize_definition(
     // reused verbatim when the flows are emitted below.
     let preserve = di.filter(|d| d.covers(def));
     let (flow_ids, default_flows) = flow_id_resolution(def, preserve);
-    let mut reserved_ids: BTreeSet<String> = def.elements.keys().cloned().collect();
-    reserved_ids.insert(def.id.clone());
-    reserved_ids.extend(flow_ids.iter().cloned());
-    // Reserve every id declared inside a preserved `<bpmndi:BPMNDiagram>` block:
-    // it is re-attached verbatim by `definition_to_xml_preserving_di`, so a
-    // generated declaration id (`Escalation_…`, `Signal_…`, …) that duplicated a
-    // DI plane/shape/edge/diagram id would emit an invalid document with two
-    // elements sharing one XML id (#1173).
-    if let Some(d) = preserve {
-        reserved_ids.extend(d.di_ids.iter().cloned());
-    }
-    let errors = collect_error_ids(def, &reserved_ids);
-    let (messages, msg_lookup) = collect_messages(def);
-    let signals = collect_signals(def);
-    let escalations = collect_escalations(def, &reserved_ids);
+    let reserved_ids = reserved_ids(def, &flow_ids, preserve);
+    // Declaration ids come from ONE registry. Single-process callers pass `None`
+    // and get a local registry seeded with this document's reserved ids (the
+    // historical behaviour); multi-process assembly passes a shared registry so
+    // ids are unique across the whole merged document (#1625). Either way this
+    // process's own reserved ids are seeded before its declarations are minted.
+    let mut local_registry = DeclRegistry::default();
+    let registry = match registry {
+        Some(r) => r,
+        None => &mut local_registry,
+    };
+    registry.reserve(&reserved_ids);
+    let errors = collect_error_ids(def, registry);
+    let (messages, msg_lookup) = collect_messages(def, registry);
+    let signals = collect_signals(def, registry);
+    let escalations = collect_escalations(def, registry);
 
     // Resolve a human label for every element: an operator-set name wins, else a readable label
     // derived from the id (so an authored node like `FraudScreen` shows as "Fraud Screen").
@@ -4566,17 +4970,46 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
 /// 0, with a fresh diagram) and splices the remaining phase definitions back in, so the file stays
 /// self-contained and the authored overview survives. Shared by `edit_model_in` and the IR
 /// `write_model_ir` path so both assemble multi-phase models identically.
+///
+/// Every definition serializes against ONE shared [`DeclRegistry`] (#1625): definitions-level
+/// declaration ids (`<bpmn:error>`/`<bpmn:escalation>`/`<bpmn:message>`/`<bpmn:signal>`) are
+/// allocated document-wide, so two codes whose `id_fragment` collides (`A.B` vs `A/B`) in
+/// different processes can never mint the same declaration id and misroute their refs at merge —
+/// and an identical declaration in two processes resolves to the same id, so the splice dedupes it
+/// to one declaration.
 pub(crate) fn assemble_model(
     defs: &[ProcessDefinition],
     names: &BTreeMap<String, String>,
-) -> String {
+) -> Result<String, String> {
     if defs.len() == 1 {
-        definition_to_xml_labeled(&defs[0], names)
+        Ok(definition_to_xml_labeled(&defs[0], names))
     } else {
-        let primary = definition_to_xml_labeled(&defs[0], names);
+        let mut registry = DeclRegistry::default();
+        // Reserve EVERY definition's emitted ids up front, before any process
+        // serializes: a declaration minted for an early process must avoid not
+        // just its own ids but every later process's ids too — a process
+        // literally named `Error_BOOM` serialized AFTER a process that throws
+        // `BOOM` cannot take its id back once the declaration is minted, so
+        // the merged document would carry two elements with one id. The
+        // prepass mirrors `serialize_definition`'s own normalization and
+        // reservation exactly (no preserved diagram on this path), so the
+        // per-process reserve during serialization is a subset of this.
+        for d in defs {
+            let mut normalized = d.clone();
+            normalized.normalize_legacy_agent_tasks();
+            restore_adhoc_catalog_elements(&mut normalized);
+            let (flow_ids, _) = flow_id_resolution(&normalized, None);
+            registry.reserve(&reserved_ids(&normalized, &flow_ids, None));
+        }
+        let serialize = |d: &ProcessDefinition, registry: &mut DeclRegistry| {
+            let emitted = serialize_definition(d, names, None, None, Some(registry));
+            let extensions = extract_nano_extensions(&d.xml);
+            preserve_nano_extensions_in(emitted, &extensions)
+        };
+        let primary = serialize(&defs[0], &mut registry);
         let extras: Vec<String> = defs[1..]
             .iter()
-            .map(|d| definition_to_xml_labeled(d, names))
+            .map(|d| serialize(d, &mut registry))
             .collect();
         let extra_refs: Vec<&str> = extras.iter().map(String::as_str).collect();
         merge_definitions(&primary, &extra_refs)
@@ -4639,7 +5072,7 @@ pub fn edit_model_in(
     // Serialize. Single-definition models round-trip exactly as before. For a multi-stage model
     // we re-emit the orchestrator (with a fresh diagram) and splice the remaining phase
     // definitions back in, so the file stays self-contained and the overview survives.
-    let xml = assemble_model(&defs, &names);
+    let xml = assemble_model(&defs, &names)?;
 
     // The serializer owns correctness, but re-parse defensively so we never hand back XML that the
     // engine would reject at deploy time — surfacing any logical inconsistency the ops introduced.
@@ -6287,7 +6720,9 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .build()
             .unwrap();
         let reserved: std::collections::BTreeSet<String> = def.elements.keys().cloned().collect();
-        let errors = collect_error_ids(&def, &reserved);
+        let mut registry = DeclRegistry::default();
+        registry.reserve(&reserved);
+        let errors = collect_error_ids(&def, &mut registry);
         assert_eq!(errors.len(), 2, "both codes get a declaration");
         let ids: std::collections::BTreeSet<&String> = errors.values().collect();
         assert_eq!(
@@ -6315,7 +6750,9 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .build()
             .unwrap();
         let reserved: std::collections::BTreeSet<String> = def.elements.keys().cloned().collect();
-        let errors = collect_error_ids(&def, &reserved);
+        let mut registry = DeclRegistry::default();
+        registry.reserve(&reserved);
+        let errors = collect_error_ids(&def, &mut registry);
         assert_ne!(errors["OOPS"], "Error_OOPS");
         let xml = definition_to_xml(&def);
         parse_bpmn(&xml).expect("serialized model re-parses");
@@ -6347,7 +6784,9 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .build()
             .unwrap();
         let reserved: std::collections::BTreeSet<String> = def.elements.keys().cloned().collect();
-        let escalations = collect_escalations(&def, &reserved);
+        let mut registry = DeclRegistry::default();
+        registry.reserve(&reserved);
+        let escalations = collect_escalations(&def, &mut registry);
         assert_eq!(escalations.len(), 2, "both codes get a declaration");
         let ids: std::collections::BTreeSet<&String> = escalations.values().collect();
         assert_eq!(
@@ -6390,7 +6829,9 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         // A preserved sequence-flow id (or the process id) that happens to equal
         // the escalation base id.
         reserved.insert("Escalation_OVERLOAD".to_string());
-        let escalations = collect_escalations(&def, &reserved);
+        let mut registry = DeclRegistry::default();
+        registry.reserve(&reserved);
+        let escalations = collect_escalations(&def, &mut registry);
         assert_eq!(
             escalations.get("OVERLOAD").map(String::as_str),
             Some("Escalation_OVERLOAD_2"),
@@ -6482,6 +6923,676 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         );
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);
+    }
+
+    // ---- #1625: multi-process assembly must mint declaration ids document-wide ----
+    //
+    // `assemble_model` used to serialize each process independently and splice the
+    // documents, so definitions-level declaration ids were unique only PER PROCESS:
+    // two codes whose `id_fragment` collides (`A.B` vs `A/B`) in different processes
+    // both minted `Error_A_B`, and the merged document resolved both refs to one
+    // code — misrouting the throw/catch. These regressions pin the document-wide
+    // allocation per declaration kind (error, escalation, message, signal).
+
+    #[test]
+    fn assemble_model_mints_document_wide_error_ids_across_processes() {
+        // `A.B` in ProcA and `A/B` in ProcB both fragment to `Error_A_B`; the
+        // merged document must carry two distinct `<bpmn:error>` declarations and
+        // each error end event must reparse onto its own code (#1625).
+        let a = nanobpmn_engine_core::ProcessBuilder::new("ProcA")
+            .start_event("StartA")
+            .error_end_event("ThrowA", "A.B")
+            .connect("StartA", "ThrowA")
+            .build()
+            .unwrap();
+        let b = nanobpmn_engine_core::ProcessBuilder::new("ProcB")
+            .start_event("StartB")
+            .error_end_event("ThrowB", "A/B")
+            .connect("StartB", "ThrowB")
+            .build()
+            .unwrap();
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
+        let error_ids: std::collections::BTreeSet<&str> = xml
+            .lines()
+            .filter(|l| l.contains("<bpmn:error "))
+            .map(|l| {
+                l.split("id=\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .expect("error declaration carries an id")
+            })
+            .collect();
+        assert_eq!(
+            error_ids.len(),
+            2,
+            "colliding codes in different processes need distinct declaration ids, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("assembled model re-parses");
+        assert_eq!(reparsed.len(), 2, "both processes survive the merge");
+        for (pid, node, code) in [("ProcA", "ThrowA", "A.B"), ("ProcB", "ThrowB", "A/B")] {
+            let def = reparsed
+                .iter()
+                .find(|d| d.id == pid)
+                .unwrap_or_else(|| panic!("{pid} present"));
+            match &def.elements[node].kind {
+                ElementKind::ErrorEndEvent { error_code } => assert_eq!(
+                    error_code, code,
+                    "{pid}/{node} must resolve to its own code, not the sibling's"
+                ),
+                other => panic!("{pid}/{node}: expected ErrorEndEvent, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn assemble_model_dedupes_identical_error_declarations_across_processes() {
+        // The SAME code in two processes is ONE declaration: the merged document
+        // must carry a single `<bpmn:error>` for it (not two with the same id),
+        // and both processes' refs resolve to that code.
+        let a = nanobpmn_engine_core::ProcessBuilder::new("ProcA")
+            .start_event("StartA")
+            .error_end_event("ThrowA", "SHARED")
+            .connect("StartA", "ThrowA")
+            .build()
+            .unwrap();
+        let b = nanobpmn_engine_core::ProcessBuilder::new("ProcB")
+            .start_event("StartB")
+            .error_end_event("ThrowB", "SHARED")
+            .connect("StartB", "ThrowB")
+            .build()
+            .unwrap();
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
+        assert_eq!(
+            xml.matches("<bpmn:error ").count(),
+            1,
+            "an identical declaration is deduped at merge, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("assembled model re-parses");
+        for (pid, node) in [("ProcA", "ThrowA"), ("ProcB", "ThrowB")] {
+            let def = reparsed.iter().find(|d| d.id == pid).expect("process");
+            match &def.elements[node].kind {
+                ElementKind::ErrorEndEvent { error_code } => assert_eq!(error_code, "SHARED"),
+                other => panic!("{pid}/{node}: expected ErrorEndEvent, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn assemble_model_mints_document_wide_escalation_ids_across_processes() {
+        // `A/B` in ProcA and `A_B` in ProcB both fragment to `Escalation_A_B`;
+        // the merged document must carry two distinct declarations and each throw
+        // must reparse onto its own code (#1625).
+        let esc_def = |pid: &str, start: &str, throw: &str, code: &str| {
+            nanobpmn_engine_core::ProcessBuilder::new(pid)
+                .start_event(start)
+                .escalation_throw_event(throw, code)
+                .connect(start, throw)
+                .build()
+                .unwrap()
+        };
+        let a = esc_def("ProcA", "StartA", "ThrowA", "A/B");
+        let b = esc_def("ProcB", "StartB", "ThrowB", "A_B");
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
+        assert_eq!(
+            xml.matches("<bpmn:escalation ").count(),
+            2,
+            "colliding codes in different processes need distinct declarations, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("assembled model re-parses");
+        for (pid, node, code) in [("ProcA", "ThrowA", "A/B"), ("ProcB", "ThrowB", "A_B")] {
+            let def = reparsed
+                .iter()
+                .find(|d| d.id == pid)
+                .unwrap_or_else(|| panic!("{pid} present"));
+            match &def.elements[node].kind {
+                ElementKind::EscalationThrowEvent { escalation_code } => assert_eq!(
+                    escalation_code, code,
+                    "{pid}/{node} must resolve to its own code, not the sibling's"
+                ),
+                other => panic!("{pid}/{node}: expected EscalationThrowEvent, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn assemble_model_mints_document_wide_message_ids_across_processes() {
+        // `A/B` in ProcA and `A.B` in ProcB both fragment to `Message_A_B_*`;
+        // with per-process serialization both landed on `Message_A_B_0` and the
+        // merged document resolved both refs to one name (#1625).
+        let msg_def = |pid: &str, start: &str, catch: &str, end: &str, name: &str| {
+            nanobpmn_engine_core::ProcessBuilder::new(pid)
+                .start_event(start)
+                .message_intermediate_catch_event(catch, name, "orderId")
+                .end_event(end)
+                .connect(start, catch)
+                .connect(catch, end)
+                .build()
+                .unwrap()
+        };
+        let a = msg_def("ProcA", "StartA", "CatchA", "EndA", "A/B");
+        let b = msg_def("ProcB", "StartB", "CatchB", "EndB", "A.B");
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
+        assert_eq!(
+            xml.matches("<bpmn:message ").count(),
+            2,
+            "distinct message names need distinct declarations, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("assembled model re-parses");
+        for (pid, node, name) in [("ProcA", "CatchA", "A/B"), ("ProcB", "CatchB", "A.B")] {
+            let def = reparsed
+                .iter()
+                .find(|d| d.id == pid)
+                .unwrap_or_else(|| panic!("{pid} present"));
+            match &def.elements[node].kind {
+                ElementKind::MessageIntermediateCatchEvent { message_name, .. } => assert_eq!(
+                    message_name, name,
+                    "{pid}/{node} must resolve to its own message name, not the sibling's"
+                ),
+                other => {
+                    panic!("{pid}/{node}: expected MessageIntermediateCatchEvent, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn assemble_model_mints_document_wide_signal_ids_across_processes() {
+        // `A/B` in ProcA and `A.B` in ProcB both fragment to `Signal_A_B`; with
+        // per-process serialization both declarations shared one id and the merged
+        // document resolved both refs to one signal name (#1625).
+        let sig_def = |pid: &str, start: &str, catch: &str, end: &str, name: &str| {
+            nanobpmn_engine_core::ProcessBuilder::new(pid)
+                .start_event(start)
+                .signal_intermediate_catch_event(catch, name)
+                .end_event(end)
+                .connect(start, catch)
+                .connect(catch, end)
+                .build()
+                .unwrap()
+        };
+        let a = sig_def("ProcA", "StartA", "CatchA", "EndA", "A/B");
+        let b = sig_def("ProcB", "StartB", "CatchB", "EndB", "A.B");
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
+        assert_eq!(
+            xml.matches("<bpmn:signal ").count(),
+            2,
+            "distinct signal names need distinct declarations, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("assembled model re-parses");
+        for (pid, node, name) in [("ProcA", "CatchA", "A/B"), ("ProcB", "CatchB", "A.B")] {
+            let def = reparsed
+                .iter()
+                .find(|d| d.id == pid)
+                .unwrap_or_else(|| panic!("{pid} present"));
+            match &def.elements[node].kind {
+                ElementKind::SignalIntermediateCatchEvent { signal_name } => assert_eq!(
+                    signal_name, name,
+                    "{pid}/{node} must resolve to its own signal name, not the sibling's"
+                ),
+                other => {
+                    panic!("{pid}/{node}: expected SignalIntermediateCatchEvent, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn assemble_model_declaration_ids_do_not_shadow_a_process_id() {
+        // A process literally named like a generated declaration id (`Error_BOOM`)
+        // must not be shadowed by the declaration minted for code `BOOM` thrown in
+        // a DIFFERENT process — with per-process serialization the sibling's
+        // registry never saw this process's id (#1625, same class as #1173).
+        let a = nanobpmn_engine_core::ProcessBuilder::new("Error_BOOM")
+            .start_event("StartA")
+            .error_end_event("ThrowA", "BOOM")
+            .connect("StartA", "ThrowA")
+            .build()
+            .unwrap();
+        let b = nanobpmn_engine_core::ProcessBuilder::new("ProcB")
+            .start_event("StartB")
+            .error_end_event("ThrowB", "BOOM")
+            .connect("StartB", "ThrowB")
+            .build()
+            .unwrap();
+        let xml = assemble_model(&[a, b], &BTreeMap::new()).unwrap();
+        assert!(
+            xml.contains("<bpmn:process id=\"Error_BOOM\""),
+            "the process keeps its id, got:\n{xml}"
+        );
+        assert!(
+            !xml.contains("<bpmn:error id=\"Error_BOOM\""),
+            "the shared declaration must not shadow the process id, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("assembled model re-parses");
+        assert_eq!(reparsed.len(), 2);
+    }
+
+    #[test]
+    fn assemble_model_declaration_ids_do_not_shadow_a_process_id_in_either_order() {
+        // Order-independence (#1625): the registry reserves every definition's
+        // ids BEFORE any process serializes, so a process named `Error_BOOM`
+        // wins its id whether it is serialized before OR after the process
+        // that throws `BOOM`. Reserving only as each process serialized left
+        // the throwing-first order broken: the declaration minted `Error_BOOM`
+        // before the later process's id was ever seen, and the merged document
+        // carried two elements with one id.
+        let throwing = nanobpmn_engine_core::ProcessBuilder::new("ProcA")
+            .start_event("StartA")
+            .error_end_event("ThrowA", "BOOM")
+            .connect("StartA", "ThrowA")
+            .build()
+            .unwrap();
+        let named = nanobpmn_engine_core::ProcessBuilder::new("Error_BOOM")
+            .start_event("StartB")
+            .end_event("EndB")
+            .connect("StartB", "EndB")
+            .build()
+            .unwrap();
+        for (first, second, order) in [
+            (named.clone(), throwing.clone(), "named process first"),
+            (throwing.clone(), named.clone(), "throwing process first"),
+        ] {
+            let xml = assemble_model(&[first, second], &BTreeMap::new()).unwrap();
+            assert!(
+                xml.contains("<bpmn:process id=\"Error_BOOM\""),
+                "{order}: the process keeps its id, got:\n{xml}"
+            );
+            assert!(
+                !xml.contains("<bpmn:error id=\"Error_BOOM\""),
+                "{order}: the declaration must not shadow the process id, got:\n{xml}"
+            );
+            assert_eq!(
+                xml.matches("id=\"Error_BOOM\"").count(),
+                1,
+                "{order}: exactly one element may carry id=\"Error_BOOM\", got:\n{xml}"
+            );
+            let reparsed = parse_bpmn(&xml).expect("assembled model re-parses");
+            assert_eq!(reparsed.len(), 2, "{order}: both processes survive");
+            let proc_a = reparsed.iter().find(|d| d.id == "ProcA").expect("ProcA");
+            match &proc_a.elements["ThrowA"].kind {
+                ElementKind::ErrorEndEvent { error_code } => assert_eq!(
+                    error_code, "BOOM",
+                    "{order}: the throw still resolves to its own code"
+                ),
+                other => panic!("{order}: expected ErrorEndEvent, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn definition_to_xml_avoids_a_declaration_id_colliding_with_a_synthesized_di_id() {
+        // Regression: an element literally named `Message_Order` gets the
+        // synthesized `<bpmndi:BPMNShape id="Message_Order_di">` from
+        // `append_diagram`; a message declaration for a message named `Order_di`
+        // (fragmenting to the same base) must NOT mint `Message_Order_di` for
+        // its `<bpmn:message>` — that would emit two elements sharing one XML
+        // id. The synthesized shape/edge ids are reserved before declarations
+        // are minted, so the declaration bumps to `Message_Order_di_2`.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Proc")
+            .start_event("Start")
+            .message_intermediate_catch_event("Message_Order", "Order_di", "orderId")
+            .end_event("End")
+            .connect("Start", "Message_Order")
+            .connect("Message_Order", "End")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmndi:BPMNShape id=\"Message_Order_di\" bpmnElement=\"Message_Order\""),
+            "the synthesized shape id is emitted, got:\n{xml}"
+        );
+        assert!(
+            !xml.contains("<bpmn:message id=\"Message_Order_di\""),
+            "the declaration must not duplicate the synthesized shape id, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<bpmn:message id=\"Message_Order_di_2\""),
+            "the declaration bumps to the first free suffix, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        match &reparsed[0].elements["Message_Order"].kind {
+            ElementKind::MessageIntermediateCatchEvent { message_name, .. } => {
+                assert_eq!(message_name, "Order_di", "the catch keeps its message name")
+            }
+            other => panic!("expected MessageIntermediateCatchEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declaration_spans_ignore_closing_tags_inside_comments_and_cdata() {
+        // A closing tag mentioned in a child's comment / CDATA must not end the
+        // child early: otherwise text after it is scanned as top-level markup.
+        for body in [
+            r#"<bpmn:process id="P"><!-- </bpmn:process> <bpmn:error id="E_FAKE"/> --></bpmn:process><bpmn:error id="E_REAL"/>"#,
+            r#"<bpmn:process id="P"><bpmn:documentation><![CDATA[</bpmn:process><bpmn:error id="E_FAKE"/>]]></bpmn:documentation></bpmn:process><bpmn:error id="E_REAL"/>"#,
+        ] {
+            let ids: Vec<_> = declaration_spans(body)
+                .into_iter()
+                .filter_map(|(s, _)| declaration_id_at(body, s))
+                .collect();
+            assert_eq!(ids, vec!["E_REAL".to_string()], "body: {body}");
+        }
+    }
+
+    #[test]
+    fn declaration_spans_cover_whole_declaration_despite_inner_closing_text() {
+        // A duplicate declaration whose body mentions its own closing tag in a
+        // comment / CDATA must be spanned whole, so dedup leaves valid XML.
+        for body in [
+            r#"<bpmn:message id="M"><!-- </bpmn:message> --><bpmn:extensionElements/></bpmn:message>"#,
+            r#"<bpmn:message id="M"><bpmn:documentation><![CDATA[</bpmn:message>]]></bpmn:documentation></bpmn:message>"#,
+        ] {
+            assert_eq!(
+                declaration_spans(body),
+                vec![(0, body.len())],
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_definitions_does_not_dedupe_a_commented_out_declaration() {
+        // A `<bpmn:error>` inside a comment is not a declaration: it must not
+        // seed the dedup set, or the extra's REAL declaration with the same id
+        // would be dropped and its `errorRef` left dangling.
+        let primary = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn.io/schema/bpmn">
+  <!-- <bpmn:error id="Error_BOOM" errorCode="BOOM"/> -->
+  <bpmn:process id="ProcA" isExecutable="true"/>
+</bpmn:definitions>
+"#;
+        let extra = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:error id="Error_BOOM" errorCode="BOOM"/>
+  <bpmn:process id="ProcB" isExecutable="true"/>
+</bpmn:definitions>
+"#;
+        let merged = merge_definitions(primary, &[extra]).unwrap();
+        assert!(
+            merged.contains("<bpmn:error id=\"Error_BOOM\" errorCode=\"BOOM\"/>"),
+            "the real declaration survives — the commented one must not shadow it, got:\n{merged}"
+        );
+        assert!(
+            merged.contains("<bpmn:process id=\"ProcB\""),
+            "the extra's process is spliced in, got:\n{merged}"
+        );
+    }
+
+    #[test]
+    fn merge_definitions_does_not_dedupe_a_declaration_nested_in_a_process() {
+        // A declaration-shaped element nested inside `<process>` (or any other
+        // non-definitions parent) is not a top-level declaration: it must not
+        // seed the dedup set, or the extra's real declaration would be dropped.
+        let primary = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="ProcA" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:extensionElements>
+        <zeebe:properties><zeebe:property name="note" value="&lt;bpmn:error id=&quot;Error_BOOM&quot;/&gt;"/></zeebe:properties>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+  </bpmn:process>
+</bpmn:definitions>
+"#;
+        // A raw (unescaped) nested element is malformed BPMN but must still not
+        // drive dedup: the scan only counts direct children of <definitions>.
+        let primary_raw_nested = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="ProcA" isExecutable="true">
+    <bpmn:extensionElements>
+      <bpmn:error id="Error_BOOM" errorCode="SHADOW"/>
+    </bpmn:extensionElements>
+  </bpmn:process>
+</bpmn:definitions>
+"#;
+        let extra = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:error id="Error_BOOM" errorCode="BOOM"/>
+  <bpmn:process id="ProcB" isExecutable="true"/>
+</bpmn:definitions>
+"#;
+        for (label, p) in [("escaped", primary), ("raw-nested", primary_raw_nested)] {
+            let merged = merge_definitions(p, &[extra]).unwrap();
+            assert!(
+                merged.contains("<bpmn:error id=\"Error_BOOM\" errorCode=\"BOOM\"/>"),
+                "{label}: the extra's real declaration survives, got:\n{merged}"
+            );
+        }
+    }
+
+    #[test]
+    fn declaration_spans_skip_processing_instructions_through_their_terminator() {
+        // A PI ends at `?>`, not its first `>`: a declaration mentioned inside
+        // one is not a declaration (top level) and must not truncate an
+        // enclosing element's span (nested).
+        let top = r#"<?note > <bpmn:error id="E"/> ?><bpmn:message id="M"/>"#;
+        let spans = declaration_spans(top);
+        assert_eq!(spans.len(), 1, "only the real message: {spans:?}");
+        assert_eq!(&top[spans[0].0..spans[0].1], r#"<bpmn:message id="M"/>"#);
+
+        let nested =
+            r#"<bpmn:error id="E"><?pi > </bpmn:error> ?></bpmn:error><bpmn:process id="P"/>"#;
+        assert_eq!(
+            declaration_spans(nested),
+            vec![(0, nested.find("<bpmn:process").unwrap())],
+            "the nested PI's `</bpmn:error>` is not the boundary"
+        );
+        // An unterminated PI is malformed: never a guessed span.
+        assert!(declaration_spans(r#"<bpmn:error id="E"><?pi </bpmn:error>"#).is_empty());
+    }
+
+    #[test]
+    fn merge_definitions_ignores_a_declaration_inside_a_processing_instruction() {
+        let primary = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <?note > <bpmn:error id="E"/> ?>
+  <bpmn:process id="ProcA"/>
+</bpmn:definitions>"#;
+        let extra = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="E" errorCode="BOOM"/>
+  <bpmn:process id="ProcB"/>
+</bpmn:definitions>"#;
+        let merged = merge_definitions(primary, &[extra]).unwrap();
+        assert!(
+            merged.contains(r#"<bpmn:error id="E" errorCode="BOOM"/>"#),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn merge_definitions_splices_before_the_real_diagram_not_a_commented_one() {
+        let primary = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI">
+  <!-- old <bpmndi:BPMNDiagram id="X"> -->
+  <bpmn:process id="ProcA"/>
+  <bpmndi:BPMNDiagram id="D"/>
+</bpmn:definitions>"#;
+        let extra = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="ProcB"/>
+</bpmn:definitions>"#;
+        let merged = merge_definitions(primary, &[extra]).unwrap();
+        let at = merged
+            .find(r#"<bpmn:process id="ProcB"/>"#)
+            .expect("spliced");
+        assert!(at > merged.find("-->").expect("comment"), "{merged}");
+        assert!(
+            at < merged.find(r#"<bpmndi:BPMNDiagram id="D""#).expect("di"),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn definitions_body_is_not_truncated_by_markup_mentions() {
+        // A closing `definitions` tag or a diagram mentioned in a comment,
+        // CDATA section or PI must neither end the body nor be stripped as DI.
+        for noise in [
+            "<!-- </bpmn:definitions> <bpmndi:BPMNDiagram id=\"Z\"> -->",
+            "<![CDATA[ </bpmn:definitions> <bpmndi:BPMNDiagram id=\"Z\"> ]]>",
+            "<?pi </bpmn:definitions> <bpmndi:BPMNDiagram id=\"Z\"> ?>",
+        ] {
+            let extra = format!(
+                "<bpmn:definitions xmlns:bpmn=\"m\">\n  {noise}\n  <bpmn:process id=\"ProcB\"/>\n</bpmn:definitions>"
+            );
+            let inner = definitions_inner_no_di(&extra).expect("body");
+            assert!(inner.contains(noise), "{inner}");
+            assert!(inner.contains(r#"<bpmn:process id="ProcB"/>"#), "{inner}");
+        }
+    }
+
+    #[test]
+    fn declaration_ids_are_read_from_real_attributes() {
+        // The id is the tag's real `id` attribute: a lookalike inside another
+        // attribute's value is not it, and every legal spelling is.
+        for (tag, want) in [
+            (
+                r#"<bpmn:message name='order id="Error_SHARED"' id="M1"/>"#,
+                Some("M1"),
+            ),
+            (r#"<bpmn:message name='order id="Error_SHARED"'/>"#, None),
+            (r#"<bpmn:error id='E1'/>"#, Some("E1")),
+            (r#"<bpmn:error id = "E2"/>"#, Some("E2")),
+            (r#"<bpmn:error name="a>b" id="E3"/>"#, Some("E3")),
+            (r#"<bpmn:error errorId="X"/>"#, None),
+        ] {
+            assert_eq!(declaration_id_at(tag, 0).as_deref(), want, "tag: {tag}");
+        }
+        // End to end: a lookalike must not delete a distinct declaration.
+        let primary = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:message id="M1" name='order id="Error_SHARED"'/>
+</bpmn:definitions>"#;
+        let extra = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Error_SHARED" errorCode="S"/>
+</bpmn:definitions>"#;
+        let merged = merge_definitions(primary, &[extra]).unwrap();
+        assert!(
+            merged.contains(r#"<bpmn:error id="Error_SHARED" errorCode="S"/>"#),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn merge_definitions_still_dedupes_a_genuine_duplicate_declaration() {
+        // The dedup itself must keep working: an extra carrying the SAME
+        // top-level declaration id as the primary is dropped, so the merged
+        // document carries it exactly once.
+        let primary = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:error id="Error_SHARED" errorCode="SHARED"/>
+  <bpmn:process id="ProcA" isExecutable="true"/>
+</bpmn:definitions>
+"#;
+        let extra = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:error id="Error_SHARED" errorCode="SHARED"/>
+  <bpmn:process id="ProcB" isExecutable="true"/>
+</bpmn:definitions>
+"#;
+        let merged = merge_definitions(primary, &[extra]).unwrap();
+        assert_eq!(
+            merged.matches("<bpmn:error ").count(),
+            1,
+            "the duplicate declaration is deduped, got:\n{merged}"
+        );
+        assert!(
+            merged.contains("<bpmn:process id=\"ProcB\""),
+            "the extra's process is still spliced in, got:\n{merged}"
+        );
+    }
+
+    fn defs_with(decl: &str, process: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn.io/schema/bpmn">
+  {decl}
+  <bpmn:process id="{process}" isExecutable="true"/>
+</bpmn:definitions>
+"#
+        )
+    }
+
+    #[test]
+    fn merge_definitions_rejects_same_id_declarations_with_different_content() {
+        // Silently dropping the extra's declaration would rebind its refs to
+        // the primary's (different) declaration — the merge must fail closed.
+        let primary = defs_with(r#"<bpmn:error id="E" errorCode="A"/>"#, "ProcA");
+        let extra = defs_with(r#"<bpmn:error id="E" errorCode="B"/>"#, "ProcB");
+        let err = merge_definitions(&primary, &[extra.as_str()])
+            .expect_err("conflicting same-id declarations must be rejected");
+        assert!(err.contains("'E'"), "error names the id, got: {err}");
+        // Also between two extras, not only primary-vs-extra.
+        let p = defs_with("", "ProcP");
+        let err = merge_definitions(&p, &[primary.as_str(), extra.as_str()])
+            .expect_err("conflict across extras must be rejected");
+        assert!(err.contains("'E'"), "error names the id, got: {err}");
+    }
+
+    #[test]
+    fn merge_definitions_dedupes_same_declaration_differing_only_in_whitespace() {
+        let primary = defs_with(r#"<bpmn:error id="E" errorCode="A"/>"#, "ProcA");
+        let extra = defs_with("<bpmn:error  id=\"E\"\n      errorCode=\"A\"/>", "ProcB");
+        let merged = merge_definitions(&primary, &[extra.as_str()]).unwrap();
+        assert_eq!(
+            merged.matches("<bpmn:error ").count(),
+            1,
+            "whitespace-only differences dedupe, got:\n{merged}"
+        );
+    }
+
+    #[test]
+    fn merge_definitions_dedupes_markup_adjacent_whitespace_variants() {
+        // Whitespace next to `<`, `>`, `/>` or `=` carries no meaning in XML, so
+        // declarations formatted differently that way are the same declaration —
+        // they must dedupe, not conflict. (Adversarial finding: a pretty-printer
+        // emitting `<bpmn:error id="E" />` against a hand-written
+        // `<bpmn:error id="E"/>` must not break the merge of authored documents
+        // such as the seed_demo phase files.)
+        for (a, b) in [
+            // `/>` vs ` />`
+            (r#"<bpmn:error id="E"/>"#, r#"<bpmn:error id="E" />"#),
+            // whitespace around `=`
+            (r#"<bpmn:error id="E"/>"#, r#"<bpmn:error id = "E"/>"#),
+            // newline after the tag name vs space
+            (
+                "<bpmn:message id=\"M\">\n  <bpmn:extensionElements>x</bpmn:extensionElements>\n</bpmn:message>",
+                "<bpmn:message id=\"M\"><bpmn:extensionElements>x</bpmn:extensionElements></bpmn:message>",
+            ),
+        ] {
+            let primary = defs_with(a, "ProcA");
+            let extra = defs_with(b, "ProcB");
+            let merged = merge_definitions(&primary, &[extra.as_str()])
+                .unwrap_or_else(|e| panic!("{a:?} vs {b:?} must dedupe, got: {e}"));
+            let decl_tag = a.split([' ', '\n', '/']).next().unwrap();
+            assert_eq!(
+                merged.matches(&format!("{decl_tag} ")).count()
+                    + merged.matches(&format!("{decl_tag}/")).count(),
+                1,
+                "{a:?} vs {b:?} dedupes to one declaration, got:\n{merged}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_definitions_whitespace_inside_attribute_values_is_significant() {
+        // Collapsing whitespace inside a quoted value would conflate distinct
+        // error codes / message names and silently drop one declaration.
+        for (a, b) in [
+            (r#"errorCode="A B""#, r#"errorCode="A  B""#),
+            (r#"name='m x'"#, "name='m\tx'"),
+        ] {
+            let primary = defs_with(&format!("<bpmn:error id=\"E\" {a}/>"), "ProcA");
+            let extra = defs_with(&format!("<bpmn:error id=\"E\" {b}/>"), "ProcB");
+            merge_definitions(&primary, &[extra.as_str()])
+                .expect_err("values differing only in inner whitespace must conflict");
+        }
+        // An apostrophe in text content is not a quote: whitespace after it
+        // still collapses.
+        let primary = defs_with(
+            "<bpmn:message id=\"M\"><bpmn:documentation>don't  x</bpmn:documentation></bpmn:message>",
+            "ProcA",
+        );
+        let extra = defs_with(
+            "<bpmn:message  id=\"M\"><bpmn:documentation>don't x</bpmn:documentation></bpmn:message>",
+            "ProcB",
+        );
+        merge_definitions(&primary, &[extra.as_str()]).unwrap();
     }
 
     #[test]
@@ -7199,7 +8310,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
     ];
 
     fn merged_cdd() -> String {
-        merge_definitions(CDD_ORCH, &CDD_PHASES)
+        merge_definitions(CDD_ORCH, &CDD_PHASES).unwrap()
     }
 
     #[test]
