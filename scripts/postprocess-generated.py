@@ -239,6 +239,77 @@ def fix_discriminator_mapping_values(models: str) -> tuple[str, list[str]]:
     return models, applied
 
 
+OPTIONAL_JSON_EXTRACTOR_MARKER = "pub struct OptionalJson<T>"
+
+OPTIONAL_JSON_EXTRACTOR = """
+
+/// Extractor for an OPTIONAL JSON request body (injected by
+/// `scripts/postprocess-generated.py`, issue #1531).
+///
+/// rust-axum emits `Json<Option<T>>` for a `requestBody` that is not
+/// `required: true`, but axum's `Json` extractor rejects a request without a
+/// `Content-Type: application/json` header with 415 *before* the `Option` is
+/// considered, so a bodyless request -- which Camunda 8 accepts -- never
+/// reached the handler. An empty body (with or without a content type) is
+/// "no body" (`None`); any non-empty body is decoded exactly as `Json` would,
+/// including its content-type check.
+#[derive(Debug, Clone, Default)]
+pub struct OptionalJson<T>(pub Option<T>);
+
+impl<T, S> FromRequest<S> for OptionalJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        use axum::response::IntoResponse;
+
+        // Buffer on the ORIGINAL request: `Bytes::from_request` reads the
+        // router's `DefaultBodyLimit` extension from `req.extensions()`, so a
+        // router that raises the limit is respected here.
+        let headers = req.headers().clone();
+        let bytes = <Bytes as FromRequest<S>>::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if bytes.is_empty() {
+            return Ok(OptionalJson(None));
+        }
+        // Rebuild with the original headers for the `Json` decode. The body is
+        // already fully buffered, so disable the body limit on the rebuilt
+        // request: otherwise the inner `Json` extraction re-applies the default
+        // 2 MiB limit and 413s a body the router explicitly permitted.
+        let mut rebuilt = Request::new(Body::from(bytes));
+        *rebuilt.headers_mut() = headers;
+        DefaultBodyLimit::disable().apply(&mut rebuilt);
+        let Json(value) = <Json<Option<T>> as FromRequest<S>>::from_request(rebuilt, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        Ok(OptionalJson(value))
+    }
+}
+"""
+
+_OPTIONAL_JSON_PARAM = re.compile(r"Json\(body\): Json<Option<(models::\w+)>>")
+
+
+def fix_optional_json_bodies(server: str) -> tuple[str, int]:
+    """Accept bodyless requests on optional-body operations (issue #1531).
+
+    Rewrites every `Json(body): Json<Option<models::T>>` handler parameter to
+    the `OptionalJson<T>` extractor and injects its definition once. The
+    handler body is untouched: `OptionalJson(body)` binds the same
+    `Option<models::T>` the generator expected.
+    """
+    server, count = _OPTIONAL_JSON_PARAM.subn(r"OptionalJson(body): OptionalJson<\1>", server)
+    if count and OPTIONAL_JSON_EXTRACTOR_MARKER not in server:
+        server += OPTIONAL_JSON_EXTRACTOR
+    if re.search(r": Json<Option<", server):
+        raise SystemExit("optional JSON body: unrecognised Json<Option<..>> parameter left behind")
+    return server, count
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"usage: {argv[0]} <generated-crate-dir>", file=sys.stderr)
@@ -261,6 +332,13 @@ def main(argv: list[str]) -> int:
 
     models_path.write_text(models, encoding="utf-8")
 
+    server_path = crate_dir / "src" / "server" / "mod.rs"
+    optional_json_count = 0
+    if server_path.is_file():
+        server = server_path.read_text(encoding="utf-8")
+        server, optional_json_count = fix_optional_json_bodies(server)
+        server_path.write_text(server, encoding="utf-8")
+
     print("Post-processed generated code:")
     print(f"  oneOf date-time variant occurrences fixed: {datetime_count}")
     if optional_props:
@@ -274,6 +352,7 @@ def main(argv: list[str]) -> int:
     print(f"  discriminator mapping keys applied: {len(discriminator_keys)}")
     print(f"  HTML-escaped regex patterns unescaped: {regex_count}")
     print(f"  default-tenant XSS false positive fixed: {xss_count}")
+    print(f"  optional JSON bodies made bodyless-tolerant: {optional_json_count}")
     return 0
 
 
