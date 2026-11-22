@@ -35,6 +35,9 @@ concurrency:
 
 permissions:
   contents: read
+  # The `prune-allowlist` job opens (and queues) the post-tag determinism
+  # allowlist pruning PR (#1801).
+  pull-requests: write
 
 env:
   PLUGIN_REPO: jwulf/c8ctl-plugin-nano
@@ -355,6 +358,90 @@ jobs:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
           retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Post-tag housekeeping (#1801): the previous-release determinism gate
+  # expires every allowlist entry whose `introduced_in <=` the tag just pushed
+  # and FAILS on the stale entries until they are removed — so before this job
+  # existed, every release turned `main` (and every open PR) red until a human
+  # pruned the file by hand. Open and queue that pruning PR automatically.
+  # Runs on the tag push itself, independent of the binary matrix: the gate
+  # goes red at the tag, not when the binaries finish, so the PR must not wait
+  # for (or be skipped by a failure of) the cross-compile legs.
+  # ---------------------------------------------------------------------------
+  prune-allowlist:
+    name: Prune expired determinism allowlist entries
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        # The PR branches from (and targets) main, not the tag.
+        with:
+          ref: main
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Open and queue the allowlist pruning PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="chore/prune-determinism-allowlist-${TAG}"
+          allowlist="engine-core/examples/determinism/divergence-allowlist.json"
+
+          # Idempotent: a re-run of the same tag's workflow must not open a
+          # second PR. Re-queue the existing one and stop.
+          existing="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "pruning PR #${existing} already exists for ${TAG}; re-queueing it"
+            gh pr comment "$existing" --body "@mergifyio queue" || true
+            exit 0
+          fi
+
+          removed="$(node scripts/prune-divergence-allowlist.mjs "$TAG" --write 2>&1 >/dev/null)" || {
+            echo "::error::prune-divergence-allowlist.mjs failed: ${removed}"
+            exit 1
+          }
+          echo "${removed}"
+          if git diff --quiet -- "$allowlist"; then
+            echo "no allowlist entries expire at ${TAG}; nothing to prune"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add "$allowlist"
+          git commit -s -m "chore(determinism): expire allowlist entries shipped in ${TAG}
+
+          The previous-release determinism gate fails on entries whose introduced_in
+          the previous release has reached (check_expiry); ${TAG} just shipped them,
+          so main is red until they are pruned. Opened automatically by the release
+          workflow (#1801). The append-only upgrade-boundaries.json ledger is
+          untouched: expiring an entry never lifts the cluster-join restriction it
+          recorded (#1702)."
+          git push -u origin "$branch"
+
+          pr_body="$(mktemp)"
+          {
+            echo "The previous-release determinism gate (\`check_expiry\`) fails on every allowlist entry whose \`introduced_in\` the previous release has reached. ${TAG} just shipped these, so \`main\` — and every open PR — fails the required \`determinism (seed/profile/platform/previous-release)\` check until they are pruned:"
+            echo ""
+            echo '```'
+            echo "${removed}"
+            echo '```'
+            echo ""
+            echo "Opened automatically by the \`publish-c8ctl-binaries\` release workflow at the ${TAG} tag push (#1801). The append-only \`upgrade-boundaries.json\` ledger is untouched: expiring an allowlist entry never lifts the cluster-join restriction it recorded (#1702)."
+            echo ""
+            echo "Refs #1801"
+          } > "$pr_body"
+          pr="$(gh pr create --base main --title "chore(determinism): expire allowlist entries shipped in ${TAG}" --body-file "$pr_body")"
+          echo "opened ${pr}"
+          # Land it through the merge queue so the red window on main is as
+          # short as CI allows. If queueing fails (e.g. Mergify not installed
+          # for the bot), the PR still exists and a human can queue it.
+          gh pr comment "$pr" --body "@mergifyio queue" || true
 
   publish:
     name: Upload binaries + trigger plugin release

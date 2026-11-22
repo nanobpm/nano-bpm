@@ -39,6 +39,13 @@ ignored silently:
 
    Every entry names its `issue`, the `introduced_in` release, an `upgrade`
    mode and a `rationale` that names that mode and says why it applies.
+   `introduced_in` is DERIVED, never hand-guessed: it must be the next
+   gateway release (the pending `server/Cargo.toml` bump, else the next
+   patch after the latest `v*` tag). CI's `check-allowlist-introduced-in`
+   step (`scripts/check-allowlist-introduced-in.mjs`, #1801) fails the PR
+   otherwise — a guessed future version becomes a spurious append-only
+   `upgrade-boundaries.json` entry the ledger can never remove (#1528's
+   entries were labelled v0.0.29 but shipped in v0.0.28).
    Raft members **re-execute** committed commands (ADR 0066, "Rolling
    upgrade", option C), so an allowlisted divergence makes mixed-version
    members disagree unless gated. `upgrade` is required and is exactly one of:
@@ -79,6 +86,9 @@ ignored silently:
 
    An entry **expires** (must be removed) once the
    previous release is at or past `introduced_in`, and a **stale** entry —
-   one the run never needs — fails too, so the file cannot drift.
+   one the run never needs — fails too, so the file cannot drift. The
+   gateway release workflow prunes the expired entries itself: its
+   `prune-allowlist` job opens the removal PR at the tag push (#1801,
+   RELEASE.md §2a).
 
 Self-tests: `tests/determinism_corpus.rs` (`prev_release_gate_*`).

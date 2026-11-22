@@ -115,6 +115,48 @@ The script (`scripts/release-tags.mjs`):
 
 Don't hand-push release tags. If you must, push one tag per command.
 
+### 2a. The gateway tag prunes the determinism allowlist itself (#1801)
+
+The previous-release determinism gate expires every
+`divergence-allowlist.json` entry whose `introduced_in` the previous release
+has reached and **fails on the stale entries** — so an unpruned allowlist
+turns `main` (and every open PR) red the moment a gateway tag lands. The
+`publish-c8ctl-binaries` workflow therefore opens the pruning PR itself: its
+`prune-allowlist` job runs at the `v*` tag push, drops every entry with
+`introduced_in <= the new tag` (`scripts/prune-divergence-allowlist.mjs`),
+opens `chore(determinism): expire allowlist entries shipped in <tag>` against
+`main`, and comments `@mergifyio queue` so the red window is only as long as
+one queued CI run. It is idempotent — re-running the tag's workflow re-queues
+the existing PR instead of opening a duplicate, and a release with nothing to
+prune opens nothing. The append-only `upgrade-boundaries.json` ledger is never
+touched: expiring an allowlist entry never lifts the cluster-join restriction
+it recorded (#1702).
+
+**If the pruning PR never appears** (the job failed or was skipped): run the
+prune by hand from a clean `main` and open the PR yourself:
+
+```bash
+git checkout -b chore/prune-determinism-allowlist-<tag> origin/main
+node scripts/prune-divergence-allowlist.mjs <tag> --write   # drops the expired entries
+git commit -sam "chore(determinism): expire allowlist entries shipped in <tag>"
+git push -u origin chore/prune-determinism-allowlist-<tag>
+gh pr create --base main   # title as the commit; Refs #1801
+```
+
+Until that PR merges, every PR's required `determinism
+(seed/profile/platform/previous-release)` check fails on the STALE entries —
+queue the pruning PR first.
+
+**Authoring new entries:** an entry's `introduced_in` is **derived, never
+hand-guessed** — it must be the *next* gateway release (the version your
+release PR will cut: the pending `server/Cargo.toml` bump when one exists,
+else the next patch after the latest `v*` tag). The
+`check-allowlist-introduced-in` step of the determinism CI job
+(`scripts/check-allowlist-introduced-in.mjs`) fails the PR otherwise. A
+guessed future version is exactly how #1528's entries ended up labelled
+`v0.0.29` while shipping in v0.0.28 — and the append-only ledger recorded the
+spurious boundary permanently.
+
 ### 3. Watch the workflows
 
 - <https://github.com/nanobpm/nano-bpm/actions/workflows/publish-c8ctl-binaries.yml>
