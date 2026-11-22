@@ -842,10 +842,63 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
         "instance G's stale stamp must apply superseded"
     );
     journal.extend(superseded);
+    // Terminal-tombstone witness (#1608 review): instance I is quarantined
+    // through a stamped command, then its job completes (driving the instance
+    // to completion) while the loss tombstone is still live, so the snapshot
+    // pins the tombstone's additive `terminal` flag (omitted when `false`, so
+    // otherwise never serialized).
+    let inst_i = orphan_instance(&mut engine, &mut journal, T0 + 29, "I");
+    let stamp_i = engine
+        .orphan_incident_stamp(inst_i, nanobpmn_engine_core::OrphanKind::Resident)
+        .expect("stamp instance I");
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: inst_i,
+                    stamp: Some(stamp_i),
+                },
+                T0 + 30,
+            )
+            .expect("quarantine instance I"),
+    );
+    let job_i = engine
+        .snapshot()
+        .state
+        .jobs_by_instance
+        .get(&inst_i)
+        .and_then(|jobs| jobs.iter().next().copied())
+        .expect("instance I job");
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::activate_jobs_by_key(
+                    vec![job_i],
+                    "worker-1",
+                    30_000,
+                    T0 + 31,
+                    Default::default(),
+                ),
+                T0 + 31,
+            )
+            .expect("activate job I"),
+    );
+    journal.extend(
+        engine
+            .apply_command_at(Command::complete_job(job_i), T0 + 31)
+            .expect("complete job I"),
+    );
     {
         let state = &engine.snapshot().state;
         assert!(state.settled_orphan_episodes.contains_key(&inst_f));
         assert!(state.pending_orphan_supersedes.contains_key(&inst_g));
+        assert!(
+            state
+                .variables_lost_quarantined
+                .get(&inst_i)
+                .is_some_and(|t| t.terminal),
+            "instance I's live tombstone must carry `terminal: true`"
+        );
     }
 
     // Event sub-process held-payload witness (#1555): a non-interrupting
