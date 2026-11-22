@@ -2810,9 +2810,13 @@ impl State {
         // scratch state that sees only the loss-lifecycle events.
         let mut folded = State::default();
         let mut superseded_at: BTreeMap<Key, Key> = BTreeMap::new();
+        let mut terminated_in_history: BTreeSet<Key> = BTreeSet::new();
         for event in history {
             if !event.is_loss_lifecycle() {
                 continue;
+            }
+            if let Some(instance_key) = event.terminal_instance_key() {
+                terminated_in_history.insert(instance_key);
             }
             if let crate::Event::OrphanStampSuperseded {
                 instance_key,
@@ -2834,6 +2838,12 @@ impl State {
             }
             crate::state::apply(&mut folded, event);
         }
+        // A legacy (pre-#1608) tombstone carries `terminal: false` even when
+        // the instance completed after its quarantine. Normalize it from the
+        // retained terminal history BEFORE the snapshot's terminal shell can
+        // be evicted or the bounded ring wraps, so a later `IncidentResolved`
+        // decides terminality identically on every replica (#1608 review).
+        self.normalize_legacy_tombstones(&terminated_in_history);
         // The snapshot is AUTHORITATIVE over the retained history: it may be
         // newer than it (an adopted leader snapshot) or the history may have a
         // pruned gap. Never resurrect an entry for an instance the snapshot
@@ -2866,6 +2876,29 @@ impl State {
             self.pending_orphan_supersedes
                 .entry(instance_key)
                 .or_insert(kind);
+        }
+    }
+
+    /// Sets the replicated `terminal` flag on every loss tombstone whose
+    /// instance the snapshot's own lifecycle records ([`Self::snapshot_shows_terminal`])
+    /// or `terminated` (retained terminal history) prove terminal (#1608
+    /// review). A tombstone restored from a pre-#1608 snapshot defaults the
+    /// flag to `false`; without this, terminality after shell eviction / ring
+    /// wrap would depend on residency and split replicas. Idempotent, and a
+    /// no-op on a post-#1608 snapshot (the live terminal fold already set it).
+    pub(crate) fn normalize_legacy_tombstones(&mut self, terminated: &BTreeSet<Key>) {
+        let to_mark: Vec<Key> = self
+            .variables_lost_quarantined
+            .iter()
+            .filter(|(k, t)| {
+                !t.terminal && (terminated.contains(k) || self.snapshot_shows_terminal(**k))
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for key in to_mark {
+            if let Some(t) = self.variables_lost_quarantined.get_mut(&key) {
+                t.terminal = true;
+            }
         }
     }
 

@@ -38,6 +38,12 @@ impl Engine {
             snapshot.partition_id,
             state::MAX_PARTITION_ID
         );
+        // #1608 review: a pre-#1608 snapshot's loss tombstones default
+        // `terminal: false`; derive the flag from the snapshot's own
+        // lifecycle records before any terminal shell can be evicted.
+        snapshot
+            .state
+            .normalize_legacy_tombstones(&std::collections::BTreeSet::new());
         for deployed in snapshot
             .state
             .processes

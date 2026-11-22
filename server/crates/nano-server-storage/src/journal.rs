@@ -2053,6 +2053,21 @@ impl Journal {
             .map(|(k, kind)| (*k, *kind))
             .collect();
         for (key, kind) in open {
+            // Revalidate against the RECOVERED routing and stores (#1608
+            // review): a healthy snapshot can still carry a pending supersede
+            // whose payload has since been restored, and re-parking it would
+            // let adoption/promotion raise a false `VariablesLost`. Only a
+            // DEFINITIVELY present payload settles the report; an unreadable
+            // row (`Err`, possibly transient) keeps the confirmed loss parked.
+            if self.orphan_payload_present(key, kind) {
+                tracing::info!(
+                    instance_key = key,
+                    ?kind,
+                    "recovery rebuild (#1608): pending orphan report's payload is \
+                     present; not re-parking an intact instance"
+                );
+                continue;
+            }
             // `park_orphan` dedups and skips a key whose `VariablesLost`
             // incident is already active (e.g. raised by a cold-orphan
             // quarantine the set cannot attribute to this report).
@@ -2105,6 +2120,18 @@ impl Journal {
     /// (`Ok(None)`); a now-readable payload (`Ok(Some)`), a spill flag that has
     /// since cleared, or a merely UNREADABLE row (`Err` — possibly transient,
     /// fail closed) drops the report instead of quarantining an intact instance.
+    /// Whether the payload an orphan report names DEFINITIVELY reads back
+    /// under current routing (the spill / var-store row for a resident
+    /// report, the cold row for a cold one). Only a successful read counts:
+    /// a cleared spill flag or missing index entry is not evidence (the loss
+    /// path itself clears them), and an unreadable row (`Err`) is not present.
+    fn orphan_payload_present(&self, key: Key, kind: OrphanKind) -> bool {
+        match kind {
+            OrphanKind::Resident => matches!(self.peek_spilled_variables(key), Ok(Some(_))),
+            OrphanKind::Cold => matches!(self.peek_cold_instance(key), Ok(Some(_))),
+        }
+    }
+
     fn park_orphan_revalidated(&mut self, key: Key, kind: OrphanKind, context: &str) {
         let still_absent = match kind {
             // A resident report is stale once the instance is no longer spilled
@@ -8786,6 +8813,65 @@ mod tests {
         other.restore_engine_from_snapshot(own);
         assert!(other.orphan_backlog().is_empty(), "no cross-partition park");
 
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608 review: a healthy snapshot can still carry a pending supersede
+    // whose payload has since been RESTORED. Rebuilding the backlog on
+    // adoption must revalidate against the recovered stores and not re-park
+    // (and later raise a false `VariablesLost` for) an intact instance.
+    #[test]
+    fn adoption_does_not_repark_a_pending_report_whose_payload_was_restored() {
+        let path = restart_store_path("orphan-supersede-restored-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        journal.set_orphan_sink(Arc::new(RecordingSink::default()));
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        let saved = store.try_get(keys[0]).unwrap().expect("spilled payload");
+        store.forget(&[keys[0]]).unwrap();
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (_events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "pending");
+        let snap = journal.engine_snapshot();
+        assert!(
+            snap.state.pending_orphan_supersedes.contains_key(&keys[0]),
+            "precondition: the snapshot carries the pending supersede"
+        );
+        // The payload is restored before adoption.
+        store.put(keys[0], &saved).unwrap();
+        journal.restore_engine_from_snapshot(snap);
+        assert!(
+            journal.orphan_backlog().is_empty(),
+            "a restored payload settles the rebuilt report"
+        );
+        assert!(
+            !journal.engine().has_active_variables_lost(keys[0]),
+            "no VariablesLost was raised"
+        );
+
+        drop(journal);
         drop(store);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

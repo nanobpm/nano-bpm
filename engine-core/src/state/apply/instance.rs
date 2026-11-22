@@ -1370,6 +1370,77 @@ mod pending_orphan_supersede_tests {
         assert!(state.settled_orphan_episodes.is_empty());
     }
 
+    // #1608 review: a PRE-#1608 snapshot covering quarantine -> completion
+    // restores its tombstone with `terminal: false`. Normalization from the
+    // retained terminal history must set the flag, so that after the ring
+    // wraps a resident-shell replica and an evicted replica resolve the
+    // incident to identical state.
+    fn legacy_terminal_tombstone_snapshot() -> (State, Vec<Event>) {
+        let history = vec![
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 5,
+            },
+            Event::ProcessInstanceCompleted { instance_key: 10 },
+        ];
+        let mut state = State::default();
+        for event in &history {
+            apply(&mut state, event);
+        }
+        // Strip what a pre-#1608 build never wrote.
+        state
+            .variables_lost_quarantined
+            .get_mut(&10)
+            .expect("tombstone")
+            .terminal = false;
+        (state, history)
+    }
+
+    fn wrap_ring(state: &mut State) {
+        let cap = u64::try_from(crate::state::RECENTLY_TERMINATED_CAP).unwrap_or(u64::MAX);
+        for other in 1_000..1_000 + cap {
+            apply(
+                state,
+                &Event::ProcessInstanceCompleted {
+                    instance_key: other,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_normalizes_a_legacy_tombstone_from_retained_terminal_history() {
+        let (mut evicted, history) = legacy_terminal_tombstone_snapshot();
+        evicted.backfill_settled_orphan_episodes(history.iter());
+        assert!(evicted.variables_lost_quarantined[&10].terminal);
+        wrap_ring(&mut evicted);
+        assert!(!evicted.snapshot_shows_terminal(10));
+        resolve(&mut evicted, 10, 99);
+        assert!(evicted.variables_lost_quarantined.is_empty());
+        assert!(evicted.settled_orphan_episodes.is_empty());
+    }
+
+    #[test]
+    fn normalize_from_snapshot_lifecycle_matches_resident_and_evicted_replicas() {
+        // Resident replica: the snapshot still proves terminality itself.
+        let (mut resident, _) = legacy_terminal_tombstone_snapshot();
+        resident.normalize_legacy_tombstones(&std::collections::BTreeSet::new());
+        assert!(resident.variables_lost_quarantined[&10].terminal);
+        // Evicted replica restored from the same snapshot, then the ring wraps.
+        let mut evicted = resident.clone();
+        resident.instances.remove(&10);
+        wrap_ring(&mut evicted);
+        wrap_ring(&mut resident);
+        resolve(&mut resident, 10, 99);
+        resolve(&mut evicted, 10, 99);
+        assert_eq!(
+            resident.settled_orphan_episodes,
+            evicted.settled_orphan_episodes
+        );
+        assert!(resident.settled_orphan_episodes.is_empty());
+    }
+
     // A genuinely missing (cold / pruned) target is NOT proven terminal: its
     // report is preserved exactly as before the ring-wrap reconciliation.
     #[test]
