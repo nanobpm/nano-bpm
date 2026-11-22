@@ -2111,15 +2111,6 @@ impl Journal {
         }
     }
 
-    /// [`park_orphan`](Self::park_orphan) for an OFF-THREAD (streaming-snapshot)
-    /// discovery, which can be stale (#1574 review): the capture referenced a
-    /// spill/cold row that a later command rehydrated and deleted before the
-    /// writer read it, so the writer's miss may describe a legitimately-gone row
-    /// rather than a lost payload. The report is revalidated against CURRENT
-    /// routing and parked only when the row is still DEFINITIVELY absent
-    /// (`Ok(None)`); a now-readable payload (`Ok(Some)`), a spill flag that has
-    /// since cleared, or a merely UNREADABLE row (`Err` — possibly transient,
-    /// fail closed) drops the report instead of quarantining an intact instance.
     /// Whether the payload an orphan report names DEFINITIVELY reads back
     /// under current routing (the spill / var-store row for a resident
     /// report, the cold row for a cold one). Only a successful read counts:
@@ -2132,6 +2123,15 @@ impl Journal {
         }
     }
 
+    /// [`park_orphan`](Self::park_orphan) for an OFF-THREAD (streaming-snapshot)
+    /// discovery, which can be stale (#1574 review): the capture referenced a
+    /// spill/cold row that a later command rehydrated and deleted before the
+    /// writer read it, so the writer's miss may describe a legitimately-gone row
+    /// rather than a lost payload. The report is revalidated against CURRENT
+    /// routing and parked only when the row is still DEFINITIVELY absent
+    /// (`Ok(None)`); a now-readable payload (`Ok(Some)`), a spill flag that has
+    /// since cleared, or a merely UNREADABLE row (`Err` — possibly transient,
+    /// fail closed) drops the report instead of quarantining an intact instance.
     fn park_orphan_revalidated(&mut self, key: Key, kind: OrphanKind, context: &str) {
         let still_absent = match kind {
             // A resident report is stale once the instance is no longer spilled
