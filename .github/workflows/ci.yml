@@ -688,7 +688,11 @@ jobs:
         run: npm test
 
   engine-testkit-npm:
-    name: '@nanobpm/engine-testkit (build + test)'
+    # Deliberately NOT '@nanobpm/engine-testkit (build + test)': Mergify parses a
+    # leading @scope/name as an app-qualified check from the wrong publisher and
+    # never matches the GitHub Actions result (#1138), so a required check must
+    # not start with @ (guarded by console/scripts/merge-gates.test.mjs).
+    name: 'engine-testkit (build + test)'
     runs-on: ubuntu-24.04
     needs: [changes]
     if: *code_gate
@@ -701,7 +705,7 @@ jobs:
         with:
           node-version: '24'
       - name: Install
-        run: npm install
+        run: npm ci
       - name: Type-check
         run: npm run typecheck
       - name: Build
