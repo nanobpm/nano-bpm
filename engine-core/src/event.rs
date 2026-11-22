@@ -2373,13 +2373,21 @@ impl Event {
             // the publish fans out to (#1434): it may have been minted on another
             // partition, so it never identifies the record's owner. Route by the
             // record's own (locally-minted) keys instead.
-            Event::MessageCorrelated {
-                subscription_key,
-                instance_key,
-                element_instance_key,
+            // A remote correlation is recorded on the MESSAGE partition, while
+            // its subscription / instance / element-instance keys belong to the
+            // (foreign) instance partition. Its own key is the locally-minted
+            // `delivery_key` (#1497); a pre-#1497 record (`0`) predates the
+            // shared fan-out key (#1434), so its `message_key` was local.
+            Event::RemoteMessageCorrelation {
+                delivery_key,
+                message_key,
                 ..
-            }
-            | Event::RemoteMessageCorrelation {
+            } => crate::state::partition_of(if *delivery_key != 0 {
+                *delivery_key
+            } else {
+                *message_key
+            }),
+            Event::MessageCorrelated {
                 subscription_key,
                 instance_key,
                 element_instance_key,

@@ -8719,16 +8719,6 @@ fn message_correlation_records_route_by_own_keys_not_shared_message_key() {
             variables: BTreeMap::new(),
             boundary_element_id: None,
         },
-        Event::RemoteMessageCorrelation {
-            subscription_key: own(3),
-            message_key: foreign,
-            instance_key: own(2),
-            element_instance_key: own(4),
-            element_id: "c".into(),
-            kind: crate::state::MessageSubscriptionKind::IntermediateCatch,
-            variables: BTreeMap::new(),
-            delivery_key: 0,
-        },
     ];
     for record in &records {
         assert_eq!(
@@ -8738,4 +8728,37 @@ fn message_correlation_records_route_by_own_keys_not_shared_message_key() {
         );
         assert_eq!(record.owning_partition(), 0, "{record:?}");
     }
+}
+
+/// #1434 (PR #1786 review): a `RemoteMessageCorrelation` is recorded on the
+/// MESSAGE partition, but its subscription / instance / element-instance keys
+/// belong to the instance partition. It must route by its locally-minted
+/// `delivery_key` (or, on a pre-#1497 record, its then-local `message_key`),
+/// never by the foreign instance-side keys — otherwise legacy recovery on a
+/// node owning only the message partition drops the settlement and its
+/// allocator evidence (delivery-key reuse).
+#[test]
+fn remote_message_correlation_routes_to_message_partition() {
+    use crate::state::compose_key;
+    let inst = |l| compose_key(0, l);
+    let remote = |message_key, delivery_key| Event::RemoteMessageCorrelation {
+        subscription_key: inst(3),
+        message_key,
+        instance_key: inst(2),
+        element_instance_key: inst(4),
+        element_id: "c".into(),
+        kind: crate::state::MessageSubscriptionKind::IntermediateCatch,
+        variables: BTreeMap::new(),
+        delivery_key,
+    };
+    // Current record: delivery key minted on message partition 1; the shared
+    // message key was minted on yet another partition (2) by the fan-out.
+    let current = remote(compose_key(2, 7), compose_key(1, 9));
+    assert_eq!(current.owning_partition(), 1);
+    let mut next = 0;
+    current.advance_allocator(1, &mut next);
+    assert_eq!(next, 9);
+    // Legacy (pre-#1497) record: no delivery key; message key is local.
+    let legacy = remote(compose_key(1, 5), 0);
+    assert_eq!(legacy.owning_partition(), 1);
 }
