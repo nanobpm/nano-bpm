@@ -4907,14 +4907,7 @@ fn demux_legacy_shared_log(
     let fallback = owned.first().copied();
     for event in events {
         seglog::check_cluster_variable_attribution(&event, false, partitions as usize)?;
-        if matches!(
-            event,
-            Event::ProcessDeployed { .. }
-                | Event::DecisionRequirementsDeployed { .. }
-                | Event::DecisionDeployed { .. }
-                | Event::FormDeployed { .. }
-                | Event::GenericResourceDeployed { .. }
-        ) {
+        if event.is_deployment() {
             for bucket in per_partition.values_mut() {
                 bucket.push(event.clone());
             }
@@ -5087,14 +5080,7 @@ fn rebuild_read_model_legacy(
     let mut per_shard: std::collections::HashMap<u64, Vec<&Event>> =
         shards.iter().map(|(p, _)| (*p, Vec::new())).collect();
     for e in events {
-        if matches!(
-            e,
-            Event::ProcessDeployed { .. }
-                | Event::DecisionRequirementsDeployed { .. }
-                | Event::DecisionDeployed { .. }
-                | Event::FormDeployed { .. }
-                | Event::GenericResourceDeployed { .. }
-        ) {
+        if e.is_deployment() {
             for bucket in per_shard.values_mut() {
                 bucket.push(e);
             }
@@ -18071,16 +18057,7 @@ impl ServerImpl {
         }
         let deployed: Vec<Event> = events
             .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Event::ProcessDeployed { .. }
-                        | Event::DecisionRequirementsDeployed { .. }
-                        | Event::DecisionDeployed { .. }
-                        | Event::FormDeployed { .. }
-                        | Event::GenericResourceDeployed { .. }
-                )
-            })
+            .filter(|e| e.is_deployment())
             .cloned()
             .collect();
         if deployed.is_empty() {
