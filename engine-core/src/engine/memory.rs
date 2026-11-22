@@ -211,6 +211,17 @@ impl Engine {
         }
     }
 
+    /// Backfills the replicated loss-episode settlement map from retained
+    /// history the snapshot covers (#1608 review) — see
+    /// [`State::backfill_settled_orphan_episodes`]. Call after
+    /// [`Engine::from_snapshot`] and BEFORE [`Engine::apply_replayed_events`].
+    pub fn backfill_settled_orphan_episodes<'a, I>(&mut self, history: I)
+    where
+        I: IntoIterator<Item = &'a Event>,
+    {
+        self.state.backfill_settled_orphan_episodes(history);
+    }
+
     /// one rebuilt via [`Engine::from_snapshot`]). Each event is applied through
     /// the same applier as runtime/replay, and this partition's local key
     /// generator is advanced past every replayed key it owns — identical to the

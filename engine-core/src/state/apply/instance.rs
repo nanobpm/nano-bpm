@@ -338,11 +338,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             episode,
         } => {
             state.pending_orphan_supersedes.remove(instance_key);
-            if *episode > 0 {
-                state
-                    .settled_orphan_episodes
-                    .insert(*instance_key, *episode);
-            }
+            state.fold_settlement_quarantined(*instance_key, *episode);
             state.variables_lost_quarantined.insert(
                 *instance_key,
                 crate::state::types::VariablesLostTombstone {
@@ -1040,6 +1036,89 @@ mod pending_orphan_supersede_tests {
         assert_eq!(state.settled_orphan_episodes.get(&10), Some(&5));
         supersede(&mut state, 10, 5);
         assert!(state.pending_orphan_supersedes.is_empty());
+    }
+
+    // #1608 review (operator decision, option 1): a PRE-#1608 snapshot taken
+    // after a stamped loss episode was quarantined AND resolved carries neither
+    // a settlement map nor a tombstone. Recovery backfills the map from the
+    // retained history the snapshot covers — through the live fold — BEFORE
+    // replaying the tail, so a delayed duplicate's supersede is not pending.
+    fn legacy_resolved_snapshot() -> (State, Vec<Event>) {
+        let history = vec![
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 8,
+            },
+            Event::IncidentResolved {
+                incident_key: 99,
+                instance_key: 10,
+                job_key: None,
+                resolved_at: 1,
+                operation_reference: None,
+            },
+        ];
+        let mut state = State::default();
+        for event in &history {
+            apply(&mut state, event);
+        }
+        // Strip what a pre-#1608 build never wrote.
+        state.settled_orphan_episodes.clear();
+        assert!(state.variables_lost_quarantined.is_empty());
+        (state, history)
+    }
+
+    #[test]
+    fn backfill_from_retained_history_settles_a_legacy_resolved_episode() {
+        let (mut state, history) = legacy_resolved_snapshot();
+        state.backfill_settled_orphan_episodes(history.iter());
+        assert_eq!(state.settled_orphan_episodes.get(&10), Some(&8));
+        // The delayed duplicate (E5 <= E8) in the tail: no new report.
+        supersede(&mut state, 10, 5);
+        assert!(state.pending_orphan_supersedes.is_empty());
+    }
+
+    // Residual window (documented): history pruned, nothing to backfill — the
+    // duplicate is recorded pending exactly once (one extra, resolvable
+    // `VariablesLost`), and the instance itself is untouched (no data loss).
+    #[test]
+    fn backfill_with_pruned_history_leaves_exactly_one_pending_report() {
+        let (mut state, _history) = legacy_resolved_snapshot();
+        state.backfill_settled_orphan_episodes(std::iter::empty());
+        supersede(&mut state, 10, 5);
+        supersede(&mut state, 10, 5);
+        assert_eq!(state.pending_orphan_supersedes.len(), 1);
+    }
+
+    // The backfill is the live fold: a terminal event in the retained history
+    // clears the episode, and a post-#1608 map is only ever raised (high-water
+    // mark), never lowered.
+    #[test]
+    fn backfill_honours_terminal_events_and_never_lowers_the_mark() {
+        let history = [
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 8,
+            },
+            Event::ProcessInstanceTerminated { instance_key: 10 },
+            Event::VariablesLostQuarantined {
+                instance_key: 20,
+                incident_key: 98,
+                episode: 3,
+            },
+            Event::VariablesLostQuarantined {
+                instance_key: 30,
+                incident_key: 97,
+                episode: 0,
+            },
+        ];
+        let mut state = State::default();
+        state.settled_orphan_episodes.insert(20, 7);
+        state.backfill_settled_orphan_episodes(history.iter());
+        assert_eq!(state.settled_orphan_episodes.get(&10), None);
+        assert_eq!(state.settled_orphan_episodes.get(&20), Some(&7));
+        assert_eq!(state.settled_orphan_episodes.get(&30), None);
     }
 
     #[cfg(feature = "serde")]

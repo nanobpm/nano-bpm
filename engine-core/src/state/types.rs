@@ -2752,6 +2752,66 @@ impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
 }
 
 impl State {
+    /// The settlement half of the live `VariablesLostQuarantined` fold
+    /// (#1608): record `episode` as `instance_key`'s settled loss episode.
+    /// The ONE canonical derivation of `settled_orphan_episodes`, shared by
+    /// the live applier and [`State::backfill_settled_orphan_episodes`].
+    pub(crate) fn fold_settlement_quarantined(&mut self, instance_key: Key, episode: Key) {
+        if episode > 0 {
+            self.settled_orphan_episodes.insert(instance_key, episode);
+        }
+    }
+
+    /// The settlement half of the live terminal fold (#1608): a terminal
+    /// instance's settled episode no longer matters.
+    pub(crate) fn fold_settlement_terminal(&mut self, instance_key: Key) {
+        self.settled_orphan_episodes.remove(&instance_key);
+    }
+
+    /// Best-effort backfill of `settled_orphan_episodes` from retained history
+    /// that a snapshot covers (#1608 review). A snapshot written before #1608
+    /// carries no settlement map, and an episode resolved before the upgrade
+    /// has also lifted its tombstone — so a delayed duplicate's supersede in
+    /// the replayed tail would be recorded pending and re-raise
+    /// `VariablesLost` without a new loss. Recovery calls this with whatever
+    /// prefix `[0, covered)` it still holds (cold archive + hot prefix)
+    /// BEFORE replaying the tail. It folds the history through the same
+    /// helpers the live applier uses, then merges by high-water mark (episodes
+    /// grow monotonically per instance), so on a post-#1608 snapshot it is a
+    /// no-op: the live fold already recorded exactly these values.
+    ///
+    /// Residual window (documented, accepted): when the prefix holding the
+    /// quarantine was pruned, nothing can be backfilled and a delayed
+    /// duplicate straddling the upgrade raises ONE extra, resolvable
+    /// `VariablesLost` incident — never data loss.
+    pub fn backfill_settled_orphan_episodes<'a, I>(&mut self, history: I)
+    where
+        I: IntoIterator<Item = &'a crate::Event>,
+    {
+        let mut folded = State::default();
+        for event in history {
+            match event {
+                crate::Event::VariablesLostQuarantined {
+                    instance_key,
+                    episode,
+                    ..
+                } => folded.fold_settlement_quarantined(*instance_key, *episode),
+                crate::Event::ProcessInstanceCompleted { instance_key }
+                | crate::Event::ProcessInstanceTerminated { instance_key } => {
+                    folded.fold_settlement_terminal(*instance_key)
+                }
+                _ => {}
+            }
+        }
+        for (instance_key, episode) in folded.settled_orphan_episodes {
+            let entry = self
+                .settled_orphan_episodes
+                .entry(instance_key)
+                .or_insert(0);
+            *entry = (*entry).max(episode);
+        }
+    }
+
     /// Records `instance_key` as terminal in the bounded replicated ring and
     /// advances the replicated terminal epoch. Also stamps the instance's own
     /// [`ProcessInstance::terminated_epoch`] with the new epoch — the
@@ -2765,7 +2825,7 @@ impl State {
         self.recently_terminated.push_back(instance_key);
         // #1608: a terminal instance's pending loss report no longer matters.
         self.pending_orphan_supersedes.remove(&instance_key);
-        self.settled_orphan_episodes.remove(&instance_key);
+        self.fold_settlement_terminal(instance_key);
         self.terminal_epoch += 1;
         if let Some(instance) = self.instances.get_mut(&instance_key) {
             instance.terminated_epoch = self.terminal_epoch;

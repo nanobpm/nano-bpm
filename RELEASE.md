@@ -95,6 +95,20 @@ Run it (CI's previous-release determinism gate does) and copy each
 `UPGRADE BOUNDARY` line into the release notes verbatim, with the entry's
 issue link.
 
+### 1b. Upgrade note: off-heap orphan settlement backfill (#1608)
+
+Call this out in the release notes of the release that first ships #1608
+(https://github.com/nanobpm/nano-bpm/issues/1608), next to the no-rolling-upgrade
+warning above. A pre-#1608 snapshot carries no `settled_orphan_episodes`. On
+every snapshot-based recovery (single- and multi-partition), the engine
+backfills that map from the retained covered history (the cold archive plus the
+hot prefix) before it replays the tail, using the live fold. Adopted leader
+snapshots come from an already-upgraded leader and need no backfill. **Residual
+window:** a pre-#1608 snapshot, a pruned cold prefix, and a delayed duplicate
+orphan report straddling the upgrade together raise **one extra, resolvable
+`VariablesLost` incident** for that instance. Data is never lost. Resolve the
+incident as usual.
+
 ### 2. Tag every bumped train from the merge commit
 
 ```bash

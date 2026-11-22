@@ -1355,6 +1355,11 @@ impl Journal {
             cold.index = ColdIndex::default();
         }
         self.discard_orphan_reports();
+        // #1608 review: no settlement backfill here. An adopted snapshot is
+        // serialized by an already-upgraded leader, whose own snapshot-based
+        // recovery backfilled `settled_orphan_episodes` from ITS retained
+        // history (seglog `recover`/`recover_multi`). This receiver's local
+        // history is not that log, so folding it would be wrong.
         // #1608: a report whose supersede is DURABLE survives the adoption —
         // the snapshot the leader sent covers only settled state, so a
         // supersede whose retry never committed must be re-parked from the

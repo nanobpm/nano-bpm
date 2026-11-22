@@ -1860,6 +1860,15 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
             let mut engine = Engine::from_snapshot(snap);
             // Replay only events after the snapshot boundary.
             let skip = covered.saturating_sub(first_index) as usize;
+            // #1608 review: backfill loss-episode settlement from the retained
+            // history the snapshot covers (cold archive + hot prefix) BEFORE the
+            // tail, so a pre-#1608 snapshot does not re-raise `VariablesLost`
+            // for an episode resolved before the upgrade. Best-effort: a pruned
+            // prefix leaves the documented one-extra-incident residual window.
+            let cold = read_cold_prefix(dir).map(|(ev, _)| ev).unwrap_or_default();
+            engine.backfill_settled_orphan_episodes(
+                cold.iter().chain(events[..skip.min(events.len())].iter()),
+            );
             if skip < events.len() {
                 // ADR 0066 #1664: the replayed tail must re-derive the chain
                 // digests it recorded, continuing from the snapshot base's.
@@ -2992,6 +3001,12 @@ pub fn recover_multi_scoped(
     let migrate = match loaded {
         Ok(Some(c)) => {
             combined = Some(c);
+            // #1608 review: the retained cold prefix feeds the best-effort
+            // loss-settlement backfill below (never a replay input on this
+            // branch). Unreadable → nothing to backfill (residual window).
+            cold_tagged = read_cold_prefix_tagged(dir, num_partitions)
+                .map(|(events, _)| events)
+                .unwrap_or_default();
             false
         }
         // No combined snapshot. If the journal still starts at index 0 the
@@ -3193,6 +3208,16 @@ pub fn recover_multi_scoped(
                 match combined.as_ref().and_then(|m| m.get(&p)) {
                     Some((covered, snap)) => {
                         let mut engine = Engine::from_snapshot(snap.clone());
+                        // #1608 review: best-effort settlement backfill from the
+                        // retained covered prefix (see the single-partition path).
+                        let skip_b = (covered.saturating_sub(base_p) as usize).min(p_events.len());
+                        engine.backfill_settled_orphan_episodes(
+                            cold_tagged
+                                .iter()
+                                .filter(|(tag, _)| *tag == p)
+                                .map(|(_, e)| e)
+                                .chain(p_events[..skip_b].iter()),
+                        );
                         if let Some(all) = stored_vars.as_ref() {
                             for (key, vars) in all {
                                 if partition_of(*key) == p {
@@ -4286,6 +4311,107 @@ mod tests {
             (key1, key2)
         };
         (dir, key1, key2)
+    }
+
+    /// #1608 review (operator decision, option 1): builds a dir whose snapshot
+    /// is PRE-#1608 in shape (no `settled_orphan_episodes`) and covers a stamped
+    /// loss episode that was quarantined AND resolved, whose covered prefix
+    /// was compacted into the cold archive, and whose surviving tail holds a
+    /// delayed duplicate's `OrphanStampSuperseded`. Returns the dir and key.
+    fn legacy_resolved_orphan_dir(tag: &str) -> (PathBuf, u64) {
+        let dir = temp_dir(tag);
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let stale = journal
+            .engine()
+            .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
+            .expect("stamp the original report");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let fresh = journal
+            .engine()
+            .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
+            .expect("re-stamp the retry");
+        let (events, _) = journal
+            .apply_command(Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(fresh),
+            })
+            .unwrap();
+        let incident_key = events
+            .iter()
+            .find_map(|e| match e {
+                Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                _ => None,
+            })
+            .expect("the retry quarantines");
+        let _ = journal
+            .apply_command(Command::ResolveIncident { incident_key })
+            .unwrap();
+        let (mut snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+        // A pre-#1608 build never wrote the settlement map.
+        assert!(!snap.state.settled_orphan_episodes.is_empty());
+        snap.state.settled_orphan_episodes.clear();
+        assert!(snap.state.variables_lost_quarantined.is_empty());
+        write_snapshot(&dir, snap, covered).expect("write snapshot");
+        assert_eq!(compact(&shared, covered), 1, "prefix archived cold");
+        let (events, _) = journal
+            .apply_command(Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(stale),
+            })
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "the delayed duplicate applies superseded in the tail: {events:?}"
+        );
+        (dir, key)
+    }
+
+    #[test]
+    fn recover_backfills_settlement_for_a_legacy_snapshot_from_retained_history() {
+        let (dir, key) = legacy_resolved_orphan_dir("legacy-settle-retained");
+        let (reopened, _) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+        let state = reopened.engine().state();
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "retained history settles the resolved episode: no new VariablesLost"
+        );
+        assert!(state.settled_orphan_episodes.contains_key(&key));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The documented residual window: the covered prefix was pruned, so the
+    // duplicate is recorded pending exactly once (one extra, resolvable
+    // `VariablesLost`), and the instance itself survives (no data loss).
+    #[test]
+    fn recover_with_pruned_history_leaves_one_resolvable_extra_report() {
+        let (dir, key) = legacy_resolved_orphan_dir("legacy-settle-pruned");
+        let covered = cold_archive_span(&dir).unwrap().expect("archived").1;
+        assert_eq!(prune_cold_archive(&dir, covered), 1);
+        let (reopened, _) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+        let state = reopened.engine().state();
+        assert_eq!(
+            state
+                .pending_orphan_supersedes
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![key],
+        );
+        assert!(reopened.instance(key).is_some(), "no data loss");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Returns the path of the (single) persisted snapshot file in `dir`.
