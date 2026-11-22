@@ -87,7 +87,10 @@ import {
   type AgentModdleElement,
   type AgentModeling,
 } from "../lib/agentTask";
-import { DocumentLoadGate } from "../lib/documentLoadGate";
+import {
+  DocumentLoadGate,
+  type LoadAttempt,
+} from "../lib/documentLoadGate";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";
@@ -1263,7 +1266,11 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       importXml(xml: string) {
         const modeler = modelerRef.current;
         if (!modeler) return Promise.resolve();
-        const duplicate = loadGateRef.current.shouldLoad(modeler, xml);
+        // The attempt token keys the gate record to THIS load, so a stale
+        // failure/settle from a superseded attempt (e.g. the first A in an
+        // A → B → A sequence) cannot clear or capture into a newer record.
+        const attempt: { current?: LoadAttempt } = {};
+        const duplicate = loadGateRef.current.shouldLoad(modeler, xml, attempt);
         // A duplicate request awaits the ORIGINAL in-flight import (rejection
         // included) instead of resolving immediately — resolving early would
         // let a repeated XML→Visual click clear the XML-dirty flag and show
@@ -1273,11 +1280,11 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           m.importXML(xml).catch((e: unknown) => {
             // Only re-arm when the gate still records THIS import — a newer
             // document may have been delivered while this one was in flight.
-            loadGateRef.current.invalidateIf(modeler, xml);
+            loadGateRef.current.invalidateIf(modeler, xml, attempt.current);
             throw e;
           }),
         );
-        loadGateRef.current.settle(modeler, xml, run);
+        loadGateRef.current.settle(modeler, xml, run, attempt.current);
         return run;
       },
       createBlank() {

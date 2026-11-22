@@ -18,11 +18,23 @@
 // document loads again; a failed import calls `invalidateIf()` so a stale
 // failure cannot re-arm a newer document delivered while the failed one was in
 // flight.
+//
+// The record is keyed by load ATTEMPT, not by document identity: in an
+// A → B → A sequence both A attempts name the same document, so comparing the
+// doc alone would let the FIRST A's late failure (or late `settle`) clear or
+// capture into the SECOND A's record. `shouldLoad` hands back an opaque
+// attempt token; `settle`/`invalidateIf` only touch the record while it still
+// belongs to that attempt.
+
+/** Opaque identity of one load attempt, returned by `shouldLoad`. */
+export type LoadAttempt = object;
 
 export class DocumentLoadGate<I> {
   private current: {
     instance: I;
     doc: string;
+    /** Identity of the load attempt that created this record. */
+    attempt: LoadAttempt;
     /** The in-flight import of `doc`, if the caller registered one. */
     promise: Promise<void> | null;
   } | null = null;
@@ -30,17 +42,26 @@ export class DocumentLoadGate<I> {
   /** Whether `doc` must be loaded into `instance`, and what a duplicate caller
    *  should await. Records the delivery on a new pair.
    *
-   *  Returns `null` when the caller must start the load itself (and SHOULD then
-   *  pass the load's promise to `settle()` so duplicates share it). Otherwise
-   *  returns the promise a duplicate must return: the recorded in-flight
-   *  promise while the import is still running (preserving its rejection), or
-   *  an already-resolved promise once it has settled (the import is a no-op). */
-  shouldLoad(instance: I, doc: string): Promise<void> | null {
+   *  Returns `null` when the caller must start the load itself, and sets
+   *  `attempt` (when provided) to the token identifying the new record — the
+   *  caller SHOULD pass it back to `settle()`/`invalidateIf()` so a superseded
+   *  attempt cannot touch a newer record, and SHOULD pass the load's promise
+   *  to `settle()` so duplicates share it. Otherwise returns the promise a
+   *  duplicate must return: the recorded in-flight promise while the import is
+   *  still running (preserving its rejection), or an already-resolved promise
+   *  once it has settled (the import is a no-op). */
+  shouldLoad(
+    instance: I,
+    doc: string,
+    attempt?: { current?: LoadAttempt },
+  ): Promise<void> | null {
     const cur = this.current;
     if (cur && cur.instance === instance && cur.doc === doc) {
       return cur.promise ?? Promise.resolve();
     }
-    this.current = { instance, doc, promise: null };
+    const token: LoadAttempt = {};
+    this.current = { instance, doc, attempt: token, promise: null };
+    if (attempt) attempt.current = token;
     return null;
   }
 
@@ -48,10 +69,23 @@ export class DocumentLoadGate<I> {
    *  `null`, so a duplicate request for the same pair awaits the same import.
    *  No-op when the gate no longer records that pair (an edit, blank load, or
    *  a newer document superseded it) — the load then belongs to no record and
-   *  duplicates re-load as usual. */
-  settle(instance: I, doc: string, promise: Promise<void>): void {
+   *  duplicates re-load as usual. When `attempt` is given, the registration is
+   *  also a no-op unless the record still belongs to THAT attempt: in an
+   *  A → B → A sequence the first A's late `settle` must not capture its
+   *  promise into the second A's record. */
+  settle(
+    instance: I,
+    doc: string,
+    promise: Promise<void>,
+    attempt?: LoadAttempt,
+  ): void {
     const cur = this.current;
-    if (cur && cur.instance === instance && cur.doc === doc) {
+    if (
+      cur &&
+      cur.instance === instance &&
+      cur.doc === doc &&
+      (attempt === undefined || cur.attempt === attempt)
+    ) {
       cur.promise = promise;
     }
   }
@@ -62,13 +96,20 @@ export class DocumentLoadGate<I> {
   }
 
   /** The load of `doc` into `instance` failed, so the editor no longer holds
-   *  it — but only clear the record when it still names that pair. A stale
-   *  failure (an earlier queued import rejecting after a newer document was
-   *  recorded) must not re-arm the newer document: that would re-import it and
-   *  wipe the selection, the double-import this gate exists to prevent. */
-  invalidateIf(instance: I, doc: string): void {
+   *  it — but only clear the record when it still names that pair AND still
+   *  belongs to the failing attempt. A stale failure (an earlier queued import
+   *  rejecting after a newer document — or a newer attempt at the SAME
+   *  document, as in A → B → A — was recorded) must not re-arm the newer
+   *  record: that would re-import it and wipe the selection, the double-import
+   *  this gate exists to prevent. */
+  invalidateIf(instance: I, doc: string, attempt?: LoadAttempt): void {
     const cur = this.current;
-    if (cur && cur.instance === instance && cur.doc === doc) {
+    if (
+      cur &&
+      cur.instance === instance &&
+      cur.doc === doc &&
+      (attempt === undefined || cur.attempt === attempt)
+    ) {
       this.current = null;
     }
   }

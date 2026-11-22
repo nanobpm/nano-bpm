@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DocumentLoadGate } from "./documentLoadGate.ts";
+import { DocumentLoadGate, type LoadAttempt } from "./documentLoadGate.ts";
 
 // Issue #1048: ProjectWorkspace's content-import effect re-runs when the lazy
 // editor flips `editorReady`. When the file content landed after the modeler
@@ -136,4 +136,57 @@ test("settle() is a no-op when the record no longer names that pair", () => {
   gate.settle(m, "<a/>", new Promise<void>(() => {}));
   // B's record must not capture A's promise.
   assert.notEqual(gate.shouldLoad(m, "<b/>"), null);
+});
+
+// A → B → A on the same editor: the FIRST A's import fails after the second A
+// was recorded. The stale failure must not clear the newer A's record — the
+// gate would otherwise re-import A on the next duplicate delivery and wipe the
+// selection, the very double-import this gate exists to prevent. Comparing
+// document identity is not enough here (both attempts name "<a/>"); the record
+// must be keyed by load ATTEMPT.
+test("a stale failure in an A → B → A sequence does not clear the newer A's record", () => {
+  const gate = new DocumentLoadGate<object>();
+  const m = {};
+  const a1: { current?: LoadAttempt } = {};
+  gate.shouldLoad(m, "<a/>", a1);
+  gate.shouldLoad(m, "<b/>");
+  const a2: { current?: LoadAttempt } = {};
+  gate.shouldLoad(m, "<a/>", a2);
+  // The first A's import rejects late; only ITS record may be cleared.
+  gate.invalidateIf(m, "<a/>", a1.current);
+  assert.notEqual(gate.shouldLoad(m, "<a/>"), null);
+  // Sanity: the second attempt's own failure still re-arms A.
+  gate.invalidateIf(m, "<a/>", a2.current);
+  assert.equal(gate.shouldLoad(m, "<a/>"), null);
+});
+
+// The same stale-attempt class on the registration path: a superseded
+// attempt's late settle() must not capture its promise into the newer record
+// (a duplicate would then await the STALE import, whose rejection belongs to
+// an attempt the gate no longer records).
+test("a stale settle() in an A → B → A sequence does not capture into the newer A's record", () => {
+  const gate = new DocumentLoadGate<object>();
+  const m = {};
+  const a1: { current?: LoadAttempt } = {};
+  gate.shouldLoad(m, "<a/>", a1);
+  gate.shouldLoad(m, "<b/>");
+  const a2: { current?: LoadAttempt } = {};
+  gate.shouldLoad(m, "<a/>", a2);
+  let releaseStale!: () => void;
+  const stale = new Promise<void>((resolve) => {
+    releaseStale = resolve;
+  });
+  gate.settle(m, "<a/>", stale, a1.current);
+  // The newer record must not have captured the stale promise.
+  const duplicate = gate.shouldLoad(m, "<a/>");
+  assert.notEqual(duplicate, stale);
+  // And the newer attempt's own settle still registers normally.
+  let releaseNewer!: () => void;
+  const newer = new Promise<void>((resolve) => {
+    releaseNewer = resolve;
+  });
+  gate.settle(m, "<a/>", newer, a2.current);
+  assert.equal(gate.shouldLoad(m, "<a/>"), newer);
+  releaseStale();
+  releaseNewer();
 });

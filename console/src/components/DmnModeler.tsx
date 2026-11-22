@@ -1,7 +1,10 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import Modeler from "dmn-js/lib/Modeler";
 import type { FeelVariable } from "../lib/dmnDomainVariables";
-import { DocumentLoadGate } from "../lib/documentLoadGate";
+import {
+  DocumentLoadGate,
+  type LoadAttempt,
+} from "../lib/documentLoadGate";
 import "dmn-js/dist/assets/diagram-js.css";
 import "dmn-js/dist/assets/dmn-js-shared.css";
 import "dmn-js/dist/assets/dmn-js-drd.css";
@@ -265,7 +268,11 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
       importXml(xml: string) {
         const modeler = modelerRef.current;
         if (!modeler) return Promise.resolve();
-        const duplicate = loadGateRef.current.shouldLoad(modeler, xml);
+        // The attempt token keys the gate record to THIS load, so a stale
+        // failure/settle from a superseded attempt (e.g. the first A in an
+        // A → B → A sequence) cannot clear or capture into a newer record.
+        const attempt: { current?: LoadAttempt } = {};
+        const duplicate = loadGateRef.current.shouldLoad(modeler, xml, attempt);
         // A duplicate request awaits the ORIGINAL in-flight import (rejection
         // included) instead of resolving immediately — resolving early would
         // let a caller treat a still-pending, possibly-failing import as done.
@@ -274,11 +281,11 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
           m.importXML(xml).catch((e: unknown) => {
             // Only re-arm when the gate still records THIS import — a newer
             // document may have been delivered while this one was in flight.
-            loadGateRef.current.invalidateIf(modeler, xml);
+            loadGateRef.current.invalidateIf(modeler, xml, attempt.current);
             throw e;
           }),
         );
-        loadGateRef.current.settle(modeler, xml, run);
+        loadGateRef.current.settle(modeler, xml, run, attempt.current);
         return run;
       },
       createBlank() {
