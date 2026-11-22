@@ -3426,3 +3426,44 @@ fn prev_release_gate_boundary_projection_terminal_epoch_after_ring_wrap() {
     checked_s(&head, &prev, expected)
         .unwrap_or_else(|e| panic!("a wrapped-out ratified completion reconciles: {e}"));
 }
+
+/// #1608 review: `settled_orphan_episodes` maps an instance key to an episode
+/// key. A ratified remint shifts BOTH, so equivalent state on the two sides
+/// must project equal — the value canonicalized as well as the entry key —
+/// while a ratified instance's entry is still dropped. A tombstone's nested
+/// `episode` is canonicalized the same way.
+#[test]
+fn settled_orphan_episodes_project_equal_under_remint() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let ids = |pairs: &[(u64, &str)]| -> BTreeMap<u64, String> {
+        pairs.iter().map(|(k, v)| (*k, (*v).to_string())).collect()
+    };
+    // Head: instance 10 settled at episode 15; ratified instance 30 at 31.
+    let head_ids = ids(&[(10, "inst-A"), (15, "inc-A"), (30, "inst-R")]);
+    // Prev: the same entities reminted to different raw keys.
+    let prev_ids = ids(&[(20, "inst-A"), (25, "inc-A"), (40, "inst-R")]);
+    let head = serde_json::json!({"10": 15, "30": 31});
+    let prev = serde_json::json!({"20": 25, "40": 41});
+    let excluded_head = BTreeSet::from([30]);
+    let excluded_prev = BTreeSet::from([40]);
+    let field = "settled_orphan_episodes";
+    let h = compare::project_state_field(field, &head, &head_ids, &excluded_head).unwrap();
+    let p = compare::project_state_field(field, &prev, &prev_ids, &excluded_prev).unwrap();
+    assert_eq!(h, p, "a remint must not split equivalent settled episodes");
+    assert_eq!(h, serde_json::json!({field: {"inst-A": "inc-A"}}));
+    // A genuinely different episode still diverges.
+    let other = serde_json::json!({"20": 26});
+    let o = compare::project_state_field(field, &other, &prev_ids, &excluded_prev).unwrap();
+    assert_ne!(h, o);
+
+    // The tombstone's nested `episode` reference is canonicalized too.
+    let field = "variables_lost_quarantined";
+    let head = serde_json::json!({"10": {"incident_key": 15, "episode": 15}});
+    let prev = serde_json::json!({"20": {"incident_key": 25, "episode": 25}});
+    let h = compare::project_state_field(field, &head, &head_ids, &excluded_head).unwrap();
+    let p = compare::project_state_field(field, &prev, &prev_ids, &excluded_prev).unwrap();
+    assert_eq!(
+        h, p,
+        "a remint must not split equivalent tombstone episodes"
+    );
+}

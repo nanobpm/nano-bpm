@@ -2098,18 +2098,53 @@ pub enum Event {
     /// observes identically: the leader re-stamps the still-pending report at
     /// its now-current allocator position and re-proposes it, instead of
     /// silently clearing the pending report without raising `VariablesLost`.
-    /// Carries no state change — the reducers ignore it; it exists so the
-    /// supersede decision is journaled and replica-deterministic. Additive
-    /// variant: no snapshot-format bump.
+    /// Its only state change records the report in
+    /// `State::pending_orphan_supersedes` (#1608) until a
+    /// `VariablesLostQuarantined` or terminal event settles it, so the pending
+    /// report survives snapshots and adoption. Additive variant: no
+    /// snapshot-format bump.
     OrphanStampSuperseded {
         instance_key: Key,
         /// The superseded loss-episode id (the stamp's `episode`), recorded so
         /// the journal can correlate the reissue with the report it parked.
         episode: Key,
+        /// The off-heap tier the pending report was detected against (#1608).
+        /// The supersede is the DURABLE record that a loss report is pending,
+        /// so recovery and snapshot-adoption rebuild the in-memory backlog
+        /// from the surviving event history — a crash or failover between the
+        /// supersede and the re-stamped retry otherwise loses the report and
+        /// `VariablesLost` is never raised for a dormant lost instance.
+        /// `None` for a frame written before this field existed: the rebuild
+        /// then derives the tier at re-stamp time from the recovered routing
+        /// state. Additive: `serde(default)`, no snapshot-format bump.
+        ///
+        /// Omitted when `None` so a legacy frame re-serializes byte-identically
+        /// (the chain digest folds serialized events).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        kind: Option<crate::command::OrphanKind>,
     },
 }
 
 impl Event {
+    /// Whether this event is one of the loss-lifecycle variants the #1608
+    /// settlement backfill folds (`OrphanStampSuperseded`,
+    /// `VariablesLostQuarantined`, `ProcessInstanceCompleted`,
+    /// `ProcessInstanceTerminated`). The ONE canonical filter, shared by the
+    /// backfill fold and the storage readers that feed it (so retained-history
+    /// reads keep only these, not every archived payload).
+    pub fn is_loss_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Event::OrphanStampSuperseded { .. }
+                | Event::VariablesLostQuarantined { .. }
+                | Event::ProcessInstanceCompleted { .. }
+                | Event::ProcessInstanceTerminated { .. }
+        )
+    }
+
     /// The process-instance key of a **terminal** transition (completed or
     /// terminated), if this event is one. Used by the follower-replica apply
     /// path to reclaim the hot-state shell of an instance the moment it reaches

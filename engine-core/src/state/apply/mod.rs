@@ -15,6 +15,7 @@
 
 mod element;
 mod instance;
+pub(crate) use instance::settled_orphan_episode;
 mod job;
 mod process;
 mod resource;
