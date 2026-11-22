@@ -1166,6 +1166,50 @@ pub fn write_rebase_floor(dir: &Path, partition: Option<u64>, covered: u64) -> i
     Ok(())
 }
 
+/// Filename of the durable BACKFILL FLOOR (#1608 review) for the
+/// single-partition layout, or for partition `p` of the multi-partition
+/// layout: the absolute (global) journal event index below which this
+/// partition's retained history is KNOWN-DIVERGED and must never feed the
+/// loss-episode settlement backfill. Raised when a recovery-only receiver
+/// adopts the leader's authoritative snapshot over a diverged journal: the
+/// diverged events stay in the sealed segments / cold archive (checkpointing
+/// only rotates, compaction archives rather than deletes), so without this
+/// fence a LATER ordinary adoption or a restart would fold them in again.
+fn backfill_floor_path(dir: &Path, partition: Option<u64>) -> PathBuf {
+    match partition {
+        None => dir.join("journal.backfill-floor"),
+        Some(p) => dir.join(format!("journal.backfill-floor.p{p}")),
+    }
+}
+
+/// The backfill floor (see [`backfill_floor_path`]): `0` when absent (no
+/// diverged history). Fails CLOSED: an unreadable or malformed floor yields
+/// `u64::MAX`, so the best-effort backfill folds nothing rather than risk
+/// importing diverged history.
+pub(crate) fn read_backfill_floor(dir: &Path, partition: Option<u64>) -> u64 {
+    match fs::read_to_string(backfill_floor_path(dir, partition)) {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(u64::MAX),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Durably raises the backfill floor (see [`backfill_floor_path`]) to at least
+/// `global` — it never lowers, so an earlier divergence fence is kept.
+pub fn raise_backfill_floor(dir: &Path, partition: Option<u64>, global: u64) -> io::Result<()> {
+    let floor = read_backfill_floor(dir, partition).max(global);
+    let path = backfill_floor_path(dir, partition);
+    let tmp = unique_tmp_path(&path);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(floor.to_string().as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    fsync_dir(dir);
+    Ok(())
+}
+
 /// Reads the rebase floor, if any. An unreadable or malformed floor is an error
 /// (fail closed): it means a base was adopted and we cannot tell how far.
 fn read_rebase_floor(dir: &Path, partition: Option<u64>) -> io::Result<Option<RebaseFloor>> {
@@ -1865,9 +1909,14 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
             // tail, so a pre-#1608 snapshot does not re-raise `VariablesLost`
             // for an episode resolved before the upgrade. Best-effort: a pruned
             // prefix leaves the documented one-extra-incident residual window.
-            let cold = read_cold_retained(dir, None);
+            // Never fold history below the backfill floor: it is a diverged
+            // journal's pre-recovery prefix the leader never committed.
+            let floor = read_backfill_floor(dir, None);
+            let cold = read_cold_retained(dir, None, floor);
+            let hot = &events[..skip.min(events.len())];
             engine.backfill_settled_orphan_episodes(
-                cold.iter().chain(events[..skip.min(events.len())].iter()),
+                cold.iter()
+                    .chain(hot.iter().skip(below(floor, first_index).min(hot.len()))),
             );
             if skip < events.len() {
                 // ADR 0066 #1664: the replayed tail must re-derive the chain
@@ -2353,24 +2402,41 @@ pub(crate) fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
 /// zero-based, complete prefix and must stay strict. Here a gap or an
 /// unreadable file merely ends the run — the backfill is best-effort and the
 /// snapshot stays authoritative over whatever history it receives.
-pub(crate) fn read_cold_retained(dir: &Path, tag: Option<(u64, usize)>) -> Vec<Event> {
+///
+/// Events at a global index below `floor` (the [backfill
+/// floor](read_backfill_floor)) are excluded.
+pub(crate) fn read_cold_retained(dir: &Path, tag: Option<(u64, usize)>, floor: u64) -> Vec<Event> {
     match tag {
-        None => cold_retained_run(dir, parse_cold_file),
-        Some((partition, num_partitions)) => {
-            only_partition(read_cold_retained_tagged(dir, num_partitions), partition)
-        }
+        None => at_or_above(cold_retained_run(dir, parse_cold_file), floor),
+        Some((partition, num_partitions)) => only_partition(
+            read_cold_retained_tagged(dir, num_partitions, floor),
+            partition,
+        ),
     }
 }
 
 /// [`read_cold_retained`] with write-partition tags (multi-partition recovery
 /// demuxes them per partition itself).
-fn read_cold_retained_tagged(dir: &Path, num_partitions: usize) -> Vec<(u64, Event)> {
-    cold_retained_run(dir, |path| parse_cold_file_tagged(path, num_partitions))
+fn read_cold_retained_tagged(dir: &Path, num_partitions: usize, floor: u64) -> Vec<(u64, Event)> {
+    at_or_above(
+        cold_retained_run(dir, |path| parse_cold_file_tagged(path, num_partitions)),
+        floor,
+    )
+}
+
+/// Drops every indexed event below the backfill `floor`, keeping the events.
+fn at_or_above<T>(indexed: Vec<(u64, T)>, floor: u64) -> Vec<T> {
+    indexed
+        .into_iter()
+        .filter(|(i, _)| *i >= floor)
+        .map(|(_, e)| e)
+        .collect()
 }
 
 /// The contiguous retained cold run (see [`read_cold_retained`]), decoded by
 /// `parse`.
-fn cold_retained_run<T>(dir: &Path, parse: impl Fn(&Path) -> io::Result<Vec<T>>) -> Vec<T> {
+/// `parse`, each event paired with its absolute (global) journal index.
+fn cold_retained_run<T>(dir: &Path, parse: impl Fn(&Path) -> io::Result<Vec<T>>) -> Vec<(u64, T)> {
     let Ok(files) = list_cold(dir) else {
         return Vec::new();
     };
@@ -2381,12 +2447,18 @@ fn cold_retained_run<T>(dir: &Path, parse: impl Fn(&Path) -> io::Result<Vec<T>>)
             break;
         }
         match parse(&path) {
-            Ok(decoded) => events.extend(decoded),
+            Ok(decoded) => events.extend((start..).zip(decoded)),
             Err(_) => break,
         }
         expected = Some(end);
     }
     events
+}
+
+/// How many leading events of a file starting at global index `start` lie
+/// below the backfill `floor`.
+fn below(floor: u64, start: u64) -> usize {
+    usize::try_from(floor.saturating_sub(start)).unwrap_or(usize::MAX)
 }
 
 /// Keeps only `partition`'s events of a tagged (shared-writer) read.
@@ -2402,22 +2474,25 @@ fn only_partition(tagged: Vec<(u64, Event)>, partition: u64) -> Vec<Event> {
 /// every still-sealed segment (oldest first), then the active segment. `tag`
 /// as for [`read_cold_retained`]. Best-effort like it: an unreadable segment
 /// ends the history there (a later segment after a hole would fold out of
-/// order).
+/// order). Each segment is given with its absolute start index; events below
+/// the backfill `floor` are excluded.
 pub(crate) fn read_hot_retained(
-    sealed: &[PathBuf],
-    active: &Path,
+    sealed: &[(u64, PathBuf)],
+    active: (u64, &Path),
     tag: Option<(u64, usize)>,
+    floor: u64,
 ) -> Vec<Event> {
     let mut events = Vec::new();
-    for path in sealed
+    for (start, path) in sealed
         .iter()
-        .map(PathBuf::as_path)
+        .map(|(start, path)| (*start, path.as_path()))
         .chain(std::iter::once(active))
     {
+        let skip = below(floor, start);
         let decoded = match tag {
-            None => read_segment_events(path),
+            None => read_segment_events(path).map(|d| d.into_iter().skip(skip).collect()),
             Some((partition, num_partitions)) => read_segment_events_tagged(path, num_partitions)
-                .map(|tagged| only_partition(tagged, partition)),
+                .map(|tagged| only_partition(tagged.into_iter().skip(skip).collect(), partition)),
         };
         match decoded {
             Ok(decoded) => events.extend(decoded),
@@ -3069,6 +3144,10 @@ pub fn recover_multi_scoped(
     // The full tagged history for a migration replay (cold-archived prefix +
     // surviving tail), populated only when we fall into the migrator below.
     let mut cold_tagged: Vec<(u64, Event)> = Vec::new();
+    // The retained cold prefix for the settlement backfill, each event with
+    // its GLOBAL journal index (so each partition can apply its own backfill
+    // floor). Populated only on the snapshot branch.
+    let mut cold_backfill: Vec<(u64, (u64, Event))> = Vec::new();
     sweep_unique_tmp(dir);
     let loaded = load_multi_snapshot_based(dir);
     for &p in owned {
@@ -3089,7 +3168,10 @@ pub fn recover_multi_scoped(
             // #1608 review: the retained cold prefix feeds the best-effort
             // loss-settlement backfill below (never a replay input on this
             // branch). Unreadable → nothing to backfill (residual window).
-            cold_tagged = read_cold_retained_tagged(dir, num_partitions);
+            // Read unfenced: each partition applies its own backfill floor
+            // below (the floor is per partition, the archive is shared).
+            cold_backfill =
+                cold_retained_run(dir, |path| parse_cold_file_tagged(path, num_partitions));
             false
         }
         // No combined snapshot. If the journal still starts at index 0 the
@@ -3294,12 +3376,21 @@ pub fn recover_multi_scoped(
                         // #1608 review: best-effort settlement backfill from the
                         // retained covered prefix (see the single-partition path).
                         let skip_b = (covered.saturating_sub(base_p) as usize).min(p_events.len());
+                        // Never fold this partition's history below its
+                        // backfill floor (a diverged pre-recovery prefix).
+                        let floor = read_backfill_floor(dir, Some(p));
+                        let hot_prefix = (first_index..)
+                            .zip(tagged.iter())
+                            .filter(|(_, (tag, _))| *tag == p)
+                            .take(skip_b)
+                            .filter(|(i, _)| *i >= floor)
+                            .map(|(_, (_, e))| e);
                         engine.backfill_settled_orphan_episodes(
-                            cold_tagged
+                            cold_backfill
                                 .iter()
-                                .filter(|(tag, _)| *tag == p)
-                                .map(|(_, e)| e)
-                                .chain(p_events[..skip_b].iter()),
+                                .filter(|(i, (tag, _))| *tag == p && *i >= floor)
+                                .map(|(_, (_, e))| e)
+                                .chain(hot_prefix),
                         );
                         if let Some(all) = stored_vars.as_ref() {
                             for (key, vars) in all {
@@ -4514,7 +4605,7 @@ mod tests {
         )
         .unwrap();
         fs::write(&active, line(Some(1), &terminated)).unwrap();
-        let hot = read_hot_retained(std::slice::from_ref(&sealed), &active, Some((1, 2)));
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), Some((1, 2)), 0);
         assert_eq!(hot, vec![quarantined.clone(), terminated.clone()]);
         let mut state = nanobpmn_engine_core::State::default();
         state.backfill_settled_orphan_episodes(hot.iter());
@@ -4522,8 +4613,47 @@ mod tests {
         // Untagged single-partition format reads every record as-is.
         fs::write(&sealed, line(None, &quarantined)).unwrap();
         fs::write(&active, line(None, &terminated)).unwrap();
-        let hot = read_hot_retained(std::slice::from_ref(&sealed), &active, None);
+        let hot = read_hot_retained(&[(0, sealed.clone())], (1, &active), None, 0);
         assert_eq!(hot, vec![quarantined, terminated]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review: the backfill floor excludes every event below it from the
+    /// retained history (tagged and untagged), only ever rises, and fails
+    /// CLOSED on a malformed file.
+    #[test]
+    fn backfill_floor_fences_retained_history_and_fails_closed() {
+        let dir = temp_dir("backfill-floor");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ev = |k: u64| Event::ProcessInstanceTerminated { instance_key: k };
+        let line = |tag: Option<u64>, e: &Event| {
+            let json = nanobpmn_engine_core::encode_record_json(e, None).expect("encode");
+            match tag {
+                Some(t) => format!("{t}\t{json}\n"),
+                None => format!("{json}\n"),
+            }
+        };
+        let sealed = dir.join("sealed.log");
+        let active = dir.join("active.log");
+        // Untagged: sealed [0, 2), active [2, 3); floor 1 drops event 0 only.
+        fs::write(&sealed, line(None, &ev(0)) + &line(None, &ev(1))).unwrap();
+        fs::write(&active, line(None, &ev(2))).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), None, 1);
+        assert_eq!(hot, vec![ev(1), ev(2)]);
+        // Tagged: the floor is a GLOBAL index, applied before the demux.
+        fs::write(&sealed, line(Some(1), &ev(0)) + &line(Some(0), &ev(1))).unwrap();
+        fs::write(&active, line(Some(1), &ev(2))).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), Some((1, 2)), 2);
+        assert_eq!(hot, vec![ev(2)]);
+        // Floor file: absent -> 0, only rises, per partition, malformed -> MAX.
+        assert_eq!(read_backfill_floor(&dir, Some(1)), 0);
+        raise_backfill_floor(&dir, Some(1), 7).unwrap();
+        raise_backfill_floor(&dir, Some(1), 3).unwrap();
+        assert_eq!(read_backfill_floor(&dir, Some(1)), 7);
+        assert_eq!(read_backfill_floor(&dir, Some(0)), 0);
+        fs::write(backfill_floor_path(&dir, None), "garbage").unwrap();
+        assert_eq!(read_backfill_floor(&dir, None), u64::MAX);
         let _ = fs::remove_dir_all(&dir);
     }
 

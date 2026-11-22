@@ -1407,15 +1407,27 @@ impl Journal {
             // Chronological order — retained cold run, sealed segments oldest
             // first, then the active segment — so a later termination is
             // folded AFTER the quarantine it supersedes.
-            let cold = crate::seglog::read_cold_retained(&shared.dir, tag);
-            let sealed: Vec<std::path::PathBuf> = shared
+            // Never fold history below this partition's backfill floor: a
+            // previous divergence recovery left the diverged pre-recovery
+            // prefix in the sealed segments / cold archive (#1608 review).
+            let floor = crate::seglog::read_backfill_floor(&shared.dir, self.floor_partition());
+            let cold = crate::seglog::read_cold_retained(&shared.dir, tag, floor);
+            let sealed: Vec<(u64, std::path::PathBuf)> = shared
                 .sealed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .map(|seg| seg.path.clone())
+                .map(|seg| (seg.start, seg.path.clone()))
                 .collect();
-            let hot = crate::seglog::read_hot_retained(&sealed, &shared.active_path, tag);
+            let active_start = shared
+                .active_start
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let hot = crate::seglog::read_hot_retained(
+                &sealed,
+                (active_start, &shared.active_path),
+                tag,
+                floor,
+            );
             self.engine
                 .backfill_settled_orphan_episodes(cold.iter().chain(hot.iter()));
         }
@@ -1448,11 +1460,41 @@ impl Journal {
         self.restore_engine_from_snapshot(snapshot);
         self.raft_entry = None;
         self.fenced = false;
-        let published = self.checkpoint_base(permit);
+        let published = self
+            .checkpoint_base(permit)
+            .and_then(|()| self.fence_diverged_history());
         if published.is_err() {
             self.fenced = true;
         }
         published
+    }
+
+    /// During divergence recovery, durably raises this partition's backfill
+    /// floor past the whole diverged pre-recovery journal (#1608 review), so
+    /// no LATER ordinary adoption or restart ever folds it into the
+    /// settlement backfill: checkpointing only rotates and compaction
+    /// archives, so the diverged events otherwise stay readable. Called right
+    /// after the adopted base is checkpointed — the rotation sealed every
+    /// diverged event below `active_start`. Runs before the Raft layer clears
+    /// the divergence marker, so a failure keeps the member in recovery.
+    fn fence_diverged_history(&self) -> io::Result<()> {
+        if !self.divergence_recovery {
+            return Ok(());
+        }
+        let Some(seg) = self.seg.as_ref() else {
+            return Ok(());
+        };
+        let boundary = seg.active_start.load(std::sync::atomic::Ordering::SeqCst);
+        crate::seglog::raise_backfill_floor(&seg.dir, self.floor_partition(), boundary)
+    }
+
+    /// The per-partition key of this journal's durable floor files: `None`
+    /// for the single-partition layout, this partition for the shared
+    /// multi-partition writer.
+    fn floor_partition(&self) -> Option<u64> {
+        self.seg
+            .as_ref()
+            .and_then(|seg| (!seg.per_partition_total.is_empty()).then_some(self.partition_id))
     }
 
     /// Replaces this journal's engine with one rebuilt from authoritative
@@ -5208,7 +5250,7 @@ impl Journal {
             ));
         }
         let refused = || io::Error::other("journal checkpoint refused (fenced or incomplete)");
-        let floor_partition = (!seg.per_partition_total.is_empty()).then_some(self.partition_id);
+        let floor_partition = self.floor_partition();
         // Publish the rebase floor BEFORE touching any authoritative state (the
         // var store, then the snapshot): a crash at any later boundary leaves a
         // floor no older snapshot satisfies, so recovery fails closed instead of
@@ -7334,6 +7376,121 @@ mod tests {
             "no receiver-local supersede is imported either"
         );
         assert!(receiver.instance(key).is_some(), "no data loss");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review: the backfill floor raised at divergence-recovery
+    /// adoption keeps the diverged pre-recovery prefix (still in the sealed
+    /// segments / cold archive) out of every LATER backfill — an ordinary
+    /// adoption after recovery ends, and a restart.
+    #[test]
+    fn diverged_history_stays_fenced_after_divergence_recovery_ends() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-adopt-diverged-later-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The diverged receiver's retained log holds a resolved loss episode
+        // the leader's snapshot does not carry (stripped to the pre-#1608
+        // shape, exactly as in the ordinary-adoption test above).
+        let key = {
+            let (mut journal, _recovery) = Journal::open_segmented(&dir).expect("open segmented");
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            let fresh = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("stamp the report");
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(fresh),
+                })
+                .unwrap();
+            let incident_key = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                    _ => None,
+                })
+                .expect("quarantines");
+            let _ = journal
+                .apply_command(Command::ResolveIncident { incident_key })
+                .unwrap();
+            key
+        };
+
+        // Reopen the receiver over the diverged retained log and adopt the
+        // leader's authoritative snapshot with divergence-recovery mode set —
+        // exactly what `bootstrap_recovery_receiver` arranges (#1701).
+        let (mut receiver, recovery) = Journal::open_segmented(&dir).expect("reopen receiver");
+        receiver.set_divergence_recovery(true);
+        let mut stripped = receiver.engine_snapshot();
+        stripped.state.settled_orphan_episodes.clear();
+        stripped.raft_applied = Some((42, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(stripped, Some(&permit))
+            .expect("adoption publishes the new base");
+        drop(permit);
+
+        let state = receiver.engine().state();
+        assert!(
+            state.settled_orphan_episodes.is_empty(),
+            "the diverged journal's retained prefix is NOT folded into the authoritative snapshot"
+        );
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "no receiver-local supersede is imported either"
+        );
+        assert!(receiver.instance(key).is_some(), "no data loss");
+
+        // Recovery ends (the Raft layer clears the mode with the marker) and
+        // the member applies new entries as a normal replica. The diverged
+        // events are still on disk in the sealed segments.
+        receiver.set_divergence_recovery(false);
+        let _ = receiver
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+
+        // A LATER ordinary adoption of a pre-#1608 snapshot must still not
+        // fold the diverged resolved episode back in.
+        let mut stripped = receiver.engine_snapshot();
+        stripped.state.settled_orphan_episodes.clear();
+        stripped.raft_applied = Some((43, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(stripped, Some(&permit))
+            .expect("ordinary adoption publishes the new base");
+        drop(permit);
+        let state = receiver.engine().state();
+        assert!(
+            state.settled_orphan_episodes.is_empty(),
+            "a later ordinary adoption never imports the diverged resolved episode"
+        );
+        assert!(state.pending_orphan_supersedes.is_empty());
+        drop(receiver);
+        drop(recovery);
+
+        // Nor does a restart's recovery backfill.
+        let (reopened, _recovery) = Journal::open_segmented(&dir).expect("restart");
+        assert!(
+            reopened.engine().state().settled_orphan_episodes.is_empty(),
+            "restart recovery never imports the diverged resolved episode"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

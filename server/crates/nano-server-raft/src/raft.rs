@@ -2167,8 +2167,11 @@ impl PartitionStateMachine {
             // as a normal replica and applies the leader's log from here on.
             // Clear the journal's divergence-recovery mode with it (#1608
             // review): the adopted base IS the authoritative state, so a
-            // later ordinary adoption may backfill from the retained prefix
-            // again — it is a verified committed prefix from here on.
+            // later ordinary adoption may backfill again — but only from
+            // history written AFTER this adoption: the adoption durably
+            // raised the journal's backfill floor past the diverged
+            // pre-recovery prefix, which stays in the sealed segments / cold
+            // archive and is never folded in again (nor on restart).
             self.engine
                 .with(|journal| journal.set_divergence_recovery(false))
                 .await;
