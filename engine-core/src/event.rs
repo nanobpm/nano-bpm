@@ -2098,9 +2098,11 @@ pub enum Event {
     /// observes identically: the leader re-stamps the still-pending report at
     /// its now-current allocator position and re-proposes it, instead of
     /// silently clearing the pending report without raising `VariablesLost`.
-    /// Carries no state change — the reducers ignore it; it exists so the
-    /// supersede decision is journaled and replica-deterministic. Additive
-    /// variant: no snapshot-format bump.
+    /// Its only state change records the report in
+    /// `State::pending_orphan_supersedes` (#1608) until a
+    /// `VariablesLostQuarantined` or terminal event settles it, so the pending
+    /// report survives snapshots and adoption. Additive variant: no
+    /// snapshot-format bump.
     OrphanStampSuperseded {
         instance_key: Key,
         /// The superseded loss-episode id (the stamp's `episode`), recorded so

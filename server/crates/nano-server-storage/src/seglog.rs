@@ -4180,14 +4180,12 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -4552,14 +4550,12 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -4646,14 +4642,12 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -4706,14 +4700,12 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -4787,14 +4779,12 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -4902,14 +4892,12 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -5056,14 +5044,12 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -5160,14 +5146,12 @@ mod tests {
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j2 = crate::journal::Journal::from_engine_shared(
                 2,
                 engines.remove(&2).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j2.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -6636,14 +6620,12 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -6717,14 +6699,12 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             let mut j1 = crate::journal::Journal::from_engine_shared(
                 1,
                 engines.remove(&1).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
@@ -7432,9 +7412,9 @@ mod tests {
                 let mut engines: std::collections::BTreeMap<u64, Engine> =
                     recovery.engines.into_iter().collect();
                 let mut j0 =
-                    Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer, &[]);
+                    Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
                 let mut j1 =
-                    Journal::from_engine_shared(1, engines.remove(&1).unwrap(), true, &writer, &[]);
+                    Journal::from_engine_shared(1, engines.remove(&1).unwrap(), true, &writer);
                 j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
                 j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
@@ -7761,7 +7741,6 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             // The first digest-bearing entry claims a chain that does not
@@ -8356,7 +8335,6 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.restore_engine_from_snapshot(snap);
             let permit = seg.try_checkpoint_permit().expect("gate free");
@@ -8490,7 +8468,6 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx, Arc::new(AtomicU64::new(0)));
             let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
@@ -8565,7 +8542,6 @@ mod tests {
                 engines.remove(&0).unwrap(),
                 true,
                 &writer,
-                &[],
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j0.set_varstore(Arc::clone(&varstore));
@@ -8611,7 +8587,6 @@ mod tests {
             engines.remove(&0).unwrap(),
             true,
             &writer,
-            &[],
         );
         j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
         j0.set_varstore(Arc::clone(&varstore));
@@ -8639,7 +8614,6 @@ mod tests {
             engines.remove(&1).unwrap(),
             true,
             &writer,
-            &[],
         );
         j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
         j1.set_varstore(Arc::clone(&varstore));

@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -370,11 +370,6 @@ pub struct Journal {
     /// legacy single-file paths. Lets the snapshot/compaction task read segment
     /// boundaries and drives [`Journal::snapshot_and_rotate`].
     seg: Option<Arc<SegShared>>,
-    /// The durable log's active file, when this journal persists. Read by the
-    /// orphan-backlog rebuild (#1608) on engine adoption to re-park a
-    /// still-open superseded report from the surviving tail. `None` for an
-    /// in-memory journal.
-    log_active_path: Option<PathBuf>,
     /// Channel to the read-model exporter thread, if one is wired. Every command's
     /// journaled events are forwarded here (in command order: the actor applies
     /// commands serially) to be projected into the read store. The events are
@@ -1237,7 +1232,6 @@ impl Journal {
             writer_thread: None,
             durable: false,
             seg: None,
-            log_active_path: None,
             exporter: None,
             shared_exporter: None,
             fresh: true,
@@ -1276,7 +1270,6 @@ impl Journal {
             writer_thread: None,
             durable: false,
             seg: None,
-            log_active_path: None,
             exporter: None,
             shared_exporter: None,
             fresh: false,
@@ -1298,7 +1291,7 @@ impl Journal {
         };
         // #1608: re-park any still-open superseded orphan report the replayed
         // history proves pending.
-        journal.rebuild_orphan_backlog_from_events(&events);
+        journal.rebuild_orphan_backlog();
         journal
     }
 
@@ -1366,50 +1359,8 @@ impl Journal {
         // the snapshot the leader sent covers only settled state, so a
         // supersede whose retry never committed must be re-parked from the
         // surviving tail or the loss is never reported after a failover.
-        let pending = self.pending_orphan_reports_from_tail();
-        self.rebuild_orphan_backlog_from_events(&pending);
+        self.rebuild_orphan_backlog();
         self.fresh = false;
-    }
-
-    /// Reads this journal's surviving (post-snapshot) event tail for the
-    /// orphan-backlog rebuild (#1608). Empty for a non-durable journal or when
-    /// the tail cannot be read — an unreadable tail is fail-closed elsewhere
-    /// (the boot replay verifies it before any adoption), and a report missed
-    /// here is still re-detected on the next access to the lost instance.
-    fn pending_orphan_reports_from_tail(&self) -> Vec<Event> {
-        let Some(active_path) = self.log_active_path.as_ref() else {
-            return Vec::new();
-        };
-        let mut events: Vec<Event> = Vec::new();
-        // Sealed segments in ascending order, then the active segment — the
-        // same surviving-tail layout `seglog::recover` reads. The legacy
-        // single-file path has no sealed segments: its whole journal is the
-        // active file.
-        if let Some(seg) = self.seg.as_ref() {
-            for sealed in seg.sealed.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                match crate::seglog::read_segment_events(&sealed.path) {
-                    Ok(seg_events) => events.extend(seg_events),
-                    Err(err) => {
-                        tracing::error!(
-                            error = %err,
-                            "orphan-backlog rebuild (#1608): a sealed segment is unreadable; \
-                             skipping it (the boot replay fails closed on the same read)"
-                        );
-                    }
-                }
-            }
-        }
-        match crate::seglog::read_segment_events(active_path) {
-            Ok(active) => events.extend(active),
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    "orphan-backlog rebuild (#1608): the active segment is unreadable; \
-                     skipping it (the boot replay fails closed on the same read)"
-                );
-            }
-        }
-        events
     }
 
     /// Adopts an AUTHORITATIVE snapshot (a leader's Raft snapshot) and
@@ -1478,8 +1429,7 @@ impl Journal {
         self.discard_orphan_reports();
         // #1608: a report whose supersede is DURABLE survives the rebuild —
         // re-park it from the surviving tail or a failover loses the loss.
-        let pending = self.pending_orphan_reports_from_tail();
-        self.rebuild_orphan_backlog_from_events(&pending);
+        self.rebuild_orphan_backlog();
         // The rebuild IS the durable state: the fence and any armed (aborted)
         // raft-entry buffer are predecessor state that must not outlive it.
         self.raft_entry = None;
@@ -1541,7 +1491,6 @@ impl Journal {
             writer_thread: Some(writer_thread),
             durable: true,
             seg: None,
-            log_active_path: Some(path.to_path_buf()),
             exporter: None,
             shared_exporter: None,
             fresh,
@@ -1564,7 +1513,7 @@ impl Journal {
         // #1608: re-park any still-open superseded orphan report the durable
         // history proves pending (a crash between the supersede and its
         // re-stamped retry must not lose the loss).
-        journal.rebuild_orphan_backlog_from_events(&events);
+        journal.rebuild_orphan_backlog();
         Ok(journal)
     }
 
@@ -1588,7 +1537,6 @@ impl Journal {
             writer: Some(tx),
             writer_thread: Some(writer_thread),
             durable: true,
-            log_active_path: Some(shared.active_path.clone()),
             seg: Some(shared),
             exporter: None,
             shared_exporter: None,
@@ -1613,7 +1561,7 @@ impl Journal {
         // tail proves pending (a crash between the supersede and its
         // re-stamped retry must not lose the loss).
         let mut journal = journal;
-        journal.rebuild_orphan_backlog_from_events(&recovery.events);
+        journal.rebuild_orphan_backlog();
         Ok((journal, recovery))
     }
 
@@ -1644,7 +1592,6 @@ impl Journal {
             writer: Some(shared.sender()),
             writer_thread: None,
             durable: true,
-            log_active_path: shared.seg.as_ref().map(|s| s.active_path.clone()),
             seg: shared.seg.clone(),
             exporter: None,
             shared_exporter: shared.exporter.clone(),
@@ -1667,7 +1614,7 @@ impl Journal {
         };
         // #1608: re-park any still-open superseded orphan report the durable
         // history proves pending.
-        journal.rebuild_orphan_backlog_from_events(&events);
+        journal.rebuild_orphan_backlog();
         Ok(journal)
     }
 
@@ -1680,20 +1627,13 @@ impl Journal {
     /// state and exporter cell so snapshots/compaction and read-model forwarding
     /// work for this partition.
     ///
-    /// `tail_events` are this partition's surviving (post-snapshot) events —
-    /// the same events [`crate::seglog::recover_multi`] replayed into
-    /// `engine`. The orphan backlog is rebuilt from them (#1608): a pending
-    /// report is only durable once its supersede is journaled, and a
-    /// supersede covered by the snapshot was necessarily settled (the
-    /// snapshot's engine state carries the resulting tombstone / terminal
-    /// record), so the surviving tail is the complete set of possibly-open
-    /// reports.
+    /// The orphan backlog is rebuilt from the recovered engine's replicated
+    /// pending-supersede set (#1608), which the snapshot carries too.
     pub fn from_engine_shared(
         partition_id: u64,
         engine: Engine,
         fresh: bool,
         shared: &SharedWriter,
-        tail_events: &[Event],
     ) -> Self {
         let mut journal = Self {
             engine,
@@ -1701,7 +1641,6 @@ impl Journal {
             writer: Some(shared.sender()),
             writer_thread: None,
             durable: true,
-            log_active_path: shared.seg.as_ref().map(|s| s.active_path.clone()),
             seg: shared.seg.clone(),
             exporter: None,
             shared_exporter: shared.exporter.clone(),
@@ -1724,7 +1663,7 @@ impl Journal {
         };
         // #1608: re-park any still-open superseded orphan report the surviving
         // tail proves pending.
-        journal.rebuild_orphan_backlog_from_events(tail_events);
+        journal.rebuild_orphan_backlog();
         journal
     }
 
@@ -1953,70 +1892,48 @@ impl Journal {
     /// This discards only REPLICA-LOCAL detections. Reports whose supersede
     /// was journaled ([`Event::OrphanStampSuperseded`]) are DURABLE pending
     /// state (#1608): the caller must follow with
-    /// [`rebuild_orphan_backlog_from_events`](Self::rebuild_orphan_backlog_from_events)
-    /// over the surviving event history so a crash/failover between a
-    /// supersede and its re-stamped retry cannot silently lose the loss.
+    /// [`rebuild_orphan_backlog`](Self::rebuild_orphan_backlog) so a
+    /// crash/failover between a supersede and its re-stamped retry cannot
+    /// silently lose the loss.
     fn discard_orphan_reports(&mut self) {
         self.orphans.backlog.clear();
         self.orphans.in_flight.clear();
         let _ = self.orphans.inbox.take();
     }
 
-    /// Rebuilds the pending orphan-report backlog from the surviving event
-    /// history (#1608) — the durability half of the #1587 supersede mechanism.
+    /// Rebuilds the pending orphan-report backlog from REPLICATED engine
+    /// state (#1608) — the durability half of the #1587 supersede mechanism.
     ///
     /// A stamped `QuarantineOffheapOrphan` that applies SUPERSEDED journals
-    /// [`Event::OrphanStampSuperseded`]: the durable, replica-deterministic
-    /// record that a loss report for `instance_key` is still pending (its
-    /// re-stamped retry has not committed). The report itself lives in the
-    /// in-memory backlog, so a crash or leader failover in that window would
-    /// lose it — and a dormant lost instance is never re-detected
-    /// (re-detection only fires on access), so `VariablesLost` would never be
-    /// raised. Scanning the surviving tail here re-parks every still-open
-    /// superseded report:
+    /// [`Event::OrphanStampSuperseded`], which records the report in
+    /// `State::pending_orphan_supersedes` until a `VariablesLostQuarantined`
+    /// or the instance's terminal event settles it. The report itself lives in
+    /// the in-memory backlog, so a crash or leader failover in that window
+    /// would lose it — and a dormant lost instance is never re-detected
+    /// (re-detection only fires on access). Because the pending set is engine
+    /// state, it survives snapshots, compaction and Raft snapshot adoption
+    /// (a tail scan would miss a supersede compacted into a snapshot) and is
+    /// per-partition by construction (no shared-segment demux needed). The
+    /// parked report is re-stamped against CURRENT engine state at propose
+    /// time (`orphan_pending_stamp`), which resolves the truth — an already
+    /// rehydrated or already-incidented key stamps `None` and settles without
+    /// proposing.
     ///
-    /// - a later [`Event::VariablesLostQuarantined`] for the same key means
-    ///   the re-stamped retry committed (or another episode quarantined it):
-    ///   the report is settled, not re-parked;
-    /// - a later terminal event
-    ///   ([`Event::ProcessInstanceCompleted`]/[`Event::ProcessInstanceTerminated`])
-    ///   means the loss no longer matters to any live work: settled;
-    /// - otherwise the report is re-parked with the tier the supersede
-    ///   carried (`kind`), defaulting to [`OrphanKind::Resident`] for a frame
-    ///   written before that field existed (#1608 is additive): the parked
-    ///   report is re-stamped against CURRENT engine state at propose time
-    ///   (`orphan_pending_stamp`), which resolves the truth — an already
-    ///   rehydrated or already-incidented key stamps `None` and settles
-    ///   without proposing.
-    ///
-    /// Call this with the full surviving event stream AFTER the engine was
-    /// rebuilt from it (boot replay, snapshot+tail recovery) and after an
-    /// engine adoption (snapshot install / durable rebuild) — the adopted
-    /// engine is self-contained, so only reports the durable history proves
-    /// still-pending may survive the adoption.
-    pub fn rebuild_orphan_backlog_from_events(&mut self, events: &[Event]) {
-        let mut open: BTreeMap<Key, OrphanKind> = BTreeMap::new();
-        for event in events {
-            match event {
-                Event::OrphanStampSuperseded {
-                    instance_key, kind, ..
-                } => {
-                    open.insert(*instance_key, kind.unwrap_or(OrphanKind::Resident));
-                }
-                Event::VariablesLostQuarantined { instance_key, .. } => {
-                    open.remove(instance_key);
-                }
-                Event::ProcessInstanceCompleted { instance_key }
-                | Event::ProcessInstanceTerminated { instance_key } => {
-                    open.remove(instance_key);
-                }
-                _ => {}
-            }
-        }
+    /// Call this after the engine is rebuilt (boot replay, snapshot+tail
+    /// recovery) and after an engine adoption (snapshot install / durable
+    /// rebuild).
+    pub fn rebuild_orphan_backlog(&mut self) {
+        let open: Vec<(Key, OrphanKind)> = self
+            .engine
+            .state()
+            .pending_orphan_supersedes
+            .iter()
+            .map(|(k, kind)| (*k, *kind))
+            .collect();
         for (key, kind) in open {
             // `park_orphan` dedups and skips a key whose `VariablesLost`
             // incident is already active (e.g. raised by a cold-orphan
-            // quarantine the scan cannot attribute to this report).
+            // quarantine the set cannot attribute to this report).
             self.park_orphan(key, kind, "recovery rebuild (#1608)");
         }
         self.drain_orphan_backlog();
@@ -7583,8 +7500,7 @@ mod tests {
                 SharedWriter::open_segmented(&dir, &[0], 1, Some(&varstore)).unwrap();
             let mut engines: BTreeMap<u64, nanobpmn_engine_core::Engine> =
                 recovery.engines.into_iter().collect();
-            let mut j0 =
-                Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer, &[]);
+            let mut j0 = Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
             j0.set_exporter(export_tx.clone(), Arc::new(AtomicU64::new(0)));
             j0.set_varstore(Arc::clone(&varstore));
             let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
@@ -8289,6 +8205,72 @@ mod tests {
         );
 
         drop(journal);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608 (adversarial review): a snapshot taken AFTER the supersede
+    // committed but BEFORE the retry — so the supersede survives only in the
+    // compacted prefix — must still carry the pending report. A tail scan
+    // misses it; the replicated `pending_orphan_supersedes` state does not.
+    // Adopting it onto a journal with NO surviving tail (a fresh replica, or
+    // another partition sharing the segment) re-parks exactly this report.
+    #[test]
+    fn superseded_orphan_report_survives_a_snapshot_covering_the_supersede() {
+        let path = restart_store_path("orphan-supersede-snapshot-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        journal.set_orphan_sink(Arc::new(RecordingSink::default()));
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (_events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        let snap = journal.engine_snapshot();
+        drop(journal);
+
+        // A tail-less receiver: nothing but the snapshot survives.
+        let mut receiver = Journal::in_memory();
+        receiver.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        receiver.set_orphan_sink(sink.clone());
+        receiver.set_orphan_leadership(true);
+        receiver.restore_engine_from_snapshot(snap);
+        assert_eq!(
+            receiver.orphan_backlog(),
+            vec![keys[0]],
+            "a supersede compacted into the snapshot is still pending"
+        );
+
+        // A partition whose own state holds no pending supersede parks
+        // nothing on adoption, whatever other partitions hold.
+        let mut other = Journal::in_memory_partition(1);
+        other.set_replicated_apply(true);
+        other.set_orphan_leadership(true);
+        let own = other.engine_snapshot();
+        other.restore_engine_from_snapshot(own);
+        assert!(other.orphan_backlog().is_empty(), "no cross-partition park");
+
         drop(store);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -10127,8 +10109,7 @@ mod tests {
                 SharedWriter::open_segmented(&dir, &[0], 1, Some(&varstore)).unwrap();
             let mut engines: BTreeMap<u64, nanobpmn_engine_core::Engine> =
                 recovery.engines.into_iter().collect();
-            let mut j =
-                Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer, &[]);
+            let mut j = Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
             let (export_tx, _export_rx) = std::sync::mpsc::channel::<ExportBatch>();
             j.set_exporter(export_tx, Arc::new(AtomicU64::new(0)));
             let (deploy, c) = j

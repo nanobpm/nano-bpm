@@ -250,7 +250,7 @@ async fn forwarded_publish_persists_operation_reference_on_the_peer() {
             let engine = engines
                 .remove(&p)
                 .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
-            crate::Journal::from_engine_shared(p, engine, true, &writer, &[])
+            crate::Journal::from_engine_shared(p, engine, true, &writer)
         })
         .collect();
     let server = crate::build_server_in_memory(journals, topology);

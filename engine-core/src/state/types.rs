@@ -2600,6 +2600,23 @@ pub struct State {
     /// `serde(default)` alone does not convert an existing numeric value.
     #[cfg_attr(feature = "serde", serde(default))]
     pub variables_lost_quarantined: BTreeMap<Key, VariablesLostTombstone>,
+    /// Loss reports whose stamped quarantine applied SUPERSEDED
+    /// (`Event::OrphanStampSuperseded`) and whose re-stamped retry has not yet
+    /// committed (#1608), keyed by instance with the off-heap tier the report
+    /// was detected against. A **replicated** record — inserted by the
+    /// supersede, cleared by `VariablesLostQuarantined` or the instance's
+    /// terminal event — so it survives every snapshot/compaction checkpoint
+    /// and engine adoption: the host's in-memory orphan backlog is rebuilt from
+    /// it after recovery, so a crash or failover between a supersede and its
+    /// retry never silently drops the loss. `serde(default)` (additive): a
+    /// snapshot written before it deserializes empty.
+    /// Omitted when empty, so a snapshot with nothing pending keeps the
+    /// pre-#1608 shape byte-for-byte.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub pending_orphan_supersedes: BTreeMap<Key, crate::command::OrphanKind>,
     /// The most recent instance keys to reach a terminal state
     /// (`ProcessInstanceCompleted` / `ProcessInstanceTerminated`), oldest
     /// first, bounded by [`RECENTLY_TERMINATED_CAP`] (#1574 review). A
@@ -2733,6 +2750,8 @@ impl State {
             self.recently_terminated.pop_front();
         }
         self.recently_terminated.push_back(instance_key);
+        // #1608: a terminal instance's pending loss report no longer matters.
+        self.pending_orphan_supersedes.remove(&instance_key);
         self.terminal_epoch += 1;
         if let Some(instance) = self.instances.get_mut(&instance_key) {
             instance.terminated_epoch = self.terminal_epoch;

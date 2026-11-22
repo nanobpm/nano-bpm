@@ -17,6 +17,8 @@ mod console_api;
 mod consumers;
 mod falcon;
 mod mcp;
+#[cfg(test)]
+mod optional_body_guard;
 #[cfg(feature = "console")]
 mod provisioning;
 mod query;
@@ -31113,23 +31115,12 @@ async fn main() {
                     let recovered = !recovery.fresh;
                     let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
                         recovery.engines.into_iter().collect();
-                    // #1608: each partition's surviving tail (its tagged events)
-                    // feeds the orphan-backlog rebuild — a superseded report
-                    // whose retry never committed is re-parked, not lost.
-                    let mut tails: std::collections::HashMap<
-                        u64,
-                        Vec<nanobpmn_engine_core::Event>,
-                    > = std::collections::HashMap::new();
-                    for (tag, event) in &recovery.tagged {
-                        tails.entry(*tag).or_default().push(event.clone());
-                    }
                     let journals: Vec<Journal> = (0..partitions as u64)
                         .map(|p| {
                             let engine = engines
                                 .remove(&p)
                                 .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
-                            let tail = tails.remove(&p).unwrap_or_default();
-                            Journal::from_engine_shared(p, engine, !recovered, &shared, &tail)
+                            Journal::from_engine_shared(p, engine, !recovered, &shared)
                         })
                         .collect();
                     (journals, recovered, read_model)
@@ -31230,24 +31221,13 @@ async fn main() {
                     let recovered = !recovery.fresh;
                     let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
                         recovery.engines.into_iter().collect();
-                    // #1608: each partition's surviving tail (its tagged events)
-                    // feeds the orphan-backlog rebuild — a superseded report
-                    // whose retry never committed is re-parked, not lost.
-                    let mut tails: std::collections::HashMap<
-                        u64,
-                        Vec<nanobpmn_engine_core::Event>,
-                    > = std::collections::HashMap::new();
-                    for (tag, event) in &recovery.tagged {
-                        tails.entry(*tag).or_default().push(event.clone());
-                    }
                     let journals: Vec<Journal> = owned
                         .iter()
                         .map(|&p| {
                             let engine = engines
                                 .remove(&p)
                                 .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
-                            let tail = tails.remove(&p).unwrap_or_default();
-                            Journal::from_engine_shared(p, engine, !recovered, &shared, &tail)
+                            Journal::from_engine_shared(p, engine, !recovered, &shared)
                         })
                         .collect();
                     (journals, recovered, read_model)
@@ -52119,7 +52099,7 @@ mod subscription_placement_tests {
                 let engine = engines
                     .remove(&p)
                     .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
-                Journal::from_engine_shared(p, engine, true, &writer, &[])
+                Journal::from_engine_shared(p, engine, true, &writer)
             })
             .collect();
         let server = build_server_in_memory(journals, topology);

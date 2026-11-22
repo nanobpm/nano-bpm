@@ -337,6 +337,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             incident_key,
             episode,
         } => {
+            state.pending_orphan_supersedes.remove(instance_key);
             state.variables_lost_quarantined.insert(
                 *instance_key,
                 crate::state::types::VariablesLostTombstone {
@@ -346,10 +347,19 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             );
         }
 
-        // A superseded orphan stamp (#1587 review) carries no state change —
-        // it only journals the replica-deterministic decision so the leader's
-        // journal re-enqueues the still-pending report. Nothing to apply.
-        Event::OrphanStampSuperseded { .. } => {}
+        // A superseded orphan stamp (#1587 review) journals the
+        // replica-deterministic decision so the leader's journal re-enqueues
+        // the still-pending report.
+        // #1608: it does record the report as durably pending, so the host
+        // rebuilds its orphan backlog from replicated state after recovery.
+        Event::OrphanStampSuperseded {
+            instance_key, kind, ..
+        } => {
+            state.pending_orphan_supersedes.insert(
+                *instance_key,
+                kind.unwrap_or(crate::command::OrphanKind::Resident),
+            );
+        }
 
         Event::ProcessInstanceCompleted { instance_key } => {
             state.note_terminated(*instance_key);
@@ -817,5 +827,83 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         // there is no local state to mutate here.
         Event::StartInstanceDispatched { .. } => {}
         _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod pending_orphan_supersede_tests {
+    use crate::command::OrphanKind;
+    use crate::state::{apply, State};
+    use crate::Event;
+
+    // #1608: the pending-supersede set is REPLICATED state, so it survives a
+    // snapshot (unlike a tail scan, which misses a supersede compacted into
+    // the snapshot) and is settled only by a quarantine or a terminal event.
+    #[test]
+    fn supersede_is_recorded_and_settled_by_quarantine_or_terminal() {
+        let mut state = State::default();
+        for key in [10, 20, 30] {
+            apply(
+                &mut state,
+                &Event::OrphanStampSuperseded {
+                    instance_key: key,
+                    episode: 1,
+                    kind: Some(OrphanKind::Cold),
+                },
+            );
+        }
+        // A legacy frame without `kind` defaults to Resident.
+        apply(
+            &mut state,
+            &Event::OrphanStampSuperseded {
+                instance_key: 40,
+                episode: 1,
+                kind: None,
+            },
+        );
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 1,
+            },
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 20 },
+        );
+        let pending: Vec<_> = state
+            .pending_orphan_supersedes
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        assert_eq!(
+            pending,
+            vec![(30, OrphanKind::Cold), (40, OrphanKind::Resident)]
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn pending_supersedes_survive_a_snapshot_round_trip() {
+        let mut state = State::default();
+        apply(
+            &mut state,
+            &Event::OrphanStampSuperseded {
+                instance_key: 7,
+                episode: 3,
+                kind: Some(OrphanKind::Cold),
+            },
+        );
+        let json = serde_json::to_string(&state).expect("serialize");
+        let back: State = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.pending_orphan_supersedes,
+            state.pending_orphan_supersedes
+        );
+        // Empty set keeps the pre-#1608 snapshot shape (field omitted).
+        let empty = serde_json::to_string(&State::default()).expect("serialize");
+        assert!(!empty.contains("pending_orphan_supersedes"));
     }
 }
