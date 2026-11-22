@@ -27,7 +27,10 @@ import {
   loadCorpus,
   caseRecord,
   unexplained,
-  MAX_GATEWAYS
+  MAX_GATEWAYS,
+  issueBody,
+  corpusIdentity,
+  uncommittedIssues
 } from './fuzz.mjs'
 import { prng } from '../traces/fuzz/generate.mjs'
 
@@ -271,4 +274,28 @@ test('stepSignatures / commandSignature fail closed on an unknown op', () => {
   assert.throws(() => stepSignatures([{ op: 'teleport' }]), /unknown scenario step op/)
   assert.throws(() => commandSignature({ id: 'g' }, { op: 'teleport' }), /unknown command op/)
   assert.deepEqual(stepSignatures([{ op: 'setVariables', variables: {} }, { op: 'advanceTime', ms: 1 }, { op: 'cancelInstance' }]), ['tick', 'cancel'])
+})
+
+// M8 fuzz triage: every filed finding must have a committed reproducer. #1753–
+// #1758 were filed claiming "committed in fuzz-corpus.json" from a run whose
+// corpus diff never landed, so nothing replayed them. Triaged duplicates are
+// aliased to the issue whose committed case (same graph, same seed) covers them.
+export const TRIAGED_FUZZ_ISSUES = ['#1753', '#1754', '#1755', '#1756', '#1758']
+export const TRIAGE_ALIASES = { '#1753': '#1693', '#1754': '#1675' }
+
+test('every triaged fuzz issue has a committed reproducer (or an alias that does)', () => {
+  assert.deepEqual(uncommittedIssues(TRIAGED_FUZZ_ISSUES, loadCorpus(), TRIAGE_ALIASES), [])
+})
+
+test('uncommittedIssues reports a filed finding absent from the corpus', () => {
+  const cases = [{ issue: '#1' }, { issue: '#2' }]
+  assert.deepEqual(uncommittedIssues(['#1', '#3', '#4'], cases, { '#4': '#2' }), ['#3'])
+})
+
+test('issueBody states the commit obligation and carries the corpus identity', () => {
+  const c = loadCorpus()[0]
+  const body = issueBody(c)
+  assert.doesNotMatch(body, /committed in `formal\/corpus\/fuzz-corpus.json`/)
+  assert.match(body, /NOT guarded until that corpus diff is committed/)
+  assert.ok(body.includes(corpusIdentity(c)))
 })

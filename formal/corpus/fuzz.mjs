@@ -403,15 +403,27 @@ export function executionNamer (tag) {
   return (kind) => `${kind}${tag}x${++n}`
 }
 
-function fileIssue (c) {
-  const body = [
+/**
+ * The body of the parity issue filed for committed-to-be case `c`.
+ *
+ * The reproducer is written to the run's WORKING-TREE corpus before the issue
+ * is filed; it is not on `main` until that corpus diff is committed. The body
+ * must not claim otherwise: #1753–#1758 were filed saying "committed in
+ * fuzz-corpus.json" from a run whose corpus diff never landed, so their
+ * reproducers lived only in the issue text and no replay guarded them. The
+ * body therefore states the commit obligation and carries the case identity
+ * (`corpusIdentity`) that `committedIssueCases` checks the corpus against.
+ */
+export function issueBody (c) {
+  return [
     'Found by the differential fuzzer (`formal/corpus/fuzz.mjs`, #1250) and shrunk to a minimal reproducer.',
     '',
     `- signature: \`${c.signature}\``,
     `- run seed: \`${c.seed}\``,
     `- graph: \`${c.graph.id}\` (\`${c.graph.key}\`)`,
+    `- corpus identity: \`${corpusIdentity(c)}\``,
     '',
-    'Reproducer (committed in `formal/corpus/fuzz-corpus.json`):',
+    'Reproducer — recorded in the filing run\'s working-tree `formal/corpus/fuzz-corpus.json`. It is NOT guarded until that corpus diff is committed with `"issue"` set to this issue: commit it (open, or `"fixed": true` once resolved) as part of triage.',
     '',
     '```json',
     JSON.stringify({ skeleton: c.skeleton, scenario: c.scenario, detail: c.detail }, null, 2),
@@ -419,6 +431,24 @@ function fileIssue (c) {
     '',
     'Part of #1240.'
   ].join('\n')
+}
+
+/** The stable identity of a corpus case: its graph key and signature. */
+export const corpusIdentity = (c) => `${c.graph.key}#${c.signature}`
+
+/**
+ * The issues among `issues` (`#N`) that no committed case names — a filed
+ * finding whose reproducer never reached the corpus, so nothing replays it.
+ * `aliases` maps an issue triaged as a duplicate to the issue whose committed
+ * case covers it.
+ */
+export function uncommittedIssues (issues, cases, aliases = {}) {
+  const named = new Set(cases.map((x) => x.issue))
+  return issues.filter((i) => !named.has(aliases[i] ?? i))
+}
+
+function fileIssue (c) {
+  const body = issueBody(c)
   const url = execFileSync('gh', ['issue', 'create', '--title', `parity(fuzz): ${c.signature.slice(0, 180)}`, '--body', body], { encoding: 'utf8' }).trim()
   return `#${url.split('/').pop()}`
 }
