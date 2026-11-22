@@ -1509,8 +1509,8 @@ async fn handle_client_frame(
                 }
             };
             let vars = to_engine_vars(variables);
-            let (message_key, instance) = match server
-                .correlate_message_local(
+            let (message_key, instance, local_failed) = match server
+                .correlate_message_local_tracked(
                     name,
                     correlation_key,
                     vars,
@@ -1538,7 +1538,10 @@ async fn handle_client_frame(
             server.signal_jobs_available();
             conn.send(ServerFrame::CommandResult {
                 corr,
-                status: 200,
+                // A failed local apply is ambiguous (it may have committed under
+                // a key it never returned): never a 200, or the originator would
+                // treat it as a no-op and re-send unkeyed (PR #1786 review).
+                status: crate::publish_peer_reply_status(local_failed),
                 body: Some(serde_json::json!({
                     // `None` only when this peer owns no target partition, which
                     // the fan-out never targets; serialised as JSON null so the

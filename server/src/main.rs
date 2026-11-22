@@ -10723,7 +10723,7 @@ impl ServerImpl {
         business_id: Option<String>,
         only_partitions: Option<&[u64]>,
         operation_reference: Option<i64>,
-        mut message_key: Option<u64>,
+        message_key: Option<u64>,
     ) -> Result<(Vec<Event>, bool), EngineError> {
         // Reject an out-of-range business id before touching any partition, with
         // the engine's own rule: one partition must not apply the publish while
@@ -10744,20 +10744,7 @@ impl ServerImpl {
             targets.retain(|p| only.contains(p));
         }
 
-        let mut all_events: Vec<Event> = Vec::new();
-        let mut failed = false;
-        for target in targets {
-            if !publish_fanout_may_send(message_key, failed) {
-                // An earlier target failed after possibly committing under a
-                // key we never learned: an unkeyed apply here would mint a
-                // second identity for the same publication (#1434).
-                break;
-            }
-            // Skip a target this node does not own; the cluster broadcast routes
-            // the publish to the owning node, which correlates it locally.
-            // Under Raft "owns" means "currently LEADS": the publish is proposed
-            // through the target partition's replicated log (#1307), and the
-            // cluster fan-out reaches the leader node when it is a peer.
+        let (all_events, failed) = apply_publish_targets(targets, message_key, |target, key| {
             let command = Command::CorrelateMessage {
                 message_name: name.clone(),
                 correlation_key: correlation_key.clone(),
@@ -10766,27 +10753,11 @@ impl ServerImpl {
                 // One publication, one key (#1434): the first applied target
                 // mints it (unless the cluster fan-out already did), every
                 // later target reuses it.
-                message_key,
+                message_key: key,
             };
-            match self
-                .apply_routed_command(target, command, operation_reference)
-                .await
-            {
-                RoutedApply::Applied(events) => {
-                    if message_key.is_none() {
-                        message_key = message_key_of(&events);
-                    }
-                    all_events.extend(events)
-                }
-                RoutedApply::NotHere => {}
-                RoutedApply::Failed(status, message) => {
-                    failed = true;
-                    tracing::warn!(
-                        "message correlation on partition {target} failed ({status}): {message}"
-                    );
-                }
-            }
-        }
+            self.apply_routed_command(target, command, operation_reference)
+        })
+        .await;
         // Drive the token advance for any subscription whose instance lives on
         // another partition (the publish settled it here via
         // `RemoteMessageCorrelation`), plus any start-instance dispatch a
@@ -10813,6 +10784,7 @@ impl ServerImpl {
     /// every local target (the legacy behaviour). `operation_reference` is the
     /// publishing request's `operationReference` (#1600), threaded through to
     /// every record the publish produces here.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn correlate_message_local(
         &self,
@@ -10840,7 +10812,7 @@ impl ServerImpl {
     /// [`Self::correlate_message_local`], additionally reporting whether a
     /// local apply failed (see [`Self::correlate_message_everywhere_tracked`]).
     #[allow(clippy::too_many_arguments)]
-    async fn correlate_message_local_tracked(
+    pub(crate) async fn correlate_message_local_tracked(
         &self,
         name: String,
         correlation_key: String,
@@ -59706,6 +59678,55 @@ fn publish_fanout_should_retry(
     remote_targets > 0 && !delivered && !ambiguous && attempt < max_attempts
 }
 
+/// Applies a publish to each local `targets` partition in order, threading the
+/// publication's key (#1434). Once a target FAILS without a known key, it may
+/// have exported records under a key it never returned, so no later target is
+/// applied unkeyed (that would mint a second identity). Returns the produced
+/// events and whether any target failed. Skipping a target this node does not
+/// lead (`NotHere`) is not a failure: the cluster fan-out reaches its leader.
+async fn apply_publish_targets<F, Fut>(
+    targets: Vec<u64>,
+    mut message_key: Option<u64>,
+    mut apply: F,
+) -> (Vec<Event>, bool)
+where
+    F: FnMut(u64, Option<u64>) -> Fut,
+    Fut: std::future::Future<Output = RoutedApply>,
+{
+    let mut all_events: Vec<Event> = Vec::new();
+    let mut failed = false;
+    for target in targets {
+        if !publish_fanout_may_send(message_key, failed) {
+            break;
+        }
+        match apply(target, message_key).await {
+            RoutedApply::Applied(events) => {
+                if message_key.is_none() {
+                    message_key = message_key_of(&events);
+                }
+                all_events.extend(events)
+            }
+            RoutedApply::NotHere => {}
+            RoutedApply::Failed(status, message) => {
+                failed = true;
+                tracing::warn!(
+                    "message correlation on partition {target} failed ({status}): {message}"
+                );
+            }
+        }
+    }
+    (all_events, failed)
+}
+
+/// The status a peer's `PublishMessage` handler answers with. A failed local
+/// apply may have committed under a key it never returned, so the reply must
+/// NOT be a 200 (which the originator reads, when keyless, as a known
+/// non-leader no-op and would re-send unkeyed): a 503 marks the send ambiguous
+/// on the originator, ending the unkeyed fan-out (PR #1786 review).
+pub(crate) fn publish_peer_reply_status(local_failed: bool) -> u16 {
+    if local_failed { 503 } else { 200 }
+}
+
 /// Whether the fan-out may send to the next peer. Once an outcome is
 /// ambiguous (the peer may have committed) and no key is known, a further send
 /// would carry no key, so the receiver mints a fresh one that cannot locate the
@@ -59730,17 +59751,55 @@ mod publish_fanout_retry_tests {
         );
     }
 
-    #[test]
-    fn a_failed_unkeyed_local_apply_blocks_every_later_target() {
-        // PR #1786 review: a failed local apply may have exported records under
-        // a key it never returned; the local target loop and the peer fan-out
-        // both seed their ambiguity from it, so no unkeyed send follows.
-        use super::publish_fanout_may_send as may_send;
-        let local_failed = true;
-        assert!(!may_send(None, local_failed));
+    #[tokio::test]
+    async fn a_failed_unkeyed_local_apply_blocks_every_later_target() {
+        // PR #1786 review: drive the real target loop with a first target that
+        // FAILS; no later target may be applied (it would be unkeyed).
+        use super::{RoutedApply, apply_publish_targets};
+        let mut applied = Vec::new();
+        let (events, failed) = apply_publish_targets(vec![3, 0], None, |target, key| {
+            applied.push((target, key));
+            std::future::ready(if target == 3 {
+                RoutedApply::Failed(503, "not durable".into())
+            } else {
+                RoutedApply::Applied(Vec::new())
+            })
+        })
+        .await;
+        assert!(failed);
+        assert!(events.is_empty());
+        assert_eq!(applied, vec![(3, None)], "no unkeyed apply after a failure");
         assert!(
-            !retry(1, false, local_failed, 1, 8),
+            !retry(1, false, failed, 1, 8),
             "a failed local apply must not trigger a republish"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyed_publish_continues_past_a_failed_target() {
+        use super::{RoutedApply, apply_publish_targets};
+        let mut applied = Vec::new();
+        let (_, failed) = apply_publish_targets(vec![3, 0], Some(9), |target, key| {
+            applied.push((target, key));
+            std::future::ready(if target == 3 {
+                RoutedApply::Failed(503, "x".into())
+            } else {
+                RoutedApply::Applied(Vec::new())
+            })
+        })
+        .await;
+        assert!(failed);
+        assert_eq!(applied, vec![(3, Some(9)), (0, Some(9))]);
+    }
+
+    #[test]
+    fn a_peer_with_a_failed_local_apply_never_answers_200() {
+        use super::publish_peer_reply_status as status;
+        assert_eq!(status(false), 200);
+        assert_ne!(
+            status(true),
+            200,
+            "a keyless 200 reads as a known no-op and invites an unkeyed re-send"
         );
     }
 
