@@ -1232,6 +1232,13 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-xwin
+      # Restore cargo-xwin's ~1.5 GB CRT/SDK download from the Actions cache so
+      # a Microsoft aka.ms outage cannot fail this required gate on a cold cache
+      # (the same defect class as the uncached libduckdb #1461 / openapi-generator
+      # #1684 downloads). Must run AFTER the install: the key derives from the
+      # resolved cargo-xwin version.
+      - name: cargo-xwin CRT/SDK (cached)
+        uses: ./.github/actions/xwin-cache
       # Link the prebuilt DuckDB from the Actions cache via DUCKDB_LIB_DIR
       # (which libduckdb-sys prefers over DUCKDB_DOWNLOAD_LIB), so a GitHub
       # Releases outage cannot fail this gate on a warm cache (#1461). The lib
@@ -1297,6 +1304,13 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-xwin
+      # Restore cargo-xwin's ~1.5 GB CRT/SDK download from the Actions cache so
+      # a Microsoft aka.ms outage cannot fail this required gate on a cold cache
+      # (the same defect class as the uncached libduckdb #1461 / openapi-generator
+      # #1684 downloads). Must run AFTER the install: the key derives from the
+      # resolved cargo-xwin version.
+      - name: cargo-xwin CRT/SDK (cached)
+        uses: ./.github/actions/xwin-cache
       - name: Restore the cached openapi-generator JAR (#1684)
         uses: ./.github/actions/openapi-generator-cache
       - name: Generate REST layer + stub impls

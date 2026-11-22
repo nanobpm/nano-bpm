@@ -41,6 +41,13 @@ export function violations({ name, body }) {
   if (/DUCKDB_DOWNLOAD_LIB/.test(body) && !/uses:\s*\.\/\.github\/actions\/libduckdb\b/.test(body)) {
     bad.push(`${name}: sets DUCKDB_DOWNLOAD_LIB without ./.github/actions/libduckdb (uncached libduckdb download)`);
   }
+  // #1372: the `xwin` clippy-matrix entries make cargo-xwin download ~1.5 GB of
+  // Microsoft CRT/SDK (aka.ms) per cold run. Any job that installs cargo-xwin
+  // must restore it from the Actions cache, so an aka.ms outage cannot fail a
+  // required gate on a warm cache.
+  if (/tool:\s*cargo-xwin\b/.test(body) && !/uses:\s*\.\/\.github\/actions\/xwin-cache\b/.test(body)) {
+    bad.push(`${name}: installs cargo-xwin without ./.github/actions/xwin-cache (uncached CRT/SDK download)`);
+  }
   // #1684: the openapi-generator JAR came from a live Maven Central fetch per
   // run. Any job that runs codegen — directly or via a Makefile target whose
   // prerequisites regenerate generated/ — must restore the cached JAR.
@@ -58,8 +65,8 @@ function scan() {
   const wf = join(root, '.github', 'workflows');
   for (const f of readdirSync(wf)) out.push(...units(f, readFileSync(join(wf, f), 'utf8')));
   const actions = join(root, '.github', 'actions');
-  // The two caching composites are the canonical providers; they may name what they cache.
-  for (const d of readdirSync(actions).filter((d) => !['libduckdb', 'wasm-pack-cache', 'openapi-generator-cache'].includes(d))) {
+  // The caching composites are the canonical providers; they may name what they cache.
+  for (const d of readdirSync(actions).filter((d) => !['libduckdb', 'wasm-pack-cache', 'openapi-generator-cache', 'xwin-cache'].includes(d))) {
     const p = join(actions, d, 'action.yml');
     if (existsSync(p)) out.push({ name: `actions/${d}`, body: code(readFileSync(p, 'utf8')) });
   }
@@ -71,11 +78,12 @@ test('no workflow job or composite action does an uncached Releases download', (
 });
 
 test('the guard catches the defect class', () => {
-  const wf = `on: push\njobs:\n  a:\n    steps:\n      - run: make console-wasm\n  b:\n    env:\n      DUCKDB_DOWNLOAD_LIB: '1'\n    steps:\n      - run: cargo test\n  c:\n    steps:\n      - uses: ./.github/actions/wasm-pack-cache\n      - run: make console-wasm\n  d:\n    steps:\n      - run: make generate\n  e:\n    steps:\n      - uses: ./.github/actions/openapi-generator-cache\n      - run: ./scripts/generate-console.sh\n  f:\n    steps:\n      - run: make generate-app-manifest\n`;
+  const wf = `on: push\njobs:\n  a:\n    steps:\n      - run: make console-wasm\n  b:\n    env:\n      DUCKDB_DOWNLOAD_LIB: '1'\n    steps:\n      - run: cargo test\n  c:\n    steps:\n      - uses: ./.github/actions/wasm-pack-cache\n      - run: make console-wasm\n  d:\n    steps:\n      - run: make generate\n  e:\n    steps:\n      - uses: ./.github/actions/openapi-generator-cache\n      - run: ./scripts/generate-console.sh\n  f:\n    steps:\n      - run: make generate-app-manifest\n  g:\n    steps:\n      - uses: taiki-e/install-action@v2\n        with:\n          tool: cargo-xwin\n  h:\n    steps:\n      - uses: taiki-e/install-action@v2\n        with:\n          tool: cargo-xwin\n      - uses: ./.github/actions/xwin-cache\n`;
   assert.deepEqual(units('w.yml', wf).flatMap(violations), [
     'w.yml job a: runs wasm-pack without ./.github/actions/wasm-pack-cache (uncached binaryen/wasm-bindgen download)',
     'w.yml job b: sets DUCKDB_DOWNLOAD_LIB without ./.github/actions/libduckdb (uncached libduckdb download)',
     'w.yml job d: runs openapi-generator codegen without ./.github/actions/openapi-generator-cache (uncached Maven Central download)',
+    'w.yml job g: installs cargo-xwin without ./.github/actions/xwin-cache (uncached CRT/SDK download)',
   ]);
 });
 
