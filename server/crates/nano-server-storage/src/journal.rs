@@ -9584,6 +9584,122 @@ mod tests {
         }
     }
 
+    /// #1504 review regression: a replicated deployment whose events arrive in
+    /// more than one ordered batch must not leave a window where an instance
+    /// can reach a deployment-bound user task before its form is installed.
+    /// The live broadcast therefore ships the whole deployment as ONE atomic
+    /// `InstallDeployment` frame (admission rejects any deployment whose
+    /// events sum past the frame budget, so a live deployment is never split).
+    /// This test does NOT observe the broadcast's one-frame-per-peer shape
+    /// (that is guarded by the aggregate admission test
+    /// `many_resources_summing_past_frame_budget_are_rejected` in the server);
+    /// it drives the batch boundaries directly to document the failure mode
+    /// the atomic install forecloses, and that the split case still recovers:
+    /// with the process batch installed
+    /// first, an instance created in the gap parks on the form-binding
+    /// incident; once the form batch lands, resolving the incident redrives
+    /// the activation body and the task is created with the resolved form key.
+    #[test]
+    fn install_deployment_durable_ref_stages_batches_until_the_whole_deployment_lands() {
+        use nanobpmn_engine_core::ProcessBuilder;
+        use nanobpmn_engine_core::UserTaskProps;
+
+        // A user task bound to its form by DEPLOYMENT binding: the form must
+        // arrive in the same deployment, so a process-only first batch parks
+        // the task with a resolvable incident instead of creating it.
+        let def = ProcessBuilder::new("staged")
+            .start_event("start")
+            .user_task_with(
+                "review",
+                UserTaskProps {
+                    form_id: Some("review-form".to_string()),
+                    form_binding_type: nanobpmn_engine_core::BindingType::Deployment,
+                    ..Default::default()
+                },
+            )
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .expect("valid process");
+
+        let mut source = Journal::in_memory();
+        let (process_events, _) = source
+            .apply_command(Command::DeployProcess(def))
+            .expect("process deploys");
+        let process_definition_key = process_events
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessDeployed {
+                    process_definition_key,
+                    ..
+                } => Some(*process_definition_key),
+                _ => None,
+            })
+            .expect("a process definition key is minted");
+        // The replicated form event carries the SAME deployment key as the
+        // process (one deployment, minted once on the owner): this is what a
+        // real `DeployBundle` broadcast ships, split across batches.
+        let form_events: Vec<Event> = vec![Event::FormDeployed {
+            deployment_key: 1,
+            form_key: process_definition_key + 1,
+            version: 1,
+            form_id: "review-form".to_string(),
+            resource_name: "review-form.form".to_string(),
+            schema: r#"{"id":"review-form","type":"default","components":[]}"#.to_string(),
+            version_tag: None,
+        }];
+        let form_key = process_definition_key + 1;
+
+        // The peer: batch 1 (the process) lands first; the instance created in
+        // the gap parks on the form-binding incident (no task yet).
+        let mut peer = Journal::in_memory();
+        peer.install_deployment_durable(&process_events)
+            .blocking_wait();
+        let (created, _) = peer
+            .apply_command(Command::create_instance("staged"))
+            .expect("instance creates");
+        assert!(
+            created
+                .iter()
+                .any(|e| matches!(e, Event::IncidentRaised { .. })),
+            "the deployment-binding miss raises a resolvable incident"
+        );
+        assert!(
+            !created
+                .iter()
+                .any(|e| matches!(e, Event::UserTaskCreated { .. })),
+            "no task exists before the form batch lands"
+        );
+
+        // Batch 2 (the form) lands; resolving the incident redrives the
+        // activation body, which now resolves the form key.
+        peer.install_deployment_durable(&form_events)
+            .blocking_wait();
+        let incident_key = created
+            .iter()
+            .find_map(|e| match e {
+                Event::IncidentRaised { incident_key, .. } => Some(*incident_key),
+                _ => None,
+            })
+            .expect("an incident key");
+        let (resolved, _) = peer
+            .apply_command(Command::ResolveIncident { incident_key })
+            .expect("the incident resolves");
+        let created_task = resolved
+            .iter()
+            .find_map(|e| match e {
+                Event::UserTaskCreated {
+                    user_task_key,
+                    form_key: Some(k),
+                    ..
+                } => Some((*user_task_key, *k)),
+                _ => None,
+            })
+            .expect("the redriven activation creates the task with a resolved form");
+        assert_eq!(created_task.1, form_key);
+    }
+
     /// Tagged (shared multi-partition writer, `<partition>\t<json>` lines)
     /// variant of the above.
     #[test]
