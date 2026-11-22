@@ -563,7 +563,7 @@ ${flowExamples()}
     step, or per run.</p>
     <p>We run nano-coder because it is optimised for size. It is a coding agent written in ${esc(nanoCoderFacts().language)}, built to be the
     worker your graphs fan out. Node-based agent CLIs take ${esc(nanoCoderFacts().nodeRss)} apiece;
-    nano-coder takes ${esc(nanoCoderFacts().rss)}, so a laptop runs a fleet instead of a handful.
+    nano-coder takes ${esc(nanoCoderFacts().rssQualified)}, so a laptop runs a fleet instead of a handful.
     Interactive in your terminal, or headless over ACP as a flow's agent step.</p>
     ${installCommand("Install nano-coder with npm", nanoCoderFacts().install)}
     ${installCommand("Install nano-coder with Homebrew", nanoCoderFacts().brew)}
@@ -1049,7 +1049,7 @@ function architectureHtml() {
         "hires any supported harness — " +
         agentHarnesses().filter((h) => h !== "nano-coder").join(", ") +
         " and more — and you can mix them in one fleet. nano-coder is the purpose-built option: " +
-        `an agent written in ${nanoCoderFacts().language} at ${nanoCoderFacts().rss} resident memory, so a laptop can host a dense fleet, ` +
+        `an agent written in ${nanoCoderFacts().language} at ${nanoCoderFacts().rssQualified} memory, so a laptop can host a dense fleet, ` +
         "running interactively or headless over ACP.",
       descLink: { text: "nano-coder", href: "/nano-coder/" },
       tags: agentHarnesses(),
@@ -1324,7 +1324,7 @@ function blogPosts() {
       dek:
         "When a graph fans out ten coding agents, the agent's footprint becomes the fleet's " +
         `ceiling. nano-coder is a coding agent written in ${nanoCoderFacts().language} that runs in ` +
-        `about ${nanoCoderFacts().rss.replace(/^~/, "")}, so the ceiling moves.`,
+        `about ${nanoCoderFacts().rssQualified} of memory, so the ceiling moves.`,
       body: nanoCoderPostBody,
     },
     {
@@ -1412,6 +1412,10 @@ function nanoCoderFacts() {
     language: "D",
     platforms: "macOS and Linux (x64, arm64)",
     rss: "~4MB",
+    // The README qualifies the ~4MB figure as a peak footprint measured on macOS,
+    // not unqualified resident memory. Use this qualified form wherever the memory
+    // claim is stated as a measurement, so pages don't overstate the number.
+    rssQualified: "~4MB (peak footprint on macOS)",
     nodeRss: "150–660MB",
     repo: "https://github.com/nanobpm/nano-coder",
   };
@@ -1422,7 +1426,7 @@ function nanoCoderFacts() {
 function nanoCoderHtml() {
   const F = nanoCoderFacts();
   const FEATURES = [
-    [`${F.rss} resident memory`, `Written in ${F.language}. Node-based agent CLIs take ${F.nodeRss}; nano-coder lets you run a dense fleet of workers on one laptop.`],
+    [`${F.rssQualified} memory`, `Written in ${F.language}. Node-based agent CLIs take ${F.nodeRss}; nano-coder lets you run a dense fleet of workers on one laptop.`],
     ["Interactive or headless", "A streaming terminal REPL with steering and queued prompts — or headless over ACP (JSON-RPC 2.0 on stdio) as a Nano Workforce worker."],
     ["Bring your own model", "OpenAI-compatible and Anthropic endpoints, remote or local, selected per model as <code>provider/model</code>."],
     ["Survives long tasks", "Task plans live outside the conversation, so work survives compaction, resume and a change of worker. Sessions are append-only JSONL."],
@@ -1507,7 +1511,7 @@ ${post.body()}
 function nanoCoderPostBody() {
   const F = nanoCoderFacts();
   return `  <p class="post-note"><strong>Update:</strong> nano-coder 1.0 is a rewrite in ${esc(F.language)}, at
-  ${esc(F.rss)} resident memory, and installs through npm or Homebrew. The figures below are current.</p>
+  ${esc(F.rssQualified)} memory, and installs through npm or Homebrew. The figures below are current.</p>
   <p>Nano Workforce turns software delivery into durable graphs: plan, implement, review,
   test, merge. The interesting graphs fan out — ten slices of an epic, each with its own coding
   agent, each looping through review until it converges. At that point the question stops being
@@ -1520,7 +1524,7 @@ function nanoCoderPostBody() {
 
   <h2>nano-coder</h2>
   <p><a href="/nano-coder/">nano-coder</a> is a coding agent written in ${esc(F.language)} that runs in
-  ${esc(F.rss)}. It is a complete terminal agent — streaming REPL, tool calling, task plans that survive
+  ${esc(F.rssQualified)} of memory. It is a complete terminal agent — streaming REPL, tool calling, task plans that survive
   compaction, OS sandboxing, <code>AGENTS.md</code> and skills — and it also runs headless over ACP
   (JSON-RPC 2.0 on stdio), which is how Workforce drives it as a durable job worker.</p>
   <p>Because the engine owns durability, the worker doesn't have to: if a nano-coder process dies,
