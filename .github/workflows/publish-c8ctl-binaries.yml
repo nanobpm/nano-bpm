@@ -373,17 +373,29 @@ jobs:
     name: Prune expired determinism allowlist entries
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
+    # Job-level: the workflow default is contents: read, and this job pushes
+    # its pruning branch.
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v5
-        # The PR branches from (and targets) main, not the tag.
+        # The PR branches from (and targets) main, not the tag. The token is
+        # persisted for the push, so prefer the PAT/App token (see GH_TOKEN).
         with:
           ref: main
+          token: ${{ secrets.ALLOWLIST_PRUNE_TOKEN || secrets.GITHUB_TOKEN }}
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
       - name: Open and queue the allowlist pruning PR
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A PR opened (or branch pushed) with GITHUB_TOKEN does not trigger
+          # the required pull_request CI, so the queue could never land it.
+          # ALLOWLIST_PRUNE_TOKEN (a repo-scoped GitHub App token or PAT with
+          # contents + pull-requests write) makes its checks run; without it
+          # the job still opens the PR and a human must re-trigger its CI.
+          GH_TOKEN: ${{ secrets.ALLOWLIST_PRUNE_TOKEN || secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         shell: bash
         run: |
@@ -400,29 +412,46 @@ jobs:
             exit 0
           fi
 
+          # Recovery: an earlier run pushed the branch but failed before
+          # `gh pr create`. Recreating the commit would diverge from the
+          # pushed one (non-fast-forward), so reuse the pushed branch.
+          reuse_branch=false
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "branch ${branch} already pushed; reusing it to open the missing PR"
+            git fetch origin "$branch"
+            git checkout -B "$branch" FETCH_HEAD
+            reuse_branch=true
+          fi
+
           removed="$(node scripts/prune-divergence-allowlist.mjs "$TAG" --write 2>&1 >/dev/null)" || {
             echo "::error::prune-divergence-allowlist.mjs failed: ${removed}"
             exit 1
           }
           echo "${removed}"
-          if git diff --quiet -- "$allowlist"; then
+          if [ "$reuse_branch" = true ]; then
+            # The pushed branch already carries the pruning commit; re-running
+            # the prune over it is a no-op; point the PR body at that commit.
+            removed="(entries removed by the pruning commit already on ${branch})"
+          elif git diff --quiet -- "$allowlist"; then
             echo "no allowlist entries expire at ${TAG}; nothing to prune"
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
-          git add "$allowlist"
-          git commit -s -m "chore(determinism): expire allowlist entries shipped in ${TAG}
+          if [ "$reuse_branch" != true ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -b "$branch"
+            git add "$allowlist"
+            git commit -s -m "chore(determinism): expire allowlist entries shipped in ${TAG}
 
-          The previous-release determinism gate fails on entries whose introduced_in
-          the previous release has reached (check_expiry); ${TAG} just shipped them,
-          so main is red until they are pruned. Opened automatically by the release
-          workflow (#1801). The append-only upgrade-boundaries.json ledger is
-          untouched: expiring an entry never lifts the cluster-join restriction it
-          recorded (#1702)."
-          git push -u origin "$branch"
+            The previous-release determinism gate fails on entries whose introduced_in
+            the previous release has reached (check_expiry); ${TAG} just shipped them,
+            so main is red until they are pruned. Opened automatically by the release
+            workflow (#1801). The append-only upgrade-boundaries.json ledger is
+            untouched: expiring an entry never lifts the cluster-join restriction it
+            recorded (#1702)."
+            git push -u origin "$branch"
+          fi
 
           pr_body="$(mktemp)"
           {

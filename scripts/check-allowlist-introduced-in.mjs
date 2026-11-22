@@ -12,10 +12,9 @@
 // every mismatch.
 
 import { readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkIntroducedIn, nextGatewayRelease } from "./allowlist-version.mjs";
+import { checkIntroducedIn, nextGatewayRelease, releaseTagNames } from "./allowlist-version.mjs";
 import { cargoPackageVersion } from "./release-tags.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -24,18 +23,7 @@ const ALLOWLIST = "engine-core/examples/determinism/divergence-allowlist.json";
 const allowlist = JSON.parse(readFileSync(join(root, ALLOWLIST), "utf8"));
 const workspaceVersion = cargoPackageVersion(readFileSync(join(root, "server/Cargo.toml"), "utf8"));
 
-let tags;
-try {
-  tags = execFileSync("git", ["ls-remote", "--tags", "origin"], { encoding: "utf8", cwd: root })
-    .split("\n")
-    .map((l) => l.match(/refs\/tags\/(.+?)(\^\{\})?$/)?.[1])
-    .filter(Boolean);
-} catch {
-  // Offline / no remote: local tags are a fine approximation for a PR gate.
-  tags = execFileSync("git", ["tag", "--list", "v*"], { encoding: "utf8", cwd: root })
-    .split("\n")
-    .filter(Boolean);
-}
+const tags = releaseTagNames(root);
 
 const expected = nextGatewayRelease({ workspaceVersion, tags });
 const err = checkIntroducedIn(allowlist, expected);

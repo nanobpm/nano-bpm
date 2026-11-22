@@ -132,6 +132,13 @@ prune opens nothing. The append-only `upgrade-boundaries.json` ledger is never
 touched: expiring an allowlist entry never lifts the cluster-join restriction
 it recorded (#1702).
 
+The job authenticates with the `ALLOWLIST_PRUNE_TOKEN` repository secret (a
+repo-scoped GitHub App token or PAT with contents + pull-requests write) when
+set: a PR opened with the default `GITHUB_TOKEN` does not trigger its required
+CI, so without the secret the PR opens but a human must re-trigger its checks
+before it can merge. A re-run after a failed `gh pr create` reuses the
+already-pushed branch.
+
 **If the pruning PR never appears** (the job failed or was skipped): run the
 prune by hand from a clean `main` and open the PR yourself:
 

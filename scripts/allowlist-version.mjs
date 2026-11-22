@@ -20,6 +20,8 @@
  * `vMAJOR.MINOR.PATCH` (leading `v` optional) as a comparable triple, or null.
  * Mirrors compare.rs `parse_release`.
  */
+import { execFileSync } from "node:child_process";
+
 export function parseRelease(tag) {
   const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(tag).trim());
   if (!m) return null;
@@ -122,4 +124,24 @@ export function pruneAllowlist(allowlist, tag) {
     divergences: (allowlist.divergences ?? []).filter((d) => keep(d, `scenario ${d.scenario} divergence`)),
   };
   return { pruned, removed };
+}
+
+/**
+ * The repository's release tag names — the single tag source for every
+ * `nextGatewayRelease` caller (the CI gate AND its repo-state test), so a
+ * shallow checkout without local tags can't make them disagree. Asks the
+ * remote first (authoritative, independent of checkout depth); falls back to
+ * local tags only when the remote is unreachable.
+ */
+export function releaseTagNames(root) {
+  try {
+    return execFileSync("git", ["ls-remote", "--tags", "origin"], { encoding: "utf8", cwd: root, stdio: ["ignore", "pipe", "pipe"] })
+      .split("\n")
+      .map((l) => l.match(/refs\/tags\/(.+?)(\^\{\})?$/)?.[1])
+      .filter(Boolean);
+  } catch {
+    return execFileSync("git", ["tag", "--list", "v*"], { encoding: "utf8", cwd: root })
+      .split("\n")
+      .filter(Boolean);
+  }
 }

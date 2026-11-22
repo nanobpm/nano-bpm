@@ -19,6 +19,7 @@ import {
   nextGatewayRelease,
   parseRelease,
   pruneAllowlist,
+  releaseTagNames,
 } from "./allowlist-version.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -173,10 +174,10 @@ test("the checked-in allowlist is clean for the CURRENT next gateway release", a
   // The repo-state half of the #1801 gate: with the allowlist empty (post
   // v0.0.28 pruning, #1802) this passes vacuously; the first NEW entry must
   // name the release its PR will ship in. Derived from git tags + the
-  // workspace version, so it needs no network.
-  const tags = execFileSync("git", ["tag", "--list", "v*"], { encoding: "utf8", cwd: root })
-    .split("\n")
-    .filter(Boolean);
+  // workspace version, via the SAME tag source as the CI gate
+  // (releaseTagNames: remote tags first), so a shallow checkout without local
+  // tags can't derive a stale expected version.
+  const tags = releaseTagNames(root);
   const { cargoPackageVersion } = await import("./release-tags.mjs");
   const workspaceVersion = cargoPackageVersion(readFileSync(join(root, "server/Cargo.toml"), "utf8"));
   const expected = nextGatewayRelease({ workspaceVersion, tags });
@@ -192,4 +193,12 @@ test("the pruning job is wired into the tag-triggered gateway release workflow",
   assert.match(wf, /prune-divergence-allowlist\.mjs/);
   assert.match(wf, /chore\/prune-determinism-allowlist-\$\{TAG\}/);
   assert.match(wf, /pull-requests:\s*write/);
+  // The job pushes its branch: it needs contents: write at JOB level (the
+  // workflow default is read-only), or every push is rejected.
+  const job = wf.slice(wf.indexOf("  prune-allowlist:"), wf.indexOf("\n  publish:"));
+  assert.match(job, /permissions:[\s\S]*contents:\s*write/);
+  // A bot-token PR does not trigger required CI; a PAT/App token must be preferred.
+  assert.match(job, /secrets\.ALLOWLIST_PRUNE_TOKEN \|\| secrets\.GITHUB_TOKEN/);
+  // Re-run recovery: an already-pushed branch is reused, not recreated.
+  assert.match(job, /git ls-remote --exit-code --heads origin "\$branch"/);
 });
