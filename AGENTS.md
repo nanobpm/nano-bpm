@@ -137,7 +137,10 @@ crate that is failing it — these are the traps the fleet hit:
   jobs — no extra required check. Locally: `rustup target add
   x86_64-pc-windows-msvc && cargo install --locked cargo-xwin`, then
   `node scripts/clippy-matrix.mjs run --id processos-windows` (or
-  `--id server-windows-all-features`). The matrix guard fails if an MSVC entry
+  `--id server-windows-all-features`). cargo-xwin also needs `clang` and
+  `llvm-lib` on PATH (cc-rs's MSVC archiver) — install the distro `llvm` /
+  `clang` packages (CI does via the build-tools action's `apt: llvm`). The
+  matrix guard fails if an MSVC entry
   does not set `xwin`, or if a new Windows-only site is frozen instead of linted.
 
 ## Long builds and test runs (agent sessions)

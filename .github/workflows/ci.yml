@@ -1219,6 +1219,11 @@ jobs:
         uses: ./.github/actions/build-tools
         with:
           mold: 'true'
+          # `llvm` supplies llvm-lib: cargo-xwin points cc-rs's MSVC archiver
+          # (AR_x86_64_pc_windows_msvc) at it, and the runner image ships only
+          # clang, so the xwin entries fail "failed to find tool llvm-lib"
+          # without it (#1372).
+          apt: llvm
       - uses: taiki-e/install-action@nextest
       - name: Install cargo-xwin (Windows clippy cross-check, #1372)
         # The `xwin` clippy-matrix entries lint the cfg(windows) / not(unix) code
@@ -1279,6 +1284,11 @@ jobs:
         uses: ./.github/actions/build-tools
         with:
           mold: 'true'
+          # `llvm` supplies llvm-lib: cargo-xwin points cc-rs's MSVC archiver
+          # (AR_x86_64_pc_windows_msvc) at it, and the runner image ships only
+          # clang, so the xwin entries fail "failed to find tool llvm-lib"
+          # without it (#1372).
+          apt: llvm
       - uses: taiki-e/install-action@nextest
       - name: Install cargo-xwin (Windows clippy cross-check, #1372)
         # The `xwin` clippy-matrix entries lint the cfg(windows) / not(unix) code
