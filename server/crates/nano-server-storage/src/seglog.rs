@@ -5205,7 +5205,20 @@ mod tests {
     /// broadcast predicate is lost on restart.
     #[test]
     fn clustered_replicated_deployment_recovers_every_resource_kind() {
-        let dir = temp_dir("cluster-deploy-kinds");
+        clustered_deployment_kinds_roundtrip("cluster-deploy-kinds", false);
+    }
+
+    /// #1500 (migration path): the same guarantee when the replicated
+    /// deployments were compacted into the COLD ARCHIVE and the combined
+    /// snapshot is gone, so `recover_multi` migrates by replay and the
+    /// cold-prefix broadcast filter is the only source of the definitions.
+    #[test]
+    fn clustered_replicated_deployment_kinds_survive_cold_archive_migration() {
+        clustered_deployment_kinds_roundtrip("cluster-deploy-kinds-cold", true);
+    }
+
+    fn clustered_deployment_kinds_roundtrip(name: &str, compact_and_migrate: bool) {
+        let dir = temp_dir(name);
         let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
 
         let deploy_events: Vec<Event> = {
@@ -5264,7 +5277,23 @@ mod tests {
             j2.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             let _ = j1.install_deployment_durable(&deploy_events);
             j2.install_deployment(&deploy_events);
-            let _ = j1.snapshot_and_rotate().expect("flush via rotate");
+            let seg = Arc::clone(&recovery.shared);
+            let (snap1, covered1) = j1.snapshot_and_rotate().expect("flush via rotate");
+            if compact_and_migrate {
+                let (snap2, covered2) = j2.snapshot_and_rotate().expect("snapshot p2");
+                write_multi_snapshot(&dir, vec![(1, covered1, snap1), (2, covered2, snap2)])
+                    .expect("write combined snapshot");
+                // `covered` / `exported` are indexed by GLOBAL partition id.
+                assert_eq!(
+                    compact_multi(&seg, &[0, covered1, covered2], &[u64::MAX; 3]),
+                    1
+                );
+                assert!(
+                    cold_archive_span(&dir).unwrap().is_some(),
+                    "replicated deployments archived cold"
+                );
+                fs::remove_file(dir.join(MULTI_SNAP_NAME)).expect("remove combined snapshot");
+            }
         }
 
         let recovery = recover_multi(&dir, &[1, 2], 3, None).expect("reopen clustered");
