@@ -30868,6 +30868,11 @@ mod snapshot_health_tick_tests {
     /// no scheduler assumption. Before this refactor the loop was hard-wired
     /// to `tokio::time::interval` inside a fire-and-forget `tokio::spawn`, so
     /// no test could drive or await it at all.
+    /// Non-zero gauge value no test journal can produce; the sampler tests
+    /// pre-seed it so asserting `quarantined_orphans == 0` proves a tick
+    /// actually wrote the gauge.
+    const QUARANTINE_SENTINEL: u64 = 42;
+
     #[tokio::test]
     async fn storage_sampler_loop_runs_one_sample_per_injected_tick_then_returns() {
         let dir = scratch("sampler-loop-ticks");
@@ -30897,6 +30902,10 @@ mod snapshot_health_tick_tests {
         };
         // The gauges start unset: nothing has sampled yet, and NOTHING will
         // sample until the injected stream yields a tick.
+        // Pre-seed the quarantine gauge with a sentinel the journal cannot
+        // produce, so the post-loop `== 0` proves the tick's actor query
+        // actually ran and overwrote it (not merely the default value).
+        h.set_quarantined_orphans(QUARANTINE_SENTINEL);
         let before = h.report(Instant::now(), &tiny_budget);
         assert_eq!(before.uncompacted_bytes, 0, "no sample before a tick");
         assert_eq!(before.uncompacted_segments, 0, "no sample before a tick");
@@ -30955,6 +30964,8 @@ mod snapshot_health_tick_tests {
             uncompacted_bytes_max: 1,
             ..thresholds()
         };
+        // Sentinel: the tick must overwrite it with the real (zero) count.
+        h.set_quarantined_orphans(QUARANTINE_SENTINEL);
         let (tick_tx, mut tick_rx) = tokio::sync::mpsc::channel::<()>(4);
         // Deterministic per-tick barrier: the loop awaits the tick body BEFORE
         // polling the stream for the next tick, so "the stream was polled
