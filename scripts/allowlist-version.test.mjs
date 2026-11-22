@@ -73,6 +73,11 @@ test("checkIntroducedIn without a committed bump accepts an unreleased label (al
   assert.equal(checkIntroducedIn(allowlist, null, "v0.0.28"), null);
 });
 
+test("bump PR rejects a provisional label the release skipped (v0.0.29 vs v0.1.0)", () => {
+  const allowlist = { observational_variants: [entry("A", "v0.0.29")], divergences: [] };
+  assert.match(checkIntroducedIn(allowlist, "v0.1.0", "v0.0.28"), /next gateway release is v0\.1\.0/);
+});
+
 test("checkIntroducedIn without a committed bump rejects already-shipped and unparseable labels", () => {
   const shipped = { observational_variants: [], divergences: [{ scenario: "s", introduced_in: "v0.0.28" }] };
   assert.match(checkIntroducedIn(shipped, null, "v0.0.28"), /already shipped/);
