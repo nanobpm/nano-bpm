@@ -83,6 +83,42 @@ mod lease_contract_tests {
         assert_eq!(*only_partitions, Some(vec![1]));
     }
 
+    /// #1434: `PublishMessage` gained an additive `messageKey` (the
+    /// publication's pre-minted key). An older frame decodes as `None` (the
+    /// peer mints), and an unset key is not serialized, so the legacy wire
+    /// shape is unchanged.
+    #[test]
+    fn publish_message_message_key_is_additive_on_the_wire() {
+        let old = serde_json::json!({
+            "type": "publishMessage", "corr": 1, "name": "m", "correlationKey": "k"
+        });
+        let frame: ClientFrame = serde_json::from_value(old).unwrap();
+        let ClientFrame::PublishMessage { message_key, .. } = &frame else {
+            panic!("decodes as a publish message");
+        };
+        assert_eq!(*message_key, None);
+        assert!(
+            serde_json::to_value(&frame)
+                .unwrap()
+                .get("messageKey")
+                .is_none()
+        );
+
+        let keyed = serde_json::json!({
+            "type": "publishMessage", "corr": 2, "name": "m", "correlationKey": "k",
+            "messageKey": "2251799813685249"
+        });
+        let frame: ClientFrame = serde_json::from_value(keyed.clone()).unwrap();
+        let ClientFrame::PublishMessage { message_key, .. } = &frame else {
+            panic!("decodes as a publish message");
+        };
+        assert_eq!(message_key.as_deref(), Some("2251799813685249"));
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap().get("messageKey"),
+            keyed.get("messageKey")
+        );
+    }
+
     /// #1600 (#1556 step 4): `PublishMessage`, `RouteSubscription` and
     /// `InstallDeployment` gained an additive `operationReference`. A frame
     /// from an older node (no `operationReference`) still decodes — as `None`,
@@ -496,6 +532,14 @@ pub enum ClientFrame {
         /// (the legacy unreferenced behaviour).
         #[serde(default)]
         operation_reference: Option<i64>,
+        /// The publication's message key, already minted by the gateway or an
+        /// earlier fan-out send (#1434): the peer reuses it on every partition
+        /// it applies, so the whole publication shares the key the client
+        /// received. A decimal string like every other key on the wire.
+        /// Additive: `None` (a frame from a peer predating the field, or a
+        /// first send with no key yet) mints a fresh key on the peer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_key: Option<String>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key process-instance
     /// cancellation to the peer that owns the instance's partition. Answered by a

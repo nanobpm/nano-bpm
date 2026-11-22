@@ -2986,6 +2986,7 @@ fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
             correlation_key: "k".into(),
             variables: BTreeMap::new(),
             business_id: Some(over),
+            message_key: None,
         })
         .unwrap_err();
     assert_eq!(err, too_long);

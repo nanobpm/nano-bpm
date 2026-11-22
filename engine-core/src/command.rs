@@ -459,6 +459,16 @@ pub enum Command {
         /// so commands serialized before the field existed still decode.
         #[cfg_attr(feature = "serde", serde(default))]
         business_id: Option<String>,
+        /// A message key already minted for this publication by another
+        /// partition (#1434). A multi-partition publish fans one
+        /// `CorrelateMessage` out to the correlation-key hash partition AND
+        /// partition 0 (message starts); the host carries the key the FIRST
+        /// applied partition minted onto the others, so every
+        /// `MessagePublished` / correlation record of one publication carries
+        /// the single key the client receives. `None` (and every command
+        /// serialized before the field existed) mints a fresh key here.
+        #[cfg_attr(feature = "serde", serde(default))]
+        message_key: Option<Key>,
     },
     /// Broadcast a signal and correlate it to **every** open subscription whose
     /// signal name matches, across all instances. A signal intermediate catch
@@ -1174,11 +1184,15 @@ impl Command {
                 message_name,
                 correlation_key,
                 business_id,
+                message_key,
                 ..
             } => {
                 h.str(message_name);
                 h.str(correlation_key);
                 h.opt(business_id.as_deref());
+                if let Some(k) = message_key {
+                    h.key(*k);
+                }
             }
             Command::BroadcastSignal { signal_name, .. } => h.str(signal_name),
             Command::OpenMessageSubscription {
@@ -1836,6 +1850,7 @@ impl Command {
             correlation_key: correlation_key.into(),
             variables: BTreeMap::new(),
             business_id: None,
+            message_key: None,
         }
     }
 
@@ -1851,6 +1866,7 @@ impl Command {
             correlation_key: correlation_key.into(),
             variables,
             business_id: None,
+            message_key: None,
         }
     }
 

@@ -190,6 +190,7 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
             None,
             Some(vec![1]),
             None,
+            None,
         )
         .await
         .expect("scoped publish returns a result");
@@ -203,7 +204,15 @@ async fn publish_message_only_partitions_scopes_the_peer_apply() {
 
     // Unscoped (legacy): the publish reaches partition 0 and starts an instance.
     let res = link
-        .publish_message("order-placed".to_string(), order_id, None, None, None, None)
+        .publish_message(
+            "order-placed".to_string(),
+            order_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("unscoped publish returns a result");
     assert_eq!(res.status, 200);
@@ -304,6 +313,7 @@ async fn forwarded_publish_persists_operation_reference_on_the_peer() {
             None,
             None,
             Some(REF),
+            None,
         )
         .await
         .expect("forwarded publish returns a result");
@@ -866,4 +876,105 @@ async fn outbound_link_to_incompatible_binary_is_refused_once_feature_is_require
         .await
         .expect("no requirement yet");
     assert!(!link.supports(F));
+}
+
+/// PR #1786 review (#1434): the publication key must survive the PeerLink +
+/// Falcon hop. A 3-node cluster (one partition per node) where the GATEWAY
+/// (node 2) owns neither target partition of the publish: node 0 (partition
+/// 0, message starts) is sent first and mints the key, which must then ride
+/// the send to node 1 (partition 1, the correlation-key partition) so the
+/// catch correlation recorded there carries the key the client received.
+/// Dropping the forwarded key would let node 1 mint its own, and this fails.
+#[tokio::test]
+async fn cross_node_publish_forwards_one_message_key_to_every_peer() {
+    use nanobpmn_engine_core::ProcessBuilder;
+    // Each peer is served as a self-contained node leading every partition (so
+    // it can deploy and place instances without dialling anyone); the gateway
+    // still addresses node 0 for partition 0 and node 1 for partition 1, and
+    // each peer applies only the partitions that send scopes it to.
+    let standalone = crate::cluster::Topology {
+        node_id: 0,
+        peers: vec!["http://self".into()],
+        num_partitions: 3,
+        replication_factor: 1,
+    };
+    let (n0_base, _n0) = serve_cluster_node(standalone.clone(), 0).await;
+    let (n1_base, n1) = serve_cluster_node(standalone, 0).await;
+
+    // A waiting catch on node 1 whose subscription lives on partition 1 (the
+    // correlation key hashes there).
+    let order_id = (0..)
+        .map(|i| format!("order-{i}"))
+        .find(|k| nanobpmn_engine_core::subscription_partition(k, 3) == 1)
+        .expect("some key hashes to partition 1");
+    let catcher = ProcessBuilder::new("catcher")
+        .start_event("s")
+        .message_intermediate_catch_event("wait", "order-placed", "orderId")
+        .end_event("e")
+        .connect("s", "wait")
+        .connect("wait", "e")
+        .build()
+        .expect("valid catch process");
+    let mut names = std::collections::HashMap::new();
+    names.insert("catcher".to_string(), "catcher.bpmn".to_string());
+    n1.deploy_resources_locally(
+        vec![catcher],
+        &names,
+        Vec::new(),
+        &std::collections::HashMap::new(),
+        "<default>",
+    )
+    .await
+    .expect("deploy the catcher on node 1");
+    let n1_link = PeerLink::connect(&n1_base).await.expect("connect node 1");
+    let mut vars = serde_json::Map::new();
+    vars.insert(
+        "orderId".into(),
+        serde_json::Value::String(order_id.clone()),
+    );
+    let res = n1_link
+        .create_instance(Some("catcher".into()), None, Some(vars))
+        .await
+        .expect("create on node 1");
+    assert_eq!(res.status, 200, "{res:?}");
+
+    // The gateway owns only partition 2: neither target partition.
+    let gateway = crate::build_server_in_memory(
+        vec![crate::Journal::in_memory_partition(2)],
+        crate::cluster::Topology {
+            node_id: 2,
+            ..cluster_topology(vec![n0_base, n1_base, "http://self-unused".into()])
+        },
+    );
+    let mut request = crate::models::MessagePublicationRequest::new("order-placed".to_string());
+    request.correlation_key = Some(order_id);
+    let resp = gateway
+        .publish_message_impl(&request)
+        .await
+        .expect("publish returns");
+    let crate::apis::message::PublishMessageResponse::Status200_TheMessageWasPublished(published) =
+        resp
+    else {
+        panic!("expected a 200 publication, got {resp:?}");
+    };
+    let message_key = published.message_key.0.clone();
+
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        rows = n1
+            .store
+            .correlated_message_subscriptions()
+            .into_iter()
+            .map(|r| r.message_key.to_string())
+            .collect();
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rows.len(), 1, "node 1 correlated the catch: {rows:?}");
+    assert_eq!(
+        rows[0], message_key,
+        "node 1's correlation carries the key the client received"
+    );
 }

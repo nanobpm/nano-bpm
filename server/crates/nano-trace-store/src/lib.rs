@@ -2680,6 +2680,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.clone()))
                     .collect(),
                 business_id: None,
+                message_key: None,
             });
         }
         fn set(&mut self, instance_key: u64, vars: &[(&str, Value)]) {

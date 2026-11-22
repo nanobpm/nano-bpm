@@ -5119,6 +5119,27 @@ mod legacy_demux_tests {
         assert_eq!(demuxed[&2].len(), 1);
     }
 
+    /// PR #1786 review (#1434): a partition-0 message-start correlation may
+    /// carry a message key minted on partition 3 (one key per publication). A
+    /// node owning only partitions 0 and 2 must keep it on partition 0 — the
+    /// shared message key never names the record's owner.
+    #[test]
+    fn legacy_demux_ignores_a_foreign_shared_message_key() {
+        let record = Event::MessageStartEventCorrelated {
+            message_key: nanobpmn_engine_core::compose_key(3, 1),
+            subscription_key: nanobpmn_engine_core::compose_key(0, 1),
+            process_definition_key: nanobpmn_engine_core::compose_key(0, 1),
+            process_id: "p".to_string(),
+            instance_key: nanobpmn_engine_core::compose_key(0, 2),
+            element_id: "s".into(),
+            message_name: "m".to_string(),
+            correlation_key: "c".to_string(),
+        };
+        let demuxed = demux_legacy_shared_log(vec![record], vec![0, 2], 4).expect("demux");
+        assert_eq!(demuxed[&0].len(), 1, "kept on its producing partition");
+        assert!(demuxed[&2].is_empty());
+    }
+
     /// Clustered layout: a keyed event for a partition this node does not own
     /// is dropped (its owner replays it from its own journal).
     #[test]
@@ -5193,7 +5214,7 @@ mod legacy_demux_tests {
 /// resetting every shard and replaying each partition's events into its shard. A
 /// `ProcessDeployed` is partition-agnostic and its key belongs to the deployment
 /// partition (0), which a clustered peer may not own, so it is replayed into
-/// EVERY owned shard; other events route to `partition_of(key)`'s shard.
+/// EVERY owned shard; other events route to their [`Event::owning_partition`]'s shard.
 #[allow(
     clippy::expect_used,
     reason = "startup-only: one-time legacy read-model rebuild during boot; a shard reset/export failure aborts boot deliberately"
@@ -5212,8 +5233,10 @@ fn rebuild_read_model_legacy(
             }
             continue;
         }
-        let p = (nanobpmn_engine_core::partition_of(e.max_key()) as usize)
-            .min(num_partitions.saturating_sub(1)) as u64;
+        // The canonical key-derived owner (shared with the legacy journal
+        // demux): never `partition_of(max_key())`, which a shared foreign
+        // message key (#1434) or a source-minted delivery key would misroute.
+        let p = (e.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64;
         // Colocate a decision instance (and its later deletion) with its owner —
         // the process instance it ran in (so the `process_definition_key` join
         // resolves), or a standalone evaluation's own key — exactly where live
@@ -10768,6 +10791,13 @@ impl ServerImpl {
     /// (#1556 step 4, #1600): stamped on every record each per-partition apply
     /// produces, and carried onward on the routed follow-ups those records
     /// drive (the routing pump below).
+    ///
+    /// `message_key`, when set, is the publication's key already minted on
+    /// another node (#1434); every local target reuses it. When `None`, the
+    /// first locally applied target mints it and the rest reuse that one, so
+    /// all records of one publication carry the key the client receives.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn correlate_message_everywhere(
         &self,
         name: String,
@@ -10776,7 +10806,39 @@ impl ServerImpl {
         business_id: Option<String>,
         only_partitions: Option<&[u64]>,
         operation_reference: Option<i64>,
+        message_key: Option<u64>,
     ) -> Result<Vec<Event>, EngineError> {
+        self.correlate_message_everywhere_tracked(
+            name,
+            correlation_key,
+            variables,
+            business_id,
+            only_partitions,
+            operation_reference,
+            message_key,
+        )
+        .await
+        .map(|(events, _)| events)
+    }
+
+    /// [`Self::correlate_message_everywhere`], additionally reporting whether a
+    /// local target's apply FAILED. A failed write is ambiguous: the write path
+    /// (e.g. a failed legacy journal writer) may already have exported records
+    /// under a key it minted but never returned. So once a target fails with no
+    /// key known, no further target is applied (it would mint a second,
+    /// unrelated key), and the cluster fan-out treats the flag like an
+    /// ambiguous peer outcome (PR #1786 review).
+    #[allow(clippy::too_many_arguments)]
+    async fn correlate_message_everywhere_tracked(
+        &self,
+        name: String,
+        correlation_key: String,
+        variables: std::collections::BTreeMap<String, Value>,
+        business_id: Option<String>,
+        only_partitions: Option<&[u64]>,
+        operation_reference: Option<i64>,
+        message_key: Option<u64>,
+    ) -> Result<(Vec<Event>, bool), EngineError> {
         // Reject an out-of-range business id before touching any partition, with
         // the engine's own rule: one partition must not apply the publish while
         // another rejects it. It is `CorrelateMessage`'s only failure mode, so
@@ -10796,32 +10858,20 @@ impl ServerImpl {
             targets.retain(|p| only.contains(p));
         }
 
-        let mut all_events: Vec<Event> = Vec::new();
-        for target in targets {
-            // Skip a target this node does not own; the cluster broadcast routes
-            // the publish to the owning node, which correlates it locally.
-            // Under Raft "owns" means "currently LEADS": the publish is proposed
-            // through the target partition's replicated log (#1307), and the
-            // cluster fan-out reaches the leader node when it is a peer.
+        let (all_events, failed) = apply_publish_targets(targets, message_key, |target, key| {
             let command = Command::CorrelateMessage {
                 message_name: name.clone(),
                 correlation_key: correlation_key.clone(),
                 variables: variables.clone(),
                 business_id: business_id.clone(),
+                // One publication, one key (#1434): the first applied target
+                // mints it (unless the cluster fan-out already did), every
+                // later target reuses it.
+                message_key: key,
             };
-            match self
-                .apply_routed_command(target, command, operation_reference)
-                .await
-            {
-                RoutedApply::Applied(events) => all_events.extend(events),
-                RoutedApply::NotHere => {}
-                RoutedApply::Failed(status, message) => {
-                    tracing::warn!(
-                        "message correlation on partition {target} failed ({status}): {message}"
-                    );
-                }
-            }
-        }
+            self.apply_routed_command(target, command, operation_reference)
+        })
+        .await;
         // Drive the token advance for any subscription whose instance lives on
         // another partition (the publish settled it here via
         // `RemoteMessageCorrelation`), plus any start-instance dispatch a
@@ -10833,7 +10883,7 @@ impl ServerImpl {
             )
             .await;
         }
-        Ok(all_events)
+        Ok((all_events, failed))
     }
 
     /// Correlates a message across this node's owned partitions and returns the
@@ -10848,6 +10898,8 @@ impl ServerImpl {
     /// every local target (the legacy behaviour). `operation_reference` is the
     /// publishing request's `operationReference` (#1600), threaded through to
     /// every record the publish produces here.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn correlate_message_local(
         &self,
         name: String,
@@ -10856,15 +10908,43 @@ impl ServerImpl {
         business_id: Option<String>,
         only_partitions: Option<Vec<u64>>,
         operation_reference: Option<i64>,
+        message_key: Option<u64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
-        let events = self
-            .correlate_message_everywhere(
+        self.correlate_message_local_tracked(
+            name,
+            correlation_key,
+            variables,
+            business_id,
+            only_partitions,
+            operation_reference,
+            message_key,
+        )
+        .await
+        .map(|(key, instance, _)| (key, instance))
+    }
+
+    /// [`Self::correlate_message_local`], additionally reporting whether a
+    /// local apply failed (see [`Self::correlate_message_everywhere_tracked`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn correlate_message_local_tracked(
+        &self,
+        name: String,
+        correlation_key: String,
+        variables: std::collections::BTreeMap<String, Value>,
+        business_id: Option<String>,
+        only_partitions: Option<Vec<u64>>,
+        operation_reference: Option<i64>,
+        message_key: Option<u64>,
+    ) -> Result<(Option<u64>, Option<u64>, bool), EngineError> {
+        let (events, local_failed) = self
+            .correlate_message_everywhere_tracked(
                 name,
                 correlation_key,
                 variables,
                 business_id,
                 only_partitions.as_deref(),
                 operation_reference,
+                message_key,
             )
             .await?;
         let message_key = message_key_of(&events);
@@ -10877,7 +10957,7 @@ impl ServerImpl {
             Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
         });
-        Ok((message_key, instance))
+        Ok((message_key, instance, local_failed))
     }
 
     /// Correlates a message across the **whole cluster**: this node's own
@@ -10914,14 +10994,15 @@ impl ServerImpl {
                     .collect()
             })
             .unwrap_or_default();
-        let (mut message_key, mut instance) = self
-            .correlate_message_local(
+        let (mut message_key, mut instance, local_failed) = self
+            .correlate_message_local_tracked(
                 name.clone(),
                 correlation_key.clone(),
                 engine_vars,
                 business_id.clone(),
                 None,
                 operation_reference,
+                None,
             )
             .await?;
 
@@ -10998,8 +11079,18 @@ impl ServerImpl {
                 // node is ambiguous — the target may have committed — and a
                 // republish would mint a second message key (no dedup), so it
                 // ends the loop instead.
-                let mut ambiguous = false;
+                // A failed LOCAL apply is ambiguous in the same way: it may
+                // have exported records under a key it never returned, so a
+                // healthy peer must not mint a second one (PR #1786 review).
+                let mut ambiguous = local_failed;
                 for (node, partitions) in &sends {
+                    if !publish_fanout_may_send(message_key, ambiguous) {
+                        // An earlier send may have committed under a key we
+                        // never learned: an unkeyed send would mint a second,
+                        // unrelated key and could return it as the publication's
+                        // (PR #1786 review). Stop; the no-key path answers 503.
+                        break;
+                    }
                     match self.peers.link(*node).await {
                         Ok(link) => match link
                             .publish_message(
@@ -11009,6 +11100,10 @@ impl ServerImpl {
                                 business_id.clone(),
                                 Some(partitions.clone()),
                                 operation_reference,
+                                // Carry the publication's key (minted locally
+                                // or by an earlier send) so the peer's
+                                // partitions record the same one (#1434).
+                                message_key,
                             )
                             .await
                         {
@@ -36804,6 +36899,37 @@ mod clustered_startup_tests {
         assert_eq!((rows(0), rows(1)), (0, 0));
     }
 
+    /// PR #1786 review (#1434): the legacy read-model rebuild must route a
+    /// message-start correlation by its producing partition, not by a foreign
+    /// shared message key — otherwise a node owning partitions 0 and 2 loses
+    /// the correlation history of a key minted on partition 3.
+    #[test]
+    fn legacy_rebuild_ignores_a_foreign_shared_message_key() {
+        let events = vec![Event::MessageStartEventCorrelated {
+            message_key: nanobpmn_engine_core::compose_key(3, 1),
+            subscription_key: nanobpmn_engine_core::compose_key(0, 1),
+            process_definition_key: nanobpmn_engine_core::compose_key(0, 1),
+            process_id: "p".to_string(),
+            instance_key: nanobpmn_engine_core::compose_key(0, 2),
+            element_id: "s".into(),
+            message_name: "m".to_string(),
+            correlation_key: "c".to_string(),
+        }];
+        let read_model = readstore::ReadModel::in_memory_partitions(&[0, 2]);
+        let shards = read_model.shards();
+        rebuild_read_model_legacy(&shards, &events, 4);
+        let rows = |p: u64| {
+            shards
+                .iter()
+                .find(|(pid, _)| *pid == p)
+                .expect("shard")
+                .1
+                .correlated_message_subscriptions()
+                .len()
+        };
+        assert_eq!((rows(0), rows(2)), (1, 0), "history kept on partition 0");
+    }
+
     /// Issue #1292 fixture: a two-decision DRG (`root` requires `base`). `base`
     /// maps `lang = "de"` to `base_output`; `root` echoes it, unless
     /// `lang = "xx"`, where two `root` rules match under a UNIQUE hit policy so
@@ -52316,6 +52442,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -52421,6 +52548,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 Some(REF),
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -52566,6 +52694,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 order.clone(),
                 std::collections::BTreeMap::new(),
+                None,
                 None,
                 None,
                 None,
@@ -53062,6 +53191,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("the publish applies");
@@ -53100,6 +53230,7 @@ mod subscription_placement_tests {
             correlation_key: "k".into(),
             variables: Default::default(),
             business_id: None,
+            message_key: None,
         };
         assert!(!ServerImpl::routed_command_is_idempotent(&publish));
         let num_partitions = 4;
@@ -53349,6 +53480,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -53407,6 +53539,7 @@ mod subscription_placement_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("correlation with a valid business id");
@@ -53430,6 +53563,106 @@ mod subscription_placement_tests {
         assert!(
             per_partition[0] < 16,
             "partition 0 must NOT hold every instance (per-partition counts: {per_partition:?})"
+        );
+    }
+
+    /// #1434: a multi-partition publish applies `CorrelateMessage` on the
+    /// correlation-key hash partition AND partition 0 (message starts). Both
+    /// must record the ONE message key the publish response returns, so the
+    /// correlation history is searchable by it — previously each partition
+    /// minted its own key and the partition-0 message-start row carried a key
+    /// the client never saw.
+    #[tokio::test]
+    async fn multi_partition_publish_records_one_message_key_across_partitions() {
+        use apis::message_subscription::SearchCorrelatedMessageSubscriptionsResponse as Search;
+        let server = single_node_multi_partition();
+        let proc = ProcessBuilder::new("intake")
+            .message_start_event("start", "order-placed")
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("intake".to_string(), "intake.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy the message-start process on every owned partition");
+
+        // A correlation key whose hash partition is NOT partition 0, so the
+        // publish fans out to two partitions.
+        let correlation_key = (0..64)
+            .map(|i| format!("order-{i}"))
+            .find(|k| nanobpmn_engine_core::subscription_partition(k, 4) != 0)
+            .expect("some key hashes off partition 0");
+        let mut request = models::MessagePublicationRequest::new("order-placed".to_string());
+        request.correlation_key = Some(correlation_key);
+        let resp = server
+            .publish_message_impl(&request)
+            .await
+            .expect("publish returns");
+        let apis::message::PublishMessageResponse::Status200_TheMessageWasPublished(published) =
+            resp
+        else {
+            panic!("expected a 200 publication, got {resp:?}");
+        };
+        let message_key = published.message_key.0.clone();
+
+        // The partition-0 message-start correlation is searchable by the key
+        // the client received.
+        let query = models::CorrelatedMessageSubscriptionSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(models::CorrelatedMessageSubscriptionFilter {
+                message_key: Some(models::BasicStringFilterProperty::String(
+                    message_key.clone(),
+                )),
+                ..models::CorrelatedMessageSubscriptionFilter::new()
+            }),
+        };
+        let mut by_key = Vec::new();
+        for _ in 0..200 {
+            let resp = server
+                .search_correlated_message_subscriptions_impl(&Some(query.clone()))
+                .await
+                .expect("search returns");
+            let Search::Status200_TheCorrelatedMessageSubscriptionsSearchResult(result) = resp
+            else {
+                panic!("expected a 200 result");
+            };
+            if !result.items.is_empty() {
+                by_key = result.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            by_key.len(),
+            1,
+            "the message-start correlation is recorded under the returned messageKey {message_key}"
+        );
+        assert_eq!(by_key[0].message_key.0, message_key);
+        assert_eq!(by_key[0].element_id, "start");
+
+        // And no correlation row carries a different (per-partition) key.
+        let resp = server
+            .search_correlated_message_subscriptions_impl(&None)
+            .await
+            .expect("search returns");
+        let Search::Status200_TheCorrelatedMessageSubscriptionsSearchResult(all) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert!(
+            all.items.iter().all(|row| row.message_key.0 == message_key),
+            "every correlation row of one publication shares its key"
         );
     }
 
@@ -53524,6 +53757,7 @@ mod subscription_placement_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("correlation with a valid business id");
@@ -53591,6 +53825,7 @@ mod subscription_placement_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -53629,6 +53864,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 "order-x".into(),
                 std::collections::BTreeMap::new(),
+                None,
                 None,
                 None,
                 None,
@@ -59717,9 +59953,130 @@ fn publish_fanout_should_retry(
     remote_targets > 0 && !delivered && !ambiguous && attempt < max_attempts
 }
 
+/// Applies a publish to each local `targets` partition in order, threading the
+/// publication's key (#1434). Once a target FAILS without a known key, it may
+/// have exported records under a key it never returned, so no later target is
+/// applied unkeyed (that would mint a second identity). Returns the produced
+/// events and whether any target failed. Skipping a target this node does not
+/// lead (`NotHere`) is not a failure: the cluster fan-out reaches its leader.
+async fn apply_publish_targets<F, Fut>(
+    targets: Vec<u64>,
+    mut message_key: Option<u64>,
+    mut apply: F,
+) -> (Vec<Event>, bool)
+where
+    F: FnMut(u64, Option<u64>) -> Fut,
+    Fut: std::future::Future<Output = RoutedApply>,
+{
+    let mut all_events: Vec<Event> = Vec::new();
+    let mut failed = false;
+    for target in targets {
+        if !publish_fanout_may_send(message_key, failed) {
+            break;
+        }
+        match apply(target, message_key).await {
+            RoutedApply::Applied(events) => {
+                if message_key.is_none() {
+                    message_key = message_key_of(&events);
+                }
+                all_events.extend(events)
+            }
+            RoutedApply::NotHere => {}
+            RoutedApply::Failed(status, message) => {
+                failed = true;
+                tracing::warn!(
+                    "message correlation on partition {target} failed ({status}): {message}"
+                );
+            }
+        }
+    }
+    (all_events, failed)
+}
+
+/// The status a peer's `PublishMessage` handler answers with. A failed local
+/// apply may have committed under a key it never returned, so the reply must
+/// NOT be a 200 (which the originator reads, when keyless, as a known
+/// non-leader no-op and would re-send unkeyed): a 503 marks the send ambiguous
+/// on the originator, ending the unkeyed fan-out (PR #1786 review).
+pub(crate) fn publish_peer_reply_status(local_failed: bool) -> u16 {
+    if local_failed { 503 } else { 200 }
+}
+
+/// Whether the fan-out may send to the next peer. Once an outcome is
+/// ambiguous (the peer may have committed) and no key is known, a further send
+/// would carry no key, so the receiver mints a fresh one that cannot locate the
+/// first peer's records — one publication, two identities (#1434). A known key
+/// keeps every later send on the same identity, so sending stays safe.
+fn publish_fanout_may_send(message_key: Option<u64>, ambiguous: bool) -> bool {
+    message_key.is_some() || !ambiguous
+}
+
 #[cfg(test)]
 mod publish_fanout_retry_tests {
     use super::publish_fanout_should_retry as retry;
+
+    #[test]
+    fn no_unkeyed_send_after_an_ambiguous_outcome() {
+        use super::publish_fanout_may_send as may_send;
+        assert!(may_send(None, false), "first unkeyed send is fine");
+        assert!(may_send(Some(7), true), "a known key keeps one identity");
+        assert!(
+            !may_send(None, true),
+            "an ambiguous peer may have minted a key we never saw"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_unkeyed_local_apply_blocks_every_later_target() {
+        // PR #1786 review: drive the real target loop with a first target that
+        // FAILS; no later target may be applied (it would be unkeyed).
+        use super::{RoutedApply, apply_publish_targets};
+        let mut applied = Vec::new();
+        let (events, failed) = apply_publish_targets(vec![3, 0], None, |target, key| {
+            applied.push((target, key));
+            std::future::ready(if target == 3 {
+                RoutedApply::Failed(503, "not durable".into())
+            } else {
+                RoutedApply::Applied(Vec::new())
+            })
+        })
+        .await;
+        assert!(failed);
+        assert!(events.is_empty());
+        assert_eq!(applied, vec![(3, None)], "no unkeyed apply after a failure");
+        assert!(
+            !retry(1, false, failed, 1, 8),
+            "a failed local apply must not trigger a republish"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyed_publish_continues_past_a_failed_target() {
+        use super::{RoutedApply, apply_publish_targets};
+        let mut applied = Vec::new();
+        let (_, failed) = apply_publish_targets(vec![3, 0], Some(9), |target, key| {
+            applied.push((target, key));
+            std::future::ready(if target == 3 {
+                RoutedApply::Failed(503, "x".into())
+            } else {
+                RoutedApply::Applied(Vec::new())
+            })
+        })
+        .await;
+        assert!(failed);
+        assert_eq!(applied, vec![(3, Some(9)), (0, Some(9))]);
+    }
+
+    #[test]
+    fn a_peer_with_a_failed_local_apply_never_answers_200() {
+        use super::publish_peer_reply_status as status;
+        assert_eq!(status(false), 200);
+        assert_ne!(
+            status(true),
+            200,
+            "a keyless 200 reads as a known no-op and invites an unkeyed re-send"
+        );
+    }
 
     #[test]
     fn retries_only_on_definite_non_delivery() {
