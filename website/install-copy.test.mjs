@@ -100,11 +100,12 @@ test("a pending copy cannot be raced by repeated clicks", async () => {
 
 const CURL = "curl -fsSL https://nanobpm.io/install.sh | sh";
 const NPM = "npm install -g @nanobpm/nano-coder";
+const BREW = "brew install nanobpm/tap/nano-coder";
 
 // The homepage's controls, in page order: every command of every tested NAGE
 // host tab (derived from the same facts the page renders), then nano-coder's
-// npm install, then the distributed Nano Workforce installer.
-const HOME = [...nageFacts().hosts.filter((h) => h.tested).flatMap((h) => h.commands), NPM, CURL];
+// npm and Homebrew installs, then the distributed Nano Workforce installer.
+const HOME = [...nageFacts().hosts.filter((h) => h.tested).flatMap((h) => h.commands), NPM, BREW, CURL];
 
 // `commands` lists, in page order, the install command each control must carry.
 function assertInstallControls(html, commands = HOME) {
@@ -119,10 +120,10 @@ function assertInstallControls(html, commands = HOME) {
   }
 }
 
-test("the nano-coder page wires its npm install control to the shipped handler", () => {
+test("the nano-coder page wires its npm and Homebrew install controls to the shipped handler", () => {
   const site = buildSite();
   const html = site("nano-coder/index.html");
-  assertInstallControls(html, [NPM]);
+  assertInstallControls(html, [NPM, BREW]);
   assert.match(html, /bindInstallCopy\(document, navigator\.clipboard\)/);
 });
 
