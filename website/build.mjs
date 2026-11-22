@@ -561,11 +561,12 @@ ${flowExamples()}
     <p><b>Bring your own agent CLI.</b> Agent steps run on the CLI you already use: Claude Code,
     Copilot, Qwen Code, Kimi, OpenCode, or anything else that speaks ACP. Choose one per flow, per
     step, or per run.</p>
-    <p>We run nano-coder because it is optimised for size. It is a Rust coding agent built to be the
+    <p>We run nano-coder because it is optimised for size. It is a coding agent written in ${esc(nanoCoderFacts().language)}, built to be the
     worker your graphs fan out. Node-based agent CLIs take ${esc(nanoCoderFacts().nodeRss)} apiece;
     nano-coder takes ${esc(nanoCoderFacts().rss)}, so a laptop runs a fleet instead of a handful.
     Interactive in your terminal, or headless over ACP as a flow's agent step.</p>
-    ${installCommand("Install nano-coder", nanoCoderFacts().install)}
+    ${installCommand("Install nano-coder with npm", nanoCoderFacts().install)}
+    ${installCommand("Install nano-coder with Homebrew", nanoCoderFacts().brew)}
     <p><a href="/nano-coder/">Meet nano-coder →</a> · <a href="/blog/a-6mb-coding-agent/">Why the worker's size matters →</a></p>
   </div>
 </section>
@@ -1048,7 +1049,7 @@ function architectureHtml() {
         "hires any supported harness — " +
         agentHarnesses().filter((h) => h !== "nano-coder").join(", ") +
         " and more — and you can mix them in one fleet. nano-coder is the purpose-built option: " +
-        `a Rust agent at ${nanoCoderFacts().rss} resident memory, so a laptop can host a dense fleet, ` +
+        `an agent written in ${nanoCoderFacts().language} at ${nanoCoderFacts().rss} resident memory, so a laptop can host a dense fleet, ` +
         "running interactively or headless over ACP.",
       descLink: { text: "nano-coder", href: "/nano-coder/" },
       tags: agentHarnesses(),
@@ -1400,12 +1401,16 @@ function agentHarnesses() {
 // Single source of truth for the nano-coder claims repeated across the site
 // (product page, home band, architecture layer, launch post). Hoisted function so
 // it is callable during the top-level emit. Platforms mirror the npm package's
-// optionalDependencies (@nanobpm/nano-coder-{darwin,linux}-{x64,arm64}).
+// optionalDependencies (@nanobpm/nano-coder-{darwin,linux}-{x64,arm64}); the
+// Homebrew formula (nanobpm/tap) ships the same binaries. Language, size and
+// install commands mirror the nanobpm/nano-coder README (1.0 is the D rewrite).
 function nanoCoderFacts() {
   return {
     install: "npm install -g @nanobpm/nano-coder",
+    brew: "brew install nanobpm/tap/nano-coder",
+    language: "D",
     platforms: "macOS and Linux (x64, arm64)",
-    rss: "~6MB",
+    rss: "~4MB",
     nodeRss: "150–660MB",
     repo: "https://github.com/nanobpm/nano-coder",
   };
@@ -1416,7 +1421,7 @@ function nanoCoderFacts() {
 function nanoCoderHtml() {
   const F = nanoCoderFacts();
   const FEATURES = [
-    [`${F.rss} resident memory`, `Written in Rust. Node-based agent CLIs take ${F.nodeRss}; nano-coder lets you run a dense fleet of workers on one laptop.`],
+    [`${F.rss} resident memory`, `Written in ${F.language}. Node-based agent CLIs take ${F.nodeRss}; nano-coder lets you run a dense fleet of workers on one laptop.`],
     ["Interactive or headless", "A streaming terminal REPL with steering and queued prompts — or headless over ACP (JSON-RPC 2.0 on stdio) as a Nano Workforce worker."],
     ["Bring your own model", "OpenAI-compatible and Anthropic endpoints, remote or local, selected per model as <code>provider/model</code>."],
     ["Survives long tasks", "Task plans live outside the conversation, so work survives compaction, resume and a change of worker. Sessions are append-only JSONL."],
@@ -1428,12 +1433,13 @@ function nanoCoderHtml() {
 ${blogStyle()}
 <section class="blog-index">
   <p class="eyebrow"><code>@nanobpm/nano-coder</code></p>
-  <h1>A 6MB coding agent.<br><span class="grad">Run a fleet on your laptop.</span></h1>
+  <h1>A ${esc(F.rss.replace(/^~/, ""))} coding agent.<br><span class="grad">Run a fleet on your laptop.</span></h1>
   <p class="lede">nano-coder is the worker at the bottom of the Nano stack: a terminal coding agent
   small enough that Nano Workforce graphs can fan out dozens of them on one machine — durable,
   resumable, and supervised by the engine.</p>
-  ${installCommand("Install nano-coder", F.install)}
-  <p class="install-note">Prebuilt binaries for ${esc(F.platforms)}. Or <code>cargo install nano-coder</code>.</p>
+  ${installCommand("Install nano-coder with npm", F.install)}
+  ${installCommand("Install nano-coder with Homebrew", F.brew)}
+  <p class="install-note">Prebuilt binaries for ${esc(F.platforms)}, through npm or Homebrew. (<code>cargo install nano-coder</code> only installs the last Rust release, 0.69, which is no longer updated.)</p>
 ${cards}
   <p class="lede">Why the worker's size matters: <a href="/blog/a-6mb-coding-agent/">A 6MB coding agent, and why fleets need one →</a></p>
   <div class="cta">
@@ -1499,7 +1505,9 @@ ${post.body()}
 // The article body for the nano-coder launch post.
 function nanoCoderPostBody() {
   const F = nanoCoderFacts();
-  return `  <p>Nano Workforce turns software delivery into durable graphs: plan, implement, review,
+  return `  <p class="post-note"><strong>Update:</strong> nano-coder 1.0 is a rewrite in ${esc(F.language)}, at
+  ${esc(F.rss)} resident memory, and installs through npm or Homebrew. The figures below are current.</p>
+  <p>Nano Workforce turns software delivery into durable graphs: plan, implement, review,
   test, merge. The interesting graphs fan out — ten slices of an epic, each with its own coding
   agent, each looping through review until it converges. At that point the question stops being
   <em>how good is one agent</em> and becomes <em>how many can this machine hold?</em></p>
@@ -1510,8 +1518,8 @@ function nanoCoderPostBody() {
   life waiting on a model or a test run.</p>
 
   <h2>nano-coder</h2>
-  <p><a href="/nano-coder/">nano-coder</a> is a coding agent written in Rust that runs in about
-  ${F.rss}. It is a complete terminal agent — streaming REPL, tool calling, task plans that survive
+  <p><a href="/nano-coder/">nano-coder</a> is a coding agent written in ${esc(F.language)} that runs in
+  ${esc(F.rss)}. It is a complete terminal agent — streaming REPL, tool calling, task plans that survive
   compaction, OS sandboxing, <code>AGENTS.md</code> and skills — and it also runs headless over ACP
   (JSON-RPC 2.0 on stdio), which is how Workforce drives it as a durable job worker.</p>
   <p>Because the engine owns durability, the worker doesn't have to: if a nano-coder process dies,
@@ -1519,8 +1527,9 @@ function nanoCoderPostBody() {
   up. Small workers plus a durable orchestrator is the whole design.</p>
 
   <h2>Try it</h2>
-  <figure class="code"><pre><code>${esc(F.install)}</code></pre></figure>
-  <p>Prebuilt binaries ship for ${F.platforms}; or <code>cargo install nano-coder</code>. Source and
+  <figure class="code"><pre><code>${esc(F.install)}
+${esc(F.brew)}</code></pre></figure>
+  <p>Prebuilt binaries ship for ${esc(F.platforms)}. Source and
   docs are on <a href="${F.repo}">GitHub</a>.</p>`;
 }
 
