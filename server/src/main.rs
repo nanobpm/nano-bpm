@@ -29735,6 +29735,48 @@ fn log_health_alert_transitions(
     }
 }
 
+/// One full storage-usage sampler tick: refreshes the disk/backlog gauges
+/// FIRST (no actor involvement, so a busy engine cannot stall them), then the
+/// quarantined-orphan count from the engine actors (applied whenever the query
+/// returns). Split from the driver loop so a tick is one awaitable unit of
+/// work — a test can drive ticks explicitly and know exactly when each landed,
+/// with no sleep and no wall-clock (#1458/#1466).
+async fn storage_usage_sampler_tick(
+    health: &snapshot_health::SnapshotHealth,
+    shared: &seglog::SegShared,
+    handles: &[DeepthiHandle],
+    thresholds: &snapshot_health::HealthThresholds,
+) {
+    sample_storage_usage(health, shared, None, thresholds);
+    let (quarantined, _) = journal_quarantine_state(handles).await;
+    health.set_quarantined_orphans(quarantined);
+}
+
+/// The sampler loop over an arbitrary tick source. One
+/// [`storage_usage_sampler_tick`] per `()` the stream yields; the loop exits
+/// when the stream does. `thresholds` is consulted per tick (production re-reads
+/// the env, matching the original loop; tests hand back a fixed value).
+/// Production ticks from a wall-clock [`tokio::time::interval`]; tests tick
+/// from an `mpsc` channel they hold the sender of, so the sampler advances
+/// exactly when the test says — never when the scheduler happens to
+/// (#1458/#1466).
+async fn storage_usage_sampler_loop(
+    shared: Arc<seglog::SegShared>,
+    handles: Vec<DeepthiHandle>,
+    health: &snapshot_health::SnapshotHealth,
+    thresholds: impl Fn() -> snapshot_health::HealthThresholds,
+    ticks: impl futures_util::Stream<Item = ()> + Send,
+) {
+    tokio::pin!(ticks);
+    loop {
+        let tick = futures_util::StreamExt::next(&mut ticks).await;
+        if tick.is_none() {
+            return;
+        }
+        storage_usage_sampler_tick(health, &shared, &handles, &thresholds()).await;
+    }
+}
+
 /// Seeds the storage gauges synchronously (so `/health` reflects an existing
 /// backlog / low disk before the first request) and keeps them fresh on a
 /// fixed cadence decoupled from the snapshot interval — with
@@ -29752,30 +29794,34 @@ fn log_health_alert_transitions(
 /// `/health` and the disk guards sit stale while other partitions keep growing
 /// the journal. The quarantine count trails by the actor's queue latency and
 /// is applied whenever the query returns.
+///
+/// The tick source is injected ([`storage_usage_sampler_loop`]) so tests drive
+/// the SAME loop deterministically — a test that needs the sampler to advance
+/// must send it a tick, never sleep and hope the interval fired (the
+/// #1458/#1466 defect class).
 fn spawn_storage_usage_sampler(shared: Arc<seglog::SegShared>, handles: Vec<DeepthiHandle>) {
     let health = snapshot_health::global();
-    sample_storage_usage(
-        health,
-        &shared,
-        None,
-        &snapshot_health::HealthThresholds::from_env(),
+    let thresholds = snapshot_health::HealthThresholds::from_env();
+    sample_storage_usage(health, &shared, None, &thresholds);
+    // `unfold` carries the interval in the fold state, so the stream owns it
+    // across polls. The first `interval_at` tick fires immediately — that IS
+    // the "first, immediate async tick" that fills in the quarantine count.
+    let ticks = futures_util::stream::unfold(
+        tokio::time::interval_at(tokio::time::Instant::now(), STORAGE_USAGE_SAMPLE_INTERVAL),
+        |mut interval| async move {
+            interval.tick().await;
+            Some(((), interval))
+        },
     );
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(STORAGE_USAGE_SAMPLE_INTERVAL);
-        loop {
-            ticker.tick().await;
-            // Disk/backlog first: no actor involvement, so a busy engine
-            // cannot stall the storage-health refresh.
-            sample_storage_usage(
-                health,
-                &shared,
-                None,
-                &snapshot_health::HealthThresholds::from_env(),
-            );
-            // Then the actor query; the count updates whenever it returns.
-            let (quarantined, _) = journal_quarantine_state(&handles).await;
-            health.set_quarantined_orphans(quarantined);
-        }
+        storage_usage_sampler_loop(
+            shared,
+            handles,
+            health,
+            snapshot_health::HealthThresholds::from_env,
+            ticks,
+        )
+        .await;
     });
 }
 
@@ -30811,6 +30857,165 @@ mod snapshot_health_tick_tests {
             h.report(Instant::now(), &tiny_budget).quarantined_orphans,
             0
         );
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1458/#1466: the sampler LOOP itself is driven by an injected tick
+    /// source, never by a wall clock the test cannot control. A bounded stream
+    /// of N ticks runs exactly N samples and then lets the loop return, so the
+    /// test observes completion by AWAITING THE LOOP — no sleep, no timeout,
+    /// no scheduler assumption. Before this refactor the loop was hard-wired
+    /// to `tokio::time::interval` inside a fire-and-forget `tokio::spawn`, so
+    /// no test could drive or await it at all.
+    #[tokio::test]
+    async fn storage_sampler_loop_runs_one_sample_per_injected_tick_then_returns() {
+        let dir = scratch("sampler-loop-ticks");
+        let (mut journal, recovery) =
+            journal::Journal::open_segmented(&dir).expect("open segmented");
+        // Await the commit so the deploy is fsynced to the segment BEFORE any
+        // sampler tick reads its on-disk length below — otherwise the sampler
+        // races the background writer and can observe a zero-length active
+        // segment (#1466). Async test, so use the async `wait`.
+        let (_, commit) = journal
+            .apply_command(Command::DeployProcess(
+                nanobpmn_engine_core::ProcessBuilder::new("p")
+                    .start_event("s")
+                    .end_event("e")
+                    .connect("s", "e")
+                    .build()
+                    .unwrap(),
+            ))
+            .unwrap();
+        commit.wait().await;
+        let handle = DeepthiHandle::spawn(journal, 0, None);
+
+        let h = snapshot_health::SnapshotHealth::new();
+        let tiny_budget = snapshot_health::HealthThresholds {
+            uncompacted_bytes_max: 1,
+            ..thresholds()
+        };
+        // The gauges start unset: nothing has sampled yet, and NOTHING will
+        // sample until the injected stream yields a tick.
+        let before = h.report(Instant::now(), &tiny_budget);
+        assert_eq!(before.uncompacted_bytes, 0, "no sample before a tick");
+        assert_eq!(before.uncompacted_segments, 0, "no sample before a tick");
+
+        // Three ticks, then the stream ends: the loop must run exactly three
+        // samples and return. Awaiting the loop's return is the deterministic
+        // completion signal — every tick's effects (including the actor
+        // quarantine query) have landed by then.
+        storage_usage_sampler_loop(
+            Arc::clone(&recovery.shared),
+            std::slice::from_ref(&handle).to_vec(),
+            &h,
+            || tiny_budget.clone(),
+            futures_util::stream::iter([(), (), ()]),
+        )
+        .await;
+
+        let r = h.report(Instant::now(), &tiny_budget);
+        assert!(r.uncompacted_bytes > 1, "tick sampled the backlog: {r:?}");
+        assert!(r.uncompacted_segments >= 1, "{r:?}");
+        assert_eq!(
+            r.quarantined_orphans, 0,
+            "the tick's actor query landed before the loop returned"
+        );
+        assert!(r.causes.contains(&"journal_uncompacted_bytes"), "{r:?}");
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1458/#1466: with the tick source an `mpsc` channel the test holds, the
+    /// sampler advances ONLY when the test sends a tick — a second sample
+    /// cannot sneak in between sends regardless of scheduler load. This is the
+    /// defect-class guard for "sampler tests depending on wall-clock/tick
+    /// timing": any future sampler behaviour is testable by sending ticks and
+    /// awaiting the loop, never by sleeping.
+    #[tokio::test]
+    async fn storage_sampler_loop_does_not_advance_without_an_injected_tick() {
+        let dir = scratch("sampler-loop-gated");
+        let (mut journal, recovery) =
+            journal::Journal::open_segmented(&dir).expect("open segmented");
+        let (_, commit) = journal
+            .apply_command(Command::DeployProcess(
+                nanobpmn_engine_core::ProcessBuilder::new("p")
+                    .start_event("s")
+                    .end_event("e")
+                    .connect("s", "e")
+                    .build()
+                    .unwrap(),
+            ))
+            .unwrap();
+        commit.wait().await;
+        let handle = DeepthiHandle::spawn(journal, 0, None);
+
+        let h = Arc::new(snapshot_health::SnapshotHealth::new());
+        let tiny_budget = snapshot_health::HealthThresholds {
+            uncompacted_bytes_max: 1,
+            ..thresholds()
+        };
+        let (tick_tx, mut tick_rx) = tokio::sync::mpsc::channel::<()>(4);
+        // Deterministic per-tick barrier: the loop awaits the tick body BEFORE
+        // polling the stream for the next tick, so "the stream was polled
+        // again after yielding" means the tick's sample — actor query and all
+        // — has fully landed. The stream below flips `landed` on that re-poll;
+        // the test awaits it instead of sleeping or racing the actor mailbox.
+        let landed = Arc::new(tokio::sync::Notify::new());
+        let ticks = {
+            let landed = Arc::clone(&landed);
+            let mut yielded = false;
+            futures_util::stream::poll_fn(move |cx| {
+                if yielded {
+                    yielded = false;
+                    landed.notify_one();
+                }
+                match tick_rx.poll_recv(cx) {
+                    std::task::Poll::Ready(Some(())) => {
+                        yielded = true;
+                        std::task::Poll::Ready(Some(()))
+                    }
+                    other => other,
+                }
+            })
+        };
+        let sampler = tokio::spawn({
+            let shared = Arc::clone(&recovery.shared);
+            let handle = handle.clone();
+            let h = Arc::clone(&h);
+            let tiny_budget = tiny_budget.clone();
+            async move {
+                storage_usage_sampler_loop(
+                    shared,
+                    std::slice::from_ref(&handle).to_vec(),
+                    &h,
+                    || tiny_budget.clone(),
+                    ticks,
+                )
+                .await;
+            }
+        });
+
+        // No tick sent: the sampler is parked on the channel. The assertion is
+        // the robust direction — the gauges MUST still be unset (any spurious
+        // sample would set them), however the scheduler interleaves.
+        tokio::task::yield_now().await;
+        let r = h.report(Instant::now(), &tiny_budget);
+        assert_eq!(r.uncompacted_bytes, 0, "no tick, no sample: {r:?}");
+
+        // One tick → exactly one sample, observed via the re-poll barrier.
+        tick_tx.send(()).await.expect("sampler alive");
+        landed.notified().await;
+        let r = h.report(Instant::now(), &tiny_budget);
+        assert!(r.uncompacted_bytes > 1, "one tick, one sample: {r:?}");
+        assert_eq!(
+            r.quarantined_orphans, 0,
+            "the tick's actor query landed too: {r:?}"
+        );
+
+        // Closing the channel ends the stream, so the loop returns.
+        drop(tick_tx);
+        sampler.await.expect("sampler loop returned");
         drop(handle);
         let _ = std::fs::remove_dir_all(&dir);
     }
