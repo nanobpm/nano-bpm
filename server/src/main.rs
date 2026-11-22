@@ -10683,6 +10683,7 @@ impl ServerImpl {
     /// first locally applied target mints it and the rest reuse that one, so
     /// all records of one publication carry the key the client receives.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn correlate_message_everywhere(
         &self,
         name: String,
@@ -10691,8 +10692,39 @@ impl ServerImpl {
         business_id: Option<String>,
         only_partitions: Option<&[u64]>,
         operation_reference: Option<i64>,
-        mut message_key: Option<u64>,
+        message_key: Option<u64>,
     ) -> Result<Vec<Event>, EngineError> {
+        self.correlate_message_everywhere_tracked(
+            name,
+            correlation_key,
+            variables,
+            business_id,
+            only_partitions,
+            operation_reference,
+            message_key,
+        )
+        .await
+        .map(|(events, _)| events)
+    }
+
+    /// [`Self::correlate_message_everywhere`], additionally reporting whether a
+    /// local target's apply FAILED. A failed write is ambiguous: the write path
+    /// (e.g. a failed legacy journal writer) may already have exported records
+    /// under a key it minted but never returned. So once a target fails with no
+    /// key known, no further target is applied (it would mint a second,
+    /// unrelated key), and the cluster fan-out treats the flag like an
+    /// ambiguous peer outcome (PR #1786 review).
+    #[allow(clippy::too_many_arguments)]
+    async fn correlate_message_everywhere_tracked(
+        &self,
+        name: String,
+        correlation_key: String,
+        variables: std::collections::BTreeMap<String, Value>,
+        business_id: Option<String>,
+        only_partitions: Option<&[u64]>,
+        operation_reference: Option<i64>,
+        mut message_key: Option<u64>,
+    ) -> Result<(Vec<Event>, bool), EngineError> {
         // Reject an out-of-range business id before touching any partition, with
         // the engine's own rule: one partition must not apply the publish while
         // another rejects it. It is `CorrelateMessage`'s only failure mode, so
@@ -10713,7 +10745,14 @@ impl ServerImpl {
         }
 
         let mut all_events: Vec<Event> = Vec::new();
+        let mut failed = false;
         for target in targets {
+            if !publish_fanout_may_send(message_key, failed) {
+                // An earlier target failed after possibly committing under a
+                // key we never learned: an unkeyed apply here would mint a
+                // second identity for the same publication (#1434).
+                break;
+            }
             // Skip a target this node does not own; the cluster broadcast routes
             // the publish to the owning node, which correlates it locally.
             // Under Raft "owns" means "currently LEADS": the publish is proposed
@@ -10741,6 +10780,7 @@ impl ServerImpl {
                 }
                 RoutedApply::NotHere => {}
                 RoutedApply::Failed(status, message) => {
+                    failed = true;
                     tracing::warn!(
                         "message correlation on partition {target} failed ({status}): {message}"
                     );
@@ -10758,7 +10798,7 @@ impl ServerImpl {
             )
             .await;
         }
-        Ok(all_events)
+        Ok((all_events, failed))
     }
 
     /// Correlates a message across this node's owned partitions and returns the
@@ -10784,8 +10824,34 @@ impl ServerImpl {
         operation_reference: Option<i64>,
         message_key: Option<u64>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
-        let events = self
-            .correlate_message_everywhere(
+        self.correlate_message_local_tracked(
+            name,
+            correlation_key,
+            variables,
+            business_id,
+            only_partitions,
+            operation_reference,
+            message_key,
+        )
+        .await
+        .map(|(key, instance, _)| (key, instance))
+    }
+
+    /// [`Self::correlate_message_local`], additionally reporting whether a
+    /// local apply failed (see [`Self::correlate_message_everywhere_tracked`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn correlate_message_local_tracked(
+        &self,
+        name: String,
+        correlation_key: String,
+        variables: std::collections::BTreeMap<String, Value>,
+        business_id: Option<String>,
+        only_partitions: Option<Vec<u64>>,
+        operation_reference: Option<i64>,
+        message_key: Option<u64>,
+    ) -> Result<(Option<u64>, Option<u64>, bool), EngineError> {
+        let (events, local_failed) = self
+            .correlate_message_everywhere_tracked(
                 name,
                 correlation_key,
                 variables,
@@ -10805,7 +10871,7 @@ impl ServerImpl {
             Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
         });
-        Ok((message_key, instance))
+        Ok((message_key, instance, local_failed))
     }
 
     /// Correlates a message across the **whole cluster**: this node's own
@@ -10842,8 +10908,8 @@ impl ServerImpl {
                     .collect()
             })
             .unwrap_or_default();
-        let (mut message_key, mut instance) = self
-            .correlate_message_local(
+        let (mut message_key, mut instance, local_failed) = self
+            .correlate_message_local_tracked(
                 name.clone(),
                 correlation_key.clone(),
                 engine_vars,
@@ -10927,7 +10993,10 @@ impl ServerImpl {
                 // node is ambiguous — the target may have committed — and a
                 // republish would mint a second message key (no dedup), so it
                 // ends the loop instead.
-                let mut ambiguous = false;
+                // A failed LOCAL apply is ambiguous in the same way: it may
+                // have exported records under a key it never returned, so a
+                // healthy peer must not mint a second one (PR #1786 review).
+                let mut ambiguous = local_failed;
                 for (node, partitions) in &sends {
                     if !publish_fanout_may_send(message_key, ambiguous) {
                         // An earlier send may have committed under a key we
@@ -59658,6 +59727,20 @@ mod publish_fanout_retry_tests {
         assert!(
             !may_send(None, true),
             "an ambiguous peer may have minted a key we never saw"
+        );
+    }
+
+    #[test]
+    fn a_failed_unkeyed_local_apply_blocks_every_later_target() {
+        // PR #1786 review: a failed local apply may have exported records under
+        // a key it never returned; the local target loop and the peer fan-out
+        // both seed their ambiguity from it, so no unkeyed send follows.
+        use super::publish_fanout_may_send as may_send;
+        let local_failed = true;
+        assert!(!may_send(None, local_failed));
+        assert!(
+            !retry(1, false, local_failed, 1, 8),
+            "a failed local apply must not trigger a republish"
         );
     }
 
