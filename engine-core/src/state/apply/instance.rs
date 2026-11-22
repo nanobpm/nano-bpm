@@ -344,6 +344,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 crate::state::types::VariablesLostTombstone {
                     incident_key: *incident_key,
                     episode: *episode,
+                    terminal: false,
                 },
             );
         }
@@ -1030,6 +1031,7 @@ mod pending_orphan_supersede_tests {
             crate::state::types::VariablesLostTombstone {
                 incident_key: 99,
                 episode: 5,
+                terminal: false,
             },
         );
         assert!(state.settled_orphan_episodes.is_empty());
@@ -1063,6 +1065,46 @@ mod pending_orphan_supersede_tests {
         resolve(&mut state, 10, 99);
         assert!(state.variables_lost_quarantined.is_empty());
         assert!(state.settled_orphan_episodes.is_empty());
+    }
+
+    // #1608 review: the "already terminal" decision on resolve must not
+    // depend on residency. Here the instance has no resident shell (as on an
+    // evicted replica) and the bounded terminal ring has wrapped, so only the
+    // tombstone's replicated `terminal` flag can say the instance completed.
+    #[test]
+    fn resolve_after_completion_and_ring_wrap_without_shell_does_not_recreate_settlement() {
+        let mut state = State::default();
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 5,
+            },
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 10 },
+        );
+        let cap = u64::try_from(crate::state::RECENTLY_TERMINATED_CAP).unwrap_or(u64::MAX);
+        for other in 1_000..1_000 + cap {
+            apply(
+                &mut state,
+                &Event::ProcessInstanceCompleted {
+                    instance_key: other,
+                },
+            );
+        }
+        assert!(
+            !state.snapshot_shows_terminal(10),
+            "precondition: residency/ring no longer show the instance terminal"
+        );
+        resolve(&mut state, 10, 99);
+        assert!(state.variables_lost_quarantined.is_empty());
+        assert!(
+            state.settled_orphan_episodes.is_empty(),
+            "no settlement recreated for a completed, evicted instance"
+        );
     }
 
     // #1608 review (operator decision, option 1): a PRE-#1608 snapshot taken

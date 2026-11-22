@@ -2706,6 +2706,18 @@ pub struct VariablesLostTombstone {
     /// dropping the report (#1587 review).
     #[cfg_attr(feature = "serde", serde(default))]
     pub episode: u64,
+    /// The quarantined instance reached a terminal state while this tombstone
+    /// was live (#1608 review). Set by the replicated terminal fold
+    /// ([`State::note_terminated`]) so a later `IncidentResolved` decides
+    /// "already terminal" from replicated state alone — never from whether the
+    /// terminal shell is still resident (it may be evicted) or still in the
+    /// bounded `recently_terminated` ring (it may have wrapped). Additive:
+    /// omitted when `false`, defaulted on read.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub terminal: bool,
 }
 
 /// Backward-compatible deserialization for [`VariablesLostTombstone`]: a
@@ -2731,6 +2743,8 @@ impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
                 incident_key: Key,
                 #[serde(default)]
                 episode: u64,
+                #[serde(default)]
+                terminal: bool,
             },
             /// Legacy (pre-#1587) form: the bare incident key.
             Legacy(Key),
@@ -2739,13 +2753,16 @@ impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
             Repr::Current {
                 incident_key,
                 episode,
+                terminal,
             } => VariablesLostTombstone {
                 incident_key,
                 episode,
+                terminal,
             },
             Repr::Legacy(incident_key) => VariablesLostTombstone {
                 incident_key,
                 episode: 0,
+                terminal: false,
             },
         })
     }
@@ -2895,6 +2912,9 @@ impl State {
         // #1608: a terminal instance's pending loss report no longer matters.
         self.pending_orphan_supersedes.remove(&instance_key);
         self.fold_settlement_terminal(instance_key);
+        if let Some(t) = self.variables_lost_quarantined.get_mut(&instance_key) {
+            t.terminal = true;
+        }
         self.terminal_epoch += 1;
         if let Some(instance) = self.instances.get_mut(&instance_key) {
             instance.terminated_epoch = self.terminal_epoch;

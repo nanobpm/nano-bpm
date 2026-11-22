@@ -454,10 +454,11 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             // reported fresh. Keyed on the replicated incident key — NOT on the
             // incident record, which is absent on a cold-tiered replica — so
             // every replica lifts identically.
-            if state
+            if let Some(tombstone) = state
                 .variables_lost_quarantined
                 .get(instance_key)
-                .is_some_and(|t| t.incident_key == *incident_key)
+                .copied()
+                .filter(|t| t.incident_key == *incident_key)
             {
                 // Carry the episode into the settlement high-water mark before
                 // lifting the tombstone (#1608 review): a legacy snapshot's
@@ -469,7 +470,12 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 // quarantine -> completion -> ResolveIncident ordering would
                 // otherwise recreate the settlement entry the terminal fold
                 // cleared, leaking it in memory and snapshots indefinitely.
-                let settled = (!state.snapshot_shows_terminal(*instance_key))
+                // Terminality comes from the tombstone's replicated flag first
+                // (#1608 review): the terminal shell may be evicted and the
+                // bounded terminal ring may have wrapped, so residency alone
+                // would split replicas.
+                let terminal = tombstone.terminal || state.snapshot_shows_terminal(*instance_key);
+                let settled = (!terminal)
                     .then(|| super::instance::settled_orphan_episode(state, *instance_key))
                     .flatten();
                 if let Some(settled) = settled {
