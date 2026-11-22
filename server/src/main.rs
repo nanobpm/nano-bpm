@@ -33822,6 +33822,19 @@ mod clustered_startup_tests {
         };
         assert!(check_replication_event_sizes(&[], &[], &[form], &[]).is_err());
 
+        // Escaping-only overflow: raw content fits the budget, but each NUL
+        // serializes as `\u0000` (6x), so the event does not. A raw-length
+        // check would wrongly admit this; the serialized check must reject.
+        let escaped = nanobpmn_engine_core::GenericResource {
+            resource_id: "nul.md".into(),
+            resource_name: "nul.md".into(),
+            content: "\0".repeat(MAX_REPLICATED_EVENT_BYTES / 2),
+            version_tag: None,
+        };
+        let err = check_replication_event_sizes(&[], &[], &[], &[escaped])
+            .expect_err("escaping-expanded resource must be rejected");
+        assert!(err.contains("nul.md") && err.contains("too large"), "{err}");
+
         // Every accepted event fits a batch, so it fits the frame on its own.
         let ok = nanobpmn_engine_core::GenericResource {
             resource_id: "ok.md".into(),
