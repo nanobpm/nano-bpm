@@ -337,19 +337,48 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             incident_key,
             episode,
         } => {
+            state.pending_orphan_supersedes.remove(instance_key);
+            state.fold_settlement_quarantined(*instance_key, *episode);
             state.variables_lost_quarantined.insert(
                 *instance_key,
                 crate::state::types::VariablesLostTombstone {
                     incident_key: *incident_key,
                     episode: *episode,
+                    terminal: false,
                 },
             );
         }
 
-        // A superseded orphan stamp (#1587 review) carries no state change —
-        // it only journals the replica-deterministic decision so the leader's
-        // journal re-enqueues the still-pending report. Nothing to apply.
-        Event::OrphanStampSuperseded { .. } => {}
+        // A superseded orphan stamp (#1587 review) journals the
+        // replica-deterministic decision so the leader's journal re-enqueues
+        // the still-pending report.
+        // #1608: it does record the report as durably pending, so the host
+        // rebuilds its orphan backlog from replicated state after recovery.
+        Event::OrphanStampSuperseded {
+            instance_key,
+            episode,
+            kind,
+        } => {
+            // A delayed duplicate of an already-settled episode is not a
+            // pending report (#1608 review): recording it would make recovery
+            // re-raise `VariablesLost` without a new loss.
+            //
+            // Episodes are allocator positions, so they grow monotonically per
+            // instance: the latest settled episode is a HIGH-WATER MARK. Any
+            // nonzero episode at or below it (an original E1 superseded, its
+            // retry quarantined at E2 and resolved, then E1 arriving late) is
+            // settled too. A legacy snapshot's live tombstone (written before
+            // the settlement map existed) counts as settled at its episode.
+            if *episode > 0
+                && settled_orphan_episode(state, *instance_key).is_some_and(|s| *episode <= s)
+            {
+                return;
+            }
+            state.pending_orphan_supersedes.insert(
+                *instance_key,
+                kind.unwrap_or(crate::command::OrphanKind::Resident),
+            );
+        }
 
         Event::ProcessInstanceCompleted { instance_key } => {
             state.note_terminated(*instance_key);
@@ -817,5 +846,638 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         // there is no local state to mutate here.
         Event::StartInstanceDispatched { .. } => {}
         _ => unreachable!(),
+    }
+}
+
+/// The highest settled (quarantined) nonzero loss episode of `instance_key`
+/// (#1608 review): the replicated settlement map, or — for a snapshot written
+/// before that map existed — the live dedup tombstone's episode.
+pub(crate) fn settled_orphan_episode(state: &State, instance_key: Key) -> Option<Key> {
+    let settled = state.settled_orphan_episodes.get(&instance_key).copied();
+    let live = state
+        .variables_lost_quarantined
+        .get(&instance_key)
+        .map(|t| t.episode)
+        .filter(|e| *e > 0);
+    settled.max(live)
+}
+
+#[cfg(test)]
+mod pending_orphan_supersede_tests {
+    use std::collections::BTreeMap;
+
+    use crate::command::OrphanKind;
+    use crate::state::{apply, State};
+    use crate::Event;
+
+    // #1608: the pending-supersede set is REPLICATED state, so it survives a
+    // snapshot (unlike a tail scan, which misses a supersede compacted into
+    // the snapshot) and is settled only by a quarantine or a terminal event.
+    #[test]
+    fn supersede_is_recorded_and_settled_by_quarantine_or_terminal() {
+        let mut state = State::default();
+        for key in [10, 20, 30] {
+            apply(
+                &mut state,
+                &Event::OrphanStampSuperseded {
+                    instance_key: key,
+                    episode: 1,
+                    kind: Some(OrphanKind::Cold),
+                },
+            );
+        }
+        // A legacy frame without `kind` defaults to Resident.
+        apply(
+            &mut state,
+            &Event::OrphanStampSuperseded {
+                instance_key: 40,
+                episode: 1,
+                kind: None,
+            },
+        );
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 1,
+            },
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 20 },
+        );
+        let pending: Vec<_> = state
+            .pending_orphan_supersedes
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        assert_eq!(
+            pending,
+            vec![(30, OrphanKind::Cold), (40, OrphanKind::Resident)]
+        );
+    }
+
+    // #1608 review: a delayed duplicate of a settled (quarantined, then
+    // resolved) episode applies superseded but must not be recorded pending —
+    // a fresh stale-stamp supersede (different episode) still is.
+    #[test]
+    fn supersede_of_a_settled_episode_is_not_pending() {
+        let mut state = State::default();
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 5,
+            },
+        );
+        state.variables_lost_quarantined.remove(&10); // resolve lifts it
+        apply(
+            &mut state,
+            &Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 5,
+                kind: Some(OrphanKind::Cold),
+            },
+        );
+        assert!(state.pending_orphan_supersedes.is_empty());
+        apply(
+            &mut state,
+            &Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 6,
+                kind: Some(OrphanKind::Cold),
+            },
+        );
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Cold)
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 10 },
+        );
+        assert!(state.settled_orphan_episodes.is_empty());
+    }
+
+    fn supersede(state: &mut State, instance_key: u64, episode: u64) {
+        apply(
+            state,
+            &Event::OrphanStampSuperseded {
+                instance_key,
+                episode,
+                kind: Some(OrphanKind::Cold),
+            },
+        );
+    }
+
+    fn resolve(state: &mut State, instance_key: u64, incident_key: u64) {
+        apply(
+            state,
+            &Event::IncidentResolved {
+                incident_key,
+                instance_key,
+                job_key: None,
+                resolved_at: 1,
+                operation_reference: None,
+            },
+        );
+    }
+
+    // #1608 review: E1 superseded → retry quarantined at E2 → E2 resolved →
+    // the ORIGINAL E1 proposal arrives late. E1 < E2, so it is settled by the
+    // high-water mark and must not become pending again (recovery would
+    // otherwise re-stamp it and raise a second `VariablesLost`).
+    #[test]
+    fn delayed_original_after_resolved_retry_is_not_pending() {
+        let mut state = State::default();
+        supersede(&mut state, 10, 5);
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 8,
+            },
+        );
+        resolve(&mut state, 10, 99);
+        supersede(&mut state, 10, 5);
+        assert!(state.pending_orphan_supersedes.is_empty());
+        // ...and it stays settled across a snapshot (recovery) round trip.
+        #[cfg(feature = "serde")]
+        {
+            let json = serde_json::to_string(&state).expect("serialize");
+            let mut back: State = serde_json::from_str(&json).expect("deserialize");
+            supersede(&mut back, 10, 5);
+            assert!(back.pending_orphan_supersedes.is_empty());
+        }
+        // A genuinely fresh episode above the mark is still pending.
+        supersede(&mut state, 10, 9);
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Cold)
+        );
+    }
+
+    // #1608 review: a legacy snapshot carries a nonzero-episode tombstone but
+    // no settlement map. Resolving must carry the episode into the map before
+    // lifting the tombstone, so a delayed duplicate is not recorded pending.
+    #[test]
+    fn legacy_tombstone_resolve_then_duplicate_is_not_pending() {
+        let mut state = State::default();
+        state.variables_lost_quarantined.insert(
+            10,
+            crate::state::types::VariablesLostTombstone {
+                incident_key: 99,
+                episode: 5,
+                terminal: false,
+            },
+        );
+        assert!(state.settled_orphan_episodes.is_empty());
+        resolve(&mut state, 10, 99);
+        assert!(state.variables_lost_quarantined.is_empty());
+        assert_eq!(state.settled_orphan_episodes.get(&10), Some(&5));
+        supersede(&mut state, 10, 5);
+        assert!(state.pending_orphan_supersedes.is_empty());
+    }
+
+    // #1608 review: completion retains active incidents, so quarantine ->
+    // completion -> ResolveIncident must NOT recreate the settlement entry the
+    // terminal fold cleared (it would leak for a completed instance forever).
+    #[test]
+    fn resolve_after_completion_does_not_recreate_settlement() {
+        let mut state = State::default();
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 5,
+            },
+        );
+        assert_eq!(state.settled_orphan_episodes.get(&10), Some(&5));
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 10 },
+        );
+        assert!(state.settled_orphan_episodes.is_empty());
+        resolve(&mut state, 10, 99);
+        assert!(state.variables_lost_quarantined.is_empty());
+        assert!(state.settled_orphan_episodes.is_empty());
+    }
+
+    // #1608 review: the "already terminal" decision on resolve must not
+    // depend on residency. Here the instance has no resident shell (as on an
+    // evicted replica) and the bounded terminal ring has wrapped, so only the
+    // tombstone's replicated `terminal` flag can say the instance completed.
+    #[test]
+    fn resolve_after_completion_and_ring_wrap_without_shell_does_not_recreate_settlement() {
+        let mut state = State::default();
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 5,
+            },
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 10 },
+        );
+        let cap = u64::try_from(crate::state::RECENTLY_TERMINATED_CAP).unwrap_or(u64::MAX);
+        for other in 1_000..1_000 + cap {
+            apply(
+                &mut state,
+                &Event::ProcessInstanceCompleted {
+                    instance_key: other,
+                },
+            );
+        }
+        assert!(
+            !state.snapshot_shows_terminal(10),
+            "precondition: residency/ring no longer show the instance terminal"
+        );
+        resolve(&mut state, 10, 99);
+        assert!(state.variables_lost_quarantined.is_empty());
+        assert!(
+            state.settled_orphan_episodes.is_empty(),
+            "no settlement recreated for a completed, evicted instance"
+        );
+    }
+
+    // #1608 review (operator decision, option 1): a PRE-#1608 snapshot taken
+    // after a stamped loss episode was quarantined AND resolved carries neither
+    // a settlement map nor a tombstone. Recovery backfills the map from the
+    // retained history the snapshot covers — through the live fold — BEFORE
+    // replaying the tail, so a delayed duplicate's supersede is not pending.
+    fn legacy_resolved_snapshot() -> (State, Vec<Event>) {
+        let history = vec![
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 8,
+            },
+            Event::IncidentResolved {
+                incident_key: 99,
+                instance_key: 10,
+                job_key: None,
+                resolved_at: 1,
+                operation_reference: None,
+            },
+        ];
+        let mut state = State::default();
+        for event in &history {
+            apply(&mut state, event);
+        }
+        // Strip what a pre-#1608 build never wrote.
+        state.settled_orphan_episodes.clear();
+        assert!(state.variables_lost_quarantined.is_empty());
+        (state, history)
+    }
+
+    #[test]
+    fn backfill_from_retained_history_settles_a_legacy_resolved_episode() {
+        let (mut state, history) = legacy_resolved_snapshot();
+        state.backfill_settled_orphan_episodes(history.iter());
+        assert_eq!(state.settled_orphan_episodes.get(&10), Some(&8));
+        // The delayed duplicate (E5 <= E8) in the tail: no new report.
+        supersede(&mut state, 10, 5);
+        assert!(state.pending_orphan_supersedes.is_empty());
+    }
+
+    // #1608 review: a legacy snapshot carries no pending-supersede map, so a
+    // covered supersede whose retry never committed is reconstructed from
+    // retained history — and one the history itself settles is not.
+    #[test]
+    fn backfill_reconstructs_an_unresolved_supersede_for_a_legacy_snapshot() {
+        let history = [
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 4,
+                kind: Some(OrphanKind::Cold),
+            },
+            Event::OrphanStampSuperseded {
+                instance_key: 20,
+                episode: 4,
+                kind: None,
+            },
+            Event::VariablesLostQuarantined {
+                instance_key: 20,
+                incident_key: 98,
+                episode: 6,
+            },
+        ];
+        let mut state = State::default();
+        for event in &history {
+            apply(&mut state, event);
+        }
+        // Strip what a pre-#1608 build never wrote.
+        state.pending_orphan_supersedes.clear();
+        state.settled_orphan_episodes.clear();
+        state.backfill_settled_orphan_episodes(history.iter());
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Cold)
+        );
+        assert!(!state.pending_orphan_supersedes.contains_key(&20));
+    }
+
+    // #1608 review: the snapshot is authoritative — retained history older
+    // than it (a quarantine whose later termination the local log never
+    // held) must not resurrect settlement or a pending report for an
+    // instance the snapshot shows terminated.
+    #[test]
+    fn backfill_never_resurrects_entries_for_an_instance_the_snapshot_terminated() {
+        let local_history = [
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 4,
+                kind: None,
+            },
+            Event::VariablesLostQuarantined {
+                instance_key: 30,
+                incident_key: 97,
+                episode: 5,
+            },
+        ];
+        let mut state = State::default();
+        for event in &local_history {
+            apply(&mut state, event);
+        }
+        apply(
+            &mut state,
+            &Event::ProcessInstanceTerminated { instance_key: 10 },
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceTerminated { instance_key: 30 },
+        );
+        state.backfill_settled_orphan_episodes(local_history.iter());
+        assert!(state.pending_orphan_supersedes.is_empty());
+        assert!(state.settled_orphan_episodes.is_empty());
+    }
+
+    // Residual window (documented): history pruned, nothing to backfill — the
+    // duplicate is recorded pending exactly once (one extra, resolvable
+    // `VariablesLost`), and the instance itself is untouched (no data loss).
+    #[test]
+    fn backfill_with_pruned_history_leaves_exactly_one_pending_report() {
+        let (mut state, _history) = legacy_resolved_snapshot();
+        state.backfill_settled_orphan_episodes(std::iter::empty());
+        supersede(&mut state, 10, 5);
+        supersede(&mut state, 10, 5);
+        assert_eq!(state.pending_orphan_supersedes.len(), 1);
+    }
+
+    // The backfill is the live fold: a terminal event in the retained history
+    // clears the episode, and a post-#1608 map is only ever raised (high-water
+    // mark), never lowered.
+    #[test]
+    fn backfill_honours_terminal_events_and_never_lowers_the_mark() {
+        let history = [
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 8,
+            },
+            Event::ProcessInstanceTerminated { instance_key: 10 },
+            Event::VariablesLostQuarantined {
+                instance_key: 20,
+                incident_key: 98,
+                episode: 3,
+            },
+            Event::VariablesLostQuarantined {
+                instance_key: 30,
+                incident_key: 97,
+                episode: 0,
+            },
+        ];
+        let mut state = State::default();
+        state.settled_orphan_episodes.insert(20, 7);
+        state.backfill_settled_orphan_episodes(history.iter());
+        assert_eq!(state.settled_orphan_episodes.get(&10), None);
+        assert_eq!(state.settled_orphan_episodes.get(&20), Some(&7));
+        assert_eq!(state.settled_orphan_episodes.get(&30), None);
+    }
+
+    // #1608 review: a delayed duplicate E5 arriving AFTER the fresh supersede
+    // E9 must not replace it in the backfill's superseded-episode record —
+    // comparing E5 against the settlement mark would drop the genuinely
+    // unresolved E9 report and leave the dormant loss unreported.
+    #[test]
+    fn backfill_keeps_the_highest_superseded_episode_per_instance() {
+        let history = [
+            // E8 quarantined (settled), then the fresh supersede E9, then the
+            // delayed duplicate E5 of the settled episode.
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 8,
+            },
+            Event::IncidentResolved {
+                incident_key: 99,
+                instance_key: 10,
+                job_key: None,
+                resolved_at: 1,
+                operation_reference: None,
+            },
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 9,
+                kind: Some(OrphanKind::Resident),
+            },
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 5,
+                kind: Some(OrphanKind::Resident),
+            },
+        ];
+        let mut state = State::default();
+        for event in &history {
+            apply(&mut state, event);
+        }
+        // A pre-#1608 snapshot: neither map recorded.
+        state.pending_orphan_supersedes.clear();
+        state.settled_orphan_episodes.clear();
+        state.backfill_settled_orphan_episodes(history.iter());
+        // E9 is still reconstructed as pending — only the delayed duplicate
+        // E5 (at/below the settlement mark E8) is dropped.
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Resident)
+        );
+        assert_eq!(state.settled_orphan_episodes.get(&10), Some(&8));
+    }
+
+    // #1608 review: after the bounded terminal ring wraps past an evicted
+    // terminal instance, `terminated_epoch_of` can no longer prove it
+    // terminated. The backfill must still reconcile against the snapshot's
+    // own lifecycle state — a resident terminal shell — or a lagging
+    // receiver's earlier supersede restores a loss report for completed work.
+    #[test]
+    fn backfill_never_restores_a_report_for_a_terminal_shell_after_ring_wrap() {
+        let mut state = State::default();
+        // The instance completed and is still resident (a terminal shell the
+        // exporter has not yet reaped)…
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCreated {
+                instance_key: 10,
+                process_id: "p".to_string(),
+                variables: BTreeMap::new(),
+                created_at: 0,
+                tags: Vec::new(),
+                business_id: None,
+                process_definition_key: 1,
+                version: 1,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+            },
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 10 },
+        );
+        // …but the bounded ring has wrapped past it and the instance itself
+        // was evicted before its terminal epoch could be stamped, so the
+        // replicated terminal record can no longer prove the termination —
+        // only the resident shell's lifecycle state can.
+        state.recently_terminated.clear();
+        state
+            .instances
+            .get_mut(&10)
+            .expect("resident shell")
+            .terminated_epoch = 0;
+        assert_eq!(state.terminated_epoch_of(10), None);
+        // The lagging receiver's retained history holds only the earlier
+        // supersede/quarantine of the completed work.
+        let local_history = [
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 4,
+                kind: None,
+            },
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 97,
+                episode: 5,
+            },
+        ];
+        state.backfill_settled_orphan_episodes(local_history.iter());
+        assert!(state.pending_orphan_supersedes.is_empty());
+        assert!(state.settled_orphan_episodes.is_empty());
+    }
+
+    // #1608 review: a PRE-#1608 snapshot covering quarantine -> completion
+    // restores its tombstone with `terminal: false`. Normalization from the
+    // retained terminal history must set the flag, so that after the ring
+    // wraps a resident-shell replica and an evicted replica resolve the
+    // incident to identical state.
+    fn legacy_terminal_tombstone_snapshot() -> (State, Vec<Event>) {
+        let history = vec![
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 5,
+            },
+            Event::ProcessInstanceCompleted { instance_key: 10 },
+        ];
+        let mut state = State::default();
+        for event in &history {
+            apply(&mut state, event);
+        }
+        // Strip what a pre-#1608 build never wrote.
+        state
+            .variables_lost_quarantined
+            .get_mut(&10)
+            .expect("tombstone")
+            .terminal = false;
+        (state, history)
+    }
+
+    fn wrap_ring(state: &mut State) {
+        let cap = u64::try_from(crate::state::RECENTLY_TERMINATED_CAP).unwrap_or(u64::MAX);
+        for other in 1_000..1_000 + cap {
+            apply(
+                state,
+                &Event::ProcessInstanceCompleted {
+                    instance_key: other,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_normalizes_a_legacy_tombstone_from_retained_terminal_history() {
+        let (mut evicted, history) = legacy_terminal_tombstone_snapshot();
+        evicted.backfill_settled_orphan_episodes(history.iter());
+        assert!(evicted.variables_lost_quarantined[&10].terminal);
+        wrap_ring(&mut evicted);
+        assert!(!evicted.snapshot_shows_terminal(10));
+        resolve(&mut evicted, 10, 99);
+        assert!(evicted.variables_lost_quarantined.is_empty());
+        assert!(evicted.settled_orphan_episodes.is_empty());
+    }
+
+    #[test]
+    fn normalize_from_snapshot_lifecycle_matches_resident_and_evicted_replicas() {
+        // Resident replica: the snapshot still proves terminality itself.
+        let (mut resident, _) = legacy_terminal_tombstone_snapshot();
+        resident.normalize_legacy_tombstones(&std::collections::BTreeSet::new());
+        assert!(resident.variables_lost_quarantined[&10].terminal);
+        // Evicted replica restored from the same snapshot, then the ring wraps.
+        let mut evicted = resident.clone();
+        resident.instances.remove(&10);
+        wrap_ring(&mut evicted);
+        wrap_ring(&mut resident);
+        resolve(&mut resident, 10, 99);
+        resolve(&mut evicted, 10, 99);
+        assert_eq!(
+            resident.settled_orphan_episodes,
+            evicted.settled_orphan_episodes
+        );
+        assert!(resident.settled_orphan_episodes.is_empty());
+    }
+
+    // A genuinely missing (cold / pruned) target is NOT proven terminal: its
+    // report is preserved exactly as before the ring-wrap reconciliation.
+    #[test]
+    fn backfill_preserves_a_report_whose_target_the_snapshot_does_not_hold() {
+        let history = [Event::OrphanStampSuperseded {
+            instance_key: 10,
+            episode: 4,
+            kind: Some(OrphanKind::Cold),
+        }];
+        let mut state = State::default();
+        state.backfill_settled_orphan_episodes(history.iter());
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Cold)
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn pending_supersedes_survive_a_snapshot_round_trip() {
+        let mut state = State::default();
+        apply(
+            &mut state,
+            &Event::OrphanStampSuperseded {
+                instance_key: 7,
+                episode: 3,
+                kind: Some(OrphanKind::Cold),
+            },
+        );
+        let json = serde_json::to_string(&state).expect("serialize");
+        let back: State = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.pending_orphan_supersedes,
+            state.pending_orphan_supersedes
+        );
+        // Empty set keeps the pre-#1608 snapshot shape (field omitted).
+        let empty = serde_json::to_string(&State::default()).expect("serialize");
+        assert!(!empty.contains("pending_orphan_supersedes"));
     }
 }

@@ -2165,6 +2165,16 @@ impl PartitionStateMachine {
             // The authoritative state is adopted, checkpointed and the marker
             // durably cleared: a recovery-only member (#1701) now continues
             // as a normal replica and applies the leader's log from here on.
+            // Clear the journal's divergence-recovery mode with it (#1608
+            // review): the adopted base IS the authoritative state, so a
+            // later ordinary adoption may backfill again — but only from
+            // history written AFTER this adoption: the adoption durably
+            // raised the journal's backfill floor past the diverged
+            // pre-recovery prefix, which stays in the sealed segments / cold
+            // archive and is never folded in again (nor on restart).
+            self.engine
+                .with(|journal| journal.set_divergence_recovery(false))
+                .await;
             self.recovering.store(false, Ordering::SeqCst);
         }
         {
@@ -4518,8 +4528,17 @@ impl RaftPartition {
              receiver instead (#1701)"
         );
         // Fence before any fallible setup (#1691): the journal is known
-        // diverged and must not take a direct write while we construct.
+        // diverged and must not take a direct write while we construct. Also
+        // mark divergence-recovery mode (#1608 review): while it lasts, the
+        // journal's snapshot-adoption path skips the receiver-local
+        // loss-episode backfill — the diverged journal's retained prefix is
+        // not the verified committed prefix the leader snapshotted, so
+        // folding it in would import supersedes/settlements the leader never
+        // committed and checkpoint the altered maps.
         engine.with(|journal| journal.abort_raft_entry()).await;
+        engine
+            .with(|journal| journal.set_divergence_recovery(true))
+            .await;
         let part = Self::bootstrap_member_inner(
             node_id,
             partition_id,
