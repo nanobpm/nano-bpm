@@ -145,7 +145,13 @@ fn creations_of(records: &[Json]) -> Creations {
 
 /// Whether a field name holds an entity key (or a list of them).
 fn is_key_field(name: &str) -> bool {
-    name == "key" || name == "scope" || name.ends_with("_key") || name.ends_with("_keys")
+    // `episode` (#1587) is an allocator position — an engine key — so a
+    // remint shifts it exactly like a `*_key` reference (#1608 review).
+    name == "key"
+        || name == "scope"
+        || name == "episode"
+        || name.ends_with("_key")
+        || name.ends_with("_keys")
 }
 
 // ---- Post-boundary snapshot projection, DERIVED from the State schema (#1764)
@@ -179,6 +185,12 @@ pub enum FieldRule {
     /// identity (associations preserved), and entries of (or owned by) a
     /// ratified instance are dropped.
     EntityMap,
+    /// A [`FieldRule::EntityMap`] whose scalar values are themselves engine
+    /// keys (`BTreeMap<Key, Key>` at `State` level, e.g.
+    /// `settled_orphan_episodes`): the entry key AND its value canonicalized,
+    /// ratified-owned entries dropped (#1608 review — a remint must not make
+    /// equivalent state compare unequal).
+    EntityKeyMap,
     /// A `BTreeMap<Key, BTreeSet<Key>>` owner→keys reverse index: the owner
     /// and every member are canonicalized (owner association preserved), and
     /// a ratified instance's entry / owned members are dropped.
@@ -273,7 +285,7 @@ pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("resource_versions", FieldRule::EntityMap),
     ("variables_lost_quarantined", FieldRule::EntityMap),
     ("pending_orphan_supersedes", FieldRule::EntityMap),
-    ("settled_orphan_episodes", FieldRule::EntityMap),
+    ("settled_orphan_episodes", FieldRule::EntityKeyMap),
     ("recently_terminated", FieldRule::KeyList),
     ("terminal_epoch", FieldRule::TerminalEpoch),
     ("lenient_completion", FieldRule::Exact),
@@ -758,6 +770,7 @@ fn project_fields(
                 None => continue,
             },
             FieldRule::EntityMap => project_entity_map(v, side, &format!("{path}.{k}"), None)?,
+            FieldRule::EntityKeyMap => project_entity_key_map(v, side, &format!("{path}.{k}"))?,
             FieldRule::KeyIndex => project_key_index(v, side, &format!("{path}.{k}"))?,
             FieldRule::PriorityKeyIndex => project_priority_index(v, side),
             FieldRule::KeyList => project_key_list(v, side),
@@ -876,6 +889,59 @@ fn project_entity_map(
         }
     }
     Ok(Json::Object(out))
+}
+
+/// [`FieldRule::EntityKeyMap`]: entity-map filtering plus value
+/// canonicalization ([`key_reference`]).
+fn project_entity_key_map(v: &Json, side: &ProjectionSide<'_>, path: &str) -> Result<Json, String> {
+    let projected = project_entity_map(v, side, path, None)?;
+    Ok(match projected {
+        Json::Object(map) => Json::Object(
+            map.into_iter()
+                .map(|(k, val)| (k, key_reference(&val, side)))
+                .collect(),
+        ),
+        other => other,
+    })
+}
+
+/// Projects one `State` field through its [`STATE_FIELD_RULES`] rule with
+/// `ids` as the side's key identities and `excluded` as the ratified
+/// instances — the seam the remint regressions drive (#1608 review).
+#[allow(
+    dead_code,
+    reason = "test seam: driven by tests/determinism_corpus.rs only"
+)]
+pub fn project_state_field(
+    field: &str,
+    value: &Json,
+    ids: &BTreeMap<u64, String>,
+    excluded: &BTreeSet<u64>,
+) -> Result<Json, String> {
+    let key_ids = KeyIds {
+        ids: ids.clone(),
+        ordinals: BTreeMap::new(),
+    };
+    let creations = Creations::default();
+    let side = ProjectionSide {
+        ids: &key_ids,
+        excluded,
+        owned: BTreeSet::new(),
+        excluded_epochs: Vec::new(),
+        creations: &creations,
+        at: 0,
+    };
+    let mut root = serde_json::Map::new();
+    root.insert(field.to_string(), value.clone());
+    let rules: Vec<(&str, FieldRule)> = STATE_FIELD_RULES
+        .iter()
+        .filter(|(f, _)| *f == field)
+        .copied()
+        .collect();
+    if rules.is_empty() {
+        return Err(format!("no STATE_FIELD_RULES entry for {field}"));
+    }
+    project_fields(&root, &rules, "$.state", &side, &root)
 }
 
 fn project_key_index(v: &Json, side: &ProjectionSide<'_>, path: &str) -> Result<Json, String> {

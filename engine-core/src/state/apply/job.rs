@@ -459,6 +459,15 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 .get(instance_key)
                 .is_some_and(|t| t.incident_key == *incident_key)
             {
+                // Carry the episode into the settlement high-water mark before
+                // lifting the tombstone (#1608 review): a legacy snapshot's
+                // tombstone predates `settled_orphan_episodes`, so without this
+                // a delayed duplicate of the resolved episode would be recorded
+                // pending and re-raise `VariablesLost` on recovery.
+                if let Some(settled) = super::instance::settled_orphan_episode(state, *instance_key)
+                {
+                    state.settled_orphan_episodes.insert(*instance_key, settled);
+                }
                 state.variables_lost_quarantined.remove(instance_key);
             }
             // A recoverable job-incident: return the parked job to the

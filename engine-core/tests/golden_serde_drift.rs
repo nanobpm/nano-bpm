@@ -782,6 +782,72 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("quarantine instance E"),
     );
 
+    // Off-heap-orphan settlement witnesses (#1608): instance F is quarantined
+    // through a STAMPED (nonzero-episode) command, so the snapshot's
+    // `settled_orphan_episodes` is nonempty; instance G's stamp goes stale in
+    // flight (an unrelated mint advances the allocator before it applies), so
+    // it applies SUPERSEDED and `pending_orphan_supersedes` is nonempty. Both
+    // maps are omitted when empty, so without these witnesses the golden
+    // snapshot (and the previous-release vocabulary derived from it) would
+    // never carry them.
+    let orphan_instance = |engine: &mut Engine, journal: &mut Vec<Event>, at: u64, label: &str| {
+        let created = engine
+            .apply_command_at(Command::create_instance("order"), at)
+            .unwrap_or_else(|e| panic!("create instance {label}: {e:?}"));
+        let key = created
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap_or_else(|| panic!("instance {label} key"));
+        journal.extend(created);
+        key
+    };
+    let inst_f = orphan_instance(&mut engine, &mut journal, T0 + 24, "F");
+    let inst_g = orphan_instance(&mut engine, &mut journal, T0 + 25, "G");
+    let stamp_f = engine
+        .orphan_incident_stamp(inst_f, nanobpmn_engine_core::OrphanKind::Resident)
+        .expect("stamp instance F");
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: inst_f,
+                    stamp: Some(stamp_f),
+                },
+                T0 + 26,
+            )
+            .expect("quarantine instance F"),
+    );
+    let stamp_g = engine
+        .orphan_incident_stamp(inst_g, nanobpmn_engine_core::OrphanKind::Cold)
+        .expect("stamp instance G");
+    let _ = orphan_instance(
+        &mut engine,
+        &mut journal,
+        T0 + 27,
+        "H (advances the allocator)",
+    );
+    let superseded = engine
+        .apply_command_at(
+            Command::QuarantineOffheapOrphan {
+                instance_key: inst_g,
+                stamp: Some(stamp_g),
+            },
+            T0 + 28,
+        )
+        .expect("quarantine instance G");
+    assert!(
+        superseded
+            .iter()
+            .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+        "instance G's stale stamp must apply superseded"
+    );
+    journal.extend(superseded);
+    {
+        let state = &engine.snapshot().state;
+        assert!(state.settled_orphan_episodes.contains_key(&inst_f));
+        assert!(state.pending_orphan_supersedes.contains_key(&inst_g));
+    }
+
     // Event sub-process held-payload witness (#1555): a non-interrupting
     // message event sub-process whose start event carries an output mapping and
     // whose CONTAINER has a `start` execution listener. The correlated payload is

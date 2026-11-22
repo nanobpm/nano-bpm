@@ -1,5 +1,5 @@
 {
-  "next_local": 125,
+  "next_local": 138,
   "now": 1700000000029,
   "num_partitions": 1,
   "partition_id": 0,
@@ -16,7 +16,7 @@
       "esp-gate": [
         [
           -50,
-          108
+          121
         ]
       ],
       "payment": [
@@ -31,6 +31,18 @@
         [
           -50,
           97
+        ],
+        [
+          -50,
+          102
+        ],
+        [
+          -50,
+          106
+        ],
+        [
+          -50,
+          111
         ]
       ],
       "sync-task": [
@@ -71,7 +83,7 @@
       "decide": 2,
       "dup": 1,
       "esp-held": 1,
-      "order": 5,
+      "order": 8,
       "sync": 1,
       "trip": 1,
       "twins": 1,
@@ -587,6 +599,20 @@
     "form_versions": {},
     "forms": {},
     "incidents": {
+      "107": {
+        "created_at": 1700000000026,
+        "element_id": "order",
+        "element_instance_key": 99,
+        "instance_key": 99,
+        "job_key": null,
+        "key": 107,
+        "kind": "VariablesLost",
+        "operation_reference": null,
+        "reason": "variables lost: spill row missing",
+        "redrive": null,
+        "resolved_at": null,
+        "state": "Active"
+      },
       "81": {
         "created_at": 1700000000013,
         "element_id": "brt",
@@ -633,7 +659,7 @@
     "inflight_by_process": {
       "decide": 1,
       "esp-held": 1,
-      "order": 3,
+      "order": 6,
       "order-v2": 1,
       "sync": 1,
       "trip": 1,
@@ -641,13 +667,83 @@
       "whole": 1
     },
     "instances": {
-      "101": {
+      "103": {
+        "activating": [],
+        "active": {
+          "105": "charge"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000025,
+        "esp_held_payloads": {},
+        "gateway_routes": {},
+        "incidents": [],
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
+        "key": 103,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 2,
+        "process_id": "order",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "terminated_epoch": 0,
+        "variables": {},
+        "variables_spilled": false
+      },
+      "108": {
+        "activating": [],
+        "active": {
+          "110": "charge"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000027,
+        "esp_held_payloads": {},
+        "gateway_routes": {},
+        "incidents": [],
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
+        "key": 108,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 2,
+        "process_id": "order",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "terminated_epoch": 0,
+        "variables": {},
+        "variables_spilled": false
+      },
+      "114": {
         "activating": [
-          107
+          120
         ],
         "active": {
-          "104": "work",
-          "107": "esp"
+          "117": "work",
+          "120": "esp"
         },
         "adhoc_instances": {},
         "agent_history": {},
@@ -657,7 +753,7 @@
         "compensation_waits": {},
         "created_at": 1700000000025,
         "esp_held_payloads": {
-          "107": {
+          "120": {
             "payload": {
               "Int": 42
             }
@@ -668,18 +764,18 @@
         "join_counts": [],
         "join_flow_arrivals": [],
         "join_instances": [],
-        "key": 101,
+        "key": 114,
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
         "parked_joins": [],
-        "process_definition_key": 100,
+        "process_definition_key": 113,
         "process_id": "esp-held",
         "scope_parents": {
-          "107": 0
+          "120": 0
         },
         "scope_variables": {
-          "107": {}
+          "120": {}
         },
         "scopes": {},
         "state": "Active",
@@ -693,13 +789,13 @@
         },
         "variables_spilled": false
       },
-      "111": {
+      "124": {
         "activating": [],
         "active": {
-          "118": "onM2",
-          "120": "onM1",
-          "122": "onM2",
-          "124": "onM1"
+          "131": "onM2",
+          "133": "onM1",
+          "135": "onM2",
+          "137": "onM1"
         },
         "adhoc_instances": {},
         "agent_history": {},
@@ -714,18 +810,18 @@
         "join_counts": [],
         "join_flow_arrivals": [],
         "join_instances": [],
-        "key": 111,
+        "key": 124,
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
         "parked_joins": [],
-        "process_definition_key": 110,
+        "process_definition_key": 123,
         "process_id": "twins",
         "races": {
-          "118": 116,
-          "120": 116,
-          "122": 117,
-          "124": 117
+          "131": 129,
+          "133": 129,
+          "135": 130,
+          "137": 130
         },
         "scope_parents": {},
         "scope_variables": {},
@@ -1239,29 +1335,100 @@
         "terminated_epoch": 0,
         "variables": {},
         "variables_spilled": false
+      },
+      "99": {
+        "activating": [],
+        "active": {
+          "101": "charge"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000024,
+        "esp_held_payloads": {},
+        "gateway_routes": {},
+        "incidents": [
+          107
+        ],
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
+        "key": 99,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 2,
+        "process_id": "order",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "terminated_epoch": 0,
+        "variables": {},
+        "variables_spilled": false
       }
     },
     "jobs": {
-      "108": {
+      "102": {
         "activated": false,
         "activated_at": null,
         "activation_timeout": null,
-        "created_at": 1700000000026,
+        "created_at": 1700000000024,
         "deadline": null,
-        "element_id": "esp",
-        "element_instance_key": 107,
+        "element_id": "charge",
+        "element_instance_key": 101,
         "error_code": null,
         "error_message": null,
-        "instance_key": 101,
-        "job_type": "esp-gate",
-        "key": 108,
-        "kind": {
-          "ExecutionListener": {
-            "event_type": "Start",
-            "index": 0,
-            "scope": 0
-          }
-        },
+        "instance_key": 99,
+        "job_type": "payment",
+        "key": 102,
+        "kind": "BpmnElement",
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Created",
+        "worker": null
+      },
+      "106": {
+        "activated": false,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000025,
+        "deadline": null,
+        "element_id": "charge",
+        "element_instance_key": 105,
+        "error_code": null,
+        "error_message": null,
+        "instance_key": 103,
+        "job_type": "payment",
+        "key": 106,
+        "kind": "BpmnElement",
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Created",
+        "worker": null
+      },
+      "111": {
+        "activated": false,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000027,
+        "deadline": null,
+        "element_id": "charge",
+        "element_instance_key": 110,
+        "error_code": null,
+        "error_message": null,
+        "instance_key": 108,
+        "job_type": "payment",
+        "key": 111,
+        "kind": "BpmnElement",
         "lease_token": null,
         "priority": 50,
         "retries": 3,
@@ -1291,6 +1458,32 @@
           "at": 1700000000003,
           "deadline": 1700000030002
         },
+        "worker": null
+      },
+      "121": {
+        "activated": false,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000026,
+        "deadline": null,
+        "element_id": "esp",
+        "element_instance_key": 120,
+        "error_code": null,
+        "error_message": null,
+        "instance_key": 114,
+        "job_type": "esp-gate",
+        "key": 121,
+        "kind": {
+          "ExecutionListener": {
+            "event_type": "Start",
+            "index": 0,
+            "scope": 0
+          }
+        },
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Created",
         "worker": null
       },
       "17": {
@@ -1437,8 +1630,14 @@
       }
     },
     "jobs_by_instance": {
-      "101": [
-        108
+      "103": [
+        106
+      ],
+      "108": [
+        111
+      ],
+      "114": [
+        121
       ],
       "14": [
         17
@@ -1463,20 +1662,23 @@
       ],
       "94": [
         97
+      ],
+      "99": [
+        102
       ]
     },
     "lenient_completion": false,
     "message_start_subscriptions": {},
     "message_subscriptions": {
-      "103": {
+      "116": {
         "correlated_message_keys": [
-          106
+          119
         ],
         "correlation_key": "7",
         "element_id": "esp_start",
         "element_instance_key": 0,
-        "instance_key": 101,
-        "key": 103,
+        "instance_key": 114,
+        "key": 116,
         "kind": {
           "EventSubProcess": {
             "esp_element_id": "esp",
@@ -1486,49 +1688,52 @@
         "message_name": "esp-msg",
         "state": "Open"
       },
-      "119": {
+      "132": {
         "correlation_key": "k",
         "element_id": "onM2",
-        "element_instance_key": 118,
-        "instance_key": 111,
-        "key": 119,
+        "element_instance_key": 131,
+        "instance_key": 124,
+        "key": 132,
         "kind": "IntermediateCatch",
         "message_name": "M2",
         "state": "Open"
       },
-      "121": {
+      "134": {
         "correlation_key": "k",
         "element_id": "onM1",
-        "element_instance_key": 120,
-        "instance_key": 111,
-        "key": 121,
+        "element_instance_key": 133,
+        "instance_key": 124,
+        "key": 134,
         "kind": "IntermediateCatch",
         "message_name": "M1",
         "state": "Open"
       },
-      "123": {
+      "136": {
         "correlation_key": "k",
         "element_id": "onM2",
-        "element_instance_key": 122,
-        "instance_key": 111,
-        "key": 123,
+        "element_instance_key": 135,
+        "instance_key": 124,
+        "key": 136,
         "kind": "IntermediateCatch",
         "message_name": "M2",
         "state": "Open"
       },
-      "125": {
+      "138": {
         "correlation_key": "k",
         "element_id": "onM1",
-        "element_instance_key": 124,
-        "instance_key": 111,
-        "key": 125,
+        "element_instance_key": 137,
+        "instance_key": 124,
+        "key": 138,
         "kind": "IntermediateCatch",
         "message_name": "M1",
         "state": "Open"
       }
     },
+    "pending_orphan_supersedes": {
+      "103": "Cold"
+    },
     "process_versions": {
-      "100": {
+      "113": {
         "definition": {
           "adhoc": [],
           "elements": {
@@ -1691,11 +1896,11 @@
           "start_form_id": null,
           "xml": "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\"\n                      xmlns:zeebe=\"http://camunda.org/schema/zeebe/1.0\">\n         <bpmn:message id=\"Msg\" name=\"esp-msg\">\n           <bpmn:extensionElements><zeebe:subscription correlationKey=\"=orderId\" /></bpmn:extensionElements>\n         </bpmn:message>\n         <bpmn:process id=\"esp-held\" isExecutable=\"true\">\n           <bpmn:startEvent id=\"s\" />\n           <bpmn:intermediateCatchEvent id=\"work\">\n             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>\n           </bpmn:intermediateCatchEvent>\n           <bpmn:endEvent id=\"e\" />\n           <bpmn:sequenceFlow id=\"f1\" sourceRef=\"s\" targetRef=\"work\" />\n           <bpmn:sequenceFlow id=\"f2\" sourceRef=\"work\" targetRef=\"e\" />\n           <bpmn:subProcess id=\"esp\" triggeredByEvent=\"true\">\n             <bpmn:extensionElements>\n               <zeebe:executionListeners>\n                 <zeebe:executionListener eventType=\"start\" type=\"esp-gate\" />\n               </zeebe:executionListeners>\n             </bpmn:extensionElements>\n             <bpmn:startEvent id=\"esp_start\" isInterrupting=\"false\">\n               <bpmn:extensionElements>\n                 <zeebe:ioMapping><zeebe:output source=\"=payload\" target=\"mapped\" /></zeebe:ioMapping>\n               </bpmn:extensionElements>\n               <bpmn:messageEventDefinition messageRef=\"Msg\" />\n             </bpmn:startEvent>\n             <bpmn:endEvent id=\"esp_end\" />\n             <bpmn:sequenceFlow id=\"ef1\" sourceRef=\"esp_start\" targetRef=\"esp_end\" />\n           </bpmn:subProcess>\n         </bpmn:process>\n       </bpmn:definitions>"
         },
-        "deployment_key": 99,
-        "key": 100,
+        "deployment_key": 112,
+        "key": 113,
         "version": 1
       },
-      "110": {
+      "123": {
         "definition": {
           "adhoc": [],
           "elements": {
@@ -1888,8 +2093,8 @@
           "start_form_id": null,
           "xml": ""
         },
-        "deployment_key": 109,
-        "key": 110,
+        "deployment_key": 122,
+        "key": 123,
         "version": 1
       },
       "19": {
@@ -4166,8 +4371,8 @@
           "start_form_id": null,
           "xml": "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\"\n                      xmlns:zeebe=\"http://camunda.org/schema/zeebe/1.0\">\n         <bpmn:message id=\"Msg\" name=\"esp-msg\">\n           <bpmn:extensionElements><zeebe:subscription correlationKey=\"=orderId\" /></bpmn:extensionElements>\n         </bpmn:message>\n         <bpmn:process id=\"esp-held\" isExecutable=\"true\">\n           <bpmn:startEvent id=\"s\" />\n           <bpmn:intermediateCatchEvent id=\"work\">\n             <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>\n           </bpmn:intermediateCatchEvent>\n           <bpmn:endEvent id=\"e\" />\n           <bpmn:sequenceFlow id=\"f1\" sourceRef=\"s\" targetRef=\"work\" />\n           <bpmn:sequenceFlow id=\"f2\" sourceRef=\"work\" targetRef=\"e\" />\n           <bpmn:subProcess id=\"esp\" triggeredByEvent=\"true\">\n             <bpmn:extensionElements>\n               <zeebe:executionListeners>\n                 <zeebe:executionListener eventType=\"start\" type=\"esp-gate\" />\n               </zeebe:executionListeners>\n             </bpmn:extensionElements>\n             <bpmn:startEvent id=\"esp_start\" isInterrupting=\"false\">\n               <bpmn:extensionElements>\n                 <zeebe:ioMapping><zeebe:output source=\"=payload\" target=\"mapped\" /></zeebe:ioMapping>\n               </bpmn:extensionElements>\n               <bpmn:messageEventDefinition messageRef=\"Msg\" />\n             </bpmn:startEvent>\n             <bpmn:endEvent id=\"esp_end\" />\n             <bpmn:sequenceFlow id=\"ef1\" sourceRef=\"esp_start\" targetRef=\"esp_end\" />\n           </bpmn:subProcess>\n         </bpmn:process>\n       </bpmn:definitions>"
         },
-        "deployment_key": 99,
-        "key": 100,
+        "deployment_key": 112,
+        "key": 113,
         "version": 1
       },
       "order": {
@@ -5012,8 +5217,8 @@
           "start_form_id": null,
           "xml": ""
         },
-        "deployment_key": 109,
-        "key": 110,
+        "deployment_key": 122,
+        "key": 123,
         "version": 1
       },
       "whole": {
@@ -5469,22 +5674,30 @@
     ],
     "resource_versions": {},
     "resources": {},
+    "settled_orphan_episodes": {
+      "99": 107
+    },
     "signal_subscriptions": {},
     "start_timers": {},
     "terminal_epoch": 4,
     "timers": {
-      "105": {
+      "118": {
         "due_at": 1700003600025,
         "element_id": "work",
-        "element_instance_key": 104,
-        "instance_key": 101,
-        "key": 105,
+        "element_instance_key": 117,
+        "instance_key": 114,
+        "key": 118,
         "kind": "IntermediateCatch",
         "repetitions": null,
         "state": "Created"
       }
     },
     "user_tasks": {},
-    "variables_lost_quarantined": {}
+    "variables_lost_quarantined": {
+      "99": {
+        "episode": 107,
+        "incident_key": 107
+      }
+    }
   }
 }

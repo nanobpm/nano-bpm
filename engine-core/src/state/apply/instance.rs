@@ -365,7 +365,16 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             // A delayed duplicate of an already-settled episode is not a
             // pending report (#1608 review): recording it would make recovery
             // re-raise `VariablesLost` without a new loss.
-            if state.settled_orphan_episodes.get(instance_key) == Some(episode) {
+            //
+            // Episodes are allocator positions, so they grow monotonically per
+            // instance: the latest settled episode is a HIGH-WATER MARK. Any
+            // nonzero episode at or below it (an original E1 superseded, its
+            // retry quarantined at E2 and resolved, then E1 arriving late) is
+            // settled too. A legacy snapshot's live tombstone (written before
+            // the settlement map existed) counts as settled at its episode.
+            if *episode > 0
+                && settled_orphan_episode(state, *instance_key).is_some_and(|s| *episode <= s)
+            {
                 return;
             }
             state.pending_orphan_supersedes.insert(
@@ -843,6 +852,19 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
     }
 }
 
+/// The highest settled (quarantined) nonzero loss episode of `instance_key`
+/// (#1608 review): the replicated settlement map, or — for a snapshot written
+/// before that map existed — the live dedup tombstone's episode.
+pub(crate) fn settled_orphan_episode(state: &State, instance_key: Key) -> Option<Key> {
+    let settled = state.settled_orphan_episodes.get(&instance_key).copied();
+    let live = state
+        .variables_lost_quarantined
+        .get(&instance_key)
+        .map(|t| t.episode)
+        .filter(|e| *e > 0);
+    settled.max(live)
+}
+
 #[cfg(test)]
 mod pending_orphan_supersede_tests {
     use crate::command::OrphanKind;
@@ -938,6 +960,86 @@ mod pending_orphan_supersede_tests {
             &Event::ProcessInstanceCompleted { instance_key: 10 },
         );
         assert!(state.settled_orphan_episodes.is_empty());
+    }
+
+    fn supersede(state: &mut State, instance_key: u64, episode: u64) {
+        apply(
+            state,
+            &Event::OrphanStampSuperseded {
+                instance_key,
+                episode,
+                kind: Some(OrphanKind::Cold),
+            },
+        );
+    }
+
+    fn resolve(state: &mut State, instance_key: u64, incident_key: u64) {
+        apply(
+            state,
+            &Event::IncidentResolved {
+                incident_key,
+                instance_key,
+                job_key: None,
+                resolved_at: 1,
+                operation_reference: None,
+            },
+        );
+    }
+
+    // #1608 review: E1 superseded → retry quarantined at E2 → E2 resolved →
+    // the ORIGINAL E1 proposal arrives late. E1 < E2, so it is settled by the
+    // high-water mark and must not become pending again (recovery would
+    // otherwise re-stamp it and raise a second `VariablesLost`).
+    #[test]
+    fn delayed_original_after_resolved_retry_is_not_pending() {
+        let mut state = State::default();
+        supersede(&mut state, 10, 5);
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 8,
+            },
+        );
+        resolve(&mut state, 10, 99);
+        supersede(&mut state, 10, 5);
+        assert!(state.pending_orphan_supersedes.is_empty());
+        // ...and it stays settled across a snapshot (recovery) round trip.
+        #[cfg(feature = "serde")]
+        {
+            let json = serde_json::to_string(&state).expect("serialize");
+            let mut back: State = serde_json::from_str(&json).expect("deserialize");
+            supersede(&mut back, 10, 5);
+            assert!(back.pending_orphan_supersedes.is_empty());
+        }
+        // A genuinely fresh episode above the mark is still pending.
+        supersede(&mut state, 10, 9);
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Cold)
+        );
+    }
+
+    // #1608 review: a legacy snapshot carries a nonzero-episode tombstone but
+    // no settlement map. Resolving must carry the episode into the map before
+    // lifting the tombstone, so a delayed duplicate is not recorded pending.
+    #[test]
+    fn legacy_tombstone_resolve_then_duplicate_is_not_pending() {
+        let mut state = State::default();
+        state.variables_lost_quarantined.insert(
+            10,
+            crate::state::types::VariablesLostTombstone {
+                incident_key: 99,
+                episode: 5,
+            },
+        );
+        assert!(state.settled_orphan_episodes.is_empty());
+        resolve(&mut state, 10, 99);
+        assert!(state.variables_lost_quarantined.is_empty());
+        assert_eq!(state.settled_orphan_episodes.get(&10), Some(&5));
+        supersede(&mut state, 10, 5);
+        assert!(state.pending_orphan_supersedes.is_empty());
     }
 
     #[cfg(feature = "serde")]
