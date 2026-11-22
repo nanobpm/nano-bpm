@@ -41,24 +41,25 @@ const DISK_OBSERVATIONS: &[&str] = &[
     ".metadata()",
 ];
 
-/// Calls that order everything before them on the writer: awaiting a commit,
-/// a writer-queued (FIFO) message, or closing/reopening the journal (the writer
-/// drains on drop). Matched as *calls* — an identifier-bounded name followed by
-/// `(` — so identifiers that merely contain a name (`recovery.`, `rotated`,
-/// `flushed`) are never mistaken for a sync point.
-const SYNC_CALLS: &[&str] = &[
-    "blocking_wait",
-    "wait",
+/// Method calls on the *affected journal* that order everything before them on
+/// its writer: a writer-queued (FIFO) message, or closing/reopening that
+/// journal (the writer drains on drop). A sync point must be tied to the same
+/// receiver as the discarded commit — `barrier.wait()`, or opening *another*
+/// journal, says nothing about this write.
+const RECEIVER_SYNC_METHODS: &[&str] = &[
     "snapshot_and_rotate",
     "streaming_snapshot_and_rotate",
     "rotate",
-    "drop",
     "flush",
     "shutdown",
-    "open_segmented",
-    "Journal::open",
-    "recover",
 ];
+
+/// Calls that await a commit regardless of the receiver they are invoked on:
+/// the commit's own `blocking_wait`, or `drop(journal…` (the writer drains on
+/// drop). Matched as *calls* — an identifier-bounded name followed by `(` — so
+/// identifiers that merely contain a name (`rotated`, `flushed`) are never
+/// mistaken for a sync point.
+const FREE_SYNC_CALLS: &[&str] = &["blocking_wait", "drop"];
 
 fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
@@ -66,7 +67,7 @@ fn is_ident(c: u8) -> bool {
 
 /// Offset of the first call to any of `names` in `hay`: the name must not be
 /// preceded by an identifier byte and must be followed (after optional
-/// whitespace) by `(`. `drop` only counts as `drop(journal…`.
+/// whitespace) by `(`.
 fn first_call(hay: &str, names: &[&str]) -> Option<usize> {
     let b = hay.as_bytes();
     names
@@ -83,14 +84,95 @@ fn first_call(hay: &str, names: &[&str]) -> Option<usize> {
                 if !rest.starts_with('(') {
                     continue;
                 }
-                if *name == "drop" && !rest[1..].trim_start().starts_with("journal") {
-                    continue;
-                }
                 return Some(at);
             }
             None
         })
         .min()
+}
+
+/// The identifier a `.method(` call at `dot_at` is invoked on (the text
+/// immediately before the dot), or `None` when there is no receiver.
+fn receiver_before(hay: &str, dot_at: usize) -> Option<String> {
+    if dot_at == 0 || hay.as_bytes()[dot_at - 1] == b'.' {
+        return None; // a path (`Journal::open`) or a float, not a receiver
+    }
+    let recv: String = hay[..dot_at]
+        .trim_end()
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    (!recv.is_empty()).then_some(recv)
+}
+
+/// Whether `region` contains a sync point for the journal `recv` was applied
+/// on, returning its offset: a writer-ordered method called *on that same
+/// receiver*, or a receiver-independent await (`blocking_wait`, `drop(journal…`).
+fn sync_point_at(region: &str, recv: &str) -> Option<usize> {
+    let b = region.as_bytes();
+    let tied = RECEIVER_SYNC_METHODS.iter().filter_map(|name| {
+        let mut from = 0;
+        while let Some(off) = region[from..].find(name) {
+            let at = from + off;
+            from = at + name.len();
+            if at > 0 && is_ident(b[at - 1]) {
+                continue;
+            }
+            if !region[from..].trim_start().starts_with('(') {
+                continue;
+            }
+            // `.name(` — the receiver is the identifier before the dot.
+            if b[at - 1] == b'.' && receiver_before(region, at - 1).as_deref() == Some(recv) {
+                return Some(at);
+            }
+        }
+        None
+    });
+    tied.chain(
+        FREE_SYNC_CALLS
+            .iter()
+            .filter_map(|name| first_call(region, std::slice::from_ref(name))),
+    )
+    .min()
+}
+
+/// The index of the first byte of `region` that is NOT reachable on every
+/// control-flow path: the start of the smallest enclosing `{…}` that follows a
+/// conditional keyword (`if`/`else`/`match`/`while`/`for`/`loop`) or a `?` /
+/// `=>` (an early-returning call or a match arm) — `None` when the whole
+/// region is unconditional. A sync point at or after this offset may never
+/// execute, so it cannot order the observation; one *before* it still can.
+fn conditional_from(region: &str) -> Option<usize> {
+    let b = region.as_bytes();
+    let mut best = region.len();
+    for kw in ["if", "else", "match", "while", "for", "loop"] {
+        let mut from = 0;
+        while let Some(off) = region[from..].find(kw) {
+            let at = from + off;
+            from = at + kw.len();
+            let prev_ok = at == 0 || !is_ident(b[at - 1]);
+            let next_ok = from >= region.len() || !is_ident(b[from]);
+            if !(prev_ok && next_ok) {
+                continue;
+            }
+            if let Some(rel) = region[from..].find('{') {
+                best = best.min(from + rel);
+            }
+        }
+    }
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'?' {
+            best = best.min(i);
+        }
+        if c == b'=' && b.get(i + 1) == Some(&b'>') {
+            best = best.min(i);
+        }
+    }
+    (best < region.len()).then_some(best)
 }
 
 /// Replaces string/char literals and comments with spaces (keeping byte
@@ -236,39 +318,43 @@ fn discards_commit(body: &str, apply_at: usize) -> bool {
     };
     let pat = pat[..eq].split(':').next().unwrap_or("");
     let last = match pat.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
-        Some(inner) => inner.rsplit(',').next().unwrap_or(""),
+        // The commit is the last tuple slot; a trailing comma leaves an empty
+        // final component, so skip empty slots.
+        Some(inner) => inner.rsplit(',').find(|s| !s.is_empty()).unwrap_or(""),
         None => pat,
     };
     last.trim_start_matches("mut").starts_with('_')
 }
 
 /// Whether the journal `apply_at` is called on was built in memory
-/// (`Journal::in_memory*`): it has no writer thread, so its commit is always
-/// already resolved and nothing can race it.
+/// (`Journal::in_memory*`) and never reassigned: it has no writer thread, so
+/// its commit is always already resolved and nothing can race it. A later
+/// reassignment (`j = Journal::open(&path)`) invalidates the exemption — from
+/// then on `j` has an asynchronous disk writer.
 fn is_in_memory_receiver(body: &str, apply_at: usize) -> bool {
-    let recv: String = body[..apply_at]
-        .trim_end()
-        .chars()
-        .rev()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if recv.is_empty() {
+    let Some(recv) = receiver_before(body, apply_at) else {
         return false;
-    }
+    };
     ["let mut ", "let "].iter().any(|kw| {
         let binding = format!("{kw}{recv} =");
         body[..apply_at].rfind(&binding).is_some_and(|at| {
             let stmt_end = body[at..].find(';').map_or(body.len(), |n| at + n);
-            body[at..stmt_end].contains("in_memory")
+            // No reassignment of the receiver between its binding and the apply.
+            let reassigned = body[stmt_end..apply_at].split([';', '{', '}']).any(|stmt| {
+                let stmt: String = stmt.chars().filter(|c| !c.is_whitespace()).collect();
+                stmt.strip_prefix(&recv)
+                    .is_some_and(|rest| rest.starts_with('=') && !rest.starts_with("=="))
+            });
+            !reassigned && body[at..stmt_end].contains("in_memory")
         })
     })
 }
 
 /// The `(fn name, offending observation)` pairs in `src`: a disk observation
-/// that follows a discarded commit with no sync point in between.
+/// that follows a discarded commit with no sync point in between. A sync point
+/// must be tied to the *affected journal* (or await the commit itself) and must
+/// execute on every path to the observation — an unrelated `barrier.wait()`, a
+/// different journal's rotation, or a rotation inside `if …` orders nothing.
 fn violations(src: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     for (name, body) in fn_bodies(src) {
@@ -287,7 +373,17 @@ fn violations(src: &str) -> Vec<(String, String)> {
                     .min()
             };
             if let Some((obs_at, obs)) = first(DISK_OBSERVATIONS) {
-                let synced = first_call(tail, SYNC_CALLS).is_some_and(|sync_at| sync_at < obs_at);
+                let recv = receiver_before(&body, apply_at).unwrap_or_default();
+                // A sync point orders the observation only when it is tied to
+                // the affected journal (or awaits the commit itself) AND
+                // executes on every path to it: nothing conditional (a `?`, an
+                // `if`/`match`/loop body, a match arm) may sit between the sync
+                // point and the observation. Conditionals *before* the sync
+                // point do not weaken it — every path still reaches it.
+                let region = &tail[..obs_at];
+                let synced = sync_point_at(region, &recv).is_some_and(|sync_at| {
+                    conditional_from(region).is_none_or(|cut| sync_at < cut)
+                });
                 if !synced {
                     found.push((name.clone(), obs.to_string()));
                     break;
@@ -420,6 +516,108 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
         }
     "#;
     assert!(violations(in_memory).is_empty());
+
+    // …but reassigning it to a persistent journal revives the race.
+    let reassigned = r#"
+        fn t() {
+            let mut j = Journal::in_memory();
+            j = Journal::open(&path).unwrap();
+            let _ = j.apply_command(c).unwrap();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(reassigned).len(), 1);
+
+    // A trailing comma still discards the commit slot (one line and multiline).
+    let trailing_comma = r#"
+        fn t() {
+            let (_events, _,) = journal.apply_command(c).unwrap();
+            let len = fs::metadata(&path).unwrap().len();
+        }
+    "#;
+    assert_eq!(violations(trailing_comma).len(), 1);
+    let trailing_comma_multiline = r#"
+        fn t() {
+            let (
+                _events,
+                _,
+            ) = journal.apply_command(c).unwrap();
+            let len = fs::metadata(&path).unwrap().len();
+        }
+    "#;
+    assert_eq!(violations(trailing_comma_multiline).len(), 1);
+
+    // A sync point must be tied to the affected journal: an unrelated
+    // `barrier.wait()`, another journal's rotation, or reopening a *different*
+    // journal orders nothing for this write.
+    let unrelated_barrier = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            barrier.wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(unrelated_barrier).len(), 1);
+    let other_journal = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            other.snapshot_and_rotate();
+            let other2 = Journal::open(&path).unwrap();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(other_journal).len(), 1);
+
+    // A sync point that may never execute orders nothing either.
+    let conditional_barrier = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            if false {
+                journal.snapshot_and_rotate();
+            }
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(conditional_barrier).len(), 1);
+    let conditional_wait = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            if flag { commit.blocking_wait(); }
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(conditional_wait).len(), 1);
+
+    // …while the same calls, tied to the affected journal and unconditional,
+    // are real sync points.
+    let tied = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            journal.snapshot_and_rotate();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(tied).is_empty());
+    let dropped = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            drop(journal);
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(dropped).is_empty());
+
+    // A sync point *before* a conditional still executes on every path: the
+    // `?` only makes the suffix after it conditional.
+    let synced_then_fallible = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            journal.snapshot_and_rotate();
+            let x = fallible()?;
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(synced_then_fallible).is_empty());
 
     // Text inside string literals and comments is not code.
     let literal = r#"
