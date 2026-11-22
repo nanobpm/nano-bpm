@@ -4526,51 +4526,57 @@ fn chunk_seed_events(events: Vec<Event>, max_bytes: usize) -> Vec<Vec<Event>> {
 /// escaping, so the peer rejected the frame and the seed retried forever.
 const MAX_REPLICATED_EVENT_BYTES: usize = SEED_BATCH_MAX_BYTES;
 
-/// Rejects a deployment whose replicated `*Deployed` event would exceed
-/// [`MAX_REPLICATED_EVENT_BYTES`]. Evaluated BEFORE the deploy commits, on the
-/// worst-case event shape (maximal keys/versions), so the measured size is an
-/// upper bound of what live replication and the startup seed will send.
-fn check_replication_event_sizes(
+/// The worst-case replicated event shapes (maximal keys/versions) for a
+/// deployment, each tagged with the resource name it derives from (#1504).
+/// The single derivation behind both the per-event and the aggregate
+/// admission bound in [`check_replication_event_sizes`]; it mirrors what
+/// `broadcast_deployment` ships, including one `DecisionDeployed` per decision
+/// of each DRG.
+fn worst_case_replication_events(
     processes: &[ProcessDefinition],
     decisions: &[nanobpmn_engine_core::dmn::DecisionRequirementsGraph],
     forms: &[nanobpmn_engine_core::FormResource],
     resources: &[nanobpmn_engine_core::GenericResource],
-) -> Result<(), String> {
-    let check = |name: &str, event: Event| -> Result<(), String> {
-        let size = serde_json::to_vec(&event).map_or(usize::MAX, |v| v.len());
-        if size > MAX_REPLICATED_EVENT_BYTES {
-            return Err(format!(
-                "Deployment resource '{name}' is too large: its replicated form is {size} bytes, \
-                 over the {MAX_REPLICATED_EVENT_BYTES}-byte limit."
-            ));
-        }
-        Ok(())
-    };
+) -> Vec<(String, Event)> {
+    let mut out: Vec<(String, Event)> = Vec::new();
     for p in processes {
-        check(
-            &p.id,
+        out.push((
+            p.id.clone(),
             Event::ProcessDeployed {
                 deployment_key: Key::MAX,
                 process_definition_key: Key::MAX,
                 version: i32::MIN,
                 process: p.clone(),
             },
-        )?;
+        ));
     }
     for d in decisions {
-        check(
-            &d.id,
+        out.push((
+            d.id.clone(),
             Event::DecisionRequirementsDeployed {
                 deployment_key: Key::MAX,
                 decision_requirements_key: Key::MAX,
                 version: i32::MIN,
                 drg: d.clone(),
             },
-        )?;
+        ));
+        for decision in &d.decisions {
+            out.push((
+                d.id.clone(),
+                Event::DecisionDeployed {
+                    deployment_key: Key::MAX,
+                    decision_requirements_key: Key::MAX,
+                    decision_key: Key::MAX,
+                    decision_id: decision.id.clone(),
+                    decision_name: decision.name.clone(),
+                    version: i32::MIN,
+                },
+            ));
+        }
     }
     for f in forms {
-        check(
-            &f.resource_name,
+        out.push((
+            f.resource_name.clone(),
             Event::FormDeployed {
                 deployment_key: Key::MAX,
                 form_key: Key::MAX,
@@ -4580,11 +4586,11 @@ fn check_replication_event_sizes(
                 schema: f.schema.clone(),
                 version_tag: f.version_tag.clone(),
             },
-        )?;
+        ));
     }
     for r in resources {
-        check(
-            &r.resource_name,
+        out.push((
+            r.resource_name.clone(),
             Event::GenericResourceDeployed {
                 deployment_key: Key::MAX,
                 resource_key: Key::MAX,
@@ -4594,7 +4600,44 @@ fn check_replication_event_sizes(
                 content: r.content.clone(),
                 version_tag: r.version_tag.clone(),
             },
-        )?;
+        ));
+    }
+    out
+}
+
+/// Rejects a deployment whose replicated events would not fit replication
+/// (#1504). Evaluated BEFORE the deploy commits, on the worst-case event shapes
+/// from [`worst_case_replication_events`], so the measured sizes are upper
+/// bounds of what live replication and the startup seed will send:
+/// - each event must fit [`MAX_REPLICATED_EVENT_BYTES`] (one seed batch), and
+/// - the whole deployment must fit [`SEED_BATCH_MAX_BYTES`] in aggregate,
+///   because the live broadcast installs it atomically as ONE
+///   `InstallDeployment` frame per peer (half the peer's 16 MiB frame limit,
+///   leaving the other half as envelope headroom).
+fn check_replication_event_sizes(
+    processes: &[ProcessDefinition],
+    decisions: &[nanobpmn_engine_core::dmn::DecisionRequirementsGraph],
+    forms: &[nanobpmn_engine_core::FormResource],
+    resources: &[nanobpmn_engine_core::GenericResource],
+) -> Result<(), String> {
+    let events = worst_case_replication_events(processes, decisions, forms, resources);
+    for (name, event) in &events {
+        let size = serde_json::to_vec(event).map_or(usize::MAX, |v| v.len());
+        if size > MAX_REPLICATED_EVENT_BYTES {
+            return Err(format!(
+                "Deployment resource '{name}' is too large: its replicated form is {size} bytes, \
+                 over the {MAX_REPLICATED_EVENT_BYTES}-byte limit."
+            ));
+        }
+    }
+    let frame: Vec<&Event> = events.iter().map(|(_, e)| e).collect();
+    let total = serde_json::to_vec(&frame).map_or(usize::MAX, |v| v.len());
+    if total > SEED_BATCH_MAX_BYTES {
+        return Err(format!(
+            "Deployment is too large: its replicated form is {total} bytes in aggregate, \
+             over the {SEED_BATCH_MAX_BYTES}-byte limit for one atomic install frame. \
+             Split it into smaller deployments."
+        ));
     }
     Ok(())
 }
@@ -17764,66 +17807,6 @@ impl ServerImpl {
     ) -> Result<(models::DeploymentResult, Arc<Vec<Event>>), (&'static str, String)> {
         check_replication_event_sizes(&processes, &decisions, &forms, &generic_resources)
             .map_err(|detail| ("Deployment too large", detail))?;
-        // The live broadcast ships the whole deployment as ONE
-        // `InstallDeployment` frame per peer (atomic install: no window where a
-        // concurrent instance reaches a user task before its form, #1504
-        // review), so the deployment's events must ALSO fit one frame in
-        // aggregate — per-event admission alone lets a many-resource
-        // deployment sum past the peer's frame limit. The budget accounts for
-        // the frame envelope by halving the peer's 16 MiB limit, exactly like
-        // the seed batch budget.
-        let worst_case: Vec<Event> = processes
-            .iter()
-            .map(|p| Event::ProcessDeployed {
-                deployment_key: Key::MAX,
-                process_definition_key: Key::MAX,
-                version: i32::MIN,
-                process: p.clone(),
-            })
-            .chain(
-                decisions
-                    .iter()
-                    .map(|d| Event::DecisionRequirementsDeployed {
-                        deployment_key: Key::MAX,
-                        decision_requirements_key: Key::MAX,
-                        version: i32::MIN,
-                        drg: d.clone(),
-                    }),
-            )
-            .chain(forms.iter().map(|f| Event::FormDeployed {
-                deployment_key: Key::MAX,
-                form_key: Key::MAX,
-                version: i32::MIN,
-                form_id: f.id.clone(),
-                resource_name: f.resource_name.clone(),
-                schema: f.schema.clone(),
-                version_tag: f.version_tag.clone(),
-            }))
-            .chain(
-                generic_resources
-                    .iter()
-                    .map(|r| Event::GenericResourceDeployed {
-                        deployment_key: Key::MAX,
-                        resource_key: Key::MAX,
-                        version: i32::MIN,
-                        resource_id: r.resource_id.clone(),
-                        resource_name: r.resource_name.clone(),
-                        content: r.content.clone(),
-                        version_tag: r.version_tag.clone(),
-                    }),
-            )
-            .collect();
-        let total = serde_json::to_vec(&worst_case).map_or(usize::MAX, |v| v.len());
-        if total > SEED_BATCH_MAX_BYTES {
-            return Err((
-                "Deployment too large",
-                format!(
-                    "Deployment is too large: its replicated form is {total} bytes in aggregate, \
-                     over the {SEED_BATCH_MAX_BYTES}-byte limit for one atomic install frame. \
-                     Split it into smaller deployments."
-                ),
-            ));
-        }
         let requested_ids: Vec<String> = processes.iter().map(|p| p.id.clone()).collect();
         let requested_drg_ids: Vec<String> = decisions.iter().map(|d| d.id.clone()).collect();
         let requested_form_ids: Vec<String> = forms.iter().map(|f| f.id.clone()).collect();
@@ -33847,6 +33830,24 @@ mod clustered_startup_tests {
             version_tag: None,
         };
         check_replication_event_sizes(&[], &[], &[], &[ok]).expect("within budget");
+    }
+
+    /// #1504 aggregate bound: the live broadcast installs a deployment as ONE
+    /// frame per peer, so resources that each fit on their own must still be
+    /// rejected when they sum past the atomic-install budget.
+    #[test]
+    fn many_resources_summing_past_frame_budget_are_rejected() {
+        let mk = |i: usize| nanobpmn_engine_core::GenericResource {
+            resource_id: format!("r{i}.md"),
+            resource_name: format!("r{i}.md"),
+            content: "x".repeat(MAX_REPLICATED_EVENT_BYTES / 2),
+            version_tag: None,
+        };
+        let two: Vec<_> = (0..2).map(mk).collect();
+        check_replication_event_sizes(&[], &[], &[], &two[..1]).expect("one fits");
+        let err = check_replication_event_sizes(&[], &[], &[], &two)
+            .expect_err("aggregate over budget must be rejected");
+        assert!(err.contains("in aggregate"), "{err}");
     }
 
     /// #1504: the deploy chokepoint rejects an oversized resource without

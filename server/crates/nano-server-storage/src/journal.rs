@@ -9599,8 +9599,12 @@ mod tests {
     /// The live broadcast therefore ships the whole deployment as ONE atomic
     /// `InstallDeployment` frame (admission rejects any deployment whose
     /// events sum past the frame budget, so a live deployment is never split).
-    /// This test drives the batch boundaries directly to prove the failure
-    /// mode the atomic install forecloses: with the process batch installed
+    /// This test does NOT observe the broadcast's one-frame-per-peer shape
+    /// (that is guarded by the aggregate admission test
+    /// `many_resources_summing_past_frame_budget_are_rejected` in the server);
+    /// it drives the batch boundaries directly to document the failure mode
+    /// the atomic install forecloses, and that the split case still recovers:
+    /// with the process batch installed
     /// first, an instance created in the gap parks on the form-binding
     /// incident; once the form batch lands, resolving the incident redrives
     /// the activation body and the task is created with the resolved form key.
