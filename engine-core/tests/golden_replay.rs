@@ -421,8 +421,16 @@ fn pre_1608_orphan_stamp_superseded_decodes_with_no_kind() {
         }
         other => panic!("expected OrphanStampSuperseded, got {other:?}"),
     }
+    // Re-serializes byte-identically (#1608 review): the storage chain digest
+    // folds serialized events, so an extra `"kind":null` would fail
+    // `replay_verified` on an existing digest-bearing journal.
+    assert_eq!(
+        serde_json::to_string(&decoded).expect("serialize"),
+        legacy_line,
+        "a legacy supersede must round-trip byte-identically"
+    );
     // Replaying a journal that contains it must not error/panic (the reducer
-    // ignores it; the point is decode + replay of the legacy shape succeed).
+    // records it pending; the point is decode + replay of the legacy shape succeed).
     let _engine = Engine::replay(std::iter::once(decoded));
 }
 

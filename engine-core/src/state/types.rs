@@ -2617,6 +2617,19 @@ pub struct State {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub pending_orphan_supersedes: BTreeMap<Key, crate::command::OrphanKind>,
+    /// Instance key → the loss-episode id of its most recently quarantined
+    /// (`VariablesLostQuarantined`) episode (#1608 review). A **replicated**
+    /// record that outlives the tombstone (lifted on resolve), so a delayed
+    /// duplicate of an already-settled episode — which applies superseded —
+    /// is recognised and NOT recorded in `pending_orphan_supersedes`;
+    /// otherwise recovery would re-park, re-stamp and raise a second
+    /// `VariablesLost` without a new loss. Cleared on the instance's terminal
+    /// event. Additive; omitted when empty.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub settled_orphan_episodes: BTreeMap<Key, Key>,
     /// The most recent instance keys to reach a terminal state
     /// (`ProcessInstanceCompleted` / `ProcessInstanceTerminated`), oldest
     /// first, bounded by [`RECENTLY_TERMINATED_CAP`] (#1574 review). A
@@ -2752,6 +2765,7 @@ impl State {
         self.recently_terminated.push_back(instance_key);
         // #1608: a terminal instance's pending loss report no longer matters.
         self.pending_orphan_supersedes.remove(&instance_key);
+        self.settled_orphan_episodes.remove(&instance_key);
         self.terminal_epoch += 1;
         if let Some(instance) = self.instances.get_mut(&instance_key) {
             instance.terminated_epoch = self.terminal_epoch;

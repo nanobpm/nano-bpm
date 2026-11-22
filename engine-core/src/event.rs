@@ -2117,7 +2117,13 @@ pub enum Event {
         /// `None` for a frame written before this field existed: the rebuild
         /// then derives the tier at re-stamp time from the recovered routing
         /// state. Additive: `serde(default)`, no snapshot-format bump.
-        #[cfg_attr(feature = "serde", serde(default))]
+        ///
+        /// Omitted when `None` so a legacy frame re-serializes byte-identically
+        /// (the chain digest folds serialized events).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
         kind: Option<crate::command::OrphanKind>,
     },
 }

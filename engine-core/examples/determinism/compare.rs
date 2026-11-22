@@ -273,6 +273,7 @@ pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("resource_versions", FieldRule::EntityMap),
     ("variables_lost_quarantined", FieldRule::EntityMap),
     ("pending_orphan_supersedes", FieldRule::EntityMap),
+    ("settled_orphan_episodes", FieldRule::EntityMap),
     ("recently_terminated", FieldRule::KeyList),
     ("terminal_epoch", FieldRule::TerminalEpoch),
     ("lenient_completion", FieldRule::Exact),

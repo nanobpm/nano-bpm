@@ -338,6 +338,11 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             episode,
         } => {
             state.pending_orphan_supersedes.remove(instance_key);
+            if *episode > 0 {
+                state
+                    .settled_orphan_episodes
+                    .insert(*instance_key, *episode);
+            }
             state.variables_lost_quarantined.insert(
                 *instance_key,
                 crate::state::types::VariablesLostTombstone {
@@ -353,8 +358,16 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
         // #1608: it does record the report as durably pending, so the host
         // rebuilds its orphan backlog from replicated state after recovery.
         Event::OrphanStampSuperseded {
-            instance_key, kind, ..
+            instance_key,
+            episode,
+            kind,
         } => {
+            // A delayed duplicate of an already-settled episode is not a
+            // pending report (#1608 review): recording it would make recovery
+            // re-raise `VariablesLost` without a new loss.
+            if state.settled_orphan_episodes.get(instance_key) == Some(episode) {
+                return;
+            }
             state.pending_orphan_supersedes.insert(
                 *instance_key,
                 kind.unwrap_or(crate::command::OrphanKind::Resident),
@@ -882,6 +895,49 @@ mod pending_orphan_supersede_tests {
             pending,
             vec![(30, OrphanKind::Cold), (40, OrphanKind::Resident)]
         );
+    }
+
+    // #1608 review: a delayed duplicate of a settled (quarantined, then
+    // resolved) episode applies superseded but must not be recorded pending —
+    // a fresh stale-stamp supersede (different episode) still is.
+    #[test]
+    fn supersede_of_a_settled_episode_is_not_pending() {
+        let mut state = State::default();
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 5,
+            },
+        );
+        state.variables_lost_quarantined.remove(&10); // resolve lifts it
+        apply(
+            &mut state,
+            &Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 5,
+                kind: Some(OrphanKind::Cold),
+            },
+        );
+        assert!(state.pending_orphan_supersedes.is_empty());
+        apply(
+            &mut state,
+            &Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 6,
+                kind: Some(OrphanKind::Cold),
+            },
+        );
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Cold)
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 10 },
+        );
+        assert!(state.settled_orphan_episodes.is_empty());
     }
 
     #[cfg(feature = "serde")]

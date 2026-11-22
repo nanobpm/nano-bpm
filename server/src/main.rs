@@ -17,8 +17,6 @@ mod console_api;
 mod consumers;
 mod falcon;
 mod mcp;
-#[cfg(test)]
-mod optional_body_guard;
 #[cfg(feature = "console")]
 mod provisioning;
 mod query;

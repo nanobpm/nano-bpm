@@ -1261,7 +1261,7 @@ impl Journal {
         let engine = if events.is_empty() {
             Engine::with_partition(partition_id)
         } else {
-            Engine::replay_partition(partition_id, events.clone())
+            Engine::replay_partition(partition_id, events)
         };
         let mut journal = Self {
             engine,
@@ -1475,7 +1475,7 @@ impl Journal {
 
         let events = Self::read_events(path)?;
         if !events.is_empty() {
-            engine = Self::replay_verified(partition_id, events.clone())?;
+            engine = Self::replay_verified(partition_id, events)?;
             fresh = false;
         }
 
@@ -1584,7 +1584,7 @@ impl Journal {
         let engine = if fresh {
             Engine::with_partition(partition_id)
         } else {
-            Self::replay_verified(partition_id, events.clone())?
+            Self::replay_verified(partition_id, events)?
         };
         let mut journal = Self {
             engine,
@@ -1792,8 +1792,14 @@ impl Journal {
         if self.orphans.leader != leader {
             self.orphans.in_flight.clear();
         }
+        let promoted = leader && !self.orphans.leader;
         self.orphans.leader = leader;
-        if leader {
+        if promoted {
+            // #1608: a follower applied supersedes into replicated state
+            // without parking a local report; rebuild on promotion so the
+            // pending loss is re-proposed (this also drains).
+            self.rebuild_orphan_backlog();
+        } else if leader {
             self.drain_orphan_backlog();
         }
     }
@@ -8271,6 +8277,65 @@ mod tests {
         other.restore_engine_from_snapshot(own);
         assert!(other.orphan_backlog().is_empty(), "no cross-partition park");
 
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608 review: a FOLLOWER applies a supersede into replicated state
+    // with no local report parked (it never detected the loss itself). On
+    // ordinary promotion — no recovery, no snapshot adoption — the new leader
+    // must rebuild its backlog from replicated state, or a leader failure
+    // before the retry leaves the dormant loss unreported forever.
+    #[test]
+    fn promotion_rebuilds_the_orphan_backlog_from_replicated_state() {
+        let path = restart_store_path("orphan-supersede-promotion-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(false);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "the stale stamp journals its supersede: {events:?}"
+        );
+        // Model a follower that never parked the report locally.
+        journal.discard_orphan_reports();
+        assert!(journal.orphan_backlog().is_empty());
+
+        journal.set_orphan_leadership(true);
+        assert_eq!(
+            journal.orphan_backlog(),
+            vec![keys[0]],
+            "promotion re-parks the replicated pending report"
+        );
+
+        drop(journal);
         drop(store);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
