@@ -31,10 +31,40 @@ test("a fresh editor instance (e.g. StrictMode remount) loads the same document"
   assert.equal(gate.shouldLoad({}, "<a/>"), true);
 });
 
-test("invalidate() (an edit, a blank load or a failed import) re-arms the same document", () => {
+test("invalidate() (an edit or a blank load) re-arms the same document", () => {
   const gate = new DocumentLoadGate<object>();
   const m = {};
   gate.shouldLoad(m, "<a/>");
   gate.invalidate();
   assert.equal(gate.shouldLoad(m, "<a/>"), true);
+});
+
+// A failed import must only re-arm the document that failed. When import(A) is
+// queued, then import(B) records B in the gate, A's failure must NOT clear B's
+// record — otherwise a duplicate delivery of B imports again and wipes the
+// selection (the very double-import the gate exists to prevent).
+test("invalidateIf() clears the record only when it still names the failed document", () => {
+  const gate = new DocumentLoadGate<object>();
+  const m = {};
+  gate.shouldLoad(m, "<a/>");
+  gate.shouldLoad(m, "<b/>");
+  // A's import fails after B was recorded: B's record must survive.
+  gate.invalidateIf(m, "<a/>");
+  assert.equal(gate.shouldLoad(m, "<b/>"), false);
+});
+
+test("invalidateIf() re-arms the document whose import actually failed", () => {
+  const gate = new DocumentLoadGate<object>();
+  const m = {};
+  gate.shouldLoad(m, "<a/>");
+  gate.invalidateIf(m, "<a/>");
+  assert.equal(gate.shouldLoad(m, "<a/>"), true);
+});
+
+test("invalidateIf() ignores a failure attributed to another editor instance", () => {
+  const gate = new DocumentLoadGate<object>();
+  const m = {};
+  gate.shouldLoad(m, "<a/>");
+  gate.invalidateIf({}, "<a/>");
+  assert.equal(gate.shouldLoad(m, "<a/>"), false);
 });

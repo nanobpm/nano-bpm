@@ -9,8 +9,10 @@
 //
 // The gate records which document was last delivered to which editor instance.
 // A repeat request for the same pair is a no-op. Anything that makes the editor
-// diverge from that document (a user edit, a blank load, a failed import)
-// must call `invalidate()` so the next request for the document loads again.
+// diverge from that document (a user edit, a blank load) must call
+// `invalidate()` so the next request for the document loads again; a failed
+// import calls `invalidateIf()` so a stale failure cannot re-arm a newer
+// document delivered while the failed one was in flight.
 
 export class DocumentLoadGate<I> {
   private current: { instance: I; doc: string } | null = null;
@@ -27,5 +29,17 @@ export class DocumentLoadGate<I> {
   /** The editor no longer holds the recorded document unchanged. */
   invalidate(): void {
     this.current = null;
+  }
+
+  /** The load of `doc` into `instance` failed, so the editor no longer holds
+   *  it — but only clear the record when it still names that pair. A stale
+   *  failure (an earlier queued import rejecting after a newer document was
+   *  recorded) must not re-arm the newer document: that would re-import it and
+   *  wipe the selection, the double-import this gate exists to prevent. */
+  invalidateIf(instance: I, doc: string): void {
+    const cur = this.current;
+    if (cur && cur.instance === instance && cur.doc === doc) {
+      this.current = null;
+    }
   }
 }

@@ -1266,7 +1266,9 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           return Promise.resolve();
         return runLoad((m) =>
           m.importXML(xml).catch((e: unknown) => {
-            loadGateRef.current.invalidate();
+            // Only re-arm when the gate still records THIS import — a newer
+            // document may have been delivered while this one was in flight.
+            loadGateRef.current.invalidateIf(modeler, xml);
             throw e;
           }),
         );

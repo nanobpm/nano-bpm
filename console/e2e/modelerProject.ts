@@ -113,8 +113,6 @@ export async function stubProjectFiles(
   );
 }
 
-/** Open `resources/processes/agent-task.bpmn` in the workspace tree so the
- *  modeler mounts. */
 /** Open the stubbed `.bpmn` and return once the modeler has settled on it
  *  (see `waitForModelLoaded`). `settledOn` is the id of a shape in the model the
  *  spec stubbed, so "settled" means "this document is on the canvas". */

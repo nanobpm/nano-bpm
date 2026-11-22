@@ -167,7 +167,9 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
           try {
             await e.importSchema(parseSchema(json));
           } catch (err) {
-            loadGateRef.current.invalidate();
+            // Only re-arm when the gate still records THIS import — a newer
+            // document may have been delivered while this one was in flight.
+            loadGateRef.current.invalidateIf(editor, json);
             throw err;
           }
         });
