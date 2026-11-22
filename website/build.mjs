@@ -1323,7 +1323,8 @@ function blogPosts() {
       date: "2026-10-21",
       dek:
         "When a graph fans out ten coding agents, the agent's footprint becomes the fleet's " +
-        "ceiling. nano-coder is a Rust coding agent that runs in about 6MB, so the ceiling moves.",
+        `ceiling. nano-coder is a coding agent written in ${nanoCoderFacts().language} that runs in ` +
+        `about ${nanoCoderFacts().rss.replace(/^~/, "")}, so the ceiling moves.`,
       body: nanoCoderPostBody,
     },
     {
