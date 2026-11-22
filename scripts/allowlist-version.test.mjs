@@ -223,7 +223,10 @@ test("the checked-in allowlist is clean for the CURRENT next gateway release", a
   const workspaceVersion = cargoPackageVersion(readFileSync(join(root, "server/Cargo.toml"), "utf8"));
   const expected = nextGatewayRelease({ workspaceVersion, tags });
   const allowlist = JSON.parse(readFileSync(join(root, ALLOWLIST_REL), "utf8"));
-  assert.equal(checkIntroducedIn(allowlist, expected), null);
+  // Same policy as the CLI gate: also reject already-shipped labels when no
+  // bump is pending (expected === null).
+  const latestTag = latestGatewayTag(tags)?.tag ?? null;
+  assert.equal(checkIntroducedIn(allowlist, expected, latestTag), null);
 });
 
 test("the pruning job is wired into the tag-triggered gateway release workflow", () => {
