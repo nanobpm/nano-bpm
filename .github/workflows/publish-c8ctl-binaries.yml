@@ -36,8 +36,8 @@ concurrency:
 permissions:
   contents: read
   # The `prune-allowlist` job opens (and queues) the post-tag determinism
-  # allowlist pruning PR (#1801).
-  pull-requests: write
+  # allowlist pruning PR (#1801); it declares the extra permissions it needs
+  # at job level, so no other job inherits a PR-write token.
 
 env:
   PLUGIN_REPO: jwulf/c8ctl-plugin-nano
