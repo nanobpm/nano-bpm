@@ -1406,16 +1406,17 @@ function agentHarnesses() {
 // Homebrew formula (nanobpm/tap) ships the same binaries. Language, size and
 // install commands mirror the nanobpm/nano-coder README (1.0 is the D rewrite).
 function nanoCoderFacts() {
+  const rss = "~4MB";
   return {
     install: "npm install -g @nanobpm/nano-coder",
     brew: "brew install nanobpm/tap/nano-coder",
     language: "D",
     platforms: "macOS and Linux (x64, arm64)",
-    rss: "~4MB",
+    rss,
     // The README qualifies the ~4MB figure as a peak footprint measured on macOS,
     // not unqualified resident memory. Use this qualified form wherever the memory
     // claim is stated as a measurement, so pages don't overstate the number.
-    rssQualified: "~4MB (peak footprint on macOS)",
+    rssQualified: `${rss} (peak footprint on macOS)`,
     nodeRss: "150–660MB",
     repo: "https://github.com/nanobpm/nano-coder",
   };
