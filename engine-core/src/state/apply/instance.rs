@@ -863,6 +863,8 @@ pub(crate) fn settled_orphan_episode(state: &State, instance_key: Key) -> Option
 
 #[cfg(test)]
 mod pending_orphan_supersede_tests {
+    use std::collections::BTreeMap;
+
     use crate::command::OrphanKind;
     use crate::state::{apply, State};
     use crate::Event;
@@ -1191,6 +1193,131 @@ mod pending_orphan_supersede_tests {
         assert_eq!(state.settled_orphan_episodes.get(&10), None);
         assert_eq!(state.settled_orphan_episodes.get(&20), Some(&7));
         assert_eq!(state.settled_orphan_episodes.get(&30), None);
+    }
+
+    // #1608 review: a delayed duplicate E5 arriving AFTER the fresh supersede
+    // E9 must not replace it in the backfill's superseded-episode record —
+    // comparing E5 against the settlement mark would drop the genuinely
+    // unresolved E9 report and leave the dormant loss unreported.
+    #[test]
+    fn backfill_keeps_the_highest_superseded_episode_per_instance() {
+        let history = [
+            // E8 quarantined (settled), then the fresh supersede E9, then the
+            // delayed duplicate E5 of the settled episode.
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 8,
+            },
+            Event::IncidentResolved {
+                incident_key: 99,
+                instance_key: 10,
+                job_key: None,
+                resolved_at: 1,
+                operation_reference: None,
+            },
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 9,
+                kind: Some(OrphanKind::Resident),
+            },
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 5,
+                kind: Some(OrphanKind::Resident),
+            },
+        ];
+        let mut state = State::default();
+        for event in &history {
+            apply(&mut state, event);
+        }
+        // A pre-#1608 snapshot: neither map recorded.
+        state.pending_orphan_supersedes.clear();
+        state.settled_orphan_episodes.clear();
+        state.backfill_settled_orphan_episodes(history.iter());
+        // E9 is still reconstructed as pending — only the delayed duplicate
+        // E5 (at/below the settlement mark E8) is dropped.
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Resident)
+        );
+        assert_eq!(state.settled_orphan_episodes.get(&10), Some(&8));
+    }
+
+    // #1608 review: after the bounded terminal ring wraps past an evicted
+    // terminal instance, `terminated_epoch_of` can no longer prove it
+    // terminated. The backfill must still reconcile against the snapshot's
+    // own lifecycle state — a resident terminal shell — or a lagging
+    // receiver's earlier supersede restores a loss report for completed work.
+    #[test]
+    fn backfill_never_restores_a_report_for_a_terminal_shell_after_ring_wrap() {
+        let mut state = State::default();
+        // The instance completed and is still resident (a terminal shell the
+        // exporter has not yet reaped)…
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCreated {
+                instance_key: 10,
+                process_id: "p".to_string(),
+                variables: BTreeMap::new(),
+                created_at: 0,
+                tags: Vec::new(),
+                business_id: None,
+                process_definition_key: 1,
+                version: 1,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+            },
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 10 },
+        );
+        // …but the bounded ring has wrapped past it and the instance itself
+        // was evicted before its terminal epoch could be stamped, so the
+        // replicated terminal record can no longer prove the termination —
+        // only the resident shell's lifecycle state can.
+        state.recently_terminated.clear();
+        state
+            .instances
+            .get_mut(&10)
+            .expect("resident shell")
+            .terminated_epoch = 0;
+        assert_eq!(state.terminated_epoch_of(10), None);
+        // The lagging receiver's retained history holds only the earlier
+        // supersede/quarantine of the completed work.
+        let local_history = [
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 4,
+                kind: None,
+            },
+            Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 97,
+                episode: 5,
+            },
+        ];
+        state.backfill_settled_orphan_episodes(local_history.iter());
+        assert!(state.pending_orphan_supersedes.is_empty());
+        assert!(state.settled_orphan_episodes.is_empty());
+    }
+
+    // A genuinely missing (cold / pruned) target is NOT proven terminal: its
+    // report is preserved exactly as before the ring-wrap reconciliation.
+    #[test]
+    fn backfill_preserves_a_report_whose_target_the_snapshot_does_not_hold() {
+        let history = [Event::OrphanStampSuperseded {
+            instance_key: 10,
+            episode: 4,
+            kind: Some(OrphanKind::Cold),
+        }];
+        let mut state = State::default();
+        state.backfill_settled_orphan_episodes(history.iter());
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Cold)
+        );
     }
 
     #[cfg(feature = "serde")]

@@ -419,6 +419,17 @@ pub struct Journal {
     /// Pre-cutover legacy lenient-completion host flag (#1661), re-applied to
     /// every rebuilt engine (it is not in the snapshot body).
     legacy_lenient_completion: bool,
+    /// Divergence-recovery mode (#1608 review, #1701): set by the Raft layer
+    /// while this journal belongs to a recovery-only receiver — a member
+    /// booted over a crash-durable divergence marker whose local journal is
+    /// KNOWN-DIVERGED. While set, snapshot adoption
+    /// ([`restore_engine_from_snapshot`](Self::restore_engine_from_snapshot))
+    /// skips the receiver-local loss-episode backfill: folding the diverged
+    /// journal's retained prefix into the authoritative leader snapshot would
+    /// import supersedes or settlements the leader never committed, letting
+    /// discarded local state trigger a false loss report or suppress a valid
+    /// one — and then checkpoint the altered maps as the recovery base.
+    divergence_recovery: bool,
     /// Keys of instances already quarantined as **off-heap orphans** (#1383): a
     /// spilled instance whose variable row, or a cold instance whose snapshot
     /// row, is *definitively absent* from a readable store. Its payload is
@@ -1250,6 +1261,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
+            divergence_recovery: false,
         }
     }
 
@@ -1288,6 +1300,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
+            divergence_recovery: false,
         };
         // #1608: re-park any still-open superseded orphan report the replayed
         // history proves pending.
@@ -1371,7 +1384,18 @@ impl Journal {
         // it also reconstructs a legacy snapshot's unresolved supersedes.
         // Best-effort: a pruned prefix leaves the documented one-extra-
         // incident residual window.
-        if self.engine.raft_applied().is_some()
+        //
+        // DIVERGENCE RECOVERY (#1608 review, #1701): a recovery-only
+        // receiver's local journal is KNOWN-DIVERGED — its retained prefix is
+        // NOT the verified committed prefix the leader snapshotted. Folding
+        // it into the authoritative snapshot would import receiver-local
+        // supersedes or settlements the leader never committed (a false loss
+        // report, or a suppressed valid one) and then checkpoint the altered
+        // maps as the recovery base. Skip the backfill: the leader's snapshot
+        // is the whole truth here, and the fence stays armed until it is
+        // checkpointed.
+        if !self.divergence_recovery
+            && self.engine.raft_applied().is_some()
             && let Some(shared) = self.seg.clone()
         {
             // The shared multi-partition writer journals `<partition>\t<json>`
@@ -1549,6 +1573,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
+            divergence_recovery: false,
         };
         // #1608: re-park any still-open superseded orphan report the durable
         // history proves pending (a crash between the supersede and its
@@ -1596,6 +1621,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
+            divergence_recovery: false,
         };
         // #1608: re-park any still-open superseded orphan report the surviving
         // tail proves pending (a crash between the supersede and its
@@ -1651,6 +1677,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
+            divergence_recovery: false,
         };
         // #1608: re-park any still-open superseded orphan report the durable
         // history proves pending.
@@ -1700,6 +1727,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
+            divergence_recovery: false,
         };
         // #1608: re-park any still-open superseded orphan report the surviving
         // tail proves pending.
@@ -3429,6 +3457,14 @@ impl Journal {
     /// the `fenced` field).
     pub fn is_fenced(&self) -> bool {
         self.fenced
+    }
+
+    /// Marks (or clears) divergence-recovery mode (#1608 review, #1701) —
+    /// see the `divergence_recovery` field. The Raft layer sets it when a
+    /// recovery-only receiver boots over a divergence marker and clears it
+    /// once the leader's authoritative snapshot is adopted and checkpointed.
+    pub fn set_divergence_recovery(&mut self, recovering: bool) {
+        self.divergence_recovery = recovering;
     }
 
     /// The last Raft applied-entry record this journal wrote or recovered
@@ -7215,6 +7251,87 @@ mod tests {
         assert!(
             state.settled_orphan_episodes.contains_key(&key),
             "adoption backfilled the settlement map from the retained prefix"
+        );
+        assert!(receiver.instance(key).is_some(), "no data loss");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review (divergence-recovery arm): a recovery-only receiver's
+    /// local journal is KNOWN-DIVERGED (#1701), so its retained prefix is not
+    /// the verified committed prefix the leader snapshotted. Adoption must
+    /// SKIP the receiver-local backfill — importing the diverged journal's
+    /// supersedes/settlements into the authoritative snapshot could trigger a
+    /// false loss report or suppress a valid one, and then checkpoint the
+    /// altered maps as the recovery base.
+    #[test]
+    fn snapshot_adoption_skips_the_local_backfill_during_divergence_recovery() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-adopt-diverged-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The diverged receiver's retained log holds a resolved loss episode
+        // the leader's snapshot does not carry (stripped to the pre-#1608
+        // shape, exactly as in the ordinary-adoption test above).
+        let key = {
+            let (mut journal, _recovery) = Journal::open_segmented(&dir).expect("open segmented");
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            let fresh = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("stamp the report");
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(fresh),
+                })
+                .unwrap();
+            let incident_key = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                    _ => None,
+                })
+                .expect("quarantines");
+            let _ = journal
+                .apply_command(Command::ResolveIncident { incident_key })
+                .unwrap();
+            key
+        };
+
+        // Reopen the receiver over the diverged retained log and adopt the
+        // leader's authoritative snapshot with divergence-recovery mode set —
+        // exactly what `bootstrap_recovery_receiver` arranges (#1701).
+        let (mut receiver, recovery) = Journal::open_segmented(&dir).expect("reopen receiver");
+        receiver.set_divergence_recovery(true);
+        let mut stripped = receiver.engine_snapshot();
+        stripped.state.settled_orphan_episodes.clear();
+        stripped.raft_applied = Some((42, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(stripped, Some(&permit))
+            .expect("adoption publishes the new base");
+        drop(permit);
+
+        let state = receiver.engine().state();
+        assert!(
+            state.settled_orphan_episodes.is_empty(),
+            "the diverged journal's retained prefix is NOT folded into the authoritative snapshot"
+        );
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "no receiver-local supersede is imported either"
         );
         assert!(receiver.instance(key).is_some(), "no data loss");
         let _ = std::fs::remove_dir_all(&dir);

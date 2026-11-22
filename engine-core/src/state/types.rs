@@ -2800,7 +2800,17 @@ impl State {
                     episode,
                     ..
                 } => {
-                    superseded_at.insert(*instance_key, *episode);
+                    // Keep the HIGHEST superseded episode per instance, not
+                    // the last in journal order (#1608 review): a delayed
+                    // duplicate E5 arriving after the fresh supersede E9 must
+                    // not replace E9 here — the pending-supersede
+                    // reconstruction below would then compare E5 against the
+                    // settlement mark and drop the genuinely unresolved E9
+                    // report, leaving the dormant loss unreported.
+                    superseded_at
+                        .entry(*instance_key)
+                        .and_modify(|e| *e = (*e).max(*episode))
+                        .or_insert(*episode);
                 }
                 crate::Event::VariablesLostQuarantined { .. }
                 | crate::Event::ProcessInstanceCompleted { .. }
@@ -2815,7 +2825,7 @@ impl State {
         // already knows terminated (a later termination the local history
         // does not hold) — the terminal fold cleared it there.
         for (instance_key, episode) in folded.settled_orphan_episodes {
-            if self.terminated_epoch_of(instance_key).is_some() {
+            if self.snapshot_shows_terminal(instance_key) {
                 continue;
             }
             let entry = self
@@ -2830,7 +2840,7 @@ impl State {
         // tombstone or a settlement mark at/above its episode) or terminated.
         for (instance_key, kind) in folded.pending_orphan_supersedes {
             let episode = superseded_at.get(&instance_key).copied().unwrap_or(0);
-            if self.terminated_epoch_of(instance_key).is_some()
+            if self.snapshot_shows_terminal(instance_key)
                 || self.variables_lost_quarantined.contains_key(&instance_key)
                 || (episode > 0
                     && super::apply::settled_orphan_episode(self, instance_key)
@@ -2842,6 +2852,35 @@ impl State {
                 .entry(instance_key)
                 .or_insert(kind);
         }
+    }
+
+    /// Whether the SNAPSHOT's own lifecycle records prove `instance_key`
+    /// reached a terminal state (#1608 review): the replicated terminal
+    /// record ([`State::terminated_epoch_of`] — the resident instance's
+    /// stamped epoch or its position in the bounded terminal ring), or the
+    /// instance's own resident lifecycle state (`Completed` / `Terminated`).
+    ///
+    /// The state check closes the bounded-ring hole: once a terminal instance
+    /// falls out of the 4,096-entry `recently_terminated` ring,
+    /// `terminated_epoch_of` returns `None` even though the snapshot still
+    /// holds the instance's terminal shell, and without it a lagging
+    /// receiver's earlier supersede/quarantine would be restored as pending
+    /// or settled — resurrecting a loss report for work the authoritative
+    /// snapshot shows COMPLETED. `Terminating` is not terminal (the instance
+    /// is still draining its canceling listeners), and a missing instance
+    /// (genuinely cold / pruned) is not proven terminal either — a cold
+    /// target's report must still be preserved.
+    fn snapshot_shows_terminal(&self, instance_key: Key) -> bool {
+        if self.terminated_epoch_of(instance_key).is_some() {
+            return true;
+        }
+        self.instances.get(&instance_key).is_some_and(|i| {
+            matches!(
+                i.state,
+                crate::state::types::ProcessInstanceState::Completed
+                    | crate::state::types::ProcessInstanceState::Terminated
+            )
+        })
     }
 
     /// Records `instance_key` as terminal in the bounded replicated ring and
