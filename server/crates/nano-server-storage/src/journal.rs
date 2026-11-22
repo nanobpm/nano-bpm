@@ -2064,8 +2064,14 @@ impl Journal {
                     instance_key = key,
                     ?kind,
                     "recovery rebuild (#1608): pending orphan report's payload is \
-                     present; not re-parking an intact instance"
+                     present; settling any parked report for an intact instance"
                 );
+                // A report parked by an EARLIER rebuild (e.g. the constructor's,
+                // which runs before the spill/var stores are wired, so the
+                // payload then read as absent) must be settled here too, or the
+                // drain below would still propose a false `VariablesLost`
+                // (#1608 review).
+                self.settle_orphan_report(key);
                 continue;
             }
             // `park_orphan` dedups and skips a key whose `VariablesLost`
@@ -8931,6 +8937,81 @@ mod tests {
         );
 
         drop(journal);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608 review: `Journal::open` rebuilds the backlog BEFORE the spill
+    // store is wired, so a restored payload reads as absent and the report is
+    // parked. Once the store is wired, promotion's rebuild sees the payload
+    // and must SETTLE the already-parked report, not merely skip re-parking
+    // it — otherwise the drain proposes a false `VariablesLost`.
+    #[test]
+    fn promotion_settles_a_constructor_parked_report_once_stores_are_wired() {
+        let path = restart_store_path("orphan-supersede-ctor-wiring-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        journal.set_orphan_sink(Arc::new(RecordingSink::default()));
+        journal.set_orphan_leadership(false);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        let saved = store.try_get(keys[0]).unwrap().expect("spilled row");
+        store.forget(&[keys[0]]).unwrap();
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "superseded: {events:?}"
+        );
+        drop(journal);
+        // The payload is restored before the restart.
+        store.put(keys[0], &saved).unwrap();
+
+        let mut rebuilt = Journal::open(&journal_path).unwrap();
+        assert_eq!(
+            rebuilt.orphan_backlog(),
+            vec![keys[0]],
+            "constructor rebuild runs before the store is wired and parks"
+        );
+        rebuilt.set_spill(
+            Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap()),
+            0,
+        );
+        rebuilt.set_replicated_apply(true);
+        let resink = Arc::new(RecordingSink::default());
+        rebuilt.set_orphan_sink(resink.clone());
+        rebuilt.set_orphan_leadership(true);
+        assert!(
+            rebuilt.orphan_backlog().is_empty(),
+            "promotion settles the parked report once the payload reads back"
+        );
+        assert!(
+            resink.keys().is_empty(),
+            "no false VariablesLost proposed for an intact instance"
+        );
+
+        drop(rebuilt);
         drop(store);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
