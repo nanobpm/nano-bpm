@@ -27,7 +27,9 @@ export function loadMatrix(root = ROOT) {
 
 /** The argv (after `cargo`) for one matrix entry. */
 export function clippyArgs(entry) {
-  const args = ['clippy'];
+  // `xwin`: cross-check an MSVC target from the Linux runner via cargo-xwin,
+  // which supplies the Windows CRT/SDK headers C build scripts (ring, …) need.
+  const args = entry.xwin ? ['xwin', 'clippy'] : ['clippy'];
   if (entry.workspace) args.push('--workspace');
   if (entry.scope === 'lib') args.push('--lib');
   else if (entry.scope === 'all-targets') args.push('--all-targets');

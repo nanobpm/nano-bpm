@@ -38,7 +38,28 @@ test('every entry denies warnings and is runnable', () => {
     const args = clippyArgs(e);
     assert.deepEqual(args.slice(-3), ['--', '-D', 'warnings'], e.id);
     assert.ok(e.why, `entry ${e.id} documents why it exists`);
+    // An MSVC target cannot build its C build scripts (ring, …) on the Linux
+    // runner without the Windows CRT/SDK headers cargo-xwin supplies (#1372).
+    if (/-windows-msvc$/.test(e.target)) assert.equal(e.xwin, true, `${e.id}: MSVC entries must set xwin`);
+    assert.equal(args[0], e.xwin ? 'xwin' : 'clippy', e.id);
   }
+});
+
+test('xwin entries run `cargo xwin clippy --target <msvc>`', () => {
+  const args = clippyArgs({ id: 'w', xwin: true, scope: 'all-targets', target: 'x86_64-pc-windows-msvc' });
+  assert.deepEqual(args.slice(0, 5), ['xwin', 'clippy', '--all-targets', '--target', 'x86_64-pc-windows-msvc']);
+});
+
+test('the live matrix lints Windows-only code (no #1372 freeze left)', () => {
+  // cfg(windows) / not(unix) code is compiled by a Windows-target entry in
+  // BOTH crates that ship Windows binaries, so it can no longer rot unseen.
+  for (const dir of ['processos', 'server']) {
+    assert.ok(
+      loadMatrix().entries.some((e) => e.dir === dir && e.target === 'x86_64-pc-windows-msvc'),
+      `${dir} has a Windows clippy entry`,
+    );
+  }
+  assert.deepEqual(loadMatrix().unlintedCfg.filter((u) => u.trackedIn === '#1372'), []);
 });
 
 // --- fixture repo: proves the guard goes RED on each uncovered surface -----
@@ -102,6 +123,12 @@ test('RED: platform-only code (target_os / windows) the Linux runner never compi
   const out = gaps(fixture({ cargo: '', lib, entries: [{}] })).join('\n');
   assert.match(out, /target_os = "macos"/);
   assert.match(out, /cfg\(windows\)/);
+});
+
+test('RED→GREEN: cfg(windows) code is covered by a Windows-target entry', () => {
+  const lib = '#[cfg(windows)]\nfn w() {}\n#[cfg(not(unix))]\nfn n() {}\n';
+  assert.match(gaps(fixture({ cargo: '', lib, entries: [{}] })).join('\n'), /cfg\(windows\)/);
+  assert.deepEqual(gaps(fixture({ cargo: '', lib, entries: [{}, { target: 'x86_64-pc-windows-msvc', xwin: true }] })), []);
 });
 
 test('RED: unmodelled cfg keys fail closed (target_env, target_vendor, custom --cfg)', () => {
