@@ -464,9 +464,12 @@ jobs:
           # GH013, and a ruleset bypass actor cannot be added on a personal repo
           # — see jwulf/c8ctl-plugin-nano#29). So land the marker bump on a
           # short-lived branch, open a PR, and merge it via the API. The ruleset
-          # requires 0 approvals and its Copilot review is non-blocking, so the
-          # squash-merge is immediate and — landing a commit on `main` — triggers
-          # the plugin's semantic-release exactly as the old direct push did.
+          # requires 0 approvals, but it also REQUIRES the plugin's CI check
+          # (`Lint & Test`, no bypass actors), so a red PR cannot merge. Queue
+          # auto-merge and WAIT for it. Landing the squash commit on `main`
+          # triggers the plugin's semantic-release exactly as a direct push did.
+          # If the plugin's CI fails, this step fails and the release stops here,
+          # instead of shipping a plugin release built on red CI.
           # The squash commit subject IS the conventional-commit message that
           # semantic-release parses, so it must carry `$msg`.
           branch="release/bundle-nanobpmn-${ver}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -481,5 +484,27 @@ jobs:
           pr_url="$(gh pr create --repo "$PLUGIN_REPO" --base main --head "$branch" \
             --title "$msg" --body "$body")"
           echo "opened marker PR: $pr_url"
-          gh pr merge "$pr_url" --repo "$PLUGIN_REPO" --squash --delete-branch \
+          gh pr merge "$pr_url" --repo "$PLUGIN_REPO" --squash --auto \
             --subject "$msg" --body "$body"
+          # Wait (bounded) for the auto-merge. Fail closed on red CI or a timeout.
+          deadline=$(( $(date +%s) + 30 * 60 ))
+          while :; do
+            state="$(gh pr view "$pr_url" --repo "$PLUGIN_REPO" --json state -q .state)"
+            [ "$state" = "MERGED" ] && break
+            # `gh pr checks` exits non-zero while checks are pending, so take its
+            # output and ignore the exit status. The count is what matters.
+            failed="$(gh pr checks "$pr_url" --repo "$PLUGIN_REPO" --json bucket \
+              -q '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length' 2>/dev/null; true)"
+            if [ "${failed:-0}" != "0" ]; then
+              echo "::error::plugin CI failed on $pr_url, so it cannot merge (required check). Fix it, then merge the PR to cut the plugin release."
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::timed out after 30 min waiting for $pr_url to merge"
+              exit 1
+            fi
+            echo "waiting for $pr_url (state=$state)"
+            sleep 20
+          done
+          echo "merged: $pr_url"
+          git push origin --delete "$branch" || true
