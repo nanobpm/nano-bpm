@@ -156,8 +156,11 @@ queue the pruning PR first.
 
 **Authoring new entries:** an entry's `introduced_in` is **derived, never
 hand-guessed** — it must be the *next* gateway release (the version your
-release PR will cut: the pending `server/Cargo.toml` bump when one exists,
-else the next patch after the latest `v*` tag). The
+release PR will cut: the pending `server/Cargo.toml` bump). There is no
+"next patch" guess: if `server/Cargo.toml` is not ahead of the latest `v*` tag,
+**every** entry fails — bump `server/Cargo.toml` to the release the entry ships
+in (patch, minor or major) in the same PR first, so an upgrade boundary is never
+recorded under a version the release later skips. The
 `check-allowlist-introduced-in` step of the determinism CI job
 (`scripts/check-allowlist-introduced-in.mjs`) fails the PR otherwise. A
 guessed future version is exactly how #1528's entries ended up labelled

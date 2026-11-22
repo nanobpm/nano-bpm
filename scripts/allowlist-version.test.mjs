@@ -53,15 +53,32 @@ test("nextGatewayRelease is the pending workspace bump when it is ahead of every
   assert.equal(next, "v0.0.29");
 });
 
-test("nextGatewayRelease is the next patch after the latest tag when no bump is pending", () => {
+test("nextGatewayRelease is null (no guess) when no bump is pending", () => {
+  // A guessed next patch (v0.0.29) would be wrong if the release becomes a
+  // minor/major — and an upgrade-boundary recorded under it is permanent.
   const next = nextGatewayRelease({ workspaceVersion: "0.0.28", tags: ["v0.0.28", "v0.0.27"] });
-  assert.equal(next, "v0.0.29");
+  assert.equal(next, null);
+});
+
+test("nextGatewayRelease follows a minor/major bump, never a patch guess", () => {
+  assert.equal(nextGatewayRelease({ workspaceVersion: "0.1.0", tags: ["v0.0.28"] }), "v0.1.0");
+  assert.equal(nextGatewayRelease({ workspaceVersion: "1.0.0", tags: ["v0.0.28"] }), "v1.0.0");
+});
+
+test("checkIntroducedIn rejects every entry when no release version is committed", () => {
+  const allowlist = {
+    observational_variants: [entry("A", "v0.0.29", { upgrade: "upgrade-boundary" })],
+    divergences: [],
+  };
+  assert.match(checkIntroducedIn(allowlist, null), /no gateway release version is committed/);
+  // An empty allowlist is still clean.
+  assert.equal(checkIntroducedIn({ observational_variants: [], divergences: [] }, null), null);
 });
 
 test("nextGatewayRelease ignores non-gateway tags when finding the latest", () => {
   const next = nextGatewayRelease({
-    workspaceVersion: "0.0.28",
-    tags: ["v0.0.28", "nano-bernd-npm-v0.3.0", "bojtos-npm-v0.11.2"],
+    workspaceVersion: "0.0.29",
+    tags: ["v0.0.28", "nano-bernd-npm-v0.3.0", "bojtos-npm-v0.99.0"],
   });
   assert.equal(next, "v0.0.29");
 });
@@ -152,6 +169,16 @@ test("prune-divergence-allowlist.mjs --write rewrites the file; a second run is 
   const before2 = readFileSync(file, "utf8");
   execFileSync("node", [script, "v0.0.28", "--write", "--allowlist", file], { encoding: "utf8" });
   assert.equal(readFileSync(file, "utf8"), before2);
+});
+
+test("prune-divergence-allowlist.mjs dry run emits the unchanged JSON when nothing expires", () => {
+  const dir = mkdtempSync(join(tmpdir(), "allowlist-prune-"));
+  const file = join(dir, "allowlist.json");
+  const doc = { observational_variants: [entry("B", "v0.0.29")], divergences: [] };
+  writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+  const script = join(root, "scripts", "prune-divergence-allowlist.mjs");
+  const out = execFileSync("node", [script, "v0.0.28", "--allowlist", file], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.deepEqual(JSON.parse(out), doc);
 });
 
 test("prune-divergence-allowlist.mjs rejects a non-release tag", () => {

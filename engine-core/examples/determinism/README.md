@@ -40,8 +40,8 @@ ignored silently:
    Every entry names its `issue`, the `introduced_in` release, an `upgrade`
    mode and a `rationale` that names that mode and says why it applies.
    `introduced_in` is DERIVED, never hand-guessed: it must be the next
-   gateway release (the pending `server/Cargo.toml` bump, else the next
-   patch after the latest `v*` tag). CI's `check-allowlist-introduced-in`
+   gateway release (the pending `server/Cargo.toml` bump; with no bump
+   committed every entry fails — no next-patch guess). CI's `check-allowlist-introduced-in`
    step (`scripts/check-allowlist-introduced-in.mjs`, #1801) fails the PR
    otherwise — a guessed future version becomes a spurious append-only
    `upgrade-boundaries.json` entry the ledger can never remove (#1528's

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // CI gate (#1801): every divergence-allowlist entry's `introduced_in` must be
 // DERIVED, not hand-guessed — it must equal the NEXT gateway release: the
-// pending server/Cargo.toml version bump when one exists, else the next patch
-// after the latest `v*` tag. #1528's entries were labelled v0.0.29 but shipped
+// pending server/Cargo.toml version bump. With no bump committed, any entry
+// fails (no guessed next-patch: the release may be a minor/major). #1528's entries were labelled v0.0.29 but shipped
 // in v0.0.28, and the append-only upgrade-boundaries.json ledger recorded the
 // spurious boundary (it forbids edits, so it is permanent). This check fails
 // the PR that introduces a mislabel, before the ledger can record it.
@@ -28,7 +28,7 @@ const tags = releaseTagNames(root);
 const expected = nextGatewayRelease({ workspaceVersion, tags });
 const err = checkIntroducedIn(allowlist, expected);
 if (err) {
-  console.error(`check-allowlist-introduced-in: expected introduced_in == ${expected} (the next gateway release)\n${err}`);
+  console.error(`check-allowlist-introduced-in: expected introduced_in == ${expected ?? "<no committed release version>"} (the next gateway release)\n${err}`);
   process.exit(1);
 }
-console.log(`check-allowlist-introduced-in: every entry's introduced_in is the next gateway release (${expected})`);
+console.log(`check-allowlist-introduced-in: every entry's introduced_in is the next gateway release (${expected ?? "none committed; allowlist empty"})`);

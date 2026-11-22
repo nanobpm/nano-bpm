@@ -46,6 +46,9 @@ const { pruned, removed } = pruneAllowlist(allowlist, opts.tag);
 
 if (removed.length === 0) {
   console.error(`prune-divergence-allowlist: no entries expire at ${opts.tag} (allowlist unchanged)`);
+  // Dry run always emits the (unchanged) allowlist JSON so a caller parsing
+  // stdout never gets empty input; --write leaves the file byte-identical.
+  if (!opts.write) process.stdout.write(`${JSON.stringify(pruned, null, 2)}\n`);
   process.exit(0);
 }
 for (const r of removed) {
