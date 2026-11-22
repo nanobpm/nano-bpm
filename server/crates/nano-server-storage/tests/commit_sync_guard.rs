@@ -41,21 +41,57 @@ const DISK_OBSERVATIONS: &[&str] = &[
     ".metadata()",
 ];
 
-/// Points that order everything before them on the writer: awaiting a commit,
+/// Calls that order everything before them on the writer: awaiting a commit,
 /// a writer-queued (FIFO) message, or closing/reopening the journal (the writer
-/// drains on drop).
-const SYNC_POINTS: &[&str] = &[
-    "blocking_wait(",
-    ".wait(",
+/// drains on drop). Matched as *calls* — an identifier-bounded name followed by
+/// `(` — so identifiers that merely contain a name (`recovery.`, `rotated`,
+/// `flushed`) are never mistaken for a sync point.
+const SYNC_CALLS: &[&str] = &[
+    "blocking_wait",
+    "wait",
     "snapshot_and_rotate",
+    "streaming_snapshot_and_rotate",
     "rotate",
-    "drop(journal",
+    "drop",
     "flush",
     "shutdown",
     "open_segmented",
     "Journal::open",
     "recover",
 ];
+
+fn is_ident(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// Offset of the first call to any of `names` in `hay`: the name must not be
+/// preceded by an identifier byte and must be followed (after optional
+/// whitespace) by `(`. `drop` only counts as `drop(journal…`.
+fn first_call(hay: &str, names: &[&str]) -> Option<usize> {
+    let b = hay.as_bytes();
+    names
+        .iter()
+        .filter_map(|name| {
+            let mut from = 0;
+            while let Some(off) = hay[from..].find(name) {
+                let at = from + off;
+                from = at + name.len();
+                if at > 0 && is_ident(b[at - 1]) {
+                    continue;
+                }
+                let rest = hay[from..].trim_start();
+                if !rest.starts_with('(') {
+                    continue;
+                }
+                if *name == "drop" && !rest[1..].trim_start().starts_with("journal") {
+                    continue;
+                }
+                return Some(at);
+            }
+            None
+        })
+        .min()
+}
 
 /// Replaces string/char literals and comments with spaces (keeping byte
 /// offsets and newlines), so braces and keywords inside them are ignored.
@@ -177,15 +213,33 @@ fn fn_bodies(src: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Whether the statement ending at `apply_at` binds the returned commit to `_`:
-/// `let _ = <expr>.apply_command…` or `let (<pat>, _) = <expr>.apply_command…`.
+/// Whether the statement ending at `apply_at` drops the returned commit
+/// without awaiting it: a bare expression statement (nothing bound), a
+/// `_`-prefixed binding (`let _ =`, `let _r =`), or a tuple whose commit (last)
+/// slot is `_`-prefixed (`let (e, _) =`, `let (_e, _commit) =`).
 fn discards_commit(body: &str, apply_at: usize) -> bool {
     let stmt_start = body[..apply_at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
     let stmt: String = body[stmt_start..apply_at]
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    stmt.starts_with("let_=") || (stmt.starts_with("let(") && stmt.contains(",_)="))
+    let Some(pat) = stmt.strip_prefix("let") else {
+        // No binding at all: an expression statement discards the commit,
+        // unless the value is assigned/returned/passed on.
+        return !stmt.contains('=')
+            && !stmt.starts_with("return")
+            && stmt.matches('(').count() == stmt.matches(')').count();
+    };
+    let pat = pat.strip_prefix("mut").unwrap_or(pat);
+    let Some(eq) = pat.find('=') else {
+        return false;
+    };
+    let pat = pat[..eq].split(':').next().unwrap_or("");
+    let last = match pat.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+        Some(inner) => inner.rsplit(',').next().unwrap_or(""),
+        None => pat,
+    };
+    last.trim_start_matches("mut").starts_with('_')
 }
 
 /// Whether the journal `apply_at` is called on was built in memory
@@ -233,7 +287,7 @@ fn violations(src: &str) -> Vec<(String, String)> {
                     .min()
             };
             if let Some((obs_at, obs)) = first(DISK_OBSERVATIONS) {
-                let synced = first(SYNC_POINTS).is_some_and(|(sync_at, _)| sync_at < obs_at);
+                let synced = first_call(tail, SYNC_CALLS).is_some_and(|sync_at| sync_at < obs_at);
                 if !synced {
                     found.push((name.clone(), obs.to_string()));
                     break;
@@ -323,6 +377,39 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
         }
     "#;
     assert!(violations(rotated).is_empty());
+
+    // An identifier merely containing a sync name is not a sync point.
+    let lookalike = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let rotated = flushed; let u = recovery.shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(lookalike).len(), 1);
+
+    // A bare expression statement and a `_`-prefixed commit slot both discard.
+    let bare = r#"
+        fn t() {
+            journal.apply_command(c).unwrap();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(bare).len(), 1);
+    let named_unawaited = r#"
+        fn t() {
+            let (_e, _commit) = journal.apply_command(c).unwrap();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(named_unawaited).len(), 1);
+    let awaited_named = r#"
+        fn t() {
+            let (_e, commit) = journal.apply_command(c).unwrap();
+            commit.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(awaited_named).is_empty());
 
     // An in-memory journal has no writer thread: its commit is always Ready.
     let in_memory = r#"
