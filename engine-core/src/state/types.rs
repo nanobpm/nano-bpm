@@ -2603,6 +2603,36 @@ pub struct State {
     /// `serde(default)` alone does not convert an existing numeric value.
     #[cfg_attr(feature = "serde", serde(default))]
     pub variables_lost_quarantined: BTreeMap<Key, VariablesLostTombstone>,
+    /// Loss reports whose stamped quarantine applied SUPERSEDED
+    /// (`Event::OrphanStampSuperseded`) and whose re-stamped retry has not yet
+    /// committed (#1608), keyed by instance with the off-heap tier the report
+    /// was detected against. A **replicated** record — inserted by the
+    /// supersede, cleared by `VariablesLostQuarantined` or the instance's
+    /// terminal event — so it survives every snapshot/compaction checkpoint
+    /// and engine adoption: the host's in-memory orphan backlog is rebuilt from
+    /// it after recovery, so a crash or failover between a supersede and its
+    /// retry never silently drops the loss. `serde(default)` (additive): a
+    /// snapshot written before it deserializes empty.
+    /// Omitted when empty, so a snapshot with nothing pending keeps the
+    /// pre-#1608 shape byte-for-byte.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub pending_orphan_supersedes: BTreeMap<Key, crate::command::OrphanKind>,
+    /// Instance key → the loss-episode id of its most recently quarantined
+    /// (`VariablesLostQuarantined`) episode (#1608 review). A **replicated**
+    /// record that outlives the tombstone (lifted on resolve), so a delayed
+    /// duplicate of an already-settled episode — which applies superseded —
+    /// is recognised and NOT recorded in `pending_orphan_supersedes`;
+    /// otherwise recovery would re-park, re-stamp and raise a second
+    /// `VariablesLost` without a new loss. Cleared on the instance's terminal
+    /// event. Additive; omitted when empty.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub settled_orphan_episodes: BTreeMap<Key, Key>,
     /// The most recent instance keys to reach a terminal state
     /// (`ProcessInstanceCompleted` / `ProcessInstanceTerminated`), oldest
     /// first, bounded by [`RECENTLY_TERMINATED_CAP`] (#1574 review). A
@@ -2679,6 +2709,18 @@ pub struct VariablesLostTombstone {
     /// dropping the report (#1587 review).
     #[cfg_attr(feature = "serde", serde(default))]
     pub episode: u64,
+    /// The quarantined instance reached a terminal state while this tombstone
+    /// was live (#1608 review). Set by the replicated terminal fold
+    /// ([`State::note_terminated`]) so a later `IncidentResolved` decides
+    /// "already terminal" from replicated state alone — never from whether the
+    /// terminal shell is still resident (it may be evicted) or still in the
+    /// bounded `recently_terminated` ring (it may have wrapped). Additive:
+    /// omitted when `false`, defaulted on read.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub terminal: bool,
 }
 
 /// Backward-compatible deserialization for [`VariablesLostTombstone`]: a
@@ -2704,6 +2746,8 @@ impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
                 incident_key: Key,
                 #[serde(default)]
                 episode: u64,
+                #[serde(default)]
+                terminal: bool,
             },
             /// Legacy (pre-#1587) form: the bare incident key.
             Legacy(Key),
@@ -2712,19 +2756,184 @@ impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
             Repr::Current {
                 incident_key,
                 episode,
+                terminal,
             } => VariablesLostTombstone {
                 incident_key,
                 episode,
+                terminal,
             },
             Repr::Legacy(incident_key) => VariablesLostTombstone {
                 incident_key,
                 episode: 0,
+                terminal: false,
             },
         })
     }
 }
 
 impl State {
+    /// The settlement half of the live `VariablesLostQuarantined` fold
+    /// (#1608): record `episode` as `instance_key`'s settled loss episode.
+    /// The ONE canonical derivation of `settled_orphan_episodes`, shared by
+    /// the live applier and [`State::backfill_settled_orphan_episodes`].
+    pub(crate) fn fold_settlement_quarantined(&mut self, instance_key: Key, episode: Key) {
+        if episode > 0 {
+            self.settled_orphan_episodes.insert(instance_key, episode);
+        }
+    }
+
+    /// The settlement half of the live terminal fold (#1608): a terminal
+    /// instance's settled episode no longer matters.
+    pub(crate) fn fold_settlement_terminal(&mut self, instance_key: Key) {
+        self.settled_orphan_episodes.remove(&instance_key);
+    }
+
+    /// Best-effort backfill of `settled_orphan_episodes` from retained history
+    /// that a snapshot covers (#1608 review). A snapshot written before #1608
+    /// carries no settlement map, and an episode resolved before the upgrade
+    /// has also lifted its tombstone — so a delayed duplicate's supersede in
+    /// the replayed tail would be recorded pending and re-raise
+    /// `VariablesLost` without a new loss. Recovery calls this with whatever
+    /// prefix `[0, covered)` it still holds (cold archive + hot prefix)
+    /// BEFORE replaying the tail. It folds the history through the same
+    /// helpers the live applier uses, then merges by high-water mark (episodes
+    /// grow monotonically per instance), so on a post-#1608 snapshot it is a
+    /// no-op: the live fold already recorded exactly these values.
+    ///
+    /// Residual window (documented, accepted): when the prefix holding the
+    /// quarantine was pruned, nothing can be backfilled and a delayed
+    /// duplicate straddling the upgrade raises ONE extra, resolvable
+    /// `VariablesLost` incident — never data loss.
+    pub fn backfill_settled_orphan_episodes<'a, I>(&mut self, history: I)
+    where
+        I: IntoIterator<Item = &'a crate::Event>,
+    {
+        // Fold the retained history through the LIVE applier (the one
+        // canonical derivation of settlement and pending supersedes), on a
+        // scratch state that sees only the loss-lifecycle events.
+        let mut folded = State::default();
+        let mut superseded_at: BTreeMap<Key, Key> = BTreeMap::new();
+        let mut terminated_in_history: BTreeSet<Key> = BTreeSet::new();
+        for event in history {
+            if !event.is_loss_lifecycle() {
+                continue;
+            }
+            if let Some(instance_key) = event.terminal_instance_key() {
+                terminated_in_history.insert(instance_key);
+            }
+            if let crate::Event::OrphanStampSuperseded {
+                instance_key,
+                episode,
+                ..
+            } = event
+            {
+                // Keep the HIGHEST superseded episode per instance, not
+                // the last in journal order (#1608 review): a delayed
+                // duplicate E5 arriving after the fresh supersede E9 must
+                // not replace E9 here — the pending-supersede
+                // reconstruction below would then compare E5 against the
+                // settlement mark and drop the genuinely unresolved E9
+                // report, leaving the dormant loss unreported.
+                superseded_at
+                    .entry(*instance_key)
+                    .and_modify(|e| *e = (*e).max(*episode))
+                    .or_insert(*episode);
+            }
+            crate::state::apply(&mut folded, event);
+        }
+        // A legacy (pre-#1608) tombstone carries `terminal: false` even when
+        // the instance completed after its quarantine. Normalize it from the
+        // retained terminal history BEFORE the snapshot's terminal shell can
+        // be evicted or the bounded ring wraps, so a later `IncidentResolved`
+        // decides terminality identically on every replica (#1608 review).
+        self.normalize_legacy_tombstones(&terminated_in_history);
+        // The snapshot is AUTHORITATIVE over the retained history: it may be
+        // newer than it (an adopted leader snapshot) or the history may have a
+        // pruned gap. Never resurrect an entry for an instance the snapshot
+        // already knows terminated (a later termination the local history
+        // does not hold) — the terminal fold cleared it there.
+        for (instance_key, episode) in folded.settled_orphan_episodes {
+            if self.snapshot_shows_terminal(instance_key) {
+                continue;
+            }
+            let entry = self
+                .settled_orphan_episodes
+                .entry(instance_key)
+                .or_insert(0);
+            *entry = (*entry).max(episode);
+        }
+        // A legacy (pre-#1608) snapshot carries no pending-supersede map, so a
+        // covered supersede whose retry never committed would stay dormant:
+        // reconstruct it — unless the snapshot shows it settled (an active
+        // tombstone or a settlement mark at/above its episode) or terminated.
+        for (instance_key, kind) in folded.pending_orphan_supersedes {
+            let episode = superseded_at.get(&instance_key).copied().unwrap_or(0);
+            if self.snapshot_shows_terminal(instance_key)
+                || self.variables_lost_quarantined.contains_key(&instance_key)
+                || (episode > 0
+                    && super::apply::settled_orphan_episode(self, instance_key)
+                        .is_some_and(|s| episode <= s))
+            {
+                continue;
+            }
+            self.pending_orphan_supersedes
+                .entry(instance_key)
+                .or_insert(kind);
+        }
+    }
+
+    /// Sets the replicated `terminal` flag on every loss tombstone whose
+    /// instance the snapshot's own lifecycle records ([`Self::snapshot_shows_terminal`])
+    /// or `terminated` (retained terminal history) prove terminal (#1608
+    /// review). A tombstone restored from a pre-#1608 snapshot defaults the
+    /// flag to `false`; without this, terminality after shell eviction / ring
+    /// wrap would depend on residency and split replicas. Idempotent, and a
+    /// no-op on a post-#1608 snapshot (the live terminal fold already set it).
+    pub(crate) fn normalize_legacy_tombstones(&mut self, terminated: &BTreeSet<Key>) {
+        let to_mark: Vec<Key> = self
+            .variables_lost_quarantined
+            .iter()
+            .filter(|(k, t)| {
+                !t.terminal && (terminated.contains(k) || self.snapshot_shows_terminal(**k))
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for key in to_mark {
+            if let Some(t) = self.variables_lost_quarantined.get_mut(&key) {
+                t.terminal = true;
+            }
+        }
+    }
+
+    /// Whether the SNAPSHOT's own lifecycle records prove `instance_key`
+    /// reached a terminal state (#1608 review): the replicated terminal
+    /// record ([`State::terminated_epoch_of`] — the resident instance's
+    /// stamped epoch or its position in the bounded terminal ring), or the
+    /// instance's own resident lifecycle state (`Completed` / `Terminated`).
+    ///
+    /// The state check closes the bounded-ring hole: once a terminal instance
+    /// falls out of the 4,096-entry `recently_terminated` ring,
+    /// `terminated_epoch_of` returns `None` even though the snapshot still
+    /// holds the instance's terminal shell, and without it a lagging
+    /// receiver's earlier supersede/quarantine would be restored as pending
+    /// or settled — resurrecting a loss report for work the authoritative
+    /// snapshot shows COMPLETED. `Terminating` is not terminal (the instance
+    /// is still draining its canceling listeners), and a missing instance
+    /// (genuinely cold / pruned) is not proven terminal either — a cold
+    /// target's report must still be preserved.
+    pub(crate) fn snapshot_shows_terminal(&self, instance_key: Key) -> bool {
+        if self.terminated_epoch_of(instance_key).is_some() {
+            return true;
+        }
+        self.instances.get(&instance_key).is_some_and(|i| {
+            matches!(
+                i.state,
+                crate::state::types::ProcessInstanceState::Completed
+                    | crate::state::types::ProcessInstanceState::Terminated
+            )
+        })
+    }
+
     /// Records `instance_key` as terminal in the bounded replicated ring and
     /// advances the replicated terminal epoch. Also stamps the instance's own
     /// [`ProcessInstance::terminated_epoch`] with the new epoch — the
@@ -2736,6 +2945,12 @@ impl State {
             self.recently_terminated.pop_front();
         }
         self.recently_terminated.push_back(instance_key);
+        // #1608: a terminal instance's pending loss report no longer matters.
+        self.pending_orphan_supersedes.remove(&instance_key);
+        self.fold_settlement_terminal(instance_key);
+        if let Some(t) = self.variables_lost_quarantined.get_mut(&instance_key) {
+            t.terminal = true;
+        }
         self.terminal_epoch += 1;
         if let Some(instance) = self.instances.get_mut(&instance_key) {
             instance.terminated_epoch = self.terminal_epoch;

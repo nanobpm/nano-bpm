@@ -1166,6 +1166,50 @@ pub fn write_rebase_floor(dir: &Path, partition: Option<u64>, covered: u64) -> i
     Ok(())
 }
 
+/// Filename of the durable BACKFILL FLOOR (#1608 review) for the
+/// single-partition layout, or for partition `p` of the multi-partition
+/// layout: the absolute (global) journal event index below which this
+/// partition's retained history is KNOWN-DIVERGED and must never feed the
+/// loss-episode settlement backfill. Raised when a recovery-only receiver
+/// adopts the leader's authoritative snapshot over a diverged journal: the
+/// diverged events stay in the sealed segments / cold archive (checkpointing
+/// only rotates, compaction archives rather than deletes), so without this
+/// fence a LATER ordinary adoption or a restart would fold them in again.
+fn backfill_floor_path(dir: &Path, partition: Option<u64>) -> PathBuf {
+    match partition {
+        None => dir.join("journal.backfill-floor"),
+        Some(p) => dir.join(format!("journal.backfill-floor.p{p}")),
+    }
+}
+
+/// The backfill floor (see [`backfill_floor_path`]): `0` when absent (no
+/// diverged history). Fails CLOSED: an unreadable or malformed floor yields
+/// `u64::MAX`, so the best-effort backfill folds nothing rather than risk
+/// importing diverged history.
+pub(crate) fn read_backfill_floor(dir: &Path, partition: Option<u64>) -> u64 {
+    match fs::read_to_string(backfill_floor_path(dir, partition)) {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(u64::MAX),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Durably raises the backfill floor (see [`backfill_floor_path`]) to at least
+/// `global` — it never lowers, so an earlier divergence fence is kept.
+pub fn raise_backfill_floor(dir: &Path, partition: Option<u64>, global: u64) -> io::Result<()> {
+    let floor = read_backfill_floor(dir, partition).max(global);
+    let path = backfill_floor_path(dir, partition);
+    let tmp = unique_tmp_path(&path);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(floor.to_string().as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    fsync_dir(dir);
+    Ok(())
+}
+
 /// Reads the rebase floor, if any. An unreadable or malformed floor is an error
 /// (fail closed): it means a base was adopted and we cannot tell how far.
 fn read_rebase_floor(dir: &Path, partition: Option<u64>) -> io::Result<Option<RebaseFloor>> {
@@ -1860,6 +1904,20 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
             let mut engine = Engine::from_snapshot(snap);
             // Replay only events after the snapshot boundary.
             let skip = covered.saturating_sub(first_index) as usize;
+            // #1608 review: backfill loss-episode settlement from the retained
+            // history the snapshot covers (cold archive + hot prefix) BEFORE the
+            // tail, so a pre-#1608 snapshot does not re-raise `VariablesLost`
+            // for an episode resolved before the upgrade. Best-effort: a pruned
+            // prefix leaves the documented one-extra-incident residual window.
+            // Never fold history below the backfill floor: it is a diverged
+            // journal's pre-recovery prefix the leader never committed.
+            let floor = read_backfill_floor(dir, None);
+            let cold = read_cold_retained(dir, None, floor);
+            let hot = &events[..skip.min(events.len())];
+            engine.backfill_settled_orphan_episodes(
+                cold.iter()
+                    .chain(hot.iter().skip(below(floor, first_index).min(hot.len()))),
+            );
             if skip < events.len() {
                 // ADR 0066 #1664: the replayed tail must re-derive the chain
                 // digests it recorded, continuing from the snapshot base's.
@@ -2307,7 +2365,7 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
 /// record-count mismatch — or an undecodable frame — is a hard `Err`
 /// (fail-closed): the journal is not trustworthy. An empty (or non-zero-starting)
 /// archive yields `(vec![], 0)`.
-fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
+pub(crate) fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
     let mut events = Vec::new();
     let mut expected = 0u64;
     for (start, end, path) in list_cold(dir)? {
@@ -2331,6 +2389,132 @@ fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
         expected = end;
     }
     Ok((events, expected))
+}
+
+/// Reads the RETAINED cold archive for the best-effort #1608 loss-settlement
+/// backfill: the contiguous run of cold files starting at the OLDEST retained
+/// one, whatever its start (rolling pruning removes the oldest generation, so
+/// the run need not begin at 0). `tag` selects the shared multi-partition
+/// format (`Some((partition, num_partitions))` keeps only that write
+/// partition's events); `None` reads the untagged single-partition format.
+///
+/// Deliberately NOT the migrator's [`read_cold_prefix`]: that gate requires a
+/// zero-based, complete prefix and must stay strict. Here a gap or an
+/// unreadable file merely ends the run — the backfill is best-effort and the
+/// snapshot stays authoritative over whatever history it receives.
+///
+/// Events at a global index below `floor` (the [backfill
+/// floor](read_backfill_floor)) are excluded.
+pub(crate) fn read_cold_retained(dir: &Path, tag: Option<(u64, usize)>, floor: u64) -> Vec<Event> {
+    match tag {
+        None => at_or_above(
+            cold_retained_run(dir, parse_cold_file, Event::is_loss_lifecycle),
+            floor,
+        ),
+        Some((partition, num_partitions)) => only_partition(
+            read_cold_retained_tagged(dir, num_partitions, floor),
+            partition,
+        ),
+    }
+}
+
+/// [`read_cold_retained`] with write-partition tags (multi-partition recovery
+/// demuxes them per partition itself).
+fn read_cold_retained_tagged(dir: &Path, num_partitions: usize, floor: u64) -> Vec<(u64, Event)> {
+    at_or_above(
+        cold_retained_run(
+            dir,
+            |path| parse_cold_file_tagged(path, num_partitions),
+            |(_, e): &(u64, Event)| e.is_loss_lifecycle(),
+        ),
+        floor,
+    )
+}
+
+/// Drops every indexed event below the backfill `floor`, keeping the events.
+fn at_or_above<T>(indexed: Vec<(u64, T)>, floor: u64) -> Vec<T> {
+    indexed
+        .into_iter()
+        .filter(|(i, _)| *i >= floor)
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// The contiguous retained cold run (see [`read_cold_retained`]), decoded by
+/// `parse`.
+/// `parse`, each event paired with its absolute (global) journal index.
+fn cold_retained_run<T>(
+    dir: &Path,
+    parse: impl Fn(&Path) -> io::Result<Vec<T>>,
+    keep: impl Fn(&T) -> bool,
+) -> Vec<(u64, T)> {
+    let Ok(files) = list_cold(dir) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut expected: Option<u64> = None;
+    for (start, end, path) in files {
+        if expected.is_some_and(|e| e != start) {
+            break;
+        }
+        match parse(&path) {
+            // Keep only the loss-lifecycle variants the backfill folds
+            // (#1608 review): retaining every archived payload would grow peak
+            // recovery memory with the whole cold archive. Global indices are
+            // assigned BEFORE filtering so the floor fence stays exact.
+            Ok(decoded) => events.extend((start..).zip(decoded).filter(|(_, e)| keep(e))),
+            Err(_) => break,
+        }
+        expected = Some(end);
+    }
+    events
+}
+
+/// How many leading events of a file starting at global index `start` lie
+/// below the backfill `floor`.
+fn below(floor: u64, start: u64) -> usize {
+    usize::try_from(floor.saturating_sub(start)).unwrap_or(usize::MAX)
+}
+
+/// Keeps only `partition`'s events of a tagged (shared-writer) read.
+fn only_partition(tagged: Vec<(u64, Event)>, partition: u64) -> Vec<Event> {
+    tagged
+        .into_iter()
+        .filter(|(t, _)| *t == partition)
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// The retained hot history of a live segmented log, in chronological order:
+/// every still-sealed segment (oldest first), then the active segment. `tag`
+/// as for [`read_cold_retained`]. Best-effort like it: an unreadable segment
+/// ends the history there (a later segment after a hole would fold out of
+/// order). Each segment is given with its absolute start index; events below
+/// the backfill `floor` are excluded.
+pub(crate) fn read_hot_retained(
+    sealed: &[(u64, PathBuf)],
+    active: (u64, &Path),
+    tag: Option<(u64, usize)>,
+    floor: u64,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for (start, path) in sealed
+        .iter()
+        .map(|(start, path)| (*start, path.as_path()))
+        .chain(std::iter::once(active))
+    {
+        let skip = below(floor, start);
+        let decoded = match tag {
+            None => read_segment_events(path).map(|d| d.into_iter().skip(skip).collect()),
+            Some((partition, num_partitions)) => read_segment_events_tagged(path, num_partitions)
+                .map(|tagged| only_partition(tagged.into_iter().skip(skip).collect(), partition)),
+        };
+        match decoded {
+            Ok(decoded) => events.extend(decoded.into_iter().filter(Event::is_loss_lifecycle)),
+            Err(_) => break,
+        }
+    }
+    events
 }
 
 /// [`read_cold_prefix`] with write-partition tags (multi-partition path).
@@ -2976,6 +3160,10 @@ pub fn recover_multi_scoped(
     // The full tagged history for a migration replay (cold-archived prefix +
     // surviving tail), populated only when we fall into the migrator below.
     let mut cold_tagged: Vec<(u64, Event)> = Vec::new();
+    // The retained cold prefix for the settlement backfill, each event with
+    // its GLOBAL journal index (so each partition can apply its own backfill
+    // floor). Populated only on the snapshot branch.
+    let mut cold_backfill: Vec<(u64, (u64, Event))> = Vec::new();
     sweep_unique_tmp(dir);
     let loaded = load_multi_snapshot_based(dir);
     for &p in owned {
@@ -2993,6 +3181,16 @@ pub fn recover_multi_scoped(
     let migrate = match loaded {
         Ok(Some(c)) => {
             combined = Some(c);
+            // #1608 review: the retained cold prefix feeds the best-effort
+            // loss-settlement backfill below (never a replay input on this
+            // branch). Unreadable → nothing to backfill (residual window).
+            // Read unfenced: each partition applies its own backfill floor
+            // below (the floor is per partition, the archive is shared).
+            cold_backfill = cold_retained_run(
+                dir,
+                |path| parse_cold_file_tagged(path, num_partitions),
+                |(_, e): &(u64, Event)| e.is_loss_lifecycle(),
+            );
             false
         }
         // No combined snapshot. If the journal still starts at index 0 the
@@ -3194,6 +3392,25 @@ pub fn recover_multi_scoped(
                 match combined.as_ref().and_then(|m| m.get(&p)) {
                     Some((covered, snap)) => {
                         let mut engine = Engine::from_snapshot(snap.clone());
+                        // #1608 review: best-effort settlement backfill from the
+                        // retained covered prefix (see the single-partition path).
+                        let skip_b = (covered.saturating_sub(base_p) as usize).min(p_events.len());
+                        // Never fold this partition's history below its
+                        // backfill floor (a diverged pre-recovery prefix).
+                        let floor = read_backfill_floor(dir, Some(p));
+                        let hot_prefix = (first_index..)
+                            .zip(tagged.iter())
+                            .filter(|(_, (tag, _))| *tag == p)
+                            .take(skip_b)
+                            .filter(|(i, _)| *i >= floor)
+                            .map(|(_, (_, e))| e);
+                        engine.backfill_settled_orphan_episodes(
+                            cold_backfill
+                                .iter()
+                                .filter(|(i, (tag, _))| *tag == p && *i >= floor)
+                                .map(|(_, (_, e))| e)
+                                .chain(hot_prefix),
+                        );
                         if let Some(all) = stored_vars.as_ref() {
                             for (key, vars) in all {
                                 if partition_of(*key) == p {
@@ -4287,6 +4504,426 @@ mod tests {
             (key1, key2)
         };
         (dir, key1, key2)
+    }
+
+    /// #1608 review (operator decision, option 1): builds a dir whose snapshot
+    /// is PRE-#1608 in shape (no `settled_orphan_episodes`) and covers a stamped
+    /// loss episode that was quarantined AND resolved, whose covered prefix
+    /// was compacted into the cold archive, and whose surviving tail holds a
+    /// delayed duplicate's `OrphanStampSuperseded`. Returns the dir and key.
+    fn legacy_resolved_orphan_dir(tag: &str) -> (PathBuf, u64) {
+        let (dir, key, _) = legacy_resolved_orphan_dir_with(tag, false);
+        (dir, key)
+    }
+
+    /// [`legacy_resolved_orphan_dir`], optionally preceded by an OLDER
+    /// archived generation (unrelated history, compacted cold before the loss
+    /// episode); returns that generation's end so a test can prune it.
+    fn legacy_resolved_orphan_dir_with(
+        tag: &str,
+        older_generation: bool,
+    ) -> (PathBuf, u64, Option<u64>) {
+        let dir = temp_dir(tag);
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let older_end = older_generation.then(|| {
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1, "older generation archived");
+            covered
+        });
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let stale = journal
+            .engine()
+            .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
+            .expect("stamp the original report");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let fresh = journal
+            .engine()
+            .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
+            .expect("re-stamp the retry");
+        let (events, _) = journal
+            .apply_command(Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(fresh),
+            })
+            .unwrap();
+        let incident_key = events
+            .iter()
+            .find_map(|e| match e {
+                Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                _ => None,
+            })
+            .expect("the retry quarantines");
+        let _ = journal
+            .apply_command(Command::ResolveIncident { incident_key })
+            .unwrap();
+        let (mut snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+        // A pre-#1608 build never wrote the settlement map.
+        assert!(!snap.state.settled_orphan_episodes.is_empty());
+        snap.state.settled_orphan_episodes.clear();
+        assert!(snap.state.variables_lost_quarantined.is_empty());
+        write_snapshot(&dir, snap, covered).expect("write snapshot");
+        assert_eq!(compact(&shared, covered), 1, "prefix archived cold");
+        let (events, _) = journal
+            .apply_command(Command::QuarantineOffheapOrphan {
+                instance_key: key,
+                stamp: Some(stale),
+            })
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "the delayed duplicate applies superseded in the tail: {events:?}"
+        );
+        (dir, key, older_end)
+    }
+
+    /// #1608 review: the adoption backfill's hot history must (a) read the
+    /// shared writer's `<partition>\t<json>` records tagged, keeping only the
+    /// adopting partition's own, and (b) fold sealed segments BEFORE the
+    /// active one, so a later termination in the active segment clears the
+    /// quarantine an older sealed segment recorded.
+    #[test]
+    fn hot_retained_history_is_partition_tagged_and_chronological() {
+        let dir = temp_dir("hot-retained-order");
+        fs::create_dir_all(&dir).unwrap();
+        let line = |tag: Option<u64>, e: &Event| {
+            let json = nanobpmn_engine_core::encode_record_json(e, None).expect("encode");
+            match tag {
+                Some(t) => format!("{t}\t{json}\n"),
+                None => format!("{json}\n"),
+            }
+        };
+        let quarantined = Event::VariablesLostQuarantined {
+            instance_key: 10,
+            incident_key: 99,
+            episode: 8,
+        };
+        let terminated = Event::ProcessInstanceTerminated { instance_key: 10 };
+        let foreign = Event::VariablesLostQuarantined {
+            instance_key: 20,
+            incident_key: 98,
+            episode: 3,
+        };
+        let sealed = dir.join("sealed.log");
+        let active = dir.join("active.log");
+        fs::write(
+            &sealed,
+            line(Some(1), &quarantined) + &line(Some(0), &foreign),
+        )
+        .unwrap();
+        fs::write(&active, line(Some(1), &terminated)).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), Some((1, 2)), 0);
+        assert_eq!(hot, vec![quarantined.clone(), terminated.clone()]);
+        let mut state = nanobpmn_engine_core::State::default();
+        state.backfill_settled_orphan_episodes(hot.iter());
+        assert!(state.settled_orphan_episodes.is_empty());
+        // Untagged single-partition format reads every record as-is.
+        fs::write(&sealed, line(None, &quarantined)).unwrap();
+        fs::write(&active, line(None, &terminated)).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (1, &active), None, 0);
+        assert_eq!(hot, vec![quarantined, terminated]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review: retained-history reads keep ONLY the loss-lifecycle
+    /// variants the backfill folds (cold and hot, tagged and untagged), so
+    /// recovery never holds the whole archived payload in memory — while the
+    /// floor fence still uses the ORIGINAL global indices.
+    #[test]
+    fn retained_history_keeps_only_loss_lifecycle_events() {
+        let dir = temp_dir("retained-lifecycle-only");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let line = |tag: Option<u64>, e: &Event| {
+            let json = nanobpmn_engine_core::encode_record_json(e, None).expect("encode");
+            match tag {
+                Some(t) => format!("{t}\t{json}\n"),
+                None => format!("{json}\n"),
+            }
+        };
+        let payload = Event::IncidentResolved {
+            incident_key: 1,
+            instance_key: 10,
+            job_key: None,
+            resolved_at: 1,
+            operation_reference: None,
+        };
+        let kept = Event::ProcessInstanceTerminated { instance_key: 10 };
+        let kept2 = Event::ProcessInstanceCompleted { instance_key: 11 };
+        // Untagged cold [0, 3): payload, kept, payload; floor 1 keeps `kept`.
+        let plain = line(None, &payload) + &line(None, &kept) + &line(None, &payload);
+        fs::write(
+            cold_name(&dir, 0, 3),
+            deflate_all(plain.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_cold_retained(&dir, None, 1), vec![kept.clone()]);
+        assert_eq!(read_cold_retained(&dir, None, 2), Vec::<Event>::new());
+        // Tagged cold: same, demuxed.
+        fs::remove_file(cold_name(&dir, 0, 3)).unwrap();
+        let tagged = line(Some(1), &payload) + &line(Some(1), &kept) + &line(Some(0), &kept2);
+        fs::write(
+            cold_name(&dir, 0, 3),
+            deflate_all(tagged.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_cold_retained(&dir, Some((1, 2)), 0),
+            vec![kept.clone()]
+        );
+        // Hot, untagged and tagged.
+        let sealed = dir.join("sealed.log");
+        let active = dir.join("active.log");
+        fs::write(&sealed, line(None, &payload) + &line(None, &kept)).unwrap();
+        fs::write(&active, line(None, &payload) + &line(None, &kept2)).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), None, 1);
+        assert_eq!(hot, vec![kept.clone(), kept2.clone()]);
+        fs::write(&sealed, line(Some(0), &payload) + &line(Some(0), &kept)).unwrap();
+        fs::write(&active, line(Some(0), &payload)).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), Some((0, 2)), 0);
+        assert_eq!(hot, vec![kept]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review: the backfill floor excludes every event below it from the
+    /// retained history (tagged and untagged), only ever rises, and fails
+    /// CLOSED on a malformed file.
+    #[test]
+    fn backfill_floor_fences_retained_history_and_fails_closed() {
+        let dir = temp_dir("backfill-floor");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ev = |k: u64| Event::ProcessInstanceTerminated { instance_key: k };
+        let line = |tag: Option<u64>, e: &Event| {
+            let json = nanobpmn_engine_core::encode_record_json(e, None).expect("encode");
+            match tag {
+                Some(t) => format!("{t}\t{json}\n"),
+                None => format!("{json}\n"),
+            }
+        };
+        let sealed = dir.join("sealed.log");
+        let active = dir.join("active.log");
+        // Untagged: sealed [0, 2), active [2, 3); floor 1 drops event 0 only.
+        fs::write(&sealed, line(None, &ev(0)) + &line(None, &ev(1))).unwrap();
+        fs::write(&active, line(None, &ev(2))).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), None, 1);
+        assert_eq!(hot, vec![ev(1), ev(2)]);
+        // Tagged: the floor is a GLOBAL index, applied before the demux.
+        fs::write(&sealed, line(Some(1), &ev(0)) + &line(Some(0), &ev(1))).unwrap();
+        fs::write(&active, line(Some(1), &ev(2))).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), Some((1, 2)), 2);
+        assert_eq!(hot, vec![ev(2)]);
+        // Floor file: absent -> 0, only rises, per partition, malformed -> MAX.
+        assert_eq!(read_backfill_floor(&dir, Some(1)), 0);
+        raise_backfill_floor(&dir, Some(1), 7).unwrap();
+        raise_backfill_floor(&dir, Some(1), 3).unwrap();
+        assert_eq!(read_backfill_floor(&dir, Some(1)), 7);
+        assert_eq!(read_backfill_floor(&dir, Some(0)), 0);
+        fs::write(backfill_floor_path(&dir, None), "garbage").unwrap();
+        assert_eq!(read_backfill_floor(&dir, None), u64::MAX);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review: rolling pruning removes the OLDEST archive generation,
+    /// so the retained cold run no longer starts at 0 — but it still holds
+    /// the resolved episode, and the backfill must use it (the migrator's
+    /// zero-based completeness gate stays strict; see `read_cold_retained`).
+    #[test]
+    fn recover_backfills_settlement_after_partial_cold_pruning() {
+        let (dir, key, older_end) =
+            legacy_resolved_orphan_dir_with("legacy-settle-partial-prune", true);
+        let older_end = older_end.expect("older generation");
+        assert_eq!(prune_cold_archive(&dir, older_end), 1, "oldest gen pruned");
+        assert!(read_cold_prefix(&dir).unwrap().0.is_empty());
+        let (reopened, _) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+        let state = reopened.engine().state();
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "the retained generation settles the resolved episode"
+        );
+        assert!(state.settled_orphan_episodes.contains_key(&key));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_backfills_settlement_for_a_legacy_snapshot_from_retained_history() {
+        let (dir, key) = legacy_resolved_orphan_dir("legacy-settle-retained");
+        let (reopened, _) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+        let state = reopened.engine().state();
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "retained history settles the resolved episode: no new VariablesLost"
+        );
+        assert!(state.settled_orphan_episodes.contains_key(&key));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The documented residual window: the covered prefix was pruned, so the
+    // duplicate is recorded pending exactly once (one extra, resolvable
+    // `VariablesLost`), and the instance itself survives (no data loss).
+    #[test]
+    fn recover_with_pruned_history_leaves_one_resolvable_extra_report() {
+        let (dir, key) = legacy_resolved_orphan_dir("legacy-settle-pruned");
+        let covered = cold_archive_span(&dir).unwrap().expect("archived").1;
+        assert_eq!(prune_cold_archive(&dir, covered), 1);
+        let (reopened, _) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+        let state = reopened.engine().state();
+        assert_eq!(
+            state
+                .pending_orphan_supersedes
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![key],
+        );
+        assert!(reopened.instance(key).is_some(), "no data loss");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review (multi-partition arm of the operator decision): the
+    /// `recover_multi_scoped` backfill must fold each partition's OWN retained
+    /// covered prefix — the cold-archived frames tagged to that partition plus
+    /// its surviving hot prefix below the snapshot boundary (`skip_b`) — never
+    /// a sibling's history. Two partitions each carry a resolved legacy loss
+    /// episode (covered, cold-archived) and a delayed duplicate in the tail:
+    /// recovery must settle BOTH from retained history, with no cross-tag leak.
+    #[test]
+    fn recover_multi_backfills_settlement_per_partition_from_retained_history() {
+        let dir = temp_dir("legacy-settle-multi");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+
+        let (key0, key1) = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            // Each partition: original report, retry, quarantine, resolve —
+            // a legacy resolved loss episode per partition.
+            let episode = |j: &mut crate::journal::Journal| {
+                let (events, _) = j.apply_command(Command::create_instance("demo")).unwrap();
+                let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+                let stale = j
+                    .engine()
+                    .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
+                    .expect("stamp the original report");
+                let _ = j.apply_command(Command::create_instance("demo")).unwrap();
+                let fresh = j
+                    .engine()
+                    .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
+                    .expect("re-stamp the retry");
+                let (events, _) = j
+                    .apply_command(Command::QuarantineOffheapOrphan {
+                        instance_key: key,
+                        stamp: Some(fresh),
+                    })
+                    .unwrap();
+                let incident_key = events
+                    .iter()
+                    .find_map(|e| match e {
+                        Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                        _ => None,
+                    })
+                    .expect("the retry quarantines");
+                let _ = j
+                    .apply_command(Command::ResolveIncident { incident_key })
+                    .unwrap();
+                (key, stale)
+            };
+            let (key0, stale0) = episode(&mut j0);
+            let (key1, stale1) = episode(&mut j1);
+            assert_eq!(nanobpmn_engine_core::partition_of(key0), 0);
+            assert_eq!(nanobpmn_engine_core::partition_of(key1), 1);
+
+            // Snapshot both partitions and strip the settlement map to the
+            // pre-#1608 shape, then archive the covered prefix cold.
+            let (mut snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
+            let (mut snap1, covered1) = j1.snapshot_and_rotate().expect("snapshot p1");
+            assert!(!snap0.state.settled_orphan_episodes.is_empty());
+            assert!(!snap1.state.settled_orphan_episodes.is_empty());
+            snap0.state.settled_orphan_episodes.clear();
+            snap1.state.settled_orphan_episodes.clear();
+            write_multi_snapshot(&dir, vec![(0, covered0, snap0), (1, covered1, snap1)])
+                .expect("write combined snapshot");
+            assert_eq!(
+                compact_multi(&seg, &[covered0, covered1], &[u64::MAX; 2]),
+                1,
+                "the sealed prefix is archived cold"
+            );
+
+            // The delayed duplicate of each partition's ORIGINAL report lands
+            // in the surviving tail (superseded — the episode is long over).
+            for (j, key, stale) in [(&mut j0, key0, stale0), (&mut j1, key1, stale1)] {
+                let (events, _) = j
+                    .apply_command(Command::QuarantineOffheapOrphan {
+                        instance_key: key,
+                        stamp: Some(stale),
+                    })
+                    .unwrap();
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+                    "the delayed duplicate applies superseded in the tail: {events:?}"
+                );
+            }
+            (key0, key1)
+        };
+
+        let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reopen multi");
+        let engines: std::collections::BTreeMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        for (p, key) in [(0u64, key0), (1u64, key1)] {
+            let state = engines[&p].state();
+            assert!(
+                state.pending_orphan_supersedes.is_empty(),
+                "partition {p}: retained history settles the resolved episode"
+            );
+            assert!(
+                state.settled_orphan_episodes.contains_key(&key),
+                "partition {p}: its own covered prefix backfilled the episode"
+            );
+            assert!(
+                engines[&p].instance(key).is_some(),
+                "partition {p}: no data loss"
+            );
+        }
+        // No cross-tag leak: partition 0's map holds only its own instance.
+        assert_eq!(engines[&0].state().settled_orphan_episodes.len(), 1);
+        assert_eq!(engines[&1].state().settled_orphan_episodes.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Returns the path of the (single) persisted snapshot file in `dir`.

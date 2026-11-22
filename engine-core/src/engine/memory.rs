@@ -38,6 +38,12 @@ impl Engine {
             snapshot.partition_id,
             state::MAX_PARTITION_ID
         );
+        // #1608 review: a pre-#1608 snapshot's loss tombstones default
+        // `terminal: false`; derive the flag from the snapshot's own
+        // lifecycle records before any terminal shell can be evicted.
+        snapshot
+            .state
+            .normalize_legacy_tombstones(&std::collections::BTreeSet::new());
         for deployed in snapshot
             .state
             .processes
@@ -209,6 +215,17 @@ impl Engine {
             instance.variables = Arc::new(variables);
             instance.variables_spilled = false;
         }
+    }
+
+    /// Backfills the replicated loss-episode settlement map from retained
+    /// history the snapshot covers (#1608 review) — see
+    /// [`State::backfill_settled_orphan_episodes`]. Call after
+    /// [`Engine::from_snapshot`] and BEFORE [`Engine::apply_replayed_events`].
+    pub fn backfill_settled_orphan_episodes<'a, I>(&mut self, history: I)
+    where
+        I: IntoIterator<Item = &'a Event>,
+    {
+        self.state.backfill_settled_orphan_episodes(history);
     }
 
     /// one rebuilt via [`Engine::from_snapshot`]). Each event is applied through

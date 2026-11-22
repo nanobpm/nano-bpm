@@ -498,6 +498,7 @@ fn current_quarantine_tombstone_round_trips_verbatim() {
     let original = VariablesLostTombstone {
         incident_key: 9,
         episode: 42,
+        terminal: true,
     };
     let json = serde_json::to_string(&original).expect("serialize tombstone");
     let back: VariablesLostTombstone = serde_json::from_str(&json).expect("deserialize tombstone");
@@ -510,6 +511,7 @@ fn current_quarantine_tombstone_round_trips_verbatim() {
         VariablesLostTombstone {
             incident_key: 9,
             episode: 0,
+            terminal: false,
         }
     );
 }

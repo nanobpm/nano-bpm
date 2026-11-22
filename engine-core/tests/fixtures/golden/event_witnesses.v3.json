@@ -256,7 +256,8 @@
   {
     "OrphanStampSuperseded": {
       "episode": 26,
-      "instance_key": 27
+      "instance_key": 27,
+      "kind": "Resident"
     }
   },
   {

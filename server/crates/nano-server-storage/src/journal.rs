@@ -419,6 +419,17 @@ pub struct Journal {
     /// Pre-cutover legacy lenient-completion host flag (#1661), re-applied to
     /// every rebuilt engine (it is not in the snapshot body).
     legacy_lenient_completion: bool,
+    /// Divergence-recovery mode (#1608 review, #1701): set by the Raft layer
+    /// while this journal belongs to a recovery-only receiver — a member
+    /// booted over a crash-durable divergence marker whose local journal is
+    /// KNOWN-DIVERGED. While set, snapshot adoption
+    /// ([`restore_engine_from_snapshot`](Self::restore_engine_from_snapshot))
+    /// skips the receiver-local loss-episode backfill: folding the diverged
+    /// journal's retained prefix into the authoritative leader snapshot would
+    /// import supersedes or settlements the leader never committed, letting
+    /// discarded local state trigger a false loss report or suppress a valid
+    /// one — and then checkpoint the altered maps as the recovery base.
+    divergence_recovery: bool,
     /// Keys of instances already quarantined as **off-heap orphans** (#1383): a
     /// spilled instance whose variable row, or a cold instance whose snapshot
     /// row, is *definitively absent* from a readable store. Its payload is
@@ -1250,6 +1261,7 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
+            divergence_recovery: false,
         }
     }
 
@@ -1263,7 +1275,7 @@ impl Journal {
         } else {
             Engine::replay_partition(partition_id, events)
         };
-        Self {
+        let mut journal = Self {
             engine,
             partition_id,
             writer: None,
@@ -1288,7 +1300,12 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
-        }
+            divergence_recovery: false,
+        };
+        // #1608: re-park any still-open superseded orphan report the replayed
+        // history proves pending.
+        journal.rebuild_orphan_backlog();
+        journal
     }
 
     /// Adopt the engine state captured by a Raft snapshot **in place**, preserving
@@ -1337,8 +1354,6 @@ impl Journal {
             self.engine.set_track_dirty_vars(true);
             self.engine.mark_all_dirty();
         }
-        // Drop the snapshot's terminal shells: hot state keeps only in-flight work.
-        self.engine.evict_completed();
         // The received snapshot is self-contained: every cold (wholly off-heap)
         // instance was folded back in as resident (`fold_cold_into`), so this
         // receiver's own pre-existing cold routing index is now entirely stale.
@@ -1351,6 +1366,82 @@ impl Journal {
             cold.index = ColdIndex::default();
         }
         self.discard_orphan_reports();
+        // #1608 review (operator decision, option 1 — "single, multi AND
+        // snapshot adoption"): backfill loss-episode settlement from whatever
+        // covered prefix this receiver retained, exactly like the seglog
+        // recovery paths. An adopted snapshot is USUALLY serialized by an
+        // already-upgraded leader whose own recovery backfilled it — then the
+        // fold is a no-op, because the live fold already recorded those
+        // values and the merge only ever raises the high-water mark. During a
+        // ROLLING upgrade, though, a pre-#1608 leader can send a snapshot
+        // with no settlement map, and this receiver's retained prefix is the
+        // SAME replicated log the sender snapshotted (Raft install-snapshot
+        // only ever covers committed entries). The snapshot stays
+        // AUTHORITATIVE: the backfill never resurrects state for an instance
+        // the snapshot shows terminated (the local history may lag it), and
+        // it also reconstructs a legacy snapshot's unresolved supersedes.
+        // Best-effort: a pruned prefix leaves the documented one-extra-
+        // incident residual window.
+        //
+        // DIVERGENCE RECOVERY (#1608 review, #1701): a recovery-only
+        // receiver's local journal is KNOWN-DIVERGED — its retained prefix is
+        // NOT the verified committed prefix the leader snapshotted. Folding
+        // it into the authoritative snapshot would import receiver-local
+        // supersedes or settlements the leader never committed (a false loss
+        // report, or a suppressed valid one) and then checkpoint the altered
+        // maps as the recovery base. Skip the backfill: the leader's snapshot
+        // is the whole truth here, and the fence stays armed until it is
+        // checkpointed.
+        if !self.divergence_recovery
+            && self.engine.raft_applied().is_some()
+            && let Some(shared) = self.seg.clone()
+        {
+            // The shared multi-partition writer journals `<partition>\t<json>`
+            // records: read them tagged and keep only this partition's own.
+            let tag = self
+                .shared_exporter
+                .is_some()
+                .then(|| (self.partition_id, shared.partitions()));
+            // Chronological order — retained cold run, sealed segments oldest
+            // first, then the active segment — so a later termination is
+            // folded AFTER the quarantine it supersedes.
+            // Never fold history below this partition's backfill floor: a
+            // previous divergence recovery left the diverged pre-recovery
+            // prefix in the sealed segments / cold archive (#1608 review).
+            let floor = crate::seglog::read_backfill_floor(&shared.dir, self.floor_partition());
+            let cold = crate::seglog::read_cold_retained(&shared.dir, tag, floor);
+            let sealed: Vec<(u64, std::path::PathBuf)> = shared
+                .sealed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|seg| (seg.start, seg.path.clone()))
+                .collect();
+            let active_start = shared
+                .active_start
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let hot = crate::seglog::read_hot_retained(
+                &sealed,
+                (active_start, &shared.active_path),
+                tag,
+                floor,
+            );
+            self.engine
+                .backfill_settled_orphan_episodes(cold.iter().chain(hot.iter()));
+        }
+        // Drop the snapshot's terminal shells: hot state keeps only in-flight
+        // work. Deliberately AFTER the backfill (#1608 review): the backfill's
+        // never-resurrect-a-terminated-instance safeguard reads those shells,
+        // and a completed target that has also fallen out of the bounded
+        // terminal ring would otherwise have its retained supersede recreated
+        // as a pending report the sender's checkpoint does not hold. Still
+        // BEFORE the backlog rebuild, which must see only in-flight work.
+        self.engine.evict_completed();
+        // #1608: a report whose supersede is DURABLE survives the adoption —
+        // the snapshot the leader sent covers only settled state, so a
+        // supersede whose retry never committed must be re-parked from the
+        // surviving tail or the loss is never reported after a failover.
+        self.rebuild_orphan_backlog();
         self.fresh = false;
     }
 
@@ -1375,11 +1466,41 @@ impl Journal {
         self.restore_engine_from_snapshot(snapshot);
         self.raft_entry = None;
         self.fenced = false;
-        let published = self.checkpoint_base(permit);
+        let published = self
+            .checkpoint_base(permit)
+            .and_then(|()| self.fence_diverged_history());
         if published.is_err() {
             self.fenced = true;
         }
         published
+    }
+
+    /// During divergence recovery, durably raises this partition's backfill
+    /// floor past the whole diverged pre-recovery journal (#1608 review), so
+    /// no LATER ordinary adoption or restart ever folds it into the
+    /// settlement backfill: checkpointing only rotates and compaction
+    /// archives, so the diverged events otherwise stay readable. Called right
+    /// after the adopted base is checkpointed — the rotation sealed every
+    /// diverged event below `active_start`. Runs before the Raft layer clears
+    /// the divergence marker, so a failure keeps the member in recovery.
+    fn fence_diverged_history(&self) -> io::Result<()> {
+        if !self.divergence_recovery {
+            return Ok(());
+        }
+        let Some(seg) = self.seg.as_ref() else {
+            return Ok(());
+        };
+        let boundary = seg.active_start.load(std::sync::atomic::Ordering::SeqCst);
+        crate::seglog::raise_backfill_floor(&seg.dir, self.floor_partition(), boundary)
+    }
+
+    /// The per-partition key of this journal's durable floor files: `None`
+    /// for the single-partition layout, this partition for the shared
+    /// multi-partition writer.
+    fn floor_partition(&self) -> Option<u64> {
+        self.seg
+            .as_ref()
+            .and_then(|seg| (!seg.per_partition_total.is_empty()).then_some(self.partition_id))
     }
 
     /// Replaces this journal's engine with one rebuilt from authoritative
@@ -1418,6 +1539,9 @@ impl Journal {
         self.engine.evict_completed();
         // Orphan reports describe the superseded engine (#1574 review).
         self.discard_orphan_reports();
+        // #1608: a report whose supersede is DURABLE survives the rebuild —
+        // re-park it from the surviving tail or a failover loses the loss.
+        self.rebuild_orphan_backlog();
         // The rebuild IS the durable state: the fence and any armed (aborted)
         // raft-entry buffer are predecessor state that must not outlive it.
         self.raft_entry = None;
@@ -1472,7 +1596,7 @@ impl Journal {
         let (tx, rx) = mpsc::channel::<WriterMsg>();
         let writer_thread = spawn_writer(seg_active, rx, None)?;
 
-        Ok(Self {
+        let mut journal = Self {
             engine,
             partition_id,
             writer: Some(tx),
@@ -1497,7 +1621,13 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
-        })
+            divergence_recovery: false,
+        };
+        // #1608: re-park any still-open superseded orphan report the durable
+        // history proves pending (a crash between the supersede and its
+        // re-stamped retry must not lose the loss).
+        journal.rebuild_orphan_backlog();
+        Ok(journal)
     }
 
     /// Opens (or recovers) a **segmented** journal rooted at directory `dir` —
@@ -1539,7 +1669,13 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
+            divergence_recovery: false,
         };
+        // #1608: re-park any still-open superseded orphan report the surviving
+        // tail proves pending (a crash between the supersede and its
+        // re-stamped retry must not lose the loss).
+        let mut journal = journal;
+        journal.rebuild_orphan_backlog();
         Ok((journal, recovery))
     }
 
@@ -1564,7 +1700,7 @@ impl Journal {
         } else {
             Self::replay_verified(partition_id, events)?
         };
-        Ok(Self {
+        let mut journal = Self {
             engine,
             partition_id,
             writer: Some(shared.sender()),
@@ -1589,7 +1725,12 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
-        })
+            divergence_recovery: false,
+        };
+        // #1608: re-park any still-open superseded orphan report the durable
+        // history proves pending.
+        journal.rebuild_orphan_backlog();
+        Ok(journal)
     }
 
     /// Builds a partition journal that persists through a segmented
@@ -1600,13 +1741,16 @@ impl Journal {
     /// [`crate::seglog::recover_multi`]. Inherits the writer's segmented seal
     /// state and exporter cell so snapshots/compaction and read-model forwarding
     /// work for this partition.
+    ///
+    /// The orphan backlog is rebuilt from the recovered engine's replicated
+    /// pending-supersede set (#1608), which the snapshot carries too.
     pub fn from_engine_shared(
         partition_id: u64,
         engine: Engine,
         fresh: bool,
         shared: &SharedWriter,
     ) -> Self {
-        Self {
+        let mut journal = Self {
             engine,
             partition_id,
             writer: Some(shared.sender()),
@@ -1631,7 +1775,12 @@ impl Journal {
             resident_child_scans: 0,
             spill_check_skip: 0,
             legacy_lenient_completion: false,
-        }
+            divergence_recovery: false,
+        };
+        // #1608: re-park any still-open superseded orphan report the surviving
+        // tail proves pending.
+        journal.rebuild_orphan_backlog();
+        journal
     }
 
     /// Installs an already-minted deployment (the [`Event`]s from a `Deploy`
@@ -1750,8 +1899,14 @@ impl Journal {
         if self.orphans.leader != leader {
             self.orphans.in_flight.clear();
         }
+        let promoted = leader && !self.orphans.leader;
         self.orphans.leader = leader;
-        if leader {
+        if promoted {
+            // #1608: a follower applied supersedes into replicated state
+            // without parking a local report; rebuild on promotion so the
+            // pending loss is re-proposed (this also drains).
+            self.rebuild_orphan_backlog();
+        } else if leader {
             self.drain_orphan_backlog();
         }
     }
@@ -1846,10 +2001,76 @@ impl Journal {
     /// queued in the sink is dropped too: [`orphan_pending_stamp`](Self::orphan_pending_stamp)
     /// stamps only keys still in the backlog. A genuine loss in the adopted
     /// state is re-detected afresh by its next restore/fold.
+    ///
+    /// This discards only REPLICA-LOCAL detections. Reports whose supersede
+    /// was journaled ([`Event::OrphanStampSuperseded`]) are DURABLE pending
+    /// state (#1608): the caller must follow with
+    /// [`rebuild_orphan_backlog`](Self::rebuild_orphan_backlog) so a
+    /// crash/failover between a supersede and its re-stamped retry cannot
+    /// silently lose the loss.
     fn discard_orphan_reports(&mut self) {
         self.orphans.backlog.clear();
         self.orphans.in_flight.clear();
         let _ = self.orphans.inbox.take();
+    }
+
+    /// Rebuilds the pending orphan-report backlog from REPLICATED engine
+    /// state (#1608) — the durability half of the #1587 supersede mechanism.
+    ///
+    /// A stamped `QuarantineOffheapOrphan` that applies SUPERSEDED journals
+    /// [`Event::OrphanStampSuperseded`], which records the report in
+    /// `State::pending_orphan_supersedes` until a `VariablesLostQuarantined`
+    /// or the instance's terminal event settles it. The report itself lives in
+    /// the in-memory backlog, so a crash or leader failover in that window
+    /// would lose it — and a dormant lost instance is never re-detected
+    /// (re-detection only fires on access). Because the pending set is engine
+    /// state, it survives snapshots, compaction and Raft snapshot adoption
+    /// (a tail scan would miss a supersede compacted into a snapshot) and is
+    /// per-partition by construction (no shared-segment demux needed). The
+    /// parked report is re-stamped against CURRENT engine state at propose
+    /// time (`orphan_pending_stamp`), which resolves the truth — an already
+    /// rehydrated or already-incidented key stamps `None` and settles without
+    /// proposing.
+    ///
+    /// Call this after the engine is rebuilt (boot replay, snapshot+tail
+    /// recovery) and after an engine adoption (snapshot install / durable
+    /// rebuild).
+    pub fn rebuild_orphan_backlog(&mut self) {
+        let open: Vec<(Key, OrphanKind)> = self
+            .engine
+            .state()
+            .pending_orphan_supersedes
+            .iter()
+            .map(|(k, kind)| (*k, *kind))
+            .collect();
+        for (key, kind) in open {
+            // Revalidate against the RECOVERED routing and stores (#1608
+            // review): a healthy snapshot can still carry a pending supersede
+            // whose payload has since been restored, and re-parking it would
+            // let adoption/promotion raise a false `VariablesLost`. Only a
+            // DEFINITIVELY present payload settles the report; an unreadable
+            // row (`Err`, possibly transient) keeps the confirmed loss parked.
+            if self.orphan_payload_present(key, kind) {
+                tracing::info!(
+                    instance_key = key,
+                    ?kind,
+                    "recovery rebuild (#1608): pending orphan report's payload is \
+                     present; settling any parked report for an intact instance"
+                );
+                // A report parked by an EARLIER rebuild (e.g. the constructor's,
+                // which runs before the spill/var stores are wired, so the
+                // payload then read as absent) must be settled here too, or the
+                // drain below would still propose a false `VariablesLost`
+                // (#1608 review).
+                self.settle_orphan_report(key);
+                continue;
+            }
+            // `park_orphan` dedups and skips a key whose `VariablesLost`
+            // incident is already active (e.g. raised by a cold-orphan
+            // quarantine the set cannot attribute to this report).
+            self.park_orphan(key, kind, "recovery rebuild (#1608)");
+        }
+        self.drain_orphan_backlog();
     }
 
     /// The leader's stamp for a queued orphan proposal (#1447): `None` when the
@@ -1884,6 +2105,18 @@ impl Journal {
                  VariablesLost incident deferred to a leader-proposed stamped \
                  QuarantineOffheapOrphan (#1447)"
             );
+        }
+    }
+
+    /// Whether the payload an orphan report names DEFINITIVELY reads back
+    /// under current routing (the spill / var-store row for a resident
+    /// report, the cold row for a cold one). Only a successful read counts:
+    /// a cleared spill flag or missing index entry is not evidence (the loss
+    /// path itself clears them), and an unreadable row (`Err`) is not present.
+    fn orphan_payload_present(&self, key: Key, kind: OrphanKind) -> bool {
+        match kind {
+            OrphanKind::Resident => matches!(self.peek_spilled_variables(key), Ok(Some(_))),
+            OrphanKind::Cold => matches!(self.peek_cold_instance(key), Ok(Some(_))),
         }
     }
 
@@ -3296,6 +3529,14 @@ impl Journal {
     /// the `fenced` field).
     pub fn is_fenced(&self) -> bool {
         self.fenced
+    }
+
+    /// Marks (or clears) divergence-recovery mode (#1608 review, #1701) —
+    /// see the `divergence_recovery` field. The Raft layer sets it when a
+    /// recovery-only receiver boots over a divergence marker and clears it
+    /// once the leader's authoritative snapshot is adopted and checkpointed.
+    pub fn set_divergence_recovery(&mut self, recovering: bool) {
+        self.divergence_recovery = recovering;
     }
 
     /// The last Raft applied-entry record this journal wrote or recovered
@@ -5039,7 +5280,7 @@ impl Journal {
             ));
         }
         let refused = || io::Error::other("journal checkpoint refused (fenced or incomplete)");
-        let floor_partition = (!seg.per_partition_total.is_empty()).then_some(self.partition_id);
+        let floor_partition = self.floor_partition();
         // Publish the rebase floor BEFORE touching any authoritative state (the
         // var store, then the snapshot): a crash at any later boundary leaves a
         // floor no older snapshot satisfies, so recovery fails closed instead of
@@ -6972,6 +7213,391 @@ mod tests {
         );
     }
 
+    /// #1608 review (operator decision, option 1 — adoption arm): during a
+    /// rolling upgrade a PRE-#1608 leader can send a Raft snapshot with no
+    /// `settled_orphan_episodes`, covering a loss episode that was quarantined
+    /// AND resolved before the upgrade. The receiver's retained prefix is the
+    /// same replicated log, so adoption must backfill the settlement map from
+    /// it — otherwise a delayed duplicate's supersede in the tail is recorded
+    /// pending and re-raises `VariablesLost` without a new loss.
+    #[test]
+    fn snapshot_adoption_backfills_settlement_for_a_stripped_legacy_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-adopt-backfill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Build the receiver's retained log: a resolved loss episode whose
+        // covered prefix is archived cold, plus the delayed duplicate's
+        // supersede in the surviving tail.
+        let key = {
+            let (mut journal, recovery) = Journal::open_segmented(&dir).expect("open segmented");
+            let shared = std::sync::Arc::clone(&recovery.shared);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            // The original report's stamp, then the retry's fresh stamp.
+            let stale = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("stamp the original report");
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let fresh = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("re-stamp the retry");
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(fresh),
+                })
+                .unwrap();
+            let incident_key = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                    _ => None,
+                })
+                .expect("the retry quarantines");
+            let _ = journal
+                .apply_command(Command::ResolveIncident { incident_key })
+                .unwrap();
+            // Snapshot+rotate, persist the snapshot (stripped to its pre-#1608
+            // shape, as a pre-upgrade leader would have written it), then
+            // archive the covered prefix cold — the retained history the
+            // adoption backfill folds.
+            let (mut snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+            assert!(!snap.state.settled_orphan_episodes.is_empty());
+            snap.state.settled_orphan_episodes.clear();
+            crate::seglog::write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(
+                crate::seglog::compact(&shared, covered),
+                1,
+                "prefix archived cold"
+            );
+            // The delayed duplicate lands in the surviving tail.
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(stale),
+                })
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+                "the delayed duplicate applies superseded in the tail: {events:?}"
+            );
+            key
+        };
+
+        // Reopen the receiver (same retained log: cold archive + tail) and
+        // adopt — through the real Raft path — a snapshot stripped to its
+        // pre-#1608 shape, as a pre-upgrade leader would have serialized it.
+        let (mut receiver, recovery) = Journal::open_segmented(&dir).expect("reopen receiver");
+        let mut stripped = receiver.engine_snapshot();
+        stripped.state.settled_orphan_episodes.clear();
+        stripped.raft_applied = Some((42, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(stripped, Some(&permit))
+            .expect("adoption publishes the new base");
+        drop(permit);
+
+        let state = receiver.engine().state();
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "the retained prefix settles the resolved episode: no new VariablesLost"
+        );
+        assert!(
+            state.settled_orphan_episodes.contains_key(&key),
+            "adoption backfilled the settlement map from the retained prefix"
+        );
+        assert!(receiver.instance(key).is_some(), "no data loss");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review (adoption ordering): the adopted snapshot's terminal
+    /// shells must still be resident when the backfill runs. A completed
+    /// target that has also fallen out of the bounded terminal ring is proven
+    /// terminal ONLY by its shell, so evicting shells before the backfill let
+    /// the receiver's retained supersede be recreated as a pending report the
+    /// sender's checkpoint does not hold.
+    #[test]
+    fn snapshot_adoption_backfills_before_evicting_terminal_shells_after_ring_wrap() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-adopt-evict-order-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = {
+            let (mut journal, _recovery) = Journal::open_segmented(&dir).expect("open segmented");
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            let stale = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("stamp the original report");
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(stale),
+                })
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+                "the stale stamp supersedes in the retained log: {events:?}"
+            );
+            key
+        };
+        let (mut receiver, recovery) = Journal::open_segmented(&dir).expect("reopen receiver");
+        // The sender's snapshot: the target completed (a resident terminal
+        // shell) and its ring entry wrapped away, so only the shell proves it.
+        let mut snap = receiver.engine_snapshot();
+        snap.state.pending_orphan_supersedes.clear();
+        snap.state.recently_terminated.clear();
+        let shell = snap.state.instances.get_mut(&key).expect("resident");
+        shell.state = nanobpmn_engine_core::ProcessInstanceState::Completed;
+        shell.terminated_epoch = 0;
+        snap.raft_applied = Some((42, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(snap, Some(&permit))
+            .expect("adoption publishes the new base");
+        drop(permit);
+        let state = receiver.engine().state();
+        assert!(
+            !state.pending_orphan_supersedes.contains_key(&key),
+            "no pending report recreated for a completed target"
+        );
+        assert!(
+            !state.instances.contains_key(&key),
+            "the terminal shell is still evicted after the backfill"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review (divergence-recovery arm): a recovery-only receiver's
+    /// local journal is KNOWN-DIVERGED (#1701), so its retained prefix is not
+    /// the verified committed prefix the leader snapshotted. Adoption must
+    /// SKIP the receiver-local backfill — importing the diverged journal's
+    /// supersedes/settlements into the authoritative snapshot could trigger a
+    /// false loss report or suppress a valid one, and then checkpoint the
+    /// altered maps as the recovery base.
+    #[test]
+    fn snapshot_adoption_skips_the_local_backfill_during_divergence_recovery() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-adopt-diverged-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The diverged receiver's retained log holds a resolved loss episode
+        // the leader's snapshot does not carry (stripped to the pre-#1608
+        // shape, exactly as in the ordinary-adoption test above).
+        let key = {
+            let (mut journal, _recovery) = Journal::open_segmented(&dir).expect("open segmented");
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            let fresh = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("stamp the report");
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(fresh),
+                })
+                .unwrap();
+            let incident_key = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                    _ => None,
+                })
+                .expect("quarantines");
+            let _ = journal
+                .apply_command(Command::ResolveIncident { incident_key })
+                .unwrap();
+            key
+        };
+
+        // Reopen the receiver over the diverged retained log and adopt the
+        // leader's authoritative snapshot with divergence-recovery mode set —
+        // exactly what `bootstrap_recovery_receiver` arranges (#1701).
+        let (mut receiver, recovery) = Journal::open_segmented(&dir).expect("reopen receiver");
+        receiver.set_divergence_recovery(true);
+        let mut stripped = receiver.engine_snapshot();
+        stripped.state.settled_orphan_episodes.clear();
+        stripped.raft_applied = Some((42, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(stripped, Some(&permit))
+            .expect("adoption publishes the new base");
+        drop(permit);
+
+        let state = receiver.engine().state();
+        assert!(
+            state.settled_orphan_episodes.is_empty(),
+            "the diverged journal's retained prefix is NOT folded into the authoritative snapshot"
+        );
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "no receiver-local supersede is imported either"
+        );
+        assert!(receiver.instance(key).is_some(), "no data loss");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review: the backfill floor raised at divergence-recovery
+    /// adoption keeps the diverged pre-recovery prefix (still in the sealed
+    /// segments / cold archive) out of every LATER backfill — an ordinary
+    /// adoption after recovery ends, and a restart.
+    #[test]
+    fn diverged_history_stays_fenced_after_divergence_recovery_ends() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-adopt-diverged-later-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The diverged receiver's retained log holds a resolved loss episode
+        // the leader's snapshot does not carry (stripped to the pre-#1608
+        // shape, exactly as in the ordinary-adoption test above).
+        let key = {
+            let (mut journal, _recovery) = Journal::open_segmented(&dir).expect("open segmented");
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            let fresh = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("stamp the report");
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(fresh),
+                })
+                .unwrap();
+            let incident_key = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                    _ => None,
+                })
+                .expect("quarantines");
+            let _ = journal
+                .apply_command(Command::ResolveIncident { incident_key })
+                .unwrap();
+            key
+        };
+
+        // Reopen the receiver over the diverged retained log and adopt the
+        // leader's authoritative snapshot with divergence-recovery mode set —
+        // exactly what `bootstrap_recovery_receiver` arranges (#1701).
+        let (mut receiver, recovery) = Journal::open_segmented(&dir).expect("reopen receiver");
+        receiver.set_divergence_recovery(true);
+        let mut stripped = receiver.engine_snapshot();
+        stripped.state.settled_orphan_episodes.clear();
+        stripped.raft_applied = Some((42, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(stripped, Some(&permit))
+            .expect("adoption publishes the new base");
+        drop(permit);
+
+        let state = receiver.engine().state();
+        assert!(
+            state.settled_orphan_episodes.is_empty(),
+            "the diverged journal's retained prefix is NOT folded into the authoritative snapshot"
+        );
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "no receiver-local supersede is imported either"
+        );
+        assert!(receiver.instance(key).is_some(), "no data loss");
+
+        // Recovery ends (the Raft layer clears the mode with the marker) and
+        // the member applies new entries as a normal replica. The diverged
+        // events are still on disk in the sealed segments.
+        receiver.set_divergence_recovery(false);
+        let _ = receiver
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+
+        // A LATER ordinary adoption of a pre-#1608 snapshot must still not
+        // fold the diverged resolved episode back in.
+        let mut stripped = receiver.engine_snapshot();
+        stripped.state.settled_orphan_episodes.clear();
+        stripped.raft_applied = Some((43, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(stripped, Some(&permit))
+            .expect("ordinary adoption publishes the new base");
+        drop(permit);
+        let state = receiver.engine().state();
+        assert!(
+            state.settled_orphan_episodes.is_empty(),
+            "a later ordinary adoption never imports the diverged resolved episode"
+        );
+        assert!(state.pending_orphan_supersedes.is_empty());
+        drop(receiver);
+        drop(recovery);
+
+        // Nor does a restart's recovery backfill.
+        let (reopened, _recovery) = Journal::open_segmented(&dir).expect("restart");
+        assert!(
+            reopened.engine().state().settled_orphan_episodes.is_empty(),
+            "restart recovery never imports the diverged resolved episode"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A unique on-disk spill-store path, so a test can close and **reopen** the
     /// store exactly as a process restart does (an in-memory store cannot model
     /// the boot path).
@@ -7006,6 +7632,43 @@ mod tests {
             let (events, _) = journal
                 .apply_command(Command::create_instance_with("demo", vars))
                 .unwrap();
+            keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+        }
+        journal.force_spill_scan();
+        for key in &keys {
+            assert!(
+                journal.engine.is_variables_spilled(*key),
+                "precondition: spilled"
+            );
+        }
+        (journal, keys)
+    }
+
+    /// [`spilled_journal`] over a DURABLE journal at `journal_path` (#1608
+    /// restart regressions): every command's events are fsynced before its
+    /// commit resolves, so dropping the journal and reopening `journal_path`
+    /// replays exactly the surviving durable history — the real crash window.
+    fn spilled_durable_journal(
+        journal_path: &std::path::Path,
+        spill_path: &std::path::Path,
+        n: usize,
+    ) -> (Journal, Vec<Key>) {
+        use nanobpmn_engine_core::Value;
+
+        let mut journal = Journal::open(journal_path).unwrap();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(spill_path)).unwrap());
+        journal.set_spill(store, 0);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let mut keys = Vec::new();
+        for i in 0..n {
+            let mut vars = std::collections::BTreeMap::new();
+            vars.insert("data".to_string(), Value::Str(format!("payload-{i}")));
+            let (events, commit) = journal
+                .apply_command(Command::create_instance_with("demo", vars))
+                .unwrap();
+            commit.blocking_wait();
             keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
         }
         journal.force_spill_scan();
@@ -7909,6 +8572,589 @@ mod tests {
         assert_eq!(journal.orphan_backlog(), vec![keys[0]], "still parked");
 
         drop(journal);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608: a pending report whose stamped proposal applied SUPERSEDED must
+    // survive a restart — the supersede decision is journaled
+    // (`Event::OrphanStampSuperseded`), so replaying the surviving event
+    // history must rebuild the pending report instead of losing the loss.
+    // Before this fix the backlog was purely in-memory: a crash after the
+    // supersede committed but before the re-stamped retry committed left the
+    // backlog empty on recovery, and a dormant lost instance is never
+    // re-detected (re-detection only fires on access), so `VariablesLost` was
+    // never raised.
+    #[test]
+    fn superseded_orphan_report_is_rebuilt_from_the_surviving_event_history() {
+        let path = restart_store_path("orphan-supersede-restart-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        // Detect the loss and park the report (leader: enqueued + in flight).
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "parked");
+
+        // The leader stamps the report; intervening key-minting work then
+        // advances the allocator, so the stamped proposal applies SUPERSEDED —
+        // the durable journal now holds `OrphanStampSuperseded` and the report
+        // lives only in the in-memory backlog.
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "the stale stamp journals its supersede: {events:?}"
+        );
+        assert!(
+            !journal.engine.has_active_variables_lost(keys[0]),
+            "no incident raised by the superseded proposal"
+        );
+
+        // CRASH WINDOW: the process dies before the re-stamped retry commits.
+        // The rebuilt journal replays the surviving durable history — the
+        // journaled supersede must re-park the still-pending report.
+        // The supersede is durable before the "crash".
+        let persisted = Journal::read_events(&journal_path).unwrap();
+        assert!(
+            persisted
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "the supersede decision is journaled"
+        );
+        drop(journal);
+        let mut rebuilt = Journal::open(&journal_path).unwrap();
+        rebuilt.set_spill(
+            Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap()),
+            0,
+        );
+        rebuilt.set_replicated_apply(true);
+        let resink = Arc::new(RecordingSink::default());
+        rebuilt.set_orphan_sink(resink.clone());
+        rebuilt.set_orphan_leadership(true);
+        assert_eq!(
+            rebuilt.orphan_backlog(),
+            vec![keys[0]],
+            "the journaled supersede rebuilds the still-pending report on recovery"
+        );
+        assert_eq!(
+            resink.keys(),
+            vec![keys[0]],
+            "the rebuilt report is re-proposed by the new leader"
+        );
+
+        // The re-stamped retry now commits: the loss is reported, durably.
+        let retry = stamped_quarantine(&rebuilt, keys[0], OrphanKind::Resident);
+        let (_events, commit) = rebuilt.apply_command_at(retry, 43).unwrap();
+        commit.blocking_wait();
+        assert!(
+            rebuilt.engine.has_active_variables_lost(keys[0]),
+            "VariablesLost is raised for the lost instance after restart"
+        );
+        assert!(rebuilt.orphan_backlog().is_empty(), "settled on apply");
+
+        drop(rebuilt);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608 (failover half): a replica that adopts a leader's snapshot
+    // (promotion after a failover) discards its replica-local pending reports
+    // — but a report whose supersede is DURABLE in the surviving tail must be
+    // re-parked, or the promoted leader never re-proposes it and
+    // `VariablesLost` is never raised for the dormant lost instance.
+    #[test]
+    fn superseded_orphan_report_survives_snapshot_adoption() {
+        let path = restart_store_path("orphan-supersede-adopt-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        // Detect + stamp + supersede, exactly as the restart regression.
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "the stale stamp journals its supersede: {events:?}"
+        );
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "still pending");
+
+        // FAILOVER: this replica adopts a leader snapshot taken BEFORE the
+        // quarantine ever landed (the leader's snapshot carries no tombstone
+        // for the lost instance). The adoption discards the replica-local
+        // backlog — but the journaled supersede in the surviving tail must
+        // re-park the still-pending report.
+        let adopted = journal.engine_snapshot();
+        journal.restore_engine_from_snapshot(adopted);
+        assert_eq!(
+            journal.orphan_backlog(),
+            vec![keys[0]],
+            "a durable supersede survives snapshot adoption (promotion)"
+        );
+
+        drop(journal);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608 (adversarial review): a snapshot taken AFTER the supersede
+    // committed but BEFORE the retry — so the supersede survives only in the
+    // compacted prefix — must still carry the pending report. A tail scan
+    // misses it; the replicated `pending_orphan_supersedes` state does not.
+    // Adopting it onto a journal with NO surviving tail (a fresh replica, or
+    // another partition sharing the segment) re-parks exactly this report.
+    #[test]
+    fn superseded_orphan_report_survives_a_snapshot_covering_the_supersede() {
+        let path = restart_store_path("orphan-supersede-snapshot-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        journal.set_orphan_sink(Arc::new(RecordingSink::default()));
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (_events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        let snap = journal.engine_snapshot();
+        drop(journal);
+
+        // A tail-less receiver: nothing but the snapshot survives.
+        let mut receiver = Journal::in_memory();
+        receiver.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        receiver.set_orphan_sink(sink.clone());
+        receiver.set_orphan_leadership(true);
+        receiver.restore_engine_from_snapshot(snap);
+        assert_eq!(
+            receiver.orphan_backlog(),
+            vec![keys[0]],
+            "a supersede compacted into the snapshot is still pending"
+        );
+
+        // A partition whose own state holds no pending supersede parks
+        // nothing on adoption, whatever other partitions hold.
+        let mut other = Journal::in_memory_partition(1);
+        other.set_replicated_apply(true);
+        other.set_orphan_leadership(true);
+        let own = other.engine_snapshot();
+        other.restore_engine_from_snapshot(own);
+        assert!(other.orphan_backlog().is_empty(), "no cross-partition park");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608 review: a healthy snapshot can still carry a pending supersede
+    // whose payload has since been RESTORED. Rebuilding the backlog on
+    // adoption must revalidate against the recovered stores and not re-park
+    // (and later raise a false `VariablesLost` for) an intact instance.
+    #[test]
+    fn adoption_does_not_repark_a_pending_report_whose_payload_was_restored() {
+        let path = restart_store_path("orphan-supersede-restored-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        journal.set_orphan_sink(Arc::new(RecordingSink::default()));
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        let saved = store.try_get(keys[0]).unwrap().expect("spilled payload");
+        store.forget(&[keys[0]]).unwrap();
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (_events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert_eq!(journal.orphan_backlog(), vec![keys[0]], "pending");
+        let snap = journal.engine_snapshot();
+        assert!(
+            snap.state.pending_orphan_supersedes.contains_key(&keys[0]),
+            "precondition: the snapshot carries the pending supersede"
+        );
+        // The payload is restored before adoption.
+        store.put(keys[0], &saved).unwrap();
+        journal.restore_engine_from_snapshot(snap);
+        assert!(
+            journal.orphan_backlog().is_empty(),
+            "a restored payload settles the rebuilt report"
+        );
+        assert!(
+            !journal.engine().has_active_variables_lost(keys[0]),
+            "no VariablesLost was raised"
+        );
+
+        drop(journal);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608 review: a FOLLOWER applies a supersede into replicated state
+    // with no local report parked (it never detected the loss itself). On
+    // ordinary promotion — no recovery, no snapshot adoption — the new leader
+    // must rebuild its backlog from replicated state, or a leader failure
+    // before the retry leaves the dormant loss unreported forever.
+    #[test]
+    fn promotion_rebuilds_the_orphan_backlog_from_replicated_state() {
+        let path = restart_store_path("orphan-supersede-promotion-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(false);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "the stale stamp journals its supersede: {events:?}"
+        );
+        // Model a follower that never parked the report locally.
+        journal.discard_orphan_reports();
+        assert!(journal.orphan_backlog().is_empty());
+
+        journal.set_orphan_leadership(true);
+        assert_eq!(
+            journal.orphan_backlog(),
+            vec![keys[0]],
+            "promotion re-parks the replicated pending report"
+        );
+
+        drop(journal);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608 review: `Journal::open` rebuilds the backlog BEFORE the spill
+    // store is wired, so a restored payload reads as absent and the report is
+    // parked. Once the store is wired, promotion's rebuild sees the payload
+    // and must SETTLE the already-parked report, not merely skip re-parking
+    // it — otherwise the drain proposes a false `VariablesLost`.
+    #[test]
+    fn promotion_settles_a_constructor_parked_report_once_stores_are_wired() {
+        let path = restart_store_path("orphan-supersede-ctor-wiring-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        journal.set_orphan_sink(Arc::new(RecordingSink::default()));
+        journal.set_orphan_leadership(false);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        let saved = store.try_get(keys[0]).unwrap().expect("spilled row");
+        store.forget(&[keys[0]]).unwrap();
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "superseded: {events:?}"
+        );
+        drop(journal);
+        // The payload is restored before the restart.
+        store.put(keys[0], &saved).unwrap();
+
+        let mut rebuilt = Journal::open(&journal_path).unwrap();
+        assert_eq!(
+            rebuilt.orphan_backlog(),
+            vec![keys[0]],
+            "constructor rebuild runs before the store is wired and parks"
+        );
+        rebuilt.set_spill(
+            Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap()),
+            0,
+        );
+        rebuilt.set_replicated_apply(true);
+        let resink = Arc::new(RecordingSink::default());
+        rebuilt.set_orphan_sink(resink.clone());
+        rebuilt.set_orphan_leadership(true);
+        assert!(
+            rebuilt.orphan_backlog().is_empty(),
+            "promotion settles the parked report once the payload reads back"
+        );
+        assert!(
+            resink.keys().is_empty(),
+            "no false VariablesLost proposed for an intact instance"
+        );
+
+        drop(rebuilt);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608: the rebuild settles reports the surviving history shows as
+    // already resolved — a supersede followed by a committed re-stamped
+    // quarantine (its `VariablesLostQuarantined` tombstone) must NOT re-park
+    // the report on recovery, or a delayed reissue would raise a spurious
+    // duplicate incident.
+    #[test]
+    fn orphan_report_rebuild_settles_reports_the_history_quarantined() {
+        let path = restart_store_path("orphan-supersede-settled-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "superseded: {events:?}"
+        );
+
+        // The re-stamped retry commits BEFORE the crash: the loss is durably
+        // reported, so recovery must not re-park the report.
+        let retry = stamped_quarantine(&journal, keys[0], OrphanKind::Resident);
+        let (_events, commit) = journal.apply_command_at(retry, 43).unwrap();
+        commit.blocking_wait();
+        assert!(journal.engine.has_active_variables_lost(keys[0]));
+
+        drop(journal);
+        let mut rebuilt = Journal::open(&journal_path).unwrap();
+        rebuilt.set_spill(
+            Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap()),
+            0,
+        );
+        rebuilt.set_replicated_apply(true);
+        let resink = Arc::new(RecordingSink::default());
+        rebuilt.set_orphan_sink(resink.clone());
+        rebuilt.set_orphan_leadership(true);
+        assert!(
+            rebuilt.orphan_backlog().is_empty(),
+            "a quarantined report is settled by the surviving history, not re-parked"
+        );
+        assert!(
+            resink.keys().is_empty(),
+            "nothing re-proposed for a settled report"
+        );
+
+        drop(rebuilt);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1608: the rebuild settles reports whose target the surviving history
+    // shows as TERMINAL — a supersede followed by the instance's completion
+    // must NOT re-park the report on recovery (the loss no longer matters to
+    // any live work, and the terminal instance is evicted on replay, so
+    // nothing could re-detect it).
+    #[test]
+    fn orphan_report_rebuild_settles_reports_whose_target_terminated() {
+        let path = restart_store_path("orphan-supersede-terminal-1608");
+        let journal_path = path.with_file_name(format!(
+            "{}.journal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let (mut journal, keys) = spilled_durable_journal(&journal_path, &path, 1);
+        journal.set_replicated_apply(true);
+        let sink = Arc::new(RecordingSink::default());
+        journal.set_orphan_sink(sink.clone());
+        journal.set_orphan_leadership(true);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        let stamp = journal
+            .engine()
+            .orphan_incident_stamp(keys[0], OrphanKind::Resident)
+            .expect("a live orphan stamps");
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (events, commit) = journal
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: keys[0],
+                    stamp: Some(stamp),
+                },
+                42,
+            )
+            .unwrap();
+        commit.blocking_wait();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+            "superseded: {events:?}"
+        );
+
+        // The lost instance is CANCELLED before the retry commits: the report
+        // is moot, and recovery must not re-park it.
+        let (_events, commit) = journal
+            .apply_command(Command::cancel_instance(keys[0]))
+            .unwrap();
+        commit.blocking_wait();
+
+        drop(journal);
+        let mut rebuilt = Journal::open(&journal_path).unwrap();
+        rebuilt.set_spill(
+            Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap()),
+            0,
+        );
+        rebuilt.set_replicated_apply(true);
+        let resink = Arc::new(RecordingSink::default());
+        rebuilt.set_orphan_sink(resink.clone());
+        rebuilt.set_orphan_leadership(true);
+        assert!(
+            rebuilt.orphan_backlog().is_empty(),
+            "a report whose target terminated is settled by the surviving history"
+        );
+        assert!(
+            resink.keys().is_empty(),
+            "nothing re-proposed for a terminal target"
+        );
+
+        drop(rebuilt);
         drop(store);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
