@@ -8687,3 +8687,55 @@ fn inclusive_join_reached_by_a_fork_sibling_still_in_transit_waits_like_zeebe() 
     );
     assert!(!engine.is_completed(instance_key));
 }
+
+/// #1434 (PR #1786 review): a message key is a publication identity shared by
+/// every partition of a fan-out, so it may be FOREIGN to the partition that
+/// recorded a correlation. A legacy key-derived split must route every
+/// message-correlation record by its own keys, never by the shared message key
+/// (`max_key` would pick a foreign key minted on a higher partition and drop
+/// the record on recovery by a node that does not own that partition).
+#[test]
+fn message_correlation_records_route_by_own_keys_not_shared_message_key() {
+    use crate::state::compose_key;
+    let foreign = compose_key(3, 1);
+    let own = |l| compose_key(0, l);
+    let records = [
+        Event::MessageStartEventCorrelated {
+            message_key: foreign,
+            subscription_key: own(1),
+            process_definition_key: own(1),
+            process_id: "p".into(),
+            instance_key: own(2),
+            element_id: "s".into(),
+            message_name: "m".into(),
+            correlation_key: "c".into(),
+        },
+        Event::MessageCorrelated {
+            subscription_key: own(3),
+            message_key: foreign,
+            instance_key: own(2),
+            element_instance_key: own(4),
+            element_id: "c".into(),
+            variables: BTreeMap::new(),
+            boundary_element_id: None,
+        },
+        Event::RemoteMessageCorrelation {
+            subscription_key: own(3),
+            message_key: foreign,
+            instance_key: own(2),
+            element_instance_key: own(4),
+            element_id: "c".into(),
+            kind: crate::state::MessageSubscriptionKind::IntermediateCatch,
+            variables: BTreeMap::new(),
+            delivery_key: 0,
+        },
+    ];
+    for record in &records {
+        assert_eq!(
+            crate::state::partition_of(record.max_key()),
+            3,
+            "{record:?}"
+        );
+        assert_eq!(record.owning_partition(), 0, "{record:?}");
+    }
+}

@@ -4998,6 +4998,27 @@ mod legacy_demux_tests {
         assert_eq!(demuxed[&2].len(), 1);
     }
 
+    /// PR #1786 review (#1434): a partition-0 message-start correlation may
+    /// carry a message key minted on partition 3 (one key per publication). A
+    /// node owning only partitions 0 and 2 must keep it on partition 0 — the
+    /// shared message key never names the record's owner.
+    #[test]
+    fn legacy_demux_ignores_a_foreign_shared_message_key() {
+        let record = Event::MessageStartEventCorrelated {
+            message_key: nanobpmn_engine_core::compose_key(3, 1),
+            subscription_key: nanobpmn_engine_core::compose_key(0, 1),
+            process_definition_key: nanobpmn_engine_core::compose_key(0, 1),
+            process_id: "p".to_string(),
+            instance_key: nanobpmn_engine_core::compose_key(0, 2),
+            element_id: "s".into(),
+            message_name: "m".to_string(),
+            correlation_key: "c".to_string(),
+        };
+        let demuxed = demux_legacy_shared_log(vec![record], vec![0, 2], 4).expect("demux");
+        assert_eq!(demuxed[&0].len(), 1, "kept on its producing partition");
+        assert!(demuxed[&2].is_empty());
+    }
+
     /// Clustered layout: a keyed event for a partition this node does not own
     /// is dropped (its owner replays it from its own journal).
     #[test]
@@ -5072,7 +5093,7 @@ mod legacy_demux_tests {
 /// resetting every shard and replaying each partition's events into its shard. A
 /// `ProcessDeployed` is partition-agnostic and its key belongs to the deployment
 /// partition (0), which a clustered peer may not own, so it is replayed into
-/// EVERY owned shard; other events route to `partition_of(key)`'s shard.
+/// EVERY owned shard; other events route to their [`Event::owning_partition`]'s shard.
 #[allow(
     clippy::expect_used,
     reason = "startup-only: one-time legacy read-model rebuild during boot; a shard reset/export failure aborts boot deliberately"
@@ -5098,8 +5119,10 @@ fn rebuild_read_model_legacy(
             }
             continue;
         }
-        let p = (nanobpmn_engine_core::partition_of(e.max_key()) as usize)
-            .min(num_partitions.saturating_sub(1)) as u64;
+        // The canonical key-derived owner (shared with the legacy journal
+        // demux): never `partition_of(max_key())`, which a shared foreign
+        // message key (#1434) or a source-minted delivery key would misroute.
+        let p = (e.owning_partition() as usize).min(num_partitions.saturating_sub(1)) as u64;
         // Colocate a decision instance (and its later deletion) with its owner —
         // the process instance it ran in (so the `process_definition_key` join
         // resolves), or a standalone evaluation's own key — exactly where live
@@ -10906,6 +10929,13 @@ impl ServerImpl {
                 // ends the loop instead.
                 let mut ambiguous = false;
                 for (node, partitions) in &sends {
+                    if !publish_fanout_may_send(message_key, ambiguous) {
+                        // An earlier send may have committed under a key we
+                        // never learned: an unkeyed send would mint a second,
+                        // unrelated key and could return it as the publication's
+                        // (PR #1786 review). Stop; the no-key path answers 503.
+                        break;
+                    }
                     match self.peers.link(*node).await {
                         Ok(link) => match link
                             .publish_message(
@@ -36553,6 +36583,37 @@ mod clustered_startup_tests {
         assert_eq!((rows(0), rows(1)), (0, 0));
     }
 
+    /// PR #1786 review (#1434): the legacy read-model rebuild must route a
+    /// message-start correlation by its producing partition, not by a foreign
+    /// shared message key — otherwise a node owning partitions 0 and 2 loses
+    /// the correlation history of a key minted on partition 3.
+    #[test]
+    fn legacy_rebuild_ignores_a_foreign_shared_message_key() {
+        let events = vec![Event::MessageStartEventCorrelated {
+            message_key: nanobpmn_engine_core::compose_key(3, 1),
+            subscription_key: nanobpmn_engine_core::compose_key(0, 1),
+            process_definition_key: nanobpmn_engine_core::compose_key(0, 1),
+            process_id: "p".to_string(),
+            instance_key: nanobpmn_engine_core::compose_key(0, 2),
+            element_id: "s".into(),
+            message_name: "m".to_string(),
+            correlation_key: "c".to_string(),
+        }];
+        let read_model = readstore::ReadModel::in_memory_partitions(&[0, 2]);
+        let shards = read_model.shards();
+        rebuild_read_model_legacy(&shards, &events, 4);
+        let rows = |p: u64| {
+            shards
+                .iter()
+                .find(|(pid, _)| *pid == p)
+                .expect("shard")
+                .1
+                .correlated_message_subscriptions()
+                .len()
+        };
+        assert_eq!((rows(0), rows(2)), (1, 0), "history kept on partition 0");
+    }
+
     /// Issue #1292 fixture: a two-decision DRG (`root` requires `base`). `base`
     /// maps `lang = "de"` to `base_output`; `root` echoes it, unless
     /// `lang = "xx"`, where two `root` rules match under a UNIQUE hit policy so
@@ -59576,9 +59637,29 @@ fn publish_fanout_should_retry(
     remote_targets > 0 && !delivered && !ambiguous && attempt < max_attempts
 }
 
+/// Whether the fan-out may send to the next peer. Once an outcome is
+/// ambiguous (the peer may have committed) and no key is known, a further send
+/// would carry no key, so the receiver mints a fresh one that cannot locate the
+/// first peer's records — one publication, two identities (#1434). A known key
+/// keeps every later send on the same identity, so sending stays safe.
+fn publish_fanout_may_send(message_key: Option<u64>, ambiguous: bool) -> bool {
+    message_key.is_some() || !ambiguous
+}
+
 #[cfg(test)]
 mod publish_fanout_retry_tests {
     use super::publish_fanout_should_retry as retry;
+
+    #[test]
+    fn no_unkeyed_send_after_an_ambiguous_outcome() {
+        use super::publish_fanout_may_send as may_send;
+        assert!(may_send(None, false), "first unkeyed send is fine");
+        assert!(may_send(Some(7), true), "a known key keeps one identity");
+        assert!(
+            !may_send(None, true),
+            "an ambiguous peer may have minted a key we never saw"
+        );
+    }
 
     #[test]
     fn retries_only_on_definite_non_delivery() {

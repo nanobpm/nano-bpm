@@ -2359,14 +2359,39 @@ impl Event {
     /// split per partition on recovery. Normally the partition encoded in
     /// [`Event::max_key`]; a [`Event::RoutedDeliveryRecorded`] record instead
     /// belongs to its `recipient_partition`, because its only key was minted on
-    /// the SOURCE partition (#1497). Every key-derived split must go through
-    /// this, never `partition_of(max_key())` directly.
+    /// the SOURCE partition (#1497), and a message-correlation record routes by
+    /// its own keys, never its (possibly foreign, #1434) shared message key.
+    /// Every key-derived split must go through this, never
+    /// `partition_of(max_key())` directly.
     pub fn owning_partition(&self) -> u64 {
         match self {
             Event::RoutedDeliveryRecorded {
                 recipient_partition,
                 ..
             } => *recipient_partition,
+            // A message key is a PUBLICATION identity shared by every partition
+            // the publish fans out to (#1434): it may have been minted on another
+            // partition, so it never identifies the record's owner. Route by the
+            // record's own (locally-minted) keys instead.
+            Event::MessageCorrelated {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Event::RemoteMessageCorrelation {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                ..
+            } => crate::state::partition_of(
+                (*subscription_key)
+                    .max(*instance_key)
+                    .max(*element_instance_key),
+            ),
+            Event::MessageStartEventCorrelated { instance_key, .. } => {
+                crate::state::partition_of(*instance_key)
+            }
             _ => crate::state::partition_of(self.max_key()),
         }
     }
