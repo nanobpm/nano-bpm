@@ -161,9 +161,13 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
       },
       importSchema(json: string) {
         const editor = editorRef.current;
-        if (!editor || !loadGateRef.current.shouldLoad(editor, json))
-          return Promise.resolve();
-        return runLoad(async (e) => {
+        if (!editor) return Promise.resolve();
+        const duplicate = loadGateRef.current.shouldLoad(editor, json);
+        // A duplicate request awaits the ORIGINAL in-flight import (rejection
+        // included) instead of resolving immediately — resolving early would
+        // let a caller treat a still-pending, possibly-failing import as done.
+        if (duplicate) return duplicate;
+        const run = runLoad(async (e) => {
           try {
             await e.importSchema(parseSchema(json));
           } catch (err) {
@@ -173,6 +177,8 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
             throw err;
           }
         });
+        loadGateRef.current.settle(editor, json, run);
+        return run;
       },
       createBlank() {
         loadGateRef.current.invalidate();

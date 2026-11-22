@@ -1262,9 +1262,14 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       },
       importXml(xml: string) {
         const modeler = modelerRef.current;
-        if (!modeler || !loadGateRef.current.shouldLoad(modeler, xml))
-          return Promise.resolve();
-        return runLoad((m) =>
+        if (!modeler) return Promise.resolve();
+        const duplicate = loadGateRef.current.shouldLoad(modeler, xml);
+        // A duplicate request awaits the ORIGINAL in-flight import (rejection
+        // included) instead of resolving immediately — resolving early would
+        // let a repeated XML→Visual click clear the XML-dirty flag and show
+        // the canvas even when the import later fails.
+        if (duplicate) return duplicate;
+        const run = runLoad((m) =>
           m.importXML(xml).catch((e: unknown) => {
             // Only re-arm when the gate still records THIS import — a newer
             // document may have been delivered while this one was in flight.
@@ -1272,6 +1277,8 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
             throw e;
           }),
         );
+        loadGateRef.current.settle(modeler, xml, run);
+        return run;
       },
       createBlank() {
         loadGateRef.current.invalidate();
