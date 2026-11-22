@@ -2788,27 +2788,59 @@ impl State {
     where
         I: IntoIterator<Item = &'a crate::Event>,
     {
+        // Fold the retained history through the LIVE applier (the one
+        // canonical derivation of settlement and pending supersedes), on a
+        // scratch state that sees only the loss-lifecycle events.
         let mut folded = State::default();
+        let mut superseded_at: BTreeMap<Key, Key> = BTreeMap::new();
         for event in history {
             match event {
-                crate::Event::VariablesLostQuarantined {
+                crate::Event::OrphanStampSuperseded {
                     instance_key,
                     episode,
                     ..
-                } => folded.fold_settlement_quarantined(*instance_key, *episode),
-                crate::Event::ProcessInstanceCompleted { instance_key }
-                | crate::Event::ProcessInstanceTerminated { instance_key } => {
-                    folded.fold_settlement_terminal(*instance_key)
+                } => {
+                    superseded_at.insert(*instance_key, *episode);
                 }
-                _ => {}
+                crate::Event::VariablesLostQuarantined { .. }
+                | crate::Event::ProcessInstanceCompleted { .. }
+                | crate::Event::ProcessInstanceTerminated { .. } => {}
+                _ => continue,
             }
+            crate::state::apply(&mut folded, event);
         }
+        // The snapshot is AUTHORITATIVE over the retained history: it may be
+        // newer than it (an adopted leader snapshot) or the history may have a
+        // pruned gap. Never resurrect an entry for an instance the snapshot
+        // already knows terminated (a later termination the local history
+        // does not hold) — the terminal fold cleared it there.
         for (instance_key, episode) in folded.settled_orphan_episodes {
+            if self.terminated_epoch_of(instance_key).is_some() {
+                continue;
+            }
             let entry = self
                 .settled_orphan_episodes
                 .entry(instance_key)
                 .or_insert(0);
             *entry = (*entry).max(episode);
+        }
+        // A legacy (pre-#1608) snapshot carries no pending-supersede map, so a
+        // covered supersede whose retry never committed would stay dormant:
+        // reconstruct it — unless the snapshot shows it settled (an active
+        // tombstone or a settlement mark at/above its episode) or terminated.
+        for (instance_key, kind) in folded.pending_orphan_supersedes {
+            let episode = superseded_at.get(&instance_key).copied().unwrap_or(0);
+            if self.terminated_epoch_of(instance_key).is_some()
+                || self.variables_lost_quarantined.contains_key(&instance_key)
+                || (episode > 0
+                    && super::apply::settled_orphan_episode(self, instance_key)
+                        .is_some_and(|s| episode <= s))
+            {
+                continue;
+            }
+            self.pending_orphan_supersedes
+                .entry(instance_key)
+                .or_insert(kind);
         }
     }
 

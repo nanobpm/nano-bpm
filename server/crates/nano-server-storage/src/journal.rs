@@ -1365,29 +1365,33 @@ impl Journal {
         // ROLLING upgrade, though, a pre-#1608 leader can send a snapshot
         // with no settlement map, and this receiver's retained prefix is the
         // SAME replicated log the sender snapshotted (Raft install-snapshot
-        // only ever covers committed entries), so folding it is sound.
+        // only ever covers committed entries). The snapshot stays
+        // AUTHORITATIVE: the backfill never resurrects state for an instance
+        // the snapshot shows terminated (the local history may lag it), and
+        // it also reconstructs a legacy snapshot's unresolved supersedes.
         // Best-effort: a pruned prefix leaves the documented one-extra-
         // incident residual window.
         if self.engine.raft_applied().is_some()
             && let Some(shared) = self.seg.clone()
         {
-            let cold = crate::seglog::read_cold_prefix(&shared.dir)
-                .map(|(ev, _)| ev)
-                .unwrap_or_default();
-            let mut hot =
-                crate::seglog::read_segment_events(&shared.active_path).unwrap_or_default();
-            // The retained prefix also includes any still-sealed (not yet
-            // compacted) segments — compaction archives them cold, but a
-            // receiver that has not compacted yet holds the same history
-            // sealed on disk.
-            for seg in shared
+            // The shared multi-partition writer journals `<partition>\t<json>`
+            // records: read them tagged and keep only this partition's own.
+            let tag = self
+                .shared_exporter
+                .is_some()
+                .then(|| (self.partition_id, shared.partitions()));
+            // Chronological order — retained cold run, sealed segments oldest
+            // first, then the active segment — so a later termination is
+            // folded AFTER the quarantine it supersedes.
+            let cold = crate::seglog::read_cold_retained(&shared.dir, tag);
+            let sealed: Vec<std::path::PathBuf> = shared
                 .sealed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-            {
-                hot.extend(crate::seglog::read_segment_events(&seg.path).unwrap_or_default());
-            }
+                .map(|seg| seg.path.clone())
+                .collect();
+            let hot = crate::seglog::read_hot_retained(&sealed, &shared.active_path, tag);
             self.engine
                 .backfill_settled_orphan_episodes(cold.iter().chain(hot.iter()));
         }

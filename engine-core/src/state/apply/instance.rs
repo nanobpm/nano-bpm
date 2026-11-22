@@ -1078,6 +1078,78 @@ mod pending_orphan_supersede_tests {
         assert!(state.pending_orphan_supersedes.is_empty());
     }
 
+    // #1608 review: a legacy snapshot carries no pending-supersede map, so a
+    // covered supersede whose retry never committed is reconstructed from
+    // retained history — and one the history itself settles is not.
+    #[test]
+    fn backfill_reconstructs_an_unresolved_supersede_for_a_legacy_snapshot() {
+        let history = [
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 4,
+                kind: Some(OrphanKind::Cold),
+            },
+            Event::OrphanStampSuperseded {
+                instance_key: 20,
+                episode: 4,
+                kind: None,
+            },
+            Event::VariablesLostQuarantined {
+                instance_key: 20,
+                incident_key: 98,
+                episode: 6,
+            },
+        ];
+        let mut state = State::default();
+        for event in &history {
+            apply(&mut state, event);
+        }
+        // Strip what a pre-#1608 build never wrote.
+        state.pending_orphan_supersedes.clear();
+        state.settled_orphan_episodes.clear();
+        state.backfill_settled_orphan_episodes(history.iter());
+        assert_eq!(
+            state.pending_orphan_supersedes.get(&10),
+            Some(&OrphanKind::Cold)
+        );
+        assert!(!state.pending_orphan_supersedes.contains_key(&20));
+    }
+
+    // #1608 review: the snapshot is authoritative — retained history older
+    // than it (a quarantine whose later termination the local log never
+    // held) must not resurrect settlement or a pending report for an
+    // instance the snapshot shows terminated.
+    #[test]
+    fn backfill_never_resurrects_entries_for_an_instance_the_snapshot_terminated() {
+        let local_history = [
+            Event::OrphanStampSuperseded {
+                instance_key: 10,
+                episode: 4,
+                kind: None,
+            },
+            Event::VariablesLostQuarantined {
+                instance_key: 30,
+                incident_key: 97,
+                episode: 5,
+            },
+        ];
+        let mut state = State::default();
+        for event in &local_history {
+            apply(&mut state, event);
+        }
+        apply(
+            &mut state,
+            &Event::ProcessInstanceTerminated { instance_key: 10 },
+        );
+        apply(
+            &mut state,
+            &Event::ProcessInstanceTerminated { instance_key: 30 },
+        );
+        state.backfill_settled_orphan_episodes(local_history.iter());
+        assert!(state.pending_orphan_supersedes.is_empty());
+        assert!(state.settled_orphan_episodes.is_empty());
+    }
+
     // Residual window (documented): history pruned, nothing to backfill — the
     // duplicate is recorded pending exactly once (one extra, resolvable
     // `VariablesLost`), and the instance itself is untouched (no data loss).

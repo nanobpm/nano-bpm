@@ -1865,7 +1865,7 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
             // tail, so a pre-#1608 snapshot does not re-raise `VariablesLost`
             // for an episode resolved before the upgrade. Best-effort: a pruned
             // prefix leaves the documented one-extra-incident residual window.
-            let cold = read_cold_prefix(dir).map(|(ev, _)| ev).unwrap_or_default();
+            let cold = read_cold_retained(dir, None);
             engine.backfill_settled_orphan_episodes(
                 cold.iter().chain(events[..skip.min(events.len())].iter()),
             );
@@ -2340,6 +2340,91 @@ pub(crate) fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
         expected = end;
     }
     Ok((events, expected))
+}
+
+/// Reads the RETAINED cold archive for the best-effort #1608 loss-settlement
+/// backfill: the contiguous run of cold files starting at the OLDEST retained
+/// one, whatever its start (rolling pruning removes the oldest generation, so
+/// the run need not begin at 0). `tag` selects the shared multi-partition
+/// format (`Some((partition, num_partitions))` keeps only that write
+/// partition's events); `None` reads the untagged single-partition format.
+///
+/// Deliberately NOT the migrator's [`read_cold_prefix`]: that gate requires a
+/// zero-based, complete prefix and must stay strict. Here a gap or an
+/// unreadable file merely ends the run — the backfill is best-effort and the
+/// snapshot stays authoritative over whatever history it receives.
+pub(crate) fn read_cold_retained(dir: &Path, tag: Option<(u64, usize)>) -> Vec<Event> {
+    match tag {
+        None => cold_retained_run(dir, parse_cold_file),
+        Some((partition, num_partitions)) => {
+            only_partition(read_cold_retained_tagged(dir, num_partitions), partition)
+        }
+    }
+}
+
+/// [`read_cold_retained`] with write-partition tags (multi-partition recovery
+/// demuxes them per partition itself).
+fn read_cold_retained_tagged(dir: &Path, num_partitions: usize) -> Vec<(u64, Event)> {
+    cold_retained_run(dir, |path| parse_cold_file_tagged(path, num_partitions))
+}
+
+/// The contiguous retained cold run (see [`read_cold_retained`]), decoded by
+/// `parse`.
+fn cold_retained_run<T>(dir: &Path, parse: impl Fn(&Path) -> io::Result<Vec<T>>) -> Vec<T> {
+    let Ok(files) = list_cold(dir) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut expected: Option<u64> = None;
+    for (start, end, path) in files {
+        if expected.is_some_and(|e| e != start) {
+            break;
+        }
+        match parse(&path) {
+            Ok(decoded) => events.extend(decoded),
+            Err(_) => break,
+        }
+        expected = Some(end);
+    }
+    events
+}
+
+/// Keeps only `partition`'s events of a tagged (shared-writer) read.
+fn only_partition(tagged: Vec<(u64, Event)>, partition: u64) -> Vec<Event> {
+    tagged
+        .into_iter()
+        .filter(|(t, _)| *t == partition)
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// The retained hot history of a live segmented log, in chronological order:
+/// every still-sealed segment (oldest first), then the active segment. `tag`
+/// as for [`read_cold_retained`]. Best-effort like it: an unreadable segment
+/// ends the history there (a later segment after a hole would fold out of
+/// order).
+pub(crate) fn read_hot_retained(
+    sealed: &[PathBuf],
+    active: &Path,
+    tag: Option<(u64, usize)>,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for path in sealed
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(active))
+    {
+        let decoded = match tag {
+            None => read_segment_events(path),
+            Some((partition, num_partitions)) => read_segment_events_tagged(path, num_partitions)
+                .map(|tagged| only_partition(tagged, partition)),
+        };
+        match decoded {
+            Ok(decoded) => events.extend(decoded),
+            Err(_) => break,
+        }
+    }
+    events
 }
 
 /// [`read_cold_prefix`] with write-partition tags (multi-partition path).
@@ -3004,9 +3089,7 @@ pub fn recover_multi_scoped(
             // #1608 review: the retained cold prefix feeds the best-effort
             // loss-settlement backfill below (never a replay input on this
             // branch). Unreadable → nothing to backfill (residual window).
-            cold_tagged = read_cold_prefix_tagged(dir, num_partitions)
-                .map(|(events, _)| events)
-                .unwrap_or_default();
+            cold_tagged = read_cold_retained_tagged(dir, num_partitions);
             false
         }
         // No combined snapshot. If the journal still starts at index 0 the
@@ -4319,6 +4402,17 @@ mod tests {
     /// was compacted into the cold archive, and whose surviving tail holds a
     /// delayed duplicate's `OrphanStampSuperseded`. Returns the dir and key.
     fn legacy_resolved_orphan_dir(tag: &str) -> (PathBuf, u64) {
+        let (dir, key, _) = legacy_resolved_orphan_dir_with(tag, false);
+        (dir, key)
+    }
+
+    /// [`legacy_resolved_orphan_dir`], optionally preceded by an OLDER
+    /// archived generation (unrelated history, compacted cold before the loss
+    /// episode); returns that generation's end so a test can prune it.
+    fn legacy_resolved_orphan_dir_with(
+        tag: &str,
+        older_generation: bool,
+    ) -> (PathBuf, u64, Option<u64>) {
         let dir = temp_dir(tag);
         let (mut journal, recovery) =
             crate::journal::Journal::open_segmented(&dir).expect("open segmented");
@@ -4326,6 +4420,12 @@ mod tests {
         let _ = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
+        let older_end = older_generation.then(|| {
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1, "older generation archived");
+            covered
+        });
         let (events, _) = journal
             .apply_command(Command::create_instance("demo"))
             .unwrap();
@@ -4376,7 +4476,76 @@ mod tests {
                 .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
             "the delayed duplicate applies superseded in the tail: {events:?}"
         );
-        (dir, key)
+        (dir, key, older_end)
+    }
+
+    /// #1608 review: the adoption backfill's hot history must (a) read the
+    /// shared writer's `<partition>\t<json>` records tagged, keeping only the
+    /// adopting partition's own, and (b) fold sealed segments BEFORE the
+    /// active one, so a later termination in the active segment clears the
+    /// quarantine an older sealed segment recorded.
+    #[test]
+    fn hot_retained_history_is_partition_tagged_and_chronological() {
+        let dir = temp_dir("hot-retained-order");
+        fs::create_dir_all(&dir).unwrap();
+        let line = |tag: Option<u64>, e: &Event| {
+            let json = nanobpmn_engine_core::encode_record_json(e, None).expect("encode");
+            match tag {
+                Some(t) => format!("{t}\t{json}\n"),
+                None => format!("{json}\n"),
+            }
+        };
+        let quarantined = Event::VariablesLostQuarantined {
+            instance_key: 10,
+            incident_key: 99,
+            episode: 8,
+        };
+        let terminated = Event::ProcessInstanceTerminated { instance_key: 10 };
+        let foreign = Event::VariablesLostQuarantined {
+            instance_key: 20,
+            incident_key: 98,
+            episode: 3,
+        };
+        let sealed = dir.join("sealed.log");
+        let active = dir.join("active.log");
+        fs::write(
+            &sealed,
+            line(Some(1), &quarantined) + &line(Some(0), &foreign),
+        )
+        .unwrap();
+        fs::write(&active, line(Some(1), &terminated)).unwrap();
+        let hot = read_hot_retained(std::slice::from_ref(&sealed), &active, Some((1, 2)));
+        assert_eq!(hot, vec![quarantined.clone(), terminated.clone()]);
+        let mut state = nanobpmn_engine_core::State::default();
+        state.backfill_settled_orphan_episodes(hot.iter());
+        assert!(state.settled_orphan_episodes.is_empty());
+        // Untagged single-partition format reads every record as-is.
+        fs::write(&sealed, line(None, &quarantined)).unwrap();
+        fs::write(&active, line(None, &terminated)).unwrap();
+        let hot = read_hot_retained(std::slice::from_ref(&sealed), &active, None);
+        assert_eq!(hot, vec![quarantined, terminated]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review: rolling pruning removes the OLDEST archive generation,
+    /// so the retained cold run no longer starts at 0 — but it still holds
+    /// the resolved episode, and the backfill must use it (the migrator's
+    /// zero-based completeness gate stays strict; see `read_cold_retained`).
+    #[test]
+    fn recover_backfills_settlement_after_partial_cold_pruning() {
+        let (dir, key, older_end) =
+            legacy_resolved_orphan_dir_with("legacy-settle-partial-prune", true);
+        let older_end = older_end.expect("older generation");
+        assert_eq!(prune_cold_archive(&dir, older_end), 1, "oldest gen pruned");
+        assert!(read_cold_prefix(&dir).unwrap().0.is_empty());
+        let (reopened, _) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+        let state = reopened.engine().state();
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "the retained generation settles the resolved episode"
+        );
+        assert!(state.settled_orphan_episodes.contains_key(&key));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
