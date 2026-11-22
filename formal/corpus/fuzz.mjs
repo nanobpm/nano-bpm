@@ -412,7 +412,9 @@ export function executionNamer (tag) {
  * fuzz-corpus.json" from a run whose corpus diff never landed, so their
  * reproducers lived only in the issue text and no replay guarded them. The
  * body therefore states the commit obligation and carries the case identity
- * (`corpusIdentity`) that `committedIssueCases` checks the corpus against.
+ * (`corpusIdentity`) so triage can match the issue to its corpus case; the
+ * `uncommittedIssues` guard then fails any triaged issue whose committed
+ * reproducer is still absent.
  */
 export function issueBody (c) {
   return [

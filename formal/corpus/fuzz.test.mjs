@@ -280,6 +280,9 @@ test('stepSignatures / commandSignature fail closed on an unknown op', () => {
 // #1758 were filed claiming "committed in fuzz-corpus.json" from a run whose
 // corpus diff never landed, so nothing replayed them. Triaged duplicates are
 // aliased to the issue whose committed case (same graph, same seed) covers them.
+// #1757 is deliberately absent from this list: it is not a fuzz parity issue at
+// all but a Mergify merge-queue draft (for #1743), so there is no reproducer to
+// commit and nothing for the guard below to check.
 export const TRIAGED_FUZZ_ISSUES = ['#1753', '#1754', '#1755', '#1756', '#1758']
 export const TRIAGE_ALIASES = { '#1753': '#1693', '#1754': '#1675' }
 
