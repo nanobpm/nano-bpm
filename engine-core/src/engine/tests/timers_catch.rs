@@ -826,6 +826,7 @@ fn message_start_stamps_the_message_business_id_on_the_new_instance() {
                 correlation_key: String::new(),
                 variables: BTreeMap::new(),
                 business_id: Some("order-42".into()),
+                message_key: None,
             },
             0,
         )
@@ -861,6 +862,7 @@ fn message_start_stamps_the_message_business_id_on_the_new_instance() {
                 correlation_key: "A".into(),
                 variables: BTreeMap::new(),
                 business_id: Some("ignored".into()),
+                message_key: None,
             },
             0,
         )
@@ -1935,4 +1937,72 @@ fn a_timer_batch_cascades_parent_teardown_before_firing_descendant_timers() {
         .filter(|e| matches!(e, Event::ProcessInstanceTerminated { .. }))
         .count();
     assert_eq!(terminated, 2, "child and grandchild are terminated");
+}
+
+/// #1434: a multi-partition publish fans one `CorrelateMessage` out to the
+/// correlation-key hash partition and partition 0. A key pre-minted by the
+/// first partition must be reused verbatim on the next, so every record of the
+/// publication carries the single key the client received — and the foreign
+/// key must NOT advance this partition's own key allocator.
+#[test]
+fn correlate_message_reuses_a_pre_minted_message_key() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_start()))
+        .unwrap();
+    let foreign = crate::state::compose_key(3, 4_242);
+    let fired = engine
+        .apply_command_at(
+            Command::CorrelateMessage {
+                message_name: "order-placed".into(),
+                correlation_key: String::new(),
+                variables: BTreeMap::new(),
+                business_id: None,
+                message_key: Some(foreign),
+            },
+            0,
+        )
+        .unwrap();
+    let published: Vec<Key> = fired
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessagePublished { message_key, .. } => Some(*message_key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(published, vec![foreign], "the pre-minted key is reused");
+    let started: Vec<Key> = fired
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageStartEventCorrelated { message_key, .. } => Some(*message_key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        vec![foreign],
+        "the start correlation carries it too"
+    );
+    // Every key this partition minted stays on its own partition and below
+    // the foreign key's local counter: the allocator was not touched by it.
+    for e in &fired {
+        if let Event::ProcessInstanceCreated { instance_key, .. } = e {
+            assert_eq!(crate::state::partition_of(*instance_key), 0);
+            assert!(crate::state::local_of(*instance_key) < 4_242);
+        }
+    }
+
+    // Without a pre-minted key the engine still mints a fresh local one.
+    let fired = engine
+        .apply_command_at(Command::correlate_message("order-placed", ""), 0)
+        .unwrap();
+    let minted = fired
+        .iter()
+        .find_map(|e| match e {
+            Event::MessagePublished { message_key, .. } => Some(*message_key),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(crate::state::partition_of(minted), 0);
+    assert_ne!(minted, foreign);
 }

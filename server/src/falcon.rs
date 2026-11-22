@@ -1492,16 +1492,32 @@ async fn handle_client_frame(
             business_id,
             only_partitions,
             operation_reference,
+            message_key,
         } => {
+            // Only an OMITTED key selects the minting path: a present but
+            // unparseable key is a corrupt publication identity and must be
+            // rejected, never silently replaced by a freshly minted one (#1434).
+            let message_key = match message_key.map(|k| k.parse::<u64>()).transpose() {
+                Ok(k) => k,
+                Err(e) => {
+                    conn.send(ServerFrame::CommandResult {
+                        corr,
+                        status: 400,
+                        body: Some(Value::String(format!("invalid messageKey: {e}"))),
+                    });
+                    return;
+                }
+            };
             let vars = to_engine_vars(variables);
-            let (message_key, instance) = match server
-                .correlate_message_local(
+            let (message_key, instance, local_failed) = match server
+                .correlate_message_local_tracked(
                     name,
                     correlation_key,
                     vars,
                     business_id,
                     only_partitions,
                     operation_reference,
+                    message_key,
                 )
                 .await
             {
@@ -1522,7 +1538,10 @@ async fn handle_client_frame(
             server.signal_jobs_available();
             conn.send(ServerFrame::CommandResult {
                 corr,
-                status: 200,
+                // A failed local apply is ambiguous (it may have committed under
+                // a key it never returned): never a 200, or the originator would
+                // treat it as a no-op and re-send unkeyed (PR #1786 review).
+                status: crate::publish_peer_reply_status(local_failed),
                 body: Some(serde_json::json!({
                     // `None` only when this peer owns no target partition, which
                     // the fan-out never targets; serialised as JSON null so the
@@ -3426,6 +3445,7 @@ mod registry_tests {
             business_id: Some(business_id),
             only_partitions: None,
             operation_reference: None,
+            message_key: None,
         };
         let status_of = |frame: Option<ServerFrame>| match frame {
             Some(ServerFrame::CommandResult { status, .. }) => status,
@@ -3454,6 +3474,47 @@ mod registry_tests {
         )
         .await;
         assert_eq!(status_of(rx.try_recv().ok()), 200);
+    }
+
+    /// #1434 (PR #1786 review): only an OMITTED `messageKey` selects the
+    /// minting path. A present but unparseable key (non-numeric, overflowing)
+    /// is rejected with 400 rather than silently replaced by a fresh key.
+    #[tokio::test]
+    async fn publish_message_with_an_invalid_message_key_is_a_400() {
+        let server = ServerImpl::default();
+        let registry = Registry::new();
+        let (conn, mut rx) = test_connection_with_rx(7, 8);
+        let publish = |corr: u64, message_key: Option<String>| ClientFrame::PublishMessage {
+            corr,
+            name: "m".into(),
+            correlation_key: "k".into(),
+            variables: None,
+            business_id: None,
+            only_partitions: None,
+            operation_reference: None,
+            message_key,
+        };
+        let status_of = |frame: Option<ServerFrame>| match frame {
+            Some(ServerFrame::CommandResult { status, .. }) => status,
+            other => panic!("expected a CommandResult, got {other:?}"),
+        };
+        for (corr, key, want) in [
+            (1, Some("abc".to_string()), 400),
+            (2, Some("99999999999999999999999".to_string()), 400),
+            (3, Some(String::new()), 400),
+            (4, None, 200),
+        ] {
+            handle_client_frame(
+                &server,
+                &registry,
+                &conn,
+                "w",
+                publish(corr, key),
+                Channel::Cluster,
+            )
+            .await;
+            assert_eq!(status_of(rx.try_recv().ok()), want, "corr {corr}");
+        }
     }
 
     #[test]

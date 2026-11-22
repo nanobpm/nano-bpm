@@ -153,6 +153,7 @@ fn run_scenario(path: &Path) -> (Key, Vec<Event>) {
                 correlation_key: s("correlationKey"),
                 variables: v,
                 business_id: None,
+                message_key: None,
             }),
             "broadcastSignal" => run.apply(Command::BroadcastSignal {
                 signal_name: s("name"),
