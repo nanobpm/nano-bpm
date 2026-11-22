@@ -219,7 +219,13 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
         ).getActiveView?.();
         activeDecisionIdRef.current = view?.element?.id;
         attachActiveViewerChangeListener();
-        handleChanged();
+        // Switching views (DRD <-> decision table) is navigation, not an edit:
+        // the document is untouched, so the load gate must NOT be invalidated —
+        // otherwise a duplicate XML delivered after a view switch re-imports and
+        // resets the active view + selection (issue #1048). Only surface the
+        // change notification, suppression-guarded like handleChanged.
+        if (suppressChange.current) return;
+        onChangeRef.current?.();
       };
 
       modeler.on("views.changed", handleViewsChanged);
