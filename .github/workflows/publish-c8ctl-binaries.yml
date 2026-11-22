@@ -412,6 +412,14 @@ jobs:
             exit 0
           fi
 
+          # Already landed: a re-run after the pruning PR was merged must be a
+          # no-op, not reuse the stale branch to open a redundant PR.
+          merged="$(gh pr list --head "$branch" --state merged --json number --jq '.[0].number // empty')"
+          if [ -n "$merged" ]; then
+            echo "pruning PR #${merged} for ${TAG} already merged; nothing to do"
+            exit 0
+          fi
+
           # Recovery: an earlier run pushed the branch but failed before
           # `gh pr create`. Recreating the commit would diverge from the
           # pushed one (non-fast-forward), so reuse the pushed branch.
