@@ -2794,28 +2794,26 @@ impl State {
         let mut folded = State::default();
         let mut superseded_at: BTreeMap<Key, Key> = BTreeMap::new();
         for event in history {
-            match event {
-                crate::Event::OrphanStampSuperseded {
-                    instance_key,
-                    episode,
-                    ..
-                } => {
-                    // Keep the HIGHEST superseded episode per instance, not
-                    // the last in journal order (#1608 review): a delayed
-                    // duplicate E5 arriving after the fresh supersede E9 must
-                    // not replace E9 here — the pending-supersede
-                    // reconstruction below would then compare E5 against the
-                    // settlement mark and drop the genuinely unresolved E9
-                    // report, leaving the dormant loss unreported.
-                    superseded_at
-                        .entry(*instance_key)
-                        .and_modify(|e| *e = (*e).max(*episode))
-                        .or_insert(*episode);
-                }
-                crate::Event::VariablesLostQuarantined { .. }
-                | crate::Event::ProcessInstanceCompleted { .. }
-                | crate::Event::ProcessInstanceTerminated { .. } => {}
-                _ => continue,
+            if !event.is_loss_lifecycle() {
+                continue;
+            }
+            if let crate::Event::OrphanStampSuperseded {
+                instance_key,
+                episode,
+                ..
+            } = event
+            {
+                // Keep the HIGHEST superseded episode per instance, not
+                // the last in journal order (#1608 review): a delayed
+                // duplicate E5 arriving after the fresh supersede E9 must
+                // not replace E9 here — the pending-supersede
+                // reconstruction below would then compare E5 against the
+                // settlement mark and drop the genuinely unresolved E9
+                // report, leaving the dormant loss unreported.
+                superseded_at
+                    .entry(*instance_key)
+                    .and_modify(|e| *e = (*e).max(*episode))
+                    .or_insert(*episode);
             }
             crate::state::apply(&mut folded, event);
         }
@@ -2870,7 +2868,7 @@ impl State {
     /// is still draining its canceling listeners), and a missing instance
     /// (genuinely cold / pruned) is not proven terminal either — a cold
     /// target's report must still be preserved.
-    fn snapshot_shows_terminal(&self, instance_key: Key) -> bool {
+    pub(crate) fn snapshot_shows_terminal(&self, instance_key: Key) -> bool {
         if self.terminated_epoch_of(instance_key).is_some() {
             return true;
         }

@@ -1040,6 +1040,31 @@ mod pending_orphan_supersede_tests {
         assert!(state.pending_orphan_supersedes.is_empty());
     }
 
+    // #1608 review: completion retains active incidents, so quarantine ->
+    // completion -> ResolveIncident must NOT recreate the settlement entry the
+    // terminal fold cleared (it would leak for a completed instance forever).
+    #[test]
+    fn resolve_after_completion_does_not_recreate_settlement() {
+        let mut state = State::default();
+        apply(
+            &mut state,
+            &Event::VariablesLostQuarantined {
+                instance_key: 10,
+                incident_key: 99,
+                episode: 5,
+            },
+        );
+        assert_eq!(state.settled_orphan_episodes.get(&10), Some(&5));
+        apply(
+            &mut state,
+            &Event::ProcessInstanceCompleted { instance_key: 10 },
+        );
+        assert!(state.settled_orphan_episodes.is_empty());
+        resolve(&mut state, 10, 99);
+        assert!(state.variables_lost_quarantined.is_empty());
+        assert!(state.settled_orphan_episodes.is_empty());
+    }
+
     // #1608 review (operator decision, option 1): a PRE-#1608 snapshot taken
     // after a stamped loss episode was quarantined AND resolved carries neither
     // a settlement map nor a tombstone. Recovery backfills the map from the

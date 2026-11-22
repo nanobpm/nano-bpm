@@ -2407,7 +2407,10 @@ pub(crate) fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
 /// floor](read_backfill_floor)) are excluded.
 pub(crate) fn read_cold_retained(dir: &Path, tag: Option<(u64, usize)>, floor: u64) -> Vec<Event> {
     match tag {
-        None => at_or_above(cold_retained_run(dir, parse_cold_file), floor),
+        None => at_or_above(
+            cold_retained_run(dir, parse_cold_file, Event::is_loss_lifecycle),
+            floor,
+        ),
         Some((partition, num_partitions)) => only_partition(
             read_cold_retained_tagged(dir, num_partitions, floor),
             partition,
@@ -2419,7 +2422,11 @@ pub(crate) fn read_cold_retained(dir: &Path, tag: Option<(u64, usize)>, floor: u
 /// demuxes them per partition itself).
 fn read_cold_retained_tagged(dir: &Path, num_partitions: usize, floor: u64) -> Vec<(u64, Event)> {
     at_or_above(
-        cold_retained_run(dir, |path| parse_cold_file_tagged(path, num_partitions)),
+        cold_retained_run(
+            dir,
+            |path| parse_cold_file_tagged(path, num_partitions),
+            |(_, e): &(u64, Event)| e.is_loss_lifecycle(),
+        ),
         floor,
     )
 }
@@ -2436,7 +2443,11 @@ fn at_or_above<T>(indexed: Vec<(u64, T)>, floor: u64) -> Vec<T> {
 /// The contiguous retained cold run (see [`read_cold_retained`]), decoded by
 /// `parse`.
 /// `parse`, each event paired with its absolute (global) journal index.
-fn cold_retained_run<T>(dir: &Path, parse: impl Fn(&Path) -> io::Result<Vec<T>>) -> Vec<(u64, T)> {
+fn cold_retained_run<T>(
+    dir: &Path,
+    parse: impl Fn(&Path) -> io::Result<Vec<T>>,
+    keep: impl Fn(&T) -> bool,
+) -> Vec<(u64, T)> {
     let Ok(files) = list_cold(dir) else {
         return Vec::new();
     };
@@ -2447,7 +2458,11 @@ fn cold_retained_run<T>(dir: &Path, parse: impl Fn(&Path) -> io::Result<Vec<T>>)
             break;
         }
         match parse(&path) {
-            Ok(decoded) => events.extend((start..).zip(decoded)),
+            // Keep only the loss-lifecycle variants the backfill folds
+            // (#1608 review): retaining every archived payload would grow peak
+            // recovery memory with the whole cold archive. Global indices are
+            // assigned BEFORE filtering so the floor fence stays exact.
+            Ok(decoded) => events.extend((start..).zip(decoded).filter(|(_, e)| keep(e))),
             Err(_) => break,
         }
         expected = Some(end);
@@ -2495,7 +2510,7 @@ pub(crate) fn read_hot_retained(
                 .map(|tagged| only_partition(tagged.into_iter().skip(skip).collect(), partition)),
         };
         match decoded {
-            Ok(decoded) => events.extend(decoded),
+            Ok(decoded) => events.extend(decoded.into_iter().filter(Event::is_loss_lifecycle)),
             Err(_) => break,
         }
     }
@@ -3170,8 +3185,11 @@ pub fn recover_multi_scoped(
             // branch). Unreadable → nothing to backfill (residual window).
             // Read unfenced: each partition applies its own backfill floor
             // below (the floor is per partition, the archive is shared).
-            cold_backfill =
-                cold_retained_run(dir, |path| parse_cold_file_tagged(path, num_partitions));
+            cold_backfill = cold_retained_run(
+                dir,
+                |path| parse_cold_file_tagged(path, num_partitions),
+                |(_, e): &(u64, Event)| e.is_loss_lifecycle(),
+            );
             false
         }
         // No combined snapshot. If the journal still starts at index 0 the
@@ -4615,6 +4633,66 @@ mod tests {
         fs::write(&active, line(None, &terminated)).unwrap();
         let hot = read_hot_retained(&[(0, sealed.clone())], (1, &active), None, 0);
         assert_eq!(hot, vec![quarantined, terminated]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review: retained-history reads keep ONLY the loss-lifecycle
+    /// variants the backfill folds (cold and hot, tagged and untagged), so
+    /// recovery never holds the whole archived payload in memory — while the
+    /// floor fence still uses the ORIGINAL global indices.
+    #[test]
+    fn retained_history_keeps_only_loss_lifecycle_events() {
+        let dir = temp_dir("retained-lifecycle-only");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let line = |tag: Option<u64>, e: &Event| {
+            let json = nanobpmn_engine_core::encode_record_json(e, None).expect("encode");
+            match tag {
+                Some(t) => format!("{t}\t{json}\n"),
+                None => format!("{json}\n"),
+            }
+        };
+        let payload = Event::IncidentResolved {
+            incident_key: 1,
+            instance_key: 10,
+            job_key: None,
+            resolved_at: 1,
+            operation_reference: None,
+        };
+        let kept = Event::ProcessInstanceTerminated { instance_key: 10 };
+        let kept2 = Event::ProcessInstanceCompleted { instance_key: 11 };
+        // Untagged cold [0, 3): payload, kept, payload; floor 1 keeps `kept`.
+        let plain = line(None, &payload) + &line(None, &kept) + &line(None, &payload);
+        fs::write(
+            cold_name(&dir, 0, 3),
+            deflate_all(plain.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_cold_retained(&dir, None, 1), vec![kept.clone()]);
+        assert_eq!(read_cold_retained(&dir, None, 2), Vec::<Event>::new());
+        // Tagged cold: same, demuxed.
+        fs::remove_file(cold_name(&dir, 0, 3)).unwrap();
+        let tagged = line(Some(1), &payload) + &line(Some(1), &kept) + &line(Some(0), &kept2);
+        fs::write(
+            cold_name(&dir, 0, 3),
+            deflate_all(tagged.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_cold_retained(&dir, Some((1, 2)), 0),
+            vec![kept.clone()]
+        );
+        // Hot, untagged and tagged.
+        let sealed = dir.join("sealed.log");
+        let active = dir.join("active.log");
+        fs::write(&sealed, line(None, &payload) + &line(None, &kept)).unwrap();
+        fs::write(&active, line(None, &payload) + &line(None, &kept2)).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), None, 1);
+        assert_eq!(hot, vec![kept.clone(), kept2.clone()]);
+        fs::write(&sealed, line(Some(0), &payload) + &line(Some(0), &kept)).unwrap();
+        fs::write(&active, line(Some(0), &payload)).unwrap();
+        let hot = read_hot_retained(&[(0, sealed.clone())], (2, &active), Some((0, 2)), 0);
+        assert_eq!(hot, vec![kept]);
         let _ = fs::remove_dir_all(&dir);
     }
 

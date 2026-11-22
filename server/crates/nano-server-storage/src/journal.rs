@@ -1354,8 +1354,6 @@ impl Journal {
             self.engine.set_track_dirty_vars(true);
             self.engine.mark_all_dirty();
         }
-        // Drop the snapshot's terminal shells: hot state keeps only in-flight work.
-        self.engine.evict_completed();
         // The received snapshot is self-contained: every cold (wholly off-heap)
         // instance was folded back in as resident (`fold_cold_into`), so this
         // receiver's own pre-existing cold routing index is now entirely stale.
@@ -1431,6 +1429,14 @@ impl Journal {
             self.engine
                 .backfill_settled_orphan_episodes(cold.iter().chain(hot.iter()));
         }
+        // Drop the snapshot's terminal shells: hot state keeps only in-flight
+        // work. Deliberately AFTER the backfill (#1608 review): the backfill's
+        // never-resurrect-a-terminated-instance safeguard reads those shells,
+        // and a completed target that has also fallen out of the bounded
+        // terminal ring would otherwise have its retained supersede recreated
+        // as a pending report the sender's checkpoint does not hold. Still
+        // BEFORE the backlog rebuild, which must see only in-flight work.
+        self.engine.evict_completed();
         // #1608: a report whose supersede is DURABLE survives the adoption —
         // the snapshot the leader sent covers only settled state, so a
         // supersede whose retry never committed must be re-parked from the
@@ -7295,6 +7301,80 @@ mod tests {
             "adoption backfilled the settlement map from the retained prefix"
         );
         assert!(receiver.instance(key).is_some(), "no data loss");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review (adoption ordering): the adopted snapshot's terminal
+    /// shells must still be resident when the backfill runs. A completed
+    /// target that has also fallen out of the bounded terminal ring is proven
+    /// terminal ONLY by its shell, so evicting shells before the backfill let
+    /// the receiver's retained supersede be recreated as a pending report the
+    /// sender's checkpoint does not hold.
+    #[test]
+    fn snapshot_adoption_backfills_before_evicting_terminal_shells_after_ring_wrap() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-adopt-evict-order-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = {
+            let (mut journal, _recovery) = Journal::open_segmented(&dir).expect("open segmented");
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            let stale = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("stamp the original report");
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(stale),
+                })
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+                "the stale stamp supersedes in the retained log: {events:?}"
+            );
+            key
+        };
+        let (mut receiver, recovery) = Journal::open_segmented(&dir).expect("reopen receiver");
+        // The sender's snapshot: the target completed (a resident terminal
+        // shell) and its ring entry wrapped away, so only the shell proves it.
+        let mut snap = receiver.engine_snapshot();
+        snap.state.pending_orphan_supersedes.clear();
+        snap.state.recently_terminated.clear();
+        let shell = snap.state.instances.get_mut(&key).expect("resident");
+        shell.state = nanobpmn_engine_core::ProcessInstanceState::Completed;
+        shell.terminated_epoch = 0;
+        snap.raft_applied = Some((42, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(snap, Some(&permit))
+            .expect("adoption publishes the new base");
+        drop(permit);
+        let state = receiver.engine().state();
+        assert!(
+            !state.pending_orphan_supersedes.contains_key(&key),
+            "no pending report recreated for a completed target"
+        );
+        assert!(
+            !state.instances.contains_key(&key),
+            "the terminal shell is still evicted after the backfill"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

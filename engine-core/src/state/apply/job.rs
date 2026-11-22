@@ -464,8 +464,15 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 // tombstone predates `settled_orphan_episodes`, so without this
                 // a delayed duplicate of the resolved episode would be recorded
                 // pending and re-raise `VariablesLost` on recovery.
-                if let Some(settled) = super::instance::settled_orphan_episode(state, *instance_key)
-                {
+                // Never for an instance that already reached a terminal state
+                // (#1608 review): completion retains active incidents, so a
+                // quarantine -> completion -> ResolveIncident ordering would
+                // otherwise recreate the settlement entry the terminal fold
+                // cleared, leaking it in memory and snapshots indefinitely.
+                let settled = (!state.snapshot_shows_terminal(*instance_key))
+                    .then(|| super::instance::settled_orphan_episode(state, *instance_key))
+                    .flatten();
+                if let Some(settled) = settled {
                     state.settled_orphan_episodes.insert(*instance_key, settled);
                 }
                 state.variables_lost_quarantined.remove(instance_key);

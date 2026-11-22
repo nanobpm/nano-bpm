@@ -2129,6 +2129,22 @@ pub enum Event {
 }
 
 impl Event {
+    /// Whether this event is one of the loss-lifecycle variants the #1608
+    /// settlement backfill folds (`OrphanStampSuperseded`,
+    /// `VariablesLostQuarantined`, `ProcessInstanceCompleted`,
+    /// `ProcessInstanceTerminated`). The ONE canonical filter, shared by the
+    /// backfill fold and the storage readers that feed it (so retained-history
+    /// reads keep only these, not every archived payload).
+    pub fn is_loss_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Event::OrphanStampSuperseded { .. }
+                | Event::VariablesLostQuarantined { .. }
+                | Event::ProcessInstanceCompleted { .. }
+                | Event::ProcessInstanceTerminated { .. }
+        )
+    }
+
     /// The process-instance key of a **terminal** transition (completed or
     /// terminated), if this event is one. Used by the follower-replica apply
     /// path to reclaim the hot-state shell of an instance the moment it reaches
