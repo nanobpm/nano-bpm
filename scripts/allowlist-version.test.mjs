@@ -65,12 +65,21 @@ test("nextGatewayRelease follows a minor/major bump, never a patch guess", () =>
   assert.equal(nextGatewayRelease({ workspaceVersion: "1.0.0", tags: ["v0.0.28"] }), "v1.0.0");
 });
 
-test("checkIntroducedIn rejects every entry when no release version is committed", () => {
+test("checkIntroducedIn without a committed bump accepts an unreleased label (allowlist-only feature PR)", () => {
   const allowlist = {
     observational_variants: [entry("A", "v0.0.29", { upgrade: "upgrade-boundary" })],
     divergences: [],
   };
-  assert.match(checkIntroducedIn(allowlist, null), /no gateway release version is committed/);
+  assert.equal(checkIntroducedIn(allowlist, null, "v0.0.28"), null);
+});
+
+test("checkIntroducedIn without a committed bump rejects already-shipped and unparseable labels", () => {
+  const shipped = { observational_variants: [], divergences: [{ scenario: "s", introduced_in: "v0.0.28" }] };
+  assert.match(checkIntroducedIn(shipped, null, "v0.0.28"), /already shipped/);
+  const older = { observational_variants: [], divergences: [{ scenario: "s", introduced_in: "v0.0.27" }] };
+  assert.match(checkIntroducedIn(older, null, "v0.0.28"), /already shipped/);
+  const bad = { observational_variants: [], divergences: [{ scenario: "s", introduced_in: "next" }] };
+  assert.match(checkIntroducedIn(bad, null, "v0.0.28"), /not a release tag/);
   // An empty allowlist is still clean.
   assert.equal(checkIntroducedIn({ observational_variants: [], divergences: [] }, null), null);
 });

@@ -54,8 +54,10 @@ export function latestGatewayTag(tags) {
  * There is deliberately no "next patch" guess: the release bump may turn out
  * to be a minor/major, and an upgrade-boundary entry accepted under a guessed
  * version would be recorded in the append-only ledger at the wrong boundary
- * forever. With no committed version, `checkIntroducedIn` rejects every entry
- * (fail closed) until the PR bumps server/Cargo.toml.
+ * forever. With no committed version, `checkIntroducedIn` only requires each
+ * entry to be strictly after the latest tag; exactness is then enforced on the
+ * release-bump PR (RELEASE.md: one bump PR after the feature PRs merge),
+ * before the tag cuts and before the ledger can record a boundary.
  * `workspaceVersion` is server/Cargo.toml's [package] version; `tags` are the
  * remote tag names.
  */
@@ -84,22 +86,27 @@ export function allowlistEntries(allowlist) {
 
 /**
  * Fails (returns an error string) when any entry's `introduced_in` is not
- * exactly `expected` — the committed next gateway release (null = none
- * committed: every entry is rejected). Returns null when clean.
+ * exactly `expected` — the committed next gateway release. When `expected` is
+ * null (no bump committed yet — the normal state for a feature PR, since the
+ * release bump is its own PR), each entry must instead be a release strictly
+ * after `latestTag` (an already-shipped label is never valid); the bump PR then
+ * fails until every entry equals the version it cuts. Returns null when clean.
  * Entries with an unparseable `introduced_in` are reported too (compare.rs
  * would fail on them at gate time; catch them earlier).
  */
-export function checkIntroducedIn(allowlist, expected) {
+export function checkIntroducedIn(allowlist, expected, latestTag = null) {
   const errors = [];
+  const latest = latestTag === null ? null : parseRelease(latestTag);
   for (const { what, introduced_in } of allowlistEntries(allowlist)) {
-    if (expected === null) {
-      errors.push(
-        `allowlist ${what}: no gateway release version is committed yet (server/Cargo.toml is not ahead of the latest v* tag) — ` +
-          `bump server/Cargo.toml to the release this entry ships in, then label it with that version; a guessed version can ` +
-          `record a wrong, permanent append-only upgrade-boundaries.json entry (#1801)`,
-      );
-    } else if (!parseRelease(introduced_in)) {
+    if (!parseRelease(introduced_in)) {
       errors.push(`allowlist ${what}: introduced_in ${JSON.stringify(introduced_in)} is not a release tag`);
+    } else if (expected === null) {
+      if (latest && cmpRelease(parseRelease(introduced_in), latest) <= 0) {
+        errors.push(
+          `allowlist ${what}: introduced_in is ${introduced_in}, but ${latestTag} has already shipped — ` +
+            `label it with an unreleased version; the release-bump PR then pins it exactly (#1801)`,
+        );
+      }
     } else if (introduced_in !== expected) {
       errors.push(
         `allowlist ${what}: introduced_in is ${introduced_in}, but the next gateway release is ${expected} — ` +
