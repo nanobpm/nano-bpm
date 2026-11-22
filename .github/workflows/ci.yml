@@ -439,6 +439,26 @@ jobs:
         # trigger drifts from the train table. Lives in this REQUIRED job so a
         # regression in the release tooling blocks the merge.
         run: node --test scripts/release-tags.test.mjs
+      - name: Allowlist introduced_in is derived, not guessed (#1801)
+        # Every divergence-allowlist entry's introduced_in must be the NEXT
+        # gateway release (derived from the latest v* tag + the pending
+        # server/Cargo.toml bump; without a bump, merely unreleased — the
+        # release-bump PR pins it exactly). Runs here, not in the determinism
+        # job, so a mislabel fails fast instead of after the full matrix.
+        # A hand-guessed future version — #1528's
+        # entries were labelled v0.0.29 but shipped in v0.0.28 — becomes a
+        # spurious append-only upgrade-boundaries.json entry the ledger can
+        # never remove. Fails the PR that introduces the mislabel.
+        run: node scripts/check-allowlist-introduced-in.mjs
+      - name: Determinism allowlist versioning (derived introduced_in, release-time pruning)
+        # scripts/allowlist-version.mjs backs the #1801 root-cause fix: the
+        # introduced_in check (check-allowlist-introduced-in.mjs, run just
+        # above) and the release-time pruning the tag-triggered
+        # gateway workflow turns into a PR (prune-divergence-allowlist.mjs).
+        # Its tests pin the expiry comparison to the gate's own rule
+        # (introduced_in <= previous release) and the pruning job's wiring, so
+        # a drift re-opens the every-release-turns-main-red window.
+        run: node --test scripts/allowlist-version.test.mjs
       - name: Rust toolchain pin (every workflow uses rust-toolchain.toml)
         # Fails if any workflow installs an unpinned/other Rust toolchain
         # (`@stable` let Rust 1.99 break clippy + the armv6 release link).
