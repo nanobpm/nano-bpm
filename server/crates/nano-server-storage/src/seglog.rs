@@ -2316,7 +2316,7 @@ fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<
 /// record-count mismatch — or an undecodable frame — is a hard `Err`
 /// (fail-closed): the journal is not trustworthy. An empty (or non-zero-starting)
 /// archive yields `(vec![], 0)`.
-fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
+pub(crate) fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
     let mut events = Vec::new();
     let mut expected = 0u64;
     for (start, end, path) in list_cold(dir)? {
@@ -4411,6 +4411,140 @@ mod tests {
             vec![key],
         );
         assert!(reopened.instance(key).is_some(), "no data loss");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1608 review (multi-partition arm of the operator decision): the
+    /// `recover_multi_scoped` backfill must fold each partition's OWN retained
+    /// covered prefix — the cold-archived frames tagged to that partition plus
+    /// its surviving hot prefix below the snapshot boundary (`skip_b`) — never
+    /// a sibling's history. Two partitions each carry a resolved legacy loss
+    /// episode (covered, cold-archived) and a delayed duplicate in the tail:
+    /// recovery must settle BOTH from retained history, with no cross-tag leak.
+    #[test]
+    fn recover_multi_backfills_settlement_per_partition_from_retained_history() {
+        let dir = temp_dir("legacy-settle-multi");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+
+        let (key0, key1) = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            let mut engines: std::collections::BTreeMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            // Each partition: original report, retry, quarantine, resolve —
+            // a legacy resolved loss episode per partition.
+            let episode = |j: &mut crate::journal::Journal| {
+                let (events, _) = j.apply_command(Command::create_instance("demo")).unwrap();
+                let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+                let stale = j
+                    .engine()
+                    .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
+                    .expect("stamp the original report");
+                let _ = j.apply_command(Command::create_instance("demo")).unwrap();
+                let fresh = j
+                    .engine()
+                    .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
+                    .expect("re-stamp the retry");
+                let (events, _) = j
+                    .apply_command(Command::QuarantineOffheapOrphan {
+                        instance_key: key,
+                        stamp: Some(fresh),
+                    })
+                    .unwrap();
+                let incident_key = events
+                    .iter()
+                    .find_map(|e| match e {
+                        Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                        _ => None,
+                    })
+                    .expect("the retry quarantines");
+                let _ = j
+                    .apply_command(Command::ResolveIncident { incident_key })
+                    .unwrap();
+                (key, stale)
+            };
+            let (key0, stale0) = episode(&mut j0);
+            let (key1, stale1) = episode(&mut j1);
+            assert_eq!(nanobpmn_engine_core::partition_of(key0), 0);
+            assert_eq!(nanobpmn_engine_core::partition_of(key1), 1);
+
+            // Snapshot both partitions and strip the settlement map to the
+            // pre-#1608 shape, then archive the covered prefix cold.
+            let (mut snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
+            let (mut snap1, covered1) = j1.snapshot_and_rotate().expect("snapshot p1");
+            assert!(!snap0.state.settled_orphan_episodes.is_empty());
+            assert!(!snap1.state.settled_orphan_episodes.is_empty());
+            snap0.state.settled_orphan_episodes.clear();
+            snap1.state.settled_orphan_episodes.clear();
+            write_multi_snapshot(&dir, vec![(0, covered0, snap0), (1, covered1, snap1)])
+                .expect("write combined snapshot");
+            assert_eq!(
+                compact_multi(&seg, &[covered0, covered1], &[u64::MAX; 2]),
+                1,
+                "the sealed prefix is archived cold"
+            );
+
+            // The delayed duplicate of each partition's ORIGINAL report lands
+            // in the surviving tail (superseded — the episode is long over).
+            for (j, key, stale) in [(&mut j0, key0, stale0), (&mut j1, key1, stale1)] {
+                let (events, _) = j
+                    .apply_command(Command::QuarantineOffheapOrphan {
+                        instance_key: key,
+                        stamp: Some(stale),
+                    })
+                    .unwrap();
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+                    "the delayed duplicate applies superseded in the tail: {events:?}"
+                );
+            }
+            (key0, key1)
+        };
+
+        let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reopen multi");
+        let engines: std::collections::BTreeMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        for (p, key) in [(0u64, key0), (1u64, key1)] {
+            let state = engines[&p].state();
+            assert!(
+                state.pending_orphan_supersedes.is_empty(),
+                "partition {p}: retained history settles the resolved episode"
+            );
+            assert!(
+                state.settled_orphan_episodes.contains_key(&key),
+                "partition {p}: its own covered prefix backfilled the episode"
+            );
+            assert!(
+                engines[&p].instance(key).is_some(),
+                "partition {p}: no data loss"
+            );
+        }
+        // No cross-tag leak: partition 0's map holds only its own instance.
+        assert_eq!(engines[&0].state().settled_orphan_episodes.len(), 1);
+        assert_eq!(engines[&1].state().settled_orphan_episodes.len(), 1);
+
         let _ = fs::remove_dir_all(&dir);
     }
 

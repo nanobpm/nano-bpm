@@ -100,10 +100,13 @@ issue link.
 Call this out in the release notes of the release that first ships #1608
 (https://github.com/nanobpm/nano-bpm/issues/1608), next to the no-rolling-upgrade
 warning above. A pre-#1608 snapshot carries no `settled_orphan_episodes`. On
-every snapshot-based recovery (single- and multi-partition), the engine
-backfills that map from the retained covered history (the cold archive plus the
-hot prefix) before it replays the tail, using the live fold. Adopted leader
-snapshots come from an already-upgraded leader and need no backfill. **Residual
+every snapshot-based recovery — single- and multi-partition recovery, and Raft
+snapshot adoption — the engine backfills that map from the retained covered
+history (the cold archive plus the hot prefix) before it replays the tail,
+using the live fold. Adoption needs it too: during a rolling upgrade a
+pre-#1608 leader can send a snapshot with no settlement map, and the
+receiver's retained prefix is the same replicated log, so the same fold
+applies. **Residual
 window:** a pre-#1608 snapshot, a pruned cold prefix, and a delayed duplicate
 orphan report straddling the upgrade together raise **one extra, resolvable
 `VariablesLost` incident** for that instance. Data is never lost. Resolve the

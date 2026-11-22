@@ -1355,11 +1355,42 @@ impl Journal {
             cold.index = ColdIndex::default();
         }
         self.discard_orphan_reports();
-        // #1608 review: no settlement backfill here. An adopted snapshot is
-        // serialized by an already-upgraded leader, whose own snapshot-based
-        // recovery backfilled `settled_orphan_episodes` from ITS retained
-        // history (seglog `recover`/`recover_multi`). This receiver's local
-        // history is not that log, so folding it would be wrong.
+        // #1608 review (operator decision, option 1 — "single, multi AND
+        // snapshot adoption"): backfill loss-episode settlement from whatever
+        // covered prefix this receiver retained, exactly like the seglog
+        // recovery paths. An adopted snapshot is USUALLY serialized by an
+        // already-upgraded leader whose own recovery backfilled it — then the
+        // fold is a no-op, because the live fold already recorded those
+        // values and the merge only ever raises the high-water mark. During a
+        // ROLLING upgrade, though, a pre-#1608 leader can send a snapshot
+        // with no settlement map, and this receiver's retained prefix is the
+        // SAME replicated log the sender snapshotted (Raft install-snapshot
+        // only ever covers committed entries), so folding it is sound.
+        // Best-effort: a pruned prefix leaves the documented one-extra-
+        // incident residual window.
+        if self.engine.raft_applied().is_some()
+            && let Some(shared) = self.seg.clone()
+        {
+            let cold = crate::seglog::read_cold_prefix(&shared.dir)
+                .map(|(ev, _)| ev)
+                .unwrap_or_default();
+            let mut hot =
+                crate::seglog::read_segment_events(&shared.active_path).unwrap_or_default();
+            // The retained prefix also includes any still-sealed (not yet
+            // compacted) segments — compaction archives them cold, but a
+            // receiver that has not compacted yet holds the same history
+            // sealed on disk.
+            for seg in shared
+                .sealed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+            {
+                hot.extend(crate::seglog::read_segment_events(&seg.path).unwrap_or_default());
+            }
+            self.engine
+                .backfill_settled_orphan_episodes(cold.iter().chain(hot.iter()));
+        }
         // #1608: a report whose supersede is DURABLE survives the adoption —
         // the snapshot the leader sent covers only settled state, so a
         // supersede whose retry never committed must be re-parked from the
@@ -7068,6 +7099,121 @@ mod tests {
             batch.events.iter().any(|e| e.instance_key() == Some(key)),
             "the created instance's events must reach the preserved exporter"
         );
+    }
+
+    /// #1608 review (operator decision, option 1 — adoption arm): during a
+    /// rolling upgrade a PRE-#1608 leader can send a Raft snapshot with no
+    /// `settled_orphan_episodes`, covering a loss episode that was quarantined
+    /// AND resolved before the upgrade. The receiver's retained prefix is the
+    /// same replicated log, so adoption must backfill the settlement map from
+    /// it — otherwise a delayed duplicate's supersede in the tail is recorded
+    /// pending and re-raises `VariablesLost` without a new loss.
+    #[test]
+    fn snapshot_adoption_backfills_settlement_for_a_stripped_legacy_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-adopt-backfill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Build the receiver's retained log: a resolved loss episode whose
+        // covered prefix is archived cold, plus the delayed duplicate's
+        // supersede in the surviving tail.
+        let key = {
+            let (mut journal, recovery) = Journal::open_segmented(&dir).expect("open segmented");
+            let shared = std::sync::Arc::clone(&recovery.shared);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+            // The original report's stamp, then the retry's fresh stamp.
+            let stale = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("stamp the original report");
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let fresh = journal
+                .engine()
+                .orphan_incident_stamp(key, OrphanKind::Resident)
+                .expect("re-stamp the retry");
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(fresh),
+                })
+                .unwrap();
+            let incident_key = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::VariablesLostQuarantined { incident_key, .. } => Some(*incident_key),
+                    _ => None,
+                })
+                .expect("the retry quarantines");
+            let _ = journal
+                .apply_command(Command::ResolveIncident { incident_key })
+                .unwrap();
+            // Snapshot+rotate, persist the snapshot (stripped to its pre-#1608
+            // shape, as a pre-upgrade leader would have written it), then
+            // archive the covered prefix cold — the retained history the
+            // adoption backfill folds.
+            let (mut snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+            assert!(!snap.state.settled_orphan_episodes.is_empty());
+            snap.state.settled_orphan_episodes.clear();
+            crate::seglog::write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(
+                crate::seglog::compact(&shared, covered),
+                1,
+                "prefix archived cold"
+            );
+            // The delayed duplicate lands in the surviving tail.
+            let (events, _) = journal
+                .apply_command(Command::QuarantineOffheapOrphan {
+                    instance_key: key,
+                    stamp: Some(stale),
+                })
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::OrphanStampSuperseded { .. })),
+                "the delayed duplicate applies superseded in the tail: {events:?}"
+            );
+            key
+        };
+
+        // Reopen the receiver (same retained log: cold archive + tail) and
+        // adopt — through the real Raft path — a snapshot stripped to its
+        // pre-#1608 shape, as a pre-upgrade leader would have serialized it.
+        let (mut receiver, recovery) = Journal::open_segmented(&dir).expect("reopen receiver");
+        let mut stripped = receiver.engine_snapshot();
+        stripped.state.settled_orphan_episodes.clear();
+        stripped.raft_applied = Some((42, "raft-state".to_string()));
+        let permit = recovery
+            .shared
+            .try_checkpoint_permit()
+            .expect("checkpoint gate free");
+        receiver
+            .adopt_snapshot_as_base(stripped, Some(&permit))
+            .expect("adoption publishes the new base");
+        drop(permit);
+
+        let state = receiver.engine().state();
+        assert!(
+            state.pending_orphan_supersedes.is_empty(),
+            "the retained prefix settles the resolved episode: no new VariablesLost"
+        );
+        assert!(
+            state.settled_orphan_episodes.contains_key(&key),
+            "adoption backfilled the settlement map from the retained prefix"
+        );
+        assert!(receiver.instance(key).is_some(), "no data loss");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A unique on-disk spill-store path, so a test can close and **reopen** the
