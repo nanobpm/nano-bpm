@@ -146,7 +146,7 @@ test.describe("modeler — built-in MCP start event component", () => {
       saved = xml;
     });
     await page.goto(`projects/${PROJECT}`);
-    await openModel(page);
+    await openModel(page, "end");
     await createMcpStartEvent(page);
     await clickSave(page);
 
@@ -179,7 +179,7 @@ test.describe("modeler — built-in MCP start event component", () => {
       saved = xml;
     });
     await page.goto(`projects/${PROJECT}`);
-    await openModel(page);
+    await openModel(page, "end");
     await createMcpStartEvent(page);
 
     const TOOL = "Tool definition";

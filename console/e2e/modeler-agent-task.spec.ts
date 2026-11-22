@@ -223,10 +223,10 @@ test.describe("modeler — agent task inspection", () => {
     const noCrash = assertNoPageCrash(page);
     await page.goto(`projects/${PROJECT}`);
 
-    // Open resources/processes/agent-task.bpmn → the modeler mounts.
-    await page.getByText("resources", { exact: true }).first().click();
-    await page.getByText("processes", { exact: true }).first().click();
-    await page.getByText("agent-task.bpmn", { exact: true }).first().click();
+    // Open resources/processes/agent-task.bpmn → the modeler mounts, imports it
+    // and drains its load queue. Selecting before then raced a still-queued
+    // duplicate import that reset the panel to the process root (#1048).
+    await openModel(page, "work");
 
     // The custom renderer decorates the prompt-bound task with an AGENT badge —
     // proof the model imported and the agent-task renderer ran.
@@ -277,9 +277,7 @@ test.describe("modeler — external agent marker + opt-out", () => {
     const noCrash = assertNoPageCrash(page);
     await page.goto(`projects/${PROJECT}`);
 
-    await page.getByText("resources", { exact: true }).first().click();
-    await page.getByText("processes", { exact: true }).first().click();
-    await page.getByText("agent-task.bpmn", { exact: true }).first().click();
+    await openModel(page, "work");
 
     // The renderer recognises the task from the external-agent marker alone (no
     // prompt link) and decorates it — AGENT badge plus the "NO --auto" opt-out.
@@ -324,7 +322,7 @@ test.describe("modeler — external agent marker + opt-out", () => {
     });
 
     await page.goto(`projects/${PROJECT}`);
-    await openModel(page);
+    await openModel(page, "work");
     await expect(
       page.locator("svg").getByText("AGENT", { exact: true }),
     ).toBeVisible();
@@ -369,7 +367,7 @@ test.describe("modeler — external agent marker + opt-out", () => {
     });
 
     await page.goto(`projects/${PROJECT}`);
-    await openModel(page);
+    await openModel(page, "work");
     await expect(
       page.locator("svg").getByText("AGENT", { exact: true }),
     ).toBeVisible();
@@ -414,7 +412,7 @@ test.describe("modeler — authoring the external marker from an unmarked task",
     });
 
     await page.goto(`projects/${PROJECT}`);
-    await openModel(page);
+    await openModel(page, "work");
 
     // Nothing agentic yet: the plain service task carries no marker, so the
     // renderer draws no AGENT badge.
