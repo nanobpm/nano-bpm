@@ -533,11 +533,7 @@ fn fn_source(name: &str) -> Option<String> {
 /// (`drop(operation_reference)`, `let _ = operation_reference`) or otherwise
 /// consumes it without passing it on does not count.
 fn forwards_operation_reference(src: &str) -> bool {
-    let code: String = src
-        .lines()
-        .map(|l| l.find("//").map_or(l, |i| &l[..i]))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let code = strip_rust_comments(src);
     const FIELD: &str = "operation_reference";
     let Some(read) = code.find(&format!(".{FIELD}")) else {
         return false;
@@ -564,6 +560,74 @@ fn forwards_operation_reference(src: &str) -> bool {
             && matches!(next, Some(')' | ',' | '}'));
         bare && positioned && enclosing_is_forwarding(&code[..at])
     })
+}
+
+/// `src` with every Rust comment blanked out: `//` line comments and
+/// (nested) `/* */` block comments. String and char literals are kept intact
+/// so a `//` or `/*` inside one does not start a comment. Removed text is
+/// replaced by spaces (newlines kept) so code on either side never fuses.
+fn strip_rust_comments(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let n = b.get(i + 1).copied();
+        if c == '/' && n == Some('/') {
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && n == Some('*') {
+            let mut depth = 0usize;
+            while i < b.len() {
+                if b[i] == '/' && b.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if b[i] == '*' && b.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(if b[i] == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+            }
+        } else if c == '"' {
+            out.push(c);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '\\' {
+                    if let Some(&e) = b.get(i + 1) {
+                        out.push(e);
+                    }
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                if b[i - 1] == '"' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn strip_rust_comments_removes_line_and_nested_block_comments() {
+    assert_eq!(strip_rust_comments("a // x\nb"), "a \nb");
+    let s = strip_rust_comments("a /* x /* y */ z */ b");
+    assert_eq!(s.split_whitespace().collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(strip_rust_comments("\"//no\" c"), "\"//no\" c");
+    assert_eq!(strip_rust_comments("\"/*no*/\\\"\" c"), "\"/*no*/\\\"\" c");
 }
 
 /// Whether the innermost open `(`/`{` before the end of `head` is a
@@ -626,6 +690,12 @@ fn forwards_operation_reference_rejects_dropping_handlers() {
     assert!(!forwards_operation_reference(discarded));
     let in_block = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    if x { operation_reference }\n    self.cancel_core(k, None)\n}";
     assert!(!forwards_operation_reference(in_block));
+    let block_comment = "fn h(body: &Option<B>) {\n    /* let operation_reference = body.as_ref().and_then(|b| b.operation_reference); self.cancel_core(k, operation_reference); */\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(block_comment));
+    let nested_comment = "fn h(body: &Option<B>) {\n    /* outer /* inner */ let operation_reference = body.as_ref().and_then(|b| b.operation_reference); self.cancel_core(k, operation_reference); */\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(nested_comment));
+    let read_live_use_commented = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    self.cancel_core(k, /* operation_reference */ None)\n}";
+    assert!(!forwards_operation_reference(read_live_use_commented));
 }
 
 /// Defect-class guard (#1606): an `operationReference` request field the
