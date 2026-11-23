@@ -1112,3 +1112,57 @@ fn cascade_deadlines_ignore_unrelated_activated_jobs_on_both_iteration_sides() {
         vec![(target, 3_000)]
     );
 }
+
+/// #1856 review: a soft-activated job migrated onto an agent-marked target is
+/// still a soft (unjournaled) activation, so the cascade stamp must cover it —
+/// stamp eligibility and `job_terminal_deadline`'s fallback must use the SAME
+/// soft-activation predicate (live lock state, not model-derived durability).
+#[test]
+fn a_soft_job_migrated_to_an_agent_marked_target_keeps_its_cascade_deadline() {
+    let (mut leader, mut follower, job_key) = leader_and_follower("W");
+    let agent_marked = ProcessBuilder::new("order")
+        .start_event("start")
+        .agent_task("charge", "payment", crate::agent::AgentType::External)
+        .end_event("end")
+        .connect("start", "charge")
+        .connect("charge", "end")
+        .build()
+        .unwrap();
+    let mut target = None;
+    for replica in [&mut leader, &mut follower] {
+        let events = replica
+            .apply_command(Command::DeployProcess(agent_marked.clone()))
+            .unwrap();
+        target = events.iter().find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        });
+    }
+    let instance_key = leader.state().jobs[&job_key].instance_key;
+    replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::MigrateInstance {
+            instance_key,
+            target_process_definition_key: target.unwrap(),
+            mapping_instructions: vec![("charge".into(), "charge".into())],
+        },
+        100,
+    );
+    assert!(
+        leader.state().jobs[&job_key].lease_token.is_none()
+            && !leader.state().jobs[&job_key].durable_activation,
+        "the migrated job is still a soft activation"
+    );
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::CancelInstance { instance_key },
+        200,
+    );
+    assert_eq!(terminal_deadline(&on_leader, job_key), Some(Some(1_000)));
+    assert_eq!(terminal_deadline(&on_follower, job_key), Some(Some(1_000)));
+}

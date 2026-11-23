@@ -364,9 +364,7 @@ impl Engine {
             if let Some(job) = self.state.jobs.get(&job_key) {
                 if seen.contains(&job.instance_key)
                     && job.state == state::JobState::Activated
-                    && job.lease_token.is_none()
-                    && !job.durable_activation
-                    && !self.job_requires_durable_activation(job_key)
+                    && !job.has_replicated_lock()
                 {
                     if let Some(deadline) = job.deadline {
                         deadlines.insert(job_key, deadline);
@@ -1010,7 +1008,7 @@ impl Engine {
             // first-terminal-wins over any stamp.
             return terminal_end.deadline;
         }
-        if job.lease_token.is_some() || job.durable_activation {
+        if job.has_replicated_lock() {
             // A durable (journaled) activation: the lock is replicated, so its
             // CURRENT deadline is identical on every replica — including any
             // `UpdateJobTimeout` applied after the proposer stamped. The

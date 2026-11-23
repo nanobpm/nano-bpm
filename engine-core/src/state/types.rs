@@ -664,6 +664,17 @@ pub struct JobTerminalEnd {
 }
 
 impl Job {
+    /// Whether this job's current activation lock is journaled (replicated):
+    /// leased or durably activated. The SINGLE predicate for soft-vs-durable
+    /// lock state — used both to pick which deadlines a cascade stamps and to
+    /// decide whether `job_terminal_deadline` reads the replicated lock or the
+    /// stamp, so the two can never disagree (#1856 review). It deliberately
+    /// reads live lock state, not model-derived eligibility: a soft-activated
+    /// job migrated onto an agent-marked element is still a soft lock.
+    pub fn has_replicated_lock(&self) -> bool {
+        self.lease_token.is_some() || self.durable_activation
+    }
+
     /// The activating worker as a durable **attribution**, or `None` when there
     /// is none. An *empty* worker string (`Some("")`) is not an attribution: it
     /// normalizes to `None` here so a terminal event captured from this job
