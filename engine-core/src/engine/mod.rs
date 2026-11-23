@@ -19000,6 +19000,13 @@ trait OwnedByInstance {
 
 impl OwnedByInstance for state::Timer {
     fn instance_key(&self) -> Key {
+        // #1482: test-only op-count instrumentation for the streaming
+        // decomposition guard below — the concrete accessor a per-instance
+        // rescan regression would drive N times per entity. Gated on
+        // `feature = "serde"` to match the `decompose_scaling` module it
+        // counts for, so `cargo check --tests` without serde still compiles.
+        #[cfg(all(test, feature = "serde"))]
+        decompose_scaling::TIMER_OWNER_READS.with(|r| r.set(r.get() + 1));
         self.instance_key
     }
 }
@@ -19136,6 +19143,169 @@ fn group_owned<V: OwnedByInstance>(
         }
     }
     grouped
+}
+
+/// #1482: `group_owned` (the per-map step of `decompose_state_for_streaming`)
+/// must be linear in the map size — each entity's owner is read a constant
+/// number of times, independent of how many owners there are. A per-instance
+/// rescan (`drain_owned` in a loop) reads every owner N times, i.e. N×M work.
+/// Deterministic op-count guard instead of a wall-clock timing test.
+#[cfg(all(test, feature = "serde"))]
+mod group_owned_scaling {
+    use std::cell::Cell;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{group_owned, Key, OwnedByInstance};
+
+    thread_local! { static READS: Cell<usize> = const { Cell::new(0) }; }
+
+    struct Probe(Key);
+    impl OwnedByInstance for Probe {
+        fn instance_key(&self) -> Key {
+            READS.with(|r| r.set(r.get() + 1));
+            self.0
+        }
+    }
+
+    fn reads_for(n: u64) -> usize {
+        let mut map: BTreeMap<Key, Probe> = (0..n).map(|i| (1_000_000 + i, Probe(i))).collect();
+        let owners: BTreeSet<Key> = (0..n).collect();
+        READS.with(|r| r.set(0));
+        let grouped = group_owned(&mut map, &owners);
+        assert!(map.is_empty());
+        assert_eq!(grouped.len() as u64, n);
+        assert!(grouped.iter().all(|(k, v)| v.len() == 1 && v[0].0 == *k));
+        READS.with(Cell::get)
+    }
+
+    #[test]
+    fn group_owned_reads_each_owner_a_constant_number_of_times() {
+        let small = reads_for(500);
+        let large = reads_for(4_000);
+        assert!(
+            small <= 2 * 500,
+            "owner reads per entity must be O(1): {small}"
+        );
+        assert!(
+            large <= 2 * 4_000,
+            "owner reads per entity must be O(1): {large}"
+        );
+        // 8x the backlog must cost ~8x the work, never ~64x.
+        assert!(
+            large <= 8 * small,
+            "group_owned scaled super-linearly: {small} -> {large}"
+        );
+    }
+}
+
+/// #1482: the same linear-scaling guarantee at the level a regression would
+/// actually break it — [`Engine::decompose_state_for_streaming`] itself. The
+/// `group_owned` guard above pins the helper, but a per-instance `drain_owned`
+/// rescan restored in the decomposition loop would leave that guard green
+/// while going quadratic here. This drives the real decomposition over a
+/// hand-built backlog (N instances, one timer each) and counts owner reads
+/// through the concrete `state::Timer` accessor (instrumented above, test-only).
+#[cfg(all(test, feature = "serde"))]
+mod decompose_scaling {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use super::Engine;
+    use crate::state::{
+        ProcessInstance, ProcessInstanceState, State, Timer, TimerKind, TimerState,
+    };
+
+    thread_local! { pub(super) static TIMER_OWNER_READS: Cell<usize> = const { Cell::new(0) }; }
+
+    fn backlog(n: u64) -> State {
+        let mut state = State::default();
+        for i in 0..n {
+            let key = 1_000 + i;
+            state.insert_instance(ProcessInstance {
+                key,
+                process_id: "probe".to_string(),
+                process_definition_key: 0,
+                state: ProcessInstanceState::Active,
+                terminated_epoch: 0,
+                suspended_at: None,
+                created_at: 1_000,
+                tags: Vec::new(),
+                business_id: None,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
+                active: BTreeMap::new(),
+                scopes: BTreeMap::new(),
+                variables: Arc::new(BTreeMap::new()),
+                join_counts: BTreeMap::new(),
+                join_flow_arrivals: BTreeMap::new(),
+                join_instances: BTreeMap::new(),
+                parked_joins: Default::default(),
+                activating: Default::default(),
+                gateway_routes: BTreeMap::new(),
+                races: BTreeMap::new(),
+                incidents: Vec::new(),
+                variables_spilled: false,
+                multi_instances: BTreeMap::new(),
+                adhoc_instances: BTreeMap::new(),
+                scope_parents: BTreeMap::new(),
+                scope_variables: BTreeMap::new(),
+                esp_held_payloads: BTreeMap::new(),
+                compensable: Default::default(),
+                compensation_waits: BTreeMap::new(),
+                agent_instances: BTreeMap::new(),
+                agent_history: BTreeMap::new(),
+            });
+            state.timers.insert(
+                2_000_000 + i,
+                Timer {
+                    key: 2_000_000 + i,
+                    instance_key: key,
+                    element_instance_key: key,
+                    element_id: "wait".to_string(),
+                    due_at: 5_000,
+                    state: TimerState::Created,
+                    kind: TimerKind::IntermediateCatch,
+                    repetitions: None,
+                },
+            );
+        }
+        state
+    }
+
+    fn timer_owner_reads_for(n: u64) -> usize {
+        let state = backlog(n);
+        TIMER_OWNER_READS.with(|r| r.set(0));
+        let (control, instances) = Engine::decompose_state_for_streaming(state);
+        assert_eq!(instances.len() as u64, n);
+        assert!(control.instances.is_empty());
+        assert!(control.timers.is_empty(), "every owned timer is lifted out");
+        for snap in &instances {
+            assert_eq!(snap.timers.len(), 1);
+            assert_eq!(snap.timers[0].instance_key, snap.instance.key);
+        }
+        TIMER_OWNER_READS.with(Cell::get)
+    }
+
+    #[test]
+    fn decompose_for_streaming_reads_each_timer_owner_a_constant_number_of_times() {
+        let small = timer_owner_reads_for(500);
+        let large = timer_owner_reads_for(4_000);
+        assert!(
+            small <= 2 * 500,
+            "timer owner reads per entity must be O(1): {small}"
+        );
+        assert!(
+            large <= 2 * 4_000,
+            "timer owner reads per entity must be O(1): {large}"
+        );
+        // 8x the backlog must cost ~8x the work, never ~64x: a per-instance
+        // rescan reads every timer once per instance, i.e. N×M.
+        assert!(
+            large <= 8 * small,
+            "decompose_state_for_streaming scaled super-linearly: {small} -> {large}"
+        );
+    }
 }
 
 /// A process start event's deploy-time-resolved trigger.
