@@ -32,9 +32,11 @@
 //! `searchVariables`) are the cluster server's own [`Tool`]s, shared via
 //! [`shared_cluster_tools`] — not copies.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
-use nano_data_envelope::json_schema::{SchemaError, message_input_schema};
+use nano_data_envelope::json_schema::{EnvelopeSchema, SchemaError, start_event_input_schema};
+use nano_data_envelope::{BpmnScan, scan_bpmn};
 use nanobpm_gateway_rest::models;
 // The tool-metadata property prefix (single source: engine-core).
 use nanobpmn_engine_core::TOOL_PROPERTY_PREFIX;
@@ -105,14 +107,92 @@ struct ProcessTool {
     process_definition_version: i32,
     process_name: Option<String>,
     properties: BTreeMap<String, String>,
-    /// The start message's data envelope: `Ok(Some((shape id, object
-    /// schema)))` when it resolves, `Ok(None)` with none, and `Err` when it
-    /// resolves but its schema exceeds the derivation limits — the tool then
+    /// The start message's data envelope: `Ok(Some(..))` when it resolves,
+    /// `Ok(None)` with none, and `Err` when it is declared but its schema
+    /// cannot be derived (unresolved ref, derivation limits) — the tool then
     /// rejects every call (never falls back to a weaker contract).
     envelope: Envelope,
 }
 
-type Envelope = Result<Option<(String, Value)>, (String, SchemaError)>;
+type Envelope = Result<Option<EnvelopeSchema>, (String, SchemaError)>;
+
+/// The per-definition data-envelope cache (issue #1748). A deployed definition
+/// is immutable under its key, so its BPMN is scanned once and each start
+/// event's envelope schema derived once (lazily, only for the subscription a
+/// request actually resolves). Entries of definitions no longer serving an
+/// open tool are pruned on each resolution pass.
+#[derive(Default)]
+pub(crate) struct EnvelopeCache {
+    defs: Mutex<HashMap<u64, Arc<DefinitionEnvelopes>>>,
+}
+
+/// One definition's scan plus its derived envelopes by start element id.
+struct DefinitionEnvelopes {
+    scan: BpmnScan,
+    schemas: Mutex<HashMap<String, Envelope>>,
+}
+
+impl EnvelopeCache {
+    /// The data envelope of start event `start_element_id` of definition
+    /// `def_key`, derived at most once per (definition, start event).
+    fn envelope(
+        &self,
+        server: &ServerImpl,
+        def_key: u64,
+        process_id: &str,
+        start_element_id: &str,
+    ) -> Envelope {
+        let cached = self
+            .defs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&def_key)
+            .cloned();
+        let def = match cached {
+            Some(def) => def,
+            None => {
+                // Scan outside the lock; a racing duplicate scan is harmless
+                // (same immutable XML) and the first insert wins.
+                let Some(xml) = server.store.process_definition_xml(def_key) else {
+                    return Ok(None);
+                };
+                let fresh = Arc::new(DefinitionEnvelopes {
+                    scan: scan_bpmn(&xml),
+                    schemas: Mutex::new(HashMap::new()),
+                });
+                self.defs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(def_key)
+                    .or_insert(fresh)
+                    .clone()
+            }
+        };
+        let mut schemas = def.schemas.lock().unwrap_or_else(|e| e.into_inner());
+        schemas
+            .entry(start_element_id.to_string())
+            .or_insert_with(|| {
+                // Deployed definitions carry no fused type registry, so only
+                // model-declared shapes resolve; every external ref is
+                // surfaced as an unresolved-contract warning.
+                start_event_input_schema(&def.scan, start_element_id, Some(process_id), &())
+            })
+            .clone()
+    }
+
+    /// Drop the entries of definitions not in `live`.
+    fn retain(&self, live: &HashSet<u64>) {
+        self.defs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| live.contains(k));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.defs.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
 
 /// The message explaining why a tool whose envelope schema could not be
 /// derived rejects calls.
@@ -128,7 +208,7 @@ impl ProcessTool {
     fn input_schema(&self) -> Result<Value, String> {
         match &self.envelope {
             Ok(envelope) => Ok(resolve_input_schema(
-                envelope.as_ref().map(|(_, s)| s),
+                envelope.as_ref().map(|e| &e.schema),
                 &self.properties,
             )),
             Err((shape, e)) => Err(envelope_error_message(shape, *e)),
@@ -161,13 +241,22 @@ impl ProcessTool {
 /// ignored), and an envelope field named like the reserved `businessId`
 /// argument (stripped from the variables, so that field is never delivered).
 pub(crate) fn envelope_warnings(
-    envelope: Option<&(String, Value)>,
+    envelope: Option<&EnvelopeSchema>,
     props: &BTreeMap<String, String>,
 ) -> Vec<String> {
-    let Some((shape, schema)) = envelope else {
+    let Some(EnvelopeSchema {
+        shape,
+        schema,
+        unresolved,
+    }) = envelope
+    else {
         return Vec::new();
     };
-    let mut warnings = Vec::new();
+    // Unresolved-contract diagnostics: the schema does not enforce these.
+    let mut warnings: Vec<String> = unresolved
+        .iter()
+        .map(|d| format!("Data envelope `{shape}` is incomplete: {d}."))
+        .collect();
     if has_input_properties(props) {
         warnings.push(format!(
             "The start message declares data envelope `{shape}` and \
@@ -193,7 +282,10 @@ pub(crate) fn envelope_warnings(
 /// tool name and belong to the **latest** version of their process (a start
 /// subscription of a superseded version is closed in Zeebe, so its tool is
 /// gone even when the newer version no longer declares the message start).
-fn open_tools(server: &ServerImpl) -> Vec<ProcessTool> {
+///
+/// With `only` set, just the tool of that full name is resolved — its
+/// envelope is the only one derived (issue #1748).
+fn open_tools(server: &ServerImpl, only: Option<&str>) -> Vec<ProcessTool> {
     let latest: HashMap<u64, ProcessDefinitionRow> = server
         .store
         .process_definitions()
@@ -201,23 +293,41 @@ fn open_tools(server: &ServerImpl) -> Vec<ProcessTool> {
         .filter(|d| d.is_latest)
         .map(|d| (d.key, d))
         .collect();
-    let mut tools: Vec<ProcessTool> = server
+    let subscriptions: Vec<_> = server
         .store
         .message_start_subscriptions()
         .into_iter()
         .filter_map(|s| {
+            latest.get(&s.process_definition_key)?;
+            let tool_name = s.tool_name.clone().filter(|n| !n.is_empty())?;
+            let name = format!("{tool_name}{TOOL_NAME_DELIMITER}{}", s.subscription_key);
+            Some((s, tool_name, name))
+        })
+        .collect();
+    // Prune cache entries of definitions that no longer serve an open tool
+    // (only on a full pass: a filtered pass sees a subset).
+    if only.is_none() {
+        let live: HashSet<u64> = subscriptions
+            .iter()
+            .map(|(s, _, _)| s.process_definition_key)
+            .collect();
+        server.mcp_envelopes.retain(&live);
+    }
+    let mut tools: Vec<ProcessTool> = subscriptions
+        .into_iter()
+        .filter(|(_, _, name)| only.is_none_or(|o| o == name))
+        .filter_map(|(s, tool_name, name)| {
             let def = latest.get(&s.process_definition_key)?;
-            let tool_name = s.tool_name.filter(|n| !n.is_empty())?;
             let properties = serde_json::from_str::<BTreeMap<String, String>>(&s.tool_properties)
                 .unwrap_or_default();
-            let envelope = server
-                .store
-                .process_definition_xml(s.process_definition_key)
-                .map_or(Ok(None), |xml| {
-                    message_input_schema(&xml, &s.message_name, Some(s.process_id.as_str()))
-                });
+            let envelope = server.mcp_envelopes.envelope(
+                server,
+                s.process_definition_key,
+                &s.process_id,
+                &s.start_element_id,
+            );
             Some(ProcessTool {
-                name: format!("{tool_name}{TOOL_NAME_DELIMITER}{}", s.subscription_key),
+                name,
                 tool_name,
                 message_name: s.message_name,
                 process_definition_key: s.process_definition_key,
@@ -493,7 +603,7 @@ fn descriptor(tool: &ProcessTool) -> Value {
     )
 )]
 pub(crate) fn console_catalog(server: &ServerImpl, enabled: bool) -> Value {
-    let tools: Vec<Value> = open_tools(server)
+    let tools: Vec<Value> = open_tools(server, None)
         .iter()
         .map(|t| {
             let mut v = descriptor(t);
@@ -514,7 +624,7 @@ pub(crate) fn console_catalog(server: &ServerImpl, enabled: bool) -> Value {
                 "toolProperties"
             });
             v["dataEnvelope"] = json!(match &t.envelope {
-                Ok(envelope) => envelope.as_ref().map(|(id, _)| id),
+                Ok(envelope) => envelope.as_ref().map(|e| &e.shape),
                 Err((id, _)) => Some(id),
             });
             v["warnings"] = json!(t.warnings());
@@ -532,7 +642,7 @@ pub(crate) fn console_catalog(server: &ServerImpl, enabled: bool) -> Value {
 
 /// `tools/list` provider: the current dynamic tools.
 fn list_tools(server: &ServerImpl) -> Vec<Value> {
-    open_tools(server).iter().map(descriptor).collect()
+    open_tools(server, None).iter().map(descriptor).collect()
 }
 
 /// `tools/call` for a dynamic tool name.
@@ -544,7 +654,7 @@ async fn call_tool(server: &ServerImpl, name: String, args: Value) -> Value {
     if !well_formed {
         return tool_error_result(&format!("Tool not found: {name}"), 404);
     }
-    let Some(tool) = open_tools(server).into_iter().find(|t| t.name == name) else {
+    let Some(tool) = open_tools(server, Some(&name)).into_iter().next() else {
         return tool_error_result(
             &format!("Tool {name} has been removed. Please refresh the tool list."),
             404,
@@ -967,6 +1077,89 @@ mod tests {
         assert_eq!(entry["inputSchemaSource"], json!("toolProperties"));
         assert_eq!(entry["dataEnvelope"], Value::Null);
         assert_eq!(entry["warnings"], json!([]));
+    }
+
+    /// Issue #1748: the envelope is resolved through the start event's
+    /// `messageRef` (message id), never by subscription message name — a
+    /// decoy message sharing the name (declared first) must not be selected.
+    #[tokio::test]
+    async fn envelope_resolves_by_message_ref_not_name() {
+        let server = ServerImpl::default();
+        let decoy = r#"<bpmn:message id="Decoy" name="place-order">
+    <bpmn:extensionElements><zeebe:properties>
+      <zeebe:property name="io.nanobpm.dataEnvelope.in" value="Customer" />
+    </zeebe:properties></bpmn:extensionElements>
+  </bpmn:message>
+  <bpmn:message id="Message_place_order""#;
+        let xml = ENVELOPE_FIXTURE.replace(r#"<bpmn:message id="Message_place_order""#, decoy);
+        assert_ne!(xml, ENVELOPE_FIXTURE);
+        deploy_xml(&server, &xml).await;
+        wait_tools(&server, |t| t.len() == 1).await;
+        let entry = &console_catalog(&server, true)["tools"][0];
+        assert_eq!(entry["dataEnvelope"], json!("PlaceOrder"), "{entry}");
+    }
+
+    /// Issue #1748: an envelope ref the model does not declare is NOT the
+    /// silent legacy fallback — calls are rejected and the catalog says why.
+    #[tokio::test]
+    async fn unresolved_envelope_rejects_calls_instead_of_falling_back() {
+        let server = ServerImpl::default();
+        let xml = ENVELOPE_FIXTURE.replace(
+            ENVELOPE_PROPERTY,
+            r#"<zeebe:property name="io.nanobpm.dataEnvelope.in" value="Nope" />"#,
+        );
+        deploy_xml(&server, &xml).await;
+        let tools = wait_tools(&server, |t| t.len() == 1).await;
+        let name = tools[0]["name"].as_str().unwrap().to_string();
+        let entry = &console_catalog(&server, true)["tools"][0];
+        assert_eq!(entry["inputSchemaSource"], json!("dataEnvelope"));
+        assert_eq!(entry["dataEnvelope"], json!("Nope"));
+        assert!(
+            entry["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("neither as a shape"),
+            "{entry}"
+        );
+        let r = rpc(
+            &server,
+            "tools/call",
+            json!({ "name": name, "arguments": { "legacy": "x" } }),
+        )
+        .await;
+        assert_eq!(r["isError"], json!(true), "{r}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(server.store.process_instances().is_empty());
+    }
+
+    /// Issue #1748: a carried type the model cannot resolve is surfaced as an
+    /// unresolved-contract warning, never treated as a complete schema; and
+    /// envelopes are cached per deployed definition.
+    #[tokio::test]
+    async fn unresolved_carry_is_surfaced_and_envelopes_are_cached() {
+        let server = ServerImpl::default();
+        let xml = ENVELOPE_FIXTURE.replace(
+            r#"<nano:shape id="PlaceOrder" name="Place order">"#,
+            r#"<nano:shape id="PlaceOrder" name="Place order"><nano:carry ref="DomainOrder" />"#,
+        );
+        assert_ne!(xml, ENVELOPE_FIXTURE);
+        deploy_xml(&server, &xml).await;
+        wait_tools(&server, |t| t.len() == 1).await;
+        assert_eq!(server.mcp_envelopes.len(), 1);
+        let entry = &console_catalog(&server, true)["tools"][0];
+        let warnings: Vec<&str> = entry["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("incomplete") && w.contains("`carry` of `DomainOrder`")),
+            "{warnings:?}"
+        );
+        assert_eq!(server.mcp_envelopes.len(), 1);
     }
 
     #[test]
