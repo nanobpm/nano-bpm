@@ -70,6 +70,20 @@ const RECEIVER_SYNC_METHODS: &[&str] = &[
 /// result must be unwrapped (`.expect`/`.unwrap`/`?`) to prove a rotation ran.
 const CHECKED_SYNC_METHODS: &[&str] = &["snapshot_and_rotate", "streaming_snapshot_and_rotate"];
 
+/// Awaited wait methods on a `Commit` handle. `wait` and `wait_durable` are
+/// `async`, so without `.await` the future is discarded and waits on nothing.
+const COMMIT_WAITS: &[&str] = &[".blocking_wait()", ".wait().await", ".wait_durable().await"];
+
+/// `Journal` constructors that spawn an owned, joinable writer thread (so
+/// `drop(journal)` drains pending appends). `from_events_shared` and
+/// `from_engine_shared` borrow a shared writer with no joinable thread, so
+/// dropping them orders nothing.
+const JOINABLE_JOURNAL_CONSTRUCTORS: &[&str] = &[
+    "Journal::open(",
+    "Journal::open_partition(",
+    "Journal::open_segmented(",
+];
+
 fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
@@ -109,6 +123,9 @@ fn stmt_around(region: &str, at: usize) -> &str {
 /// `region`: it is not inside a block opened within `region` (an `if`/`match`/
 /// loop body, a match arm, a closure body), not in a deferred closure
 /// (`|| journal.rotate()`), and not short-circuited (`c && journal.flush()`).
+/// Also checks that no `break` or `continue` before `at` can exit an enclosing
+/// loop (leaving the sync unexecuted while still reaching an observation after
+/// the loop).
 /// Conditionals that *complete* before it, or a `?` before it, do not weaken
 /// it: a path that skips it also skips the observation.
 fn unconditional_at(region: &str, at: usize) -> bool {
@@ -122,7 +139,69 @@ fn unconditional_at(region: &str, at: usize) -> bool {
         }
     }
     let stmt = stmt_around(region, at);
-    depth == 0 && !(stmt.contains('|') || stmt.contains("=>") || stmt.contains("&&"))
+    depth == 0
+        && !(stmt.contains('|') || stmt.contains("=>") || stmt.contains("&&"))
+        && !has_enclosing_loop_exit(&region[..at])
+}
+
+/// Whether `prefix` (the region between the apply and a candidate sync)
+/// contains a `break` or `continue` that targets an enclosing loop — i.e. not
+/// nested inside a `for`/`while`/`loop` opened *within* `prefix`. Such a jump
+/// can skip the sync while still reaching an observation after the loop (on
+/// `break`, or on `continue` during the final iteration).
+fn has_enclosing_loop_exit(prefix: &str) -> bool {
+    let b = prefix.as_bytes();
+    // Stack of blocks opened within `prefix`: `true` if the block is a loop
+    // body (`for`/`while`/`loop`), `false` for non-loop blocks (`if`/`match`/
+    // bare block).
+    let mut blocks: Vec<bool> = Vec::new();
+    let mut pending_loop = false;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' => {
+                blocks.push(pending_loop);
+                pending_loop = false;
+                i += 1;
+            }
+            b'}' => {
+                blocks.pop();
+                pending_loop = false;
+                i += 1;
+            }
+            b';' => {
+                pending_loop = false;
+                i += 1;
+            }
+            c if is_ident(c) => {
+                let start = i;
+                while i < b.len() && is_ident(b[i]) {
+                    i += 1;
+                }
+                let word = &prefix[start..i];
+                // A field/method name (`x.break`) is not a keyword.
+                let dotted = start > 0 && b[start - 1] == b'.';
+                if dotted {
+                    continue;
+                }
+                match word {
+                    "for" | "while" | "loop" => pending_loop = true,
+                    "break" | "continue" => {
+                        let inside_inner_loop = blocks.iter().any(|&is_loop| is_loop);
+                        // A labelled `break 'outer` / `continue 'outer` can
+                        // still jump past an inner loop to an enclosing one.
+                        let labelled = prefix[i..].trim_start().starts_with('\'');
+                        if !inside_inner_loop || labelled {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// Whether `region` contains an unconditional sync point for the journal
@@ -139,7 +218,7 @@ fn unconditional_at(region: &str, at: usize) -> bool {
 /// in `violations`), a writer-queued message, or a close/reopen proves the
 /// write landed. `body` is the whole function text: the by-value binding may
 /// precede the apply, which `region` starts after.
-fn sync_point_at(region: &str, recv: &str, body: &str) -> Option<usize> {
+fn sync_point_at(region: &str, recv: &str, before_apply: &str) -> Option<usize> {
     if recv.is_empty() {
         return None;
     }
@@ -165,7 +244,10 @@ fn sync_point_at(region: &str, recv: &str, body: &str) -> Option<usize> {
                         .take_while(|c| *c != ')')
                         .filter(|c| !c.is_whitespace())
                         .collect();
-                    !dotted && arg == recv && bound_by_value(body, recv)
+                    !dotted
+                        && arg == recv
+                        && owns_joinable_journal(before_apply, recv)
+                        && !rebound_after(&region[..at], recv, "")
                 }
                 "barrier" => {
                     dotted
@@ -200,9 +282,8 @@ fn sync_point_at(region: &str, recv: &str, body: &str) -> Option<usize> {
 /// `region`. `wait`/`wait_durable` are `async`: without `.await` the future is
 /// discarded and nothing is waited on.
 fn barrier_awaited(region: &str, at: usize) -> bool {
-    const WAITS: &[&str] = &[".blocking_wait()", ".wait().await", ".wait_durable().await"];
     let chain = call_result_chain(region, at + "barrier".len());
-    if WAITS.iter().any(|w| chain.starts_with(w)) {
+    if COMMIT_WAITS.iter().any(|w| chain.starts_with(w)) {
         return true;
     }
     let stmt_start = region[..at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
@@ -220,11 +301,28 @@ fn barrier_awaited(region: &str, at: usize) -> bool {
     };
     let after = call_args_end(region, at + "barrier".len());
     let rest = &region[after..];
-    WAITS.iter().any(|w| {
-        rest.match_indices(&format!("{name}{w}")).any(|(k, _)| {
-            (k == 0 || !is_ident(rest.as_bytes()[k - 1]))
-                && !rebound_after(&rest[..k], name, "")
-                && unconditional_at(region, after + k)
+    has_unconditional_commit_wait(region, after, rest, name, name, "")
+}
+
+/// Whether `rest` (starting at byte offset `base` in `region`) contains an
+/// unconditional awaited wait (`COMMIT_WAITS`) whose *complete* receiver
+/// expression is `wait_recv` (e.g. `commit`, `b`, or `pair.1`), before any
+/// rebinding/shadowing of `handle` or `journal_recv`. Comparing the full
+/// receiver via `receiver_before` rejects foreign-field waits such as
+/// `other.commit.blocking_wait()` or `other.b.wait().await`.
+fn has_unconditional_commit_wait(
+    region: &str,
+    base: usize,
+    rest: &str,
+    wait_recv: &str,
+    handle: &str,
+    journal_recv: &str,
+) -> bool {
+    COMMIT_WAITS.iter().any(|w| {
+        rest.match_indices(w).any(|(dot_at, _)| {
+            receiver_before(rest, dot_at).as_deref() == Some(wait_recv)
+                && !rebound_after(&rest[..dot_at], handle, journal_recv)
+                && unconditional_at(region, base + dot_at)
         })
     })
 }
@@ -243,30 +341,61 @@ fn shadows(after: &str, name: &str) -> bool {
         })
 }
 
-/// Whether `recv` is bound *by value* anywhere in `region`'s function
-/// (`let recv = …` / `let mut recv = …`), so `drop(recv)` moves and closes the
-/// owned journal. A receiver that is only ever a `&mut Journal` reference
-/// (`let journal = &mut *real;`, a `&mut Journal` parameter) makes
-/// `drop(recv)` a no-op: the reference dies, the write stays pending.
-fn bound_by_value(region: &str, recv: &str) -> bool {
-    ["let mut ", "let "].iter().any(|kw| {
-        let binding = format!("{kw}{recv} =");
-        let at = region
-            .find(&binding)
-            .or_else(|| region.find(&binding.replace(" =", "=")));
-        at.is_some_and(|at| {
-            let stmt_end = region[at..].find(';').map_or(region.len(), |n| at + n);
-            let stmt: String = region[at..stmt_end]
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect();
-            // An initializer that *is* a reference (`= &…` / `= &mut …`) binds
-            // a reference: dropping it is a no-op, not a close. A `&` deeper
-            // in the expression (a `&dir` argument) is just an argument.
-            let init = stmt.split('=').nth(1).unwrap_or("");
-            !init.starts_with('&')
-        })
-    })
+/// Whether `recv` is positively bound in `before_apply` to an owned `Journal`
+/// with a joinable writer thread (`Journal::open*`) and not subsequently
+/// reassigned to a non-joinable value, so `drop(recv)` closes and
+/// drains that writer. Rejects references (`let journal = &mut *real;`,
+/// `let journal = journals.as_mut().unwrap();`, `&mut Journal` params) as well
+/// as owned journals created with a shared writer (`from_events_shared`,
+/// `from_engine_shared`) that have no writer thread to join.
+fn owns_joinable_journal(before_apply: &str, recv: &str) -> bool {
+    if recv.is_empty() || !recv.bytes().all(is_ident) {
+        return false;
+    }
+    let mut matched = None;
+    for stmt in before_apply.split([';', '{', '}']) {
+        let compact: String = stmt.chars().filter(|c| !c.is_whitespace()).collect();
+        let init_if_bound = if let Some(after_let) = compact.strip_prefix("let") {
+            after_let.split_once('=').and_then(|(pat, init)| {
+                let pat = pat.split(':').next().unwrap_or("");
+                let binds =
+                    if let Some(inner) = pat.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+                        // In `let (mut journal, recovery) = Journal::open_segmented(..)`,
+                        // only slot 0 is the `Journal`; slot 1 is `SegRecovery`.
+                        inner
+                            .split(',')
+                            .next()
+                            .is_some_and(|slot| slot.trim_start_matches("mut") == recv)
+                    } else {
+                        pat.trim_start_matches("mut") == recv
+                    };
+                binds.then_some(init)
+            })
+        } else {
+            compact
+                .strip_prefix(recv)
+                .and_then(|rest| rest.strip_prefix('='))
+                .filter(|rest| !rest.starts_with('='))
+        };
+        if let Some(init) = init_if_bound {
+            // Require the initializer's *own* expression to be a joinable
+            // constructor (`Journal::open*` or `path::to::Journal::open*`),
+            // not a reference or wrapper expression containing one.
+            let is_joinable = !init.starts_with('&')
+                && !init.contains(".as_mut(")
+                && !init.contains(".as_ref(")
+                && JOINABLE_JOURNAL_CONSTRUCTORS.iter().any(|ctor| {
+                    init.find(ctor).is_some_and(|pos| {
+                        let prefix = &init[..pos];
+                        prefix.is_empty()
+                            || (prefix.ends_with("::")
+                                && prefix.bytes().all(|c| is_ident(c) || c == b':'))
+                    })
+                });
+            matched = Some(is_joinable);
+        }
+    }
+    matched.unwrap_or(false)
 }
 
 /// Whether `handle` is rebound or `recv` shadowed in `after` (the text from
@@ -559,10 +688,10 @@ fn discards_commit(body: &str, apply_at: usize) -> bool {
     slot.is_some()
 }
 
-/// The wait expression that awaits the apply's own commit through its binding:
-/// `<slot>.1.blocking_wait()` when the binding holds the whole
-/// `(events, Commit)` tuple, else `<slot>.blocking_wait()`.
-fn own_wait(body: &str, apply_at: usize, slot: &str) -> String {
+/// The receiver expression naming the apply's own commit through its binding:
+/// `<slot>.1` when the binding holds the whole `(events, Commit)` tuple, else
+/// `<slot>`.
+fn own_commit_receiver(body: &str, apply_at: usize, slot: &str) -> String {
     let stmt_start = body[..apply_at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
     let pat: String = body[stmt_start..apply_at]
         .chars()
@@ -571,9 +700,9 @@ fn own_wait(body: &str, apply_at: usize, slot: &str) -> String {
     let tuple_pattern = pat.contains('(') && pat.find('(') < pat.find('=');
     let suffix = apply_result_suffix(body, apply_at);
     if !tuple_pattern && strip_unwrap_chain(&suffix).is_empty() {
-        format!("{slot}.1.blocking_wait()")
+        format!("{slot}.1")
     } else {
-        format!("{slot}.blocking_wait()")
+        slot.to_string()
     }
 }
 
@@ -677,15 +806,12 @@ fn violations(src: &str) -> Vec<(String, String)> {
                 // point and the observation. Conditionals *before* the sync
                 // point do not weaken it — every path still reaches it.
                 let region = &tail[..obs_at];
-                let synced = sync_point_at(region, &recv, &body).is_some()
+                let synced = sync_point_at(region, &recv, &body[..apply_at]).is_some()
                     || commit_slot(&body, apply_at).is_some_and(|slot| {
+                        let wait_recv = own_commit_receiver(&body, apply_at, &slot);
                         !slot.is_empty()
-                            && region.match_indices(&own_wait(&body, apply_at, &slot)).any(
-                                |(at, _)| {
-                                    (at == 0 || !is_ident(region.as_bytes()[at - 1]))
-                                        && !rebound_after(&region[..at], &slot, &recv)
-                                        && unconditional_at(region, at)
-                                },
+                            && has_unconditional_commit_wait(
+                                region, 0, region, &wait_recv, &slot, &recv,
                             )
                     });
                 if !synced {
@@ -1320,5 +1446,235 @@ fn guard_requires_a_proven_ordered_wait_or_sync() {
         "async fn t() { let _ = journal.apply_command(c).unwrap(); let b = journal.barrier(); b.wait_durable().await; shared.uncompacted_usage(); }",
     ] {
         assert!(violations(src).is_empty(), "{src}");
+    }
+}
+
+/// Round-7 review (#1822): loop exits bypassing sync, unjoinable/reference
+/// `drop(journal)`, async `wait()`/`wait_durable()` on commit handles, and
+/// foreign-field waits (`other.commit` / `other.b`).
+#[test]
+fn guard_handles_loop_exits_joinable_drops_async_waits_and_foreign_fields() {
+    // 1. Loop exits (`break` / `continue`) before a sync inside a loop bypass
+    // the sync on paths that still reach an observation outside the loop.
+    let loop_break = r#"
+        fn t() {
+            for _ in 0..1 {
+                let _ = journal.apply_command(c).unwrap();
+                if stop { break; }
+                journal.barrier().blocking_wait();
+            }
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(loop_break).len(), 1, "break bypasses sync");
+
+    let loop_continue = r#"
+        fn t() {
+            for _ in 0..1 {
+                let _ = journal.apply_command(c).unwrap();
+                if skip { continue; }
+                journal.barrier().blocking_wait();
+            }
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(loop_continue).len(), 1, "continue bypasses sync");
+
+    // A loop that has a sync BEFORE any break/continue still executes the sync
+    // on every path out of the loop after the apply.
+    let loop_sync_before_break = r#"
+        fn t() {
+            for _ in 0..1 {
+                let _ = journal.apply_command(c).unwrap();
+                journal.barrier().blocking_wait();
+                if stop { break; }
+            }
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert!(
+        violations(loop_sync_before_break).is_empty(),
+        "sync before break"
+    );
+
+    // A break/continue inside an *inner* loop does not exit the enclosing loop
+    // containing the apply and sync, so it does not bypass the outer sync.
+    let inner_loop_break = r#"
+        fn t() {
+            for _ in 0..1 {
+                let _ = journal.apply_command(c).unwrap();
+                for _ in 0..2 {
+                    if stop { break; }
+                }
+                journal.barrier().blocking_wait();
+            }
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert!(
+        violations(inner_loop_break).is_empty(),
+        "inner loop break does not bypass outer sync"
+    );
+
+    // 2. `drop(journal)` only counts when `journal` is positively proven to be
+    // an owned journal with a joinable writer (`Journal::open*`). Dropping a
+    // reference returned by `.as_mut()` or an owned journal created by
+    // `from_events_shared`/`from_engine_shared` (no writer thread to join) does
+    // not drain the writer.
+    let drop_as_mut_ref = r#"
+        fn t() {
+            let journal = journals.as_mut().unwrap();
+            let _ = journal.apply_command(c).unwrap();
+            drop(journal);
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(drop_as_mut_ref).len(), 1, "drop of as_mut ref");
+
+    let drop_from_events_shared = r#"
+        fn t() {
+            let mut journal = Journal::from_events_shared(0, vec![], writer.clone());
+            let _ = journal.apply_command(c).unwrap();
+            drop(journal);
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(
+        violations(drop_from_events_shared).len(),
+        1,
+        "drop of from_events_shared"
+    );
+
+    let drop_from_engine_shared = r#"
+        fn t() {
+            let mut journal = Journal::from_engine_shared(0, engine, writer.clone());
+            let _ = journal.apply_command(c).unwrap();
+            drop(journal);
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(
+        violations(drop_from_engine_shared).len(),
+        1,
+        "drop of from_engine_shared"
+    );
+
+    // Owned joinable journals (`Journal::open`, `Journal::open_partition`,
+    // `Journal::open_segmented` tuple destructuring) still pass on `drop`.
+    let drop_open_segmented_tuple = r#"
+        fn t() {
+            let (mut journal, recovery) = Journal::open_segmented(&dir).expect("open");
+            let _ = journal.apply_command(c).unwrap();
+            drop(journal);
+            recovery.shared.uncompacted_usage();
+        }
+    "#;
+    assert!(
+        violations(drop_open_segmented_tuple).is_empty(),
+        "drop of open_segmented tuple binding"
+    );
+
+    // A later `let journal = Journal::open(...)` after the apply (or a
+    // reassignment to a non-joinable journal before the apply) must not make
+    // `drop(journal)` count as draining the earlier journal.
+    let drop_reassigned_non_joinable = r#"
+        fn t() {
+            let mut journal = Journal::open(&path).unwrap();
+            journal = Journal::from_events_shared(0, vec![], writer.clone());
+            let _ = journal.apply_command(c).unwrap();
+            drop(journal);
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(
+        violations(drop_reassigned_non_joinable).len(),
+        1,
+        "reassigned to non-joinable before apply"
+    );
+
+    let drop_rebound_before_drop = r#"
+        fn t() {
+            let mut journal = Journal::open(&path).unwrap();
+            let _ = journal.apply_command(c).unwrap();
+            journal = Journal::open(&other_path).unwrap();
+            drop(journal);
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(
+        violations(drop_rebound_before_drop).len(),
+        1,
+        "reassigned between apply and drop"
+    );
+
+    let drop_wrapped_as_mut = r#"
+        fn t() {
+            let journal = Some(Journal::open(&path).unwrap()).as_mut().unwrap();
+            let _ = journal.apply_command(c).unwrap();
+            drop(journal);
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(
+        violations(drop_wrapped_as_mut).len(),
+        1,
+        "drop of wrapped as_mut ref"
+    );
+
+    // A labelled break out of an inner loop still exits the outer loop and
+    // bypasses the outer sync.
+    let labelled_break = r#"
+        fn t() {
+            'outer: for _ in 0..1 {
+                let _ = journal.apply_command(c).unwrap();
+                for _ in 0..2 {
+                    if stop { break 'outer; }
+                }
+                journal.barrier().blocking_wait();
+            }
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(
+        violations(labelled_break).len(),
+        1,
+        "labelled break exits outer loop"
+    );
+
+    // 3. Async `.wait().await` and `.wait_durable().await` on the apply's own
+    // commit handle (slot binding and whole-tuple binding) are valid syncs;
+    // un-awaited `.wait()` / `.wait_durable()` futures are still rejected.
+    for src in [
+        "async fn t() { let (_, commit) = journal.apply_command(c).unwrap(); commit.wait().await; shared.uncompacted_usage(); }",
+        "async fn t() { let (_, commit) = journal.apply_command(c).unwrap(); commit.wait_durable().await; shared.uncompacted_usage(); }",
+        "async fn t() { let pair = journal.apply_command(c).unwrap(); pair.1.wait().await; shared.uncompacted_usage(); }",
+        "async fn t() { let pair = journal.apply_command(c).unwrap(); pair.1.wait_durable().await; shared.uncompacted_usage(); }",
+    ] {
+        assert!(violations(src).is_empty(), "async own-handle wait: {src}");
+    }
+    for src in [
+        "async fn t() { let (_, commit) = journal.apply_command(c).unwrap(); let _ = commit.wait(); shared.uncompacted_usage(); }",
+        "async fn t() { let (_, commit) = journal.apply_command(c).unwrap(); let _ = commit.wait_durable(); shared.uncompacted_usage(); }",
+        "async fn t() { let pair = journal.apply_command(c).unwrap(); let _ = pair.1.wait(); shared.uncompacted_usage(); }",
+        "async fn t() { let pair = journal.apply_command(c).unwrap(); let _ = pair.1.wait_durable(); shared.uncompacted_usage(); }",
+    ] {
+        assert_eq!(
+            violations(src).len(),
+            1,
+            "unawaited own-handle future: {src}"
+        );
+    }
+
+    // 4. Foreign-field waits (`other.commit.blocking_wait()`,
+    // `other.b.blocking_wait()`, `other.pair.1.wait().await`) must NOT satisfy
+    // a local binding's wait.
+    for src in [
+        "fn t() { let (_, commit) = journal.apply_command(c).unwrap(); other.commit.blocking_wait(); shared.uncompacted_usage(); }",
+        "async fn t() { let (_, commit) = journal.apply_command(c).unwrap(); other.commit.wait().await; shared.uncompacted_usage(); }",
+        "fn t() { let pair = journal.apply_command(c).unwrap(); other.pair.1.blocking_wait(); shared.uncompacted_usage(); }",
+        "fn t() { let _ = journal.apply_command(c).unwrap(); let b = journal.barrier(); other.b.blocking_wait(); shared.uncompacted_usage(); }",
+        "async fn t() { let _ = journal.apply_command(c).unwrap(); let b = journal.barrier(); other.b.wait_durable().await; shared.uncompacted_usage(); }",
+    ] {
+        assert_eq!(violations(src).len(), 1, "foreign-field wait: {src}");
     }
 }
