@@ -1044,3 +1044,39 @@ fn cascade_deadlines_walk_through_a_cold_intermediate() {
     });
     assert_eq!(resident_only.get(&leaf_job), None);
 }
+
+/// #1856 review: the cascade deadline pass must select only jobs in reached
+/// instances whichever side it iterates (the reached instances' job lists
+/// when few, the live activation set otherwise) — unrelated activated jobs
+/// in other instances never leak in, and both branches agree.
+#[test]
+fn cascade_deadlines_ignore_unrelated_activated_jobs_on_both_iteration_sides() {
+    let mut e = Engine::new();
+    e.apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
+    e.apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    for _ in 0..5 {
+        e.apply_command(Command::create_instance("order")).unwrap();
+    }
+    let activated = e.activate_jobs("payment", "W", 5, 1_000, 0);
+    assert_eq!(activated.len(), 5);
+    let target = activated[0].key;
+    let instance_key = e.state().jobs[&target].instance_key;
+    // Few reached jobs vs many activations: per-instance side.
+    let deadlines = e.resolve_cascade_terminal_deadlines(&Command::CancelInstance { instance_key });
+    assert_eq!(
+        deadlines.into_iter().collect::<Vec<_>>(),
+        vec![(target, 1_000)]
+    );
+    // Complete the others: now activations (1) are fewer than reached job
+    // history, exercising the activation-set side.
+    for job in &activated[1..] {
+        e.apply_command(Command::complete_job(job.key)).unwrap();
+    }
+    let deadlines = e.resolve_cascade_terminal_deadlines(&Command::CancelInstance { instance_key });
+    assert_eq!(
+        deadlines.into_iter().collect::<Vec<_>>(),
+        vec![(target, 1_000)]
+    );
+}

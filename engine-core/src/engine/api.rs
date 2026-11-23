@@ -340,11 +340,27 @@ impl Engine {
             }
             roots.extend(cold.children_of(instance_key));
         }
-        // Scan only live activations, not each instance's retained job
+        // Scan only live activations, never each instance's retained job
         // history (completed/canceled jobs stay in `jobs_by_instance` until
-        // eviction), so a long-running looping instance does not make every
-        // proposal quadratic (#1856 review).
-        for &job_key in &self.state.activated_jobs {
+        // eviction) nor the engine-wide activation set when the cascade is
+        // small: iterate whichever candidate side is smaller, so the cost is
+        // bounded by min(reached instances' job lists, live activations) and
+        // does not grow with unrelated activated jobs (#1856 review).
+        let reached_jobs: usize = seen
+            .iter()
+            .filter_map(|k| self.state.jobs_by_instance.get(k))
+            .map(|jobs| jobs.len())
+            .sum();
+        let candidates: Vec<Key> = if reached_jobs <= self.state.activated_jobs.len() {
+            seen.iter()
+                .filter_map(|k| self.state.jobs_by_instance.get(k))
+                .flat_map(|jobs| jobs.iter().copied())
+                .filter(|k| self.state.activated_jobs.contains(k))
+                .collect()
+        } else {
+            self.state.activated_jobs.iter().copied().collect()
+        };
+        for job_key in candidates {
             if let Some(job) = self.state.jobs.get(&job_key) {
                 if seen.contains(&job.instance_key)
                     && job.state == state::JobState::Activated
