@@ -806,6 +806,66 @@ fn cancel_parent_stamps_call_activity_child_soft_job_deadline() {
     );
 }
 
+/// #1570: a cascade propagates UP across a call activity — completing the
+/// child's job completes the child, the parent then reaches a Terminate End
+/// Event and cancels a soft-activated job on its OTHER branch. That job must
+/// carry its deadline on every replica.
+#[test]
+fn child_completion_cascading_to_parent_terminate_stamps_parent_soft_job_deadline() {
+    let child = ProcessBuilder::new("up_child")
+        .start_event("cs")
+        .service_task("ct", "up_child_work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    let parent = ProcessBuilder::new("up_parent")
+        .start_event("ps")
+        .parallel_gateway("fork")
+        .call_activity("call", "up_child")
+        .service_task("p_task", "up_parent_work")
+        .terminate_end_event("term")
+        .end_event("pe")
+        .connect("ps", "fork")
+        .connect("fork", "call")
+        .connect("fork", "p_task")
+        .connect("call", "term")
+        .connect("p_task", "pe")
+        .build()
+        .unwrap();
+    let mut replicas: Vec<Engine> = (0..2)
+        .map(|_| {
+            let mut e = Engine::new();
+            e.apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+            e.apply_command(Command::DeployProcess(child.clone()))
+                .unwrap();
+            e.apply_command(Command::DeployProcess(parent.clone()))
+                .unwrap();
+            e.apply_command(Command::create_instance("up_parent"))
+                .unwrap();
+            e
+        })
+        .collect();
+    let mut follower = replicas.pop().unwrap();
+    let mut leader = replicas.pop().unwrap();
+    let parent_job = leader.activate_jobs("up_parent_work", "wp", 1, 9_000, 100)[0].key;
+    let child_job = leader.activate_jobs("up_child_work", "wc", 1, 5_000, 100)[0].key;
+
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::complete_job(child_job),
+        200,
+    );
+    assert_eq!(terminal_deadline(&on_leader, parent_job), Some(Some(9_100)));
+    assert_eq!(
+        terminal_deadline(&on_follower, parent_job),
+        Some(Some(9_100))
+    );
+}
+
 /// #1570: envelope stamps on a REJECTED command must not leak into a subsequent
 /// unstamped command.
 #[test]

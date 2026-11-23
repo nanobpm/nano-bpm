@@ -122,6 +122,63 @@ impl Engine {
         });
     }
 
+    /// Whether `command` can terminate a soft-activated job on this partition
+    /// (directly or by cascade) — the single source of truth for which
+    /// commands need the leader-side proposal stamp (#1570). Exhaustive with
+    /// no catch-all, so a new `Command` variant must make a deliberate choice.
+    pub fn command_may_cascade_soft_jobs(command: &Command) -> bool {
+        match command {
+            Command::CancelInstance { .. }
+            | Command::ModifyInstance { .. }
+            | Command::MigrateInstance { .. }
+            | Command::CorrelateMessageSubscription { .. }
+            | Command::ActivateAdHocActivities { .. }
+            | Command::CompleteJob { .. }
+            | Command::FailJob { .. }
+            | Command::ThrowJobError { .. }
+            | Command::CompleteUserTask { .. }
+            | Command::AssignUserTask { .. }
+            | Command::UnassignUserTask { .. }
+            | Command::UpdateUserTask { .. }
+            | Command::ResolveIncident { .. }
+            | Command::SetVariables { .. }
+            | Command::CorrelateMessage { .. }
+            | Command::TriggerTimers { .. }
+            | Command::BroadcastSignal { .. } => true,
+            Command::DeployProcess(_)
+            | Command::DeployResources(_)
+            | Command::DeployDecisionRequirements(_)
+            | Command::DeployForms(_)
+            | Command::DeployGenericResources(_)
+            | Command::DeployBundle(_)
+            | Command::DeleteDecisionInstance { .. }
+            | Command::CreateClusterVariable { .. }
+            | Command::UpdateClusterVariable { .. }
+            | Command::DeleteClusterVariable { .. }
+            | Command::EvaluateDecision { .. }
+            | Command::CreateInstance { .. }
+            | Command::ActivateJobs { .. }
+            | Command::ActivateJobsByKey { .. }
+            | Command::ExpireJobs { .. }
+            | Command::ExpireJobsByDurability { .. }
+            | Command::UpdateJobRetries { .. }
+            | Command::UpdateJobTimeout { .. }
+            | Command::UpdateJob { .. }
+            | Command::EvaluateConditionalStartEvents { .. }
+            | Command::OpenMessageSubscription { .. }
+            | Command::CloseMessageSubscription { .. }
+            | Command::SuspendInstance { .. }
+            | Command::ResumeInstance { .. }
+            | Command::DispatchStartInstance { .. }
+            | Command::CreateAgentInstance { .. }
+            | Command::UpdateAgentInstance { .. }
+            | Command::CompleteAgentInstance { .. }
+            | Command::QuarantineOffheapOrphan { .. }
+            | Command::QuarantineColdOrphan { .. }
+            | Command::SetLenientCompletion { .. } => false,
+        }
+    }
+
     /// Resolves the live soft-activation deadlines of every soft-activated job
     /// on this partition that `command` could terminate by cascade (#1570).
     ///
@@ -138,7 +195,7 @@ impl Engine {
     /// map when no soft jobs are active keeps the wire format byte-identical on
     /// the common path.
     pub fn resolve_cascade_terminal_deadlines(&self, command: &Command) -> BTreeMap<Key, u64> {
-        if self.state.activated_jobs.is_empty() {
+        if self.state.activated_jobs.is_empty() || !Self::command_may_cascade_soft_jobs(command) {
             return BTreeMap::new();
         }
         let mut roots: Vec<Key> = Vec::new();
@@ -212,45 +269,37 @@ impl Engine {
                     }
                 }
             }
-            // Commands that never cancel soft jobs on this partition.
-            Command::DeployProcess(_)
-            | Command::DeployResources(_)
-            | Command::DeployDecisionRequirements(_)
-            | Command::DeployForms(_)
-            | Command::DeployGenericResources(_)
-            | Command::DeployBundle(_)
-            | Command::DeleteDecisionInstance { .. }
-            | Command::CreateClusterVariable { .. }
-            | Command::UpdateClusterVariable { .. }
-            | Command::DeleteClusterVariable { .. }
-            | Command::EvaluateDecision { .. }
-            | Command::CreateInstance { .. }
-            | Command::ActivateJobs { .. }
-            | Command::ActivateJobsByKey { .. }
-            | Command::ExpireJobs { .. }
-            | Command::ExpireJobsByDurability { .. }
-            | Command::UpdateJobRetries { .. }
-            | Command::UpdateJobTimeout { .. }
-            | Command::UpdateJob { .. }
-            | Command::EvaluateConditionalStartEvents { .. }
-            | Command::OpenMessageSubscription { .. }
-            | Command::CloseMessageSubscription { .. }
-            | Command::SuspendInstance { .. }
-            | Command::ResumeInstance { .. }
-            | Command::DispatchStartInstance { .. }
-            | Command::CreateAgentInstance { .. }
-            | Command::UpdateAgentInstance { .. }
-            | Command::CompleteAgentInstance { .. }
-            | Command::QuarantineOffheapOrphan { .. }
-            | Command::QuarantineColdOrphan { .. }
-            | Command::SetLenientCompletion { .. } => return BTreeMap::new(),
+            // Non-cascading commands: rejected by the predicate above.
+            _ => return BTreeMap::new(),
         }
         if roots.is_empty() {
             return BTreeMap::new();
         }
-        // Walk each root instance and all its resident call-activity
-        // descendants (via `children_by_parent`), collecting every live
-        // soft-activated job's deadline.
+        // A cascade propagates UP across call activities too (a child
+        // completing/erroring can drive its parent to a terminate end event or
+        // an interrupting boundary), so first ascend each root to its resident
+        // top-level ancestor, then walk all resident call-activity descendants
+        // (via `children_by_parent`), collecting every live soft-activated
+        // job's deadline.
+        let roots: Vec<Key> = roots
+            .into_iter()
+            .map(|mut key| {
+                let mut hops = BTreeSet::new();
+                while hops.insert(key) {
+                    match self
+                        .state
+                        .instances
+                        .get(&key)
+                        .and_then(|i| i.parent_process_instance_key)
+                    {
+                        Some(parent) if self.state.instances.contains_key(&parent) => key = parent,
+                        _ => break,
+                    }
+                }
+                key
+            })
+            .collect();
+        let mut roots = roots;
         let mut seen = BTreeSet::new();
         let mut deadlines = BTreeMap::new();
         while let Some(instance_key) = roots.pop() {

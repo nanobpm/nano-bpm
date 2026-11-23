@@ -3777,7 +3777,7 @@ async fn stamp_for_proposal(
     Command,
     std::collections::BTreeMap<nanobpmn_engine_core::Key, u64>,
 ) {
-    if !command_needs_proposal_stamp(&command) {
+    if !nanobpmn_engine_core::Engine::command_may_cascade_soft_jobs(&command) {
         return (command, std::collections::BTreeMap::new());
     }
     engine
@@ -3790,34 +3790,6 @@ async fn stamp_for_proposal(
             (command, deadlines)
         })
         .await
-}
-
-/// Whether `command` can terminate a soft-activated job (directly or by
-/// cascade) and therefore needs a leader-side engine read before proposal.
-/// Keeping the common no-cascade intake commands (`CreateInstance`,
-/// `Deploy*`, `ActivateJobs`, …) off the actor hop avoids an extra round-trip
-/// on the hot create path.
-fn command_needs_proposal_stamp(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::CompleteJob { .. }
-            | Command::FailJob { .. }
-            | Command::ThrowJobError { .. }
-            | Command::CancelInstance { .. }
-            | Command::ModifyInstance { .. }
-            | Command::MigrateInstance { .. }
-            | Command::ActivateAdHocActivities { .. }
-            | Command::CompleteUserTask { .. }
-            | Command::AssignUserTask { .. }
-            | Command::UnassignUserTask { .. }
-            | Command::UpdateUserTask { .. }
-            | Command::ResolveIncident { .. }
-            | Command::SetVariables { .. }
-            | Command::CorrelateMessage { .. }
-            | Command::CorrelateMessageSubscription { .. }
-            | Command::TriggerTimers { .. }
-            | Command::BroadcastSignal { .. }
-    )
 }
 
 /// The engine-actor → Raft-leader propose channel for off-heap orphans
