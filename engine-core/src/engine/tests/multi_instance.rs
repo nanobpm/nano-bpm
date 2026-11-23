@@ -2953,3 +2953,85 @@ fn cancel_mi_child_events_fallback_user_task_lookup_is_counted() {
         "indexed lookups must not rescan the user-task map"
     );
 }
+
+/// #1767 (adversarial review): call-activity MI children terminate a distinct
+/// callee PROCESS INSTANCE each. That discard must read the callees' resources
+/// from the shared `TeardownIndex` (one pass per map for all callees) and the
+/// callee lookup must use the `children_by_parent` index — never a scan of the
+/// global resource / instance maps per callee, which kept early completion of
+/// N call-activity children O(N × |resources|).
+#[test]
+fn early_multi_instance_teardown_of_call_activity_children_scans_independently_of_child_count() {
+    fn scans_for(n: i64) -> usize {
+        let callee = ProcessBuilder::new("mi-callee")
+            .start_event("s")
+            .service_task("work", "work")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .build()
+            .unwrap();
+        let parent = ProcessBuilder::new("mi-call-scale")
+            .start_event("start")
+            .call_activity("each", "mi-callee")
+            .with_multi_instance(
+                "each",
+                crate::model::MultiInstance {
+                    input_collection: "=items".to_string(),
+                    input_element: Some("item".to_string()),
+                    output_collection: None,
+                    output_element: None,
+                    completion_condition: Some("=true".to_string()),
+                    cancel_remaining_instances: true,
+                    sequential: false,
+                },
+            )
+            .end_event("done")
+            .connect("start", "each")
+            .connect("each", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(callee))
+            .unwrap();
+        engine
+            .apply_command(Command::DeployProcess(parent))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "mi-call-scale",
+                vars(&[("items", Value::List((0..n).map(Value::Int).collect()))]),
+            ))
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let jobs = engine.activate_jobs("work", "W", n as usize, 60_000, 0);
+        assert_eq!(jobs.len(), n as usize, "one callee job per MI child");
+        engine.resource_scan_count.set(0);
+        engine
+            .apply_command(Command::complete_job(jobs[0].key))
+            .unwrap();
+        assert!(
+            engine.instance(key).is_none()
+                || engine.instance(key).unwrap().state == ProcessInstanceState::Completed,
+            "the parent completed after the early MI body completion"
+        );
+        assert!(
+            engine
+                .state()
+                .jobs
+                .values()
+                .all(|j| j.state != state::JobState::Created
+                    && j.state != state::JobState::Activated),
+            "every sibling callee's job is cancelled"
+        );
+        engine.resource_scan_count.get()
+    }
+    let small = scans_for(4);
+    let large = scans_for(64);
+    assert_eq!(
+        small, large,
+        "call-activity MI teardown scans must not grow with child count: \
+         N=4 {small} vs N=64 {large}"
+    );
+}

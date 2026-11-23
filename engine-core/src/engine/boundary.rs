@@ -23,6 +23,84 @@ pub(crate) struct TeardownIndex<'a> {
     pub(crate) signal_subscriptions: BTreeMap<Key, Vec<&'a state::SignalSubscription>>,
     pub(crate) conditional_subscriptions: BTreeMap<Key, Vec<&'a state::ConditionalSubscription>>,
     pub(crate) incidents: BTreeMap<Key, Vec<&'a state::Incident>>,
+    /// Call-activity element instance (of this instance) → its live callee
+    /// process instance (lowest key wins), from the `children_by_parent` index.
+    pub(crate) callee_of: BTreeMap<Key, Key>,
+    /// Live resources of every callee in [`Self::callee_of`], keyed by callee
+    /// instance key — gathered in the same per-map pass, so tearing down N
+    /// call-activity children never rescans the global maps per callee (#1767).
+    pub(crate) callee_resources: BTreeMap<Key, InstanceResources<'a>>,
+}
+
+/// The live (cancellable) resources of one process instance — the single
+/// selection [`Engine::discard_instance_events`] turns into cancellations.
+#[derive(Default)]
+pub(crate) struct InstanceResources<'a> {
+    pub(crate) jobs: Vec<&'a state::Job>,
+    pub(crate) timers: Vec<&'a state::Timer>,
+    pub(crate) message_subscriptions: Vec<&'a state::MessageSubscription>,
+    pub(crate) signal_subscriptions: Vec<&'a state::SignalSubscription>,
+    pub(crate) conditional_subscriptions: Vec<&'a state::ConditionalSubscription>,
+    pub(crate) user_tasks: Vec<&'a state::UserTask>,
+}
+
+impl<'a> InstanceResources<'a> {
+    /// One pass over each resource map, bucketing the live resources of every
+    /// instance in `wanted` by instance key.
+    fn collect(st: &'a state::State, wanted: &BTreeSet<Key>) -> BTreeMap<Key, Self> {
+        let mut out: BTreeMap<Key, Self> = wanted.iter().map(|k| (*k, Self::default())).collect();
+        for j in st.jobs.values().filter(|j| job_in_play(j)) {
+            if let Some(r) = out.get_mut(&j.instance_key) {
+                r.jobs.push(j);
+            }
+        }
+        for t in st
+            .timers
+            .values()
+            .filter(|t| t.state == state::TimerState::Created)
+        {
+            if let Some(r) = out.get_mut(&t.instance_key) {
+                r.timers.push(t);
+            }
+        }
+        for s in st
+            .message_subscriptions
+            .values()
+            .filter(|s| message_sub_open(s))
+        {
+            if let Some(r) = out.get_mut(&s.instance_key) {
+                r.message_subscriptions.push(s);
+            }
+        }
+        for s in st
+            .signal_subscriptions
+            .values()
+            .filter(|s| s.state == state::MessageSubscriptionState::Open)
+        {
+            if let Some(r) = out.get_mut(&s.instance_key) {
+                r.signal_subscriptions.push(s);
+            }
+        }
+        for s in st
+            .conditional_subscriptions
+            .values()
+            .filter(|s| s.state == state::MessageSubscriptionState::Open)
+        {
+            if let Some(r) = out.get_mut(&s.instance_key) {
+                r.conditional_subscriptions.push(s);
+            }
+        }
+        for t in st
+            .user_tasks
+            .values()
+            .filter(|t| t.state == state::UserTaskState::Created)
+        {
+            if let Some(r) = out.get_mut(&t.instance_key) {
+                r.user_tasks.push(t);
+            }
+        }
+        out
+    }
 }
 
 impl TeardownIndex<'_> {
@@ -951,8 +1029,8 @@ impl Engine {
             // its descendant call-child's termination (Zeebe's parent-before-child
             // order, #1535); its `ElementTerminated` still lands after the child's
             // teardown below.
-            if let Some(child) = self.call_activity_child_of(eik) {
-                events.extend(self.discard_instance_events(child));
+            if let Some(child) = self.call_activity_child_with(eik, teardown_idx) {
+                events.extend(self.discard_instance_events_with(child, teardown_idx));
             }
             for &child in members {
                 if child != eik && self.scope_of(instance_key, child) == eik {
@@ -1300,6 +1378,28 @@ impl Engine {
         }
     }
 
+    /// The live resources of `instance_key`, gathered by one scan of each
+    /// resource map (counted by the #1767 probe).
+    pub(crate) fn instance_resources(&self, instance_key: Key) -> InstanceResources<'_> {
+        self.count_resource_scan();
+        InstanceResources::collect(&self.state, &BTreeSet::from([instance_key]))
+            .remove(&instance_key)
+            .unwrap_or_default()
+    }
+
+    /// [`Self::call_activity_child_of`] answered from a per-teardown index
+    /// when one is available (#1767).
+    pub(crate) fn call_activity_child_with(
+        &self,
+        call_eik: Key,
+        teardown_idx: Option<&TeardownIndex<'_>>,
+    ) -> Option<Key> {
+        match teardown_idx {
+            Some(idx) => idx.callee_of.get(&call_eik).copied(),
+            None => self.call_activity_child_of(call_eik),
+        }
+    }
+
     /// Builds the [`TeardownIndex`] for `instance_key`: one pass over each
     /// resource map, keeping only the instance's live resources (#1767).
     pub(crate) fn teardown_index(&self, instance_key: Key) -> TeardownIndex<'_> {
@@ -1309,6 +1409,8 @@ impl Engine {
         self.count_resource_scan();
         let st = &self.state;
         let mine = |ik: Key, eik: Key| (ik == instance_key).then_some(eik);
+        let callee_of = self.live_callees_of_instance(instance_key);
+        let callees: BTreeSet<Key> = callee_of.values().copied().collect();
         TeardownIndex {
             user_tasks: index_by(st.user_tasks.values(), |t| {
                 if t.state == state::UserTaskState::Created {
@@ -1359,6 +1461,12 @@ impl Engine {
                     None
                 }
             }),
+            callee_resources: if callees.is_empty() {
+                BTreeMap::new()
+            } else {
+                InstanceResources::collect(st, &callees)
+            },
+            callee_of,
         }
     }
 

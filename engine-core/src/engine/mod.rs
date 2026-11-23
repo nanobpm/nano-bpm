@@ -12094,8 +12094,8 @@ impl Engine {
         // Terminate the callee here; its `ProcessInstanceTerminated` also seeds
         // the command tail's `cascade_cancel_children` to reap any transitive
         // grandchildren (#1170).
-        if let Some(callee) = self.call_activity_child_of(child_eik) {
-            events.extend(self.discard_instance_events(callee));
+        if let Some(callee) = self.call_activity_child_with(child_eik, teardown_idx) {
+            events.extend(self.discard_instance_events_with(callee, teardown_idx));
         }
         if let Some(job_key) = self.active_job_with(child_eik, teardown_idx) {
             events.push(Event::JobCanceled {
@@ -12283,8 +12283,8 @@ impl Engine {
         // not outlive the ad-hoc token; emitting `ProcessInstanceTerminated` also
         // seeds `cascade_cancel_children` to reap any of the callee's own
         // grandchildren transitively.
-        if let Some(call_child) = self.call_activity_child_of(child) {
-            events.extend(self.discard_instance_events(call_child));
+        if let Some(call_child) = self.call_activity_child_with(child, teardown_idx) {
+            events.extend(self.discard_instance_events_with(call_child, teardown_idx));
         }
         // Each tool child hangs off a dedicated inner instance; tear it down too
         // so the read-model element-instance tree does not leak an orphan. Only
@@ -18313,7 +18313,17 @@ impl Engine {
     /// tokens and scopes). Returns the events (does not emit) so it composes
     /// inside an emit-driven command tail ([`discard_and_terminate_instance`]).
     fn discard_instance_events(&self, instance_key: Key) -> Vec<Event> {
-        let mut cancels = self.discard_instance_token_events(instance_key);
+        self.discard_instance_events_with(instance_key, None)
+    }
+
+    /// [`Self::discard_instance_events`] sourcing the callee's resources from a
+    /// shared per-teardown index when available (#1767).
+    pub(crate) fn discard_instance_events_with(
+        &self,
+        instance_key: Key,
+        teardown_idx: Option<&boundary::TeardownIndex<'_>>,
+    ) -> Vec<Event> {
+        let mut cancels = self.discard_instance_token_events_with(instance_key, teardown_idx);
         cancels.push(Event::ProcessInstanceTerminated { instance_key });
         cancels
     }
@@ -18328,22 +18338,28 @@ impl Engine {
     /// itself ends COMPLETED — see [`complete_terminate_end`]). Returns the events
     /// (does not emit) so it composes inside a decide-only `process_step` result.
     fn discard_instance_token_events(&self, instance_key: Key) -> Vec<Event> {
+        self.discard_instance_token_events_with(instance_key, None)
+    }
+
+    /// [`Self::discard_instance_token_events`] reading the instance's live
+    /// resources from a per-teardown [`boundary::TeardownIndex`] when it indexed
+    /// `instance_key` as a callee (#1767), else from one scan of each map.
+    fn discard_instance_token_events_with(
+        &self,
+        instance_key: Key,
+        teardown_idx: Option<&boundary::TeardownIndex<'_>>,
+    ) -> Vec<Event> {
+        let scanned;
+        let res = match teardown_idx.and_then(|i| i.callee_resources.get(&instance_key)) {
+            Some(r) => r,
+            None => {
+                scanned = self.instance_resources(instance_key);
+                &scanned
+            }
+        };
         let mut cancels: Vec<Event> = Vec::new();
 
-        let mut jobs: Vec<&state::Job> = self
-            .state
-            .jobs
-            .values()
-            .filter(|j| {
-                j.instance_key == instance_key
-                    && matches!(
-                        j.state,
-                        state::JobState::Created
-                            | state::JobState::Activated
-                            | state::JobState::Failed
-                    )
-            })
-            .collect();
+        let mut jobs = res.jobs.clone();
         jobs.sort_unstable_by_key(|j| j.key);
         cancels.extend(jobs.iter().map(|j| Event::JobCanceled {
             job_key: j.key,
@@ -18352,12 +18368,7 @@ impl Engine {
             deadline: None, // stamped centrally in `emit` (#1440)
         }));
 
-        let mut timers: Vec<&state::Timer> = self
-            .state
-            .timers
-            .values()
-            .filter(|t| t.instance_key == instance_key && t.state == state::TimerState::Created)
-            .collect();
+        let mut timers = res.timers.clone();
         timers.sort_unstable_by_key(|t| t.key);
         cancels.extend(timers.iter().map(|t| Event::TimerCanceled {
             timer_key: t.key,
@@ -18366,30 +18377,11 @@ impl Engine {
             element_id: t.element_id.clone(),
         }));
 
-        let mut subs: Vec<&state::MessageSubscription> = self
-            .state
-            .message_subscriptions
-            .values()
-            .filter(|s| {
-                s.instance_key == instance_key
-                    && matches!(
-                        s.state,
-                        state::MessageSubscriptionState::Open
-                            | state::MessageSubscriptionState::Opening
-                    )
-            })
-            .collect();
+        let mut subs = res.message_subscriptions.clone();
         subs.sort_unstable_by_key(|s| s.key);
         cancels.extend(subs.iter().map(|s| Self::disarm_subscription_event(s)));
 
-        let mut sig_subs: Vec<&state::SignalSubscription> = self
-            .state
-            .signal_subscriptions
-            .values()
-            .filter(|s| {
-                s.instance_key == instance_key && s.state == state::MessageSubscriptionState::Open
-            })
-            .collect();
+        let mut sig_subs = res.signal_subscriptions.clone();
         sig_subs.sort_unstable_by_key(|s| s.key);
         cancels.extend(sig_subs.iter().map(|s| Event::SignalSubscriptionCanceled {
             subscription_key: s.key,
@@ -18398,14 +18390,7 @@ impl Engine {
             element_id: s.element_id.clone(),
         }));
 
-        let mut cond_subs: Vec<&state::ConditionalSubscription> = self
-            .state
-            .conditional_subscriptions
-            .values()
-            .filter(|s| {
-                s.instance_key == instance_key && s.state == state::MessageSubscriptionState::Open
-            })
-            .collect();
+        let mut cond_subs = res.conditional_subscriptions.clone();
         cond_subs.sort_unstable_by_key(|s| s.key);
         cancels.extend(
             cond_subs
@@ -18418,12 +18403,7 @@ impl Engine {
                 }),
         );
 
-        let mut user_tasks: Vec<&state::UserTask> = self
-            .state
-            .user_tasks
-            .values()
-            .filter(|t| t.instance_key == instance_key && t.state == state::UserTaskState::Created)
-            .collect();
+        let mut user_tasks = res.user_tasks.clone();
         user_tasks.sort_unstable_by_key(|t| t.key);
         cancels.extend(user_tasks.iter().map(|t| Event::UserTaskCanceled {
             user_task_key: t.key,

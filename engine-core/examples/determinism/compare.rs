@@ -1376,6 +1376,7 @@ pub const ENGINE_TYPE_SOURCES: &[&str] = &[
     include_str!("../../src/engine/mod.rs"),
     include_str!("../../src/cluster_vars.rs"),
     include_str!("../../src/engine/call_activity.rs"),
+    include_str!("../../src/engine/boundary.rs"),
     include_str!("../../src/bpmn/build.rs"),
     include_str!("../../src/validate/mod.rs"),
     include_str!("../../src/agent.rs"),
