@@ -448,10 +448,10 @@ fn honoured_sort_field_values_have_an_explicit_dispatcher_arm() {
     );
 }
 
-/// `OVERRIDES` method name -> the `self.<impl>(` handler it delegates to,
-/// parsed from `scripts/gen-stub-server.py` (the single source of which
-/// operations are wired to which handler).
-fn override_handlers() -> BTreeMap<String, String> {
+/// `OVERRIDES` method name -> (the `self.<impl>(` handler it delegates to,
+/// the delegation's argument list), parsed from `scripts/gen-stub-server.py`
+/// (the single source of which operations are wired to which handler).
+fn override_handlers() -> BTreeMap<String, (String, Vec<String>)> {
     let src = std::fs::read_to_string(repo_root().join("scripts/gen-stub-server.py"))
         .expect("read gen-stub-server.py");
     let mut out = BTreeMap::new();
@@ -462,11 +462,34 @@ fn override_handlers() -> BTreeMap<String, String> {
             && parts[4].starts_with("):")
             && let Some(call) = parts[5].strip_prefix("self.")
         {
-            let name = call.split('(').next().unwrap_or_default();
-            out.insert(parts[3].to_string(), name.to_string());
+            let (name, rest) = call.split_once('(').unwrap_or((call, ""));
+            let args = rest
+                .rsplit_once(')')
+                .map_or("", |(a, _)| a)
+                .split(',')
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+            out.insert(parts[3].to_string(), (name.to_string(), args));
         }
     }
     out
+}
+
+/// Whether an `OVERRIDES` delegation hands the request body to its handler:
+/// one argument must be exactly `body` (no `None`/`&None` substitute, which
+/// would produce the same handler mapping while dropping every REST field).
+fn delegation_forwards_body(args: &[String]) -> bool {
+    args.iter().any(|a| a == "body")
+}
+
+#[test]
+fn delegation_forwards_body_rejects_dropped_bodies() {
+    let args = |s: &[&str]| s.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    assert!(delegation_forwards_body(&args(&["path_params", "body"])));
+    assert!(!delegation_forwards_body(&args(&["path_params", "&None"])));
+    assert!(!delegation_forwards_body(&args(&["path_params", "None"])));
+    assert!(!delegation_forwards_body(&args(&["path_params"])));
 }
 
 /// The source of `fn <name>(` (through its closing `}` at the definition's
@@ -502,9 +525,13 @@ fn fn_source(name: &str) -> Option<String> {
 /// Whether a handler body (Rust source) really reads the request's
 /// `operationReference` and hands it on: comments are stripped, then a
 /// `.operation_reference` field read must be followed by a later bare use of
-/// the bound value (an argument or struct field passed onward). A mention only
-/// in a comment, or a binding that is never used (forwarding `None` instead),
-/// does not count.
+/// the bound value *as a forwarding position*: a non-macro call argument
+/// (`f(x, operation_reference)`) or a struct-literal field
+/// (`Cmd { operation_reference }` / `operation_reference: operation_reference`).
+/// A mention only in a comment, a binding that is never used, or a use that
+/// merely logs (`tracing::info!(.., operation_reference)`), discards
+/// (`drop(operation_reference)`, `let _ = operation_reference`) or otherwise
+/// consumes it without passing it on does not count.
 fn forwards_operation_reference(src: &str) -> bool {
     let code: String = src
         .lines()
@@ -519,19 +546,69 @@ fn forwards_operation_reference(src: &str) -> bool {
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     code[after..].match_indices(FIELD).any(|(i, _)| {
         let at = after + i;
-        let prev = code[..at].chars().next_back();
-        let next = code[at + FIELD.len()..].chars().next();
-        prev.is_some_and(|c| !is_ident(c) && c != '.')
-            && !next.is_some_and(is_ident)
-            && !code[..at].trim_end().ends_with("let")
-            && !code[..at].trim_end().ends_with("let mut")
+        let before = code[..at].trim_end();
+        let tail = code[at + FIELD.len()..].trim_start();
+        let prev = before.chars().next_back();
+        let next = tail.chars().next();
+        let bare = code[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !is_ident(c) && c != '.')
+            && !code[at + FIELD.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_ident);
+        // Positioned as a list element / field value, ending the element.
+        let positioned = matches!(prev, Some('(' | ',' | '{' | ':'))
+            && !before.ends_with("::")
+            && matches!(next, Some(')' | ',' | '}'));
+        bare && positioned && enclosing_is_forwarding(&code[..at])
     })
+}
+
+/// Whether the innermost open `(`/`{` before the end of `head` is a
+/// forwarding context: a non-macro call (not `drop(`, not `name!(`), or a
+/// struct literal (`Name {`) rather than a block or a macro body.
+fn enclosing_is_forwarding(head: &str) -> bool {
+    let mut depth = 0i32;
+    for (i, c) in head.char_indices().rev() {
+        match c {
+            ')' | '}' | ']' => depth += 1,
+            '(' | '{' | '[' if depth > 0 => depth -= 1,
+            '(' | '{' => {
+                let pre = head[..i].trim_end();
+                if pre.ends_with('!') {
+                    return false;
+                }
+                let ident: String = pre
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_alphanumeric() || c == &'_')
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if c == '(' {
+                    return !ident.is_empty() && ident != "drop";
+                }
+                // `{`: a struct literal names a type (UpperCamel) directly.
+                return ident.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+            }
+            '[' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 #[test]
 fn forwards_operation_reference_rejects_dropping_handlers() {
     let good = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    self.cancel_core(k, operation_reference)\n}";
     assert!(forwards_operation_reference(good));
+    let good_struct = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    send(Req { key, operation_reference })\n}";
+    assert!(forwards_operation_reference(good_struct));
+    let good_await = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    self.cancel_core(\n        k,\n        operation_reference,\n    )\n    .await\n}";
+    assert!(forwards_operation_reference(good_await));
     let comment_only = "fn h(body: &Option<B>) {\n    // reads body.operation_reference (not really)\n    self.cancel_core(k, None)\n}";
     assert!(!forwards_operation_reference(comment_only));
     let bound_dropped = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    self.cancel_core(k, None)\n}";
@@ -539,6 +616,16 @@ fn forwards_operation_reference_rejects_dropping_handlers() {
     let never_read =
         "fn h(body: &Option<B>) {\n    let x = body.is_some();\n    self.cancel_core(k, None)\n}";
     assert!(!forwards_operation_reference(never_read));
+    let logged_only = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    tracing::info!(?k, operation_reference);\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(logged_only));
+    let println_only = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    println!(\"{:?}\", operation_reference);\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(println_only));
+    let dropped = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    drop(operation_reference);\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(dropped));
+    let discarded = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    let _ = operation_reference;\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(discarded));
+    let in_block = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    if x { operation_reference }\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(in_block));
 }
 
 /// Defect-class guard (#1606): an `operationReference` request field the
@@ -573,10 +660,17 @@ fn honoured_operation_references_are_forwarded_by_their_handler() {
             continue;
         }
         checked += 1;
-        let Some(handler) = handlers.get(op) else {
+        let Some((handler, args)) = handlers.get(op) else {
             dropped.push(format!("{op}: no OVERRIDES handler ({reaches:?})"));
             continue;
         };
+        if !delegation_forwards_body(args) {
+            dropped.push(format!(
+                "{op} -> {handler}({}): OVERRIDES delegation drops the request body",
+                args.join(", ")
+            ));
+            continue;
+        }
         let forwards = fn_source(handler).is_some_and(|src| forwards_operation_reference(&src));
         if !forwards {
             dropped.push(format!("{op} -> {handler}: drops {reaches:?}"));

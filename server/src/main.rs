@@ -53399,6 +53399,32 @@ mod subscription_placement_tests {
             "resume must succeed: {resp:?}"
         );
 
+        // Journal contents per segment file, in file order. Captured before the
+        // cancel so the cancellation's records are identified independently of
+        // their stamp: they are exactly the per-file suffix appended after it.
+        let read_journal = || -> std::collections::BTreeMap<
+            std::path::PathBuf,
+            Vec<nanobpmn_engine_core::Record>,
+        > {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+                })
+                .map(|p| {
+                    let recs = seglog::read_segment_records(&p).unwrap();
+                    (p, recs)
+                })
+                .collect()
+        };
+        let before_cancel: std::collections::BTreeMap<_, usize> = read_journal()
+            .into_iter()
+            .map(|(p, recs)| (p, recs.len()))
+            .collect();
+
         let resp = server
             .cancel_process_instance_impl(
                 &models::CancelProcessInstancePathParams {
@@ -53419,16 +53445,9 @@ mod subscription_placement_tests {
         );
 
         drop(server);
-        let records: Vec<nanobpmn_engine_core::Record> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
-            })
-            .flat_map(|p| seglog::read_segment_records(&p).unwrap())
-            .collect();
+        let journal = read_journal();
+        let records: Vec<nanobpmn_engine_core::Record> =
+            journal.values().flatten().cloned().collect();
         let refs_of = |pred: &dyn Fn(&Event) -> bool| -> Vec<Option<i64>> {
             records
                 .iter()
@@ -53470,13 +53489,22 @@ mod subscription_placement_tests {
         }
         // Every record the cancel cascade journaled carries CANCEL_REF (the
         // terminations of tokens, subscriptions, … not just the terminal event).
-        let cancel_cascade: Vec<_> = records
+        // The cascade is selected by journal position (everything appended
+        // after the pre-cancel snapshot), not by its stamp, so a record with a
+        // missing or wrong reference cannot hide from the assertion.
+        let cancel_cascade: Vec<&nanobpmn_engine_core::Record> = journal
             .iter()
-            .filter(|r| r.operation_reference == Some(CANCEL_REF))
+            .flat_map(|(p, recs)| recs.iter().skip(before_cancel.get(p).copied().unwrap_or(0)))
             .collect();
         assert!(
             cancel_cascade.len() > 1,
-            "the cancel cascade stamps every record, not just one: {cancel_cascade:?}"
+            "the cancel cascade journals more than the terminal event: {cancel_cascade:?}"
+        );
+        assert!(
+            cancel_cascade
+                .iter()
+                .all(|r| r.operation_reference == Some(CANCEL_REF)),
+            "every record the cancel appended carries CANCEL_REF: {cancel_cascade:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
