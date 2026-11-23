@@ -457,11 +457,13 @@ fn override_handlers() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for line in src.lines() {
         let parts: Vec<&str> = line.trim_start().split('"').collect();
-        if parts.len() > 6 && parts[0] == "(" && parts[4].starts_with("):") {
-            if let Some(call) = parts[5].strip_prefix("self.") {
-                let name = call.split('(').next().unwrap_or_default();
-                out.insert(parts[3].to_string(), name.to_string());
-            }
+        if parts.len() > 6
+            && parts[0] == "("
+            && parts[4].starts_with("):")
+            && let Some(call) = parts[5].strip_prefix("self.")
+        {
+            let name = call.split('(').next().unwrap_or_default();
+            out.insert(parts[3].to_string(), name.to_string());
         }
     }
     out

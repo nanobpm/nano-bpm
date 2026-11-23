@@ -1211,10 +1211,10 @@ async fn forwarded_instance_mutations_persist_operation_reference_on_the_peer() 
     let key = created.process_instance_key.0.clone();
     let instance_key: u64 = key.parse().expect("numeric instance key");
 
-    const SET_REF: i64 = 0x1606_11;
-    const SUSPEND_REF: i64 = 0x1606_12;
-    const RESUME_REF: i64 = 0x1606_13;
-    const CANCEL_REF: i64 = 0x1606_14;
+    const SET_REF: i64 = 0x0016_0611;
+    const SUSPEND_REF: i64 = 0x0016_0612;
+    const RESUME_REF: i64 = 0x0016_0613;
+    const CANCEL_REF: i64 = 0x0016_0614;
     let mut vars = serde_json::Map::new();
     vars.insert("fixed".to_string(), serde_json::Value::Bool(true));
     let res = link

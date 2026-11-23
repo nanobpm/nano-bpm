@@ -53239,10 +53239,10 @@ mod subscription_placement_tests {
         let key_str = result.process_instance_key.0.clone();
         let instance_key: u64 = key_str.parse().expect("numeric instance key");
 
-        const SET_REF: i64 = 0x1606_01;
-        const SUSPEND_REF: i64 = 0x1606_02;
-        const RESUME_REF: i64 = 0x1606_03;
-        const CANCEL_REF: i64 = 0x1606_04;
+        const SET_REF: i64 = 0x0016_0601;
+        const SUSPEND_REF: i64 = 0x0016_0602;
+        const RESUME_REF: i64 = 0x0016_0603;
+        const CANCEL_REF: i64 = 0x0016_0604;
 
         let mut set = models::SetVariableRequest::new(std::collections::HashMap::from([(
             "fixed".to_string(),
