@@ -150,6 +150,9 @@ test('unexplained: a replay divergence no open case explains is surfaced', () =>
   const shared = new Set([knownKey('a', 'g1'), knownKey('a', 'g2')])
   assert.deepEqual(unexplained([d('a', 'g1'), d('a', 'g2')], shared), [])
   assert.deepEqual(unexplained([d('a', 'g3')], shared).map((x) => x.entry.graph.key), ['g3'])
+  // The (signature, graph) key is unambiguous: ('ab','c') never collides with ('a','bc').
+  assert.notEqual(knownKey('ab', 'c'), knownKey('a', 'bc'))
+  assert.deepEqual(unexplained([d('a', 'bc')], new Set([knownKey('ab', 'c')])).map((x) => x.signature), ['a'])
 })
 
 test('shrinkGraph: the result is 1-minimal for the divergence predicate', async () => {

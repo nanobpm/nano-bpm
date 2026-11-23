@@ -378,7 +378,7 @@ export function unexplained (divergences, openKeys) {
 }
 
 /** The identity of one known divergence: its signature on one graph. */
-export const knownKey = (signature, graphKey) => `${signature}${graphKey}`
+export const knownKey = (signature, graphKey) => JSON.stringify([signature, graphKey])
 
 /**
  * Whether a committed case is replayed this run. A FIXED case is a regression
