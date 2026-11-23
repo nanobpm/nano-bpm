@@ -1285,6 +1285,7 @@ impl PeerLink {
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
         origin_protocol: &str,
+        operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
         self.request(|corr| ClientFrame::ForwardCreate {
             corr,
@@ -1297,6 +1298,7 @@ impl PeerLink {
             fetch_variables,
             request_timeout,
             origin_protocol: Some(origin_protocol.to_string()),
+            operation_reference,
         })
         .await
     }
@@ -1320,6 +1322,7 @@ impl PeerLink {
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
         origin_protocol: &str,
+        operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(deadline, |corr| ClientFrame::ForwardCreate {
             corr,
@@ -1332,6 +1335,7 @@ impl PeerLink {
             fetch_variables,
             request_timeout,
             origin_protocol: Some(origin_protocol.to_string()),
+            operation_reference,
         })
         .await
     }

@@ -384,6 +384,148 @@ async fn forwarded_publish_persists_operation_reference_on_the_peer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #1602: an `operationReference` riding a forwarded `ForwardCreate` frame must
+/// survive the Falcon hop AND persistence on the peer. A DISK-backed peer
+/// receives the create over a real `PeerLink`; every record the create
+/// produces there — the `ProcessInstanceCreated` and its element cascade — is
+/// journaled with the reference, while the forwarded deploy (sent
+/// unreferenced) carries none. Guards the peer-forward / Falcon-handler leg of
+/// the REST create path against silently dropping it.
+#[tokio::test]
+async fn forwarded_create_persists_operation_reference_on_the_peer() {
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!(
+        "nanobpmn-1602-peer-ref-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let topology = crate::cluster::Topology {
+        node_id: 0,
+        peers: vec!["http://n0".to_string()],
+        num_partitions: 4,
+        replication_factor: 1,
+    };
+    let owned = topology.local_partitions();
+    let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("varstore"));
+    let (writer, recovery) =
+        crate::journal::SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore))
+            .expect("open segmented writer");
+    let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+        recovery.engines.into_iter().collect();
+    let journals: Vec<crate::Journal> = owned
+        .iter()
+        .map(|&p| {
+            let engine = engines
+                .remove(&p)
+                .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+            crate::Journal::from_engine_shared(p, engine, true, &writer)
+        })
+        .collect();
+    let server = crate::build_server_in_memory(journals, topology);
+    let base = serve(server).await;
+    let link = PeerLink::connect(&base).await.expect("connect to peer");
+
+    let auto_bpmn = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="auto">
+          <bpmn:startEvent id="s" />
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let res = link
+        .deploy(vec![("auto.bpmn".to_string(), auto_bpmn.to_string())], None)
+        .await
+        .expect("forwarded deploy");
+    assert_eq!(res.status, 200, "deploy should succeed: {res:?}");
+
+    const REF: i64 = 0x1602_0001;
+    let res = link
+        .forward_create(
+            Some("auto".to_string()),
+            None,
+            None,
+            Vec::new(),
+            None,
+            false,
+            None,
+            None,
+            "rest",
+            Some(REF),
+        )
+        .await
+        .expect("forwarded create returns a result");
+    assert_eq!(res.status, 200, "create should be 200: {res:?}");
+    let instance_key: u64 = res
+        .body
+        .as_ref()
+        .and_then(|b| b.get("processInstanceKey"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .expect("create result carries a numeric processInstanceKey");
+
+    // Wait until the peer's journal holds the create cascade, then read every
+    // journaled record envelope.
+    let read_records = || -> Vec<nanobpmn_engine_core::Record> {
+        std::fs::read_dir(&dir)
+            .expect("read journal dir")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| crate::seglog::read_segment_records(&p).expect("read segment"))
+            .collect()
+    };
+    let mut records = read_records();
+    for _ in 0..200 {
+        if records.iter().any(|r| {
+            matches!(
+                r.event,
+                nanobpmn_engine_core::Event::ProcessInstanceCreated { .. }
+            )
+        }) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        records = read_records();
+    }
+
+    let create_records: Vec<_> = records
+        .iter()
+        .filter(|r| r.event.instance_key() == Some(instance_key))
+        .collect();
+    assert!(
+        create_records.iter().any(|r| matches!(
+            r.event,
+            nanobpmn_engine_core::Event::ProcessInstanceCreated { .. }
+        )),
+        "the forwarded create journals the instance: {create_records:?}"
+    );
+    for r in &create_records {
+        assert_eq!(
+            r.operation_reference,
+            Some(REF),
+            "every record of the forwarded create carries the reference: {r:?}"
+        );
+    }
+    let deployed: Vec<_> = records
+        .iter()
+        .filter(|r| matches!(r.event, nanobpmn_engine_core::Event::ProcessDeployed { .. }))
+        .collect();
+    assert!(!deployed.is_empty());
+    for r in &deployed {
+        assert_eq!(r.operation_reference, None, "unreferenced deploy: {r:?}");
+    }
+    drop(link);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // ADR 0066 rolling-upgrade gate for cluster variables (#1657, PR #1670 review).
 //
