@@ -30861,6 +30861,11 @@ mod snapshot_health_tick_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Non-zero gauge value no test journal can produce; the sampler tests
+    /// pre-seed it so asserting `quarantined_orphans == 0` proves a tick
+    /// actually wrote the gauge.
+    const QUARANTINE_SENTINEL: u64 = 42;
+
     /// #1458/#1466: the sampler LOOP itself is driven by an injected tick
     /// source, never by a wall clock the test cannot control. A bounded stream
     /// of N ticks runs exactly N samples and then lets the loop return, so the
@@ -30868,11 +30873,6 @@ mod snapshot_health_tick_tests {
     /// no scheduler assumption. Before this refactor the loop was hard-wired
     /// to `tokio::time::interval` inside a fire-and-forget `tokio::spawn`, so
     /// no test could drive or await it at all.
-    /// Non-zero gauge value no test journal can produce; the sampler tests
-    /// pre-seed it so asserting `quarantined_orphans == 0` proves a tick
-    /// actually wrote the gauge.
-    const QUARANTINE_SENTINEL: u64 = 42;
-
     #[tokio::test]
     async fn storage_sampler_loop_runs_one_sample_per_injected_tick_then_returns() {
         let dir = scratch("sampler-loop-ticks");
@@ -31011,17 +31011,24 @@ mod snapshot_health_tick_tests {
                 }
             })
         };
+        // Threshold reads happen exactly once per sample, so this counts samples
+        // (the gauges alone would be overwritten identically by an extra one).
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sampler = tokio::spawn({
             let shared = Arc::clone(&recovery.shared);
             let handle = handle.clone();
             let h = Arc::clone(&h);
             let tiny_budget = tiny_budget.clone();
+            let samples = Arc::clone(&samples);
             async move {
                 storage_usage_sampler_loop(
                     shared,
                     std::slice::from_ref(&handle).to_vec(),
                     &h,
-                    || tiny_budget.clone(),
+                    || {
+                        samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tiny_budget.clone()
+                    },
                     ticks,
                 )
                 .await;
@@ -31034,12 +31041,18 @@ mod snapshot_health_tick_tests {
         first_poll.notified().await;
         let r = h.report(Instant::now(), &tiny_budget);
         assert_eq!(r.uncompacted_bytes, 0, "no tick, no sample: {r:?}");
+        assert_eq!(samples.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // One tick → exactly one sample, observed via the re-poll barrier.
         tick_tx.send(()).await.expect("sampler alive");
         landed.notified().await;
         let r = h.report(Instant::now(), &tiny_budget);
         assert!(r.uncompacted_bytes > 1, "one tick, one sample: {r:?}");
+        assert_eq!(
+            samples.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one tick, exactly one sample"
+        );
         assert_eq!(
             r.quarantined_orphans, 0,
             "the tick's actor query landed too: {r:?}"
