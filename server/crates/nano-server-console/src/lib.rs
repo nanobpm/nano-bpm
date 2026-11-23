@@ -5595,6 +5595,8 @@ fn data_error(e: projects::DataError) -> (StatusCode, String) {
         // maker's input, not a server fault.
         Op(m) => (StatusCode::BAD_REQUEST, m),
         Gateway(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        // Back-pressure (#1329): all gateway slots busy and the queue full.
+        Busy(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
     }
 }
 

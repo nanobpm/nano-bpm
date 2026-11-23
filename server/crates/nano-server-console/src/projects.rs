@@ -3501,6 +3501,105 @@ pub enum DataError {
     /// The datasource operation itself returned `{ ok: false, error }`
     /// (bad SQL, unknown source, missing manifest, …).
     Op(String),
+    /// Back-pressure (#1329): every gateway slot is busy *and* the wait queue
+    /// is full, so the request was refused instead of spawning yet another
+    /// Node process pair. Transient — the caller should retry later.
+    Busy(String),
+}
+
+/// Default cap on concurrently running datasource gateway subprocesses
+/// (`urban data` / embedded `data-cli.ts`) across the whole console (#1329).
+/// Each one is a Node process (pair) of ~130 MB RSS, so an unbounded burst
+/// swaps a small host into a stall; this keeps the worst case at K pairs.
+const DATA_GATEWAY_DEFAULT_CONCURRENCY: usize = 2;
+/// Default number of requests allowed to *wait* for a gateway slot before
+/// further requests are refused with [`DataError::Busy`] (#1329).
+const DATA_GATEWAY_DEFAULT_QUEUE: usize = 32;
+/// Env override for [`DATA_GATEWAY_DEFAULT_CONCURRENCY`] (positive integer).
+const DATA_GATEWAY_CONCURRENCY_ENV: &str = "NANOBPMN_DATA_GATEWAY_CONCURRENCY";
+/// Env override for [`DATA_GATEWAY_DEFAULT_QUEUE`] (non-negative integer).
+const DATA_GATEWAY_QUEUE_ENV: &str = "NANOBPMN_DATA_GATEWAY_QUEUE";
+
+/// Bounds how many datasource gateway subprocesses run at once, with a bounded
+/// wait queue behind them (#1329): at most `concurrency` children are alive,
+/// at most `queue` further requests wait, and anything beyond that is refused
+/// with [`DataError::Busy`] — back-pressure instead of runaway memory.
+pub(crate) struct DataGatewayLimiter {
+    permits: tokio::sync::Semaphore,
+    waiting: std::sync::atomic::AtomicUsize,
+    concurrency: usize,
+    queue: usize,
+}
+
+impl DataGatewayLimiter {
+    pub(crate) fn new(concurrency: usize, queue: usize) -> Self {
+        let concurrency = concurrency.max(1);
+        Self {
+            permits: tokio::sync::Semaphore::new(concurrency),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            concurrency,
+            queue,
+        }
+    }
+
+    /// Take a gateway slot, waiting in the bounded queue if all are busy.
+    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, DataError> {
+        if let Ok(p) = self.permits.try_acquire() {
+            return Ok(p);
+        }
+        // Reserve a queue place atomically; refuse when the queue is full.
+        let mut w = self.waiting.load(Ordering::Acquire);
+        let reserved = loop {
+            if w >= self.queue {
+                break false;
+            }
+            match self
+                .waiting
+                .compare_exchange_weak(w, w + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break true,
+                Err(cur) => w = cur,
+            }
+        };
+        if !reserved {
+            return Err(DataError::Busy(format!(
+                "data gateway busy: {} ops running and {} queued; retry shortly",
+                self.concurrency, self.queue
+            )));
+        }
+        // Release the queue place even if this future is dropped mid-wait.
+        struct Leave<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _leave = Leave(&self.waiting);
+        self.permits
+            .acquire()
+            .await
+            .map_err(|e| DataError::Gateway(format!("data gateway limiter closed: {e}")))
+    }
+}
+
+/// The process-wide gateway limiter, sized once from the env overrides.
+fn data_gateway_limiter() -> &'static DataGatewayLimiter {
+    static LIMITER: OnceLock<DataGatewayLimiter> = OnceLock::new();
+    LIMITER.get_or_init(|| {
+        let read = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(d)
+        };
+        DataGatewayLimiter::new(
+            read(
+                DATA_GATEWAY_CONCURRENCY_ENV,
+                DATA_GATEWAY_DEFAULT_CONCURRENCY,
+            ),
+            read(DATA_GATEWAY_QUEUE_ENV, DATA_GATEWAY_DEFAULT_QUEUE),
+        )
+    })
 }
 
 /// Whether `name` resolves to an **Urban-shaped app** — one carrying a
@@ -3873,10 +3972,24 @@ fn gateway_output_parse_error(err: &serde_json::Error, raw_len: usize, trimmed: 
 }
 
 async fn pipe_data_gateway(
+    cmd: Command,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, DataError> {
+    pipe_data_gateway_limited(data_gateway_limiter(), cmd, request).await
+}
+
+/// [`pipe_data_gateway`] against an explicit [`DataGatewayLimiter`]: the child
+/// is spawned only while holding a slot, and the slot is held until the child
+/// has exited (`wait_with_output`), so at most `concurrency` gateway processes
+/// are ever alive at once (#1329).
+async fn pipe_data_gateway_limited(
+    limiter: &DataGatewayLimiter,
     mut cmd: Command,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
     use tokio::io::AsyncWriteExt;
+
+    let _permit = limiter.acquire().await?;
 
     cmd.env("NO_COLOR", "1")
         .stdin(std::process::Stdio::piped())
@@ -3964,6 +4077,36 @@ async fn pipe_data_gateway(
 /// (`{ op, source?, sql?, params? }`); the resolved result object is returned on
 /// success.
 pub async fn run_data_op(
+    project: &str,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, DataError> {
+    // Per-op trace line (#1329) so the next request spike can be attributed:
+    // project, op, source, outcome and duration.
+    let op = request
+        .get("op")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let source = request
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let started = std::time::Instant::now();
+    let res = run_data_op_inner(project, request).await;
+    tracing::debug!(
+        project,
+        op = %op,
+        source = %source,
+        ok = res.is_ok(),
+        busy = matches!(res, Err(DataError::Busy(_))),
+        duration_ms = started.elapsed().as_millis() as u64,
+        "data op"
+    );
+    res
+}
+
+async fn run_data_op_inner(
     project: &str,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
@@ -12021,6 +12164,82 @@ mod tests {
             }
             other => panic!("expected DataError::Gateway, got {other:?}"),
         }
+    }
+
+    /// #1329: a burst of N concurrent data requests never has more than K
+    /// gateway processes alive. Each stub child registers itself in a `live/`
+    /// dir, records how many siblings are alive, sleeps, then deregisters.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_data_gateway_bounds_concurrent_children() {
+        let root = temp_root();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let log = root.join("alive.log");
+        let script = format!(
+            "cat >/dev/null; touch '{live}'/$$; ls '{live}' | wc -l >> '{log}'; sleep 0.2; \
+             ls '{live}' | wc -l >> '{log}'; rm '{live}'/$$; printf '{{\"ok\":true}}'",
+            live = live.display(),
+            log = log.display()
+        );
+        const K: usize = 2;
+        const N: usize = 8;
+        let limiter = DataGatewayLimiter::new(K, N);
+        let req = serde_json::json!({ "op": "schema" });
+        let futs = (0..N).map(|_| {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(&script);
+            pipe_data_gateway_limited(&limiter, cmd, &req)
+        });
+        for r in futures_util::future::join_all(futs).await {
+            r.expect("every queued op must eventually succeed");
+        }
+        let counts: Vec<usize> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().parse().unwrap())
+            .collect();
+        assert_eq!(counts.len(), 2 * N, "every child must have run: {counts:?}");
+        let max = counts.iter().copied().max().unwrap();
+        assert!(max <= K, "{max} gateway children alive at once (cap {K})");
+        assert_eq!(max, K, "the cap should actually be reached under a burst");
+    }
+
+    /// #1329: past the bounded wait queue, a request is refused with
+    /// `DataError::Busy` (→ 503) instead of spawning another process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_data_gateway_refuses_when_queue_is_full() {
+        let limiter = DataGatewayLimiter::new(1, 1);
+        let req = serde_json::json!({ "op": "schema" });
+        let slow = || {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg("cat >/dev/null; sleep 0.3; printf '{\"ok\":true}'");
+            cmd
+        };
+        let running = pipe_data_gateway_limited(&limiter, slow(), &req);
+        let queued = pipe_data_gateway_limited(&limiter, slow(), &req);
+        let refused = async {
+            // Let the first two take the slot and the single queue place.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg("touch /dev/null; printf '{\"ok\":true}'");
+            pipe_data_gateway_limited(&limiter, cmd, &req).await
+        };
+        let (a, b, c) = tokio::join!(running, queued, refused);
+        a.expect("running op succeeds");
+        b.expect("queued op succeeds once the slot frees");
+        assert!(
+            matches!(c, Err(DataError::Busy(_))),
+            "overflow must be refused as Busy, got {c:?}"
+        );
+        // The queue place is released: a fresh request is admitted again.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("cat >/dev/null; printf '{\"ok\":true}'");
+        pipe_data_gateway_limited(&limiter, cmd, &req)
+            .await
+            .expect("limiter recovers after the burst");
     }
 
     #[test]
