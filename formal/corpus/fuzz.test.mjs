@@ -27,7 +27,11 @@ import {
   loadCorpus,
   caseRecord,
   unexplained,
-  MAX_GATEWAYS
+  knownKey,
+  MAX_GATEWAYS,
+  issueBody,
+  corpusIdentity,
+  uncommittedIssues
 } from './fuzz.mjs'
 import { prng } from '../traces/fuzz/generate.mjs'
 
@@ -134,9 +138,21 @@ test('randomSkeleton: never generates a gateway kind outside the requested vocab
 })
 
 test('unexplained: a replay divergence no open case explains is surfaced', () => {
-  const divs = [{ signature: 'a' }, { signature: 'b' }]
-  assert.deepEqual(unexplained(divs, new Set(['a'])).map((d) => d.signature), ['b'])
-  assert.deepEqual(unexplained(divs, new Set(['a', 'b'])), [])
+  const d = (signature, key) => ({ signature, entry: { graph: { key } } })
+  const keys = new Set([knownKey('a', 'g1')])
+  // A divergence on the open case's own graph is explained...
+  assert.deepEqual(unexplained([d('a', 'g1')], keys), [])
+  // ...but the SAME signature on any other graph is a distinct defect: a
+  // field-based signature must never suppress a whole class across graphs.
+  assert.deepEqual(unexplained([d('a', 'g2')], keys).map((x) => x.entry.graph.key), ['g2'])
+  assert.deepEqual(unexplained([d('a', 'g1'), d('a', 'g2'), d('b', 'g1')], keys).map((x) => [x.signature, x.entry.graph.key]), [['a', 'g2'], ['b', 'g1']])
+  // Two open cases sharing one signature explain only their own graphs each.
+  const shared = new Set([knownKey('a', 'g1'), knownKey('a', 'g2')])
+  assert.deepEqual(unexplained([d('a', 'g1'), d('a', 'g2')], shared), [])
+  assert.deepEqual(unexplained([d('a', 'g3')], shared).map((x) => x.entry.graph.key), ['g3'])
+  // The (signature, graph) key is unambiguous: ('ab','c') never collides with ('a','bc').
+  assert.notEqual(knownKey('ab', 'c'), knownKey('a', 'bc'))
+  assert.deepEqual(unexplained([d('a', 'bc')], new Set([knownKey('ab', 'c')])).map((x) => x.signature), ['a'])
 })
 
 test('shrinkGraph: the result is 1-minimal for the divergence predicate', async () => {
@@ -271,4 +287,31 @@ test('stepSignatures / commandSignature fail closed on an unknown op', () => {
   assert.throws(() => stepSignatures([{ op: 'teleport' }]), /unknown scenario step op/)
   assert.throws(() => commandSignature({ id: 'g' }, { op: 'teleport' }), /unknown command op/)
   assert.deepEqual(stepSignatures([{ op: 'setVariables', variables: {} }, { op: 'advanceTime', ms: 1 }, { op: 'cancelInstance' }]), ['tick', 'cancel'])
+})
+
+// M8 fuzz triage: every filed finding must have a committed reproducer. #1753–
+// #1758 were filed claiming "committed in fuzz-corpus.json" from a run whose
+// corpus diff never landed, so nothing replayed them. Triaged duplicates are
+// aliased to the issue whose committed case (same graph, same seed) covers them.
+// #1757 is deliberately absent from this list: it is not a fuzz parity issue at
+// all but a Mergify merge-queue draft (for #1743), so there is no reproducer to
+// commit and nothing for the guard below to check.
+export const TRIAGED_FUZZ_ISSUES = ['#1753', '#1754', '#1755', '#1756', '#1758']
+export const TRIAGE_ALIASES = { '#1753': '#1693', '#1754': '#1675' }
+
+test('every triaged fuzz issue has a committed reproducer (or an alias that does)', () => {
+  assert.deepEqual(uncommittedIssues(TRIAGED_FUZZ_ISSUES, loadCorpus(), TRIAGE_ALIASES), [])
+})
+
+test('uncommittedIssues reports a filed finding absent from the corpus', () => {
+  const cases = [{ issue: '#1' }, { issue: '#2' }]
+  assert.deepEqual(uncommittedIssues(['#1', '#3', '#4'], cases, { '#4': '#2' }), ['#3'])
+})
+
+test('issueBody states the commit obligation and carries the corpus identity', () => {
+  const c = loadCorpus()[0]
+  const body = issueBody(c)
+  assert.doesNotMatch(body, /committed in `formal\/corpus\/fuzz-corpus.json`/)
+  assert.match(body, /NOT guarded until that corpus diff is committed/)
+  assert.ok(body.includes(corpusIdentity(c)))
 })
