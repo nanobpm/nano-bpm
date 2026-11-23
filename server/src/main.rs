@@ -54644,7 +54644,23 @@ mod subscription_placement_tests {
         // partition whose canonical subscription partition is DIFFERENT, while
         // stalling the target partition's actor so the create commits and
         // answers BEFORE the target open is applied/persisted.
-        let (created_instance_key, order, target_partition, _held_release) = {
+        let crash_image = dir.with_extension("crash-image");
+        let _ = std::fs::remove_dir_all(&crash_image);
+        let _crash_image_guard = DirGuard(crash_image.clone());
+        fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                let dest = to.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_dir_recursive(&entry.path(), &dest)?;
+                } else {
+                    std::fs::copy(entry.path(), &dest)?;
+                }
+            }
+            Ok(())
+        }
+        let (created_instance_key, order, target_partition) = {
             let (shared, recovery) =
                 SharedWriter::open_segmented(&dir, &owned, 4, None).expect("open segmented boot 1");
             let fresh = recovery.fresh;
@@ -54720,16 +54736,20 @@ mod subscription_placement_tests {
                 .expect("create answered at commit despite stalled target")
                 .expect("detached owner alive")
                 .expect("create applied");
-            // Keep `release_tx` alive past Boot 2's recovery open so Boot 1's
-            // detached routing task cannot unblock and write the target open
-            // while we reopen the durable directory (simulating a process
-            // crash where the target open never reached disk).
-            (created.instance_key, order, target, release_tx)
+            // Simulate the crash by taking a crash image: copy the durable
+            // directory while the target actor is still stalled (the create is
+            // durable, the target open is not). Boot 2 recovers from the copy,
+            // so nothing Boot 1 still does after its barrier is released (its
+            // routing owner applying the queued open, its writer flushing) can
+            // ever write into the log Boot 2 reopens.
+            copy_dir_recursive(&dir, &crash_image).expect("copy crash image");
+            drop(release_tx);
+            (created.instance_key, order, target)
         };
 
-        // Boot 2: recover from the same durable journal directory.
-        let (shared, recovery) =
-            SharedWriter::open_segmented(&dir, &owned, 4, None).expect("open segmented boot 2");
+        // Boot 2: recover from the crash image, never Boot 1's live directory.
+        let (shared, recovery) = SharedWriter::open_segmented(&crash_image, &owned, 4, None)
+            .expect("open segmented boot 2");
         let fresh = recovery.fresh;
         let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
             recovery.engines.into_iter().collect();

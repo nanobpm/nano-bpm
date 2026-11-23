@@ -30,10 +30,17 @@ use nanobpmn_engine_core::Event;
 /// `(message name, correlation key)` of a pending subscription open.
 type OpenKey = (String, String);
 
+/// Per-key pending state: the number of in-flight opens and the notifier
+/// its waiters park on. Waiters of one key are woken only when THAT key's
+/// count reaches zero, never by releases of unrelated keys.
+struct Pending {
+    count: usize,
+    released: Arc<tokio::sync::Notify>,
+}
+
 #[derive(Default)]
 struct Inner {
-    pending: Mutex<HashMap<OpenKey, usize>>,
-    released: tokio::sync::Notify,
+    pending: Mutex<HashMap<OpenKey, Pending>>,
 }
 
 /// The node-wide registry of pending subscription opens. Cheap to clone.
@@ -82,7 +89,13 @@ impl PublicationGate {
         }
         let mut pending = self.lock();
         for key in &keys {
-            *pending.entry(key.clone()).or_insert(0) += 1;
+            pending
+                .entry(key.clone())
+                .or_insert_with(|| Pending {
+                    count: 0,
+                    released: Arc::new(tokio::sync::Notify::new()),
+                })
+                .count += 1;
         }
         drop(pending);
         Some(PendingOpens {
@@ -109,10 +122,16 @@ impl PublicationGate {
             return GateWait::Clear;
         }
         let until = tokio::time::Instant::now() + deadline;
+        let key = (name.to_string(), correlation_key.to_string());
         loop {
-            // Arm the notification BEFORE re-checking, so a release between
-            // the check and the await is not missed.
-            let notified = self.inner.released.notified();
+            // Take this key's notifier and arm it under the lock: the final
+            // release removes the entry and notifies under the same lock, so
+            // it cannot slip between the check and the await.
+            let released = match self.lock().get(&key) {
+                Some(p) => Arc::clone(&p.released),
+                None => return GateWait::Released,
+            };
+            let notified = released.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if !self.is_pending(name, correlation_key) {
@@ -128,7 +147,7 @@ impl PublicationGate {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<OpenKey, usize>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<OpenKey, Pending>> {
         self.inner.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -137,15 +156,16 @@ impl Drop for PendingOpens {
     fn drop(&mut self) {
         let mut pending = self.gate.lock();
         for key in &self.keys {
-            if let Some(count) = pending.get_mut(key) {
-                *count -= 1;
-                if *count == 0 {
-                    pending.remove(key);
+            if let Some(p) = pending.get_mut(key) {
+                p.count -= 1;
+                if p.count == 0 {
+                    // Only the key that became clear wakes its own waiters.
+                    if let Some(p) = pending.remove(key) {
+                        p.released.notify_waiters();
+                    }
                 }
             }
         }
-        drop(pending);
-        self.gate.inner.released.notify_waiters();
     }
 }
 
@@ -216,5 +236,31 @@ mod tests {
         assert!(gate.is_pending("m", "k"));
         drop(b);
         assert!(!gate.is_pending("m", "k"));
+    }
+
+    /// A release of an unrelated key, or a partial release of the waited key,
+    /// must not wake the waiter: only its own key reaching zero does.
+    #[tokio::test]
+    async fn waiters_wake_only_when_their_own_key_clears() {
+        let gate = PublicationGate::default();
+        let a = gate.register(&[opening("m", "k")]).expect("a");
+        let b = gate.register(&[opening("m", "k")]).expect("b");
+        let other = gate.register(&[opening("m", "x")]).expect("other");
+        let released = gate
+            .lock()
+            .get(&("m".to_string(), "k".to_string()))
+            .map(|p| Arc::clone(&p.released))
+            .expect("pending");
+        let notified = released.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        drop(other);
+        drop(a);
+        assert!(
+            futures_util::FutureExt::now_or_never(notified.as_mut()).is_none(),
+            "unrelated or partial releases must not notify"
+        );
+        drop(b);
+        assert!(futures_util::FutureExt::now_or_never(notified.as_mut()).is_some());
     }
 }
