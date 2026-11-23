@@ -54142,23 +54142,33 @@ mod subscription_placement_tests {
         let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
         let accounting = CreateAccounting::enter(&server, 0);
-        let rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
-            let (process_id, sel_key, sel_ver) =
-                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
-            apply_create_instance_direct(
-                engine,
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    variables,
-                    Vec::new(),
+        let rx = server.submit_create_detached_on(
+            accounting,
+            create_engine,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
                     None,
-                    sel_key,
-                    sel_ver,
-                ),
-                &process_id,
-            )
-            .map_err(|e| (500, e.to_string()))
-        });
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
         let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
             .expect("the create is answered at commit despite the stalled target")
@@ -54267,23 +54277,33 @@ mod subscription_placement_tests {
         let mut variables = std::collections::BTreeMap::new();
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
         let accounting = CreateAccounting::enter(&server, 0);
-        let mut rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
-            let (process_id, sel_key, sel_ver) =
-                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
-            apply_create_instance_direct(
-                engine,
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    variables,
-                    Vec::new(),
+        let mut rx = server.submit_create_detached_on(
+            accounting,
+            create_engine,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
                     None,
-                    sel_key,
-                    sel_ver,
-                ),
-                &process_id,
-            )
-            .map_err(|e| (500, e.to_string()))
-        });
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
             rx.try_recv().is_err(),
@@ -54362,6 +54382,7 @@ mod subscription_placement_tests {
                         sel_ver,
                     ),
                     &process_id,
+                    None,
                 )
                 .map_err(|e| (500, e.to_string()))
             })
@@ -54508,27 +54529,33 @@ mod subscription_placement_tests {
         variables.insert("keyA".to_string(), Value::Str(key_a.clone()));
         variables.insert("keyB".to_string(), Value::Str(key_b.clone()));
         let accounting = CreateAccounting::enter(&server, 0);
-        let rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
-            let (process_id, sel_key, sel_ver) = resolve_create_selector(
-                engine.state(),
-                Some("await-two-messages".into()),
-                None,
-                None,
-            )?;
-            apply_create_instance_direct(
-                engine,
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    variables,
-                    Vec::new(),
+        let rx = server.submit_create_detached_on(
+            accounting,
+            create_engine,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-two-messages".into()),
                     None,
-                    sel_key,
-                    sel_ver,
-                ),
-                &process_id,
-            )
-            .map_err(|e| (500, e.to_string()))
-        });
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
         let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
             .expect("the create answers at commit despite stalled target_b")
@@ -54710,27 +54737,33 @@ mod subscription_placement_tests {
             let mut variables = std::collections::BTreeMap::new();
             variables.insert("orderId".to_string(), Value::Str(order.clone()));
             let accounting = CreateAccounting::enter(&server, 0);
-            let rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
-                let (process_id, sel_key, sel_ver) = resolve_create_selector(
-                    engine.state(),
-                    Some("await-payment".into()),
-                    None,
-                    None,
-                )?;
-                apply_create_instance_direct(
-                    engine,
-                    Command::create_instance_versioned(
-                        process_id.clone(),
-                        variables,
-                        Vec::new(),
+            let rx = server.submit_create_detached_on(
+                accounting,
+                create_engine,
+                move |engine| {
+                    let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                        engine.state(),
+                        Some("await-payment".into()),
                         None,
-                        sel_key,
-                        sel_ver,
-                    ),
-                    &process_id,
-                )
-                .map_err(|e| (500, e.to_string()))
-            });
+                        None,
+                    )?;
+                    apply_create_instance_direct(
+                        engine,
+                        Command::create_instance_versioned(
+                            process_id.clone(),
+                            variables,
+                            Vec::new(),
+                            None,
+                            sel_key,
+                            sel_ver,
+                        ),
+                        &process_id,
+                        None,
+                    )
+                    .map_err(|e| (500, e.to_string()))
+                },
+                None,
+            );
             let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
                 .await
                 .expect("create answered at commit despite stalled target")
