@@ -17,6 +17,16 @@
 //! crate, so the same class cannot be reintroduced in any other test: after a
 //! discarded commit, a disk observation must be preceded by a sync point.
 //!
+//! **Limits.** This is a lexical scan of Rust source, not a type or flow
+//! analysis, so it is defence in depth rather than a proof. It only scans this
+//! crate's `src/`, and exotic shapes can slip past it (a wait hidden behind a
+//! helper fn or macro, a commit moved into another binding) or be rejected
+//! although they are correct (a sync point it does not recognise). A false
+//! rejection is cheap to resolve: bind the commit and call `blocking_wait()`
+//! (or `.wait().await`) directly before the observation. The categorical
+//! replacement, making an unwaited `Commit` unrepresentable, is tracked in
+//! <https://github.com/nanobpm/nano-bpm/issues/1855>.
+//!
 
 #![allow(
     clippy::unwrap_used,
