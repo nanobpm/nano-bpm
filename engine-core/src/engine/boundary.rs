@@ -2,6 +2,149 @@
 
 use super::*;
 
+/// A per-teardown element-instance → runtime-resource index (#1767).
+///
+/// Tearing down N element instances (an MI body's children, a scope's
+/// descendants, an ad-hoc container's tools) used to sweep every global
+/// resource map — jobs, timers, message / signal / conditional subscriptions,
+/// incidents and user tasks — once PER element instance: O(N × |resources|).
+/// The index is built in ONE pass per map over the instance's live resources
+/// and shared by every per-element cancellation of the teardown, so the whole
+/// teardown is O(|resources| + N). Buckets preserve ascending key order (the
+/// source maps are key-ordered), so the events derived from a bucket are
+/// byte-identical to the per-call scan they replace. Each `*_with` cancellation
+/// helper takes `Option<&TeardownIndex>`; the `None` path is the single
+/// canonical per-call scan, so selection logic is defined once per resource.
+pub(crate) struct TeardownIndex<'a> {
+    pub(crate) user_tasks: BTreeMap<Key, Vec<&'a state::UserTask>>,
+    pub(crate) jobs: BTreeMap<Key, Vec<&'a state::Job>>,
+    pub(crate) timers: BTreeMap<Key, Vec<&'a state::Timer>>,
+    pub(crate) message_subscriptions: BTreeMap<Key, Vec<&'a state::MessageSubscription>>,
+    pub(crate) signal_subscriptions: BTreeMap<Key, Vec<&'a state::SignalSubscription>>,
+    pub(crate) conditional_subscriptions: BTreeMap<Key, Vec<&'a state::ConditionalSubscription>>,
+    pub(crate) incidents: BTreeMap<Key, Vec<&'a state::Incident>>,
+    /// Call-activity element instance (of this instance) → its live callee
+    /// process instance (lowest key wins), from the `children_by_parent` index.
+    pub(crate) callee_of: BTreeMap<Key, Key>,
+    /// Live resources of every callee in [`Self::callee_of`], keyed by callee
+    /// instance key — gathered in the same per-map pass, so tearing down N
+    /// call-activity children never rescans the global maps per callee (#1767).
+    pub(crate) callee_resources: BTreeMap<Key, InstanceResources<'a>>,
+}
+
+/// The live (cancellable) resources of one process instance — the single
+/// selection [`Engine::discard_instance_events`] turns into cancellations.
+#[derive(Default)]
+pub(crate) struct InstanceResources<'a> {
+    pub(crate) jobs: Vec<&'a state::Job>,
+    pub(crate) timers: Vec<&'a state::Timer>,
+    pub(crate) message_subscriptions: Vec<&'a state::MessageSubscription>,
+    pub(crate) signal_subscriptions: Vec<&'a state::SignalSubscription>,
+    pub(crate) conditional_subscriptions: Vec<&'a state::ConditionalSubscription>,
+    pub(crate) user_tasks: Vec<&'a state::UserTask>,
+}
+
+impl<'a> InstanceResources<'a> {
+    /// One pass over each resource map, bucketing the live resources of every
+    /// instance in `wanted` by instance key.
+    fn collect(st: &'a state::State, wanted: &BTreeSet<Key>) -> BTreeMap<Key, Self> {
+        let mut out: BTreeMap<Key, Self> = wanted.iter().map(|k| (*k, Self::default())).collect();
+        for j in st.jobs.values().filter(|j| job_in_play(j)) {
+            if let Some(r) = out.get_mut(&j.instance_key) {
+                r.jobs.push(j);
+            }
+        }
+        for t in st
+            .timers
+            .values()
+            .filter(|t| t.state == state::TimerState::Created)
+        {
+            if let Some(r) = out.get_mut(&t.instance_key) {
+                r.timers.push(t);
+            }
+        }
+        for s in st
+            .message_subscriptions
+            .values()
+            .filter(|s| message_sub_open(s))
+        {
+            if let Some(r) = out.get_mut(&s.instance_key) {
+                r.message_subscriptions.push(s);
+            }
+        }
+        for s in st
+            .signal_subscriptions
+            .values()
+            .filter(|s| s.state == state::MessageSubscriptionState::Open)
+        {
+            if let Some(r) = out.get_mut(&s.instance_key) {
+                r.signal_subscriptions.push(s);
+            }
+        }
+        for s in st
+            .conditional_subscriptions
+            .values()
+            .filter(|s| s.state == state::MessageSubscriptionState::Open)
+        {
+            if let Some(r) = out.get_mut(&s.instance_key) {
+                r.conditional_subscriptions.push(s);
+            }
+        }
+        for t in st
+            .user_tasks
+            .values()
+            .filter(|t| t.state == state::UserTaskState::Created)
+        {
+            if let Some(r) = out.get_mut(&t.instance_key) {
+                r.user_tasks.push(t);
+            }
+        }
+        out
+    }
+}
+
+impl TeardownIndex<'_> {
+    /// The lowest-keyed `Created` user task parked on `eik`, if any.
+    pub(crate) fn first_created_user_task(&self, eik: Key) -> Option<Key> {
+        self.user_tasks
+            .get(&eik)
+            .and_then(|b| b.first())
+            .map(|t| t.key)
+    }
+}
+
+fn bucket<'a, T>(index: &BTreeMap<Key, Vec<&'a T>>, eik: Key) -> Vec<&'a T> {
+    index.get(&eik).cloned().unwrap_or_default()
+}
+
+fn index_by<'a, T: 'a>(
+    items: impl Iterator<Item = &'a T>,
+    keep: impl Fn(&T) -> Option<Key>,
+) -> BTreeMap<Key, Vec<&'a T>> {
+    let mut index: BTreeMap<Key, Vec<&'a T>> = BTreeMap::new();
+    for item in items {
+        if let Some(eik) = keep(item) {
+            index.entry(eik).or_default().push(item);
+        }
+    }
+    index
+}
+
+/// Live (cancellable) predicates — the single definition shared by the
+/// per-call scans and the [`TeardownIndex`] build.
+fn job_in_play(j: &state::Job) -> bool {
+    !matches!(
+        j.state,
+        state::JobState::Completed | state::JobState::Errored | state::JobState::Canceled
+    )
+}
+fn message_sub_open(s: &state::MessageSubscription) -> bool {
+    matches!(
+        s.state,
+        state::MessageSubscriptionState::Open | state::MessageSubscriptionState::Opening
+    )
+}
+
 impl Engine {
     /// The compensation boundary events attached to the completed activity
     /// `element_id`, as `(boundary id, handler id)` pairs sorted by boundary id
@@ -729,7 +872,7 @@ impl Engine {
         &self,
         instance_key: Key,
         scope_eik: Key,
-        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+        teardown_idx: Option<&TeardownIndex<'_>>,
     ) -> Vec<Event> {
         let descendants = self.scope_descendants(instance_key, scope_eik);
         // An event sub-process trigger rests on its host **scope** (#1555) —
@@ -738,8 +881,9 @@ impl Engine {
         // cannot disarm it either. Every teardown of a scope (interrupting
         // boundary, modification terminate, error / terminate-end throw)
         // routes through here, so disarm the scope's own triggers first.
-        let mut events = self.disarm_event_subprocess_events(instance_key, scope_eik);
-        events.extend(self.element_teardown_events(instance_key, &descendants, user_tasks_by_eik));
+        let mut events =
+            self.disarm_event_subprocess_events_with(instance_key, scope_eik, teardown_idx);
+        events.extend(self.element_teardown_events(instance_key, &descendants, teardown_idx));
         self.push_scoped_compensation_cleared(&mut events, instance_key, scope_eik);
         events
     }
@@ -750,7 +894,7 @@ impl Engine {
     /// event sub-process uses it directly, so compensable activities completed
     /// in the scope stay compensable from inside the event sub-process.
     ///
-    /// `user_tasks_by_eik` is the caller's per-teardown element-instance →
+    /// `teardown_idx` is the caller's per-teardown element-instance →
     /// `Created` user-task index, when it already built one. When it is `None`
     /// (an interrupting boundary, an interrupting event sub-process, a thrown
     /// error / terminate end), the fallback is built ONCE here and shared across
@@ -762,7 +906,7 @@ impl Engine {
         &self,
         instance_key: Key,
         members: &[Key],
-        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+        teardown_idx: Option<&TeardownIndex<'_>>,
     ) -> Vec<Event> {
         // Zeebe terminates a container depth-first (#1535): the container's
         // TERMINATING, then each child's whole termination, then the
@@ -777,23 +921,17 @@ impl Engine {
         }
         let member_set: BTreeSet<Key> = members.iter().copied().collect();
         let fallback_index;
-        let user_tasks_by_eik = match user_tasks_by_eik {
+        let teardown_idx = match teardown_idx {
             Some(index) => Some(index),
             None => {
-                fallback_index = self.created_user_tasks_by_element_instance(instance_key);
+                fallback_index = self.teardown_index(instance_key);
                 Some(&fallback_index)
             }
         };
         let mut events = Vec::new();
         for &eik in members {
             if !member_set.contains(&self.scope_of(instance_key, eik)) {
-                self.push_member_teardown(
-                    &mut events,
-                    instance_key,
-                    eik,
-                    members,
-                    user_tasks_by_eik,
-                );
+                self.push_member_teardown(&mut events, instance_key, eik, members, teardown_idx);
             }
         }
         events
@@ -807,7 +945,7 @@ impl Engine {
         instance_key: Key,
         eik: Key,
         members: &[Key],
-        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+        teardown_idx: Option<&TeardownIndex<'_>>,
     ) {
         {
             let element_id = self
@@ -824,7 +962,7 @@ impl Engine {
                 });
                 return;
             }
-            if let Some(job_key) = self.active_job_on(eik) {
+            if let Some(job_key) = self.active_job_with(eik, teardown_idx) {
                 events.push(Event::JobCanceled {
                     job_key,
                     instance_key,
@@ -832,11 +970,11 @@ impl Engine {
                     deadline: None, // stamped centrally in `emit` (#1440)
                 });
             }
-            events.extend(self.cancel_all_timers_on(eik));
-            events.extend(self.cancel_all_subscriptions_on(eik));
-            events.extend(self.cancel_all_signal_subscriptions_on(eik));
-            events.extend(self.cancel_all_conditional_subscriptions_on(eik));
-            events.extend(self.cancel_created_user_tasks_on(eik, user_tasks_by_eik));
+            events.extend(self.cancel_all_timers_with(eik, teardown_idx));
+            events.extend(self.cancel_all_subscriptions_with(eik, teardown_idx));
+            events.extend(self.cancel_all_signal_subscriptions_with(eik, teardown_idx));
+            events.extend(self.cancel_all_conditional_subscriptions_with(eik, teardown_idx));
+            events.extend(self.cancel_created_user_tasks_on(eik, teardown_idx));
             // Resolve any incident parked on this element instance. Unlike the
             // whole-instance `ProcessInstanceTerminated` reducer (which closes
             // every open incident on the instance), scope teardown only removes
@@ -844,7 +982,7 @@ impl Engine {
             // so without this the instance keeps a stale `hasIncident` for a
             // descendant whose element is gone, and a later `IncidentResolved`
             // could enqueue a re-drive against the vanished token.
-            events.extend(self.resolve_incidents_on(instance_key, eik));
+            events.extend(self.resolve_incidents_with(instance_key, eik, teardown_idx));
             // Drop the runtime record of a multi-instance body / ad-hoc container
             // being torn down. `ElementCompleted` clears the body/container token
             // but not the `multi_instances` / `adhoc_instances` map (those are
@@ -891,18 +1029,12 @@ impl Engine {
             // its descendant call-child's termination (Zeebe's parent-before-child
             // order, #1535); its `ElementTerminated` still lands after the child's
             // teardown below.
-            if let Some(child) = self.call_activity_child_of(eik) {
-                events.extend(self.discard_instance_events(child));
+            if let Some(child) = self.call_activity_child_with(eik, teardown_idx) {
+                events.extend(self.discard_instance_events_with(child, teardown_idx));
             }
             for &child in members {
                 if child != eik && self.scope_of(instance_key, child) == eik {
-                    self.push_member_teardown(
-                        events,
-                        instance_key,
-                        child,
-                        members,
-                        user_tasks_by_eik,
-                    );
+                    self.push_member_teardown(events, instance_key, child, members, teardown_idx);
                 }
             }
             events.push(terminated);
@@ -1005,22 +1137,19 @@ impl Engine {
     /// [`discard_instance_events`](crate::engine::Engine::discard_instance_events)
     /// sweep, per element instance.
     ///
-    /// `user_tasks_by_eik` is the per-teardown element-instance → `Created`
+    /// `teardown_idx` is the per-teardown element-instance → `Created`
     /// user-task index built once by the enclosing teardown (see
-    /// [`crate::engine::Engine::created_user_tasks_by_element_instance`]); `None`
+    /// [`crate::engine::Engine::teardown_index`]); `None`
     /// (the default for callers outside such a teardown) falls back to scanning
     /// `state.user_tasks`. The index bucket is already key-ordered, so the emitted
     /// events are identical either way.
     pub(crate) fn cancel_created_user_tasks_on(
         &self,
         element_instance_key: Key,
-        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+        teardown_idx: Option<&TeardownIndex<'_>>,
     ) -> Vec<Event> {
-        let tasks: Vec<&state::UserTask> = match user_tasks_by_eik {
-            Some(index) => index
-                .get(&element_instance_key)
-                .cloned()
-                .unwrap_or_default(),
+        let tasks: Vec<&state::UserTask> = match teardown_idx {
+            Some(index) => bucket(&index.user_tasks, element_instance_key),
             None => {
                 // The `None` fallback scans every retained user task; a caller
                 // tearing down N members must not pay it N times — it builds the
@@ -1069,17 +1198,35 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
     ) -> Vec<Event> {
-        let mut incidents: Vec<&state::Incident> = self
-            .state
-            .incidents
-            .values()
-            .filter(|i| {
-                i.instance_key == instance_key
-                    && i.element_instance_key == element_instance_key
-                    && i.state == state::IncidentState::Active
-            })
-            .collect();
-        incidents.sort_by_key(|i| i.key);
+        self.resolve_incidents_with(instance_key, element_instance_key, None)
+    }
+
+    /// [`Self::resolve_incidents_on`] reading the shared [`TeardownIndex`]
+    /// when one is supplied (it only indexes `instance_key`'s incidents).
+    pub(crate) fn resolve_incidents_with(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        index: Option<&TeardownIndex<'_>>,
+    ) -> Vec<Event> {
+        let incidents: Vec<&state::Incident> = match index {
+            Some(index) => bucket(&index.incidents, element_instance_key),
+            None => {
+                self.count_resource_scan();
+                let mut v: Vec<&state::Incident> = self
+                    .state
+                    .incidents
+                    .values()
+                    .filter(|i| {
+                        i.instance_key == instance_key
+                            && i.element_instance_key == element_instance_key
+                            && i.state == state::IncidentState::Active
+                    })
+                    .collect();
+                v.sort_by_key(|i| i.key);
+                v
+            }
+        };
         incidents
             .into_iter()
             .map(|i| Event::IncidentResolved {
@@ -1096,16 +1243,32 @@ impl Engine {
     /// regardless of kind, returning the `TimerCanceled` events (sorted by key).
     /// Used to tear down a sub-process scope on interruption.
     pub(crate) fn cancel_all_timers_on(&self, element_instance_key: Key) -> Vec<Event> {
-        let mut timers: Vec<&state::Timer> = self
-            .state
-            .timers
-            .values()
-            .filter(|t| {
-                t.element_instance_key == element_instance_key
-                    && t.state == state::TimerState::Created
-            })
-            .collect();
-        timers.sort_by_key(|t| t.key);
+        self.cancel_all_timers_with(element_instance_key, None)
+    }
+
+    /// [`Self::cancel_all_timers_on`] reading the shared [`TeardownIndex`].
+    pub(crate) fn cancel_all_timers_with(
+        &self,
+        element_instance_key: Key,
+        index: Option<&TeardownIndex<'_>>,
+    ) -> Vec<Event> {
+        let timers: Vec<&state::Timer> = match index {
+            Some(index) => bucket(&index.timers, element_instance_key),
+            None => {
+                self.count_resource_scan();
+                let mut v: Vec<&state::Timer> = self
+                    .state
+                    .timers
+                    .values()
+                    .filter(|t| {
+                        t.element_instance_key == element_instance_key
+                            && t.state == state::TimerState::Created
+                    })
+                    .collect();
+                v.sort_by_key(|t| t.key);
+                v
+            }
+        };
         timers
             .into_iter()
             .map(|t| Event::TimerCanceled {
@@ -1121,20 +1284,31 @@ impl Engine {
     /// regardless of kind, returning the `MessageSubscriptionCanceled` events
     /// (sorted by key). Used to tear down a sub-process scope on interruption.
     pub(crate) fn cancel_all_subscriptions_on(&self, element_instance_key: Key) -> Vec<Event> {
-        let mut subs: Vec<&state::MessageSubscription> = self
-            .state
-            .message_subscriptions
-            .values()
-            .filter(|s| {
-                s.element_instance_key == element_instance_key
-                    && matches!(
-                        s.state,
-                        state::MessageSubscriptionState::Open
-                            | state::MessageSubscriptionState::Opening
-                    )
-            })
-            .collect();
-        subs.sort_by_key(|s| s.key);
+        self.cancel_all_subscriptions_with(element_instance_key, None)
+    }
+
+    /// [`Self::cancel_all_subscriptions_on`] reading the shared [`TeardownIndex`].
+    pub(crate) fn cancel_all_subscriptions_with(
+        &self,
+        element_instance_key: Key,
+        index: Option<&TeardownIndex<'_>>,
+    ) -> Vec<Event> {
+        let subs: Vec<&state::MessageSubscription> = match index {
+            Some(index) => bucket(&index.message_subscriptions, element_instance_key),
+            None => {
+                self.count_resource_scan();
+                let mut v: Vec<&state::MessageSubscription> = self
+                    .state
+                    .message_subscriptions
+                    .values()
+                    .filter(|s| {
+                        s.element_instance_key == element_instance_key && message_sub_open(s)
+                    })
+                    .collect();
+                v.sort_by_key(|s| s.key);
+                v
+            }
+        };
         subs.into_iter()
             .map(Self::disarm_subscription_event)
             .collect()
@@ -1178,19 +1352,131 @@ impl Engine {
     /// the job an interrupting boundary event cancels. At most one such job
     /// exists per element instance.
     pub(crate) fn active_job_on(&self, element_instance_key: Key) -> Option<Key> {
-        self.state
-            .jobs
-            .values()
-            .find(|j| {
-                j.element_instance_key == element_instance_key
-                    && !matches!(
-                        j.state,
-                        state::JobState::Completed
-                            | state::JobState::Errored
-                            | state::JobState::Canceled
-                    )
-            })
-            .map(|j| j.key)
+        self.active_job_with(element_instance_key, None)
+    }
+
+    /// [`Self::active_job_on`] reading the shared [`TeardownIndex`].
+    pub(crate) fn active_job_with(
+        &self,
+        element_instance_key: Key,
+        index: Option<&TeardownIndex<'_>>,
+    ) -> Option<Key> {
+        match index {
+            Some(index) => index
+                .jobs
+                .get(&element_instance_key)
+                .and_then(|b| b.first())
+                .map(|j| j.key),
+            None => {
+                self.count_resource_scan();
+                self.state
+                    .jobs
+                    .values()
+                    .find(|j| j.element_instance_key == element_instance_key && job_in_play(j))
+                    .map(|j| j.key)
+            }
+        }
+    }
+
+    /// The live resources of `instance_key`, gathered by one scan of each
+    /// resource map (counted by the #1767 probe).
+    pub(crate) fn instance_resources(&self, instance_key: Key) -> InstanceResources<'_> {
+        self.count_resource_scan();
+        InstanceResources::collect(&self.state, &BTreeSet::from([instance_key]))
+            .remove(&instance_key)
+            .unwrap_or_default()
+    }
+
+    /// [`Self::call_activity_child_of`] answered from a per-teardown index
+    /// when one is available (#1767).
+    pub(crate) fn call_activity_child_with(
+        &self,
+        call_eik: Key,
+        teardown_idx: Option<&TeardownIndex<'_>>,
+    ) -> Option<Key> {
+        match teardown_idx {
+            Some(idx) => idx.callee_of.get(&call_eik).copied(),
+            None => self.call_activity_child_of(call_eik),
+        }
+    }
+
+    /// Builds the [`TeardownIndex`] for `instance_key`: one pass over each
+    /// resource map, keeping only the instance's live resources (#1767).
+    pub(crate) fn teardown_index(&self, instance_key: Key) -> TeardownIndex<'_> {
+        #[cfg(test)]
+        self.user_task_scan_count
+            .set(self.user_task_scan_count.get() + 1);
+        self.count_resource_scan();
+        let st = &self.state;
+        let mine = |ik: Key, eik: Key| (ik == instance_key).then_some(eik);
+        let callee_of = self.live_callees_of_instance(instance_key);
+        let callees: BTreeSet<Key> = callee_of.values().copied().collect();
+        TeardownIndex {
+            user_tasks: index_by(st.user_tasks.values(), |t| {
+                if t.state == state::UserTaskState::Created {
+                    mine(t.instance_key, t.element_instance_key)
+                } else {
+                    None
+                }
+            }),
+            jobs: index_by(st.jobs.values(), |j| {
+                if job_in_play(j) {
+                    mine(j.instance_key, j.element_instance_key)
+                } else {
+                    None
+                }
+            }),
+            timers: index_by(st.timers.values(), |t| {
+                if t.state == state::TimerState::Created {
+                    mine(t.instance_key, t.element_instance_key)
+                } else {
+                    None
+                }
+            }),
+            message_subscriptions: index_by(st.message_subscriptions.values(), |s| {
+                if message_sub_open(s) {
+                    mine(s.instance_key, s.element_instance_key)
+                } else {
+                    None
+                }
+            }),
+            signal_subscriptions: index_by(st.signal_subscriptions.values(), |s| {
+                if s.state == state::MessageSubscriptionState::Open {
+                    mine(s.instance_key, s.element_instance_key)
+                } else {
+                    None
+                }
+            }),
+            conditional_subscriptions: index_by(st.conditional_subscriptions.values(), |s| {
+                if s.state == state::MessageSubscriptionState::Open {
+                    mine(s.instance_key, s.element_instance_key)
+                } else {
+                    None
+                }
+            }),
+            incidents: index_by(st.incidents.values(), |i| {
+                if i.state == state::IncidentState::Active {
+                    mine(i.instance_key, i.element_instance_key)
+                } else {
+                    None
+                }
+            }),
+            callee_resources: if callees.is_empty() {
+                BTreeMap::new()
+            } else {
+                InstanceResources::collect(st, &callees)
+            },
+            callee_of,
+        }
+    }
+
+    /// Test-only probe hook (#1767): counts every full scan of a non-user-task
+    /// resource map a teardown performs (per-call fallbacks and index builds).
+    #[inline]
+    pub(crate) fn count_resource_scan(&self) {
+        #[cfg(test)]
+        self.resource_scan_count
+            .set(self.resource_scan_count.get() + 1);
     }
 
     /// The boundary events of `def` attached to `activity_id` that arm a
@@ -1967,16 +2253,32 @@ impl Engine {
         &self,
         element_instance_key: Key,
     ) -> Vec<Event> {
-        let mut subs: Vec<&state::SignalSubscription> = self
-            .state
-            .signal_subscriptions
-            .values()
-            .filter(|s| {
-                s.element_instance_key == element_instance_key
-                    && s.state == state::MessageSubscriptionState::Open
-            })
-            .collect();
-        subs.sort_by_key(|s| s.key);
+        self.cancel_all_signal_subscriptions_with(element_instance_key, None)
+    }
+
+    /// [`Self::cancel_all_signal_subscriptions_on`] reading the shared [`TeardownIndex`].
+    pub(crate) fn cancel_all_signal_subscriptions_with(
+        &self,
+        element_instance_key: Key,
+        index: Option<&TeardownIndex<'_>>,
+    ) -> Vec<Event> {
+        let subs: Vec<&state::SignalSubscription> = match index {
+            Some(index) => bucket(&index.signal_subscriptions, element_instance_key),
+            None => {
+                self.count_resource_scan();
+                let mut v: Vec<&state::SignalSubscription> = self
+                    .state
+                    .signal_subscriptions
+                    .values()
+                    .filter(|s| {
+                        s.element_instance_key == element_instance_key
+                            && s.state == state::MessageSubscriptionState::Open
+                    })
+                    .collect();
+                v.sort_by_key(|s| s.key);
+                v
+            }
+        };
         subs.into_iter()
             .map(|s| Event::SignalSubscriptionCanceled {
                 subscription_key: s.key,
@@ -1994,16 +2296,32 @@ impl Engine {
         &self,
         element_instance_key: Key,
     ) -> Vec<Event> {
-        let mut subs: Vec<&state::ConditionalSubscription> = self
-            .state
-            .conditional_subscriptions
-            .values()
-            .filter(|s| {
-                s.element_instance_key == element_instance_key
-                    && s.state == state::MessageSubscriptionState::Open
-            })
-            .collect();
-        subs.sort_by_key(|s| s.key);
+        self.cancel_all_conditional_subscriptions_with(element_instance_key, None)
+    }
+
+    /// [`Self::cancel_all_conditional_subscriptions_on`] reading the shared [`TeardownIndex`].
+    pub(crate) fn cancel_all_conditional_subscriptions_with(
+        &self,
+        element_instance_key: Key,
+        index: Option<&TeardownIndex<'_>>,
+    ) -> Vec<Event> {
+        let subs: Vec<&state::ConditionalSubscription> = match index {
+            Some(index) => bucket(&index.conditional_subscriptions, element_instance_key),
+            None => {
+                self.count_resource_scan();
+                let mut v: Vec<&state::ConditionalSubscription> = self
+                    .state
+                    .conditional_subscriptions
+                    .values()
+                    .filter(|s| {
+                        s.element_instance_key == element_instance_key
+                            && s.state == state::MessageSubscriptionState::Open
+                    })
+                    .collect();
+                v.sort_by_key(|s| s.key);
+                v
+            }
+        };
         subs.into_iter()
             .map(|s| Event::ConditionalSubscriptionCanceled {
                 subscription_key: s.key,

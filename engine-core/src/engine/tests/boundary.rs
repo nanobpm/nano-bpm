@@ -1899,7 +1899,7 @@ fn interrupting_boundary_terminates_the_activity_and_cancels_its_user_task() {
 
 /// #1528 (review): an interrupting boundary on a multi-instance USER TASK tears
 /// down N parallel children through `element_teardown_events` with NO caller
-/// index (`user_tasks_by_eik: None`), which must build its fallback
+/// index (`teardown_idx: None`), which must build its fallback
 /// element-instance → `Created` user-task index ONCE and share it across the
 /// member list — not rescan the whole `state.user_tasks` map once per child (an
 /// O(N × tasks) blow-up). This test drives a 32-child interrupt and asserts the
@@ -2208,8 +2208,8 @@ fn created_user_task_index_is_scoped_to_the_teardown_instance() {
             .unwrap();
         keys.push(created.iter().find_map(|e| e.instance_key()).unwrap());
     }
-    let index = engine.created_user_tasks_by_element_instance(keys[0]);
-    let tasks: Vec<_> = index.values().flatten().collect();
+    let index = engine.teardown_index(keys[0]);
+    let tasks: Vec<_> = index.user_tasks.values().flatten().collect();
     assert_eq!(tasks.len(), 1, "only the target instance's task is indexed");
     assert!(tasks.iter().all(|t| t.instance_key == keys[0]));
 }
