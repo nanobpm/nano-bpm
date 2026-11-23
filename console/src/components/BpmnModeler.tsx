@@ -87,10 +87,7 @@ import {
   type AgentModdleElement,
   type AgentModeling,
 } from "../lib/agentTask";
-import {
-  DocumentLoadGate,
-  type LoadAttempt,
-} from "../lib/documentLoadGate";
+import { DocumentLoadGate, type LoadAttempt } from "../lib/documentLoadGate";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";

@@ -1,10 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import Modeler from "dmn-js/lib/Modeler";
 import type { FeelVariable } from "../lib/dmnDomainVariables";
-import {
-  DocumentLoadGate,
-  type LoadAttempt,
-} from "../lib/documentLoadGate";
+import { DocumentLoadGate, type LoadAttempt } from "../lib/documentLoadGate";
 import "dmn-js/dist/assets/diagram-js.css";
 import "dmn-js/dist/assets/dmn-js-shared.css";
 import "dmn-js/dist/assets/dmn-js-drd.css";

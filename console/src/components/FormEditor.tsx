@@ -6,10 +6,7 @@ import {
 import "@bpmn-io/form-js/dist/assets/form-js.css";
 import "@bpmn-io/form-js/dist/assets/form-js-editor.css";
 import { createFormDataBindingModule } from "../lib/formDataBindingProperties";
-import {
-  DocumentLoadGate,
-  type LoadAttempt,
-} from "../lib/documentLoadGate";
+import { DocumentLoadGate, type LoadAttempt } from "../lib/documentLoadGate";
 
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | { [key: string]: JsonValue } | JsonValue[];
