@@ -1,0 +1,46 @@
+name: cargo-xwin CRT/SDK (cached)
+description: >-
+  Restore cargo-xwin's Microsoft CRT/SDK download (~1.5 GB) from the Actions
+  cache and point cargo-xwin at it via XWIN_CACHE_DIR. The `xwin`
+  clippy-matrix entries (#1372) cross-check the MSVC target from the Linux
+  runner; without this cache every cold run re-downloaded the CRT/SDK from
+  Microsoft's aka.ms, so an outage there fails a required gate on a PR whose
+  code is fine — the same defect class as the uncached libduckdb (#1461) and
+  openapi-generator (#1684) downloads. The key embeds the resolved cargo-xwin
+  version, so a tool bump busts the cache; only a cold cache touches the
+  network. The Install cargo-xwin step must run BEFORE this action (the key
+  derives from the installed binary's version).
+runs:
+  using: composite
+  steps:
+    - name: Resolve the installed cargo-xwin version
+      id: ver
+      shell: bash
+      # `cargo xwin --version` prints e.g. `cargo-xwin-xwin 0.24.1`; take the
+      # trailing semver. The CRT/SDK layout cargo-xwin produces is a function
+      # of its own version (and the default --xwin-version 17 it resolves), so
+      # the cache is keyed on it: a cargo-xwin bump must not restore a stale
+      # sysroot.
+      run: |
+        set -euo pipefail
+        v="$(cargo xwin --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        test -n "$v" || { echo "::error::could not parse cargo-xwin version"; exit 1; }
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+    - name: Cache the cargo-xwin CRT/SDK
+      id: cache
+      uses: actions/cache@v4
+      with:
+        # XWIN_CACHE_DIR (exported below) redirects cargo-xwin's default
+        # ~/.cache/cargo-xwin here, so the cached path is the one it reads.
+        path: ~/.cache/cargo-xwin
+        key: cargo-xwin-${{ runner.os }}-${{ runner.arch }}-${{ steps.ver.outputs.version }}
+    - name: Point cargo-xwin at the cached CRT/SDK
+      shell: bash
+      # XWIN_ARCH=x86_64: the clippy matrix only ever cross-checks
+      # x86_64-pc-windows-msvc, so skip the default aarch64 half of the CRT/SDK
+      # download — it roughly halves both the cold download and the cache entry.
+      run: |
+        {
+          echo "XWIN_CACHE_DIR=$HOME/.cache/cargo-xwin"
+          echo "XWIN_ARCH=x86_64"
+        } >> "$GITHUB_ENV"

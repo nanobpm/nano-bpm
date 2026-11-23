@@ -11634,6 +11634,8 @@ mod tests {
     /// A unique, env-free temp directory for tests that pass explicit paths and
     /// therefore must NOT mutate the shared `NANOBPMN_PROJECTS_DIR` (unlike
     /// [`temp_root`]) — mutating that global would race the env-dependent tests.
+    /// Unix-only: its only callers drive a `#!/bin/sh` urban stub.
+    #[cfg(unix)]
     fn isolated_tmp(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(

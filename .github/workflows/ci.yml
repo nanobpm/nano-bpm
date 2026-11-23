@@ -688,7 +688,11 @@ jobs:
         run: npm test
 
   engine-testkit-npm:
-    name: '@nanobpm/engine-testkit (build + test)'
+    # Deliberately NOT '@nanobpm/engine-testkit (build + test)': Mergify parses a
+    # leading @scope/name as an app-qualified check from the wrong publisher and
+    # never matches the GitHub Actions result (#1138), so a required check must
+    # not start with @ (guarded by console/scripts/merge-gates.test.mjs).
+    name: 'engine-testkit (build + test)'
     runs-on: ubuntu-24.04
     needs: [changes]
     if: *code_gate
@@ -701,7 +705,7 @@ jobs:
         with:
           node-version: '24'
       - name: Install
-        run: npm install
+        run: npm ci
       - name: Type-check
         run: npm run typecheck
       - name: Build
@@ -1210,6 +1214,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
+          # The Windows clippy-matrix entries (#1372) cross-check the MSVC target.
+          targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: processos
@@ -1217,7 +1223,26 @@ jobs:
         uses: ./.github/actions/build-tools
         with:
           mold: 'true'
+          # `llvm` supplies llvm-lib: cargo-xwin points cc-rs's MSVC archiver
+          # (AR_x86_64_pc_windows_msvc) at it, and the runner image ships only
+          # clang, so the xwin entries fail "failed to find tool llvm-lib"
+          # without it (#1372).
+          apt: llvm
       - uses: taiki-e/install-action@nextest
+      - name: Install cargo-xwin (Windows clippy cross-check, #1372)
+        # The `xwin` clippy-matrix entries lint the cfg(windows) / not(unix) code
+        # from this Linux runner; cargo-xwin supplies the MSVC CRT/SDK headers
+        # the C build scripts (ring, …) need. Check only, nothing links.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+      # Restore cargo-xwin's ~1.5 GB CRT/SDK download from the Actions cache so
+      # a Microsoft aka.ms outage cannot fail this required gate on a cold cache
+      # (the same defect class as the uncached libduckdb #1461 / openapi-generator
+      # #1684 downloads). Must run AFTER the install: the key derives from the
+      # resolved cargo-xwin version.
+      - name: cargo-xwin CRT/SDK (cached)
+        uses: ./.github/actions/xwin-cache
       # Link the prebuilt DuckDB from the Actions cache via DUCKDB_LIB_DIR
       # (which libduckdb-sys prefers over DUCKDB_DOWNLOAD_LIB), so a GitHub
       # Releases outage cannot fail this gate on a warm cache (#1461). The lib
@@ -1261,6 +1286,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
+          # The Windows clippy-matrix entries (#1372) cross-check the MSVC target.
+          targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
@@ -1268,7 +1295,26 @@ jobs:
         uses: ./.github/actions/build-tools
         with:
           mold: 'true'
+          # `llvm` supplies llvm-lib: cargo-xwin points cc-rs's MSVC archiver
+          # (AR_x86_64_pc_windows_msvc) at it, and the runner image ships only
+          # clang, so the xwin entries fail "failed to find tool llvm-lib"
+          # without it (#1372).
+          apt: llvm
       - uses: taiki-e/install-action@nextest
+      - name: Install cargo-xwin (Windows clippy cross-check, #1372)
+        # The `xwin` clippy-matrix entries lint the cfg(windows) / not(unix) code
+        # from this Linux runner; cargo-xwin supplies the MSVC CRT/SDK headers
+        # the C build scripts (ring, …) need. Check only, nothing links.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+      # Restore cargo-xwin's ~1.5 GB CRT/SDK download from the Actions cache so
+      # a Microsoft aka.ms outage cannot fail this required gate on a cold cache
+      # (the same defect class as the uncached libduckdb #1461 / openapi-generator
+      # #1684 downloads). Must run AFTER the install: the key derives from the
+      # resolved cargo-xwin version.
+      - name: cargo-xwin CRT/SDK (cached)
+        uses: ./.github/actions/xwin-cache
       - name: Restore the cached openapi-generator JAR (#1684)
         uses: ./.github/actions/openapi-generator-cache
       - name: Generate REST layer + stub impls
