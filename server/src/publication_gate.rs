@@ -16,8 +16,11 @@
 //! nor blocks forever on a dead target. The guard releases on drop, so a
 //! panicking or cancelled routing owner can never wedge publications.
 //!
-//! The registry is node-local: it orders publishes entering through (or
-//! fanned out to) the node whose create owner routes the opens.
+//! The registry is node-local: it orders only publishes that apply on the node
+//! whose create owner routes the opens. Creates answer early only on a single
+//! node. With peers they keep route-before-answer, because a publish can apply
+//! on a node whose gate never saw the open (see
+//! `ServerImpl::answer_and_route_create`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
