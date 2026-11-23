@@ -2915,6 +2915,33 @@ mod converted_lock_poison_tests {
     }
 }
 
+/// Why [`ServerImpl::correlate_message_cluster`] did not correlate.
+#[derive(Debug)]
+enum CorrelateError {
+    /// The engine rejected the publish (an out-of-range business id) — 400.
+    Engine(EngineError),
+    /// A matching subscription open is still pending past the publication-gate
+    /// deadline (#1604): retryable 503, never an unmatched apply.
+    SubscriptionOpenPending,
+}
+
+impl From<EngineError> for CorrelateError {
+    fn from(e: EngineError) -> Self {
+        Self::Engine(e)
+    }
+}
+
+impl std::fmt::Display for CorrelateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine(e) => write!(f, "{e}"),
+            Self::SubscriptionOpenPending => f.write_str(
+                "a matching subscription open is still being routed; retry the publication",
+            ),
+        }
+    }
+}
+
 /// One recorded terminal status of a job's lifecycle as reported by a worker:
 /// `Completed` or `Failed`. Thrown BPMN errors are tracked separately (they are
 /// business errors, not job failures — see [`JobStatisticsState::errors`]).
@@ -3830,6 +3857,11 @@ pub struct ServerImpl {
     /// (#1604): publishes for a pending `(name, correlation key)` wait (bounded)
     /// until the create's routing owner has opened the subscription.
     publication_gate: publication_gate::PublicationGate,
+    /// Test-only override for [`publication_gate_deadline`], so tests can
+    /// exercise gate expiry deterministically in milliseconds rather than
+    /// waiting out the full production re-drive budget.
+    #[cfg(test)]
+    publication_gate_deadline_override: Arc<std::sync::Mutex<Option<std::time::Duration>>>,
     /// Per-partition lock serializing a core REBUILD (promote / rebuild-as-receiver /
     /// shutdown auto-recovery): the old core is fully shut down and awaited, then the
     /// new core is constructed and registered, all under the partition's lock. Without
@@ -4461,6 +4493,8 @@ impl ServerImpl {
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             route_redrives: Arc::new(AtomicU64::new(0)),
             publication_gate: publication_gate::PublicationGate::default(),
+            #[cfg(test)]
+            publication_gate_deadline_override: Arc::new(std::sync::Mutex::new(None)),
             partition_rebuild_locks: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -10899,22 +10933,6 @@ impl ServerImpl {
         // another rejects it. It is `CorrelateMessage`'s only failure mode, so
         // the per-partition apply below cannot fail.
         nanobpmn_engine_core::check_business_id(business_id.as_deref())?;
-        // Publication gate (#1604): a create answers at commit and routes its
-        // cross-partition subscription opens afterwards, so a publish issued
-        // the moment the create returned must not overtake the open (it would
-        // correlate against nothing and be discarded). Wait — bounded — until
-        // every pending open for this `(name, correlation key)` is routed.
-        // This precedes both the local apply and the cluster fan-out.
-        if self
-            .publication_gate
-            .wait(&name, &correlation_key, publication_gate_deadline())
-            .await
-            == publication_gate::GateWait::TimedOut
-        {
-            tracing::warn!(
-                "publish of {name:?} proceeds with its subscription open still pending after the gate deadline"
-            );
-        }
         let num_partitions = self.engine.topology().num_partitions;
         // The (deduplicated) partitions that can own a matching subscription: the
         // correlation-key hash partition (catch/boundary) + partition 0 (starts).
@@ -11056,7 +11074,27 @@ impl ServerImpl {
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         business_id: Option<String>,
         operation_reference: Option<i64>,
-    ) -> Result<(Option<u64>, Option<u64>), EngineError> {
+    ) -> Result<(Option<u64>, Option<u64>), CorrelateError> {
+        // Publication gate (#1604): a create answers at commit and routes its
+        // cross-partition subscription opens afterwards, so a publish issued
+        // the moment the create returned must not overtake the open (it would
+        // correlate against nothing and be discarded). Wait — bounded — until
+        // every pending open for this `(name, correlation key)` is routed. If
+        // the open is STILL pending at the deadline (e.g. the serial routing
+        // pump is stalled on another target), fail closed with a retryable
+        // error rather than applying unmatched and silently losing the message.
+        if self
+            .publication_gate
+            .wait(
+                &name,
+                &correlation_key,
+                self.effective_publication_gate_deadline(),
+            )
+            .await
+            == publication_gate::GateWait::TimedOut
+        {
+            return Err(CorrelateError::SubscriptionOpenPending);
+        }
         let engine_vars: std::collections::BTreeMap<String, Value> = variables
             .as_ref()
             .map(|m| {
@@ -11335,6 +11373,18 @@ impl ServerImpl {
     /// the route-before-answer ordering.
     fn create_answers_before_routing(&self) -> bool {
         !self.peers.has_peers()
+    }
+
+    fn effective_publication_gate_deadline(&self) -> std::time::Duration {
+        #[cfg(test)]
+        if let Some(d) = *self
+            .publication_gate_deadline_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return d;
+        }
+        publication_gate_deadline()
     }
 
     /// The one canonical answer/route ordering for a committed create (#1582,
@@ -13651,8 +13701,15 @@ impl ServerImpl {
             .await
         {
             Ok(correlated) => correlated,
-            // An out-of-range businessId (the only correlation failure).
-            Err(e) => {
+            Err(e @ CorrelateError::SubscriptionOpenPending) => {
+                return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "UNAVAILABLE",
+                    503,
+                    e.to_string(),
+                )));
+            }
+            // An out-of-range businessId (the only engine correlation failure).
+            Err(e @ CorrelateError::Engine(_)) => {
                 return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                     "INVALID_ARGUMENT",
                     400,
@@ -13710,8 +13767,15 @@ impl ServerImpl {
             .await
         {
             Ok(correlated) => correlated,
-            // An out-of-range businessId (the only correlation failure).
-            Err(e) => {
+            Err(e @ CorrelateError::SubscriptionOpenPending) => {
+                return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "UNAVAILABLE",
+                    503,
+                    e.to_string(),
+                )));
+            }
+            // An out-of-range businessId (the only engine correlation failure).
+            Err(e @ CorrelateError::Engine(_)) => {
                 return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                     "INVALID_ARGUMENT",
                     400,
@@ -34771,10 +34835,10 @@ mod clustered_startup_tests {
         assert_eq!(server.required_cluster_features().await, Some(Vec::new()));
         let handle = server.engine_handle_for(0).expect("partition 0 hosted");
         handle.spawn_job(|_journal| panic!("kill the engine actor"));
-        for _ in 0..200 {
-            if !handle.is_alive() {
-                break;
-            }
+        // Bounded by wall time, not iterations: under full-suite load the
+        // actor thread's unwind can take well over a second to be observed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while handle.is_alive() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(!handle.is_alive(), "precondition: actor is dead");
@@ -54219,11 +54283,9 @@ mod subscription_placement_tests {
             let order = order.clone();
             tokio::spawn(async move {
                 server
-                    .correlate_message_local(
+                    .correlate_message_cluster(
                         "payment-received".to_string(),
                         order,
-                        std::collections::BTreeMap::new(),
-                        None,
                         None,
                         None,
                         None,
@@ -54246,6 +54308,209 @@ mod subscription_placement_tests {
             .expect("the publisher task")
             .expect("the publish applies");
         assert_eq!(correlated, Some(created.instance_key));
+    }
+
+    /// Two parallel message catches whose correlation keys route to two
+    /// distinct partitions (`=keyA` and `=keyB`), used to verify that a stall
+    /// on the first routed target cannot cause a publish to the healthy second
+    /// target to overtake its still-pending subscription open and lose the
+    /// message (#1604).
+    const PARALLEL_TWO_CATCH_BPMN: &str = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="await-two-messages">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="fork" />
+          <bpmn:intermediateCatchEvent id="catch_a">
+            <bpmn:messageEventDefinition messageRef="Msg_A" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:intermediateCatchEvent id="catch_b">
+            <bpmn:messageEventDefinition messageRef="Msg_B" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:parallelGateway id="join" />
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="fork" />
+          <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="catch_a" />
+          <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="catch_b" />
+          <bpmn:sequenceFlow id="f3" sourceRef="catch_a" targetRef="join" />
+          <bpmn:sequenceFlow id="f4" sourceRef="catch_b" targetRef="join" />
+          <bpmn:sequenceFlow id="f5" sourceRef="join" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="Msg_A" name="msg-a">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=keyA" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+        <bpmn:message id="Msg_B" name="msg-b">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=keyB" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+
+    /// #1604: when a create opens subscriptions on two different partitions, a
+    /// stall on the FIRST routed target holds the serial routing pump past the
+    /// gate deadline, leaving the SECOND subscription unsubmitted. Publishing
+    /// or correlating to the healthy second target must fail retryably (503)
+    /// rather than proceeding unmatched and silently losing the message; once
+    /// the stall clears and the open lands, a retried publish/correlate
+    /// succeeds and correlates.
+    #[tokio::test]
+    async fn two_target_stall_past_gate_deadline_fails_retryably_instead_of_losing_message() {
+        let server = single_node_multi_partition();
+        *server
+            .publication_gate_deadline_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Duration::from_millis(80));
+        server
+            .deploy_centralized(
+                vec![("await-two.bpmn".into(), PARALLEL_TWO_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+
+        let create_partition = server.engine.for_create().stats().partition;
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+
+        // Pick two correlation keys that map to two DISTINCT partitions, both
+        // distinct from `create_partition`. Note: `drive_subscription_routing_now`
+        // pops from the back of `work`, so `catch_b` is routed first and
+        // `catch_a` second — stall whichever target is popped first.
+        let key_a = cross_partition_order(create_partition);
+        let target_a = nanobpmn_engine_core::subscription_partition(&key_a, 4);
+        let key_b = (0..256u32)
+            .map(|i| format!("gate-b-{i}"))
+            .find(|k| {
+                let t = nanobpmn_engine_core::subscription_partition(k, 4);
+                t != create_partition && t != target_a
+            })
+            .expect("a second distinct cross-partition correlation key exists");
+        let target_b = nanobpmn_engine_core::subscription_partition(&key_b, 4);
+        assert_ne!(target_a, target_b);
+
+        // Stall `target_b` (the first target popped by `work.pop()`), leaving
+        // `target_a` completely healthy.
+        let stalled_engine = server
+            .engine_handle_for(target_b)
+            .expect("the stalled target partition is local");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = tokio::spawn(async move {
+            stalled_engine
+                .with_low(move |_journal| {
+                    let _ = parked_tx.send(());
+                    release_rx.blocking_recv().ok();
+                })
+                .await;
+        });
+        parked_rx.await.expect("the barrier holds target_b's actor");
+
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("keyA".to_string(), Value::Str(key_a.clone()));
+        variables.insert("keyB".to_string(), Value::Str(key_b.clone()));
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
+            let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                engine.state(),
+                Some("await-two-messages".into()),
+                None,
+                None,
+            )?;
+            apply_create_instance_direct(
+                engine,
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    variables,
+                    Vec::new(),
+                    None,
+                    sel_key,
+                    sel_ver,
+                ),
+                &process_id,
+            )
+            .map_err(|e| (500, e.to_string()))
+        });
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the create answers at commit despite stalled target_b")
+            .expect("the detached owner is alive")
+            .expect("the create applied");
+        assert!(
+            server.publication_gate.is_pending("msg-a", &key_a),
+            "msg-a's open is pending while target_b stalls the serial pump"
+        );
+
+        // Publish to the HEALTHY second target (`msg-a` / `key_a`) while
+        // `target_b` stays stalled past the 80ms gate deadline. Must return a
+        // retryable 503 — NOT 200 (unmatched, silently losing the message).
+        let publish_req = models::MessagePublicationRequest {
+            name: "msg-a".to_string(),
+            correlation_key: Some(key_a.clone()),
+            time_to_live: None,
+            message_id: None,
+            variables: None,
+            tenant_id: None,
+            business_id: None,
+        };
+        let pub_resp = server
+            .publish_message_impl(&publish_req)
+            .await
+            .expect("handler returns response");
+        assert!(
+            matches!(
+                pub_resp,
+                apis::message::PublishMessageResponse::Status503_TheServiceIsCurrentlyUnavailable(
+                    _
+                )
+            ),
+            "publish to healthy target_a while open is still pending must fail retryably with 503, got: {pub_resp:?}"
+        );
+
+        // Same for `correlate_message_impl`: must return retryable 503, NOT
+        // 404 (which would falsely claim no subscription matched).
+        let corr_req = models::MessageCorrelationRequest {
+            name: "msg-a".to_string(),
+            correlation_key: Some(key_a.clone()),
+            variables: None,
+            tenant_id: None,
+            business_id: None,
+        };
+        let corr_resp = server
+            .correlate_message_impl(&corr_req)
+            .await
+            .expect("handler returns response");
+        assert!(
+            matches!(
+                corr_resp,
+                apis::message::CorrelateMessageResponse::Status503_TheServiceIsCurrentlyUnavailable(
+                    _
+                )
+            ),
+            "correlate to healthy target_a while open is still pending must fail retryably with 503, got: {corr_resp:?}"
+        );
+
+        // Release target_b's stall; the routing pump now delivers both opens
+        // and releases the gate. Retrying correlation for msg-a must succeed
+        // and correlate to the instance.
+        release_tx.send(()).expect("the barrier is parked");
+        barrier.await.expect("the barrier completes");
+        let retry_resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.correlate_message_impl(&corr_req),
+        )
+        .await
+        .expect("retry completes once stall clears")
+        .expect("handler returns response");
+        match retry_resp {
+            apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(res) => {
+                assert_eq!(res.process_instance_key.0, created.instance_key.to_string());
+            }
+            other => panic!("retried correlate after stall cleared must correlate, got: {other:?}"),
+        }
     }
 
     /// #1582: a source with no replica of the target rotates its forwards
