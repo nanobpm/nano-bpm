@@ -8636,6 +8636,7 @@ impl ServerImpl {
     async fn cancel_process_instance_impl(
         &self,
         path_params: &models::CancelProcessInstancePathParams,
+        body: &Option<models::CancelProcessInstanceRequest>,
     ) -> Result<apis::process_instance::CancelProcessInstanceResponse, ()> {
         use apis::process_instance::CancelProcessInstanceResponse as Resp;
 
@@ -8653,7 +8654,14 @@ impl ServerImpl {
             }
         };
 
-        Ok(match self.cancel_instance_core(instance_key).await {
+        // Camunda `CancelProcessInstanceRequest.operationReference` (#1606):
+        // stamped on every record the cancel produces.
+        let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
+
+        let outcome = self
+            .cancel_instance_core(instance_key, operation_reference)
+            .await;
+        Ok(match outcome {
             CancelInstanceOutcome::Canceled => Resp::Status204_TheProcessInstanceIsCanceled,
             CancelInstanceOutcome::NotFound(detail) => {
                 Resp::Status404_TheProcessInstanceIsNotFound(problem(
@@ -8682,6 +8690,7 @@ impl ServerImpl {
     async fn suspend_process_instance_impl(
         &self,
         path_params: &models::SuspendProcessInstancePathParams,
+        body: &Option<models::SuspendProcessInstanceRequest>,
     ) -> Result<apis::process_instance::SuspendProcessInstanceResponse, ()> {
         use apis::process_instance::SuspendProcessInstanceResponse as Resp;
 
@@ -8699,7 +8708,14 @@ impl ServerImpl {
             }
         };
 
-        Ok(match self.suspend_instance_core(instance_key).await {
+        // Camunda `SuspendProcessInstanceRequest.operationReference` (#1606):
+        // stamped on every record the suspend produces.
+        let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
+
+        let outcome = self
+            .suspend_instance_core(instance_key, operation_reference)
+            .await;
+        Ok(match outcome {
             TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsSuspended,
             TransitionInstanceOutcome::Conflict(detail) => {
                 Resp::Status409_TheProcessInstanceIsNotInTheACTIVEStateAndCannotBeSuspended(
@@ -8733,6 +8749,7 @@ impl ServerImpl {
     async fn resume_process_instance_impl(
         &self,
         path_params: &models::ResumeProcessInstancePathParams,
+        body: &Option<models::ResumeProcessInstanceRequest>,
     ) -> Result<apis::process_instance::ResumeProcessInstanceResponse, ()> {
         use apis::process_instance::ResumeProcessInstanceResponse as Resp;
 
@@ -8750,7 +8767,14 @@ impl ServerImpl {
             }
         };
 
-        Ok(match self.resume_instance_core(instance_key).await {
+        // Camunda `ResumeProcessInstanceRequest.operationReference` (#1606):
+        // stamped on every record the resume produces.
+        let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
+
+        let outcome = self
+            .resume_instance_core(instance_key, operation_reference)
+            .await;
+        Ok(match outcome {
             TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsResumed,
             TransitionInstanceOutcome::Conflict(detail) => {
                 Resp::Status409_TheProcessInstanceIsNotInTheSUSPENDEDStateAndCannotBeResumed(
@@ -10186,12 +10210,19 @@ impl ServerImpl {
     /// (`POST /v2/process-instances/{key}/cancellation`) and the console
     /// operator endpoint so the engine-command and clustering semantics have a
     /// single source of truth.
-    pub(crate) async fn cancel_instance_core(&self, instance_key: u64) -> CancelInstanceOutcome {
+    pub(crate) async fn cancel_instance_core(
+        &self,
+        instance_key: u64,
+        operation_reference: Option<i64>,
+    ) -> CancelInstanceOutcome {
         use CancelInstanceOutcome as Out;
 
         if let Some(node) = self.route_by_leader(instance_key) {
             return match self.peer_link(node).await {
-                Ok(link) => match link.cancel_instance(instance_key.to_string()).await {
+                Ok(link) => match link
+                    .cancel_instance(instance_key.to_string(), operation_reference)
+                    .await
+                {
                     Ok(r) if is_ok_status(r.status) => Out::Canceled,
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
@@ -10203,7 +10234,11 @@ impl ServerImpl {
         }
 
         match self
-            .apply_partition_command(instance_key, Command::cancel_instance(instance_key))
+            .apply_partition_command_ref(
+                instance_key,
+                Command::cancel_instance(instance_key),
+                operation_reference,
+            )
             .await
         {
             Ok(_) => Out::Canceled,
@@ -10220,12 +10255,16 @@ impl ServerImpl {
     pub(crate) async fn suspend_instance_core(
         &self,
         instance_key: u64,
+        operation_reference: Option<i64>,
     ) -> TransitionInstanceOutcome {
         use TransitionInstanceOutcome as Out;
 
         if let Some(node) = self.route_by_leader(instance_key) {
             return match self.peer_link(node).await {
-                Ok(link) => match link.suspend_instance(instance_key.to_string()).await {
+                Ok(link) => match link
+                    .suspend_instance(instance_key.to_string(), operation_reference)
+                    .await
+                {
                     Ok(r) if is_ok_status(r.status) => Out::Ok,
                     Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
@@ -10237,7 +10276,9 @@ impl ServerImpl {
             };
         }
 
-        self.suspend_instance_local(instance_key).await.into()
+        self.suspend_instance_local(instance_key, operation_reference)
+            .await
+            .into()
     }
 
     /// Surface-independent core of "resume a process instance". Mirrors
@@ -10245,12 +10286,16 @@ impl ServerImpl {
     pub(crate) async fn resume_instance_core(
         &self,
         instance_key: u64,
+        operation_reference: Option<i64>,
     ) -> TransitionInstanceOutcome {
         use TransitionInstanceOutcome as Out;
 
         if let Some(node) = self.route_by_leader(instance_key) {
             return match self.peer_link(node).await {
-                Ok(link) => match link.resume_instance(instance_key.to_string()).await {
+                Ok(link) => match link
+                    .resume_instance(instance_key.to_string(), operation_reference)
+                    .await
+                {
                     Ok(r) if is_ok_status(r.status) => Out::Ok,
                     Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
@@ -10262,7 +10307,9 @@ impl ServerImpl {
             };
         }
 
-        self.resume_instance_local(instance_key).await.into()
+        self.resume_instance_local(instance_key, operation_reference)
+            .await
+            .into()
     }
 
     /// Applies a suspend transition on this node's owning partition. Returns
@@ -10274,9 +10321,14 @@ impl ServerImpl {
     pub(crate) async fn suspend_instance_local(
         &self,
         instance_key: u64,
+        operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        self.apply_transition_local(instance_key, Command::suspend_instance(instance_key))
-            .await
+        self.apply_transition_local(
+            instance_key,
+            Command::suspend_instance(instance_key),
+            operation_reference,
+        )
+        .await
     }
 
     /// Applies a resume transition on this node's owning partition. Mirrors
@@ -10284,9 +10336,14 @@ impl ServerImpl {
     pub(crate) async fn resume_instance_local(
         &self,
         instance_key: u64,
+        operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        self.apply_transition_local(instance_key, Command::resume_instance(instance_key))
-            .await
+        self.apply_transition_local(
+            instance_key,
+            Command::resume_instance(instance_key),
+            operation_reference,
+        )
+        .await
     }
 
     /// Applies a suspend/resume transition on this node's owning partition,
@@ -10299,8 +10356,9 @@ impl ServerImpl {
         &self,
         instance_key: u64,
         command: Command,
+        operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        self.apply_partition_command(instance_key, command)
+        self.apply_partition_command_ref(instance_key, command, operation_reference)
             .await
             .map(|_| ())
     }
@@ -10582,13 +10640,19 @@ impl ServerImpl {
         scope_key: u64,
         variables: serde_json::Map<String, serde_json::Value>,
         local: bool,
+        operation_reference: Option<i64>,
     ) -> SetVariablesOutcome {
         use SetVariablesOutcome as Out;
 
         if let Some(node) = self.route_by_leader(scope_key) {
             return match self.peer_link(node).await {
                 Ok(link) => match link
-                    .set_variables(scope_key.to_string(), Some(variables), local)
+                    .set_variables(
+                        scope_key.to_string(),
+                        Some(variables),
+                        local,
+                        operation_reference,
+                    )
                     .await
                 {
                     Ok(r) if is_ok_status(r.status) => Out::Updated,
@@ -10606,9 +10670,10 @@ impl ServerImpl {
             .map(|(name, v)| (name.clone(), json_to_value(v)))
             .collect();
         match self
-            .apply_partition_command(
+            .apply_partition_command_ref(
                 scope_key,
                 Command::set_variables_scoped(scope_key, engine_vars, local),
+                operation_reference,
             )
             .await
         {
@@ -10712,9 +10777,14 @@ impl ServerImpl {
 
         let variables = wire_variables(Some(&body.variables)).unwrap_or_default();
         let local = body.local.unwrap_or(false);
+        // Camunda `SetVariableRequest.operationReference` (#1606).
+        let operation_reference = body.operation_reference;
 
         Ok(
-            match self.set_variables_core(scope_key, variables, local).await {
+            match self
+                .set_variables_core(scope_key, variables, local, operation_reference)
+                .await
+            {
                 SetVariablesOutcome::Updated => Resp::Status204_TheVariablesWereUpdated,
                 SetVariablesOutcome::ScopeNotFound(detail) => {
                     Resp::Status400_TheProvidedDataIsNotValid(problem(
@@ -12258,9 +12328,14 @@ impl ServerImpl {
     pub(crate) async fn cancel_instance_local(
         &self,
         instance_key: u64,
+        operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
         let _ = self
-            .apply_partition_command(instance_key, Command::cancel_instance(instance_key))
+            .apply_partition_command_ref(
+                instance_key,
+                Command::cancel_instance(instance_key),
+                operation_reference,
+            )
             .await?;
         self.signal_jobs_available();
         Ok(())
@@ -12388,10 +12463,12 @@ impl ServerImpl {
         scope_key: u64,
         variables: std::collections::BTreeMap<String, Value>,
         local: bool,
+        operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        self.apply_partition_command(
+        self.apply_partition_command_ref(
             scope_key,
             Command::set_variables_scoped(scope_key, variables, local),
+            operation_reference,
         )
         .await
         .map(|_| ())
@@ -14535,6 +14612,7 @@ impl ServerImpl {
     async fn delete_decision_instance_impl(
         &self,
         path_params: &models::DeleteDecisionInstancePathParams,
+        body: &Option<models::DeleteDecisionInstanceRequest>,
     ) -> Result<apis::decision_instance::DeleteDecisionInstanceResponse, ()> {
         use apis::decision_instance::DeleteDecisionInstanceResponse as Resp;
 
@@ -14572,13 +14650,16 @@ impl ServerImpl {
         );
         // Raft-aware: replicated through the owning partition's leader before
         // the 204 is acknowledged, so a failover cannot resurrect the rows.
+        // Camunda `DeleteDecisionInstanceRequest.operationReference` (#1606).
+        let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
         let result = self
-            .apply_partition_command(
+            .apply_partition_command_ref(
                 owner,
                 Command::DeleteDecisionInstance {
                     instance_key,
                     decision_evaluation_key,
                 },
+                operation_reference,
             )
             .await;
         match result {
@@ -29986,7 +30067,7 @@ async fn snapshot_blocker_cancel_handler(
     server: ServerImpl,
     axum::extract::Path(key): axum::extract::Path<Key>,
 ) -> Response {
-    let outcome = server.cancel_instance_core(key).await;
+    let outcome = server.cancel_instance_core(key, None).await;
     let status = snapshot_blocker_cancel_status(&outcome);
     let detail = match &outcome {
         CancelInstanceOutcome::Canceled => format!("cancelled instance {key}"),
@@ -37606,6 +37687,101 @@ mod clustered_startup_tests {
         items
     }
 
+    /// #1606: `DeleteDecisionInstanceRequest.operationReference` is threaded
+    /// through to the `_ref` funnel, so the journaled `DecisionInstanceDeleted`
+    /// record carries the request's reference. Disk-backed: asserts the
+    /// persisted envelope, so a regression back to `None` turns this red.
+    #[tokio::test]
+    async fn delete_decision_instance_stamps_operation_reference() {
+        use apis::decision_instance::DeleteDecisionInstanceResponse as DelResp;
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-1606-delete-decision-ref-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+        let varstore = Arc::new(varstore::VarStore::open(None).unwrap());
+        let (writer, recovery) =
+            SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore)).unwrap();
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|&p| {
+                let engine = engines
+                    .remove(&p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                Journal::from_engine_shared(p, engine, true, &writer)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+
+        deploy_issue_1292(&server, "hallo", true).await;
+        start_greeter(&server, "de").await;
+        let rows = decision_rows(&server, 2).await;
+        let eval_key = rows[0].decision_evaluation_key.0.clone();
+        let eval_key_num: u64 = eval_key.parse().expect("numeric evaluation key");
+
+        const DELETE_REF: i64 = 0x0016_0605;
+        let resp = server
+            .delete_decision_instance_impl(
+                &models::DeleteDecisionInstancePathParams {
+                    decision_evaluation_key: eval_key,
+                },
+                &Some(models::DeleteDecisionInstanceRequest {
+                    operation_reference: Some(DELETE_REF),
+                }),
+            )
+            .await
+            .expect("delete returns a response");
+        assert!(
+            matches!(
+                resp,
+                DelResp::Status204_TheDecisionInstanceIsMarkedForDeletion
+            ),
+            "delete must succeed: {resp:?}"
+        );
+
+        drop(server);
+        let records: Vec<nanobpmn_engine_core::Record> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| seglog::read_segment_records(&p).unwrap())
+            .collect();
+        let refs: Vec<Option<i64>> = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.event,
+                    Event::DecisionInstanceDeleted { decision_evaluation_key, .. }
+                        if *decision_evaluation_key == eval_key_num
+                )
+            })
+            .map(|r| r.operation_reference)
+            .collect();
+        assert!(
+            !refs.is_empty(),
+            "no DecisionInstanceDeleted journaled: {records:?}"
+        );
+        assert!(
+            refs.iter().all(|r| *r == Some(DELETE_REF)),
+            "the deletion record carries the request's reference: {refs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Issue #1292 (Zeebe parity): every evaluation of the same decision is its
     /// own decision instance, keyed by a per-evaluation key minted from the
     /// partition key generator (`BpmnDecisionBehavior` → `keyGenerator.nextKey()`)
@@ -37674,9 +37850,12 @@ mod clustered_startup_tests {
             (keys.next().unwrap().clone(), keys.next().unwrap().clone())
         };
         let resp = server
-            .delete_decision_instance_impl(&models::DeleteDecisionInstancePathParams {
-                decision_evaluation_key: gone.clone(),
-            })
+            .delete_decision_instance_impl(
+                &models::DeleteDecisionInstancePathParams {
+                    decision_evaluation_key: gone.clone(),
+                },
+                &None,
+            )
             .await
             .expect("delete returns a response");
         assert!(matches!(
@@ -37923,9 +38102,12 @@ mod clustered_startup_tests {
         // its own key) retracts exactly its rows.
         use apis::decision_instance::DeleteDecisionInstanceResponse as DelResp;
         let deleted = server
-            .delete_decision_instance_impl(&models::DeleteDecisionInstancePathParams {
-                decision_evaluation_key: two.decision_evaluation_key.0.clone(),
-            })
+            .delete_decision_instance_impl(
+                &models::DeleteDecisionInstancePathParams {
+                    decision_evaluation_key: two.decision_evaluation_key.0.clone(),
+                },
+                &None,
+            )
             .await
             .expect("delete returns a response");
         assert!(
@@ -40769,7 +40951,7 @@ mod clustered_startup_tests {
         ));
         assert!(matches!(
             server
-                .set_variables_core(888_888_888, serde_json::Map::new(), false)
+                .set_variables_core(888_888_888, serde_json::Map::new(), false, None)
                 .await,
             SetVariablesOutcome::ScopeNotFound(_)
         ));
@@ -40778,7 +40960,9 @@ mod clustered_startup_tests {
         let mut fix = serde_json::Map::new();
         fix.insert("n".to_string(), serde_json::Value::Number(41.into()));
         assert!(matches!(
-            server.set_variables_core(instance_key, fix, false).await,
+            server
+                .set_variables_core(instance_key, fix, false, None)
+                .await,
             SetVariablesOutcome::Updated
         ));
         assert!(matches!(
@@ -41002,13 +41186,13 @@ mod clustered_startup_tests {
 
         // A bogus key is reported as not-found, not silently swallowed.
         assert!(matches!(
-            server.cancel_instance_core(999_999_999).await,
+            server.cancel_instance_core(999_999_999, None).await,
             CancelInstanceOutcome::NotFound(_)
         ));
 
         // Cancelling discards the token and terminates the instance.
         assert!(matches!(
-            server.cancel_instance_core(instance_key).await,
+            server.cancel_instance_core(instance_key, None).await,
             CancelInstanceOutcome::Canceled
         ));
         let mut terminated = false;
@@ -41030,7 +41214,7 @@ mod clustered_startup_tests {
 
         // Cancelling an already-finished instance is now a not-found.
         assert!(matches!(
-            server.cancel_instance_core(instance_key).await,
+            server.cancel_instance_core(instance_key, None).await,
             CancelInstanceOutcome::NotFound(_)
         ));
     }
@@ -41940,7 +42124,7 @@ mod clustered_startup_tests {
         let server = ServerImpl::default();
         let (instance_key, _) = modify_fixture(&server).await;
         assert!(matches!(
-            server.suspend_instance_core(instance_key).await,
+            server.suspend_instance_core(instance_key, None).await,
             TransitionInstanceOutcome::Ok
         ));
         let resp = modify_via_rest(
@@ -43277,14 +43461,14 @@ mod clustered_startup_tests {
         );
         // cancel_instance_core routes by leader: node1 doesn't own the
         // partition, so this exercises the peer-forward path.
-        let resp = node1.cancel_instance_core(instance_key).await;
+        let resp = node1.cancel_instance_core(instance_key, None).await;
         assert!(
             matches!(resp, CancelInstanceOutcome::Canceled),
             "the forwarded cancel should succeed"
         );
         // Cancelling again is rejected (the instance is already terminal),
         // proving the first cancel took effect on the owner.
-        let again = node1.cancel_instance_core(instance_key).await;
+        let again = node1.cancel_instance_core(instance_key, None).await;
         assert!(
             matches!(again, CancelInstanceOutcome::NotFound(_)),
             "re-cancelling a terminated instance must 404"
@@ -47950,9 +48134,12 @@ mod clustered_startup_tests {
         }
         assert!(projected, "the evaluation projects decision-instance rows");
         let deleted = node0
-            .delete_decision_instance_impl(&models::DeleteDecisionInstancePathParams {
-                decision_evaluation_key: result.decision_evaluation_key.0.clone(),
-            })
+            .delete_decision_instance_impl(
+                &models::DeleteDecisionInstancePathParams {
+                    decision_evaluation_key: result.decision_evaluation_key.0.clone(),
+                },
+                &None,
+            )
             .await
             .expect("delete returns a response");
         assert!(
@@ -48384,7 +48571,7 @@ mod clustered_startup_tests {
         // the create, so its index is a stable baseline for the cancellation.
         let before = leader_applied(partition)
             .unwrap_or_else(|| panic!("partition {partition} has a leader"));
-        let outcome = node0.cancel_instance_core(instance_key).await;
+        let outcome = node0.cancel_instance_core(instance_key, None).await;
         assert!(
             matches!(outcome, CancelInstanceOutcome::Canceled),
             "cancel should succeed, got {outcome:?}"
@@ -53307,6 +53494,311 @@ mod subscription_placement_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1606 (red-first): the by-key instance mutations — set-variables,
+    /// suspend, resume and cancellation — forward their request's
+    /// `operationReference` through the codegen override, the `*_core` and the
+    /// `_ref` funnel, so every record each one journals carries ITS reference.
+    /// Before #1606 the overrides passed only `path_params` and the reference
+    /// was silently dropped. Disk-backed: asserts the persisted envelopes.
+    #[tokio::test]
+    async fn rest_instance_mutations_stamp_operation_reference_on_every_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-1606-mutation-ref-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+        let varstore = Arc::new(varstore::VarStore::open(None).unwrap());
+        let (writer, recovery) =
+            SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore)).unwrap();
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|&p| {
+                let engine = engines
+                    .remove(&p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                Journal::from_engine_shared(p, engine, true, &writer)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the message-catch process deploys onto every partition");
+
+        let mut instruction =
+            models::ProcessInstanceCreationInstructionById::new("await-payment".to_string());
+        instruction.variables = Some(std::collections::HashMap::from([(
+            "orderId".to_string(),
+            types::Object(serde_json::Value::String("order-1606".to_string())),
+        )]));
+        let body =
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                instruction,
+            );
+        let resp = server
+            .create_process_instance_impl(&body)
+            .await
+            .expect("create returns a response");
+        let apis::process_instance::CreateProcessInstanceResponse::Status200_TheProcessInstanceWasCreated(result) =
+            resp
+        else {
+            panic!("create must succeed: {resp:?}");
+        };
+        let key_str = result.process_instance_key.0.clone();
+        let instance_key: u64 = key_str.parse().expect("numeric instance key");
+
+        const SET_REF: i64 = 0x0016_0601;
+        const SUSPEND_REF: i64 = 0x0016_0602;
+        const RESUME_REF: i64 = 0x0016_0603;
+        const CANCEL_REF: i64 = 0x0016_0604;
+
+        let mut set = models::SetVariableRequest::new(std::collections::HashMap::from([(
+            "fixed".to_string(),
+            types::Object(serde_json::Value::Bool(true)),
+        )]));
+        set.operation_reference = Some(SET_REF);
+        let resp = server
+            .create_element_instance_variables_impl(
+                &models::CreateElementInstanceVariablesPathParams {
+                    element_instance_key: key_str.clone(),
+                },
+                &set,
+            )
+            .await
+            .expect("set-variables returns a response");
+        assert!(
+            matches!(
+                resp,
+                apis::element_instance::CreateElementInstanceVariablesResponse::Status204_TheVariablesWereUpdated
+            ),
+            "set-variables must succeed: {resp:?}"
+        );
+
+        let resp = server
+            .suspend_process_instance_impl(
+                &models::SuspendProcessInstancePathParams {
+                    process_instance_key: key_str.clone(),
+                },
+                &Some(models::SuspendProcessInstanceRequest {
+                    operation_reference: Some(SUSPEND_REF),
+                }),
+            )
+            .await
+            .expect("suspend returns a response");
+        assert!(
+            matches!(
+                resp,
+                apis::process_instance::SuspendProcessInstanceResponse::Status204_TheProcessInstanceIsSuspended
+            ),
+            "suspend must succeed: {resp:?}"
+        );
+
+        let resp = server
+            .resume_process_instance_impl(
+                &models::ResumeProcessInstancePathParams {
+                    process_instance_key: key_str.clone(),
+                },
+                &Some(models::ResumeProcessInstanceRequest {
+                    operation_reference: Some(RESUME_REF),
+                }),
+            )
+            .await
+            .expect("resume returns a response");
+        assert!(
+            matches!(
+                resp,
+                apis::process_instance::ResumeProcessInstanceResponse::Status204_TheProcessInstanceIsResumed
+            ),
+            "resume must succeed: {resp:?}"
+        );
+
+        // Journal contents per segment file, in file order. Captured before the
+        // cancel so the cancellation's records are identified independently of
+        // their stamp: they are exactly the per-file suffix appended after it.
+        let read_journal = || -> std::collections::BTreeMap<
+            std::path::PathBuf,
+            Vec<nanobpmn_engine_core::Record>,
+        > {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+                })
+                .map(|p| {
+                    let recs = seglog::read_segment_records(&p).unwrap();
+                    (p, recs)
+                })
+                .collect()
+        };
+        // The create is answered before its subscription open is routed
+        // (`answer_and_route_create`), so wait on the publication gate for the
+        // open to land first; otherwise its routed records could fall into the
+        // post-cancel suffix and be misattributed to the cancellation.
+        assert_ne!(
+            server
+                .publication_gate
+                .wait(
+                    "payment-received",
+                    "order-1606",
+                    std::time::Duration::from_secs(10),
+                )
+                .await,
+            crate::publication_gate::GateWait::TimedOut,
+            "the create's subscription open must be routed before the baseline"
+        );
+        let before_cancel: std::collections::BTreeMap<_, usize> = read_journal()
+            .into_iter()
+            .map(|(p, recs)| (p, recs.len()))
+            .collect();
+
+        let resp = server
+            .cancel_process_instance_impl(
+                &models::CancelProcessInstancePathParams {
+                    process_instance_key: key_str.clone(),
+                },
+                &Some(models::CancelProcessInstanceRequest {
+                    operation_reference: Some(CANCEL_REF),
+                }),
+            )
+            .await
+            .expect("cancel returns a response");
+        assert!(
+            matches!(
+                resp,
+                apis::process_instance::CancelProcessInstanceResponse::Status204_TheProcessInstanceIsCanceled
+            ),
+            "cancel must succeed: {resp:?}"
+        );
+
+        // The cancel funnel routes the subscription teardown (the
+        // `CloseMessageSubscription` to the canonical message partition) on a
+        // spawned task that holds its own server clone, so neither the 204 nor
+        // dropping `server` means the routed records are journaled. Wait for
+        // the routed close's durable tombstone (`RoutedDeliveryRecorded` with
+        // `close_tombstone` for the closed subscription) before snapshotting,
+        // so the suffix assertion below provably covers the routed records too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let recs: Vec<nanobpmn_engine_core::Record> =
+                read_journal().into_values().flatten().collect();
+            let closing: Vec<u64> = recs
+                .iter()
+                .filter_map(|r| match &r.event {
+                    Event::MessageSubscriptionClosing {
+                        subscription_key,
+                        instance_key: k,
+                        ..
+                    } if *k == instance_key => Some(*subscription_key),
+                    _ => None,
+                })
+                .collect();
+            let routed = !closing.is_empty()
+                && closing.iter().all(|sk| {
+                    recs.iter().any(|r| {
+                        matches!(
+                            &r.event,
+                            Event::RoutedDeliveryRecorded {
+                                subscription_key: Some(s),
+                                close_tombstone: true,
+                                ..
+                            } if s == sk
+                        )
+                    })
+                });
+            if routed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cancel's routed subscription teardown was never journaled: {recs:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        drop(server);
+        let journal = read_journal();
+        let records: Vec<nanobpmn_engine_core::Record> =
+            journal.values().flatten().cloned().collect();
+        let refs_of = |pred: &dyn Fn(&Event) -> bool| -> Vec<Option<i64>> {
+            records
+                .iter()
+                .filter(|r| r.event.instance_key() == Some(instance_key) && pred(&r.event))
+                .map(|r| r.operation_reference)
+                .collect()
+        };
+
+        for (what, refs, want) in [
+            (
+                "set-variables",
+                refs_of(&|e| {
+                    matches!(e, Event::VariablesUpdated { .. })
+                        && format!("{e:?}").contains("fixed")
+                }),
+                SET_REF,
+            ),
+            (
+                "suspend",
+                refs_of(&|e| matches!(e, Event::ProcessInstanceSuspended { .. })),
+                SUSPEND_REF,
+            ),
+            (
+                "resume",
+                refs_of(&|e| matches!(e, Event::ProcessInstanceResumed { .. })),
+                RESUME_REF,
+            ),
+            (
+                "cancel",
+                refs_of(&|e| matches!(e, Event::ProcessInstanceTerminated { .. })),
+                CANCEL_REF,
+            ),
+        ] {
+            assert!(!refs.is_empty(), "{what} journaled no record: {records:?}");
+            assert!(
+                refs.iter().all(|r| *r == Some(want)),
+                "every {what} record carries its request's reference: {refs:?}"
+            );
+        }
+        // Every record the cancel cascade journaled carries CANCEL_REF (the
+        // terminations of tokens, subscriptions, … not just the terminal event).
+        // The cascade is selected by journal position (everything appended
+        // after the pre-cancel snapshot), not by its stamp, so a record with a
+        // missing or wrong reference cannot hide from the assertion.
+        let cancel_cascade: Vec<&nanobpmn_engine_core::Record> = journal
+            .iter()
+            .flat_map(|(p, recs)| recs.iter().skip(before_cancel.get(p).copied().unwrap_or(0)))
+            .collect();
+        assert!(
+            cancel_cascade.len() > 1,
+            "the cancel cascade journals more than the terminal event: {cancel_cascade:?}"
+        );
+        assert!(
+            cancel_cascade
+                .iter()
+                .all(|r| r.operation_reference == Some(CANCEL_REF)),
+            "every record the cancel appended carries CANCEL_REF: {cancel_cascade:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1600 (#1556 step 4, red-first): a publish carrying an
     /// `operationReference` stamps it on EVERY record the publish produces —
     /// including the records produced on OTHER partitions by the routed
@@ -57826,7 +58318,7 @@ mod search_process_instances_suspend_resume_tests {
         };
         assert!(
             matches!(
-                server.suspend_process_instance_impl(&suspend).await.unwrap(),
+                server.suspend_process_instance_impl(&suspend, &None).await.unwrap(),
                 apis::process_instance::SuspendProcessInstanceResponse::Status400_TheProvidedDataIsNotValid(_)
             ),
             "an unparseable key is a 400 on suspension"
@@ -57837,7 +58329,7 @@ mod search_process_instances_suspend_resume_tests {
         };
         assert!(
             matches!(
-                server.resume_process_instance_impl(&resume).await.unwrap(),
+                server.resume_process_instance_impl(&resume, &None).await.unwrap(),
                 apis::process_instance::ResumeProcessInstanceResponse::Status400_TheProvidedDataIsNotValid(_)
             ),
             "an unparseable key is a 400 on resumption"

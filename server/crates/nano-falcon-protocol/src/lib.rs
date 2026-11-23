@@ -548,6 +548,11 @@ pub enum ClientFrame {
     CancelInstance {
         corr: u64,
         instance_key: String,
+        /// The REST request's `operationReference` (#1606), stamped on every
+        /// record the owner journals. Additive and serde-defaulted so a frame
+        /// from an older peer still decodes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key process-instance
     /// suspension to the peer that owns the instance's partition. Answered by a
@@ -557,6 +562,11 @@ pub enum ClientFrame {
     SuspendInstance {
         corr: u64,
         instance_key: String,
+        /// The REST request's `operationReference` (#1606), stamped on every
+        /// record the owner journals. Additive and serde-defaulted so a frame
+        /// from an older peer still decodes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key process-instance
     /// resumption to the peer that owns the instance's partition. Answered by a
@@ -566,6 +576,11 @@ pub enum ClientFrame {
     ResumeInstance {
         corr: u64,
         instance_key: String,
+        /// The REST request's `operationReference` (#1606), stamped on every
+        /// record the owner journals. Additive and serde-defaulted so a frame
+        /// from an older peer still decodes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key process-instance
     /// migration to the peer that owns the instance's partition. Answered by a
@@ -698,6 +713,9 @@ pub enum ClientFrame {
         variables: Option<Map<String, Value>>,
         #[serde(default)]
         local: bool,
+        /// The REST request's `operationReference` (#1606); see `CancelInstance`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway asks a peer to activate jobs on the peer's
     /// own partitions for a worker attached to the gateway (job-stream

@@ -1120,3 +1120,174 @@ async fn cross_node_publish_forwards_one_message_key_to_every_peer() {
         "node 1's correlation carries the key the client received"
     );
 }
+
+/// #1606: the by-key instance mutations forwarded over Falcon — set-variables,
+/// suspend, resume and cancel — carry the REST request's `operationReference`
+/// in their frame, and the owning peer journals every resulting record with it.
+/// A DISK-backed peer receives each frame over a real `PeerLink`; the persisted
+/// envelopes prove the reference survives the hop and persistence.
+#[tokio::test]
+async fn forwarded_instance_mutations_persist_operation_reference_on_the_peer() {
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!(
+        "nanobpmn-1606-peer-ref-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let topology = crate::cluster::Topology {
+        node_id: 0,
+        peers: vec!["http://n0".to_string()],
+        num_partitions: 4,
+        replication_factor: 1,
+    };
+    let owned = topology.local_partitions();
+    let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("varstore"));
+    let (writer, recovery) =
+        crate::journal::SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore))
+            .expect("open segmented writer");
+    let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+        recovery.engines.into_iter().collect();
+    let journals: Vec<crate::Journal> = owned
+        .iter()
+        .map(|&p| {
+            let engine = engines
+                .remove(&p)
+                .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+            crate::Journal::from_engine_shared(p, engine, true, &writer)
+        })
+        .collect();
+    let server = crate::build_server_in_memory(journals, topology);
+    let registry = crate::falcon::Registry::new();
+    crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
+    let app = crate::falcon::cluster_router(server.clone(), registry, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let link = PeerLink::connect(&format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("connect to peer");
+
+    let bpmn = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="work">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="t">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="work-1606" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="t" />
+          <bpmn:sequenceFlow id="f1" sourceRef="t" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let res = link
+        .deploy(vec![("work.bpmn".to_string(), bpmn.to_string())], None)
+        .await
+        .expect("forwarded deploy");
+    assert_eq!(res.status, 200, "deploy should succeed: {res:?}");
+
+    let body =
+        crate::models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+            crate::models::ProcessInstanceCreationInstructionById::new("work".to_string()),
+        );
+    let resp = server
+        .create_process_instance_impl(&body)
+        .await
+        .expect("create returns a response");
+    let crate::apis::process_instance::CreateProcessInstanceResponse::Status200_TheProcessInstanceWasCreated(created) =
+        resp
+    else {
+        panic!("create must succeed: {resp:?}");
+    };
+    let key = created.process_instance_key.0.clone();
+    let instance_key: u64 = key.parse().expect("numeric instance key");
+
+    const SET_REF: i64 = 0x0016_0611;
+    const SUSPEND_REF: i64 = 0x0016_0612;
+    const RESUME_REF: i64 = 0x0016_0613;
+    const CANCEL_REF: i64 = 0x0016_0614;
+    let mut vars = serde_json::Map::new();
+    vars.insert("fixed".to_string(), serde_json::Value::Bool(true));
+    let res = link
+        .set_variables(key.clone(), Some(vars), false, Some(SET_REF))
+        .await
+        .expect("forwarded set-variables");
+    assert!(res.status < 300, "set-variables should succeed: {res:?}");
+    let res = link
+        .suspend_instance(key.clone(), Some(SUSPEND_REF))
+        .await
+        .expect("forwarded suspend");
+    assert!(res.status < 300, "suspend should succeed: {res:?}");
+    let res = link
+        .resume_instance(key.clone(), Some(RESUME_REF))
+        .await
+        .expect("forwarded resume");
+    assert!(res.status < 300, "resume should succeed: {res:?}");
+    let res = link
+        .cancel_instance(key.clone(), Some(CANCEL_REF))
+        .await
+        .expect("forwarded cancel");
+    assert!(res.status < 300, "cancel should succeed: {res:?}");
+
+    drop(link);
+    drop(server);
+    let records: Vec<nanobpmn_engine_core::Record> = std::fs::read_dir(&dir)
+        .expect("read journal dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+        })
+        .flat_map(|p| crate::seglog::read_segment_records(&p).expect("read segment"))
+        .collect();
+    let refs_of = |pred: &dyn Fn(&nanobpmn_engine_core::Event) -> bool| -> Vec<Option<i64>> {
+        records
+            .iter()
+            .filter(|r| r.event.instance_key() == Some(instance_key) && pred(&r.event))
+            .map(|r| r.operation_reference)
+            .collect()
+    };
+    use nanobpmn_engine_core::Event;
+    for (what, refs, want) in [
+        (
+            "set-variables",
+            refs_of(&|e| {
+                matches!(e, Event::VariablesUpdated { .. }) && format!("{e:?}").contains("fixed")
+            }),
+            SET_REF,
+        ),
+        (
+            "suspend",
+            refs_of(&|e| matches!(e, Event::ProcessInstanceSuspended { .. })),
+            SUSPEND_REF,
+        ),
+        (
+            "resume",
+            refs_of(&|e| matches!(e, Event::ProcessInstanceResumed { .. })),
+            RESUME_REF,
+        ),
+        (
+            "cancel",
+            refs_of(&|e| matches!(e, Event::ProcessInstanceTerminated { .. })),
+            CANCEL_REF,
+        ),
+    ] {
+        assert!(!refs.is_empty(), "{what} journaled no record on the peer");
+        assert!(
+            refs.iter().all(|r| *r == Some(want)),
+            "every forwarded {what} record carries its reference: {refs:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
