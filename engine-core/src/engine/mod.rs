@@ -193,13 +193,16 @@ pub struct Engine {
     /// replicated [`State::lenient_completion`] governs; this flag can then only
     /// agree with it (lenience is one-way). NOT part of the snapshot.
     legacy_lenient_completion: bool,
-    /// The current command's proposer-stamped terminal deadline (#1494):
-    /// `(job_key, JobAttribution::deadline)` from a stamped `CompleteJob` /
-    /// `FailJob` / `ThrowJobError`, read by [`Engine::job_terminal_deadline`]
-    /// at the [`Engine::emit`] choke point. Per-command scratch: reset by every
-    /// `plan_command_at`, so a rejected command's stamp can never leak into a
-    /// later one. Never snapshotted.
-    terminal_deadline_stamp: Option<(Key, Option<u64>)>,
+    /// The current command's proposer-stamped terminal deadlines (#1494, #1570):
+    /// `job_key -> deadline` from the replicated command envelope
+    /// (`ReplicatedCommand::terminal_deadlines`, passed via
+    /// [`Engine::apply_command_records_stamped_at`]) plus any per-job
+    /// [`JobAttribution::deadline`] on `CompleteJob` / `FailJob` /
+    /// `ThrowJobError`, read by [`Engine::job_terminal_deadline`] at the
+    /// [`Engine::emit`] choke point. Per-command scratch: armed before
+    /// planning and cleared on every exit so a rejected command's stamps can
+    /// never leak into a later one. Never snapshotted.
+    terminal_deadline_stamps: BTreeMap<Key, u64>,
     /// The current command's caller `operationReference` (#1556), set ONLY by
     /// [`Engine::apply_command_records_at`] — the single seam that stamps it on
     /// every [`Record`](crate::Record) the command produces — and read at the
@@ -742,7 +745,7 @@ impl Engine {
             feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: 0,
             legacy_lenient_completion: false,
-            terminal_deadline_stamp: None,
+            terminal_deadline_stamps: BTreeMap::new(),
             operation_reference: None,
             #[cfg(test)]
             user_task_scan_count: std::cell::Cell::new(0),
@@ -923,7 +926,7 @@ impl Engine {
             feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr,
             legacy_lenient_completion: false,
-            terminal_deadline_stamp: None,
+            terminal_deadline_stamps: BTreeMap::new(),
             operation_reference: None,
             #[cfg(test)]
             user_task_scan_count: std::cell::Cell::new(0),
@@ -2524,7 +2527,7 @@ impl Engine {
         command: Command,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
-        self.apply_command_events(command, now, None)
+        self.apply_command_events(command, now, None, None)
     }
 
     /// Applies a command carrying a caller `operationReference` (#1556) and
@@ -2541,7 +2544,31 @@ impl Engine {
         now: u64,
         operation_reference: Option<i64>,
     ) -> Result<Vec<crate::Record>, EngineError> {
-        let events = self.apply_command_events(command, now, operation_reference)?;
+        let events = self.apply_command_events(command, now, operation_reference, None)?;
+        Ok(crate::Record::stamp_all(events, operation_reference))
+    }
+
+    /// Applies a command carrying both a caller `operationReference` (#1556)
+    /// and the proposing leader's per-job terminal-deadline stamps (#1570) for
+    /// soft-activated jobs that this command may terminate by cascade.
+    ///
+    /// Every replica applies the identical stamped map from the replicated
+    /// command envelope, so `Event::JobCanceled.deadline` (and
+    /// `Event::JobCompleted.deadline`) agree across replicas while preserving
+    /// Camunda's "keep the last deadline on CANCELED" for soft jobs.
+    pub fn apply_command_records_stamped_at(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+        terminal_deadlines: &BTreeMap<Key, u64>,
+    ) -> Result<Vec<crate::Record>, EngineError> {
+        let stamps = if terminal_deadlines.is_empty() {
+            None
+        } else {
+            Some(terminal_deadlines)
+        };
+        let events = self.apply_command_events(command, now, operation_reference, stamps)?;
         Ok(crate::Record::stamp_all(events, operation_reference))
     }
 
@@ -2550,11 +2577,18 @@ impl Engine {
         command: Command,
         now: u64,
         operation_reference: Option<i64>,
+        terminal_deadlines: Option<&BTreeMap<Key, u64>>,
     ) -> Result<Vec<Event>, EngineError> {
         // Armed BEFORE planning: the planner itself emits (e.g. the
-        // `IncidentResolved` of a `ResolveIncident`). Cleared on every exit so
-        // a reference can never leak into a later command.
+        // `IncidentResolved` of a `ResolveIncident` or `JobCanceled` of a
+        // `CancelInstance`). Cleared on every exit so neither a reference nor
+        // a deadline stamp can ever leak into a later command.
         self.operation_reference = operation_reference;
+        self.terminal_deadline_stamps.clear();
+        if let Some(stamps) = terminal_deadlines {
+            self.terminal_deadline_stamps
+                .extend(stamps.iter().map(|(&k, &v)| (k, v)));
+        }
         let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
             self.run(&mut log, queue);
             self.cascade_cancel_children(&mut log, 0);
@@ -2566,6 +2600,7 @@ impl Engine {
             log
         });
         self.operation_reference = None;
+        self.terminal_deadline_stamps.clear();
         result
     }
 
@@ -2645,25 +2680,36 @@ impl Engine {
         self.pending_timer_fires.clear();
         self.sweep_from = 0;
         // Per-command terminal-deadline stamp (#1494): set from THIS command
-        // only (or cleared), never inherited from a previous one.
-        self.terminal_deadline_stamp = match &command {
+        // only, merged with any envelope stamps armed by
+        // `apply_command_events` (#1570). The job's own `JobAttribution`
+        // wins for `job_key` (including `Some(JobAttribution { deadline: None })`,
+        // which removes any entry for `job_key`), so direct `apply_command`
+        // callers and the debug stepping driver never inherit a stale stamp.
+        match &command {
             Command::CompleteJob {
                 job_key,
-                attribution,
+                attribution: Some(attr),
                 ..
             }
             | Command::FailJob {
                 job_key,
-                attribution,
+                attribution: Some(attr),
                 ..
             }
             | Command::ThrowJobError {
                 job_key,
-                attribution,
+                attribution: Some(attr),
                 ..
-            } => attribution.as_ref().map(|a| (*job_key, a.deadline)),
-            _ => None,
-        };
+            } => match attr.deadline {
+                Some(d) => {
+                    self.terminal_deadline_stamps.insert(*job_key, d);
+                }
+                None => {
+                    self.terminal_deadline_stamps.remove(job_key);
+                }
+            },
+            _ => {}
+        }
         let mut log: Vec<Event> = Vec::new();
         let mut queue: VecDeque<Step> = VecDeque::new();
 

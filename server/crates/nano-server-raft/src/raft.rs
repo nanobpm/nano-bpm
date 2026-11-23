@@ -110,6 +110,12 @@ pub struct ReplicatedCommand {
     pub now: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_reference: Option<i64>,
+    /// Authoritative live deadlines of soft-activated jobs this command may
+    /// terminate by cascade (#1570), resolved on the proposing leader before
+    /// entering the Raft log. Additive on the wire: absent decodes as empty,
+    /// and omitted when empty so the common path stays byte-identical.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub terminal_deadlines: std::collections::BTreeMap<nanobpmn_engine_core::Key, u64>,
 }
 
 /// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
@@ -120,6 +126,8 @@ struct ReplicatedCommandWire {
     now: u64,
     #[serde(default)]
     operation_reference: Option<i64>,
+    #[serde(default)]
+    terminal_deadlines: std::collections::BTreeMap<nanobpmn_engine_core::Key, u64>,
 }
 
 /// A [`Command`] plus any legacy (pre-#1556) `operation_reference` that was
@@ -158,6 +166,7 @@ impl From<ReplicatedCommandWire> for ReplicatedCommand {
             command: wire.command.command,
             now: wire.now,
             operation_reference: wire.operation_reference.or(wire.command.nested_reference),
+            terminal_deadlines: wire.terminal_deadlines,
         }
     }
 }
@@ -169,6 +178,7 @@ impl ReplicatedCommand {
             command,
             now,
             operation_reference: None,
+            terminal_deadlines: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -2688,6 +2698,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 command,
                                 now,
                                 operation_reference,
+                                terminal_deadlines,
                             } in batch.items
                             {
                                 // Per-command actor profiling (off unless
@@ -2695,8 +2706,12 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 // delta by command kind, on the engine thread.
                                 let timer = crate::cmd_profile::start();
                                 let kind = command.kind();
-                                let outcome =
-                                    journal.apply_command_ref_at(command, now, operation_reference);
+                                let outcome = journal.apply_command_stamped_at(
+                                    command,
+                                    now,
+                                    operation_reference,
+                                    &terminal_deadlines,
+                                );
                                 crate::cmd_profile::finish(timer, kind);
                                 match outcome {
                                     Err(e) if e.is_environmental() => {
@@ -3711,7 +3726,7 @@ impl Batcher {
         now: u64,
         operation_reference: Option<i64>,
     ) -> Result<ReplicatedItem, ProposeError> {
-        let command = stamp_for_proposal(&self.engine, command).await;
+        let (command, terminal_deadlines) = stamp_for_proposal(&self.engine, command).await;
         let (resp, rx) = tokio::sync::oneshot::channel();
         // Route fresh creation intake to the low-priority lane; the drain path
         // (completes, fails, ticks, admin) takes the high lane so it
@@ -3726,6 +3741,7 @@ impl Batcher {
                 command,
                 now,
                 operation_reference,
+                terminal_deadlines,
             },
             resp,
         })
@@ -3736,29 +3752,72 @@ impl Batcher {
     }
 }
 
-/// Stamps a terminal job command with the authoritative attribution resolved
-/// from the PROPOSING node's engine, before it enters the Raft log (#963).
+/// Stamps a command with the authoritative soft-job metadata resolved from the
+/// PROPOSING node's engine, before it enters the Raft log (#963, #1494, #1570):
+///
+/// - For `CompleteJob` / `FailJob` / `ThrowJobError`, stamps `JobAttribution`
+///   (worker + deadline) onto the command itself.
+/// - For any command that could terminate soft-activated jobs by cascade
+///   (`CancelInstance`, `ModifyInstance`, terminate end events, interrupting
+///   boundaries, `TriggerTimers`, `CorrelateMessage`, `BroadcastSignal`, …),
+///   collects the live deadlines of every soft-activated job in the affected
+///   instance(s) and their call-activity descendants into
+///   `ReplicatedCommand::terminal_deadlines`.
 ///
 /// Leader-local activation keeps the activation lock (and its worker) only in
 /// the leader's RAM, so a follower re-running the replicated command cannot
-/// derive the attribution itself. Every command enters the log through the
+/// derive the metadata itself. Every command enters the log through the
 /// [`Batcher`] (the sole `client_write` caller), so stamping here covers every
-/// terminal-job write path by construction: replicas apply the identical
-/// stamped command and persist identical terminal events.
-async fn stamp_for_proposal(engine: &DeepthiHandle, command: Command) -> Command {
-    if !matches!(
-        command,
-        Command::CompleteJob { .. } | Command::FailJob { .. } | Command::ThrowJobError { .. }
-    ) {
-        return command;
+/// write path by construction: replicas apply the identical stamped command
+/// and persist identical terminal events.
+async fn stamp_for_proposal(
+    engine: &DeepthiHandle,
+    command: Command,
+) -> (
+    Command,
+    std::collections::BTreeMap<nanobpmn_engine_core::Key, u64>,
+) {
+    if !command_needs_proposal_stamp(&command) {
+        return (command, std::collections::BTreeMap::new());
     }
     engine
         .with(move |journal| {
             let mut command = command;
             journal.engine().stamp_terminal_attribution(&mut command);
-            command
+            let deadlines = journal
+                .engine()
+                .resolve_cascade_terminal_deadlines(&command);
+            (command, deadlines)
         })
         .await
+}
+
+/// Whether `command` can terminate a soft-activated job (directly or by
+/// cascade) and therefore needs a leader-side engine read before proposal.
+/// Keeping the common no-cascade intake commands (`CreateInstance`,
+/// `Deploy*`, `ActivateJobs`, …) off the actor hop avoids an extra round-trip
+/// on the hot create path.
+fn command_needs_proposal_stamp(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::CompleteJob { .. }
+            | Command::FailJob { .. }
+            | Command::ThrowJobError { .. }
+            | Command::CancelInstance { .. }
+            | Command::ModifyInstance { .. }
+            | Command::MigrateInstance { .. }
+            | Command::ActivateAdHocActivities { .. }
+            | Command::CompleteUserTask { .. }
+            | Command::AssignUserTask { .. }
+            | Command::UnassignUserTask { .. }
+            | Command::UpdateUserTask { .. }
+            | Command::ResolveIncident { .. }
+            | Command::SetVariables { .. }
+            | Command::CorrelateMessage { .. }
+            | Command::CorrelateMessageSubscription { .. }
+            | Command::TriggerTimers { .. }
+            | Command::BroadcastSignal { .. }
+    )
 }
 
 /// The engine-actor → Raft-leader propose channel for off-heap orphans
@@ -5142,6 +5201,94 @@ mod tests {
             serde_json::from_str(r#"{"command":{"ResolveIncident":{"incident_key":7}},"now":1}"#)
                 .unwrap();
         assert_eq!(plain.operation_reference, None);
+        assert!(plain.terminal_deadlines.is_empty());
+    }
+
+    /// #1570: `ReplicatedCommand::terminal_deadlines` is additive on the wire:
+    /// omitted when empty (byte-identical to pre-#1570 entries), round-trips
+    /// when populated, and decodes as empty on legacy entries without the field.
+    #[test]
+    fn replicated_command_terminal_deadlines_is_additive_on_the_wire() {
+        let plain = ReplicatedCommand::new(Command::CancelInstance { instance_key: 42 }, 10);
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !plain_json.contains("terminal_deadlines"),
+            "empty map omitted on wire: {plain_json}"
+        );
+        let decoded_plain: ReplicatedCommand = serde_json::from_str(&plain_json).unwrap();
+        assert!(decoded_plain.terminal_deadlines.is_empty());
+
+        let mut stamped = plain;
+        stamped.terminal_deadlines.insert(7, 12_345);
+        stamped.terminal_deadlines.insert(9, 67_890);
+        let stamped_json = serde_json::to_string(&stamped).unwrap();
+        assert!(stamped_json.contains("terminal_deadlines"));
+        let decoded: ReplicatedCommand = serde_json::from_str(&stamped_json).unwrap();
+        assert_eq!(decoded.terminal_deadlines.get(&7), Some(&12_345));
+        assert_eq!(decoded.terminal_deadlines.get(&9), Some(&67_890));
+    }
+
+    /// #1570: proposing `CancelInstance` through `RaftPartition::propose`
+    /// stamps the leader's soft-job deadline onto the replicated entry so the
+    /// committed `Event::JobCanceled` carries the real lock deadline.
+    #[tokio::test]
+    async fn raft_propose_cancel_instance_stamps_soft_job_deadline() {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let part = RaftPartition::bootstrap_single(0, 0, "http://self".into(), engine.clone())
+            .await
+            .expect("bootstrap single-voter raft");
+
+        let proc = ProcessBuilder::new("soft_cancel")
+            .start_event("s")
+            .service_task("t", "work")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid process");
+        part.propose(Command::DeployProcess(proc), 100)
+            .await
+            .expect("deploy");
+        let created = part
+            .propose(Command::create_instance("soft_cancel"), 200)
+            .await
+            .expect("create");
+        let instance_key = created
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .expect("instance created");
+
+        // Leader-local (soft) activation — never replicated.
+        let job_key = engine
+            .with(|journal| {
+                let activated = journal.activate_jobs("work", "w1", 1, 5_000, 300);
+                assert_eq!(activated.len(), 1);
+                activated[0].key
+            })
+            .await;
+
+        let canceled = part
+            .propose(Command::CancelInstance { instance_key }, 400)
+            .await
+            .expect("cancel");
+        let recorded_deadline = canceled.iter().find_map(|e| match e {
+            Event::JobCanceled {
+                job_key: k,
+                deadline,
+                ..
+            } if *k == job_key => Some(*deadline),
+            _ => None,
+        });
+        assert_eq!(
+            recorded_deadline,
+            Some(Some(5_300)),
+            "leader-stamped soft-job deadline must survive Raft propose/apply"
+        );
+
+        part.raft.shutdown().await.expect("clean shutdown");
     }
 
     #[test]

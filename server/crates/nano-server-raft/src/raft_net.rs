@@ -519,6 +519,7 @@ mod codec_tests {
                     command,
                     now: 0,
                     operation_reference: None,
+                    terminal_deadlines: std::collections::BTreeMap::new(),
                 },
             ])),
         };

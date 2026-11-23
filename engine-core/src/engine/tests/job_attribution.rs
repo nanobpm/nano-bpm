@@ -483,3 +483,355 @@ fn the_deadline_stamp_round_trips_and_a_pre_deadline_stamp_still_decodes() {
         "absent deadline is byte-unchanged"
     );
 }
+
+/// Proposes `command` through the #1570 leader-stamping seam and applies the
+/// identical stamped envelope on both `leader` and `follower`.
+fn replicate_stamped(
+    leader: &mut Engine,
+    follower: &mut Engine,
+    mut command: Command,
+    now: u64,
+) -> (Vec<Event>, Vec<Event>) {
+    leader.stamp_terminal_attribution(&mut command);
+    let deadlines = leader.resolve_cascade_terminal_deadlines(&command);
+    let on_leader: Vec<Event> = leader
+        .apply_command_records_stamped_at(command.clone(), now, None, &deadlines)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    let on_follower: Vec<Event> = follower
+        .apply_command_records_stamped_at(command, now, None, &deadlines)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    assert_eq!(
+        on_leader, on_follower,
+        "leader and follower must persist byte-identical events"
+    );
+    (on_leader, on_follower)
+}
+
+/// #1570: `CancelInstance` carries the leader's soft-job deadline so both
+/// leader and follower record `Some(1_000)` on `Event::JobCanceled`.
+#[test]
+fn cancel_instance_stamps_soft_job_deadline_on_every_replica() {
+    let (mut leader, mut follower, job_key) = leader_and_follower("W");
+    let instance_key = leader.state().jobs[&job_key].instance_key;
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::CancelInstance { instance_key },
+        200,
+    );
+    assert_eq!(terminal_deadline(&on_leader, job_key), Some(Some(1_000)));
+    assert_eq!(terminal_deadline(&on_follower, job_key), Some(Some(1_000)));
+}
+
+/// #1570: `ModifyInstance` terminating an element with a soft-activated job
+/// preserves its deadline on `Event::JobCanceled` across replicas.
+#[test]
+fn modify_instance_stamps_soft_job_deadline_on_every_replica() {
+    let (mut leader, mut follower, job_key) = leader_and_follower("W");
+    let instance_key = leader.state().jobs[&job_key].instance_key;
+    let element_instance_key = leader.state().jobs[&job_key].element_instance_key;
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::ModifyInstance {
+            instance_key,
+            terminate_instructions: vec![element_instance_key],
+            terminate_element_ids: vec![],
+            activate_instructions: vec![],
+            move_instructions: vec![],
+        },
+        200,
+    );
+    assert_eq!(terminal_deadline(&on_leader, job_key), Some(Some(1_000)));
+    assert_eq!(terminal_deadline(&on_follower, job_key), Some(Some(1_000)));
+}
+
+/// #1570: completing a sibling job that reaches a Terminate End Event cancels
+/// the other branch's soft-activated job with its authoritative deadline on
+/// every replica.
+#[test]
+fn terminate_end_event_cascade_stamps_sibling_soft_job_deadline() {
+    let def = ProcessBuilder::new("term_cascade")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("branch_a", "work_a")
+        .service_task("branch_b", "work_b")
+        .terminate_end_event("term_end")
+        .end_event("end_b")
+        .connect("start", "fork")
+        .connect("fork", "branch_a")
+        .connect("fork", "branch_b")
+        .connect("branch_a", "term_end")
+        .connect("branch_b", "end_b")
+        .build()
+        .unwrap();
+    let mut replicas: Vec<Engine> = (0..2)
+        .map(|_| {
+            let mut e = Engine::new();
+            e.apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+            e.apply_command(Command::DeployProcess(def.clone()))
+                .unwrap();
+            e.apply_command(Command::create_instance("term_cascade"))
+                .unwrap();
+            e
+        })
+        .collect();
+    let mut follower = replicas.pop().unwrap();
+    let mut leader = replicas.pop().unwrap();
+    let a = leader.activate_jobs("work_a", "wa", 1, 5_000, 100);
+    let b = leader.activate_jobs("work_b", "wb", 1, 9_000, 100);
+    assert_eq!(a.len(), 1);
+    assert_eq!(b.len(), 1);
+    let job_a = a[0].key;
+    let job_b = b[0].key;
+
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::complete_job(job_a),
+        200,
+    );
+    assert_eq!(terminal_deadline(&on_leader, job_a), Some(Some(5_100)));
+    assert_eq!(terminal_deadline(&on_leader, job_b), Some(Some(9_100)));
+    assert_eq!(terminal_deadline(&on_follower, job_b), Some(Some(9_100)));
+}
+
+/// #1570: an interrupting timer boundary fired by `TriggerTimers` cancels the
+/// attached soft-activated job with its deadline on every replica.
+#[test]
+fn interrupting_timer_boundary_stamps_soft_job_deadline_on_every_replica() {
+    let def = ProcessBuilder::new("timer_cancel")
+        .start_event("start")
+        .service_task("task", "work")
+        .timer_boundary_event("timeout", "task", 5_000)
+        .end_event("end_ok")
+        .end_event("end_timeout")
+        .connect("start", "task")
+        .connect("task", "end_ok")
+        .connect("timeout", "end_timeout")
+        .build()
+        .unwrap();
+    let mut replicas: Vec<Engine> = (0..2)
+        .map(|_| {
+            let mut e = Engine::new();
+            e.apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+            e.apply_command(Command::DeployProcess(def.clone()))
+                .unwrap();
+            e.apply_command_at(Command::create_instance("timer_cancel"), 1_000)
+                .unwrap();
+            e
+        })
+        .collect();
+    let mut follower = replicas.pop().unwrap();
+    let mut leader = replicas.pop().unwrap();
+    let activated = leader.activate_jobs("work", "w", 1, 30_000, 1_500);
+    assert_eq!(activated.len(), 1);
+    let job_key = activated[0].key;
+
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::TriggerTimers { now: 6_000 },
+        6_000,
+    );
+    assert_eq!(terminal_deadline(&on_leader, job_key), Some(Some(31_500)));
+    assert_eq!(terminal_deadline(&on_follower, job_key), Some(Some(31_500)));
+}
+
+/// #1570: an interrupting message boundary fired by `CorrelateMessage` cancels
+/// the attached soft-activated job with its deadline on every replica.
+#[test]
+fn interrupting_message_boundary_stamps_soft_job_deadline_on_every_replica() {
+    let def = ProcessBuilder::new("msg_cancel")
+        .start_event("start")
+        .service_task("task", "work")
+        .message_boundary_event("msg_b", "task", "cancel_msg", "orderId")
+        .end_event("end_ok")
+        .end_event("end_msg")
+        .connect("start", "task")
+        .connect("task", "end_ok")
+        .connect("msg_b", "end_msg")
+        .build()
+        .unwrap();
+    let mut vars = BTreeMap::new();
+    vars.insert("orderId".to_string(), Value::Str("ord-1".to_string()));
+    let mut replicas: Vec<Engine> = (0..2)
+        .map(|_| {
+            let mut e = Engine::new();
+            e.apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+            e.apply_command(Command::DeployProcess(def.clone()))
+                .unwrap();
+            e.apply_command(Command::create_instance_with("msg_cancel", vars.clone()))
+                .unwrap();
+            e
+        })
+        .collect();
+    let mut follower = replicas.pop().unwrap();
+    let mut leader = replicas.pop().unwrap();
+    let activated = leader.activate_jobs("work", "w", 1, 12_000, 500);
+    assert_eq!(activated.len(), 1);
+    let job_key = activated[0].key;
+
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::CorrelateMessage {
+            message_name: "cancel_msg".into(),
+            correlation_key: "ord-1".into(),
+            variables: BTreeMap::new(),
+            business_id: None,
+            message_key: None,
+        },
+        600,
+    );
+    assert_eq!(terminal_deadline(&on_leader, job_key), Some(Some(12_500)));
+    assert_eq!(terminal_deadline(&on_follower, job_key), Some(Some(12_500)));
+}
+
+/// #1570: `BroadcastSignal` interrupting soft-activated jobs across multiple
+/// instances stamps every affected job's deadline on every replica.
+#[test]
+fn broadcast_signal_cross_instance_cascade_stamps_all_soft_job_deadlines() {
+    let def = ProcessBuilder::new("sig_cancel")
+        .start_event("start")
+        .service_task("task", "work")
+        .signal_boundary_event("sig_b", "task", "abort_all")
+        .end_event("end_ok")
+        .end_event("end_sig")
+        .connect("start", "task")
+        .connect("task", "end_ok")
+        .connect("sig_b", "end_sig")
+        .build()
+        .unwrap();
+    let mut replicas: Vec<Engine> = (0..2)
+        .map(|_| {
+            let mut e = Engine::new();
+            e.apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+            e.apply_command(Command::DeployProcess(def.clone()))
+                .unwrap();
+            e.apply_command(Command::create_instance("sig_cancel"))
+                .unwrap();
+            e.apply_command(Command::create_instance("sig_cancel"))
+                .unwrap();
+            e
+        })
+        .collect();
+    let mut follower = replicas.pop().unwrap();
+    let mut leader = replicas.pop().unwrap();
+    let j1 = leader.activate_jobs("work", "w1", 1, 7_000, 100)[0].key;
+    let j2 = leader.activate_jobs("work", "w2", 1, 8_000, 200)[0].key;
+
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::BroadcastSignal {
+            signal_name: "abort_all".into(),
+            variables: BTreeMap::new(),
+        },
+        300,
+    );
+    assert_eq!(terminal_deadline(&on_leader, j1), Some(Some(7_100)));
+    assert_eq!(terminal_deadline(&on_leader, j2), Some(Some(8_200)));
+    assert_eq!(terminal_deadline(&on_follower, j1), Some(Some(7_100)));
+    assert_eq!(terminal_deadline(&on_follower, j2), Some(Some(8_200)));
+}
+
+/// #1570: cancelling a parent process cascades to a call-activity child's
+/// soft-activated job and preserves its deadline on every replica.
+#[test]
+fn cancel_parent_stamps_call_activity_child_soft_job_deadline() {
+    let child = ProcessBuilder::new("child_proc")
+        .start_event("cs")
+        .service_task("ct", "child_work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    let parent = ProcessBuilder::new("parent_proc")
+        .start_event("ps")
+        .call_activity("call", "child_proc")
+        .end_event("pe")
+        .connect("ps", "call")
+        .connect("call", "pe")
+        .build()
+        .unwrap();
+    let mut replicas: Vec<Engine> = (0..2)
+        .map(|_| {
+            let mut e = Engine::new();
+            e.apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+            e.apply_command(Command::DeployProcess(child.clone()))
+                .unwrap();
+            e.apply_command(Command::DeployProcess(parent.clone()))
+                .unwrap();
+            e.apply_command(Command::create_instance("parent_proc"))
+                .unwrap();
+            e
+        })
+        .collect();
+    let mut follower = replicas.pop().unwrap();
+    let mut leader = replicas.pop().unwrap();
+    let parent_key = leader
+        .state()
+        .instances
+        .values()
+        .find(|i| i.parent_process_instance_key.is_none())
+        .unwrap()
+        .key;
+    let child_job = leader.activate_jobs("child_work", "wc", 1, 15_000, 400)[0].key;
+
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::CancelInstance {
+            instance_key: parent_key,
+        },
+        500,
+    );
+    assert_eq!(terminal_deadline(&on_leader, child_job), Some(Some(15_400)));
+    assert_eq!(
+        terminal_deadline(&on_follower, child_job),
+        Some(Some(15_400))
+    );
+}
+
+/// #1570: envelope stamps on a REJECTED command must not leak into a subsequent
+/// unstamped command.
+#[test]
+fn a_rejected_envelope_stamped_command_does_not_leak_its_deadlines() {
+    let (mut leader, mut follower, job_key) = leader_and_follower("W");
+    let instance_key = leader.state().jobs[&job_key].instance_key;
+    let mut bogus_stamps = BTreeMap::new();
+    bogus_stamps.insert(job_key, 99_999);
+    // Cancelling a non-existent instance rejects, leaving the real instance alive.
+    assert!(leader
+        .apply_command_records_stamped_at(
+            Command::CancelInstance {
+                instance_key: 999_999,
+            },
+            100,
+            None,
+            &bogus_stamps,
+        )
+        .is_err());
+    // An unstamped cancel of the real instance must NOT pick up the leaked 99_999.
+    let on_leader = leader
+        .apply_command_at(Command::CancelInstance { instance_key }, 200)
+        .unwrap();
+    let on_follower = follower
+        .apply_command_at(Command::CancelInstance { instance_key }, 200)
+        .unwrap();
+    assert_eq!(on_leader, on_follower);
+    assert_eq!(terminal_deadline(&on_leader, job_key), Some(None));
+}

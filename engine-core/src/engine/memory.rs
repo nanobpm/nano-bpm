@@ -106,7 +106,7 @@ impl Engine {
             feel_env: crate::feel::EvalEnv::default(),
             start_dispatch_rr: snapshot.start_dispatch_rr,
             legacy_lenient_completion: false,
-            terminal_deadline_stamp: None,
+            terminal_deadline_stamps: std::collections::BTreeMap::new(),
             operation_reference: None,
             #[cfg(test)]
             user_task_scan_count: std::cell::Cell::new(0),

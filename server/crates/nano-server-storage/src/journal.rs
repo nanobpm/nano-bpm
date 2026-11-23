@@ -3298,6 +3298,19 @@ impl Journal {
         now: u64,
         operation_reference: Option<i64>,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        self.apply_command_stamped_at(command, now, operation_reference, &BTreeMap::new())
+    }
+
+    /// [`apply_command_ref_at`](Self::apply_command_ref_at) with the proposing
+    /// leader's per-job terminal-deadline stamps (#1570) for soft-activated
+    /// jobs that `command` may terminate by cascade.
+    pub fn apply_command_stamped_at(
+        &mut self,
+        command: Command,
+        now: u64,
+        operation_reference: Option<i64>,
+        terminal_deadlines: &BTreeMap<Key, u64>,
+    ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         if self.fenced {
             // Environmental + retryable: a peer (or this replica once rebuilt
             // from its journal) applies the command; this one must not (#1405).
@@ -3324,7 +3337,12 @@ impl Journal {
         };
         let events = Arc::new(
             self.engine
-                .apply_command_records_at(command, now, operation_reference)?
+                .apply_command_records_stamped_at(
+                    command,
+                    now,
+                    operation_reference,
+                    terminal_deadlines,
+                )?
                 .into_iter()
                 .map(|record| record.event)
                 .collect::<Vec<_>>(),
