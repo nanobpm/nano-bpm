@@ -32,7 +32,10 @@
 // must still reproduce its own signature (else it fails as stale — flip it to
 // `fixed: true`, never delete it); a fixed case must show NO divergence (a
 // regression guard forever). A committed case without a filed `issue` fails.
-// A fuzzed divergence whose signature matches an open committed case is known.
+// A fuzzed divergence is known only on an open committed case's OWN graph:
+// field-based signatures group unrelated defects (exhaustive.mjs `classify`),
+// so a signature-only match would let an open case suppress a DISTINCT defect
+// on any other graph that happens to mismatch the same fields.
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -361,10 +364,21 @@ export function judgeCase (c, divergences) {
 /**
  * The divergences of a replayed scenario no open corpus case explains: they
  * are new failures and go through the shrink/record path like fuzz findings.
+ *
+ * `openKeys` holds one `knownKey(signature, graphKey)` per open committed
+ * case, so an open case explains only a divergence on ITS OWN graph. Keying
+ * on the signature alone would let a field-based signature shared across
+ * graphs (a committed fixed case and an open one can carry the same field
+ * set) absorb a DISTINCT defect on an unrelated graph — it would be logged
+ * "known", never shrunk, recorded or filed (exhaustive.mjs `classify`
+ * documents the same hazard and scopes by signature + graph + scenario).
  */
-export function unexplained (divergences, openSignatures) {
-  return divergences.filter((d) => !openSignatures.has(d.signature))
+export function unexplained (divergences, openKeys) {
+  return divergences.filter((d) => !openKeys.has(knownKey(d.signature, d.entry.graph.key)))
 }
+
+/** The identity of one known divergence: its signature on one graph. */
+export const knownKey = (signature, graphKey) => JSON.stringify([signature, graphKey])
 
 /**
  * Whether a committed case is replayed this run. A FIXED case is a regression
@@ -403,15 +417,29 @@ export function executionNamer (tag) {
   return (kind) => `${kind}${tag}x${++n}`
 }
 
-function fileIssue (c) {
-  const body = [
+/**
+ * The body of the parity issue filed for committed-to-be case `c`.
+ *
+ * The reproducer is written to the run's WORKING-TREE corpus before the issue
+ * is filed; it is not on `main` until that corpus diff is committed. The body
+ * must not claim otherwise: #1753–#1758 were filed saying "committed in
+ * fuzz-corpus.json" from a run whose corpus diff never landed, so their
+ * reproducers lived only in the issue text and no replay guarded them. The
+ * body therefore states the commit obligation and carries the case identity
+ * (`corpusIdentity`) so triage can match the issue to its corpus case; the
+ * `uncommittedIssues` guard then fails any triaged issue whose committed
+ * reproducer is still absent.
+ */
+export function issueBody (c) {
+  return [
     'Found by the differential fuzzer (`formal/corpus/fuzz.mjs`, #1250) and shrunk to a minimal reproducer.',
     '',
     `- signature: \`${c.signature}\``,
     `- run seed: \`${c.seed}\``,
     `- graph: \`${c.graph.id}\` (\`${c.graph.key}\`)`,
+    `- corpus identity: \`${corpusIdentity(c)}\``,
     '',
-    'Reproducer (committed in `formal/corpus/fuzz-corpus.json`):',
+    'Reproducer — recorded in the filing run\'s working-tree `formal/corpus/fuzz-corpus.json`. It is NOT guarded until that corpus diff is committed with `"issue"` set to this issue: commit it (open, or `"fixed": true` once resolved) as part of triage.',
     '',
     '```json',
     JSON.stringify({ skeleton: c.skeleton, scenario: c.scenario, detail: c.detail }, null, 2),
@@ -419,6 +447,24 @@ function fileIssue (c) {
     '',
     'Part of #1240.'
   ].join('\n')
+}
+
+/** The stable identity of a corpus case: its graph key and signature. */
+export const corpusIdentity = (c) => `${c.graph.key}#${c.signature}`
+
+/**
+ * The issues among `issues` (`#N`) that no committed case names — a filed
+ * finding whose reproducer never reached the corpus, so nothing replays it.
+ * `aliases` maps an issue triaged as a duplicate to the issue whose committed
+ * case covers it.
+ */
+export function uncommittedIssues (issues, cases, aliases = {}) {
+  const named = new Set(cases.map((x) => x.issue))
+  return issues.filter((i) => !named.has(aliases[i] ?? i))
+}
+
+function fileIssue (c) {
+  const body = issueBody(c)
   const url = execFileSync('gh', ['issue', 'create', '--title', `parity(fuzz): ${c.signature.slice(0, 180)}`, '--body', body], { encoding: 'utf8' }).trim()
   return `#${url.split('/').pop()}`
 }
@@ -433,7 +479,11 @@ async function main () {
   const failures = corpusProblems(cases)
   const backends = await openBackends(args, log)
   const fresh = new Map()
-  const known = new Set(cases.filter((c) => !c.fixed).map((c) => c.signature))
+  // An open case marks only a divergence on ITS OWN graph as known: a
+  // field-based signature shared across graphs (e.g. a fixed case and an open
+  // one carrying the same mismatched fields) must never let the open case
+  // absorb a distinct defect on an unrelated graph.
+  const known = new Set(cases.filter((c) => !c.fixed).map((c) => knownKey(c.signature, c.graph.key)))
   // A completed minimum is persisted at once, so a later scenario error or a
   // failing backend close can never discard it.
   const nextName = executionNamer(`r${args.seed ?? 'replay'}`)
@@ -464,7 +514,9 @@ async function main () {
       const verdict = judgeCase(c, divs)
       if (verdict) failures.push(verdict)
       // A fixed case's divergence is already a REGRESSION verdict; an open
-      // case's must still not hide a different, unknown divergence.
+      // case's must still not hide a different, unknown divergence — and an
+      // open case explains a divergence only on its own graph, so a distinct
+      // defect sharing its field-based signature is surfaced, not absorbed.
       if (c.fixed) continue
       for (const d of unexplained(divs, known)) {
         if (fresh.has(d.signature)) continue
@@ -484,7 +536,7 @@ async function main () {
       for (const sc of entry.artifacts.scenarios) {
         ran++
         for (const d of await checkScenario(backends, entry, sc)) {
-          if (known.has(d.signature)) { log(`known ${d.signature} (case seed ${s})`); continue }
+          if (known.has(knownKey(d.signature, d.entry.graph.key))) { log(`known ${d.signature} on ${d.entry.graph.key} (case seed ${s})`); continue }
           if (fresh.has(d.signature)) continue
           log(`divergence ${d.signature} at case ${i} (case seed ${s}, ${entry.graph.id}) — shrinking`)
           await found(s, entry.skel, d)

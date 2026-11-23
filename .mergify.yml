@@ -69,7 +69,7 @@ queue_rules:
 # Use console/scripts/merge-gates.mjs to derive/check live branch protection;
 # see AGENTS.md for the coordinated update procedure.
 # Every required job is change-gated by the
-# `changes` job's paths-filter in `.github/workflows/ci.yml`: the six code checks
+# `changes` job's paths-filter in `.github/workflows/ci.yml`: the seven code checks
 # share the `code` filter (`*code_gate`), `processos (clippy + test)` has its own
 # `processos` filter (skipped for PRs that don't touch `processos/**`,
 # `engine-core/**`, or `.github/workflows/ci.yml`), `formal (tlc)` has its own
@@ -80,10 +80,10 @@ queue_rules:
 # `.github/workflows/ci.yml`, AGENTS.md and .mergify.yml for the merge-gate guard;
 # the typecheck job additionally runs on the `docs` filter), so each is
 # SKIPPED for PRs that don't touch its inputs (e.g. a console-/website-/docs-only
-# PR skips all six code checks; a Rust-only PR skips both console jobs). A skipped
+# PR skips all seven code checks; a Rust-only PR skips both console jobs). A skipped
 # check never reports `success`, so — matching the authoritative merge-protocol
 # in AGENTS.md ("required-when-run, skip-tolerant": acceptedConclusions
-# `["success", "skipped"]` for all ten) — each is accepted as success OR
+# `["success", "skipped"]` for all thirteen) — each is accepted as success OR
 # skipped. Required job names must not start with @: Mergify interprets
 # @scope/name as an app-qualified check, so an npm-scoped job name matches the
 # wrong publisher even when its actual GitHub Actions result is successful
@@ -103,6 +103,15 @@ merge_protections:
       - or:
           - check-success=engine-wasm-ffi (dist + verify)
           - check-skipped=engine-wasm-ffi (dist + verify)
+      # Promoted to a required gate by #898 (deferred out of #895, which added
+      # the job): this lane is the only gate on the published
+      # @nanobpm/engine-testkit npm package (typecheck + build + test). The
+      # check name drops the '@nanobpm/' prefix because Mergify parses a
+      # leading @scope/name as an app-qualified check (#1138). Change-gated on
+      # `code`, so accept skipped too.
+      - or:
+          - check-success=engine-testkit (build + test)
+          - check-skipped=engine-testkit (build + test)
       - or:
           - check-success=server (clippy + test)
           - check-skipped=server (clippy + test)
