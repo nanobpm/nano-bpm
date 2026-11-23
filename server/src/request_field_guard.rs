@@ -563,7 +563,7 @@ fn forwards_operation_reference(src: &str) -> bool {
 }
 
 /// `src` with every Rust comment blanked out: `//` line comments and
-/// (nested) `/* */` block comments. String and char literals are kept intact
+/// (nested) `/* */` block comments. String, raw-string and char literals are kept intact
 /// so a `//` or `/*` inside one does not start a comment. Removed text is
 /// replaced by spaces (newlines kept) so code on either side never fuses.
 fn strip_rust_comments(src: &str) -> String {
@@ -596,6 +596,37 @@ fn strip_rust_comments(src: &str) -> String {
                     i += 1;
                 }
             }
+        } else if c == 'r'
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == '_'))
+            && raw_string_hashes(&b[i + 1..]).is_some()
+        {
+            // Raw string `r#"..."#`: no escapes; ends at `"` + same hashes.
+            let hashes = raw_string_hashes(&b[i + 1..]).unwrap_or(0);
+            let open = 2 + hashes;
+            out.extend(&b[i..i + open]);
+            i += open;
+            while i < b.len() {
+                if b[i] == '"' && (1..=hashes).all(|k| b.get(i + k) == Some(&'#')) {
+                    out.extend(&b[i..i + 1 + hashes]);
+                    i += 1 + hashes;
+                    break;
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+        } else if c == '\'' {
+            // Char literal ('x', '\'', '\u{..}') vs. lifetime ('a): a
+            // literal closes with `'` within a short escape-aware span.
+            let end = if n == Some('\\') {
+                (i + 3..b.len().min(i + 12)).find(|&j| b[j] == '\'')
+            } else if b.get(i + 2) == Some(&'\'') {
+                Some(i + 2)
+            } else {
+                None
+            };
+            let stop = end.map_or(i + 1, |e| e + 1);
+            out.extend(&b[i..stop]);
+            i = stop;
         } else if c == '"' {
             out.push(c);
             i += 1;
@@ -619,6 +650,30 @@ fn strip_rust_comments(src: &str) -> String {
         }
     }
     out
+}
+
+/// If `rest` (the text after an `r`) opens a raw string (`#`* then `"`),
+/// the number of `#`s.
+fn raw_string_hashes(rest: &[char]) -> Option<usize> {
+    let h = rest.iter().take_while(|c| **c == '#').count();
+    (rest.get(h) == Some(&'"')).then_some(h)
+}
+
+#[test]
+fn strip_rust_comments_handles_char_literals_and_raw_strings() {
+    // A `'"'` char literal must not open a phantom string that hides a
+    // later comment (fail open): the commented-out forward is stripped.
+    let s = strip_rust_comments("let q = '\"'; // forward(x)\nb");
+    assert!(!s.contains("forward"), "{s}");
+    let s = strip_rust_comments("let q = '\\''; // forward(x)\nb");
+    assert!(!s.contains("forward"), "{s}");
+    let s = strip_rust_comments("let q = r#\"a\"b\"#; /* forward(x) */ c");
+    assert!(!s.contains("forward"), "{s}");
+    assert!(s.contains("r#\"a\"b\"#"), "{s}");
+    // Raw string content is kept intact; lifetimes don't derail scanning.
+    assert!(strip_rust_comments("r\"//keep\" x").contains("//keep"));
+    let s = strip_rust_comments("fn f<'a>(x: &'a str) {} // forward(x)");
+    assert!(!s.contains("forward"), "{s}");
 }
 
 #[test]
