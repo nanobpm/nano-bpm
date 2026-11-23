@@ -157,6 +157,11 @@ fn sync_point_at(region: &str, recv: &str, body: &str) -> Option<usize> {
                         .collect();
                     !dotted && arg == recv && bound_by_value(body, recv)
                 }
+                "barrier" => {
+                    dotted
+                        && receiver_before(region, at - 1).as_deref() == Some(recv)
+                        && barrier_awaited(region, at)
+                }
                 _ => {
                     dotted
                         && receiver_before(region, at - 1).as_deref() == Some(recv)
@@ -168,12 +173,63 @@ fn sync_point_at(region: &str, recv: &str, body: &str) -> Option<usize> {
                         })
                 }
             };
-            if ok && unconditional_at(region, at) {
+            // A sync on a *shadowing* `recv` (`let journal = <other>;`) orders
+            // the replacement journal's writer, not the discarded write's.
+            if ok && unconditional_at(region, at) && !shadows(&region[..at], recv) {
                 hits.push(at);
             }
         }
     }
     hits.into_iter().min()
+}
+
+/// Whether the `barrier()` call at `at` has its returned `Commit` awaited: an
+/// unawaited barrier queues a message but orders nothing for the caller. The
+/// wait is either chained (`.barrier().blocking_wait()`, `.wait()`,
+/// `.wait_durable()`) or on its `let` binding, unconditionally, later in
+/// `region`.
+fn barrier_awaited(region: &str, at: usize) -> bool {
+    const WAITS: &[&str] = &[".blocking_wait()", ".wait()", ".wait_durable()"];
+    let chain = call_result_chain(region, at + "barrier".len());
+    if WAITS.iter().any(|w| chain.starts_with(w)) {
+        return true;
+    }
+    let stmt_start = region[..at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
+    let head: String = region[stmt_start..at]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let Some(name) = head
+        .strip_prefix("let")
+        .map(|p| p.strip_prefix("mut").unwrap_or(p))
+        .and_then(|p| p.split('=').next())
+        .filter(|n| !n.is_empty() && n.bytes().all(is_ident))
+    else {
+        return false;
+    };
+    let after = call_args_end(region, at + "barrier".len());
+    let rest = &region[after..];
+    WAITS.iter().any(|w| {
+        rest.match_indices(&format!("{name}{w}")).any(|(k, _)| {
+            (k == 0 || !is_ident(rest.as_bytes()[k - 1]))
+                && !rebound_after(&rest[..k], name, "")
+                && unconditional_at(region, after + k)
+        })
+    })
+}
+
+/// Whether `after` redeclares `name` (`let name =` / `let mut name =`, or a
+/// typed `let name: T =`).
+fn shadows(after: &str, name: &str) -> bool {
+    !name.is_empty()
+        && after.split([';', '{', '}']).any(|stmt| {
+            let stmt: String = stmt.chars().filter(|c| !c.is_whitespace()).collect();
+            let rest = stmt
+                .strip_prefix("letmut")
+                .or_else(|| stmt.strip_prefix("let"))
+                .and_then(|r| r.strip_prefix(name));
+            rest.is_some_and(|r| r.starts_with('=') || r.starts_with(':'))
+        })
 }
 
 /// Whether `recv` is bound *by value* anywhere in `region`'s function
@@ -210,15 +266,11 @@ fn bound_by_value(region: &str, recv: &str) -> bool {
 fn rebound_after(after: &str, handle: &str, recv: &str) -> bool {
     after.split([';', '{', '}']).any(|stmt| {
         let stmt: String = stmt.chars().filter(|c| !c.is_whitespace()).collect();
-        let rebinds_handle = stmt
-            .strip_prefix(handle)
+        stmt.strip_prefix(handle)
             .or_else(|| stmt.strip_prefix(&format!("mut {handle}")))
-            .is_some_and(|rest| rest.starts_with('=') && !rest.starts_with("=="));
-        let shadows_recv = ["let mut ", "let "]
-            .iter()
-            .any(|kw| stmt.starts_with(&format!("{kw}{recv}=")));
-        rebinds_handle || shadows_recv
-    })
+            .is_some_and(|rest| rest.starts_with('=') && !rest.starts_with("=="))
+    }) || shadows(after, handle)
+        || shadows(after, recv)
 }
 
 /// The binding of the commit (last tuple slot, or the whole pattern) in the
@@ -488,23 +540,30 @@ fn discards_commit(body: &str, apply_at: usize) -> bool {
     // A named handle that is rebound before its wait (`late = Commit::ready()`)
     // no longer names the apply's commit: the wait resolves immediately and the
     // pending write races the observation — the commit is effectively dropped.
-    slot.is_some_and(|slot| {
-        slot.starts_with('_') || {
-            let recv = receiver_before(body, apply_at).unwrap_or_default();
-            let tail = &body[call_args_end(body, apply_at)..];
-            let rebound = tail
-                .match_indices(&format!("{slot}.blocking_wait()"))
-                .any(|(at, _)| {
-                    (at == 0 || !is_ident(tail.as_bytes()[at - 1]))
-                        && rebound_after(&tail[..at], &slot, &recv)
-                });
-            // No wait at all on a named handle also drops the commit.
-            let awaited = tail
-                .match_indices(&format!("{slot}.blocking_wait()"))
-                .any(|(at, _)| at == 0 || !is_ident(tail.as_bytes()[at - 1]));
-            rebound || !awaited
-        }
-    })
+    //
+    // A *named* handle is never trusted by name alone either: whether it is
+    // awaited before the observation, unconditionally, and without being
+    // rebound is position-dependent, so every bound apply is handed to
+    // `violations`, which accepts it only on such a proven wait.
+    slot.is_some()
+}
+
+/// The wait expression that awaits the apply's own commit through its binding:
+/// `<slot>.1.blocking_wait()` when the binding holds the whole
+/// `(events, Commit)` tuple, else `<slot>.blocking_wait()`.
+fn own_wait(body: &str, apply_at: usize, slot: &str) -> String {
+    let stmt_start = body[..apply_at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
+    let pat: String = body[stmt_start..apply_at]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let tuple_pattern = pat.contains('(') && pat.find('(') < pat.find('=');
+    let suffix = apply_result_suffix(body, apply_at);
+    if !tuple_pattern && strip_unwrap_chain(&suffix).is_empty() {
+        format!("{slot}.1.blocking_wait()")
+    } else {
+        format!("{slot}.blocking_wait()")
+    }
 }
 
 /// The `suffix` of an apply statement with its unwrapping chain removed:
@@ -610,13 +669,13 @@ fn violations(src: &str) -> Vec<(String, String)> {
                 let synced = sync_point_at(region, &recv, &body).is_some()
                     || commit_slot(&body, apply_at).is_some_and(|slot| {
                         !slot.is_empty()
-                            && region
-                                .match_indices(&format!("{slot}.blocking_wait()"))
-                                .any(|(at, _)| {
+                            && region.match_indices(&own_wait(&body, apply_at, &slot)).any(
+                                |(at, _)| {
                                     (at == 0 || !is_ident(region.as_bytes()[at - 1]))
                                         && !rebound_after(&region[..at], &slot, &recv)
                                         && unconditional_at(region, at)
-                                })
+                                },
+                            )
                     });
                 if !synced {
                     found.push((name.clone(), obs.to_string()));
@@ -1162,4 +1221,77 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
         }
     "#;
     assert_eq!(violations(own_handle_conditional).len(), 1);
+}
+
+/// Round-5 review (#1822): each shape that used to slip past the guard is
+/// flagged (RED), and the valid whole-tuple wait is accepted (GREEN).
+#[test]
+fn guard_requires_a_proven_ordered_wait_or_sync() {
+    let wait_after_read = r#"
+        fn t() {
+            let (_, commit) = journal.apply_command(c).unwrap();
+            shared.uncompacted_usage();
+            commit.blocking_wait();
+        }
+    "#;
+    assert_eq!(violations(wait_after_read).len(), 1);
+    let conditional_wait = r#"
+        fn t() {
+            let (_, commit) = journal.apply_command(c).unwrap();
+            if flag { commit.blocking_wait(); }
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(conditional_wait).len(), 1);
+    let let_shadowed_handle = r#"
+        fn t() {
+            let (_, _commit) = journal.apply_command(c).unwrap();
+            let _commit = Commit::ready();
+            _commit.blocking_wait();
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(let_shadowed_handle).len(), 1);
+    let shadowed_receiver_rotated = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let journal = Journal::open_segmented(&dir2).unwrap();
+            journal.snapshot_and_rotate().unwrap();
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(shadowed_receiver_rotated).len(), 1);
+    let unawaited_barrier = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            journal.barrier();
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(unawaited_barrier).len(), 1);
+    let bound_barrier_waited_late = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let b = journal.barrier();
+            shared.uncompacted_usage();
+            b.blocking_wait();
+        }
+    "#;
+    assert_eq!(violations(bound_barrier_waited_late).len(), 1);
+    let whole_tuple = r#"
+        fn t() {
+            let pair = journal.apply_command(c).unwrap();
+            pair.1.blocking_wait();
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(whole_tuple).is_empty());
+    let whole_tuple_projection_only = r#"
+        fn t() {
+            let pair = journal.apply_command(c).unwrap();
+            pair.0.len();
+            shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(whole_tuple_projection_only).len(), 1);
 }
