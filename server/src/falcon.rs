@@ -1551,21 +1551,35 @@ async fn handle_client_frame(
                 })),
             });
         }
-        ClientFrame::CancelInstance { corr, instance_key } => {
+        ClientFrame::CancelInstance {
+            corr,
+            instance_key,
+            operation_reference,
+        } => {
             forward_by_key_reply(conn, corr, &instance_key, |key| async move {
-                server.cancel_instance_local(key).await
+                server.cancel_instance_local(key, operation_reference).await
             })
             .await;
         }
-        ClientFrame::SuspendInstance { corr, instance_key } => {
+        ClientFrame::SuspendInstance {
+            corr,
+            instance_key,
+            operation_reference,
+        } => {
             forward_by_key_reply(conn, corr, &instance_key, |key| async move {
-                server.suspend_instance_local(key).await
+                server
+                    .suspend_instance_local(key, operation_reference)
+                    .await
             })
             .await;
         }
-        ClientFrame::ResumeInstance { corr, instance_key } => {
+        ClientFrame::ResumeInstance {
+            corr,
+            instance_key,
+            operation_reference,
+        } => {
             forward_by_key_reply(conn, corr, &instance_key, |key| async move {
-                server.resume_instance_local(key).await
+                server.resume_instance_local(key, operation_reference).await
             })
             .await;
         }
@@ -1709,10 +1723,13 @@ async fn handle_client_frame(
             scope_key,
             variables,
             local,
+            operation_reference,
         } => {
             let vars = to_engine_vars(variables);
             forward_by_key_reply(conn, corr, &scope_key, |key| async move {
-                server.set_variables_local(key, vars, local).await
+                server
+                    .set_variables_local(key, vars, local, operation_reference)
+                    .await
             })
             .await;
         }
@@ -4240,10 +4257,12 @@ mod asyncapi_spec_guard {
                 scope_key: "1".into(),
                 variables: None,
                 local: false,
+                operation_reference: None,
             },
             ClientFrame::CancelInstance {
                 corr: 1,
                 instance_key: "1".into(),
+                operation_reference: None,
             },
             ClientFrame::Deploy {
                 corr: 1,

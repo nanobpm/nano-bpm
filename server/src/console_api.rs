@@ -487,7 +487,7 @@ impl apis::instances::Instances for ServerImpl {
 
         // Console operator action: reuses the same engine-command + leader-forward
         // core as `POST /v2/process-instances/{key}/cancellation`.
-        Ok(match self.cancel_instance_core(instance_key).await {
+        Ok(match self.cancel_instance_core(instance_key, None).await {
             Out::Canceled => Resp::Status204_TheInstanceWasCancelled,
             Out::NotFound(d) => Resp::Status404_NotFound(d),
             Out::Unavailable(d) => Resp::Status503_TheServiceIsCurrentlyUnavailable(d),
@@ -518,7 +518,7 @@ impl apis::instances::Instances for ServerImpl {
 
         // Console operator action: reuses the same engine-command + leader-forward
         // core as `POST /v2/process-instances/{key}/suspension`.
-        Ok(match self.suspend_instance_core(instance_key).await {
+        Ok(match self.suspend_instance_core(instance_key, None).await {
             Out::Ok => Resp::Status204_TheInstanceWasSuspended,
             Out::Conflict(d) => Resp::Status400_InvalidRequest(d),
             Out::NotFound(d) => Resp::Status404_NotFound(d),
@@ -550,7 +550,7 @@ impl apis::instances::Instances for ServerImpl {
 
         // Console operator action: reuses the same engine-command + leader-forward
         // core as `POST /v2/process-instances/{key}/resumption`.
-        Ok(match self.resume_instance_core(instance_key).await {
+        Ok(match self.resume_instance_core(instance_key, None).await {
             Out::Ok => Resp::Status204_TheInstanceWasResumed,
             Out::Conflict(d) => Resp::Status400_InvalidRequest(d),
             Out::NotFound(d) => Resp::Status404_NotFound(d),
@@ -591,7 +591,10 @@ impl apis::instances::Instances for ServerImpl {
         let local = body.local.unwrap_or(false);
 
         Ok(
-            match self.set_variables_core(scope_key, variables, local).await {
+            match self
+                .set_variables_core(scope_key, variables, local, None)
+                .await
+            {
                 Out::Updated => Resp::Status204_TheVariablesWereMerged,
                 Out::ScopeNotFound(d) => Resp::Status404_NotFound(d),
                 Out::Unavailable(d) => Resp::Status503_TheServiceIsCurrentlyUnavailable(d),

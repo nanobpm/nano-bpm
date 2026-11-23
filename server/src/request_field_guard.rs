@@ -231,6 +231,15 @@ fn walk(
 /// `(served operations missing from the spec, request fields of the served
 /// operations present in it)`.
 fn served_request_fields() -> (BTreeSet<String>, BTreeSet<String>) {
+    let (missing, by_op) = served_request_fields_by_operation();
+    (missing, by_op.into_values().flatten().collect())
+}
+
+/// `(served operations missing from the spec, served operation method name ->
+/// the request fields reachable from its body)`. Each operation is walked with
+/// its own `visited` set, so a schema shared by several operations is attributed
+/// to every one of them.
+fn served_request_fields_by_operation() -> (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>) {
     let served = served_operations();
     let mut spec = Spec {
         dir: build_spec_dir(),
@@ -243,8 +252,7 @@ fn served_request_fields() -> (BTreeSet<String>, BTreeSet<String>) {
         .expect("rest-api.yaml has paths")
         .clone();
     let mut found = BTreeSet::new();
-    let mut fields = BTreeSet::new();
-    let mut visited = BTreeSet::new();
+    let mut by_op: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (_, item) in paths {
         let (item, file) = match item.get("$ref").and_then(Value::as_str) {
             Some(r) => {
@@ -282,23 +290,18 @@ fn served_request_fields() -> (BTreeSet<String>, BTreeSet<String>) {
             else {
                 continue;
             };
+            let fields = by_op.entry(snake(op_id)).or_default();
+            let mut visited = BTreeSet::new();
             for (_, media) in content.clone() {
                 if let Some(schema) = media.get("schema") {
                     let name = format!("{op_id}Body");
-                    walk(
-                        &mut spec,
-                        schema,
-                        &body_file,
-                        &name,
-                        &mut fields,
-                        &mut visited,
-                    );
+                    walk(&mut spec, schema, &body_file, &name, fields, &mut visited);
                 }
             }
         }
     }
     let missing = served.difference(&found).cloned().collect();
-    (missing, fields)
+    (missing, by_op)
 }
 
 const MANIFEST: &str = "spec-patches/request-fields.txt";
@@ -442,5 +445,108 @@ fn honoured_sort_field_values_have_an_explicit_dispatcher_arm() {
         "sort values with no explicit dispatcher arm (they would silently sort \
          by entity key) - implement them, or mark `unhonoured #<issue>` in \
          spec-patches/request-fields.txt: {unhandled:#?}"
+    );
+}
+
+/// `OVERRIDES` method name -> the `self.<impl>(` handler it delegates to,
+/// parsed from `scripts/gen-stub-server.py` (the single source of which
+/// operations are wired to which handler).
+fn override_handlers() -> BTreeMap<String, String> {
+    let src = std::fs::read_to_string(repo_root().join("scripts/gen-stub-server.py"))
+        .expect("read gen-stub-server.py");
+    let mut out = BTreeMap::new();
+    for line in src.lines() {
+        let parts: Vec<&str> = line.trim_start().split('"').collect();
+        if parts.len() > 6 && parts[0] == "(" && parts[4].starts_with("):") {
+            if let Some(call) = parts[5].strip_prefix("self.") {
+                let name = call.split('(').next().unwrap_or_default();
+                out.insert(parts[3].to_string(), name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The source of `fn <name>(` (through its closing `}` at the definition's
+/// indentation) in any `server/src/*.rs` file.
+fn fn_source(name: &str) -> Option<String> {
+    let dir = repo_root().join("server/src");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read server/src")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    files.sort();
+    let needle = format!("fn {name}(");
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("read source");
+        let Some(at) = text.find(&needle) else {
+            continue;
+        };
+        let line_start = text[..at].rfind('\n').map_or(0, |p| p + 1);
+        let indent: String = text[line_start..]
+            .chars()
+            .take_while(|c| *c == ' ')
+            .collect();
+        let rest = &text[at..];
+        let close = format!("\n{indent}}}\n");
+        let end = rest.find(&close).map_or(rest.len(), |e| e + close.len());
+        return Some(rest[..end].to_string());
+    }
+    None
+}
+
+/// Defect-class guard (#1606): an `operationReference` request field the
+/// manifest marks as honoured (no `unhonoured #N` note) must actually be read
+/// by the served operation's handler and handed on toward the `_ref` engine
+/// funnel. Before #1606, `CancelProcessInstanceRequest.operationReference` and
+/// its suspend/resume/set-variables siblings were listed as honoured while the
+/// `OVERRIDES` delegation passed only `path_params`, silently dropping the
+/// value. The guard derives, from the spec, every served operation whose body
+/// reaches an honoured `*.operationReference`, and requires that operation's
+/// handler (resolved through `OVERRIDES`) to receive `body` and read
+/// `operation_reference`.
+#[test]
+fn honoured_operation_references_are_forwarded_by_their_handler() {
+    let manifest = read_manifest();
+    let honoured: BTreeSet<&String> = manifest
+        .iter()
+        .filter(|(f, note)| note.is_none() && f.ends_with(".operationReference"))
+        .map(|(f, _)| f)
+        .collect();
+    assert!(
+        !honoured.is_empty(),
+        "no honoured operationReference fields parsed - guard is blind"
+    );
+    let (_, by_op) = served_request_fields_by_operation();
+    let handlers = override_handlers();
+    let mut dropped = Vec::new();
+    let mut checked = 0;
+    for (op, fields) in &by_op {
+        let reaches: Vec<_> = fields.iter().filter(|f| honoured.contains(f)).collect();
+        if reaches.is_empty() {
+            continue;
+        }
+        checked += 1;
+        let Some(handler) = handlers.get(op) else {
+            dropped.push(format!("{op}: no OVERRIDES handler ({reaches:?})"));
+            continue;
+        };
+        let forwards = fn_source(handler)
+            .is_some_and(|src| src.contains("body") && src.contains("operation_reference"));
+        if !forwards {
+            dropped.push(format!("{op} -> {handler}: drops {reaches:?}"));
+        }
+    }
+    assert!(
+        checked > 0,
+        "no served operation reaches an honoured operationReference"
+    );
+    assert!(
+        dropped.is_empty(),
+        "honoured operationReference fields the handler never reads - thread the \
+         reference through to the `_ref` funnel, or mark the field \
+         `unhonoured #<issue>` in spec-patches/request-fields.txt: {dropped:#?}"
     );
 }

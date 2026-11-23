@@ -1061,27 +1061,45 @@ impl PeerLink {
     }
 
     /// Forwards a `cancelProcessInstance` to the peer that owns the instance.
-    pub async fn cancel_instance(&self, instance_key: String) -> Result<PeerResult, PeerError> {
+    pub async fn cancel_instance(
+        &self,
+        instance_key: String,
+        operation_reference: Option<i64>,
+    ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::CancelInstance {
             corr,
             instance_key,
+            operation_reference,
         })
         .await
     }
 
     /// Forwards a `suspendProcessInstance` to the peer that owns the instance.
-    pub async fn suspend_instance(&self, instance_key: String) -> Result<PeerResult, PeerError> {
+    pub async fn suspend_instance(
+        &self,
+        instance_key: String,
+        operation_reference: Option<i64>,
+    ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| {
-            ClientFrame::SuspendInstance { corr, instance_key }
+            ClientFrame::SuspendInstance {
+                corr,
+                instance_key,
+                operation_reference,
+            }
         })
         .await
     }
 
     /// Forwards a `resumeProcessInstance` to the peer that owns the instance.
-    pub async fn resume_instance(&self, instance_key: String) -> Result<PeerResult, PeerError> {
+    pub async fn resume_instance(
+        &self,
+        instance_key: String,
+        operation_reference: Option<i64>,
+    ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::ResumeInstance {
             corr,
             instance_key,
+            operation_reference,
         })
         .await
     }
@@ -1260,12 +1278,14 @@ impl PeerLink {
         scope_key: String,
         variables: Option<serde_json::Map<String, Value>>,
         local: bool,
+        operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::SetVariables {
             corr,
             scope_key,
             variables,
             local,
+            operation_reference,
         })
         .await
     }

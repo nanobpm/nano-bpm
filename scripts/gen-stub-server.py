@@ -34,9 +34,9 @@ METHOD_RE = re.compile(
 # they never drift from the spec.
 OVERRIDES: dict[tuple[str, str], str] = {
     ("process_instance", "create_process_instance"): "self.create_process_instance_impl(body).await",
-    ("process_instance", "cancel_process_instance"): "self.cancel_process_instance_impl(path_params).await",
-    ("process_instance", "suspend_process_instance"): "self.suspend_process_instance_impl(path_params).await",
-    ("process_instance", "resume_process_instance"): "self.resume_process_instance_impl(path_params).await",
+    ("process_instance", "cancel_process_instance"): "self.cancel_process_instance_impl(path_params, body).await",
+    ("process_instance", "suspend_process_instance"): "self.suspend_process_instance_impl(path_params, body).await",
+    ("process_instance", "resume_process_instance"): "self.resume_process_instance_impl(path_params, body).await",
     ("process_instance", "migrate_process_instance"): "self.migrate_process_instance_impl(path_params, body).await",
     ("process_instance", "modify_process_instance"): "self.modify_process_instance_impl(path_params, body).await",
     ("job", "complete_job"): "self.complete_job_impl(path_params, body).await",
@@ -53,7 +53,7 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("decision_requirements", "get_decision_requirements_xml"): "self.get_decision_requirements_xml_impl(path_params).await",
     ("decision_requirements", "search_decision_requirements"): "self.search_decision_requirements_impl(body).await",
     ("decision_instance", "get_decision_instance"): "self.get_decision_instance_impl(path_params).await",
-    ("decision_instance", "delete_decision_instance"): "self.delete_decision_instance_impl(path_params).await",
+    ("decision_instance", "delete_decision_instance"): "self.delete_decision_instance_impl(path_params, body).await",
     ("decision_instance", "search_decision_instances"): "self.search_decision_instances_impl(body).await",
     ("form", "get_form_by_key"): "self.get_form_by_key_impl(path_params).await",
     ("job", "activate_jobs"): "self.activate_jobs_impl(body).await",
