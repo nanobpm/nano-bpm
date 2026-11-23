@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use nanobpmn_engine_core::{
-    InstanceSnapshot, JobState, Key, MessageSubscriptionState, TimerState, UserTaskState,
+    Command, InstanceSnapshot, JobState, Key, MessageSubscriptionState, TimerState, UserTaskState,
 };
 
 /// The routing facets of one cold instance, retained so its reverse-index
@@ -175,6 +175,79 @@ impl ColdIndex {
             .unwrap_or_default()
     }
 
+    /// The cold instances `command` addresses by key (job, user task,
+    /// incident, scope, instance) or by message correlation — the instances a
+    /// replica must page in before applying it. The single routing table for
+    /// both apply-time rehydration and proposal-time deadline stamping
+    /// (#1856 review), so the two cannot drift. Batch commands that page in
+    /// on their own terms (`ActivateJobs`, `TriggerTimers`) are not covered.
+    pub fn command_targets(&self, command: &Command) -> Vec<Key> {
+        let mut targets: Vec<Key> = Vec::new();
+        match command {
+            Command::CompleteJob { job_key, .. }
+            | Command::FailJob { job_key, .. }
+            | Command::ThrowJobError { job_key, .. }
+            | Command::UpdateJobRetries { job_key, .. }
+            | Command::UpdateJobTimeout { job_key, .. }
+            | Command::UpdateJob { job_key, .. } => {
+                targets.extend(self.instance_for_job(*job_key));
+            }
+            Command::ActivateJobsByKey { job_keys, .. } => {
+                targets.extend(
+                    job_keys
+                        .iter()
+                        .filter_map(|key| self.instance_for_job(*key)),
+                );
+            }
+            Command::AssignUserTask { user_task_key, .. }
+            | Command::UnassignUserTask { user_task_key }
+            | Command::UpdateUserTask { user_task_key, .. }
+            | Command::CompleteUserTask { user_task_key, .. } => {
+                targets.extend(self.instance_for_user_task(*user_task_key));
+            }
+            Command::ResolveIncident { incident_key, .. } => {
+                targets.extend(self.instance_for_incident(*incident_key));
+            }
+            Command::SetVariables { scope_key, .. } => {
+                // The scope may be the instance root or one of its active
+                // element-instance (token) scopes; both can address a cold
+                // instance and must page it back in before the update applies.
+                if self.contains(*scope_key) {
+                    targets.push(*scope_key);
+                } else {
+                    targets.extend(self.instance_for_scope(*scope_key));
+                }
+            }
+            Command::CancelInstance { instance_key } => {
+                if self.contains(*instance_key) {
+                    targets.push(*instance_key);
+                }
+            }
+            Command::ModifyInstance { instance_key, .. }
+            | Command::MigrateInstance { instance_key, .. } => {
+                // Modify/migrate address a single instance (activating/terminating its
+                // element instances); page it in before the command applies.
+                if self.contains(*instance_key) {
+                    targets.push(*instance_key);
+                }
+            }
+            Command::CorrelateMessage {
+                message_name,
+                correlation_key,
+                ..
+            } => {
+                targets.extend(self.instances_for_message(message_name, correlation_key));
+            }
+            _ => {}
+        }
+        targets
+    }
+
+    /// The calling parent of the cold instance `key`, if any.
+    pub fn parent_of(&self, key: Key) -> Option<Key> {
+        self.instances.get(&key).and_then(|facets| facets.parent)
+    }
+
     /// Whether `key` is a cold instance.
     pub fn contains(&self, key: Key) -> bool {
         self.instances.contains_key(&key)
@@ -312,6 +385,26 @@ impl ColdIndex {
             .range(..=now)
             .next()
             .is_some_and(|(_, set)| !set.is_empty())
+    }
+}
+
+/// The cold tier's call-activity links and command roots, for walks that must
+/// cross cold instances (#1856 review).
+impl nanobpmn_engine_core::ColdTopology for ColdIndex {
+    fn parent_of(&self, key: Key) -> Option<Key> {
+        ColdIndex::parent_of(self, key)
+    }
+
+    fn children_of(&self, parent: Key) -> Vec<Key> {
+        ColdIndex::children_of(self, parent)
+    }
+
+    fn command_roots(&self, command: &Command) -> Vec<Key> {
+        let mut roots = self.command_targets(command);
+        if let Command::TriggerTimers { now } = command {
+            roots.extend(self.instances_due(*now));
+        }
+        roots
     }
 }
 
