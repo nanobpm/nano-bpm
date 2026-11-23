@@ -53648,6 +53648,22 @@ mod subscription_placement_tests {
                 })
                 .collect()
         };
+        // The create is answered before its subscription open is routed
+        // (`answer_and_route_create`), so wait on the publication gate for the
+        // open to land first; otherwise its routed records could fall into the
+        // post-cancel suffix and be misattributed to the cancellation.
+        assert_ne!(
+            server
+                .publication_gate
+                .wait(
+                    "payment-received",
+                    "order-1606",
+                    std::time::Duration::from_secs(10),
+                )
+                .await,
+            crate::publication_gate::GateWait::TimedOut,
+            "the create's subscription open must be routed before the baseline"
+        );
         let before_cancel: std::collections::BTreeMap<_, usize> = read_journal()
             .into_iter()
             .map(|(p, recs)| (p, recs.len()))
