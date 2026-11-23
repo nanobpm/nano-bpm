@@ -5728,18 +5728,18 @@ mod regen_path_tests {
 
 /// Whether a saved project file is a process model that carries the worker/message
 /// I/O + custom-header contract the `domaintypes` op derives (ADR 0033 §3). The
-/// scan surface is exactly `resources/processes/*.bpmn` (`envelope_scan::
-/// scan_project` reads that directory non-recursively), so the regeneration
-/// trigger matches it precisely: a `.bpmn` directly under `resources/processes/`
-/// (extension case-insensitive). A `.bpmn` saved elsewhere is not scanned, so it
-/// must not spuriously retrigger a regeneration that could not reflect it.
-pub fn is_model_resource(rel: &str) -> bool {
-    // Mirror `safe_project_path`'s leading-slash tolerance so the trigger matches
-    // exactly what was saved.
-    let path = std::path::Path::new(rel.trim_start_matches('/'));
-    path.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("bpmn"))
-        && path.parent() == Some(std::path::Path::new("resources/processes"))
+/// scan surface is the project's resolved `models.processes` globs (manifest
+/// override, else the convention default `resources/**/*.bpmn`), and this
+/// trigger delegates to the SAME resolver as `envelope_scan::scan_project`
+/// (`is_process_model_path`), so a model the scan reads always retriggers and a
+/// file it cannot read never does.
+pub fn is_model_resource(name: &str, rel: &str) -> bool {
+    projects::project_dir(name).is_some_and(|dir| is_model_resource_in(&dir, rel))
+}
+
+/// [`is_model_resource`] against an explicit project directory.
+pub fn is_model_resource_in(project_dir: &std::path::Path, rel: &str) -> bool {
+    envelope_scan::is_process_model_path(project_dir, rel)
 }
 
 /// Whether a saved project file is a code-first workflow *source* — a `.ts`
@@ -6436,20 +6436,29 @@ mod asset_encoding_tests {
 
     #[test]
     fn is_model_resource_matches_bpmn_only() {
-        // The scan surface: `.bpmn` directly under `resources/processes/`,
-        // extension matched case-insensitively.
-        assert!(is_model_resource("resources/processes/order.bpmn"));
-        assert!(is_model_resource("resources/processes/order.BPMN")); // case-insensitive
-        assert!(is_model_resource("/resources/processes/order.bpmn")); // leading-slash tolerated
-        // A `.bpmn` outside the scan surface is NOT a scanned model, so it must
-        // not trigger a regeneration that could not reflect it.
-        assert!(!is_model_resource("order.bpmn")); // project root, not scanned
-        assert!(!is_model_resource("resources/processes/sub/order.bpmn")); // nested, not scanned
-        assert!(!is_model_resource("resources/order.bpmn"));
-        assert!(!is_model_resource("workers/charge/worker.ts"));
-        assert!(!is_model_resource("resources/forms/f.form"));
-        assert!(!is_model_resource("nano.app.json"));
-        assert!(!is_model_resource("README")); // no extension
+        // Default convention (no manifest): `resources/**/*.bpmn`, case-insensitive.
+        let dir = std::env::temp_dir().join(format!("nano-model-res-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = |rel: &str| is_model_resource_in(&dir, rel);
+        assert!(m("resources/processes/order.bpmn"));
+        assert!(m("resources/processes/order.BPMN"));
+        assert!(m("/resources/processes/order.bpmn"));
+        assert!(m("resources/order.bpmn")); // root of resources/
+        assert!(m("resources/processes/sub/order.bpmn")); // nested
+        assert!(!m("order.bpmn")); // outside resources/
+        assert!(!m("workers/charge/worker.ts"));
+        assert!(!m("resources/forms/f.form"));
+        assert!(!m("nano.app.json"));
+        assert!(!m("README"));
+        // A custom `models.processes` glob replaces the default.
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"models":{"processes":["models/*.bpmn"]}}"#,
+        )
+        .unwrap();
+        assert!(m("models/order.bpmn"));
+        assert!(!m("resources/processes/order.bpmn"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

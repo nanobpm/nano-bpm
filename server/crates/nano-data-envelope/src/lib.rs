@@ -811,30 +811,150 @@ fn fill(slot: &mut Option<String>, incoming: Option<String>) {
     }
 }
 
-/// Scan every `resources/processes/*.bpmn` under `project_dir` into the merged
-/// worker-, message- and start-IO maps. Unreadable or malformed files are
-/// skipped; a project with no processes yields an empty scan.
-pub fn scan_project(project_dir: &Path) -> BpmnScan {
-    let processes = project_dir.join("resources").join("processes");
-    let entries = match std::fs::read_dir(&processes) {
-        Ok(e) => e,
-        Err(_) => return BpmnScan::default(),
+/// The manifest file whose `models.processes` globs override the convention.
+pub const MANIFEST_FILE: &str = "nano.app.json";
+
+/// The convention-default BPMN process glob (ADR 0062, `spec-app/nano-app.schema.json`
+/// `models.processes`), used when the manifest declares no override.
+pub const DEFAULT_PROCESS_GLOBS: &[&str] = &["resources/**/*.bpmn"];
+
+/// The BPMN process globs for the project at `project_dir` — the SINGLE source of
+/// truth for "which files are process models", shared by [`scan_project`] and the
+/// save-time regeneration trigger ([`is_process_model_path`]). Reads
+/// `nano.app.json` `models.processes` when present and non-empty, else the
+/// convention default [`DEFAULT_PROCESS_GLOBS`]. A missing/malformed manifest
+/// falls back to the default.
+pub fn process_globs(project_dir: &Path) -> Vec<String> {
+    let declared = std::fs::read_to_string(project_dir.join(MANIFEST_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("models")?.get("processes")?.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|g| g.as_str())
+                    .map(|g| g.trim_start_matches("./").to_string())
+                    .filter(|g| !g.is_empty())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    if declared.is_empty() {
+        DEFAULT_PROCESS_GLOBS
+            .iter()
+            .map(|g| (*g).to_string())
+            .collect()
+    } else {
+        declared
+    }
+}
+
+/// Whether the project-relative path `rel` (`/`-separated, a leading `/` or `./`
+/// tolerated) is a process model of the project at `project_dir`, i.e. matches
+/// one of its [`process_globs`]. This is exactly the set [`scan_project`] reads.
+pub fn is_process_model_path(project_dir: &Path, rel: &str) -> bool {
+    let rel = rel.trim_start_matches('/').trim_start_matches("./");
+    let rel = rel.replace('\\', "/");
+    process_globs(project_dir)
+        .iter()
+        .any(|g| glob_match(g, &rel))
+}
+
+/// Match a `/`-separated relative path against a glob supporting `*` and `?`
+/// (within one segment) and `**` (any number of segments, including zero).
+/// ASCII case-insensitive, so a `.BPMN` model matches a `*.bpmn` glob.
+pub fn glob_match(glob: &str, path: &str) -> bool {
+    let g: Vec<&str> = glob.split('/').filter(|s| !s.is_empty()).collect();
+    let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match_segments(&g, &p)
+}
+
+fn match_segments(g: &[&str], p: &[&str]) -> bool {
+    match g.split_first() {
+        None => p.is_empty(),
+        Some((&"**", rest)) => (0..=p.len()).any(|i| match_segments(rest, &p[i..])),
+        Some((seg, rest)) => match p.split_first() {
+            Some((head, tail)) => {
+                match_segment(seg.as_bytes(), head.as_bytes()) && match_segments(rest, tail)
+            }
+            None => false,
+        },
+    }
+}
+
+fn match_segment(g: &[u8], s: &[u8]) -> bool {
+    match g.split_first() {
+        None => s.is_empty(),
+        Some((b'*', rest)) => (0..=s.len()).any(|i| match_segment(rest, &s[i..])),
+        Some((b'?', rest)) => !s.is_empty() && match_segment(rest, &s[1..]),
+        Some((c, rest)) => s
+            .split_first()
+            .is_some_and(|(h, t)| h.eq_ignore_ascii_case(c) && match_segment(rest, t)),
+    }
+}
+
+/// Directories never descended into while resolving model globs.
+const SKIP_DIRS: &[&str] = &["node_modules", ".git", "target", "nano-generated"];
+
+/// Resolve the project's [`process_globs`] to the sorted, de-duplicated set of
+/// existing model files. Each glob is walked from its literal (wildcard-free)
+/// prefix; symlinked directories are not followed.
+pub fn resolve_process_models(project_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out: std::collections::BTreeSet<std::path::PathBuf> = Default::default();
+    for glob in process_globs(project_dir) {
+        let segs: Vec<&str> = glob.split('/').filter(|s| !s.is_empty()).collect();
+        let lit = segs.iter().take_while(|s| !s.contains(['*', '?'])).count();
+        // A fully-literal glob names one file.
+        let base_rel = segs[..lit.min(segs.len().saturating_sub(1))].join("/");
+        let base = if base_rel.is_empty() {
+            project_dir.to_path_buf()
+        } else {
+            project_dir.join(&base_rel)
+        };
+        walk(&base, &base_rel, &mut |rel, path| {
+            if glob_match(&glob, rel) {
+                out.insert(path.to_path_buf());
+            }
+        });
+    }
+    out.into_iter().collect()
+}
+
+fn walk(dir: &Path, rel: &str, f: &mut dyn FnMut(&str, &Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
+    for e in entries.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        let name = e.file_name().to_string_lossy().into_owned();
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        let path = e.path();
+        if ft.is_dir() {
+            if !SKIP_DIRS.contains(&name.as_str()) {
+                walk(&path, &child_rel, f);
+            }
+        } else if ft.is_file() || (ft.is_symlink() && path.is_file()) {
+            f(&child_rel, &path);
+        }
+    }
+}
+
+/// Scan every process model of the project at `project_dir` — the files matching
+/// its [`process_globs`] (manifest `models.processes`, else the convention default
+/// `resources/**/*.bpmn`) — into the merged worker-, message- and start-IO maps.
+/// Unreadable or malformed files are skipped; a project with no processes yields
+/// an empty scan.
+pub fn scan_project(project_dir: &Path) -> BpmnScan {
+    let files = resolve_process_models(project_dir);
     let mut workers: BTreeMap<String, WorkerIo> = BTreeMap::new();
     let mut worker_seen: HashMap<String, HashSet<String>> = HashMap::new();
     let mut messages: BTreeMap<String, MessageIo> = BTreeMap::new();
     let mut starts: BTreeMap<String, StartIo> = BTreeMap::new();
     let mut shapes: Vec<ShapeDecl> = Vec::new();
     let mut meta: Vec<MetaDecl> = Vec::new();
-    let mut files: Vec<std::path::PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .is_some_and(|x| x.eq_ignore_ascii_case("bpmn"))
-        })
-        .collect();
-    files.sort();
     for path in files {
         let Ok(xml) = std::fs::read_to_string(&path) else {
             continue;
@@ -1905,5 +2025,110 @@ mod tests {
             "uppercase .BPMN model must be scanned"
         );
         assert_eq!(scan.workers[0].task_type, "charge");
+    }
+
+    fn temp_project(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nano-scan-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_model(root: &Path, rel: &str, task_type: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let xml = doc(&task("t1", "serviceTask", task_type, IN_ORDER));
+        std::fs::write(path, xml).unwrap();
+    }
+
+    fn task_types(scan: &BpmnScan) -> Vec<String> {
+        scan.workers.iter().map(|w| w.task_type.clone()).collect()
+    }
+
+    #[test]
+    fn scan_project_default_globs_cover_root_level_and_nested_resources() {
+        // Regression #1751: the default convention is `resources/**/*.bpmn`, not
+        // only immediate `resources/processes/*.bpmn`.
+        let root = temp_project("default");
+        write_model(&root, "resources/root.bpmn", "root");
+        write_model(&root, "resources/processes/flat.bpmn", "flat");
+        write_model(&root, "resources/processes/deep/nested.bpmn", "nested");
+        write_model(&root, "outside.bpmn", "outside");
+        write_model(&root, "resources/node_modules/dep.bpmn", "dep");
+        let scan = scan_project(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(task_types(&scan), vec!["flat", "nested", "root"]);
+    }
+
+    #[test]
+    fn scan_project_honours_custom_manifest_globs() {
+        let root = temp_project("custom");
+        std::fs::write(
+            root.join(MANIFEST_FILE),
+            r#"{"models":{"processes":["models/**/*.bpmn","extra/one.bpmn"]}}"#,
+        )
+        .unwrap();
+        write_model(&root, "models/a.bpmn", "a");
+        write_model(&root, "models/x/b.bpmn", "b");
+        write_model(&root, "extra/one.bpmn", "one");
+        write_model(&root, "extra/two.bpmn", "two");
+        write_model(&root, "resources/processes/ignored.bpmn", "ignored");
+        let scan = scan_project(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(task_types(&scan), vec!["a", "b", "one"]);
+    }
+
+    #[test]
+    fn trigger_and_scan_share_one_resolver() {
+        // Defect class: the save trigger and the scan drifting apart. Every file
+        // the scan resolves must satisfy the trigger, and vice versa.
+        let root = temp_project("parity");
+        for rel in [
+            "resources/a.bpmn",
+            "resources/processes/b.BPMN",
+            "resources/x/y/c.bpmn",
+            "other/d.bpmn",
+            "e.bpmn",
+        ] {
+            write_model(&root, rel, "t");
+        }
+        let resolved: Vec<String> = resolve_process_models(&root)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        for rel in [
+            "resources/a.bpmn",
+            "resources/processes/b.BPMN",
+            "resources/x/y/c.bpmn",
+            "other/d.bpmn",
+            "e.bpmn",
+        ] {
+            assert_eq!(
+                resolved.contains(&rel.to_string()),
+                is_process_model_path(&root, rel),
+                "{rel}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn glob_match_semantics() {
+        assert!(glob_match("resources/**/*.bpmn", "resources/a.bpmn"));
+        assert!(glob_match("resources/**/*.bpmn", "resources/x/y/a.bpmn"));
+        assert!(!glob_match("resources/**/*.bpmn", "res/a.bpmn"));
+        assert!(glob_match("*.bpmn", "a.BPMN"));
+        assert!(!glob_match("*.bpmn", "x/a.bpmn"));
+        assert!(glob_match("m/?.bpmn", "m/a.bpmn"));
+        assert!(glob_match("**", "any/thing"));
     }
 }
