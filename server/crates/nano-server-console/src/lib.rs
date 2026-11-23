@@ -5732,14 +5732,17 @@ mod regen_path_tests {
 /// override, else the convention default `resources/**/*.bpmn`), and this
 /// trigger delegates to the SAME resolver as `envelope_scan::scan_project`
 /// (`is_process_model_path`), so a model the scan reads always retriggers and a
-/// file it cannot read never does.
+/// file it cannot read never does. A save of the manifest (`nano.app.json`)
+/// also retriggers: it can change `models.processes` itself, so the set of
+/// models the derived types come from may have changed even though no model did.
 pub fn is_model_resource(name: &str, rel: &str) -> bool {
     projects::project_dir(name).is_some_and(|dir| is_model_resource_in(&dir, rel))
 }
 
 /// [`is_model_resource`] against an explicit project directory.
 pub fn is_model_resource_in(project_dir: &std::path::Path, rel: &str) -> bool {
-    envelope_scan::is_process_model_path(project_dir, rel)
+    rel.trim_start_matches('/') == envelope_scan::MANIFEST_FILE
+        || envelope_scan::is_process_model_path(project_dir, rel)
 }
 
 /// Whether a saved project file is a code-first workflow *source* — a `.ts`
@@ -6448,7 +6451,10 @@ mod asset_encoding_tests {
         assert!(!m("order.bpmn")); // outside resources/
         assert!(!m("workers/charge/worker.ts"));
         assert!(!m("resources/forms/f.form"));
-        assert!(!m("nano.app.json"));
+        // The manifest drives the scan surface, so saving it retriggers regen.
+        assert!(m("nano.app.json"));
+        assert!(m("/nano.app.json"));
+        assert!(!m("sub/nano.app.json"));
         assert!(!m("README"));
         // A custom `models.processes` glob replaces the default.
         std::fs::write(
