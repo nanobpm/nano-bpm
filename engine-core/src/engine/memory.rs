@@ -95,6 +95,8 @@ impl Engine {
         snapshot.state.deferred_job_deadlines =
             deferred.iter().map(|&(until, key)| (key, until)).collect();
         snapshot.state.deferred_jobs = deferred.into_iter().collect();
+        // The parent -> children index (#1827) is serde-skipped too.
+        snapshot.state.rebuild_children_index();
         Self {
             state: snapshot.state,
             partition_id: snapshot.partition_id,
@@ -110,6 +112,8 @@ impl Engine {
             user_task_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             scope_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: std::collections::BTreeSet::new(),
             forgotten_vars: std::collections::BTreeSet::new(),
@@ -276,7 +280,7 @@ impl Engine {
         if !terminal {
             return false;
         }
-        self.state.instances.remove(&key);
+        self.state.remove_instance(key);
         // Drop the instance's jobs via the reverse index (O(this instance's
         // jobs)), deindexing each from the activatable/activated indices. A
         // terminal instance's jobs are normally already settled and thus not in
@@ -445,7 +449,7 @@ impl Engine {
             }
         }
         for key in victims {
-            self.state.instances.remove(key);
+            self.state.remove_instance(*key);
             // Drop this instance's jobs via the reverse index (O(its jobs)),
             // deindexing each from the activatable/activated indices.
             if let Some(job_keys) = self.state.jobs_by_instance.remove(key) {
@@ -848,7 +852,7 @@ impl Engine {
         let user_tasks = drain_owned(&mut self.state.user_tasks, key);
         let incidents = drain_owned(&mut self.state.incidents, key);
 
-        let instance = self.state.instances.remove(&key)?;
+        let instance = self.state.remove_instance(key)?;
         Some(state::InstanceSnapshot {
             instance,
             jobs,
@@ -929,7 +933,7 @@ impl Engine {
             let conditional_subscriptions = cond_by.remove(&key).unwrap_or_default();
             let user_tasks = ut_by.remove(&key).unwrap_or_default();
             let incidents = inc_by.remove(&key).unwrap_or_default();
-            if let Some(instance) = state.instances.remove(&key) {
+            if let Some(instance) = state.remove_instance(key) {
                 out.push(state::InstanceSnapshot {
                     instance,
                     jobs,
