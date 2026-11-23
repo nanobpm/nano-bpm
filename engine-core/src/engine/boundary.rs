@@ -803,7 +803,8 @@ impl Engine {
         // cannot disarm it either. Every teardown of a scope (interrupting
         // boundary, modification terminate, error / terminate-end throw)
         // routes through here, so disarm the scope's own triggers first.
-        let mut events = self.disarm_event_subprocess_events(instance_key, scope_eik);
+        let mut events =
+            self.disarm_event_subprocess_events_with(instance_key, scope_eik, teardown_idx);
         events.extend(self.element_teardown_events(instance_key, &descendants, teardown_idx));
         self.push_scoped_compensation_cleared(&mut events, instance_key, scope_eik);
         events

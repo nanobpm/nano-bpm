@@ -263,23 +263,57 @@ impl Engine {
         instance_key: Key,
         scope_eik: Key,
     ) -> Vec<Event> {
+        self.disarm_event_subprocess_events_with(instance_key, scope_eik, None)
+    }
+
+    /// [`Self::disarm_event_subprocess_events`] reading the shared
+    /// [`super::boundary::TeardownIndex`] (#1767) when the caller built one
+    /// for `instance_key`, so tearing down N scopes does not rescan the four
+    /// global trigger maps once per scope. The index buckets hold exactly the
+    /// live (`Created` / `Open` / `Opening`) resources of the instance in
+    /// ascending key order, so the emitted events are identical either way.
+    pub(crate) fn disarm_event_subprocess_events_with(
+        &self,
+        instance_key: Key,
+        scope_eik: Key,
+        index: Option<&super::boundary::TeardownIndex<'_>>,
+    ) -> Vec<Event> {
+        fn pick<'a, T>(
+            index: Option<&std::collections::BTreeMap<Key, Vec<&'a T>>>,
+            scan: impl FnOnce() -> Vec<&'a T>,
+            keep: impl Fn(&T) -> bool,
+            key: impl Fn(&T) -> Key,
+            scope_eik: Key,
+        ) -> Vec<&'a T> {
+            let mut v: Vec<&'a T> = match index {
+                Some(ix) => ix.get(&scope_eik).cloned().unwrap_or_default(),
+                None => scan(),
+            };
+            v.retain(|x| keep(x));
+            v.sort_by_key(|x| key(x));
+            v
+        }
         let on_scope = |ik: Key, eik: Key| ik == instance_key && eik == scope_eik;
         let is_esp = |k: &state::MessageSubscriptionKind| {
             matches!(k, state::MessageSubscriptionKind::EventSubProcess { .. })
         };
+        let st = &self.state;
         let mut events = Vec::new();
 
-        let mut timers: Vec<&state::Timer> = self
-            .state
-            .timers
-            .values()
-            .filter(|t| {
+        let timers = pick(
+            index.map(|i| &i.timers),
+            || {
+                self.count_resource_scan();
+                st.timers.values().collect()
+            },
+            |t| {
                 on_scope(t.instance_key, t.element_instance_key)
                     && t.state == state::TimerState::Created
                     && matches!(t.kind, state::TimerKind::EventSubProcess { .. })
-            })
-            .collect();
-        timers.sort_by_key(|t| t.key);
+            },
+            |t| t.key,
+            scope_eik,
+        );
         events.extend(timers.into_iter().map(|t| Event::TimerCanceled {
             timer_key: t.key,
             instance_key: t.instance_key,
@@ -287,11 +321,13 @@ impl Engine {
             element_id: t.element_id.clone(),
         }));
 
-        let mut messages: Vec<&state::MessageSubscription> = self
-            .state
-            .message_subscriptions
-            .values()
-            .filter(|s| {
+        let messages = pick(
+            index.map(|i| &i.message_subscriptions),
+            || {
+                self.count_resource_scan();
+                st.message_subscriptions.values().collect()
+            },
+            |s| {
                 on_scope(s.instance_key, s.element_instance_key)
                     && matches!(
                         s.state,
@@ -299,22 +335,26 @@ impl Engine {
                             | state::MessageSubscriptionState::Opening
                     )
                     && is_esp(&s.kind)
-            })
-            .collect();
-        messages.sort_by_key(|s| s.key);
+            },
+            |s| s.key,
+            scope_eik,
+        );
         events.extend(messages.into_iter().map(Self::disarm_subscription_event));
 
-        let mut signals: Vec<&state::SignalSubscription> = self
-            .state
-            .signal_subscriptions
-            .values()
-            .filter(|s| {
+        let signals = pick(
+            index.map(|i| &i.signal_subscriptions),
+            || {
+                self.count_resource_scan();
+                st.signal_subscriptions.values().collect()
+            },
+            |s| {
                 on_scope(s.instance_key, s.element_instance_key)
                     && s.state == state::MessageSubscriptionState::Open
                     && is_esp(&s.kind)
-            })
-            .collect();
-        signals.sort_by_key(|s| s.key);
+            },
+            |s| s.key,
+            scope_eik,
+        );
         events.extend(
             signals
                 .into_iter()
@@ -326,17 +366,20 @@ impl Engine {
                 }),
         );
 
-        let mut conditionals: Vec<&state::ConditionalSubscription> = self
-            .state
-            .conditional_subscriptions
-            .values()
-            .filter(|s| {
+        let conditionals = pick(
+            index.map(|i| &i.conditional_subscriptions),
+            || {
+                self.count_resource_scan();
+                st.conditional_subscriptions.values().collect()
+            },
+            |s| {
                 on_scope(s.instance_key, s.element_instance_key)
                     && s.state == state::MessageSubscriptionState::Open
                     && is_esp(&s.kind)
-            })
-            .collect();
-        conditionals.sort_by_key(|s| s.key);
+            },
+            |s| s.key,
+            scope_eik,
+        );
         events.extend(
             conditionals
                 .into_iter()
