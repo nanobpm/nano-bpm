@@ -118,7 +118,9 @@ fn unconditional_at(region: &str, at: usize) -> bool {
 /// `recv` was applied on, returning its offset: a writer-ordered method called
 /// *on that same receiver* (a rotation must be unwrapped to prove it ran),
 /// `drop(<recv>)`, or `blocking_wait()` on a commit bound from a *later*
-/// apply on that receiver (FIFO behind the discarded write). Calls are matched
+/// apply on that receiver whose result is unwrapped (an eventless later apply
+/// returns a ready commit covering nothing; only a fallible result proves a
+/// write was queued, FIFO behind the discarded one). Calls are matched
 /// identifier-bounded and followed by `(`, so `rotated`/`flushed` never
 /// count. Unrelated drops and waits on stale or foreign commits order nothing.
 fn sync_point_at(region: &str, recv: &str) -> Option<usize> {
@@ -161,10 +163,10 @@ fn sync_point_at(region: &str, recv: &str) -> Option<usize> {
                     dotted
                         && receiver_before(region, at - 1).as_deref() == Some(recv)
                         && (!CHECKED_SYNC_METHODS.contains(name) || {
-                            let stmt = stmt_around(region, at);
-                            stmt.contains(".expect(")
-                                || stmt.contains(".unwrap()")
-                                || stmt.contains('?')
+                            let chain = call_result_chain(region, at + name.len());
+                            chain.contains(".expect(")
+                                || chain.contains(".unwrap()")
+                                || chain.contains('?')
                         })
                 }
             };
@@ -177,7 +179,12 @@ fn sync_point_at(region: &str, recv: &str) -> Option<usize> {
 }
 
 /// Whether `before` binds `handle` as the commit of an apply on `recv`
-/// (`let (_, handle) = recv.apply_command…` / `let handle = recv.apply…`).
+/// (`let (_, handle) = recv.apply_command…` / `let handle = recv.apply…`)
+/// whose result is unwrapped (`.unwrap()` / `.expect(…)` / `?`). The unwrap
+/// requirement proves the apply actually queued a write: an eventless later
+/// apply (`ExpireJobs` with nothing to expire) returns `Commit::ready()`
+/// without enqueueing anything, so waiting on it orders nothing behind the
+/// discarded write.
 fn commit_bound_from(before: &str, handle: &str, recv: &str) -> bool {
     let mut from = 0;
     while let Some(off) = before[from..].find(APPLY) {
@@ -186,7 +193,16 @@ fn commit_bound_from(before: &str, handle: &str, recv: &str) -> bool {
         if receiver_before(before, at).as_deref() != Some(recv) {
             continue;
         }
-        if commit_slot(before, at).is_some_and(|slot| slot == handle) {
+        let chain = apply_result_suffix(before, at);
+        // The result must be unwrapped (`.unwrap()` / `.expect(…)` / `?`,
+        // optionally projecting `.1`): an eventless apply returns a ready
+        // commit covering nothing, and only a fallible result proves the
+        // write was queued. The projection form binds the commit itself, so
+        // any pattern works (`let late = …unwrap().1`).
+        let proven = !chain.is_empty()
+            && (!strip_unwrap_chain(&chain).starts_with(['.', '('].as_slice())
+                || chain.ends_with(".1"));
+        if commit_slot(before, at).is_some_and(|slot| slot == handle) && proven {
             return true;
         }
     }
@@ -234,7 +250,25 @@ fn strip_literals(src: &str) -> String {
                 i = end;
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
-                let end = src[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
+                // Rust block comments nest: scan to the `*/` that closes the
+                // outermost one, or an inner close leaves its tail (quotes,
+                // braces) exposed to the string scanner.
+                let mut depth = 1usize;
+                let mut j = i + 2;
+                while j + 1 < b.len() && depth > 0 {
+                    match (b[j], b[j + 1]) {
+                        (b'/', b'*') => {
+                            depth += 1;
+                            j += 2;
+                        }
+                        (b'*', b'/') => {
+                            depth -= 1;
+                            j += 2;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                let end = j.min(b.len());
                 blank(&mut out, i, end);
                 i = end;
             }
@@ -346,39 +380,57 @@ fn fn_bodies(src: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The statement text following the apply call whose method name ends at
-/// `apply_at` (the `)` of its argument list through the end of the statement),
-/// whitespace-stripped. This is the chain that consumes the returned
-/// `Result<(events, Commit), _>`: `.unwrap()`, `?`, a `.0`/`.1` projection, or
-/// the rest of a larger expression the apply is nested in.
-fn apply_result_suffix(body: &str, apply_at: usize) -> String {
+/// The offset just past the balanced argument list of the call whose method
+/// name ends at `name_end` (`body[name_end]` is its `(`), or `body.len()`
+/// when it never closes.
+fn call_args_end(body: &str, name_end: usize) -> usize {
     let b = body.as_bytes();
-    // The argument list opens at the first `(` at/after the method name.
-    let Some(open) = body[apply_at..].find('(').map(|n| apply_at + n) else {
-        return String::new();
-    };
     let mut depth = 0usize;
     let mut close = body.len();
-    for (k, &c) in b[open..].iter().enumerate() {
+    for (k, &c) in b[name_end..].iter().enumerate() {
         match c {
             b'(' => depth += 1,
             b')' => {
                 depth -= 1;
                 if depth == 0 {
-                    close = open + k;
+                    close = name_end + k;
                     break;
                 }
             }
             _ => {}
         }
     }
-    let stmt_end = body[close..]
-        .find([';', '{', '}'])
-        .map_or(body.len(), |n| close + n);
-    body[close + 1..stmt_end]
+    close.saturating_add(1).min(body.len())
+}
+
+/// The chain consuming the result of the call whose method name ends at
+/// `name_end` (its argument list through the end of the statement),
+/// whitespace-stripped — the call's *own* result chain, so an unrelated
+/// unwrap elsewhere in the statement (`let _ = (j.rotate(), Some(()).unwrap())`)
+/// does not pass for the call's. A `,` ends the chain too: in a tuple or
+/// argument list the call's value stops there.
+fn call_result_chain(body: &str, name_end: usize) -> String {
+    let after = call_args_end(body, name_end);
+    let stmt_end = body[after..]
+        .find([';', '{', '}', ','])
+        .map_or(body.len(), |n| after + n);
+    body[after..stmt_end]
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect()
+}
+
+/// The statement text following the apply call whose method name ends at
+/// `apply_at` (the `)` of its argument list through the end of the statement),
+/// whitespace-stripped. This is the chain that consumes the returned
+/// `Result<(events, Commit), _>`: `.unwrap()`, `?`, a `.0`/`.1` projection, or
+/// the rest of a larger expression the apply is nested in.
+fn apply_result_suffix(body: &str, apply_at: usize) -> String {
+    // The argument list opens at the first `(` at/after the method name.
+    let Some(open) = body[apply_at..].find('(').map(|n| apply_at + n) else {
+        return String::new();
+    };
+    call_result_chain(body, open)
 }
 
 /// Whether the statement ending at `apply_at` drops the returned commit
@@ -458,10 +510,12 @@ fn strip_unwrap_chain(suffix: &str) -> &str {
 }
 
 /// Whether the journal `apply_at` is called on was built in memory
-/// (`Journal::in_memory*`) and never reassigned: it has no writer thread, so
-/// its commit is always already resolved and nothing can race it. A later
-/// reassignment (`j = Journal::open(&path)`) invalidates the exemption — from
-/// then on `j` has an asynchronous disk writer.
+/// (`Journal::in_memory*` — matched as the initializer's *constructor*, so a
+/// persistent `Journal::open(&in_memory_path)` does not pass on an argument
+/// name) and never reassigned: it has no writer thread, so its commit is
+/// always already resolved and nothing can race it. A later reassignment
+/// (`j = Journal::open(&path)`) invalidates the exemption — from then on `j`
+/// has an asynchronous disk writer.
 fn is_in_memory_receiver(body: &str, apply_at: usize) -> bool {
     let Some(recv) = receiver_before(body, apply_at) else {
         return false;
@@ -476,16 +530,21 @@ fn is_in_memory_receiver(body: &str, apply_at: usize) -> bool {
                 stmt.strip_prefix(&recv)
                     .is_some_and(|rest| rest.starts_with('=') && !rest.starts_with("=="))
             });
-            !reassigned && body[at..stmt_end].contains("in_memory")
+            let init: String = body[at..stmt_end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            !reassigned && init.contains("::in_memory")
         })
     })
 }
 
 /// The `(fn name, offending observation)` pairs in `src`: a disk observation
 /// that follows a discarded commit with no sync point in between. A sync point
-/// must be tied to the *affected journal* (or await the commit itself) and must
-/// execute on every path to the observation — an unrelated `barrier.wait()`, a
-/// different journal's rotation, or a rotation inside `if …` orders nothing.
+/// must be tied to the *affected journal* (or await the commit itself — the
+/// apply's own named handle included, `_commit` or not) and must execute on
+/// every path to the observation — an unrelated `barrier.wait()`, a different
+/// journal's rotation, or a rotation inside `if …` orders nothing.
 fn violations(src: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     for (name, body) in fn_bodies(src) {
@@ -496,7 +555,11 @@ fn violations(src: &str) -> Vec<(String, String)> {
             if !discards_commit(&body, apply_at) || is_in_memory_receiver(&body, apply_at) {
                 continue;
             }
-            let tail = &body[search..];
+            // Observations race only once the write is queued: scanning starts
+            // past the apply's argument list, so a disk read *constructing* the
+            // command (`apply_command(make(fs::read(&p).unwrap()))`) — over
+            // before the write is queued — is not flagged.
+            let tail = &body[call_args_end(&body, apply_at)..];
             let first = |needles: &[&'static str]| {
                 needles
                     .iter()
@@ -512,7 +575,19 @@ fn violations(src: &str) -> Vec<(String, String)> {
                 // point and the observation. Conditionals *before* the sync
                 // point do not weaken it — every path still reaches it.
                 let region = &tail[..obs_at];
-                let synced = sync_point_at(region, &recv).is_some();
+                let synced = sync_point_at(region, &recv).is_some()
+                    || commit_slot(&body, apply_at).is_some_and(|slot| {
+                        // The wait must name the bound handle exactly:
+                        // `_commit.blocking_wait()` awaits `_commit`, not a
+                        // different `commit` variable.
+                        !slot.is_empty()
+                            && region
+                                .match_indices(&format!("{slot}.blocking_wait()"))
+                                .any(|(at, _)| {
+                                    (at == 0 || !is_ident(region.as_bytes()[at - 1]))
+                                        && unconditional_at(region, at)
+                                })
+                    });
                 if !synced {
                     found.push((name.clone(), obs.to_string()));
                     break;
@@ -890,4 +965,101 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
         }
     "#;
     assert!(violations(project_commit).is_empty());
+
+    // A later apply's commit covers the discarded write only when that apply
+    // queued a write: an eventless `ExpireJobs` returns `Commit::ready()`
+    // without enqueueing anything, so a wait on it orders nothing. Only an
+    // unwrapped result proves the queueing; a raw `let (_, late) = …;`
+    // binding leaves the commit possibly ready.
+    let eventless_later = r#"
+        fn t() {
+            let _ = journal.apply_command(Command::DeployProcess(demo())).unwrap();
+            let (_, late) = journal.apply_command(Command::ExpireJobs);
+            late.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(eventless_later).len(), 1);
+    let queued_later = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let (_, late) = journal.apply_command(d).unwrap();
+            late.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(queued_later).is_empty());
+    let projected_later = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let late = journal.apply_command(d).unwrap().1;
+            late.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(projected_later).is_empty());
+
+    // A rotation must be unwrapped on its *own* result chain: an unrelated
+    // unwrap elsewhere in the statement does not prove the rotation ran.
+    let independent_unwrap = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let _ = (journal.snapshot_and_rotate(), Some(()).unwrap());
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(independent_unwrap).len(), 1);
+
+    // Rust block comments nest: an inner `*/` does not end the comment, so a
+    // quote inside the outer comment never reaches the string scanner.
+    let nested_comment = r#"
+        fn a() { /* outer /* inner */ " */ }
+        fn racy() {
+            let _ = journal.apply_command(c).unwrap();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(nested_comment).len(), 1);
+
+    // A wait on the apply's *own* named handle synchronizes, even when the
+    // binding is `_`-prefixed to silence the unused-events lint.
+    let own_handle = r#"
+        fn t() {
+            let (_, _commit) = journal.apply_command(c).unwrap();
+            _commit.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(own_handle).is_empty());
+
+    // The in-memory exemption matches the constructor, not arbitrary argument
+    // text: `Journal::open(&in_memory_path)` is a persistent journal.
+    let persistent_initializer = r#"
+        fn t() {
+            let mut j = Journal::open(&in_memory_path).unwrap();
+            let _ = j.apply_command(c).unwrap();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(persistent_initializer).len(), 1);
+
+    // A disk read *constructing* the command finishes before the write is
+    // queued, so it cannot race it.
+    let read_builds_command = r#"
+        fn t() {
+            let _ = journal.apply_command(make_command(fs::read(&path).unwrap())).unwrap();
+        }
+    "#;
+    assert!(violations(read_builds_command).is_empty());
+
+    // A wait on the candidate's own handle must be unconditional: inside a
+    // conditional it may never run.
+    let own_handle_conditional = r#"
+        fn t() {
+            let (_, _commit) = journal.apply_command(c).unwrap();
+            if flag { _commit.blocking_wait(); }
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(own_handle_conditional).len(), 1);
 }
