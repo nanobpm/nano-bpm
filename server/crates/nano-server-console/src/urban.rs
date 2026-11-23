@@ -198,10 +198,9 @@ pub(crate) fn urban_available_for(project_dir: &Path) -> bool {
 /// `urban derive --stdout`; `regenerate_domain_types` → `urban gen --no-models`)
 /// gate on this so an older toolkit that predates derivation falls back to the
 /// console's embedded driver / bare `urban gen` — additive + non-regressing,
-/// exactly like #530. Derived from the memoised [`urban_help_text`] read, so we
-/// never re-spawn the binary per capability we gate on (see its doc for the
-/// bounded, benign duplication when several *concurrent first* calls race before
-/// the cache warms).
+/// exactly like #530. Derived from the memoised, single-flight
+/// [`urban_help_text`] read, so we never re-spawn the binary per capability we
+/// gate on or across concurrent cold-cache callers.
 pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
     urban_help_text(urban)
         .await
@@ -236,29 +235,29 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
 /// so a given binary's help is read once and shared across every capability gate
 /// — one cached read, no per-capability cache to drift out of sync.
 ///
-/// The cache is populated by a check-then-insert, **not** single-flight: several
-/// *concurrent first* calls for the same path can each spawn `urban --help` once
-/// before the entry lands (a bounded, benign duplication — help output is
-/// deterministic, so every racer computes the same text and the last insert
-/// wins). Every call after the cache is warm reuses the stored text without
-/// spawning. The help is stored as an `Arc<str>` so a warm hit is a cheap
-/// refcount bump rather than a full copy of the (potentially large) help output,
-/// even when `run_data_op` gates on it per Data-panel op. The entry is keyed on
-/// the binary path and lives for the process
-/// lifetime; we deliberately do **not** stat/mtime-invalidate it, to keep the hot
-/// capability-gate path a single lock-guarded map read. If a binary is replaced
-/// *in place* at the same path (an `npm install` bumping a project-local
-/// `node_modules/.bin/urban`, a pack reinstall) the cached capability set can go
-/// stale until the server restarts — but that staleness is **benign and
-/// non-regressing**: a stale *miss* only routes to the still-working embedded
-/// fallback (never to a broken `urban <op>`), so the worst case is a newly-gained
-/// capability going unused until the next restart, not an outage. A long-lived
-/// server outliving an in-place toolkit upgrade is the rare case, and the price is
-/// a restart. `None` means the binary could not be run **or** `urban --help`
-/// exited non-zero: we only accept and cache help text on a successful exit, so a
-/// binary that errors out (or whose error message happens to contain a capability
-/// marker) cannot false-positive the gate into routing to a broken `urban <op>` —
-/// it falls back to the embedded path exactly like an absent binary.
+/// Probes are **single-flight per binary path** (`PROBES` lock map): concurrent
+/// cold-cache callers for the same path serialize on its per-path lock and
+/// re-check the cache after acquiring it, so at most one `urban --help`
+/// subprocess runs for a given binary at a time and every waiting caller shares
+/// the cached result. Every call after the cache is warm reuses the stored text
+/// without spawning. The help is stored as an `Arc<str>` so a warm hit is a
+/// cheap refcount bump rather than a full copy of the (potentially large) help
+/// output, even when `run_data_op` gates on it per Data-panel op. The entry is
+/// keyed on the binary path and lives for the process lifetime; we deliberately
+/// do **not** stat/mtime-invalidate it, to keep the hot capability-gate path a
+/// single lock-guarded map read. If a binary is replaced *in place* at the same
+/// path (an `npm install` bumping a project-local `node_modules/.bin/urban`, a
+/// pack reinstall) the cached capability set can go stale until the server
+/// restarts — but that staleness is **benign and non-regressing**: a stale
+/// *miss* only routes to the still-working embedded fallback (never to a broken
+/// `urban <op>`), so the worst case is a newly-gained capability going unused
+/// until the next restart, not an outage. A long-lived server outliving an
+/// in-place toolkit upgrade is the rare case, and the price is a restart. `None`
+/// means the binary could not be run **or** `urban --help` exited non-zero: we
+/// only accept and cache help text on a successful exit, so a binary that errors
+/// out (or whose error message happens to contain a capability marker) cannot
+/// false-positive the gate into routing to a broken `urban <op>` — it falls back
+/// to the embedded path exactly like an absent binary.
 ///
 /// A **timed-out** probe is cached too, but only for a short TTL
 /// ([`help_pipe_timeout`]): a hung `urban --help` must not let a cold-cache
