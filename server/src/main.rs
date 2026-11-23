@@ -30788,7 +30788,11 @@ mod snapshot_health_tick_tests {
     /// #1385: a busy engine actor (a long snapshot fold / rotation wait holds
     /// its quarantine query pending) must NOT stall the disk/backlog refresh —
     /// the sampler applies those measurements before awaiting the actor, so
-    /// `/health` and the disk guards never sit stale behind it.
+    /// `/health` and the disk guards never sit stale behind it. The test polls
+    /// the REAL [`storage_usage_sampler_tick`] while the actor is held, so an
+    /// ordering regression that moved the disk/backlog refresh behind the actor
+    /// query would wedge the tick (and fail the test) rather than merely
+    /// delaying it invisibly.
     #[tokio::test]
     async fn storage_sampler_refreshes_usage_while_an_actor_query_is_pending() {
         let dir = scratch("sampler-pending-actor");
@@ -30811,9 +30815,9 @@ mod snapshot_health_tick_tests {
         commit.wait().await;
         let handle = DeepthiHandle::spawn(journal, 0, None);
 
-        // Occupy the single writer with a job that parks until released, then
-        // enqueue the sampler's quarantine query behind it: the query cannot
-        // return until the barrier opens.
+        // Occupy the single writer with a job that parks until released: the
+        // tick's quarantine query then queues behind it and cannot return
+        // until the barrier opens.
         let hold = Arc::new(std::sync::Barrier::new(2));
         // `spawn_job` enqueues without awaiting: awaiting `with` here would
         // deadlock, since the barrier's other party is the release below.
@@ -30823,41 +30827,55 @@ mod snapshot_health_tick_tests {
                 hold.wait();
             }
         });
-        let query = tokio::spawn({
-            let handle = handle.clone();
-            async move { journal_quarantine_state(std::slice::from_ref(&handle)).await }
-        });
         tokio::task::yield_now().await;
 
-        // The sampler's disk/backlog half does not touch the actor, so it
-        // lands even with the query above still queued behind the barrier.
+        // Poll the ACTUAL tick: its disk/backlog half does not touch the
+        // actor, so the tick future reaches its quarantine-query await even
+        // with the actor held — and that is where it must park. Polling the
+        // real tick (rather than calling the disk sampler and the query
+        // separately) is what pins their ORDER: a regression that awaited the
+        // actor first would never reach `Pending` here.
         let h = snapshot_health::SnapshotHealth::new();
         let tiny_budget = snapshot_health::HealthThresholds {
             uncompacted_bytes_max: 1,
             ..thresholds()
         };
-        sample_storage_usage(&h, &recovery.shared, None, &tiny_budget);
+        // Sentinel: the tick must overwrite it with the real (zero) count once
+        // the actor is released — `== 0` then proves the tick's query ran.
+        h.set_quarantined_orphans(QUARANTINE_SENTINEL);
+        let mut tick = std::pin::pin!(storage_usage_sampler_tick(
+            &h,
+            &recovery.shared,
+            std::slice::from_ref(&handle),
+            &tiny_budget,
+        ));
+        assert!(
+            futures_util::poll!(&mut tick).is_pending(),
+            "tick parks on the held actor's quarantine query"
+        );
+
+        // The backlog landed BEFORE the tick parked: capture it while the
+        // actor is still held, so a stale-behind-the-actor gauge cannot hide.
         let r = h.report(Instant::now(), &tiny_budget);
         assert!(
             r.uncompacted_bytes > 1,
             "backlog refreshed despite the pending actor query: {r:?}"
         );
         assert!(r.causes.contains(&"journal_uncompacted_bytes"), "{r:?}");
-        assert!(
-            !query.is_finished(),
-            "quarantine query is still parked behind the held actor"
+        assert_eq!(
+            r.quarantined_orphans, QUARANTINE_SENTINEL,
+            "quarantine gauge untouched while the actor is held: {r:?}"
         );
 
-        // Release the actor: the pending query now completes and the sampler
-        // applies the quarantine count independently of the usage sample.
+        // Release the actor: the tick's pending query now completes and the
+        // tick applies the quarantine count before returning.
         hold.wait();
-        let (quarantined, _) = query.await.expect("quarantine query answered");
-        h.set_quarantined_orphans(quarantined);
+        tick.await;
         assert_eq!(
             h.report(Instant::now(), &tiny_budget).quarantined_orphans,
-            0
+            0,
+            "the tick's actor query landed before it returned"
         );
-        drop(handle);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
