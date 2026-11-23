@@ -198,10 +198,9 @@ pub(crate) fn urban_available_for(project_dir: &Path) -> bool {
 /// `urban derive --stdout`; `regenerate_domain_types` → `urban gen --no-models`)
 /// gate on this so an older toolkit that predates derivation falls back to the
 /// console's embedded driver / bare `urban gen` — additive + non-regressing,
-/// exactly like #530. Derived from the memoised [`urban_help_text`] read, so we
-/// never re-spawn the binary per capability we gate on (see its doc for the
-/// bounded, benign duplication when several *concurrent first* calls race before
-/// the cache warms).
+/// exactly like #530. Derived from the memoised, single-flight
+/// [`urban_help_text`] read, so we never re-spawn the binary per capability we
+/// gate on or across concurrent cold-cache callers.
 pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
     urban_help_text(urban)
         .await
@@ -236,60 +235,116 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
 /// so a given binary's help is read once and shared across every capability gate
 /// — one cached read, no per-capability cache to drift out of sync.
 ///
-/// The cache is populated by a check-then-insert, **not** single-flight: several
-/// *concurrent first* calls for the same path can each spawn `urban --help` once
-/// before the entry lands (a bounded, benign duplication — help output is
-/// deterministic, so every racer computes the same text and the last insert
-/// wins). Every call after the cache is warm reuses the stored text without
-/// spawning. The help is stored as an `Arc<str>` so a warm hit is a cheap
-/// refcount bump rather than a full copy of the (potentially large) help output,
-/// even when `run_data_op` gates on it per Data-panel op. The entry is keyed on
-/// the binary path and lives for the process
-/// lifetime; we deliberately do **not** stat/mtime-invalidate it, to keep the hot
-/// capability-gate path a single lock-guarded map read. If a binary is replaced
-/// *in place* at the same path (an `npm install` bumping a project-local
-/// `node_modules/.bin/urban`, a pack reinstall) the cached capability set can go
-/// stale until the server restarts — but that staleness is **benign and
-/// non-regressing**: a stale *miss* only routes to the still-working embedded
-/// fallback (never to a broken `urban <op>`), so the worst case is a newly-gained
-/// capability going unused until the next restart, not an outage. A long-lived
-/// server outliving an in-place toolkit upgrade is the rare case, and the price is
-/// a restart. `None` means the binary could not be run **or** `urban --help`
-/// exited non-zero: we only accept and cache help text on a successful exit, so a
-/// binary that errors out (or whose error message happens to contain a capability
-/// marker) cannot false-positive the gate into routing to a broken `urban <op>` —
-/// it falls back to the embedded path exactly like an absent binary.
+/// Probes are **single-flight per binary path** (`PROBES` lock map): concurrent
+/// cold-cache callers for the same path serialize on its per-path lock and
+/// re-check the cache after acquiring it, so at most one `urban --help`
+/// subprocess runs for a given binary at a time and every waiting caller shares
+/// the cached result. Every call after the cache is warm reuses the stored text
+/// without spawning. The help is stored as an `Arc<str>` so a warm hit is a
+/// cheap refcount bump rather than a full copy of the (potentially large) help
+/// output, even when `run_data_op` gates on it per Data-panel op. The entry is
+/// keyed on the binary path and lives for the process lifetime; we deliberately
+/// do **not** stat/mtime-invalidate it, to keep the hot capability-gate path a
+/// single lock-guarded map read. If a binary is replaced *in place* at the same
+/// path (an `npm install` bumping a project-local `node_modules/.bin/urban`, a
+/// pack reinstall) the cached capability set can go stale until the server
+/// restarts — but that staleness is **benign and non-regressing**: a stale
+/// *miss* only routes to the still-working embedded fallback (never to a broken
+/// `urban <op>`), so the worst case is a newly-gained capability going unused
+/// until the next restart, not an outage. A long-lived server outliving an
+/// in-place toolkit upgrade is the rare case, and the price is a restart. `None`
+/// means the binary could not be run **or** `urban --help` exited non-zero: we
+/// only accept and cache help text on a successful exit, so a binary that errors
+/// out (or whose error message happens to contain a capability marker) cannot
+/// false-positive the gate into routing to a broken `urban <op>` — it falls back
+/// to the embedded path exactly like an absent binary.
+///
+/// A **timed-out** probe is cached too, but only for a short TTL
+/// ([`help_pipe_timeout`]): a hung `urban --help` must not let a cold-cache
+/// burst of N callers each serialize on the single-flight lock and re-run the
+/// full probe, piling up roughly N × timeout of delay outside gateway admission.
+/// Sharing the timeout outcome lets every caller already waiting on the probe
+/// lock return `None` immediately, while a caller arriving *after* the TTL
+/// re-probes so a recovered binary is not blacklisted for the process lifetime.
 async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Option<Arc<str>>>>> =
+    use std::time::Instant;
+
+    /// Cached outcome of probing one binary's `urban --help`. `Ready` is the
+    /// permanent result (`Some` = help text, `None` = could not run / non-zero
+    /// exit) and lives for the process lifetime. `TimedOut` is a *negative*
+    /// entry with a TTL: it shares one probe's timeout with every concurrent
+    /// caller, then expires so a later request retries.
+    enum HelpCacheEntry {
+        Ready(Option<Arc<str>>),
+        TimedOut(Instant),
+    }
+
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, HelpCacheEntry>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     // Recover from a poisoned mutex rather than propagating the panic: the lock
     // only guards a tiny insert/get (no user code runs under it), so a poisoned
     // guard carries a valid map — matching this module's poison-recovery pattern
     // keeps the capability gate robust instead of taking down urban delegation.
-    if let Some(hit) = cache
+    //
+    // A fresh `TimedOut` entry is a hit (return `None` without re-probing); an
+    // expired one falls through to re-probe so a recovered binary can retry.
+    let lookup = |cache: &Mutex<std::collections::HashMap<PathBuf, HelpCacheEntry>>| match cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(urban)
-        .cloned()
     {
-        return hit;
+        Some(HelpCacheEntry::Ready(help)) => Some(Ok(help.clone())),
+        Some(HelpCacheEntry::TimedOut(at)) if at.elapsed() < help_pipe_timeout() => Some(Err(())),
+        _ => None,
+    };
+    match lookup(cache) {
+        Some(Ok(help)) => return help,
+        Some(Err(())) => return None,
+        None => {}
     }
-    let help = match urban_help_output(urban).await {
+    // Single-flight the probe per binary (#1329): a cold-cache burst must not
+    // spawn N concurrent `urban --help` processes ahead of the data-gateway
+    // limiter's bounded admission. Probes of the same binary serialize on its
+    // lock and re-check the cache, so at most one probe per binary is alive and
+    // later callers read the result the first one cached. Distinct from the
+    // gateway limiter, so a probe never consumes (or double-acquires) a slot.
+    static PROBES: OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    > = OnceLock::new();
+    let probe_lock = PROBES
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(urban.to_path_buf())
+        .or_default()
+        .clone();
+    let _probe = probe_lock.lock().await;
+    match lookup(cache) {
+        Some(Ok(help)) => return help,
+        Some(Err(())) => return None,
+        None => {}
+    }
+    let entry = match urban_help_output(urban).await {
         UrbanHelpOutput::Success { stdout, stderr } => {
             let mut help = String::from_utf8_lossy(&stdout).into_owned();
             help.push_str(&String::from_utf8_lossy(&stderr));
-            Some(Arc::from(help))
+            HelpCacheEntry::Ready(Some(Arc::from(help)))
         }
-        UrbanHelpOutput::NoHelp => None,
-        UrbanHelpOutput::TimedOut => return None,
+        UrbanHelpOutput::NoHelp => HelpCacheEntry::Ready(None),
+        UrbanHelpOutput::TimedOut => HelpCacheEntry::TimedOut(Instant::now()),
     };
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(urban.to_path_buf(), help.clone());
-    help
+        .insert(urban.to_path_buf(), entry);
+    match lookup(cache) {
+        Some(Ok(help)) => help,
+        // We just inserted this entry, so a fresh `TimedOut` is the only other
+        // reachable outcome; an expired one cannot occur within the same call.
+        _ => None,
+    }
 }
 
 enum UrbanHelpOutput {
@@ -710,6 +765,31 @@ urban — build and run Urban apps (nano.app.json)
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// #1329: a cold-cache burst must not fan out N concurrent `urban --help`
+    /// probes — probes are single-flighted so at most one runs at a time and the
+    /// rest read the cached result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn urban_help_probe_is_single_flight_on_cold_cache() {
+        let dir = urban_help_scratch("urban-help-burst");
+        let stub = dir.join("urban-burst");
+        let log = dir.join("probes.log");
+        write_probe_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\necho x >> '{}'\nsleep 0.3\nprintf 'urban data\\n'\n",
+                log.display()
+            ),
+        );
+        let probes: Vec<_> = (0..8).map(|_| urban_help_text(&stub)).collect();
+        for help in futures_util::future::join_all(probes).await {
+            assert!(help.is_some(), "every caller sees the probed help");
+        }
+        let runs = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(runs, 1, "cold-cache burst must spawn exactly one probe");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[cfg(unix)]
     fn urban_help_scratch(name: &str) -> PathBuf {
         let dir = std::env::current_dir()
@@ -827,7 +907,7 @@ urban — build and run Urban apps (nano.app.json)
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn urban_help_probe_timeout_is_bounded_and_not_cached() {
+    async fn urban_help_probe_timeout_is_bounded_and_not_cached_permanently() {
         let dir = urban_help_scratch("urban-help-timeout");
         let stub = dir.join("urban-timeout.sh");
         write_probe_stub(&stub, "#!/bin/sh\necho $$ > direct.pid\nsleep 30\n");
@@ -851,11 +931,44 @@ urban — build and run Urban apps (nano.app.json)
             panic!("timed-out urban --help child {pid} survived the probe");
         }
 
+        // The timeout outcome is cached only for a short TTL (so a concurrent
+        // burst shares it), not permanently: once the TTL lapses a later caller
+        // re-probes, so a recovered binary is not blacklisted for the process
+        // lifetime.
+        tokio::time::sleep(help_pipe_timeout() + std::time::Duration::from_millis(200)).await;
         write_probe_stub(&stub, "#!/bin/sh\nprintf 'urban data\\n'\n");
         let help = urban_help_text(&stub)
             .await
             .expect("timeout miss must not be cached permanently");
         assert!(help.contains("urban data"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1329: a timed-out probe must be *shared* with callers already waiting on
+    /// the single-flight lock, not re-run by each one. With a hung `urban
+    /// --help`, an N-caller burst must spawn exactly one probe and every caller
+    /// must observe the timeout — not serialize into N full probes (roughly
+    /// N × timeout of delay outside gateway admission and its timeout).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn urban_help_probe_timeout_is_shared_with_concurrent_callers() {
+        let dir = urban_help_scratch("urban-help-timeout-burst");
+        let stub = dir.join("urban-timeout-burst.sh");
+        let log = dir.join("probes.log");
+        write_probe_stub(
+            &stub,
+            &format!("#!/bin/sh\necho x >> '{}'\nsleep 30\n", log.display()),
+        );
+
+        let probes: Vec<_> = (0..8).map(|_| urban_help_text(&stub)).collect();
+        for help in futures_util::future::join_all(probes).await {
+            assert!(help.is_none(), "every caller observes the probe timeout");
+        }
+        let runs = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(
+            runs, 1,
+            "a concurrent burst on a hung probe must spawn exactly one probe, not N"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
