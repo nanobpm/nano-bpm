@@ -1735,3 +1735,147 @@ fn multi_instance_call_activity_input_cannot_clobber_loop_counter() {
         "the reserved loopCounter survives a user input mapping targeting it"
     );
 }
+
+/// `leaf`: start -> leaf_work(svc "leaf-job") -> end, and `orch`: start ->
+/// c1(call "leaf") -> done. Every `orch` instance owns one resident child.
+fn deploy_orch_calling_leaf(engine: &mut Engine) {
+    let leaf = ProcessBuilder::new("leaf")
+        .start_event("ls")
+        .service_task("leaf_work", "leaf-job")
+        .end_event("le")
+        .connect("ls", "leaf_work")
+        .connect("leaf_work", "le")
+        .build()
+        .unwrap();
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "leaf")
+        .end_event("done")
+        .connect("start", "c1")
+        .connect("c1", "done")
+        .build()
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(leaf)).unwrap();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+}
+
+fn create_orch(engine: &mut Engine) -> Key {
+    engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap()
+}
+
+fn child_of(engine: &Engine, parent: Key) -> Key {
+    engine
+        .state
+        .instances
+        .values()
+        .find(|i| i.parent_process_instance_key == Some(parent))
+        .expect("resident call-activity child")
+        .key
+}
+
+// #1827: ending an instance must not cost O(resident instances). Every
+// completion runs `cascade_cancel_children`; it used to filter the whole
+// instance map for children of the ended instances, so job throughput fell as
+// the backlog grew (739 jobs/s at a 110k backlog vs 1,838 at 30k in the SDK
+// performance matrix). It must look up the ended parents' children instead.
+#[test]
+fn ending_a_call_activity_parent_does_not_scan_unrelated_instances() {
+    let mut engine = Engine::new();
+    deploy_orch_calling_leaf(&mut engine);
+    for _ in 0..200 {
+        create_orch(&mut engine);
+    }
+    assert_eq!(
+        engine.state.instances.len(),
+        400,
+        "200 parents + 200 children"
+    );
+
+    engine.cascade_scan_count.set(0);
+    // Completes one child, whose call activity then completes its parent: two
+    // instances end, one of which (the parent) may own call-activity children.
+    complete_one(&mut engine, "leaf-job");
+    assert!(
+        engine.cascade_scan_count.get() <= 2,
+        "cascade examined {} instances to end one parent with 398 unrelated \
+         instances resident: the per-completion cost grows with the backlog",
+        engine.cascade_scan_count.get()
+    );
+}
+
+// The parent -> children index the cascade reads is in-memory only, so it must
+// be rebuilt on snapshot restore, or a cancelled parent would orphan its child.
+#[cfg(feature = "serde")]
+#[test]
+fn cancel_cascades_to_the_child_after_a_snapshot_restore() {
+    let mut engine = Engine::new();
+    deploy_orch_calling_leaf(&mut engine);
+    let parent = create_orch(&mut engine);
+    let child = child_of(&engine, parent);
+
+    let mut restored = Engine::from_snapshot(engine.snapshot());
+    restored
+        .apply_command(Command::CancelInstance {
+            instance_key: parent,
+        })
+        .unwrap();
+    assert_eq!(
+        restored.state.instances[&child].state,
+        ProcessInstanceState::Terminated,
+        "child orphaned: the restored engine lost the parent -> child link"
+    );
+}
+
+// A child lifted to cold storage and rehydrated must be re-linked to its parent.
+#[test]
+fn cancel_cascades_to_a_rehydrated_child() {
+    let mut engine = Engine::new();
+    deploy_orch_calling_leaf(&mut engine);
+    let parent = create_orch(&mut engine);
+    let child = child_of(&engine, parent);
+
+    let cold = engine
+        .snapshot_instance(child)
+        .expect("active child spills");
+    assert!(!engine.state.instances.contains_key(&child));
+    engine.rehydrate_instance(cold);
+    engine
+        .apply_command(Command::CancelInstance {
+            instance_key: parent,
+        })
+        .unwrap();
+    assert_eq!(
+        engine.state.instances[&child].state,
+        ProcessInstanceState::Terminated
+    );
+}
+
+// The index must not outlive the instances it describes: once every instance
+// has completed and been evicted, nothing may remain in it.
+#[test]
+fn child_index_is_empty_after_completed_instances_are_evicted() {
+    let mut engine = Engine::new();
+    deploy_orch_calling_leaf(&mut engine);
+    for _ in 0..20 {
+        create_orch(&mut engine);
+    }
+    let jobs = engine.activate_jobs("leaf-job", "test-worker", 20, 60_000, 0);
+    assert_eq!(jobs.len(), 20);
+    for job in jobs {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+    assert_eq!(engine.evict_completed(), 40);
+    assert!(engine.state.instances.is_empty());
+    assert!(
+        engine.state.children_by_parent.is_empty(),
+        "leaked index entries: {:?}",
+        engine.state.children_by_parent
+    );
+}
