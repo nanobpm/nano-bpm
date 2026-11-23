@@ -346,16 +346,73 @@ fn fn_bodies(src: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The statement text following the apply call whose method name ends at
+/// `apply_at` (the `)` of its argument list through the end of the statement),
+/// whitespace-stripped. This is the chain that consumes the returned
+/// `Result<(events, Commit), _>`: `.unwrap()`, `?`, a `.0`/`.1` projection, or
+/// the rest of a larger expression the apply is nested in.
+fn apply_result_suffix(body: &str, apply_at: usize) -> String {
+    let b = body.as_bytes();
+    // The argument list opens at the first `(` at/after the method name.
+    let Some(open) = body[apply_at..].find('(').map(|n| apply_at + n) else {
+        return String::new();
+    };
+    let mut depth = 0usize;
+    let mut close = body.len();
+    for (k, &c) in b[open..].iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = open + k;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let stmt_end = body[close..]
+        .find([';', '{', '}'])
+        .map_or(body.len(), |n| close + n);
+    body[close + 1..stmt_end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
 /// Whether the statement ending at `apply_at` drops the returned commit
 /// without awaiting it: a bare expression statement (nothing bound), a
 /// `_`-prefixed binding (`let _ =`, `let _r =`), or a tuple whose commit (last)
 /// slot is `_`-prefixed (`let (e, _) =`, `let (_e, _commit) =`).
+///
+/// The commit is also dropped when the apply's `Result<(events, Commit), _>`
+/// is consumed rather than bound whole: projecting the events half
+/// (`….unwrap().0`, `….0`, `let n = …?.0.len()`) discards the `.1` commit, and
+/// nesting the apply in a larger expression (`assert!(….is_ok())`,
+/// `let n = ….0.len()`) binds no commit at all. Only a statement whose value
+/// *is* the bare apply-chain (`….unwrap()` / `….expect(…)` / `…?`, no
+/// projection) lets the binding decide.
 fn discards_commit(body: &str, apply_at: usize) -> bool {
     let stmt_start = body[..apply_at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
     let stmt: String = body[stmt_start..apply_at]
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
+    // The chain after the apply's argument list: an unwrapping chain
+    // (`.unwrap()` / `.expect(…)` / `?`) keeps the whole `(events, Commit)`
+    // tuple for the binding to split; anything beyond it consumes the result.
+    let suffix = apply_result_suffix(body, apply_at);
+    let rest = strip_unwrap_chain(&suffix);
+    // A `.0` projection (or further use of it, `.0.len()`) keeps the events and
+    // drops the `.1` commit. Anything else left over (`assert!(…)`'s `.is_ok()`,
+    // a method on the projection, arithmetic) likewise consumes the result
+    // without binding the commit. Only an empty remainder — the bare
+    // apply-chain — or a `.1` projection (which *keeps* the commit) leaves the
+    // commit for the binding below.
+    if !rest.is_empty() && !rest.starts_with(".1") {
+        return true;
+    }
     if !stmt.starts_with("let") {
         // No binding at all: an expression statement discards the commit,
         // unless the value is assigned/returned/passed on.
@@ -364,6 +421,40 @@ fn discards_commit(body: &str, apply_at: usize) -> bool {
             && stmt.matches('(').count() == stmt.matches(')').count();
     }
     commit_slot(body, apply_at).is_some_and(|slot| slot.starts_with('_'))
+}
+
+/// The `suffix` of an apply statement with its unwrapping chain removed:
+/// leading `?`, `.unwrap()`, and `.expect(…)` (balanced-args) segments. What
+/// remains is how the `(events, Commit)` tuple itself is used.
+fn strip_unwrap_chain(suffix: &str) -> &str {
+    let mut s = suffix;
+    loop {
+        if let Some(r) = s.strip_prefix('?') {
+            s = r;
+        } else if let Some(r) = s.strip_prefix(".unwrap()") {
+            s = r;
+        } else if let Some(r) = s.strip_prefix(".expect(") {
+            // Skip the balanced argument list of `.expect("…")`.
+            let mut depth = 1usize;
+            let mut end = r.len();
+            for (k, c) in r.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = k + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            s = &r[end..];
+        } else {
+            return s;
+        }
+    }
 }
 
 /// Whether the journal `apply_at` is called on was built in memory
@@ -762,4 +853,41 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
         }
     "#;
     assert!(violations(literal).is_empty());
+
+    // Projecting the events half (`.0`) drops the `.1` commit, however the
+    // result is bound: a named binding does not make the commit awaited.
+    let project_unwrap = r#"
+        fn t() {
+            let events = journal.apply_command(c).unwrap().0;
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(project_unwrap).len(), 1);
+    let project_question = r#"
+        fn t() -> Result<()> {
+            let n = journal.apply_command(c)?.0.len();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(project_question).len(), 1);
+
+    // The apply nested inside a larger expression (a macro, a call) binds no
+    // commit at all: the result is consumed by the surrounding expression.
+    let nested_assert = r#"
+        fn t() {
+            assert!(journal.apply_command(c).is_ok());
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(nested_assert).len(), 1);
+
+    // …while a `.1` projection *keeps* the commit for the binding to await.
+    let project_commit = r#"
+        fn t() {
+            let commit = journal.apply_command(c).unwrap().1;
+            commit.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(project_commit).is_empty());
 }
