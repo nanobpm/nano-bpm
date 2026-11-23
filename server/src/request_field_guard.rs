@@ -834,3 +834,124 @@ fn honoured_operation_references_are_forwarded_by_their_handler() {
          `unhonoured #<issue>` in spec-patches/request-fields.txt: {dropped:#?}"
     );
 }
+
+/// Response-side `operationReference` fields Nano projects into its read model
+/// (#1601, step 5 of #1556). Each entry is a `Schema.property` path as derived by
+/// [`walk`] from a 2xx response body of a spec operation.
+///
+/// Camunda's read model may surface the write-side `operationReference` on read
+/// results (audit log entries, batch operation items). As of the synced spec no
+/// response schema carries it - neither `AuditLogResult` nor the batch operation
+/// item result - so there is nothing to project and this list is empty. The
+/// guard below derives the set from the spec on every run: when a re-sync adds
+/// `operationReference` to any response, it fails until the field is projected
+/// (and listed here, with its read-model column wired) - instead of the spec
+/// silently advertising a read field Nano always omits.
+const PROJECTED_RESPONSE_OPERATION_REFERENCES: &[&str] = &[];
+
+/// Every `Schema.property` reachable from a 2xx response body of **any** spec
+/// operation (served or not: an unserved read surface that gains the field is
+/// still a read-side exposure Nano must decide on before serving it).
+fn response_fields() -> BTreeSet<String> {
+    let mut spec = Spec {
+        dir: build_spec_dir(),
+        files: BTreeMap::new(),
+    };
+    let paths = spec
+        .file("rest-api.yaml")
+        .get("paths")
+        .and_then(Value::as_mapping)
+        .expect("rest-api.yaml has paths")
+        .clone();
+    let mut fields = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for (_, item) in paths {
+        let (item, file) = match item.get("$ref").and_then(Value::as_str) {
+            Some(r) => {
+                let (v, f, _) = spec.resolve(r, "rest-api.yaml");
+                (v, f)
+            }
+            None => (item.clone(), "rest-api.yaml".to_string()),
+        };
+        let Some(ops) = item.as_mapping() else {
+            continue;
+        };
+        for (_, op) in ops.clone() {
+            let Some(op_id) = op.get("operationId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(responses) = op.get("responses").and_then(Value::as_mapping) else {
+                continue;
+            };
+            for (status, resp) in responses.clone() {
+                let status = match &status {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    _ => continue,
+                };
+                if !status.starts_with('2') {
+                    continue;
+                }
+                let (resp, resp_file) = match resp.get("$ref").and_then(Value::as_str) {
+                    Some(r) => {
+                        let (v, f, _) = spec.resolve(r, &file);
+                        (v, f)
+                    }
+                    None => (resp, file.clone()),
+                };
+                let Some(content) = resp.get("content").and_then(Value::as_mapping) else {
+                    continue;
+                };
+                for (_, media) in content.clone() {
+                    if let Some(schema) = media.get("schema") {
+                        let name = format!("{op_id}Response");
+                        walk(
+                            &mut spec,
+                            schema,
+                            &resp_file,
+                            &name,
+                            &mut fields,
+                            &mut visited,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        fields.len() > 100,
+        "derived too few response fields ({}) - is the walk broken?",
+        fields.len()
+    );
+    fields
+}
+
+#[test]
+fn response_operation_references_are_all_projected() {
+    let exposed: BTreeSet<String> = response_fields()
+        .into_iter()
+        .filter(|f| f.ends_with(".operationReference"))
+        .collect();
+    let projected: BTreeSet<String> = PROJECTED_RESPONSE_OPERATION_REFERENCES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        exposed, projected,
+        "the spec's read-side `operationReference` fields (left) differ from the \
+         ones Nano projects (right, PROJECTED_RESPONSE_OPERATION_REFERENCES in \
+         server/src/request_field_guard.rs). Project a newly exposed field into \
+         the read model (#1601) before listing it; drop entries upstream removed."
+    );
+}
+
+#[test]
+fn response_field_walk_detects_a_known_read_field() {
+    // Liveness of the derivation above: a walk that silently found nothing
+    // would make the projection guard vacuous.
+    let fields = response_fields();
+    assert!(
+        fields.iter().any(|f| f.ends_with(".batchOperationKey")),
+        "expected batch operation read results to be walked"
+    );
+}

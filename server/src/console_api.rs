@@ -1525,6 +1525,28 @@ macro_rules! data_ok_or {
     };
 }
 
+/// [`data_ok_or!`] for the datasource-gateway operations, which additionally
+/// declare `503` + `Retry-After`: gateway back-pressure
+/// ([`nano_server_console::data_busy_retry_after`]) → 503 (#1837); the rest
+/// collapse exactly as in [`data_ok_or!`].
+/// `$busy` is the bare variant name of the caller's `R` response enum (a
+/// struct variant can't be built from a `path` fragment).
+macro_rules! data_gateway_ok_or {
+    ($res:expr, $ok:path, $bad:path, $nf:path, $busy:ident) => {
+        match $res {
+            Ok(v) => Ok($ok(from_val(v))),
+            Err(e) => match nano_server_console::data_busy_retry_after(&e) {
+                Some(secs) => Ok(R::$busy {
+                    body: e.1,
+                    retry_after: Some(secs),
+                }),
+                None if e.0 == http::StatusCode::NOT_FOUND => Ok($nf(e.1)),
+                None => Ok($bad(e.1)),
+            },
+        }
+    };
+}
+
 #[async_trait]
 impl apis::data::Data for ServerImpl {
     async fn get_data_sources(
@@ -1535,11 +1557,12 @@ impl apis::data::Data for ServerImpl {
         path_params: &models::GetDataSourcesPathParams,
     ) -> Result<apis::data::GetDataSourcesResponse, ()> {
         use apis::data::GetDataSourcesResponse as R;
-        data_ok_or!(
+        data_gateway_ok_or!(
             nano_server_console::project_data_sources(&path_params.name).await,
             R::Status200_DatasourcesPlusTheDefaultSourceName,
             R::Status400_InvalidRequest,
-            R::Status404_NotFound
+            R::Status404_NotFound,
+            Status503_TheDatasourceGatewayIsSaturated
         )
     }
 
@@ -1551,11 +1574,12 @@ impl apis::data::Data for ServerImpl {
         path_params: &models::GetDataSchemaPathParams,
     ) -> Result<apis::data::GetDataSchemaResponse, ()> {
         use apis::data::GetDataSchemaResponse as R;
-        data_ok_or!(
+        data_gateway_ok_or!(
             nano_server_console::project_data_schema(&path_params.name, &path_params.source).await,
             R::Status200_DatasourceSchema,
             R::Status400_InvalidRequest,
-            R::Status404_NotFound
+            R::Status404_NotFound,
+            Status503_TheDatasourceGatewayIsSaturated
         )
     }
 
@@ -1573,7 +1597,7 @@ impl apis::data::Data for ServerImpl {
             .as_ref()
             .map(|ps| ps.iter().map(|o| o.0.clone()).collect())
             .unwrap_or_default();
-        data_ok_or!(
+        data_gateway_ok_or!(
             nano_server_console::project_data_query(
                 &path_params.name,
                 &path_params.source,
@@ -1583,7 +1607,8 @@ impl apis::data::Data for ServerImpl {
             .await,
             R::Status200_QueryResult,
             R::Status400_InvalidRequest,
-            R::Status404_NotFound
+            R::Status404_NotFound,
+            Status503_TheDatasourceGatewayIsSaturated
         )
     }
 
@@ -1601,7 +1626,7 @@ impl apis::data::Data for ServerImpl {
             .as_ref()
             .map(|ps| ps.iter().map(|o| o.0.clone()).collect())
             .unwrap_or_default();
-        data_ok_or!(
+        data_gateway_ok_or!(
             nano_server_console::project_data_exec(
                 &path_params.name,
                 &path_params.source,
@@ -1611,7 +1636,8 @@ impl apis::data::Data for ServerImpl {
             .await,
             R::Status200_ExecResult,
             R::Status400_InvalidRequest,
-            R::Status404_NotFound
+            R::Status404_NotFound,
+            Status503_TheDatasourceGatewayIsSaturated
         )
     }
 
@@ -1624,7 +1650,7 @@ impl apis::data::Data for ServerImpl {
         body: &models::DataScriptRequest,
     ) -> Result<apis::data::ExecDataScriptResponse, ()> {
         use apis::data::ExecDataScriptResponse as R;
-        data_ok_or!(
+        data_gateway_ok_or!(
             nano_server_console::project_data_script(
                 &path_params.name,
                 &path_params.source,
@@ -1633,7 +1659,8 @@ impl apis::data::Data for ServerImpl {
             .await,
             R::Status200_ScriptResult,
             R::Status400_InvalidRequest,
-            R::Status404_NotFound
+            R::Status404_NotFound,
+            Status503_TheDatasourceGatewayIsSaturated
         )
     }
 
@@ -1645,12 +1672,13 @@ impl apis::data::Data for ServerImpl {
         path_params: &models::GetDataMigrationsPathParams,
     ) -> Result<apis::data::GetDataMigrationsResponse, ()> {
         use apis::data::GetDataMigrationsResponse as R;
-        data_ok_or!(
+        data_gateway_ok_or!(
             nano_server_console::project_data_migrations(&path_params.name, &path_params.source)
                 .await,
             R::Status200_MigrationStatus,
             R::Status400_InvalidRequest,
-            R::Status404_NotFound
+            R::Status404_NotFound,
+            Status503_TheDatasourceGatewayIsSaturated
         )
     }
 
@@ -1662,11 +1690,12 @@ impl apis::data::Data for ServerImpl {
         path_params: &models::MigrateDataPathParams,
     ) -> Result<apis::data::MigrateDataResponse, ()> {
         use apis::data::MigrateDataResponse as R;
-        data_ok_or!(
+        data_gateway_ok_or!(
             nano_server_console::project_data_migrate(&path_params.name, &path_params.source).await,
             R::Status200_MigrationsApplied,
             R::Status400_InvalidRequest,
-            R::Status404_NotFound
+            R::Status404_NotFound,
+            Status503_TheDatasourceGatewayIsSaturated
         )
     }
 
@@ -1678,12 +1707,13 @@ impl apis::data::Data for ServerImpl {
         path_params: &models::RegenerateDomainTypesPathParams,
     ) -> Result<apis::data::RegenerateDomainTypesResponse, ()> {
         use apis::data::RegenerateDomainTypesResponse as R;
-        data_ok_or!(
+        data_gateway_ok_or!(
             nano_server_console::project_data_domaintypes(&path_params.name, &path_params.source)
                 .await,
             R::Status200_TheEmittedDomainTypes,
             R::Status400_InvalidRequest,
-            R::Status404_NotFound
+            R::Status404_NotFound,
+            Status503_TheDatasourceGatewayIsSaturated
         )
     }
 
@@ -1704,7 +1734,7 @@ impl apis::data::Data for ServerImpl {
             .meta
             .as_ref()
             .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null));
-        data_ok_or!(
+        data_gateway_ok_or!(
             nano_server_console::project_data_preview_domaintypes(
                 &path_params.name,
                 &path_params.source,
@@ -1714,7 +1744,8 @@ impl apis::data::Data for ServerImpl {
             .await,
             R::Status200_TheResolvedDomainTextAndPer,
             R::Status400_InvalidRequest,
-            R::Status404_NotFound
+            R::Status404_NotFound,
+            Status503_TheDatasourceGatewayIsSaturated
         )
     }
 }
@@ -1940,6 +1971,48 @@ impl nano_server_console::ConsoleServer for ServerImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1837: gateway back-pressure must reach HTTP clients as `503` with a
+    /// `Retry-After`, not collapse to `400`; other errors keep their mapping.
+    #[test]
+    fn data_gateway_busy_maps_to_503_with_retry_after() {
+        use apis::data::QueryDataResponse as R;
+        let map = |e: (http::StatusCode, String)| -> R {
+            let res: Result<R, ()> = data_gateway_ok_or!(
+                Err::<serde_json::Value, _>(e),
+                R::Status200_QueryResult,
+                R::Status400_InvalidRequest,
+                R::Status404_NotFound,
+                Status503_TheDatasourceGatewayIsSaturated
+            );
+            res.unwrap_or_else(|()| panic!("adapter never returns Err"))
+        };
+        let busy = format!(
+            "{} 2 ops running and 32 queued; retry shortly",
+            nano_server_console::projects::DATA_GATEWAY_BUSY_PREFIX
+        );
+        assert_eq!(
+            map((http::StatusCode::SERVICE_UNAVAILABLE, busy.clone())),
+            R::Status503_TheDatasourceGatewayIsSaturated {
+                body: busy,
+                retry_after: Some(
+                    nano_server_console::projects::DATA_GATEWAY_BUSY_RETRY_AFTER_SECS
+                ),
+            }
+        );
+        // No-runtime is also a 503 but not transient: stays 400.
+        assert_eq!(
+            map((
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "No JavaScript runtime".into()
+            )),
+            R::Status400_InvalidRequest("No JavaScript runtime".into())
+        );
+        assert_eq!(
+            map((http::StatusCode::NOT_FOUND, "no such project".into())),
+            R::Status404_NotFound("no such project".into())
+        );
+    }
 
     /// Regression for the error path of `GET /console/api/projects`: the response
     /// model marks `urbanAvailable` **required**, and the adapter deserializes the
