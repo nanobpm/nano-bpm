@@ -68,6 +68,8 @@ enum Budget {
     Port,
     Ready,
     RequestIo,
+    ReadModelConverge,
+    LeaderElection,
 }
 
 impl Budget {
@@ -76,6 +78,8 @@ impl Budget {
             Budget::Port => budget::PORT,
             Budget::Ready => budget::READY,
             Budget::RequestIo => budget::REQUEST_IO,
+            Budget::ReadModelConverge => budget::READ_MODEL_CONVERGE,
+            Budget::LeaderElection => budget::LEADER_ELECTION,
         }
     }
 
@@ -84,15 +88,30 @@ impl Budget {
             Budget::Port => "port budget (budget::PORT)",
             Budget::Ready => "readiness budget (budget::READY)",
             Budget::RequestIo => "request I/O budget (budget::REQUEST_IO)",
+            Budget::ReadModelConverge => {
+                "read-model convergence budget (budget::READ_MODEL_CONVERGE)"
+            }
+            Budget::LeaderElection => "leader-election budget (budget::LEADER_ELECTION)",
         }
     }
 
     /// The diagnostic every budget failure panics with.
     fn exceeded(self, what: &str, elapsed: Duration, detail: &dyn std::fmt::Display) -> String {
+        self.exceeded_limit(self.limit(), what, elapsed, detail)
+    }
+
+    /// As [`Budget::exceeded`], for a caller that applied an overridden limit
+    /// (tests shrink a budget to exercise the failure path). The one format.
+    fn exceeded_limit(
+        self,
+        limit: Duration,
+        what: &str,
+        elapsed: Duration,
+        detail: &dyn std::fmt::Display,
+    ) -> String {
         format!(
-            "{what}: {} of {:?} exceeded after {elapsed:?}: {detail}",
-            self.name(),
-            self.limit()
+            "{what}: {} of {limit:?} exceeded after {elapsed:?}: {detail}",
+            self.name()
         )
     }
 }
@@ -270,10 +289,24 @@ impl ServerProcess {
         body: Option<&str>,
         accept: impl Fn(u16, &str) -> bool,
     ) -> (u16, String) {
-        let deadline = Instant::now() + budget::READ_MODEL_CONVERGE;
+        let started = Instant::now();
+        let deadline = started + budget::READ_MODEL_CONVERGE;
         loop {
             let (status, resp) = self.request(method, path, body);
-            if accept(status, &resp) || Instant::now() >= deadline {
+            if accept(status, &resp) {
+                return (status, resp);
+            }
+            if Instant::now() >= deadline {
+                // Callers assert on the returned response; name the exhausted
+                // budget here so that assert's failure output identifies it.
+                eprintln!(
+                    "{}",
+                    Budget::ReadModelConverge.exceeded(
+                        &format!("{method} {path}"),
+                        started.elapsed(),
+                        &format_args!("last response {status} {resp}")
+                    )
+                );
                 return (status, resp);
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -362,12 +395,10 @@ fn exchange(
 ) -> (u16, String) {
     let started = Instant::now();
     let fail = |e: std::io::Error| -> ! {
-        let msg = format!(
-            "{what}: {} of {io_budget:?} exceeded after {:?}: {e}",
-            Budget::RequestIo.name(),
-            started.elapsed()
-        );
-        panic!("{msg}")
+        panic!(
+            "{}",
+            Budget::RequestIo.exceeded_limit(io_budget, what, started.elapsed(), &e)
+        )
     };
     stream
         .set_read_timeout(Some(io_budget))
@@ -1680,7 +1711,8 @@ fn boot_replicated_activation(journal: &Path) -> ServerProcess {
 fn create_demo_instance_with_vars_replicated(server: &ServerProcess) -> String {
     // Raft leader election on a cold single-voter group can take several seconds
     // in a debug build; poll well past that before giving up.
-    let deadline = Instant::now() + budget::LEADER_ELECTION;
+    let started = Instant::now();
+    let deadline = started + budget::LEADER_ELECTION;
     let instance_key = loop {
         let (status, body) = server.request(
             "POST",
@@ -1697,7 +1729,12 @@ fn create_demo_instance_with_vars_replicated(server: &ServerProcess) -> String {
         }
         assert!(
             Instant::now() < deadline,
-            "create never reached a leader: {status} {body}"
+            "{}",
+            Budget::LeaderElection.exceeded(
+                "create never reached a leader",
+                started.elapsed(),
+                &format_args!("{status} {body}")
+            )
         );
         std::thread::sleep(Duration::from_millis(100));
     };
