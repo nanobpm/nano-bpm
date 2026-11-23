@@ -2649,10 +2649,13 @@ fn process_definition_search_honours_name_wildcard_and_version() {
 fn a_stalled_response_names_the_request_io_budget() {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
     let port = listener.local_addr().expect("addr").port();
-    // Accept and hold the connection open without ever responding.
+    // Accept and hold the connection open without ever responding, until the
+    // client has finished (a fixed hold could close first under scheduler
+    // delay, turning the timeout into a reset/EOF).
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || {
         let (conn, _) = listener.accept().expect("accept");
-        std::thread::sleep(Duration::from_secs(2));
+        let _ = released.recv();
         drop(conn);
     });
     let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -2664,6 +2667,8 @@ fn a_stalled_response_names_the_request_io_budget() {
             Duration::from_millis(200),
         )
     });
+    release.send(()).expect("release holder");
+    holder.join().expect("holder thread");
     let payload = result.expect_err("a stalled response must panic");
     let msg = payload
         .downcast_ref::<String>()
@@ -2674,7 +2679,6 @@ fn a_stalled_response_names_the_request_io_budget() {
         msg.contains("request I/O budget (budget::REQUEST_IO)"),
         "names the budget: {msg}"
     );
-    holder.join().expect("holder thread");
 }
 
 /// #1821 guard: non-timeout I/O errors must not be diagnosed as budget
