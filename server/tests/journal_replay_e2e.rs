@@ -182,17 +182,25 @@ fn read_listening_port(child: &mut Child) -> (u16, std::thread::JoinHandle<()>) 
             kill_child_tree(child);
             let _ = child.wait();
             let _ = stdout_thread.join();
-            panic!(
-                "{}",
-                Budget::Port.exceeded(
-                    "server never reported its listening port",
-                    started.elapsed(),
-                    &e
-                )
-            );
+            panic!("{}", port_failure(e, started.elapsed()));
         }
     };
     (port, stdout_thread)
+}
+
+/// Diagnoses a failed wait for the listening port. Only a genuine
+/// `Timeout` is a port-budget exhaustion; `Disconnected` means the stdout
+/// reader exited without a port (the child died or stdout closed during
+/// startup), which can be immediate and must not be reported as slowness.
+fn port_failure(e: std::sync::mpsc::RecvTimeoutError, elapsed: Duration) -> String {
+    const WHAT: &str = "server never reported its listening port";
+    match e {
+        std::sync::mpsc::RecvTimeoutError::Timeout => Budget::Port.exceeded(WHAT, elapsed, &e),
+        std::sync::mpsc::RecvTimeoutError::Disconnected => format!(
+            "{WHAT}: stdout reader exited without a port after {elapsed:?} \
+             (child exited or stdout closed during startup; not a budget timeout)"
+        ),
+    }
 }
 
 fn kill_child_tree(child: &mut Child) {
@@ -395,10 +403,7 @@ fn exchange(
 ) -> (u16, String) {
     let started = Instant::now();
     let fail = |e: std::io::Error| -> ! {
-        panic!(
-            "{}",
-            Budget::RequestIo.exceeded_limit(io_budget, what, started.elapsed(), &e)
-        )
+        panic!("{}", io_failure(io_budget, what, started.elapsed(), &e))
     };
     stream
         .set_read_timeout(Some(io_budget))
@@ -423,6 +428,21 @@ fn exchange(
         .map(|(_, body)| body.to_string())
         .unwrap_or_default();
     (status, body)
+}
+
+/// Diagnoses a request I/O error. Only `TimedOut`/`WouldBlock` (how a socket
+/// read/write timeout surfaces) is a request-I/O budget exhaustion; any other
+/// error (`ConnectionReset`, `BrokenPipe`, ...) is reported as an I/O failure,
+/// still naming the request and elapsed time.
+fn io_failure(limit: Duration, what: &str, elapsed: Duration, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            Budget::RequestIo.exceeded_limit(limit, what, elapsed, e)
+        }
+        kind => {
+            format!("{what}: I/O error ({kind:?}) after {elapsed:?}, not a budget timeout: {e}")
+        }
+    }
 }
 
 /// Creates an instance of the pre-seeded `demo` process and returns its key.
@@ -2655,4 +2675,42 @@ fn a_stalled_response_names_the_request_io_budget() {
         "names the budget: {msg}"
     );
     holder.join().expect("holder thread");
+}
+
+/// #1821 guard: non-timeout I/O errors must not be diagnosed as budget
+/// exhaustion, and only a real timeout may name the budget.
+#[test]
+fn non_timeout_io_errors_are_not_reported_as_budget_exhaustion() {
+    use std::io::{Error, ErrorKind};
+    let limit = Duration::from_millis(200);
+    let elapsed = Duration::from_millis(5);
+    for kind in [
+        ErrorKind::ConnectionReset,
+        ErrorKind::BrokenPipe,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::UnexpectedEof,
+    ] {
+        let msg = io_failure(limit, "GET /x", elapsed, &Error::from(kind));
+        assert!(!msg.contains("budget::REQUEST_IO"), "{kind:?}: {msg}");
+        assert!(
+            msg.contains("GET /x") && msg.contains(&format!("{kind:?}")),
+            "{msg}"
+        );
+    }
+    for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+        let msg = io_failure(limit, "GET /x", elapsed, &Error::from(kind));
+        assert!(msg.contains("budget::REQUEST_IO"), "{kind:?}: {msg}");
+    }
+}
+
+/// #1821 guard: a stdout reader that exits without a port is a startup
+/// failure, not a port-budget timeout.
+#[test]
+fn port_reader_disconnect_is_not_reported_as_budget_exhaustion() {
+    let elapsed = Duration::from_millis(5);
+    let msg = port_failure(std::sync::mpsc::RecvTimeoutError::Disconnected, elapsed);
+    assert!(!msg.contains("budget::PORT"), "{msg}");
+    assert!(msg.contains("not a budget timeout"), "{msg}");
+    let msg = port_failure(std::sync::mpsc::RecvTimeoutError::Timeout, elapsed);
+    assert!(msg.contains("budget::PORT"), "{msg}");
 }
