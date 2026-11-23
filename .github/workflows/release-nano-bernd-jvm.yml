@@ -21,10 +21,16 @@ on:
 
 jobs:
   publish:
+    if: startsWith(github.ref, 'refs/tags/nano-bernd-jvm-v')
     name: Publish io.github.jwulf:nano-bernd
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+
+      # Only a main-reachable release tag may publish (#1830).
+      - uses: ./.github/actions/assert-release-ref
+        with:
+          tag-pattern: '^nano-bernd-jvm-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
       - name: Set up Java 21 + Maven cache
         uses: actions/setup-java@v5

@@ -1,0 +1,43 @@
+name: Assert release ref
+description: >-
+  Fail closed unless this run is for a release tag (#1830): the ref is a tag,
+  its name matches `tag-pattern`, and the tagged commit is on `main`. Every
+  publishing job runs this first; scripts/release-ref-gate.test.mjs enforces it.
+  A manual `workflow_dispatch` run from a branch therefore builds but cannot
+  publish (it once shipped a side-branch server in c8ctl-plugin-nano for seven
+  weeks, #1827).
+inputs:
+  tag-pattern:
+    description: Extended regex the full tag name must match, e.g. ^v[0-9]+\.[0-9]+\.[0-9]+$
+    required: true
+  token:
+    description: Token with contents:read on this repository (for the compare API).
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    - name: Assert the ref is a main-reachable release tag
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG_PATTERN: ${{ inputs.tag-pattern }}
+      run: |
+        set -euo pipefail
+        if [ "${GITHUB_REF_TYPE:-}" != "tag" ]; then
+          echo "::error::refusing to publish from ${GITHUB_REF_TYPE:-unknown} '${GITHUB_REF_NAME:-}': only release tags publish (#1830)"
+          exit 1
+        fi
+        if ! [[ "$GITHUB_REF_NAME" =~ $TAG_PATTERN ]]; then
+          echo "::error::tag '$GITHUB_REF_NAME' does not match the release pattern $TAG_PATTERN"
+          exit 1
+        fi
+        # `behind` / `identical`: the tagged commit is an ancestor of main.
+        # Anything else (`ahead`, `diverged`) means it was tagged off-main.
+        status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq .status)"
+        case "$status" in
+          behind|identical)
+            echo "release tag $GITHUB_REF_NAME ($GITHUB_SHA) is on main" ;;
+          *)
+            echo "::error::tag $GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main (compare status: $status)"
+            exit 1 ;;
+        esac

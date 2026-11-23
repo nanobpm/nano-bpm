@@ -27,8 +27,8 @@
 #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  (an IAM key that can s3:PutObject
 #   on the bucket). Tag pushes upload an immutable per-version copy to
 # s3://sitapati-storage/processos/<tag>/ AND refresh the rolling
-# s3://sitapati-storage/processos/latest/ pointer; manual runs refresh `latest/`
-# only. The step is skipped (not failed) when the credentials are absent.
+# s3://sitapati-storage/processos/latest/ pointer; manual runs publish nothing
+# (#1830). The step is skipped (not failed) when the credentials are absent.
 #
 # The bucket is "Bucket owner enforced" (ACLs disabled), so objects are NOT
 # uploaded with a per-object ACL — public read is granted by the bucket policy
@@ -145,6 +145,7 @@ jobs:
           retention-days: 1
 
   publish:
+    if: startsWith(github.ref, 'refs/tags/v')
     name: Attach binaries to the release
     needs: build
     runs-on: ubuntu-24.04
@@ -158,6 +159,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Only a main-reachable release tag may publish (#1830).
+      - uses: ./.github/actions/assert-release-ref
+        with:
+          tag-pattern: '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
       - name: Download built binaries
         uses: actions/download-artifact@v7
         with:
@@ -166,36 +172,27 @@ jobs:
           merge-multiple: true
 
       # Attach to the release for the pushed tag (created if absent) in THIS
-      # private repo. A manual `workflow_dispatch` run (no tag) falls back to a
-      # rolling `processos-binaries` prerelease so the build is still useful.
+      # private repo. This job runs for release tags only (#1830); a manual
+      # `workflow_dispatch` run builds, and its binaries stay downloadable as the
+      # `build` legs' run artifacts.
       - name: Upload assets to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           ls -l dist
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
-            rel="${GITHUB_REF_NAME}"
-            gh release view "$rel" >/dev/null 2>&1 || \
-              gh release create "$rel" \
-                --title "$rel" \
-                --notes "ProcessOS binaries for $rel (private — Nano BPM access only)." \
-                --verify-tag
-          else
-            rel="processos-binaries"
-            gh release view "$rel" >/dev/null 2>&1 || \
-              gh release create "$rel" \
-                --title "ProcessOS binaries (rolling)" \
-                --notes "Prebuilt ProcessOS binaries from manual runs. Auto-updated." \
-                --latest=false \
-                --prerelease
-          fi
+          rel="${GITHUB_REF_NAME}"
+          gh release view "$rel" >/dev/null 2>&1 || \
+            gh release create "$rel" \
+              --title "$rel" \
+              --notes "ProcessOS binaries for $rel (private — Nano BPM access only)." \
+              --verify-tag
           gh release upload "$rel" dist/* --clobber
 
       # Mirror the same binaries to S3 so they're fetchable without a GitHub
       # token. Tag pushes publish an immutable per-version copy under
-      # `processos/<tag>/` AND refresh the rolling `processos/latest/` pointer;
-      # a manual `workflow_dispatch` run only refreshes `latest/`. The bucket is
+      # `processos/<tag>/` AND refresh the rolling `processos/latest/` pointer
+      # (tag runs only, #1830: `latest/` is what install-processos.sh fetches). The bucket is
       # ACL-disabled (Bucket owner enforced); public read comes from the bucket
       # policy, so no per-object ACL is set here. The step is skipped (not
       # failed) when the AWS credentials are absent so credential-less runs pass.
@@ -214,18 +211,15 @@ jobs:
                 --cache-control "public, max-age=300"
             done
           }
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
-            upload_to "processos/${GITHUB_REF_NAME}"
-          fi
+          upload_to "processos/${GITHUB_REF_NAME}"
           upload_to "processos/latest"
 
       # Publish a small version.json next to the binaries so clients (the
       # c8ctl-plugin-nano update notifier) can learn the latest published
-      # version without a GitHub token. Only tag pushes carry a real version, so
-      # this writes the per-tag copy AND refreshes processos/latest/version.json;
-      # manual runs (no tag) skip it and leave the existing pointer untouched.
+      # version without a GitHub token: the per-tag copy AND
+      # processos/latest/version.json.
       - name: Publish version.json to S3
-        if: ${{ env.AWS_ACCESS_KEY_ID != '' && github.ref_type == 'tag' }}
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
