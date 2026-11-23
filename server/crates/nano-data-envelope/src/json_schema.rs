@@ -10,30 +10,35 @@
 //! The mapping folds the shape's ops in author order (a later op re-declaring a
 //! field name wins, as in the reifier):
 //!
+//! A ref that names no declared shape is looked up in the caller's
+//! [`TypeRegistry`] (the fused domain types); a ref neither resolves is
+//! reported in [`EnvelopeSchema::unresolved`] (issue #1748) — never silently
+//! treated as complete — and an unresolved **root** envelope is the hard
+//! error [`SchemaError::UnresolvedEnvelope`].
+//!
 //! - `extend name type [optional] [list] [description]` — a scalar keyword maps
 //!   to its JSON-Schema type (see [`scalar_schema`]); a type naming another
-//!   shape nests that shape's object schema; any other (fused-domain) type is
-//!   left unconstrained. Required unless `optional="true"`.
+//!   shape (or registry type) nests its object schema; an unresolved type is
+//!   left unconstrained (and reported). Required unless `optional="true"`.
 //! - `reference name ref [spread] [list] [description]` — nests the referenced
-//!   shape as an object (an array of them with `list`), or inlines its fields
+//!   type as an object (an array of them with `list`), or inlines its fields
 //!   with `spread`. Required.
-//! - `carry ref` — spreads a referenced *shape*'s fields; a fused domain
-//!   entity is not resolvable from the model alone, so it contributes nothing
-//!   (undeclared arguments still pass through as process variables).
-//! - `project ref fields` — picks the named fields of a referenced shape (a
-//!   field the resolved shape lacks is an invalid projection and fails the
-//!   derivation), or declares them unconstrained (and optional) for a domain
-//!   entity the model alone cannot resolve.
+//! - `carry ref` — spreads a referenced type's fields; an unresolved type
+//!   contributes nothing (and is reported).
+//! - `project ref fields` — picks the named fields of a referenced type (a
+//!   field the resolved type lacks is an invalid projection and fails the
+//!   derivation), or declares them unconstrained (and optional, reported) for
+//!   an unresolved type.
 //!
 //! A reference cycle resolves to an unconstrained object at the point it
 //! closes, so derivation always terminates.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
-use crate::{ShapeDecl, ShapeOp, scan_bpmn};
+use crate::{BpmnScan, ShapeDecl, ShapeOp};
 
 /// The JSON Schema for a scalar `extend` type keyword (the console's
 /// `SCALAR_KEYWORDS`, `console/src/lib/shapeComposer.ts`), or `None` when the
@@ -70,6 +75,16 @@ pub enum SchemaError {
     /// expanded (a reference cycle): its fields cannot be resolved, so the
     /// projection is rejected rather than weakened to unconstrained fields.
     CyclicProjection,
+    /// The envelope ref names neither a `nano:shape` declared in the model nor
+    /// a type of the registry: the contract is unknown, so calls are rejected
+    /// rather than validated against a weaker (legacy) schema.
+    UnresolvedEnvelope,
+    /// A registry type's schema lies outside the supported subset (an object
+    /// schema of only `type`/`properties`/`required` plus annotations, with no
+    /// `$ref` anywhere): copying only its properties would drop definitions
+    /// (`$defs`, leaving dangling `$ref`s) or object-level constraints
+    /// (`additionalProperties`, …), silently weakening the contract.
+    UnsupportedRegistrySchema,
 }
 
 impl std::fmt::Display for SchemaError {
@@ -89,50 +104,93 @@ impl std::fmt::Display for SchemaError {
                 f,
                 "it projects fields from a shape that is part of a reference cycle"
             ),
+            Self::UnsupportedRegistrySchema => write!(
+                f,
+                "a registry type's schema uses keywords outside the supported subset \
+                 (`type: object`, `properties`, `required`, annotations; no `$ref`)"
+            ),
+            Self::UnresolvedEnvelope => write!(
+                f,
+                "it is declared neither as a shape in the model nor in the type registry"
+            ),
         }
     }
 }
 
 impl std::error::Error for SchemaError {}
 
-/// The data envelope a message's payload is typed by, resolved from one BPMN
-/// document: `Ok(Some((shape_id, object_schema)))` when the named
-/// `bpmn:message` carries an `io.nanobpm.dataEnvelope.in` ref that resolves to
-/// a `nano:shape` declared in the same document; `Ok(None)` when there is no
-/// envelope (or a ref the model alone cannot resolve); `Err((shape_id, e))`
-/// when the envelope resolves but its schema exceeds the derivation limits.
-/// `process_id` prefers a shape declared on that process when several
-/// processes declare the same id.
-pub fn message_input_schema(
-    xml: &str,
-    message_name: &str,
-    process_id: Option<&str>,
-) -> Result<Option<(String, Value)>, (String, SchemaError)> {
-    let scan = scan_bpmn(xml);
-    let Some(shape_id) = scan
-        .messages
-        .iter()
-        .find(|m| m.message_name == message_name)
-        .and_then(|m| m.input_type.clone())
-    else {
-        return Ok(None);
-    };
-    match shape_json_schema(&scan.shapes, &shape_id, process_id) {
-        Ok(Some(schema)) => Ok(Some((shape_id, schema))),
-        Ok(None) => Ok(None),
-        Err(e) => Err((shape_id, e)),
+/// A type registry the derivation consults for refs the model does not
+/// declare as a `nano:shape` — the fused domain types (`carry`, `project`,
+/// `extend`/`reference` to a domain entity). Returns the type's object JSON
+/// Schema (`{type: "object", properties, required?}`), or `None` when the
+/// registry does not know it (the ref is then reported as unresolved).
+pub trait TypeRegistry {
+    fn object_schema(&self, type_id: &str) -> Option<Value>;
+}
+
+/// No registry: only model-declared shapes resolve (every external ref is
+/// reported in [`EnvelopeSchema::unresolved`]).
+impl TypeRegistry for () {
+    fn object_schema(&self, _: &str) -> Option<Value> {
+        None
     }
 }
 
-/// The object JSON Schema of shape `shape_id` (`{type, properties,
-/// required?}`), `Ok(None)` if no shape with that id is declared, or an error
-/// when the expansion exceeds the derivation limits (an incomplete schema is
-/// never returned).
-pub fn shape_json_schema(
+impl TypeRegistry for HashMap<String, Value> {
+    fn object_schema(&self, type_id: &str) -> Option<Value> {
+        self.get(type_id).cloned()
+    }
+}
+
+/// A derived data-envelope contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvelopeSchema {
+    /// The envelope's shape id.
+    pub shape: String,
+    /// The object JSON Schema.
+    pub schema: Value,
+    /// Unresolved-contract diagnostics: every ref neither the model nor the
+    /// registry resolves, whose part of the contract is therefore NOT
+    /// enforced by `schema`. Empty = the schema is the complete contract.
+    pub unresolved: Vec<String>,
+}
+
+/// The data envelope a **message start event** is typed by (issue #1748),
+/// resolved from one scanned BPMN document: the start event's `messageRef` is
+/// followed to the `bpmn:message` **id** (never matched by subscription
+/// message name, which may be evaluated, fall back to the message id, or be
+/// shared by several messages), and that message's
+/// `io.nanobpm.dataEnvelope.in` ref is derived with [`envelope_schema`].
+///
+/// `Ok(None)` when the start event's message declares no envelope;
+/// `Err((shape_id, e))` when it declares one whose schema cannot be derived —
+/// including [`SchemaError::UnresolvedEnvelope`] for a ref neither the model
+/// nor `registry` declares (never a silent fallback to a weaker contract).
+pub fn start_event_input_schema(
+    scan: &BpmnScan,
+    start_element_id: &str,
+    process_id: Option<&str>,
+    registry: &dyn TypeRegistry,
+) -> Result<Option<EnvelopeSchema>, (String, SchemaError)> {
+    let Some(shape_id) = scan.start_message_envelope(start_element_id, process_id) else {
+        return Ok(None);
+    };
+    envelope_schema(&scan.shapes, shape_id, process_id, registry)
+        .map(Some)
+        .map_err(|e| (shape_id.to_string(), e))
+}
+
+/// The object JSON Schema of envelope `shape_id` with its unresolved-contract
+/// diagnostics, or an error when the expansion exceeds the derivation limits
+/// or the root ref resolves to neither a declared shape nor a registry type
+/// (an incomplete schema is never returned). `process_id` prefers a shape
+/// declared on that process when several processes declare the same id.
+pub fn envelope_schema(
     shapes: &[ShapeDecl],
     shape_id: &str,
     process_id: Option<&str>,
-) -> Result<Option<Value>, SchemaError> {
+    registry: &dyn TypeRegistry,
+) -> Result<EnvelopeSchema, SchemaError> {
     // Preselect one declaration per id, once: the first declared on
     // `process_id`, else the first declared at all.
     let mut index: HashMap<&str, &ShapeDecl> = HashMap::new();
@@ -149,19 +207,34 @@ pub fn shape_json_schema(
     }
     let resolver = Resolver {
         index,
+        registry,
         ops: Cell::new(MAX_EXPANDED_OPS),
         bytes: Cell::new(MAX_EXPANDED_BYTES),
         error: Cell::new(None),
-    };
-    let Some(shape) = resolver.find(shape_id) else {
-        return Ok(None);
+        unresolved: RefCell::new(Vec::new()),
     };
     let mut stack = Vec::new();
-    let obj = resolver.object(shape, &mut stack);
-    match resolver.error.get() {
-        Some(e) => Err(e),
-        None => Ok(Some(obj.into_schema())),
+    let obj = match resolver.find(shape_id) {
+        Some(shape) => resolver.object(shape, &mut stack),
+        None => match resolver.external(shape_id, 0) {
+            Some(obj) => obj,
+            // A registry root that hit a limit is not "unresolved".
+            None => {
+                return Err(resolver
+                    .error
+                    .get()
+                    .unwrap_or(SchemaError::UnresolvedEnvelope));
+            }
+        },
+    };
+    if let Some(e) = resolver.error.get() {
+        return Err(e);
     }
+    Ok(EnvelopeSchema {
+        shape: shape_id.to_string(),
+        schema: obj.into_schema(),
+        unresolved: resolver.unresolved.into_inner(),
+    })
 }
 
 /// An object schema under construction: ordered properties plus the
@@ -213,6 +286,38 @@ impl Obj {
         names
     }
 
+    /// An object from an object JSON Schema (`properties` + `required`); a
+    /// non-object schema yields an empty object.
+    fn from_schema(schema: Value) -> Self {
+        let mut obj = Obj::default();
+        let required: HashSet<String> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|r| {
+                r.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let props = schema.get("properties").and_then(Value::as_object);
+        if let Some(props) = props {
+            for (name, s) in props {
+                obj.set(name, s.clone(), required.contains(name));
+            }
+        }
+        // A required name absent from `properties` is still required: keep it
+        // as an unconstrained (`{}`) property rather than silently dropping it.
+        if let Some(Value::Array(names)) = schema.get("required") {
+            for name in names.iter().filter_map(Value::as_str) {
+                if !props.is_some_and(|p| p.contains_key(name)) {
+                    obj.set(name, json!({}), true);
+                }
+            }
+        }
+        obj
+    }
+
     fn into_schema(self) -> Value {
         let required = self.required_names();
         let mut v = json!({ "type": "object", "properties": self.properties });
@@ -243,17 +348,72 @@ struct Resolver<'a> {
     /// The preferred declaration per shape id, selected once per derivation
     /// so a reference lookup is O(1) in the catalog size (duplicates too).
     index: HashMap<&'a str, &'a ShapeDecl>,
+    /// Fallback for refs the model does not declare.
+    registry: &'a dyn TypeRegistry,
     /// Remaining op-expansion budget.
     ops: Cell<usize>,
     /// Remaining byte budget.
     bytes: Cell<usize>,
     /// The first limit hit; once set, expansion stops.
     error: Cell<Option<SchemaError>>,
+    /// Unresolved-contract diagnostics, in encounter order (deduplicated).
+    unresolved: RefCell<Vec<String>>,
 }
 
 impl<'a> Resolver<'a> {
     fn find(&self, id: &str) -> Option<&'a ShapeDecl> {
         self.index.get(id).copied()
+    }
+
+    /// A registry type's object, charged against the byte budget; `None`
+    /// when the registry does not know it (or a limit is hit).
+    /// `depth` is the enclosing shape-reference nesting: a registry schema's
+    /// own nesting is checked (iteratively) against what is left of
+    /// [`MAX_DEPTH`] before any recursive sizing or copying.
+    fn external(&self, id: &str, depth: usize) -> Option<Obj> {
+        let schema = self.registry.object_schema(id)?;
+        if schema_too_deep(&schema, MAX_DEPTH.saturating_sub(depth)) {
+            self.fail(SchemaError::TooDeep);
+            return None;
+        }
+        if !registry_schema_supported(&schema) {
+            self.fail(SchemaError::UnsupportedRegistrySchema);
+            return None;
+        }
+        if !self.charge(value_size(&schema)) {
+            return None;
+        }
+        Some(Obj::from_schema(schema))
+    }
+
+    /// Record that `op` on `id` is not enforced because `id` resolves to
+    /// neither a declared shape nor a registry type.
+    fn report(&self, op: &str, id: &str) {
+        let msg = format!(
+            "`{op}` of `{id}`: not declared as a shape in the model nor in the type \
+             registry, so its part of the contract is not enforced"
+        );
+        let mut u = self.unresolved.borrow_mut();
+        if !u.contains(&msg) {
+            u.push(msg);
+        }
+    }
+
+    /// Resolve `id` as a declared shape, else as a registry type, else
+    /// report it as unresolved (`None`). A declared shape that does not
+    /// resolve (cycle / limit) is not reported: it is not an external ref.
+    fn resolve_any(&self, op: &str, id: &str, stack: &mut Vec<String>) -> Option<Obj> {
+        if self.find(id).is_some() {
+            return self.resolve(id, stack);
+        }
+        if self.error.get().is_some() {
+            return None;
+        }
+        let found = self.external(id, stack.len());
+        if found.is_none() && self.error.get().is_none() {
+            self.report(op, id);
+        }
+        found
     }
 
     fn fail(&self, e: SchemaError) {
@@ -317,12 +477,12 @@ impl<'a> Resolver<'a> {
             }
             match op {
                 ShapeOp::Carry { r#ref } => {
-                    if let Some(inner) = self.resolve(r#ref, stack) {
+                    if let Some(inner) = self.resolve_any("carry", r#ref, stack) {
                         obj.spread(inner);
                     }
                 }
                 ShapeOp::Project { r#ref, fields, .. } => {
-                    let inner = self.resolve(r#ref, stack);
+                    let inner = self.resolve_any("project", r#ref, stack);
                     // A local shape that did not resolve without a recorded
                     // limit error closes a cycle: reject, never pass through.
                     if inner.is_none()
@@ -353,8 +513,8 @@ impl<'a> Resolver<'a> {
                                 self.fail(SchemaError::UnknownProjectedField);
                                 break;
                             }
-                            // An unresolved (external / fused-domain) type:
-                            // documented pass-through.
+                            // An unresolved type (reported): documented
+                            // pass-through.
                             (None, false) => obj.set(field, json!({}), false),
                         }
                     }
@@ -368,14 +528,14 @@ impl<'a> Resolver<'a> {
                 } => {
                     // A type naming a declared shape is an object even where
                     // it closes a cycle (as for `reference`); only a
-                    // fused-domain type is left unconstrained.
+                    // unresolved type is left unconstrained (and reported).
                     let item = scalar_schema(r#type).unwrap_or_else(|| {
                         let fallback = if self.find(r#type).is_some() {
                             json!({ "type": "object" })
                         } else {
                             json!({})
                         };
-                        self.resolve(r#type, stack)
+                        self.resolve_any("extend", r#type, stack)
                             .map_or(fallback, Obj::into_schema)
                     });
                     let schema = field(item, *list, description.as_deref());
@@ -388,7 +548,7 @@ impl<'a> Resolver<'a> {
                     list,
                     description,
                 } => {
-                    let inner = self.resolve(r#ref, stack);
+                    let inner = self.resolve_any("reference", r#ref, stack);
                     // `spread` wins over `list`, as in the reifier (`domain_types.ts`).
                     if *spread == Some(true) {
                         if let Some(inner) = inner {
@@ -404,6 +564,92 @@ impl<'a> Resolver<'a> {
         stack.pop();
         obj
     }
+}
+
+/// Whether `v` nests deeper than `levels` shape levels. One shape level of
+/// an object schema is two JSON levels (`properties` → property schema),
+/// plus one for the root. Iterative, so it is safe on arbitrarily deep input.
+fn schema_too_deep(v: &Value, levels: usize) -> bool {
+    let limit = levels.saturating_mul(2).saturating_add(1);
+    let mut todo: Vec<(&Value, usize)> = vec![(v, 1)];
+    while let Some((v, d)) = todo.pop() {
+        let children: Box<dyn Iterator<Item = &Value>> = match v {
+            Value::Array(a) => Box::new(a.iter()),
+            Value::Object(m) => Box::new(m.values()),
+            _ => continue,
+        };
+        if d > limit {
+            return true;
+        }
+        todo.extend(children.map(|c| (c, d + 1)));
+    }
+    false
+}
+
+/// The top-level keywords of a registry object schema [`Obj::from_schema`]
+/// preserves (or that carry no constraint).
+const REGISTRY_ROOT_KEYWORDS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "title",
+    "description",
+    "$schema",
+    "$id",
+    "$comment",
+];
+
+/// Data-carrying keywords whose values are literal data, not schemas: a
+/// `"$ref"` key inside an object here (e.g. a `const` of `{"$ref": 1}`) is a
+/// field name, never a schema reference.
+const DATA_KEYWORDS: &[&str] = &["enum", "const", "default", "examples"];
+
+/// Whether a registry schema lies within the subset the derivation copies
+/// faithfully: an object (`type`, if present, is `"object"`) whose root uses
+/// only [`REGISTRY_ROOT_KEYWORDS`] and which contains no `$ref` in any schema
+/// position (its target would not be copied, leaving it dangling). A `$ref`
+/// that is data — a property literally named `"$ref"`, or a key of an object
+/// value under [`DATA_KEYWORDS`] — is not a reference and stays supported.
+/// Iterative, so a deep schema cannot overflow the stack.
+fn registry_schema_supported(schema: &Value) -> bool {
+    let Some(root) = schema.as_object() else {
+        return false;
+    };
+    if root
+        .keys()
+        .any(|k| !REGISTRY_ROOT_KEYWORDS.contains(&k.as_str()))
+    {
+        return false;
+    }
+    if root.get("type").is_some_and(|t| t != "object") {
+        return false;
+    }
+    // Every entry is a schema position: the root, or a value nested under
+    // one (a property's schema, an `items` schema, …).
+    let mut pending: Vec<&Value> = vec![schema];
+    while let Some(v) = pending.pop() {
+        let Value::Object(m) = v else { continue };
+        if m.contains_key("$ref") {
+            return false;
+        }
+        for (k, child) in m {
+            // The keys of `properties` are property names (data), so a
+            // property literally named `"$ref"` is fine; its values are
+            // schemas and stay on the walk. Data-carrying keywords hold
+            // literal data — a `"$ref"` key inside one is a field name,
+            // never a reference. Everything else (annotations, `type`,
+            // nested schema keywords) is descended into.
+            if k == "properties" {
+                if let Value::Object(props) = child {
+                    pending.extend(props.values());
+                }
+            } else if !DATA_KEYWORDS.contains(&k.as_str()) {
+                pending.extend(child.as_array().into_iter().flatten());
+                pending.push(child);
+            }
+        }
+    }
+    true
 }
 
 /// An estimate of a schema value's size in bytes (string and key lengths plus
@@ -440,6 +686,16 @@ fn field(item: Value, list: Option<bool>, description: Option<&str>) -> Value {
 mod tests {
     use super::*;
 
+    /// The envelope of the doc's message start event `start` (no registry),
+    /// diagnostics dropped.
+    fn derive(
+        xml: &str,
+        process_id: Option<&str>,
+    ) -> Result<Option<(String, Value)>, (String, SchemaError)> {
+        start_event_input_schema(&crate::scan_bpmn(xml), "start", process_id, &())
+            .map(|e| e.map(|e| (e.shape, e.schema)))
+    }
+
     fn shapes_doc(shapes: &str) -> String {
         doc(shapes, ENVELOPE)
     }
@@ -454,7 +710,7 @@ mod tests {
                <nano:shape id="Base"><nano:extend name="other" type="string" /></nano:shape>"#,
         );
         assert_eq!(
-            message_input_schema(&xml, "placeOrder", None),
+            derive(&xml, None),
             Err(("Order".into(), SchemaError::UnknownProjectedField))
         );
     }
@@ -468,7 +724,7 @@ mod tests {
                </nano:shape>"#,
         );
         assert_eq!(
-            message_input_schema(&xml, "placeOrder", None),
+            derive(&xml, None),
             Err(("Order".into(), SchemaError::CyclicProjection))
         );
     }
@@ -478,9 +734,7 @@ mod tests {
         let xml = shapes_doc(
             r#"<nano:shape id="Order"><nano:project ref="Customer" fields="tier" /></nano:shape>"#,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&xml, None).unwrap().unwrap();
         assert_eq!(
             schema,
             json!({ "type": "object", "properties": { "tier": {} } })
@@ -502,15 +756,14 @@ mod tests {
                     <nano:extend name="orderId" type="string" />
                   </nano:shape></nano:shapes>
                 </bpmn:extensionElements>
+                <bpmn:startEvent id="start"><bpmn:messageEventDefinition messageRef="m" /></bpmn:startEvent>
               </bpmn:process>
               <bpmn:message id="m" name="placeOrder">
                 <bpmn:extensionElements><zeebe:properties>{ENVELOPE}</zeebe:properties></bpmn:extensionElements>
               </bpmn:message>
             </bpmn:definitions>"#
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", Some("orders"))
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&xml, Some("orders")).unwrap().unwrap();
         assert_eq!(
             schema,
             json!({
@@ -540,9 +793,7 @@ mod tests {
             "</bpmn:definitions>",
             &format!("{others}</bpmn:definitions>"),
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", Some("orders"))
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&xml, Some("orders")).unwrap().unwrap();
         assert_eq!(
             schema["properties"]["f3999"]["properties"],
             json!({ "first": { "type": "string" } })
@@ -555,9 +806,7 @@ mod tests {
             r#"<nano:shape id="Order"><nano:project ref="Base" fields="a,a" /></nano:shape>
                <nano:shape id="Base"><nano:extend name="a" type="number" /></nano:shape>"#,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&xml, None).unwrap().unwrap();
         assert_eq!(
             schema,
             json!({"type":"object","properties":{"a":{"type":"number"}},"required":["a"]})
@@ -569,9 +818,7 @@ mod tests {
         let xml = shapes_doc(
             r#"<nano:shape id="Order"><nano:extend name="child" type="Order" optional="true" /></nano:shape>"#,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&xml, None).unwrap().unwrap();
         assert_eq!(
             schema,
             json!({"type":"object","properties":{"child":{"type":"object"}}})
@@ -583,9 +830,7 @@ mod tests {
         let xml = shapes_doc(
             r#"<nano:shape id="Order"><nano:extend name="a" type="string" /><nano:extend name="b" type="string" /><nano:extend name="a" type="number" /><nano:extend name="b" type="string" optional="true" /></nano:shape>"#,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&xml, None).unwrap().unwrap();
         assert_eq!(schema["required"], json!(["a"]));
     }
 
@@ -603,9 +848,7 @@ mod tests {
         for i in 0..20_000 {
             shapes.push_str(&format!(r#"<nano:shape id="E{i}"></nano:shape>"#));
         }
-        let (_, schema) = message_input_schema(&shapes_doc(&shapes), "placeOrder", None)
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&shapes_doc(&shapes), None).unwrap().unwrap();
         assert_eq!(schema["required"].as_array().unwrap().len(), 9_000);
 
         let mut wide = String::from(
@@ -615,9 +858,7 @@ mod tests {
             wide.push_str(&format!(r#"<nano:extend name="f{i}" type="string" />"#));
         }
         wide.push_str("</nano:shape>");
-        let (_, schema) = message_input_schema(&shapes_doc(&wide), "placeOrder", None)
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&shapes_doc(&wide), None).unwrap().unwrap();
         assert_eq!(schema["required"].as_array().unwrap().len(), 9_000);
     }
 
@@ -627,9 +868,7 @@ mod tests {
             r#"<nano:shape id="Order"><nano:reference name="b" ref="Base" spread="true" list="true" /></nano:shape>
                <nano:shape id="Base"><nano:extend name="a" type="number" /></nano:shape>"#,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&xml, None).unwrap().unwrap();
         assert_eq!(
             schema,
             json!({"type":"object","properties":{"a":{"type":"number"}},"required":["a"]})
@@ -651,7 +890,7 @@ mod tests {
             r#"<nano:shape id="S25"><nano:extend name="x" type="string" /></nano:shape>"#,
         );
         assert_eq!(
-            message_input_schema(&shapes_doc(&shapes), "placeOrder", None),
+            derive(&shapes_doc(&shapes), None),
             Err(("Order".into(), SchemaError::TooLarge))
         );
     }
@@ -668,7 +907,7 @@ mod tests {
             ));
         }
         assert_eq!(
-            message_input_schema(&shapes_doc(&shapes), "placeOrder", None),
+            derive(&shapes_doc(&shapes), None),
             Err(("Order".into(), SchemaError::TooDeep))
         );
     }
@@ -685,7 +924,7 @@ mod tests {
             r#"{order}<nano:shape id="Big"><nano:extend name="a" type="string" description="{big}" /></nano:shape>"#
         );
         assert_eq!(
-            message_input_schema(&shapes_doc(&shapes), "placeOrder", None),
+            derive(&shapes_doc(&shapes), None),
             Err(("Order".into(), SchemaError::TooLarge))
         );
     }
@@ -699,7 +938,7 @@ mod tests {
                <nano:shape id="Base"><nano:extend name="a" type="string" description="{big}" /></nano:shape>"#
         );
         assert_eq!(
-            message_input_schema(&shapes_doc(&shapes), "placeOrder", None),
+            derive(&shapes_doc(&shapes), None),
             Err(("Order".into(), SchemaError::TooLarge))
         );
     }
@@ -711,6 +950,7 @@ mod tests {
                 xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
               <bpmn:process id="orders">
                 <bpmn:extensionElements><nano:shapes>{shapes}</nano:shapes></bpmn:extensionElements>
+                <bpmn:startEvent id="start"><bpmn:messageEventDefinition messageRef="m" /></bpmn:startEvent>
               </bpmn:process>
               <bpmn:message id="m" name="placeOrder">
                 <bpmn:extensionElements><zeebe:properties>{message_props}</zeebe:properties></bpmn:extensionElements>
@@ -739,9 +979,7 @@ mod tests {
                </nano:shape>"#,
             ENVELOPE,
         );
-        let (id, schema) = message_input_schema(&xml, "placeOrder", Some("orders"))
-            .unwrap()
-            .unwrap();
+        let (id, schema) = derive(&xml, Some("orders")).unwrap().unwrap();
         assert_eq!(id, "Order");
         assert_eq!(
             schema,
@@ -792,9 +1030,7 @@ mod tests {
                </nano:shape>"#,
             ENVELOPE,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&xml, None).unwrap().unwrap();
         assert_eq!(
             schema,
             json!({
@@ -810,24 +1046,364 @@ mod tests {
     }
 
     #[test]
-    fn cycles_terminate_and_unresolvable_envelopes_are_none() {
+    fn cycles_terminate_and_missing_envelopes_are_none() {
         let xml = doc(
             r#"<nano:shape id="Order"><nano:reference name="self" ref="Order" /></nano:shape>"#,
             ENVELOPE,
         );
-        let (_, schema) = message_input_schema(&xml, "placeOrder", None)
-            .unwrap()
-            .unwrap();
+        let (_, schema) = derive(&xml, None).unwrap().unwrap();
         assert_eq!(
             schema["properties"]["self"],
             json!({ "type": "object" }),
             "{schema}"
         );
-        // A ref with no declared shape, no envelope, or an unknown message.
-        let xml = doc("", ENVELOPE);
-        assert_eq!(message_input_schema(&xml, "placeOrder", None), Ok(None));
+        // No envelope, or an unknown start event.
         let xml = doc(r#"<nano:shape id="Order" />"#, "");
-        assert_eq!(message_input_schema(&xml, "placeOrder", None), Ok(None));
-        assert_eq!(message_input_schema(&xml, "other", None), Ok(None));
+        assert_eq!(derive(&xml, None), Ok(None));
+        let scan = crate::scan_bpmn(&doc(r#"<nano:shape id="Order" />"#, ENVELOPE));
+        assert_eq!(
+            start_event_input_schema(&scan, "other", None, &()),
+            Ok(None)
+        );
+    }
+
+    /// Review of #1842: a registry schema deeper than MAX_DEPTH (as a root
+    /// or behind a shape ref) is TooDeep; an oversized registry root is
+    /// TooLarge, never misreported as UnresolvedEnvelope.
+    #[test]
+    fn registry_roots_and_refs_honour_depth_and_size_limits() {
+        let mut deep = json!({ "type": "string" });
+        for _ in 0..(MAX_DEPTH + 2) {
+            deep = json!({ "type": "object", "properties": { "x": deep } });
+        }
+        let root = |reg: &HashMap<String, Value>| {
+            start_event_input_schema(&crate::scan_bpmn(&doc("", ENVELOPE)), "start", None, reg)
+                .map(|o| o.map(|e| e.schema))
+        };
+        let reg = HashMap::from([("Order".to_string(), deep.clone())]);
+        assert_eq!(root(&reg), Err(("Order".into(), SchemaError::TooDeep)));
+        let xml = doc(
+            r#"<nano:shape id="Order"><nano:carry ref="Deep" /></nano:shape>"#,
+            ENVELOPE,
+        );
+        let reg = HashMap::from([("Deep".to_string(), deep)]);
+        assert_eq!(
+            start_event_input_schema(&crate::scan_bpmn(&xml), "start", None, &reg).map(|_| ()),
+            Err(("Order".into(), SchemaError::TooDeep))
+        );
+        let big = "x".repeat(MAX_EXPANDED_BYTES + 1);
+        let reg = HashMap::from([(
+            "Order".to_string(),
+            json!({ "type": "object", "properties": { big: { "type": "string" } } }),
+        )]);
+        assert_eq!(root(&reg), Err(("Order".into(), SchemaError::TooLarge)));
+    }
+
+    /// Issue #1748: an envelope ref the model does not declare (and no
+    /// registry resolves) is a hard error, never the legacy fallback.
+    #[test]
+    fn unresolved_root_envelope_is_an_error_not_a_fallback() {
+        let xml = doc("", ENVELOPE);
+        assert_eq!(
+            derive(&xml, None),
+            Err(("Order".into(), SchemaError::UnresolvedEnvelope))
+        );
+        // ...but resolves from the registry when it knows the type.
+        let registry: HashMap<String, Value> = HashMap::from([(
+            "Order".to_string(),
+            json!({ "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }),
+        )]);
+        let e = start_event_input_schema(&crate::scan_bpmn(&xml), "start", None, &registry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.schema["required"], json!(["id"]));
+        assert!(e.unresolved.is_empty());
+    }
+
+    /// Issue #1748: external refs resolve from the type registry; those it
+    /// does not know are surfaced as unresolved-contract diagnostics.
+    #[test]
+    fn external_refs_resolve_from_registry_or_are_reported() {
+        let xml = doc(
+            r#"<nano:shape id="Order">
+                 <nano:carry ref="Customer" />
+                 <nano:project ref="Product" fields="sku" />
+                 <nano:extend name="addr" type="Address" />
+                 <nano:reference name="pay" ref="Payment" />
+                 <nano:carry ref="Unknown" />
+               </nano:shape>"#,
+            ENVELOPE,
+        );
+        let obj = |p: Value, r: Value| json!({ "type": "object", "properties": p, "required": r });
+        let registry: HashMap<String, Value> = HashMap::from([
+            (
+                "Customer".to_string(),
+                obj(json!({ "email": { "type": "string" } }), json!(["email"])),
+            ),
+            (
+                "Product".to_string(),
+                obj(json!({ "sku": { "type": "string" } }), json!(["sku"])),
+            ),
+            (
+                "Address".to_string(),
+                obj(json!({ "city": { "type": "string" } }), json!(["city"])),
+            ),
+        ]);
+        let e = start_event_input_schema(&crate::scan_bpmn(&xml), "start", None, &registry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            e.schema["required"],
+            json!(["email", "sku", "addr", "pay"]),
+            "{}",
+            e.schema
+        );
+        assert_eq!(e.schema["properties"]["addr"]["required"], json!(["city"]));
+        assert_eq!(e.unresolved.len(), 2, "{:?}", e.unresolved);
+        assert!(e.unresolved[0].contains("`reference` of `Payment`"));
+        assert!(e.unresolved[1].contains("`carry` of `Unknown`"));
+        // A registry type without a projected field is an invalid projection.
+        let xml = doc(
+            r#"<nano:shape id="Order"><nano:project ref="Product" fields="nope" /></nano:shape>"#,
+            ENVELOPE,
+        );
+        assert_eq!(
+            start_event_input_schema(&crate::scan_bpmn(&xml), "start", None, &registry),
+            Err(("Order".into(), SchemaError::UnknownProjectedField))
+        );
+    }
+
+    /// Issue #1748: the envelope is selected through the start event's
+    /// `messageRef` (message id), not the message name — two messages may
+    /// share a name, or a message may have no name at all.
+    #[test]
+    fn envelope_is_resolved_by_message_ref_not_name() {
+        let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
+              <bpmn:process id="orders">
+                <bpmn:extensionElements><nano:shapes>
+                  <nano:shape id="A"><nano:extend name="a" type="string" /></nano:shape>
+                  <nano:shape id="B"><nano:extend name="b" type="string" /></nano:shape>
+                </nano:shapes></bpmn:extensionElements>
+                <bpmn:startEvent id="startA"><bpmn:messageEventDefinition messageRef="mA" /></bpmn:startEvent>
+                <bpmn:startEvent id="startB"><bpmn:messageEventDefinition messageRef="mB" /></bpmn:startEvent>
+                <bpmn:startEvent id="startC"><bpmn:messageEventDefinition messageRef="mC" /></bpmn:startEvent>
+              </bpmn:process>
+              <bpmn:message id="mA" name="shared">
+                <bpmn:extensionElements><zeebe:properties><zeebe:property name="io.nanobpm.dataEnvelope.in" value="A" /></zeebe:properties></bpmn:extensionElements>
+              </bpmn:message>
+              <bpmn:message id="mB" name="shared">
+                <bpmn:extensionElements><zeebe:properties><zeebe:property name="io.nanobpm.dataEnvelope.in" value="B" /></zeebe:properties></bpmn:extensionElements>
+              </bpmn:message>
+              <bpmn:message id="mC">
+                <bpmn:extensionElements><zeebe:properties><zeebe:property name="io.nanobpm.dataEnvelope.in" value="A" /></zeebe:properties></bpmn:extensionElements>
+              </bpmn:message>
+            </bpmn:definitions>"#;
+        let scan = crate::scan_bpmn(xml);
+        let shape = |start: &str| {
+            start_event_input_schema(&scan, start, Some("orders"), &())
+                .unwrap()
+                .map(|e| e.shape)
+        };
+        assert_eq!(shape("startA").as_deref(), Some("A"));
+        assert_eq!(shape("startB").as_deref(), Some("B"));
+        // An unnamed message (the engine falls back to its id as the name).
+        assert_eq!(shape("startC").as_deref(), Some("A"));
+    }
+
+    /// Two processes in one resource may reuse a start id; each process's
+    /// tool must resolve ITS start's message envelope, never the first
+    /// process's (element ids are unique only per process).
+    #[test]
+    fn reused_start_id_resolves_per_owning_process() {
+        let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
+              <bpmn:process id="p1">
+                <bpmn:extensionElements><nano:shapes>
+                  <nano:shape id="A"><nano:extend name="a" type="string" /></nano:shape>
+                </nano:shapes></bpmn:extensionElements>
+                <bpmn:startEvent id="start"><bpmn:messageEventDefinition messageRef="mA" /></bpmn:startEvent>
+              </bpmn:process>
+              <bpmn:process id="p2">
+                <bpmn:extensionElements><nano:shapes>
+                  <nano:shape id="B"><nano:extend name="b" type="string" /></nano:shape>
+                </nano:shapes></bpmn:extensionElements>
+                <bpmn:startEvent id="start"><bpmn:messageEventDefinition messageRef="mB" /></bpmn:startEvent>
+              </bpmn:process>
+              <bpmn:message id="mA" name="a">
+                <bpmn:extensionElements><zeebe:properties><zeebe:property name="io.nanobpm.dataEnvelope.in" value="A" /></zeebe:properties></bpmn:extensionElements>
+              </bpmn:message>
+              <bpmn:message id="mB" name="b">
+                <bpmn:extensionElements><zeebe:properties><zeebe:property name="io.nanobpm.dataEnvelope.in" value="B" /></zeebe:properties></bpmn:extensionElements>
+              </bpmn:message>
+            </bpmn:definitions>"#;
+        let scan = crate::scan_bpmn(xml);
+        let shape = |p: &str| {
+            start_event_input_schema(&scan, "start", Some(p), &())
+                .unwrap()
+                .map(|e| e.shape)
+        };
+        assert_eq!(shape("p1").as_deref(), Some("A"));
+        assert_eq!(shape("p2").as_deref(), Some("B"));
+        assert_eq!(shape("p3"), None);
+    }
+
+    /// A registry schema outside the supported subset (definitions, `$ref`s,
+    /// object-level constraints, a non-object root) is rejected — as the root
+    /// envelope and as a nested ref — never copied with its constraints or
+    /// definitions silently dropped.
+    #[test]
+    fn unsupported_registry_schemas_are_rejected() {
+        let local = |inner: &str| {
+            doc(
+                &format!(r#"<nano:shape id="Order"><nano:carry ref="{inner}" /></nano:shape>"#),
+                ENVELOPE,
+            )
+        };
+        let cases = [
+            json!({"type": "object", "$defs": {"A": {"type": "string"}},
+                   "properties": {"a": {"$ref": "#/$defs/A"}}}),
+            json!({"type": "object", "properties": {"a": {"$ref": "#/x"}}}),
+            json!({"type": "object", "additionalProperties": false,
+                   "properties": {"a": {"type": "string"}}}),
+            json!({"type": "object", "minProperties": 1}),
+            json!({"type": "string"}),
+            json!(["not", "an", "object"]),
+        ];
+        for schema in cases {
+            // As the root envelope.
+            let mut reg = HashMap::new();
+            reg.insert("Order".to_string(), schema.clone());
+            let e = start_event_input_schema(
+                &crate::scan_bpmn(&doc("", ENVELOPE)),
+                "start",
+                None,
+                &reg,
+            )
+            .map(|_| ());
+            assert_eq!(
+                e,
+                Err(("Order".into(), SchemaError::UnsupportedRegistrySchema)),
+                "root {schema}"
+            );
+            // As a nested ref of a local shape.
+            let mut reg = HashMap::new();
+            reg.insert("Ext".to_string(), schema.clone());
+            let e = start_event_input_schema(&crate::scan_bpmn(&local("Ext")), "start", None, &reg)
+                .map(|_| ());
+            assert_eq!(
+                e,
+                Err(("Order".into(), SchemaError::UnsupportedRegistrySchema)),
+                "nested {schema}"
+            );
+        }
+        // The supported subset (with annotations) still resolves.
+        let mut reg = HashMap::new();
+        reg.insert(
+            "Order".to_string(),
+            json!({"type": "object", "title": "O", "description": "d",
+                   "properties": {"a": {"type": "string", "description": "x"}},
+                   "required": ["a"]}),
+        );
+        let ok =
+            start_event_input_schema(&crate::scan_bpmn(&doc("", ENVELOPE)), "start", None, &reg)
+                .unwrap()
+                .unwrap();
+        assert_eq!(ok.schema["required"], json!(["a"]));
+    }
+
+    /// A registry schema may require a name it does not declare in
+    /// `properties`; that requirement must survive conversion (as an
+    /// unconstrained required property), for root and carried types alike.
+    #[test]
+    fn required_only_registry_fields_are_preserved() {
+        let reg: HashMap<String, Value> = HashMap::from([
+            (
+                "Order".to_string(),
+                json!({"type": "object", "properties": {}, "required": ["id"]}),
+            ),
+            (
+                "Customer".to_string(),
+                json!({"type": "object", "required": ["email"]}),
+            ),
+        ]);
+        let root =
+            start_event_input_schema(&crate::scan_bpmn(&doc("", ENVELOPE)), "start", None, &reg)
+                .unwrap()
+                .unwrap();
+        assert_eq!(root.schema["required"], json!(["id"]), "{}", root.schema);
+        assert_eq!(root.schema["properties"]["id"], json!({}));
+        let xml = doc(
+            r#"<nano:shape id="Order"><nano:carry ref="Customer" /></nano:shape>"#,
+            ENVELOPE,
+        );
+        let carried = start_event_input_schema(&crate::scan_bpmn(&xml), "start", None, &reg)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            carried.schema["required"],
+            json!(["email"]),
+            "{}",
+            carried.schema
+        );
+        assert_eq!(carried.schema["properties"]["email"], json!({}));
+        assert!(carried.unresolved.is_empty(), "{:?}", carried.unresolved);
+    }
+
+    /// A `$ref` that is data, not a schema keyword — a property literally
+    /// named `"$ref"`, or a `"$ref"` key inside an object value under
+    /// `enum` / `const` / `default` / `examples` — is not a reference, so it
+    /// stays within the supported subset.
+    #[test]
+    fn a_data_ref_is_not_an_unsupported_registry_schema() {
+        let cases = [
+            // A property literally named `$ref`.
+            json!({"type": "object",
+                   "properties": {"$ref": {"type": "string"}}}),
+            // `"$ref"` keys inside data values (enum/const/default/examples).
+            json!({"type": "object",
+                   "properties": {"a": {"type": "object",
+                                        "const": {"$ref": "#/x"},
+                                        "default": {"$ref": "#/y"},
+                                        "enum": [{"$ref": "#/z"}],
+                                        "examples": [{"$ref": "#/w"}]}}}),
+        ];
+        for schema in cases {
+            let mut reg = HashMap::new();
+            reg.insert("Order".to_string(), schema.clone());
+            let e = start_event_input_schema(
+                &crate::scan_bpmn(&doc("", ENVELOPE)),
+                "start",
+                None,
+                &reg,
+            );
+            assert!(e.is_ok(), "data $ref rejected: {schema} -> {e:?}");
+        }
+        // A real `$ref` in a schema position is still rejected, even nested
+        // under a property or a non-`properties` keyword like `items`.
+        for schema in [
+            json!({"type": "object", "properties": {"a": {"$ref": "#/x"}}}),
+            json!({"type": "object",
+                   "properties": {"a": {"type": "array", "items": {"$ref": "#/x"}}}}),
+            // A property named `$ref` whose SCHEMA holds a real `$ref`.
+            json!({"type": "object", "properties": {"$ref": {"$ref": "#/x"}}}),
+        ] {
+            let mut reg = HashMap::new();
+            reg.insert("Order".to_string(), schema.clone());
+            let e = start_event_input_schema(
+                &crate::scan_bpmn(&doc("", ENVELOPE)),
+                "start",
+                None,
+                &reg,
+            )
+            .map(|_| ());
+            assert_eq!(
+                e,
+                Err(("Order".into(), SchemaError::UnsupportedRegistrySchema)),
+                "schema-position $ref accepted: {schema}"
+            );
+        }
     }
 }

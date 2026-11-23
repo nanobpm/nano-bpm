@@ -118,6 +118,60 @@ pub struct BpmnScan {
     pub shapes: Vec<ShapeDecl>,
     pub meta: Vec<MetaDecl>,
     pub starts: Vec<StartIo>,
+    /// Every `bpmn:message` by its **id** (the identity a start event's
+    /// `messageRef` points at), with its own input envelope — unlike
+    /// [`messages`](Self::messages), never merged by name (issue #1748).
+    pub message_defs: Vec<MessageDef>,
+    /// Every process-level message start event with its `messageRef`, so a
+    /// subscription's envelope is resolved by message id (issue #1748).
+    pub message_starts: Vec<MessageStart>,
+}
+
+/// A `bpmn:message` keyed by its document-unique `id` and the input envelope
+/// it carries (`io.nanobpm.dataEnvelope.in`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageDef {
+    pub id: String,
+    pub input_type: Option<String>,
+}
+
+/// A process-level message start event: its element `id` and the `messageRef`
+/// of its `messageEventDefinition`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageStart {
+    /// The owning process's id: element ids are unique only per process, so
+    /// two processes in one resource may reuse a start id.
+    pub process: Option<String>,
+    pub element_id: String,
+    pub message_ref: String,
+}
+
+impl BpmnScan {
+    /// The input envelope ref of the message start event `start_element_id`:
+    /// follows the start event's `messageRef` to the `bpmn:message` **id**
+    /// (never the — possibly evaluated, fallen-back or shared — subscription
+    /// message name). `None` when the start event, its message, or the
+    /// message's envelope is absent.
+    ///
+    /// `process_id` scopes the lookup to the owning process (element ids are
+    /// unique only per process, so a resource with several processes may
+    /// reuse a start id); with `Some`, a start owned by another process never
+    /// matches. `None` takes the first start with that id.
+    pub fn start_message_envelope(
+        &self,
+        start_element_id: &str,
+        process_id: Option<&str>,
+    ) -> Option<&str> {
+        let start = self.message_starts.iter().find(|s| {
+            s.element_id == start_element_id
+                && process_id.is_none_or(|p| s.process.as_deref() == Some(p))
+        })?;
+        self.message_defs
+            .iter()
+            .find(|m| m.id == start.message_ref)?
+            .input_type
+            .as_deref()
+    }
 }
 
 /// One composition operation of a `nano:shape`, in author (XML) order. Serializes
@@ -210,6 +264,10 @@ struct Accum {
     /// start (an envelope carrier); any definition = a typed start whose
     /// envelope lives elsewhere (a message start's on the `bpmn:message`).
     event_defs: usize,
+    /// The carrier element's own `id` (messages and start events).
+    elem_id: Option<String>,
+    /// A start event's `messageEventDefinition` `messageRef`.
+    message_ref: Option<String>,
 }
 
 impl Accum {
@@ -222,6 +280,8 @@ impl Accum {
             header_keys: Vec::new(),
             header_seen: HashSet::new(),
             event_defs: 0,
+            elem_id: None,
+            message_ref: None,
         }
     }
 }
@@ -279,6 +339,8 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
     let mut workers: BTreeMap<String, WorkerIo> = BTreeMap::new();
     let mut messages: BTreeMap<String, MessageIo> = BTreeMap::new();
     let mut starts: BTreeMap<String, StartIo> = BTreeMap::new();
+    let mut message_defs: Vec<MessageDef> = Vec::new();
+    let mut message_starts: Vec<MessageStart> = Vec::new();
 
     // Depth of the currently-open carrier's start tag; `None` when not inside one.
     // Sub-elements (`extensionElements`, `zeebe:taskDefinition`, `zeebe:properties`,
@@ -364,8 +426,10 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         // self-closing `<bpmn:message name=.. />` carries no
                         // envelope, but its name still completes the `MessageName`
                         // union (ADR 0040 slice 2), so flush it straight away.
-                        let acc = Accum::new(Kind::Message, message_name(attr(attrs, "name")));
+                        let mut acc = Accum::new(Kind::Message, message_name(attr(attrs, "name")));
+                        acc.elem_id = envelope_ref(attr(attrs, "id"));
                         if *self_closing {
+                            record_ids(&acc, &mut message_defs, &mut message_starts);
                             flush(
                                 &mut workers,
                                 &mut worker_seen,
@@ -384,9 +448,11 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         // it — so the accumulator stays open and `flush` decides.
                         // A self-closing `<startEvent/>` has no children, so it is
                         // a none start by construction: flush it straight away.
-                        let acc =
+                        let mut acc =
                             Accum::new(Kind::Start, process_id.as_deref().map(str::to_string));
+                        acc.elem_id = envelope_ref(attr(attrs, "id"));
                         if *self_closing {
+                            record_ids(&acc, &mut message_defs, &mut message_starts);
                             flush(
                                 &mut workers,
                                 &mut worker_seen,
@@ -411,6 +477,9 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                             && ln.ends_with(EVENT_DEFINITION_SUFFIX) =>
                         {
                             acc.event_defs += 1;
+                            if ln == "messageEventDefinition" {
+                                acc.message_ref = envelope_ref(attr(attrs, "messageRef"));
+                            }
                         }
                         "property" if in_zeebe_ns && parent_is("properties") => {
                             match attr(attrs, "name") {
@@ -498,6 +567,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                 depth = depth.saturating_sub(1);
                 if let Some((open_depth, acc)) = cur.take() {
                     if depth == open_depth {
+                        record_ids(&acc, &mut message_defs, &mut message_starts);
                         flush(
                             &mut workers,
                             &mut worker_seen,
@@ -529,6 +599,35 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
         shapes,
         meta,
         starts: starts.into_values().collect(),
+        message_defs,
+        message_starts,
+    }
+}
+
+/// Record a closed message / message-start carrier by element id (issue
+/// #1748): a message by its `id` with its own envelope, a start event with
+/// a `messageEventDefinition` by its `id` and `messageRef`.
+fn record_ids(acc: &Accum, defs: &mut Vec<MessageDef>, starts: &mut Vec<MessageStart>) {
+    let Some(id) = acc.elem_id.clone() else {
+        return;
+    };
+    match acc.kind {
+        Kind::Message => defs.push(MessageDef {
+            id,
+            input_type: acc.input_type.clone(),
+        }),
+        Kind::Start => {
+            // Keyed on `messageRef` alone, as the engine selects a message
+            // start: extra (vendor / inert) event definitions don't hide it.
+            if let Some(message_ref) = acc.message_ref.clone() {
+                starts.push(MessageStart {
+                    process: acc.key.clone(),
+                    element_id: id,
+                    message_ref,
+                });
+            }
+        }
+        Kind::Worker => {}
     }
 }
 
@@ -790,6 +889,10 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
         shapes,
         meta,
         starts: starts.into_values().collect(),
+        // Element ids are document-scoped, so the id-keyed message maps of
+        // single-document resolution are not merged across files.
+        message_defs: Vec::new(),
+        message_starts: Vec::new(),
     }
 }
 
@@ -1409,6 +1512,33 @@ mod tests {
                 output_type: None,
             }]
         );
+    }
+
+    /// Review of #1842: extra (vendor or inert) event definitions beside a
+    /// `messageEventDefinition` do not hide the message start's envelope.
+    #[test]
+    fn message_start_with_extra_event_definitions_keeps_its_envelope() {
+        for extra in [
+            "<bpmn:terminateEventDefinition />",
+            "<zeebe:customEventDefinition />",
+        ] {
+            let body = format!(
+                "{}<bpmn:process id=\"p\">{}</bpmn:process>",
+                message("orderPlaced", IN_ORDER),
+                start_event(
+                    "s",
+                    &format!(
+                        "{extra}<bpmn:messageEventDefinition messageRef=\"Msg_orderPlaced\" />"
+                    ),
+                ),
+            );
+            let scan = scan_bpmn(&defs(&body));
+            assert_eq!(
+                scan.start_message_envelope("s", Some("p")),
+                Some("Order"),
+                "{extra}"
+            );
+        }
     }
 
     #[test]
