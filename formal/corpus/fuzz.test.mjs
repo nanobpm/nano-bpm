@@ -27,6 +27,7 @@ import {
   loadCorpus,
   caseRecord,
   unexplained,
+  knownKey,
   MAX_GATEWAYS,
   issueBody,
   corpusIdentity,
@@ -137,9 +138,18 @@ test('randomSkeleton: never generates a gateway kind outside the requested vocab
 })
 
 test('unexplained: a replay divergence no open case explains is surfaced', () => {
-  const divs = [{ signature: 'a' }, { signature: 'b' }]
-  assert.deepEqual(unexplained(divs, new Set(['a'])).map((d) => d.signature), ['b'])
-  assert.deepEqual(unexplained(divs, new Set(['a', 'b'])), [])
+  const d = (signature, key) => ({ signature, entry: { graph: { key } } })
+  const keys = new Set([knownKey('a', 'g1')])
+  // A divergence on the open case's own graph is explained...
+  assert.deepEqual(unexplained([d('a', 'g1')], keys), [])
+  // ...but the SAME signature on any other graph is a distinct defect: a
+  // field-based signature must never suppress a whole class across graphs.
+  assert.deepEqual(unexplained([d('a', 'g2')], keys).map((x) => x.entry.graph.key), ['g2'])
+  assert.deepEqual(unexplained([d('a', 'g1'), d('a', 'g2'), d('b', 'g1')], keys).map((x) => [x.signature, x.entry.graph.key]), [['a', 'g2'], ['b', 'g1']])
+  // Two open cases sharing one signature explain only their own graphs each.
+  const shared = new Set([knownKey('a', 'g1'), knownKey('a', 'g2')])
+  assert.deepEqual(unexplained([d('a', 'g1'), d('a', 'g2')], shared), [])
+  assert.deepEqual(unexplained([d('a', 'g3')], shared).map((x) => x.entry.graph.key), ['g3'])
 })
 
 test('shrinkGraph: the result is 1-minimal for the divergence predicate', async () => {
