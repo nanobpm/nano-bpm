@@ -276,6 +276,31 @@ async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
     {
         return hit;
     }
+    // Single-flight the probe per binary (#1329): a cold-cache burst must not
+    // spawn N concurrent `urban --help` processes ahead of the data-gateway
+    // limiter's bounded admission. Probes of the same binary serialize on its
+    // lock and re-check the cache, so at most one probe per binary is alive and
+    // later callers read the result the first one cached. Distinct from the
+    // gateway limiter, so a probe never consumes (or double-acquires) a slot.
+    static PROBES: OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    > = OnceLock::new();
+    let probe_lock = PROBES
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(urban.to_path_buf())
+        .or_default()
+        .clone();
+    let _probe = probe_lock.lock().await;
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(urban)
+        .cloned()
+    {
+        return hit;
+    }
     let help = match urban_help_output(urban).await {
         UrbanHelpOutput::Success { stdout, stderr } => {
             let mut help = String::from_utf8_lossy(&stdout).into_owned();
@@ -707,6 +732,31 @@ urban — build and run Urban apps (nano.app.json)
             "a successful --help exposing the marker must be read as capable"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1329: a cold-cache burst must not fan out N concurrent `urban --help`
+    /// probes — probes are single-flighted so at most one runs at a time and the
+    /// rest read the cached result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn urban_help_probe_is_single_flight_on_cold_cache() {
+        let dir = urban_help_scratch("urban-help-burst");
+        let stub = dir.join("urban-burst");
+        let log = dir.join("probes.log");
+        write_probe_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\necho x >> '{}'\nsleep 0.3\nprintf 'urban data\\n'\n",
+                log.display()
+            ),
+        );
+        let probes: Vec<_> = (0..8).map(|_| urban_help_text(&stub)).collect();
+        for help in futures_util::future::join_all(probes).await {
+            assert!(help.is_some(), "every caller sees the probed help");
+        }
+        let runs = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(runs, 1, "cold-cache burst must spawn exactly one probe");
         std::fs::remove_dir_all(&dir).ok();
     }
 

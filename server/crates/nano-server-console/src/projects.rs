@@ -4068,12 +4068,12 @@ async fn pipe_data_gateway_limited(
             // whole tree and wait for the leader before releasing the slot —
             // the same cleanup the timeout arm performs.
             tree.kill(&mut child, &_permit).await;
-            let _ = child.wait().await;
+            reap_gateway_bounded(&mut child, GATEWAY_REAP_GRACE).await;
             return Err(e);
         }
         Err(_) => {
             tree.kill(&mut child, &_permit).await;
-            let _ = child.wait().await;
+            reap_gateway_bounded(&mut child, GATEWAY_REAP_GRACE).await;
             return Err(DataError::Gateway(format!(
                 "data gateway timed out after {:?}",
                 limiter.timeout
@@ -4115,17 +4115,53 @@ impl GatewayTreeGuard {
         kill_group_by_pid(pid);
         #[cfg(windows)]
         {
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = std::process::Command::new("taskkill")
+            let killed = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("taskkill")
                     .args(["/F", "/T", "/PID", &pid.to_string()])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .status();
+                    .status()
             })
             .await;
+            let ok = matches!(&killed, Ok(Ok(st)) if st.success());
+            if !ok {
+                // taskkill missing from PATH or failed: fall back to
+                // terminating the direct child so the bounded reap that
+                // follows can still release the slot (#1329).
+                tracing::warn!(
+                    pid,
+                    ?killed,
+                    "data gateway: taskkill /T failed; falling back to direct-child kill"
+                );
+                let _ = _child.start_kill();
+            }
         }
         let _ = pid;
     }
+}
+
+/// Upper bound on reaping a gateway leader after its tree was killed (#1329).
+const GATEWAY_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Reap `child` after a tree kill, but never wait longer than `grace`: if tree
+/// termination failed (e.g. Windows `taskkill` unavailable) an unbounded
+/// `wait()` would pin the limiter slot forever. On expiry, force-kill the
+/// direct child, log the cleanup failure and return so the slot is released.
+/// Returns whether the child was reaped within `grace`.
+async fn reap_gateway_bounded(
+    child: &mut tokio::process::Child,
+    grace: std::time::Duration,
+) -> bool {
+    if tokio::time::timeout(grace, child.wait()).await.is_ok() {
+        return true;
+    }
+    let _ = child.start_kill();
+    tracing::error!(
+        pid = ?child.id(),
+        ?grace,
+        "data gateway: process did not exit after tree kill; releasing its slot"
+    );
+    false
 }
 
 impl Drop for GatewayTreeGuard {
@@ -12466,6 +12502,23 @@ mod tests {
         pipe_data_gateway_limited(&limiter, cmd, &req)
             .await
             .expect("limiter recovers after the burst");
+    }
+
+    /// #1329: reaping after a tree kill is bounded — a child that survives
+    /// (cleanup failed) must not pin the slot via an unbounded `wait()`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_gateway_bounded_gives_up_after_grace() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let reaped = reap_gateway_bounded(&mut child, std::time::Duration::from_millis(150)).await;
+        assert!(!reaped, "a surviving child is reported as not reaped");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        let _ = child.wait().await;
     }
 
     /// #1329: a hung gateway child must not hold its limiter slot forever —
