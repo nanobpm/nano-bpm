@@ -335,25 +335,28 @@ impl Engine {
             if !seen.insert(instance_key) {
                 continue;
             }
-            if let Some(job_keys) = self.state.jobs_by_instance.get(&instance_key) {
-                for &job_key in job_keys {
-                    if let Some(job) = self.state.jobs.get(&job_key) {
-                        if job.state == state::JobState::Activated
-                            && job.lease_token.is_none()
-                            && !job.durable_activation
-                            && !self.job_requires_durable_activation(job_key)
-                        {
-                            if let Some(deadline) = job.deadline {
-                                deadlines.insert(job_key, deadline);
-                            }
-                        }
-                    }
-                }
-            }
             if let Some(children) = self.state.children_by_parent.get(&instance_key) {
                 roots.extend(children.iter().copied());
             }
             roots.extend(cold.children_of(instance_key));
+        }
+        // Scan only live activations, not each instance's retained job
+        // history (completed/canceled jobs stay in `jobs_by_instance` until
+        // eviction), so a long-running looping instance does not make every
+        // proposal quadratic (#1856 review).
+        for &job_key in &self.state.activated_jobs {
+            if let Some(job) = self.state.jobs.get(&job_key) {
+                if seen.contains(&job.instance_key)
+                    && job.state == state::JobState::Activated
+                    && job.lease_token.is_none()
+                    && !job.durable_activation
+                    && !self.job_requires_durable_activation(job_key)
+                {
+                    if let Some(deadline) = job.deadline {
+                        deadlines.insert(job_key, deadline);
+                    }
+                }
+            }
         }
         deadlines
     }
