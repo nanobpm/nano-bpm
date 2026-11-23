@@ -2592,16 +2592,11 @@ impl Journal {
         let Some(cold) = self.cold.as_ref() else {
             return Ok(());
         };
-        let mut targets: Vec<Key> = Vec::new();
+        // Key-targeted routing (single source shared with proposal-time
+        // deadline stamping, #1856 review); the batch commands below page in
+        // on their own terms.
+        let targets = cold.index.command_targets(command);
         match command {
-            Command::CompleteJob { job_key, .. }
-            | Command::FailJob { job_key, .. }
-            | Command::ThrowJobError { job_key, .. }
-            | Command::UpdateJobRetries { job_key, .. }
-            | Command::UpdateJobTimeout { job_key, .. }
-            | Command::UpdateJob { job_key, .. } => {
-                targets.extend(cold.index.instance_for_job(*job_key));
-            }
             // Opportunistic batch commands (#1388): locally, an unreadable
             // candidate must not fail the whole poll/tick closed (that would
             // let one bad row starve every healthy job or timer). Rehydrate
@@ -2618,55 +2613,6 @@ impl Journal {
                 }
                 self.rehydrate_activation_candidates(&job_type, max_jobs);
                 return Ok(());
-            }
-            Command::ActivateJobsByKey { job_keys, .. } => {
-                targets.extend(
-                    job_keys
-                        .iter()
-                        .filter_map(|key| cold.index.instance_for_job(*key)),
-                );
-            }
-            Command::AssignUserTask { user_task_key, .. }
-            | Command::UnassignUserTask { user_task_key }
-            | Command::UpdateUserTask { user_task_key, .. }
-            | Command::CompleteUserTask { user_task_key, .. } => {
-                targets.extend(cold.index.instance_for_user_task(*user_task_key));
-            }
-            Command::ResolveIncident { incident_key, .. } => {
-                targets.extend(cold.index.instance_for_incident(*incident_key));
-            }
-            Command::SetVariables { scope_key, .. } => {
-                // The scope may be the instance root or one of its active
-                // element-instance (token) scopes; both can address a cold
-                // instance and must page it back in before the update applies.
-                if cold.index.contains(*scope_key) {
-                    targets.push(*scope_key);
-                } else {
-                    targets.extend(cold.index.instance_for_scope(*scope_key));
-                }
-            }
-            Command::CancelInstance { instance_key } => {
-                if cold.index.contains(*instance_key) {
-                    targets.push(*instance_key);
-                }
-            }
-            Command::ModifyInstance { instance_key, .. }
-            | Command::MigrateInstance { instance_key, .. } => {
-                // Modify/migrate address a single instance (activating/terminating its
-                // element instances); page it in before the command applies.
-                if cold.index.contains(*instance_key) {
-                    targets.push(*instance_key);
-                }
-            }
-            Command::CorrelateMessage {
-                message_name,
-                correlation_key,
-                ..
-            } => {
-                targets.extend(
-                    cold.index
-                        .instances_for_message(message_name, correlation_key),
-                );
             }
             Command::TriggerTimers { now } => {
                 let strict = self.strict_cold_reads();
@@ -2707,6 +2653,19 @@ impl Journal {
         match unavailable {
             Some(instance_key) => Err(EngineError::InstanceUnavailable { instance_key }),
             None => Ok(()),
+        }
+    }
+
+    /// The proposer-side soft-job deadline resolution for `command` (#1570),
+    /// walking the call-activity tree through this journal's cold tier too, so
+    /// a cold intermediate (or a cold instance the command addresses) cannot
+    /// hide a resident soft job from the stamp (#1856 review).
+    pub fn resolve_cascade_terminal_deadlines(&self, command: &Command) -> BTreeMap<Key, u64> {
+        match self.cold.as_ref() {
+            Some(cold) => self
+                .engine
+                .resolve_cascade_terminal_deadlines_with(command, &cold.index),
+            None => self.engine.resolve_cascade_terminal_deadlines(command),
         }
     }
 
@@ -5964,6 +5923,76 @@ mod tests {
             .apply_command(Command::create_instance("demo"))
             .unwrap();
         events.iter().find_map(|e| e.instance_key()).unwrap()
+    }
+
+    /// #1856 review: a cold call-activity intermediate must not hide resident
+    /// soft jobs from proposal-time deadline stamping — neither the leaf below
+    /// it (descent from a cancelled top) nor the top above it (ascent from a
+    /// completed leaf job).
+    #[test]
+    fn cascade_deadline_stamping_walks_through_a_cold_intermediate() {
+        let leaf = ProcessBuilder::new("cold_leaf")
+            .start_event("ls")
+            .service_task("lt", "leaf_work")
+            .end_event("le")
+            .connect("ls", "lt")
+            .connect("lt", "le")
+            .build()
+            .unwrap();
+        let mid = ProcessBuilder::new("cold_mid")
+            .start_event("ms")
+            .call_activity("mcall", "cold_leaf")
+            .end_event("me")
+            .connect("ms", "mcall")
+            .connect("mcall", "me")
+            .build()
+            .unwrap();
+        let top = ProcessBuilder::new("cold_top")
+            .start_event("ts")
+            .parallel_gateway("fork")
+            .call_activity("tcall", "cold_mid")
+            .service_task("tt", "top_work")
+            .terminate_end_event("term")
+            .end_event("te")
+            .connect("ts", "fork")
+            .connect("fork", "tcall")
+            .connect("fork", "tt")
+            .connect("tcall", "term")
+            .connect("tt", "te")
+            .build()
+            .unwrap();
+        let mut journal = cold_journal();
+        for p in [leaf, mid, top] {
+            let _ = journal.apply_command(Command::DeployProcess(p)).unwrap();
+        }
+        let _ = journal
+            .apply_command(Command::create_instance("cold_top"))
+            .unwrap();
+        let key_of = |j: &Journal, id: &str| {
+            j.engine()
+                .state()
+                .instances
+                .values()
+                .find(|i| i.process_id == id)
+                .unwrap()
+                .key
+        };
+        let top_key = key_of(&journal, "cold_top");
+        let mid_key = key_of(&journal, "cold_mid");
+        let top_job = journal.activate_jobs("top_work", "w", 1, 7_000, 100)[0].key;
+        let leaf_job = journal.activate_jobs("leaf_work", "w", 1, 3_000, 100)[0].key;
+        // Only `mid` is dormant (top and leaf hold activation locks).
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert!(journal.instance(mid_key).is_none(), "mid is cold");
+
+        let cancel_top = Command::CancelInstance {
+            instance_key: top_key,
+        };
+        let down = journal.resolve_cascade_terminal_deadlines(&cancel_top);
+        assert_eq!(down.get(&leaf_job), Some(&3_100));
+        assert_eq!(down.get(&top_job), Some(&7_100));
+        let up = journal.resolve_cascade_terminal_deadlines(&Command::complete_job(leaf_job));
+        assert_eq!(up.get(&top_job), Some(&7_100));
     }
 
     #[test]

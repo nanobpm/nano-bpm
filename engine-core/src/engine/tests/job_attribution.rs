@@ -895,3 +895,152 @@ fn a_rejected_envelope_stamped_command_does_not_leak_its_deadlines() {
     assert_eq!(on_leader, on_follower);
     assert_eq!(terminal_deadline(&on_leader, job_key), Some(None));
 }
+
+/// #1856 review: the debug entrypoint shares the planner with the production
+/// path, so a REJECTED stamped debug command must not leave its deadline stamp
+/// behind for a later unstamped debug cancel (the debug path used to bypass
+/// the per-command scratch cleanup in `apply_command_events`).
+#[test]
+fn a_rejected_stamped_debug_command_does_not_leak_its_deadline() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.pending_jobs()[0].key;
+    let mut bad = Command::complete_job(job_key);
+    if let Command::CompleteJob { attribution, .. } = &mut bad {
+        *attribution = Some(JobAttribution {
+            worker: None,
+            deadline: Some(999),
+        });
+    }
+    // Strict engine: completing a never-activated job rejects after stamping.
+    assert!(engine.debug_command_at(bad, 0, Vec::new()).is_err());
+    let instance_key = engine.state().jobs[&job_key].instance_key;
+    let session = engine
+        .debug_command_at(Command::CancelInstance { instance_key }, 0, Vec::new())
+        .unwrap();
+    assert_eq!(terminal_deadline(session.log(), job_key), Some(None));
+}
+
+/// #1856 review: a debug run that runs to completion clears its per-command
+/// stamps, so nothing can leak into a later command.
+#[test]
+fn a_finished_debug_run_clears_its_deadline_stamps() {
+    let (mut leader, _follower, job_key) = leader_and_follower("W");
+    let mut stamped = Command::complete_job(job_key);
+    leader.stamp_terminal_attribution(&mut stamped);
+    let session = leader.debug_command_at(stamped, 0, Vec::new()).unwrap();
+    assert!(!session.is_paused());
+    assert!(leader.terminal_deadline_stamps.is_empty());
+}
+
+/// A three-level call-activity tree (`top` → `mid` → `leaf`) with a soft job on
+/// `top`'s other branch and one in `leaf`, then `mid` spilled cold exactly as a
+/// host's cold tier does (`snapshot_instance`).
+fn tree_with_cold_intermediate() -> (Engine, Key, Key, Key, Key) {
+    let leaf = ProcessBuilder::new("cold_leaf")
+        .start_event("ls")
+        .service_task("lt", "leaf_work")
+        .end_event("le")
+        .connect("ls", "lt")
+        .connect("lt", "le")
+        .build()
+        .unwrap();
+    let mid = ProcessBuilder::new("cold_mid")
+        .start_event("ms")
+        .call_activity("mcall", "cold_leaf")
+        .end_event("me")
+        .connect("ms", "mcall")
+        .connect("mcall", "me")
+        .build()
+        .unwrap();
+    let top = ProcessBuilder::new("cold_top")
+        .start_event("ts")
+        .parallel_gateway("fork")
+        .call_activity("tcall", "cold_mid")
+        .service_task("tt", "top_work")
+        .terminate_end_event("term")
+        .end_event("te")
+        .connect("ts", "fork")
+        .connect("fork", "tcall")
+        .connect("fork", "tt")
+        .connect("tcall", "term")
+        .connect("tt", "te")
+        .build()
+        .unwrap();
+    let mut e = Engine::new();
+    e.apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
+    for p in [leaf, mid, top] {
+        e.apply_command(Command::DeployProcess(p)).unwrap();
+    }
+    e.apply_command(Command::create_instance("cold_top"))
+        .unwrap();
+    let key_of = |e: &Engine, id: &str| {
+        e.state()
+            .instances
+            .values()
+            .find(|i| i.process_id == id)
+            .unwrap()
+            .key
+    };
+    let (top_key, mid_key) = (key_of(&e, "cold_top"), key_of(&e, "cold_mid"));
+    let top_job = e.activate_jobs("top_work", "w", 1, 7_000, 100)[0].key;
+    let leaf_job = e.activate_jobs("leaf_work", "w", 1, 3_000, 100)[0].key;
+    assert!(e.snapshot_instance(mid_key).is_some(), "mid spills cold");
+    assert!(!e.state().instances.contains_key(&mid_key));
+    (e, top_key, mid_key, top_job, leaf_job)
+}
+
+/// The host's cold tier for [`tree_with_cold_intermediate`]: `mid` is cold.
+struct OneColdLink {
+    parent: Key,
+    child: Key,
+}
+
+impl ColdTopology for OneColdLink {
+    fn parent_of(&self, key: Key) -> Option<Key> {
+        (key == self.child).then_some(self.parent)
+    }
+
+    fn children_of(&self, parent: Key) -> Vec<Key> {
+        if parent == self.parent {
+            vec![self.child]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// #1856 review: a cold call-activity intermediate must not hide the soft
+/// jobs below it (descent) or above it (ascent) from the deadline resolver.
+#[test]
+fn cascade_deadlines_walk_through_a_cold_intermediate() {
+    let (e, top_key, mid_key, top_job, leaf_job) = tree_with_cold_intermediate();
+    let cold = OneColdLink {
+        parent: top_key,
+        child: mid_key,
+    };
+    // Descent: cancelling `top` reaches `leaf` only through cold `mid`.
+    let down = e.resolve_cascade_terminal_deadlines_with(
+        &Command::CancelInstance {
+            instance_key: top_key,
+        },
+        &cold,
+    );
+    assert_eq!(down.get(&leaf_job), Some(&3_100));
+    assert_eq!(down.get(&top_job), Some(&7_100));
+    // Ascent: completing `leaf`'s job reaches `top` only through cold `mid`.
+    let up = e.resolve_cascade_terminal_deadlines_with(&Command::complete_job(leaf_job), &cold);
+    assert_eq!(up.get(&top_job), Some(&7_100));
+    // Without the cold topology the resident-only walk misses them — the gap
+    // the `_with` variant closes for hosts with a cold tier.
+    let resident_only = e.resolve_cascade_terminal_deadlines(&Command::CancelInstance {
+        instance_key: top_key,
+    });
+    assert_eq!(resident_only.get(&leaf_job), None);
+}

@@ -2584,21 +2584,18 @@ impl Engine {
         // `CancelInstance`). Cleared on every exit so neither a reference nor
         // a deadline stamp can ever leak into a later command.
         self.operation_reference = operation_reference;
-        self.terminal_deadline_stamps.clear();
-        if let Some(stamps) = terminal_deadlines {
-            self.terminal_deadline_stamps
-                .extend(stamps.iter().map(|(&k, &v)| (k, v)));
-        }
-        let result = self.plan_command_at(command, now).map(|(mut log, queue)| {
-            self.run(&mut log, queue);
-            self.cascade_cancel_children(&mut log, 0);
-            self.finish_command(&log);
-            // Every engine test exercises the parent -> children index the
-            // cascade reads (#1827): a write path that bypassed it fails here.
-            #[cfg(test)]
-            self.state.assert_children_index_covers_instances();
-            log
-        });
+        let result =
+            self.plan_command_at(command, now, terminal_deadlines)
+                .map(|(mut log, queue)| {
+                    self.run(&mut log, queue);
+                    self.cascade_cancel_children(&mut log, 0);
+                    self.finish_command(&log);
+                    // Every engine test exercises the parent -> children index the
+                    // cascade reads (#1827): a write path that bypassed it fails here.
+                    #[cfg(test)]
+                    self.state.assert_children_index_covers_instances();
+                    log
+                });
         self.operation_reference = None;
         self.terminal_deadline_stamps.clear();
         result
@@ -2634,11 +2631,23 @@ impl Engine {
     /// drives, without running it. Splitting planning from driving is what makes
     /// stepping possible: the production path calls `run` on the queue, the
     /// debugger drives it one step at a time. `now` stamps timestamped events.
+    ///
+    /// `terminal_deadlines` are the envelope stamps (#1570). Arming them here —
+    /// the single entry point shared by the production and debug paths — and
+    /// clearing first means no caller can plan a command that inherits a
+    /// previous command's stamps (#1856 review: the debug path used to bypass
+    /// the cleanup).
     fn plan_command_at(
         &mut self,
         command: Command,
         now: u64,
+        terminal_deadlines: Option<&BTreeMap<Key, u64>>,
     ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
+        self.terminal_deadline_stamps.clear();
+        if let Some(stamps) = terminal_deadlines {
+            self.terminal_deadline_stamps
+                .extend(stamps.iter().map(|(&k, &v)| (k, v)));
+        }
         self.now = now;
         // Seed the FEEL environment from replicated inputs only (#1642), never
         // a wall clock or process-local entropy. The seed is a PURE function of
@@ -20477,6 +20486,37 @@ impl EngineError {
             | EngineError::AgentInstanceAlreadyCompleted { .. }
             | EngineError::AgentInstanceLimitExceeded { .. } => false,
         }
+    }
+}
+
+/// The call-activity links of instances a host has spilled out of the engine
+/// to a cold tier (#1856 review). The engine's own indices only cover resident
+/// instances, so walks that must cross a cold instance (e.g.
+/// [`Engine::resolve_cascade_terminal_deadlines_with`]) consult this.
+pub trait ColdTopology {
+    /// The calling parent of the COLD instance `key` (`None` if `key` is not
+    /// cold or is top-level).
+    fn parent_of(&self, key: Key) -> Option<Key>;
+    /// The COLD call-activity children of `parent` (itself resident or cold).
+    fn children_of(&self, parent: Key) -> Vec<Key>;
+    /// The COLD instances `command` addresses directly (by job, user task,
+    /// incident, scope, instance key, message correlation or due timer) —
+    /// cascade roots the engine's resident indices cannot see.
+    fn command_roots(&self, _command: &Command) -> Vec<Key> {
+        Vec::new()
+    }
+}
+
+/// A [`ColdTopology`] for an engine without a cold tier.
+pub struct NoColdTopology;
+
+impl ColdTopology for NoColdTopology {
+    fn parent_of(&self, _key: Key) -> Option<Key> {
+        None
+    }
+
+    fn children_of(&self, _parent: Key) -> Vec<Key> {
+        Vec::new()
     }
 }
 

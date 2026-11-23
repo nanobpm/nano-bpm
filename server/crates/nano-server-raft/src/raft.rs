@@ -118,6 +118,37 @@ pub struct ReplicatedCommand {
     pub terminal_deadlines: std::collections::BTreeMap<nanobpmn_engine_core::Key, u64>,
 }
 
+/// Serialized-size estimate of one `terminal_deadlines` entry: a JSON
+/// `"<key>":<deadline>,` pair with both numbers at full `u64` width (#1856
+/// review). Deliberately an upper bound so batch accounting never undercounts.
+const TERMINAL_DEADLINE_ENTRY_BYTES: u64 = 44;
+
+/// Fixed overhead of a non-empty map: `,"terminal_deadlines":{}`.
+const TERMINAL_DEADLINES_FIELD_BYTES: u64 = 24;
+
+impl ReplicatedCommand {
+    /// Approximate serialized size of the whole replicated item — the command
+    /// AND its envelope metadata. The single size estimate the propose batcher
+    /// uses for `NANOBPMN_RAFT_MAX_ENTRY_BYTES` accounting, so a cascade that
+    /// stamps every soft job of a large instance tree is counted (#1856 review).
+    pub fn approx_bytes(&self) -> u64 {
+        let stamps = match self.terminal_deadlines.len() as u64 {
+            0 => 0,
+            n => TERMINAL_DEADLINES_FIELD_BYTES + n * TERMINAL_DEADLINE_ENTRY_BYTES,
+        };
+        self.command.approx_bytes() + stamps
+    }
+
+    /// Drops the envelope deadline stamps (#1856 review): emitted only while
+    /// every member advertises
+    /// [`FEATURE_TERMINAL_DEADLINES`](nano_falcon_protocol::cluster_join::FEATURE_TERMINAL_DEADLINES),
+    /// because a pre-#1570 replica would silently ignore them and record
+    /// `deadline: None` where upgraded replicas record `Some`.
+    fn strip_terminal_deadlines(&mut self) {
+        self.terminal_deadlines.clear();
+    }
+}
+
 /// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
 /// `operation_reference` out of the command body (see the type docs).
 #[derive(Deserialize)]
@@ -1593,8 +1624,14 @@ impl PartitionStateMachine {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        // A process-wide sequence makes the name unique by construction: the
+        // wall clock alone collides on hosts with microsecond resolution
+        // (macOS), so two members created in the same tick shared — and one's
+        // cleanup deleted — the other's snapshot dir.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "{RAFT_SNAPSHOT_DIR_PREFIX}{}-p{partition_id}-{nanos}",
+            "{RAFT_SNAPSHOT_DIR_PREFIX}{}-p{partition_id}-{nanos}-{seq}",
             std::process::id()
         ))
     }
@@ -3588,7 +3625,7 @@ impl Batcher {
                 // entry remains shippable in one AppendEntries within the RPC
                 // timeout. The first command is always included, so a lone command
                 // larger than the budget still makes progress.
-                let mut batch_bytes = first.item.command.approx_bytes();
+                let mut batch_bytes = first.item.approx_bytes();
                 let mut subs = vec![first];
                 // Drain ALL pending high-priority (drain) commands into this
                 // batch first, bounded by the count and byte caps — so a
@@ -3597,7 +3634,7 @@ impl Batcher {
                 while subs.len() < MAX_PROPOSE_BATCH && batch_bytes < max_bytes {
                     match hi_rx.try_recv() {
                         Ok(s) => {
-                            batch_bytes += s.item.command.approx_bytes();
+                            batch_bytes += s.item.approx_bytes();
                             subs.push(s);
                         }
                         Err(_) => break,
@@ -3611,14 +3648,31 @@ impl Batcher {
                 while subs.len() < MAX_PROPOSE_BATCH && batch_bytes < max_bytes {
                     match lo_rx.try_recv() {
                         Ok(s) => {
-                            batch_bytes += s.item.command.approx_bytes();
+                            batch_bytes += s.item.approx_bytes();
                             subs.push(s);
                         }
                         Err(_) => break,
                     }
                 }
-                let items: Vec<ReplicatedCommand> = subs.iter().map(|s| s.item.clone()).collect();
+                let mut items: Vec<ReplicatedCommand> =
+                    subs.iter().map(|s| s.item.clone()).collect();
                 let n = items.len();
+                // Rolling-upgrade gate for envelope deadline stamps (#1856
+                // review): a member that does not advertise the capability
+                // would ignore them and diverge, so strip until every member
+                // does (the pre-#1570 behaviour: `deadline: None` everywhere).
+                if items.iter().any(|i| !i.terminal_deadlines.is_empty())
+                    && !all_members_support(
+                        &raft,
+                        transport.as_ref(),
+                        nano_falcon_protocol::cluster_join::FEATURE_TERMINAL_DEADLINES,
+                    )
+                    .await
+                {
+                    items
+                        .iter_mut()
+                        .for_each(ReplicatedCommand::strip_terminal_deadlines);
+                }
                 // Carry this (leader) replica's latest chain digest so
                 // followers can compare at that index (#1664).
                 // Rolling-upgrade gate (#1664 / #1661): stamp only while
@@ -3784,9 +3838,7 @@ async fn stamp_for_proposal(
         .with(move |journal| {
             let mut command = command;
             journal.engine().stamp_terminal_attribution(&mut command);
-            let deadlines = journal
-                .engine()
-                .resolve_cascade_terminal_deadlines(&command);
+            let deadlines = journal.resolve_cascade_terminal_deadlines(&command);
             (command, deadlines)
         })
         .await
@@ -5174,6 +5226,26 @@ mod tests {
                 .unwrap();
         assert_eq!(plain.operation_reference, None);
         assert!(plain.terminal_deadlines.is_empty());
+    }
+
+    /// #1856 review: the batcher's size estimate counts the envelope deadline
+    /// map, and each entry's estimate is an upper bound on its real
+    /// serialized size, so a stamped batch cannot overshoot
+    /// `NANOBPMN_RAFT_MAX_ENTRY_BYTES` unnoticed.
+    #[test]
+    fn replicated_command_size_estimate_counts_terminal_deadlines() {
+        let plain = ReplicatedCommand::new(Command::CancelInstance { instance_key: 42 }, 10);
+        assert_eq!(plain.approx_bytes(), plain.command.approx_bytes());
+        let mut stamped = plain.clone();
+        for k in 0..1_000u64 {
+            stamped
+                .terminal_deadlines
+                .insert(u64::MAX - k, u64::MAX - k);
+        }
+        let wire = |c: &ReplicatedCommand| serde_json::to_string(c).unwrap().len() as u64;
+        assert!(stamped.approx_bytes() - plain.approx_bytes() >= wire(&stamped) - wire(&plain));
+        stamped.strip_terminal_deadlines();
+        assert_eq!(stamped.approx_bytes(), plain.approx_bytes());
     }
 
     /// #1570: `ReplicatedCommand::terminal_deadlines` is additive on the wire:

@@ -194,7 +194,33 @@ impl Engine {
     /// replicated state at [`Self::job_terminal_deadline`]. Returning an empty
     /// map when no soft jobs are active keeps the wire format byte-identical on
     /// the common path.
+    ///
+    /// Resolved against the proposer's APPLIED state: a subscription, timer or
+    /// terminate path opened by an earlier command that is still queued in the
+    /// same propose batch (not yet applied) is not seen, so a soft job it
+    /// cancels records `deadline: None` — identically on every replica, since
+    /// the stamp is replicated, so this is a precision gap, never a divergence.
+    ///
+    /// Resident-only: an instance spilled to cold storage hides the call-activity
+    /// links through it. A host with a cold tier must use
+    /// [`Self::resolve_cascade_terminal_deadlines_with`] and supply its cold
+    /// topology, or a soft job above or below a cold intermediate is cancelled
+    /// with `deadline: None` (#1856 review).
     pub fn resolve_cascade_terminal_deadlines(&self, command: &Command) -> BTreeMap<Key, u64> {
+        self.resolve_cascade_terminal_deadlines_with(command, &NoColdTopology)
+    }
+
+    /// [`Self::resolve_cascade_terminal_deadlines`], walking the call-activity
+    /// tree through cold (non-resident) instances via `cold` (#1856 review).
+    /// Cold instances hold no live activation lock themselves (a locked job
+    /// keeps its instance hot), so only the LINKS through them are needed:
+    /// the walk ascends through a cold parent and descends through cold
+    /// children to reach every resident soft job of the cascade's tree.
+    pub fn resolve_cascade_terminal_deadlines_with(
+        &self,
+        command: &Command,
+        cold: &dyn ColdTopology,
+    ) -> BTreeMap<Key, u64> {
         if self.state.activated_jobs.is_empty() || !Self::command_may_cascade_soft_jobs(command) {
             return BTreeMap::new();
         }
@@ -272,28 +298,31 @@ impl Engine {
             // Non-cascading commands: rejected by the predicate above.
             _ => return BTreeMap::new(),
         }
+        // Cold instances the command addresses (paged in on apply): their
+        // resident ancestors/descendants are in the cascade too.
+        roots.extend(cold.command_roots(command));
         if roots.is_empty() {
             return BTreeMap::new();
         }
         // A cascade propagates UP across call activities too (a child
         // completing/erroring can drive its parent to a terminate end event or
-        // an interrupting boundary), so first ascend each root to its resident
-        // top-level ancestor, then walk all resident call-activity descendants
-        // (via `children_by_parent`), collecting every live soft-activated
-        // job's deadline.
+        // an interrupting boundary), so first ascend each root to its
+        // top-level ancestor, then walk all call-activity descendants
+        // (resident via `children_by_parent`, cold via `cold`), collecting
+        // every live soft-activated job's deadline. Both directions pass
+        // through cold intermediates (#1856 review).
+        let parent_of = |key: Key| match self.state.instances.get(&key) {
+            Some(instance) => instance.parent_process_instance_key,
+            None => cold.parent_of(key),
+        };
         let roots: Vec<Key> = roots
             .into_iter()
             .map(|mut key| {
                 let mut hops = BTreeSet::new();
                 while hops.insert(key) {
-                    match self
-                        .state
-                        .instances
-                        .get(&key)
-                        .and_then(|i| i.parent_process_instance_key)
-                    {
-                        Some(parent) if self.state.instances.contains_key(&parent) => key = parent,
-                        _ => break,
+                    match parent_of(key) {
+                        Some(parent) => key = parent,
+                        None => break,
                     }
                 }
                 key
@@ -324,6 +353,7 @@ impl Engine {
             if let Some(children) = self.state.children_by_parent.get(&instance_key) {
                 roots.extend(children.iter().copied());
             }
+            roots.extend(cold.children_of(instance_key));
         }
         deadlines
     }
