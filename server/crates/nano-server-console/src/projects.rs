@@ -12577,6 +12577,99 @@ mod tests {
         drop(limiter.acquire().await.expect("slot reusable after cancel"));
     }
 
+    /// #1329: end-to-end guard for the live-CHILD bound through
+    /// [`pipe_data_gateway_limited`] itself (not just `acquire`): a burst of
+    /// concurrent gateway calls never has more than K stub children alive,
+    /// the overflow request is refused as Busy without spawning a child, and
+    /// every admitted request completes. Each stub child is explicitly gated
+    /// on a release file, so the K-live state is held until the test opens it.
+    /// This fails if the wrapper spawned before admission, or released its
+    /// permit before the child exited.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_data_gateway_bounds_live_children_and_refuses_overflow_without_spawning() {
+        const K: usize = 2;
+        const Q: usize = 1;
+        let dir = std::env::temp_dir().join(format!(
+            "nano-gw-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let live = dir.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let release = dir.join("release");
+        let spawned = dir.join("spawned");
+        let seen = dir.join("seen");
+        // Each child: record its spawn and the number of live siblings
+        // (including itself), wait for the gate, then leave the live set
+        // before exiting.
+        let script = format!(
+            "cat >/dev/null; echo x >> '{sp}'; touch '{live}'/$$; \
+             ls '{live}' | wc -l >> '{seen}'; \
+             while [ ! -e '{rel}' ]; do sleep 0.02; done; \
+             rm -f '{live}'/$$; printf '{{\"ok\":true}}'",
+            sp = spawned.display(),
+            live = live.display(),
+            seen = seen.display(),
+            rel = release.display(),
+        );
+        let mk = || {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&script);
+            c
+        };
+        let count_lines = |p: &std::path::Path| {
+            std::fs::read_to_string(p)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let limiter = Arc::new(DataGatewayLimiter::new(K, Q));
+        let req = serde_json::json!({ "op": "schema" });
+        let tasks: Vec<_> = (0..K + Q)
+            .map(|_| {
+                let (l, cmd, req) = (limiter.clone(), mk(), req.clone());
+                tokio::spawn(async move { pipe_data_gateway_limited(&l, cmd, &req).await })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !(count_lines(&spawned) == K
+            && std::fs::read_dir(&live).unwrap().count() == K
+            && queued(&limiter) == Q)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never reached K live children + Q queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Overflow: refused as Busy and no child is spawned for it.
+        let r = pipe_data_gateway_limited(&limiter, mk(), &req).await;
+        assert!(
+            matches!(r, Err(DataError::Busy(_))),
+            "overflow must be Busy, got {r:?}"
+        );
+        assert_eq!(count_lines(&spawned), K, "overflow spawned a child");
+        std::fs::write(&release, b"").unwrap();
+        for t in tasks {
+            t.await
+                .expect("task completes")
+                .expect("admitted request succeeds");
+        }
+        assert_eq!(count_lines(&spawned), K + Q, "every admitted request ran");
+        let max_seen = std::fs::read_to_string(&seen)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().parse::<usize>().unwrap())
+            .max()
+            .unwrap();
+        assert!(max_seen <= K, "{max_seen} live children exceeded K={K}");
+        assert_eq!(limiter.permits.available_permits(), K);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1329: reaping after a tree kill is bounded — a child that survives
     /// (cleanup failed) must not pin the slot via an unbounded `wait()`.
     #[cfg(unix)]
