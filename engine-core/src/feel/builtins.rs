@@ -192,13 +192,20 @@ fn want_str(v: &FeelVal, ctx: &str) -> Result<String, FeelError> {
     }
 }
 
+/// A list argument. DMN treats a scalar as a singleton list in a list context
+/// (the same coercion `eval_index` applies to its target, eval.rs), so a
+/// non-list value is wrapped rather than rejected — `list contains("f8",
+/// "f8")` is `true`, never "expected a list, got string" (#1755: a route
+/// variable dereferenced to its single-entry head choice is a bare scalar).
+/// `null` alone stays an error: an absent value is not an empty list.
 fn want_list(v: &FeelVal, ctx: &str) -> Result<Vec<FeelVal>, FeelError> {
     match v {
         FeelVal::List(items) => Ok(items.clone()),
-        _ => Err(FeelError(format!(
+        FeelVal::Null => Err(FeelError(format!(
             "{ctx}: expected a list, got {}",
             v.type_name()
         ))),
+        scalar => Ok(vec![scalar.clone()]),
     }
 }
 
