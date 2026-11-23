@@ -1151,7 +1151,15 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
         // review): without one Camunda can run the next command before the
         // boundary interrupts its task.
         const step = { op: 'publishMessage', name: messageName(graph.id, c.node), correlationKey: name }
-        if (Object.keys(cmdVars).length > 0) step.variables = cmdVars
+        // A route suffix buffered while no job had completed rides THIS
+        // publish, exactly as it would ride a job completion: the message's
+        // variables are merged into the instance before the token drains to
+        // the gateway that reads them (#1755).
+        if (pendingCompletionVars) {
+          step.variables = pendingCompletionVars
+          pendingCompletionVars = null
+        }
+        if (Object.keys(cmdVars).length > 0) step.variables = { ...step.variables, ...cmdVars }
         const settled = messageSettlement(seeded, after)
         if (settled) step.settled = settled
         steps.push(step)
@@ -1163,7 +1171,15 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
         steps.push({ op: 'cancelInstance' })
       } else {
         const step = { op: 'publishMessage', name: messageName(graph.id, c.catch), correlationKey: name }
-        if (Object.keys(cmdVars).length > 0) step.variables = cmdVars
+        // A route suffix buffered while no job had completed rides THIS
+        // publish, exactly as it would ride a job completion: the message's
+        // variables are merged into the instance before the token drains to
+        // the gateway that reads them (#1755).
+        if (pendingCompletionVars) {
+          step.variables = pendingCompletionVars
+          pendingCompletionVars = null
+        }
+        if (Object.keys(cmdVars).length > 0) step.variables = { ...step.variables, ...cmdVars }
         // Settlement barrier: see `messageSettlement`.
         const settled = messageSettlement(seeded, after)
         if (settled) step.settled = settled

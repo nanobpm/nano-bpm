@@ -946,6 +946,17 @@ fn exclusions_regenerate_keys_and_must_not_degrade_kept_entries() {
     let (_, _, excluded) = corpus::build_excluding(RANDOM, [esp_deploy].into()).unwrap();
     assert!(excluded.len() > 1, "dependents excluded: {excluded:?}");
 
+    // The scalar-list routing deployment (#1755): its generation-time
+    // routing assertion must not panic once the deployment is excluded.
+    let sr_deploy = position_of(&full, "deploy_process")
+        .into_iter()
+        .find(
+            |&p| matches!(&full[p as usize].1, Command::DeployProcess(d) if d.id == "scalar-route"),
+        )
+        .expect("scalar-route deploy");
+    let (_, _, excluded) = corpus::build_excluding(RANDOM, [sr_deploy].into()).unwrap();
+    assert!(excluded.len() > 1, "dependents excluded: {excluded:?}");
+
     // The core order-process deployment: most of the corpus depends on it.
     assert!(corpus::build_excluding(RANDOM, [0].into()).is_err());
 }
