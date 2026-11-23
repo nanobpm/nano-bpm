@@ -1372,6 +1372,20 @@ mod tests {
             eval(r#"list contains([1, 2], 2)"#, &c),
             Ok(Value::Bool(true))
         );
+        // A scalar is a singleton list in a list context (DMN; `eval_index`
+        // already coerces the same way): `list contains` on one compares
+        // against the scalar instead of failing (#1755 — a route variable
+        // dereferenced to its single-entry head choice is a bare string).
+        assert_eq!(
+            eval(r#"list contains("f8", "f8")"#, &c),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            eval(r#"list contains("f8", "f9")"#, &c),
+            Ok(Value::Bool(false))
+        );
+        // `null` is not a list and stays an error, never a silent `false`.
+        assert!(eval(r#"list contains(null, "f9")"#, &c).is_err());
         assert_eq!(
             eval(r#"substring("hello", 2, 3)"#, &c),
             Ok(Value::Str("ell".into()))

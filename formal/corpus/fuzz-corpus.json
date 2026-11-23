@@ -1804,7 +1804,7 @@
       "signature": "nano:completed,completedElements,sequenceFlows:completed=false/true",
       "kind": "nano",
       "issue": "#1755",
-      "fixed": false,
+      "fixed": true,
       "seed": 3862859229,
       "graph": {
         "id": "Gen_f598076d15",
@@ -1880,7 +1880,14 @@
           {
             "op": "publishMessage",
             "name": "Gen_f598076d15_M2",
-            "correlationKey": "Gen_f598076d15-shrinkr13x31-o1"
+            "correlationKey": "Gen_f598076d15-shrinkr13x31-o1",
+            "variables": {
+              "route_G3": [
+                [
+                  "f8"
+                ]
+              ]
+            }
           }
         ],
         "expect": {
@@ -2015,7 +2022,7 @@
       "signature": "spec-oracle:completed,sequenceFlows",
       "kind": "spec-oracle",
       "issue": "#1755",
-      "fixed": false,
+      "fixed": true,
       "seed": 3862859229,
       "graph": {
         "id": "Gen_f598076d15",
@@ -2091,7 +2098,14 @@
           {
             "op": "publishMessage",
             "name": "Gen_f598076d15_M2",
-            "correlationKey": "Gen_f598076d15-shrinkr13x31-o1"
+            "correlationKey": "Gen_f598076d15-shrinkr13x31-o1",
+            "variables": {
+              "route_G3": [
+                [
+                  "f8"
+                ]
+              ]
+            }
           }
         ],
         "expect": {
