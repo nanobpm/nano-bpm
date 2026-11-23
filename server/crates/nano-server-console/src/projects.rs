@@ -3519,6 +3519,13 @@ const DATA_GATEWAY_DEFAULT_QUEUE: usize = 32;
 const DATA_GATEWAY_CONCURRENCY_ENV: &str = "NANOBPMN_DATA_GATEWAY_CONCURRENCY";
 /// Env override for [`DATA_GATEWAY_DEFAULT_QUEUE`] (non-negative integer).
 const DATA_GATEWAY_QUEUE_ENV: &str = "NANOBPMN_DATA_GATEWAY_QUEUE";
+/// Default wall-clock bound on one gateway op (spawn → exit). A hung child
+/// would otherwise hold one of the few limiter slots forever and starve every
+/// datasource op in the console (#1329); on expiry the child is killed
+/// (`kill_on_drop`) and its slot released.
+const DATA_GATEWAY_DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Env override for [`DATA_GATEWAY_DEFAULT_TIMEOUT_SECS`] (positive seconds).
+const DATA_GATEWAY_TIMEOUT_ENV: &str = "NANOBPMN_DATA_GATEWAY_TIMEOUT";
 
 /// Bounds how many datasource gateway subprocesses run at once, with a bounded
 /// wait queue behind them (#1329): at most `concurrency` children are alive,
@@ -3529,16 +3536,33 @@ pub(crate) struct DataGatewayLimiter {
     waiting: std::sync::atomic::AtomicUsize,
     concurrency: usize,
     queue: usize,
+    timeout: std::time::Duration,
 }
 
 impl DataGatewayLimiter {
+    #[cfg(test)]
     pub(crate) fn new(concurrency: usize, queue: usize) -> Self {
+        Self::with_timeout(
+            concurrency,
+            queue,
+            std::time::Duration::from_secs(DATA_GATEWAY_DEFAULT_TIMEOUT_SECS),
+        )
+    }
+
+    /// Like [`Self::new`] with an explicit per-op timeout (zero is clamped up
+    /// to 1 ms so a misconfiguration cannot disable every op silently).
+    pub(crate) fn with_timeout(
+        concurrency: usize,
+        queue: usize,
+        timeout: std::time::Duration,
+    ) -> Self {
         let concurrency = concurrency.max(1);
         Self {
             permits: tokio::sync::Semaphore::new(concurrency),
             waiting: std::sync::atomic::AtomicUsize::new(0),
             concurrency,
             queue,
+            timeout: timeout.max(std::time::Duration::from_millis(1)),
         }
     }
 
@@ -3592,12 +3616,19 @@ fn data_gateway_limiter() -> &'static DataGatewayLimiter {
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(d)
         };
-        DataGatewayLimiter::new(
+        let timeout_secs = read(DATA_GATEWAY_TIMEOUT_ENV, 0);
+        let timeout_secs = if timeout_secs == 0 {
+            DATA_GATEWAY_DEFAULT_TIMEOUT_SECS
+        } else {
+            timeout_secs as u64
+        };
+        DataGatewayLimiter::with_timeout(
             read(
                 DATA_GATEWAY_CONCURRENCY_ENV,
                 DATA_GATEWAY_DEFAULT_CONCURRENCY,
             ),
             read(DATA_GATEWAY_QUEUE_ENV, DATA_GATEWAY_DEFAULT_QUEUE),
+            std::time::Duration::from_secs(timeout_secs),
         )
     })
 }
@@ -3987,8 +4018,6 @@ async fn pipe_data_gateway_limited(
     mut cmd: Command,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
-    use tokio::io::AsyncWriteExt;
-
     let _permit = limiter.acquire().await?;
 
     cmd.env("NO_COLOR", "1")
@@ -3997,11 +4026,32 @@ async fn pipe_data_gateway_limited(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
+    let body = serde_json::to_vec(request)
+        .map_err(|e| DataError::Gateway(format!("serialize request: {e}")))?;
+    // Bound the whole spawn → exit span so a hung child cannot hold its slot
+    // forever (#1329). Dropping the inner future on expiry drops the child,
+    // and `kill_on_drop` reaps it; the permit is released when we return.
+    let out = tokio::time::timeout(limiter.timeout, run_data_gateway_child(cmd, body))
+        .await
+        .map_err(|_| {
+            DataError::Gateway(format!(
+                "data gateway timed out after {:?}",
+                limiter.timeout
+            ))
+        })??;
+    parse_data_gateway_output(out)
+}
+
+/// Spawn the gateway child, feed it `body` on stdin, and collect its output.
+async fn run_data_gateway_child(
+    mut cmd: Command,
+    body: Vec<u8>,
+) -> Result<std::process::Output, DataError> {
+    use tokio::io::AsyncWriteExt;
+
     let mut child = cmd
         .spawn()
         .map_err(|e| DataError::Gateway(format!("spawn data gateway: {e}")))?;
-    let body = serde_json::to_vec(request)
-        .map_err(|e| DataError::Gateway(format!("serialize request: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
         // A gateway that fails fast can exit before (or while) reading its
         // request, closing the read end of the pipe. The write then fails with
@@ -4017,10 +4067,14 @@ async fn pipe_data_gateway_limited(
         }
         // Drop stdin (via scope) so the gateway's stdin reader sees EOF.
     }
-    let out = child
+    child
         .wait_with_output()
         .await
-        .map_err(|e| DataError::Gateway(format!("await data gateway: {e}")))?;
+        .map_err(|e| DataError::Gateway(format!("await data gateway: {e}")))
+}
+
+/// Interpret a finished gateway child's output as the JSON reply.
+fn parse_data_gateway_output(out: std::process::Output) -> Result<serde_json::Value, DataError> {
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stderr = stderr.trim();
@@ -12240,6 +12294,29 @@ mod tests {
         pipe_data_gateway_limited(&limiter, cmd, &req)
             .await
             .expect("limiter recovers after the burst");
+    }
+
+    /// #1329: a hung gateway child must not hold its limiter slot forever —
+    /// it times out as `DataError::Gateway` and the next request is admitted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_data_gateway_times_out_hung_child_and_frees_slot() {
+        let limiter = DataGatewayLimiter::with_timeout(1, 0, std::time::Duration::from_millis(200));
+        let req = serde_json::json!({ "op": "schema" });
+        let mut hung = Command::new("sh");
+        hung.arg("-c").arg("cat >/dev/null; sleep 30");
+        let started = std::time::Instant::now();
+        let r = pipe_data_gateway_limited(&limiter, hung, &req).await;
+        assert!(
+            matches!(&r, Err(DataError::Gateway(m)) if m.contains("timed out")),
+            "hung child must time out, got {r:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("cat >/dev/null; printf '{\"ok\":true}'");
+        pipe_data_gateway_limited(&limiter, cmd, &req)
+            .await
+            .expect("slot is released after a timeout");
     }
 
     #[test]
