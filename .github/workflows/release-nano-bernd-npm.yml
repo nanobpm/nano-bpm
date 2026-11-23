@@ -18,6 +18,7 @@ on:
 
 jobs:
   publish:
+    if: startsWith(github.ref, 'refs/tags/nano-bernd-npm-v')
     name: Publish @nanobpm/nano-bernd
     runs-on: ubuntu-24.04
     permissions:
@@ -27,6 +28,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v5
+
+      # Only a main-reachable release tag may publish (#1830).
+      - uses: ./.github/actions/assert-release-ref
+        with:
+          tag-pattern: '^nano-bernd-npm-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
       - uses: actions/setup-node@v5
         with:

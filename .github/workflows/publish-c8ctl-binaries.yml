@@ -482,9 +482,19 @@ jobs:
 
   publish:
     name: Upload binaries + trigger plugin release
+    # A manual run builds (the `build` legs keep their artifacts) but never
+    # publishes: a branch build once shipped in the plugin for seven weeks (#1830).
+    if: github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v5
+
+      # Only a main-reachable release tag may publish (#1830).
+      - uses: ./.github/actions/assert-release-ref
+        with:
+          tag-pattern: '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
       - name: Download built binaries
         uses: actions/download-artifact@v7
         with:
@@ -530,8 +540,7 @@ jobs:
           # This job downloads artifacts only (no checkout), so derive the
           # version/sha from GitHub-provided env vars rather than `git` in the
           # workspace (which has no .git and would fail under `set -e`).
-          ver="${GITHUB_REF_NAME:-${GITHUB_SHA:0:7}}"
-          ver="${ver#v}"
+          ver="${GITHUB_REF_NAME#v}"  # tag-only job: always vX.Y.Z
           sha="${GITHUB_SHA:0:7}"
           now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           tmp="$(mktemp -d)"
