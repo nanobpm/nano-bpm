@@ -48,6 +48,7 @@ impl Engine {
     /// ever held multiple matches (a bug or partial-replay artifact),
     /// boundary-interrupt cancellation always targets the same child.
     pub(super) fn call_activity_child_of(&self, call_eik: Key) -> Option<Key> {
+        self.count_resource_scan();
         self.live_call_activity_children()
             .filter(|(parent, _)| *parent == call_eik)
             .map(|(_, child)| child)
@@ -75,17 +76,49 @@ impl Engine {
         out
     }
 
+    /// The live callee of every call-activity element instance of
+    /// `instance_key` (call eik → lowest live child key), read from the
+    /// `children_by_parent` index instead of scanning every instance (#1767).
+    /// Same lifecycle filter as [`Self::call_activity_child_of`].
+    pub(super) fn live_callees_of_instance(&self, instance_key: Key) -> BTreeMap<Key, Key> {
+        let mut out = BTreeMap::new();
+        for child in self
+            .state
+            .children_by_parent
+            .get(&instance_key)
+            .into_iter()
+            .flatten()
+        {
+            let Some(i) = self.state.instances.get(child) else {
+                continue;
+            };
+            if !Self::is_live_child(i) {
+                continue;
+            }
+            if let Some(p) = i.parent_element_instance_key {
+                out.entry(p)
+                    .and_modify(|c: &mut Key| *c = (*c).min(i.key))
+                    .or_insert(i.key);
+            }
+        }
+        out
+    }
+
+    fn is_live_child(i: &state::ProcessInstance) -> bool {
+        matches!(
+            i.state,
+            ProcessInstanceState::Active
+                | ProcessInstanceState::Terminating
+                | ProcessInstanceState::Suspended
+        )
+    }
+
     /// `(parent call-activity element-instance key, child instance key)` for
     /// every live (active / terminating / suspended) child instance — the
     /// single predicate both lookups above derive from.
     fn live_call_activity_children(&self) -> impl Iterator<Item = (Key, Key)> + '_ {
         self.state.instances.values().filter_map(|i| {
-            if matches!(
-                i.state,
-                ProcessInstanceState::Active
-                    | ProcessInstanceState::Terminating
-                    | ProcessInstanceState::Suspended
-            ) {
+            if Self::is_live_child(i) {
                 i.parent_element_instance_key.map(|p| (p, i.key))
             } else {
                 None
