@@ -3540,7 +3540,11 @@ pub(crate) struct DataGatewayLimiter {
 }
 
 impl DataGatewayLimiter {
-    #[cfg(test)]
+    /// Test-only convenience constructor. Its only callers are the
+    /// `#[cfg(unix)]` limiter tests, so gate it to Unix test targets too —
+    /// otherwise the Windows `--all-targets` Clippy gate (`-D warnings`)
+    /// flags it as an unused associated function.
+    #[cfg(all(test, unix))]
     pub(crate) fn new(concurrency: usize, queue: usize) -> Self {
         Self::with_timeout(
             concurrency,
@@ -4011,8 +4015,8 @@ async fn pipe_data_gateway(
 
 /// [`pipe_data_gateway`] against an explicit [`DataGatewayLimiter`]: the child
 /// is spawned only while holding a slot, and the slot is held until the child
-/// has exited (`wait_with_output`), so at most `concurrency` gateway processes
-/// are ever alive at once (#1329).
+/// has exited (`wait`), so at most `concurrency` gateway processes are ever
+/// alive at once (#1329).
 async fn pipe_data_gateway_limited(
     limiter: &DataGatewayLimiter,
     mut cmd: Command,
@@ -4037,8 +4041,11 @@ async fn pipe_data_gateway_limited(
         .spawn()
         .map_err(|e| DataError::Gateway(format!("spawn data gateway: {e}")))?;
     // Declared after `_permit`, so on cancellation (this future dropped) the
-    // tree is SIGKILLed *before* the permit is released.
-    let mut tree = GatewayTreeGuard(child.id());
+    // tree is SIGKILLed *before* the permit is released. On Windows the guard
+    // also owns the `Child` and the permit through the blocking `taskkill /T`
+    // wait, so the wrapper cannot be reaped by `kill_on_drop` before taskkill
+    // has walked its descendants.
+    let mut tree = GatewayTreeGuard::new(child.id());
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -4051,12 +4058,21 @@ async fn pipe_data_gateway_limited(
     )
     .await;
     let out = match res {
-        Ok(out) => {
+        Ok(Ok(out)) => {
             tree.disarm();
-            out?
+            out
+        }
+        Ok(Err(e)) => {
+            // The op failed before the child was reaped (e.g. a non-BrokenPipe
+            // stdin write error): the child may still be running, so kill the
+            // whole tree and wait for the leader before releasing the slot —
+            // the same cleanup the timeout arm performs.
+            tree.kill(&mut child, &_permit).await;
+            let _ = child.wait().await;
+            return Err(e);
         }
         Err(_) => {
-            tree.kill();
+            tree.kill(&mut child, &_permit).await;
             let _ = child.wait().await;
             return Err(DataError::Gateway(format!(
                 "data gateway timed out after {:?}",
@@ -4073,32 +4089,67 @@ async fn pipe_data_gateway_limited(
 struct GatewayTreeGuard(Option<u32>);
 
 impl GatewayTreeGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
     fn disarm(&mut self) {
         self.0 = None;
     }
 
-    fn kill(&mut self) {
+    /// Terminate the whole tree. On Unix this is a non-blocking group SIGKILL
+    /// (the caller then reaps the leader with `child.wait()`). On Windows
+    /// `taskkill /T` must finish walking the descendant tree BEFORE the
+    /// wrapper `Child` is dropped — `kill_on_drop(true)` would otherwise
+    /// TerminateProcess the wrapper first and reparent the workers out from
+    /// under taskkill — so the wait runs on a blocking thread while the
+    /// caller keeps `child` and the limiter permit borrowed across the
+    /// `.await`, keeping both alive until tree termination completes.
+    async fn kill(
+        &mut self,
+        _child: &mut tokio::process::Child,
+        _permit: &tokio::sync::SemaphorePermit<'_>,
+    ) {
         let Some(pid) = self.0.take() else { return };
         #[cfg(unix)]
         kill_group_by_pid(pid);
         #[cfg(windows)]
         {
-            // Fire-and-forget: this may run in `Drop` on a runtime thread, so
-            // never block on `taskkill`'s exit.
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            })
+            .await;
         }
-        #[cfg(not(any(unix, windows)))]
         let _ = pid;
     }
 }
 
 impl Drop for GatewayTreeGuard {
     fn drop(&mut self) {
-        self.kill();
+        // Best-effort backstop for the cancellation path, where the future is
+        // dropped and no `child` handle is available to order against. Unix
+        // group SIGKILL is exact; on Windows prefer the ordered
+        // [`Self::kill`] path (timeout / op-error arms), which every
+        // in-function exit takes — this Drop only fires when the caller itself
+        // is cancelled.
+        let Some(pid) = self.0.take() else { return };
+        #[cfg(unix)]
+        kill_group_by_pid(pid);
+        #[cfg(windows)]
+        {
+            // Fire-and-forget: `Drop` may run on a runtime thread, so never
+            // block on `taskkill`'s exit here.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        let _ = pid;
     }
 }
 
@@ -8272,6 +8323,10 @@ mod tests {
 
     /// A fresh, created scratch dir that does NOT touch
     /// `NANOBPMN_PROJECTS_DIR` — for tests independent of `project_dir`.
+    /// Its only caller is the Unix-only gateway concurrency test, so gate it
+    /// the same way or the Windows `--all-targets` Clippy gate (`-D warnings`)
+    /// flags it as dead code.
+    #[cfg(unix)]
     fn private_scratch_dir(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
@@ -8282,6 +8337,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Is `pid` a zombie — killed but not yet reaped? Only the Unix gateway
+    /// timeout test asks (a SIGKILLed descendant can linger as a zombie while
+    /// init/subreaper catches up, and `kill(pid, 0)` still succeeds for one).
+    /// Linux reads the state field of `/proc/<pid>/stat` (the field after the
+    /// parenthesised comm, which may itself contain spaces); other Unixes have
+    /// no portable zombie probe, so conservatively answer "not a zombie". The
+    /// `cfg!` (not `#[cfg]`) keeps the whole body linted on every clippy
+    /// target — a `#[cfg(not(target_os = "linux"))]` arm would be compiled by
+    /// no clippy-matrix entry and fail the live coverage guard.
+    #[cfg(unix)]
+    fn is_zombie(pid: i32) -> bool {
+        if !cfg!(target_os = "linux") {
+            let _ = pid;
+            return false;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit(')')
+            .next()
+            .and_then(|rest| rest.split_whitespace().next().map(|state| state == "Z"))
+            == Some(true)
     }
 
     fn temp_root() -> PathBuf {
@@ -12424,11 +12503,21 @@ mod tests {
             .parse()
             .expect("numeric pid");
         let _ = std::fs::remove_file(&pidfile);
-        // The descendant was SIGKILLed with the group; it is reparented to init
-        // and reaped promptly, so poll briefly for it to vanish.
+        // The descendant was SIGKILLed with the group. `kill(pid, 0)` alone
+        // also succeeds for a *zombie* — a killed descendant whose reaper
+        // (init or a subreaper, after the wrapper died with it) has not yet
+        // collected it — so probe for "still running", not "pid exists": on
+        // Linux `/proc/<pid>/stat` state `Z` counts as terminated. Elsewhere
+        // there is no zombie state to distinguish, and the signal-0 probe is
+        // exact.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        // SAFETY: signal 0 only probes for existence.
-        while unsafe { libc::kill(desc, 0) } == 0 {
+        loop {
+            // SAFETY: signal 0 only probes for existence.
+            let alive = unsafe { libc::kill(desc, 0) } == 0;
+            let running = alive && !is_zombie(desc);
+            if !running {
+                break;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "descendant {desc} outlived the gateway timeout"
