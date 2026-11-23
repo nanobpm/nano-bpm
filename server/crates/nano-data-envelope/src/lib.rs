@@ -924,33 +924,67 @@ pub fn glob_match(glob: &str, path: &str) -> bool {
 }
 
 fn match_segments(g: &[&str], p: &[&str]) -> bool {
-    match g.split_first() {
-        None => p.is_empty(),
-        Some((&"**", rest)) => (0..=p.len()).any(|i| match_segments(rest, &p[i..])),
-        Some((seg, rest)) => match p.split_first() {
-            Some((head, tail)) => {
-                // Case folding only applies when both are the final segment.
-                let fold = rest.is_empty() && tail.is_empty();
-                match_segment(seg.as_bytes(), head.as_bytes(), fold) && match_segments(rest, tail)
+    let gn = g.len();
+    let pn = p.len();
+    // dp[j] = whether g[i..] matches p[j..] (filled bottom-up from i = gn down to 0).
+    let mut dp = vec![false; pn + 1];
+    dp[pn] = true;
+    for i in (0..gn).rev() {
+        let mut next = vec![false; pn + 1];
+        if g[i] == "**" {
+            // `**` matches 0 or more segments: g[i..] matches p[j..] iff
+            // g[i+1..] matches p[j..] (0 segments) OR g[i..] matches p[j+1..] (1+ segments).
+            let mut suffix_any = false;
+            for j in (0..=pn).rev() {
+                suffix_any = suffix_any || dp[j];
+                next[j] = suffix_any;
             }
-            None => false,
-        },
+        } else {
+            for j in 0..pn {
+                // Case folding only applies when both are the final segment.
+                let fold = i + 1 == gn && j + 1 == pn;
+                if dp[j + 1] && match_segment(g[i].as_bytes(), p[j].as_bytes(), fold) {
+                    next[j] = true;
+                }
+            }
+        }
+        dp = next;
     }
+    dp[0]
 }
 
 fn match_segment(g: &[u8], s: &[u8], fold: bool) -> bool {
-    match g.split_first() {
-        None => s.is_empty(),
-        Some((b'*', rest)) => (0..=s.len()).any(|i| match_segment(rest, &s[i..], fold)),
-        Some((b'?', rest)) => !s.is_empty() && match_segment(rest, &s[1..], fold),
-        Some((c, rest)) => s.split_first().is_some_and(|(h, t)| {
-            (if fold {
-                h.eq_ignore_ascii_case(c)
-            } else {
-                h == c
-            }) && match_segment(rest, t, fold)
-        }),
+    let sn = s.len();
+    // dp[j] = whether g[i..] matches s[j..] (O(|g| * |s|) time, O(|s|) space).
+    let mut dp = vec![false; sn + 1];
+    dp[sn] = true;
+    for &gc in g.iter().rev() {
+        let mut next = vec![false; sn + 1];
+        match gc {
+            b'*' => {
+                let mut suffix_any = false;
+                for j in (0..=sn).rev() {
+                    suffix_any = suffix_any || dp[j];
+                    next[j] = suffix_any;
+                }
+            }
+            b'?' => {
+                next[..sn].copy_from_slice(&dp[1..=sn]);
+            }
+            c => {
+                for j in 0..sn {
+                    let eq = if fold {
+                        s[j].eq_ignore_ascii_case(&c)
+                    } else {
+                        s[j] == c
+                    };
+                    next[j] = eq && dp[j + 1];
+                }
+            }
+        }
+        dp = next;
     }
+    dp[0]
 }
 
 /// Directories never descended into while resolving model globs.
@@ -958,15 +992,21 @@ const SKIP_DIRS: &[&str] = &["node_modules", ".git", "target", "nano-generated"]
 
 /// Resolve the project's [`process_globs`] to the sorted, de-duplicated set of
 /// existing model files. Each glob is walked from its literal (wildcard-free)
-/// prefix; every candidate must also pass the shared eligibility rules (so a
+/// prefix (or, when the glob has no wildcards at all, a single non-recursive
+/// listing of its parent directory so literal filenames do not scan unrelated
+/// subtrees); every candidate must also pass the shared eligibility rules (so a
 /// literal prefix cannot smuggle in an excluded or symlinked directory), and
 /// symlinked directories are not followed.
 pub fn resolve_process_models(project_dir: &Path) -> Vec<std::path::PathBuf> {
     let mut out: std::collections::BTreeSet<std::path::PathBuf> = Default::default();
     for glob in process_globs(project_dir) {
         let segs: Vec<&str> = glob.split('/').filter(|s| !s.is_empty()).collect();
+        if segs.is_empty() {
+            continue;
+        }
         let lit = segs.iter().take_while(|s| !s.contains(['*', '?'])).count();
-        // A fully-literal glob names one file.
+        let is_literal = lit == segs.len();
+        let single_dir = is_literal || (lit + 1 == segs.len() && segs[lit] != "**");
         let base_rel = segs[..lit.min(segs.len().saturating_sub(1))].join("/");
         if !base_rel.is_empty() && !is_eligible(project_dir, &format!("{base_rel}/_")) {
             continue;
@@ -976,13 +1016,40 @@ pub fn resolve_process_models(project_dir: &Path) -> Vec<std::path::PathBuf> {
         } else {
             project_dir.join(&base_rel)
         };
-        walk(&base, &base_rel, &mut |rel, path| {
+        let mut accept = |rel: &str, path: &Path| {
             if glob_match(&glob, rel) && is_eligible(project_dir, rel) {
                 out.insert(path.to_path_buf());
             }
-        });
+        };
+        if single_dir {
+            list_dir_files(&base, &base_rel, &mut accept);
+        } else {
+            walk(&base, &base_rel, &mut accept);
+        }
     }
     out.into_iter().collect()
+}
+
+/// Non-recursive single-directory file listing (used for literal globs so we
+/// preserve case-insensitive filename matching without walking subtrees).
+fn list_dir_files(dir: &Path, rel: &str, f: &mut dyn FnMut(&str, &Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        let path = e.path();
+        if !(ft.is_file() || (ft.is_symlink() && path.is_file())) {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        let child_rel = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
+        f(&child_rel, &path);
+    }
 }
 
 fn walk(dir: &Path, rel: &str, f: &mut dyn FnMut(&str, &Path)) {
@@ -2242,13 +2309,15 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("real"), root.join("models/link")).unwrap();
         let resolved = rels(&root);
-        for rel in [
+        let mut cases = vec![
             "models/a.bpmn",
             "models/target/t.bpmn",
             "models/target/one.bpmn",
             "Models/upper.bpmn",
-            "models/link/r.bpmn",
-        ] {
+        ];
+        #[cfg(unix)]
+        cases.push("models/link/r.bpmn");
+        for rel in cases {
             assert_eq!(
                 resolved.contains(&rel.to_string()),
                 is_process_model_path(&root, rel),
@@ -2297,5 +2366,59 @@ mod tests {
         assert!(glob_match("**", "any/thing"));
         assert!(!glob_match("models/*.bpmn", "Models/a.bpmn"));
         assert!(glob_match("models/*.bpmn", "models/A.BPMN"));
+        assert!(glob_match("**/A.bpmn", "a.BPMN"));
+        assert!(glob_match("**/a/b.bpmn", "x/a/B.BPMN"));
+        assert!(!glob_match("**/a/b.bpmn", "x/A/b.bpmn"));
+    }
+
+    #[test]
+    fn glob_match_polynomial_on_repeated_wildcards() {
+        // Adversarial non-matches that trigger exponential backtracking in a
+        // recursive `*` / `**` matcher.
+        let start = std::time::Instant::now();
+        let seg_glob = "*a*a*a*a*a*a*a*a*a*aZ.bpmn";
+        let seg_name = format!("{}.bpmn", "a".repeat(32));
+        assert!(!glob_match(seg_glob, &seg_name));
+
+        let path_glob = "**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/z.bpmn";
+        let path_name = format!("{}/x.bpmn", vec!["a"; 24].join("/"));
+        assert!(!glob_match(path_glob, &path_name));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "glob matching took {:?} (expected polynomial)",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn literal_glob_lists_parent_without_recursing_subtrees() {
+        let root = temp_project("literal-nonrec");
+        std::fs::write(
+            root.join(MANIFEST_FILE),
+            r#"{"models":{"processes":["order.bpmn","sub/nested.bpmn","sub/target/skip.bpmn"]}}"#,
+        )
+        .unwrap();
+        // Case-insensitive filename match at project root and in a subdir.
+        write_model(&root, "Order.BPMN", "root-order");
+        write_model(&root, "sub/NESTED.bpmn", "sub-nested");
+        write_model(&root, "sub/target/skip.bpmn", "skip");
+        // Unrelated nested file that a non-recursive listing should never touch.
+        write_model(&root, "unrelated/deep/other.bpmn", "other");
+        let resolved = rels(&root);
+        assert_eq!(resolved, vec!["Order.BPMN", "sub/NESTED.bpmn"]);
+        for rel in [
+            "Order.BPMN",
+            "sub/NESTED.bpmn",
+            "sub/target/skip.bpmn",
+            "unrelated/deep/other.bpmn",
+        ] {
+            assert_eq!(
+                resolved.contains(&rel.to_string()),
+                is_process_model_path(&root, rel),
+                "{rel}"
+            );
+        }
+        // Verify a literal glob does not even require scanning subdirectories.
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
