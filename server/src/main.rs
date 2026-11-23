@@ -3530,6 +3530,10 @@ pub struct ServerImpl {
     /// [`procgov`](Self::procgov) counters use without an engine round-trip on the
     /// hot path. Deployments are rare, so ~1 Hz staleness is harmless.
     def_key_to_process_id: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// The `/mcp/processes` per-definition data-envelope cache (issue #1748):
+    /// a deployed definition is immutable, so its BPMN scan and derived tool
+    /// input schemas are computed once per definition key, not per request.
+    mcp_envelopes: Arc<mcp::processes_tools::EnvelopeCache>,
     /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
     /// completed *service-task* jobs, summed across owned partitions. This is the
     /// parked-excluded load signal the admission gate and the backlog governor
@@ -4388,6 +4392,7 @@ impl ServerImpl {
             tier2_enabled,
             guard,
             def_key_to_process_id,
+            mcp_envelopes: Arc::default(),
             backlog_cap_floor,
             backlog_cap_ceiling,
             recovery_backlog_cap,
