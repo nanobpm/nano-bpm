@@ -1445,7 +1445,7 @@ serde-derived struct that always serializes to Value"
                 // model. Best-effort — the save already succeeded and the types
                 // are an authoring-time contract only (mirrors the DDL/migrate
                 // regen triggers on the data path).
-                if nano_server_console::is_model_resource(&query_params.path) {
+                if nano_server_console::is_model_resource(&path_params.name, &query_params.path) {
                     nano_server_console::regenerate_domain_types(&path_params.name).await;
                 } else if nano_server_console::is_workflow_source(&query_params.path) {
                     // Code-first inverse (ADR 0048): a `workflows/*.ts` save
