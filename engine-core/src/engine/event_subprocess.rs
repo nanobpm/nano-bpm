@@ -278,18 +278,25 @@ impl Engine {
         scope_eik: Key,
         index: Option<&super::boundary::TeardownIndex<'_>>,
     ) -> Vec<Event> {
-        fn pick<'a, T>(
+        fn pick<'a, T: 'a, I: Iterator<Item = &'a T>>(
             index: Option<&std::collections::BTreeMap<Key, Vec<&'a T>>>,
-            scan: impl FnOnce() -> Vec<&'a T>,
+            scan: impl FnOnce() -> I,
             keep: impl Fn(&T) -> bool,
             key: impl Fn(&T) -> Key,
             scope_eik: Key,
         ) -> Vec<&'a T> {
+            // Filter before collecting: the fallback must not allocate a
+            // vector proportional to the whole global map (#1767).
             let mut v: Vec<&'a T> = match index {
-                Some(ix) => ix.get(&scope_eik).cloned().unwrap_or_default(),
-                None => scan(),
+                Some(ix) => ix
+                    .get(&scope_eik)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|x| keep(x))
+                    .collect(),
+                None => scan().filter(|x| keep(x)).collect(),
             };
-            v.retain(|x| keep(x));
             v.sort_by_key(|x| key(x));
             v
         }
@@ -304,7 +311,7 @@ impl Engine {
             index.map(|i| &i.timers),
             || {
                 self.count_resource_scan();
-                st.timers.values().collect()
+                st.timers.values()
             },
             |t| {
                 on_scope(t.instance_key, t.element_instance_key)
@@ -325,7 +332,7 @@ impl Engine {
             index.map(|i| &i.message_subscriptions),
             || {
                 self.count_resource_scan();
-                st.message_subscriptions.values().collect()
+                st.message_subscriptions.values()
             },
             |s| {
                 on_scope(s.instance_key, s.element_instance_key)
@@ -345,7 +352,7 @@ impl Engine {
             index.map(|i| &i.signal_subscriptions),
             || {
                 self.count_resource_scan();
-                st.signal_subscriptions.values().collect()
+                st.signal_subscriptions.values()
             },
             |s| {
                 on_scope(s.instance_key, s.element_instance_key)
@@ -370,7 +377,7 @@ impl Engine {
             index.map(|i| &i.conditional_subscriptions),
             || {
                 self.count_resource_scan();
-                st.conditional_subscriptions.values().collect()
+                st.conditional_subscriptions.values()
             },
             |s| {
                 on_scope(s.instance_key, s.element_instance_key)
