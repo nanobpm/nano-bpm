@@ -19138,6 +19138,59 @@ fn group_owned<V: OwnedByInstance>(
     grouped
 }
 
+/// #1482: `group_owned` (the per-map step of `decompose_state_for_streaming`)
+/// must be linear in the map size — each entity's owner is read a constant
+/// number of times, independent of how many owners there are. A per-instance
+/// rescan (`drain_owned` in a loop) reads every owner N times, i.e. N×M work.
+/// Deterministic op-count guard instead of a wall-clock timing test.
+#[cfg(all(test, feature = "serde"))]
+mod group_owned_scaling {
+    use std::cell::Cell;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{group_owned, Key, OwnedByInstance};
+
+    thread_local! { static READS: Cell<usize> = const { Cell::new(0) }; }
+
+    struct Probe(Key);
+    impl OwnedByInstance for Probe {
+        fn instance_key(&self) -> Key {
+            READS.with(|r| r.set(r.get() + 1));
+            self.0
+        }
+    }
+
+    fn reads_for(n: u64) -> usize {
+        let mut map: BTreeMap<Key, Probe> = (0..n).map(|i| (1_000_000 + i, Probe(i))).collect();
+        let owners: BTreeSet<Key> = (0..n).collect();
+        READS.with(|r| r.set(0));
+        let grouped = group_owned(&mut map, &owners);
+        assert!(map.is_empty());
+        assert_eq!(grouped.len() as u64, n);
+        assert!(grouped.iter().all(|(k, v)| v.len() == 1 && v[0].0 == *k));
+        READS.with(Cell::get)
+    }
+
+    #[test]
+    fn group_owned_reads_each_owner_a_constant_number_of_times() {
+        let small = reads_for(500);
+        let large = reads_for(4_000);
+        assert!(
+            small <= 2 * 500,
+            "owner reads per entity must be O(1): {small}"
+        );
+        assert!(
+            large <= 2 * 4_000,
+            "owner reads per entity must be O(1): {large}"
+        );
+        // 8x the backlog must cost ~8x the work, never ~64x.
+        assert!(
+            large <= 8 * small,
+            "group_owned scaled super-linearly: {small} -> {large}"
+        );
+    }
+}
+
 /// A process start event's deploy-time-resolved trigger.
 enum ResolvedStart {
     Message {
