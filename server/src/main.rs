@@ -53444,6 +53444,51 @@ mod subscription_placement_tests {
             "cancel must succeed: {resp:?}"
         );
 
+        // The cancel funnel routes the subscription teardown (the
+        // `CloseMessageSubscription` to the canonical message partition) on a
+        // spawned task that holds its own server clone, so neither the 204 nor
+        // dropping `server` means the routed records are journaled. Wait for
+        // the routed close's durable tombstone (`RoutedDeliveryRecorded` with
+        // `close_tombstone` for the closed subscription) before snapshotting,
+        // so the suffix assertion below provably covers the routed records too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let recs: Vec<nanobpmn_engine_core::Record> =
+                read_journal().into_values().flatten().collect();
+            let closing: Vec<u64> = recs
+                .iter()
+                .filter_map(|r| match &r.event {
+                    Event::MessageSubscriptionClosing {
+                        subscription_key,
+                        instance_key: k,
+                        ..
+                    } if *k == instance_key => Some(*subscription_key),
+                    _ => None,
+                })
+                .collect();
+            let routed = !closing.is_empty()
+                && closing.iter().all(|sk| {
+                    recs.iter().any(|r| {
+                        matches!(
+                            &r.event,
+                            Event::RoutedDeliveryRecorded {
+                                subscription_key: Some(s),
+                                close_tombstone: true,
+                                ..
+                            } if s == sk
+                        )
+                    })
+                });
+            if routed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cancel's routed subscription teardown was never journaled: {recs:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         drop(server);
         let journal = read_journal();
         let records: Vec<nanobpmn_engine_core::Record> =

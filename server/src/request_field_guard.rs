@@ -562,11 +562,16 @@ fn forwards_operation_reference(src: &str) -> bool {
     })
 }
 
-/// `src` with every Rust comment blanked out: `//` line comments and
-/// (nested) `/* */` block comments. String, raw-string and char literals are kept intact
-/// so a `//` or `/*` inside one does not start a comment. Removed text is
-/// replaced by spaces (newlines kept) so code on either side never fuses.
+/// `src` with every Rust comment and every literal's contents blanked out:
+/// `//` line comments, (nested) `/* */` block comments, and the interiors of
+/// string, raw-string and char literals (delimiters kept). Literals are lexed
+/// so a `//` or `/*` inside one does not start a comment, and their contents
+/// are masked so text in a string (e.g. a log message spelling out
+/// `cancel_core(k, operation_reference)`) can never pass for code. Removed
+/// text is replaced by spaces (newlines kept) so code on either side never
+/// fuses.
 fn strip_rust_comments(src: &str) -> String {
+    let blank = |ch: char| if ch == '\n' { '\n' } else { ' ' };
     let b: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
@@ -611,7 +616,7 @@ fn strip_rust_comments(src: &str) -> String {
                     i += 1 + hashes;
                     break;
                 }
-                out.push(b[i]);
+                out.push(blank(b[i]));
                 i += 1;
             }
         } else if c == '\'' {
@@ -624,25 +629,37 @@ fn strip_rust_comments(src: &str) -> String {
             } else {
                 None
             };
-            let stop = end.map_or(i + 1, |e| e + 1);
-            out.extend(&b[i..stop]);
-            i = stop;
+            match end {
+                Some(e) => {
+                    out.push('\'');
+                    out.extend(b[i + 1..e].iter().map(|&ch| blank(ch)));
+                    out.push('\'');
+                    i = e + 1;
+                }
+                None => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
         } else if c == '"' {
             out.push(c);
             i += 1;
             while i < b.len() {
-                out.push(b[i]);
                 if b[i] == '\\' {
+                    out.push(' ');
                     if let Some(&e) = b.get(i + 1) {
-                        out.push(e);
+                        out.push(blank(e));
                     }
                     i += 2;
                     continue;
                 }
-                i += 1;
-                if b[i - 1] == '"' {
+                if b[i] == '"' {
+                    out.push('"');
+                    i += 1;
                     break;
                 }
+                out.push(blank(b[i]));
+                i += 1;
             }
         } else {
             out.push(c);
@@ -669,9 +686,9 @@ fn strip_rust_comments_handles_char_literals_and_raw_strings() {
     assert!(!s.contains("forward"), "{s}");
     let s = strip_rust_comments("let q = r#\"a\"b\"#; /* forward(x) */ c");
     assert!(!s.contains("forward"), "{s}");
-    assert!(s.contains("r#\"a\"b\"#"), "{s}");
-    // Raw string content is kept intact; lifetimes don't derail scanning.
-    assert!(strip_rust_comments("r\"//keep\" x").contains("//keep"));
+    assert!(s.contains("r#\"   \"#"), "{s}");
+    // Literal contents are masked, delimiters kept.
+    assert_eq!(strip_rust_comments("r\"//keep\" x"), "r\"      \" x");
     let s = strip_rust_comments("fn f<'a>(x: &'a str) {} // forward(x)");
     assert!(!s.contains("forward"), "{s}");
 }
@@ -681,8 +698,8 @@ fn strip_rust_comments_removes_line_and_nested_block_comments() {
     assert_eq!(strip_rust_comments("a // x\nb"), "a \nb");
     let s = strip_rust_comments("a /* x /* y */ z */ b");
     assert_eq!(s.split_whitespace().collect::<Vec<_>>(), ["a", "b"]);
-    assert_eq!(strip_rust_comments("\"//no\" c"), "\"//no\" c");
-    assert_eq!(strip_rust_comments("\"/*no*/\\\"\" c"), "\"/*no*/\\\"\" c");
+    assert_eq!(strip_rust_comments("\"//no\" c"), "\"    \" c");
+    assert_eq!(strip_rust_comments("\"/*no*/\\\"\" c"), "\"        \" c");
 }
 
 /// Whether the innermost open `(`/`{` before the end of `head` is a
@@ -749,6 +766,11 @@ fn forwards_operation_reference_rejects_dropping_handlers() {
     assert!(!forwards_operation_reference(block_comment));
     let nested_comment = "fn h(body: &Option<B>) {\n    /* outer /* inner */ let operation_reference = body.as_ref().and_then(|b| b.operation_reference); self.cancel_core(k, operation_reference); */\n    self.cancel_core(k, None)\n}";
     assert!(!forwards_operation_reference(nested_comment));
+    // Text inside string literals must never pass for code (#1606 review).
+    let in_string = "fn h(body: &Option<B>) {\n    tracing::info!(\"body.operation_reference -> cancel_core(k, operation_reference)\");\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(in_string));
+    let in_raw_string = "fn h(body: &Option<B>) {\n    let m = r#\"body.operation_reference; f(k, operation_reference)\"#;\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(in_raw_string));
     let read_live_use_commented = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    self.cancel_core(k, /* operation_reference */ None)\n}";
     assert!(!forwards_operation_reference(read_live_use_commented));
 }
