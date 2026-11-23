@@ -702,6 +702,54 @@ fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
         "tags": [], "business_id": null
     }}));
 
+    // ---- Scalar-list routing (#1755) ---------------------------------------
+    // `list contains` coerces a non-null scalar to a singleton list (DMN: a
+    // scalar in a list context), so a gateway condition on a scalar route head
+    // ROUTES instead of raising an incident. The previous release rejects the
+    // scalar with an evaluation error, so the same command journals different
+    // events across the two builds — a ratified upgrade-boundary divergence
+    // (`divergence-allowlist.json`), never a rolling upgrade.
+    g.scenario("scalar-list-routing");
+    let scalar_route = ProcessBuilder::new("scalar-route")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .exclusive_gateway("merge")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "scalar-m1", "=key")
+        .message_intermediate_catch_event("onM2", "scalar-m2", "=key")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "merge")
+        .connect("fork", "merge")
+        .connect("merge", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "join")
+        .connect("onM2", "join")
+        // The corpus shape (#1755): the condition reads the route schedule's
+        // head `route[1]` — the activation's single-entry choice, a bare
+        // scalar once dereferenced.
+        .connect_when("join", "e", "=list contains(route[1], \"f8\")")
+        .connect_when("join", "e", "=list contains(route[1], \"f9\")")
+        .build()
+        .expect("scalar-route");
+    g.push(Command::DeployProcess(scalar_route));
+    let sr = g.push(create(
+        "scalar-route",
+        vars(&[
+            ("key", Value::Str("k".into())),
+            ("route", Value::List(vec![Value::Str("f8".into())])),
+        ]),
+    ));
+    let sr_instance = find(&sr, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
+    g.push(Command::correlate_message("scalar-m1", "k"));
+    g.push(Command::correlate_message("scalar-m2", "k"));
+    assert!(
+        g.engine.is_completed(sr_instance),
+        "the scalar head choice routes the fired inclusive join"
+    );
+
     // ---- Suspend / resume / cancel ----------------------------------------
     g.scenario("suspend-resume-cancel");
     g.push(Command::SuspendInstance {

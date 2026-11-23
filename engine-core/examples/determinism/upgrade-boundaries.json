@@ -17,7 +17,8 @@
       "entries": [
         "multi-instance-user-tasks (#1528)",
         "newest-variants (#1528)",
-        "multi-instance-cancel-remaining (#1528)"
+        "multi-instance-cancel-remaining (#1528)",
+        "scalar-list-routing (#1755)"
       ]
     }
   ]

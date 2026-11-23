@@ -483,8 +483,9 @@ mod legacy_element_wide {
     }
 }
 
-/// #1755 (fuzz finding, corpus case `Gen_f598076d15`): an inclusive join whose
-/// two arrivals come from two activations of the SAME event-based gateway.
+/// The #1755 topology (fuzz finding, corpus case `Gen_f598076d15`): an
+/// inclusive join whose two arrivals come from two activations of the SAME
+/// event-based gateway.
 ///
 /// `start -> fork(and) => merge(xor) -> gw(event-based) -> { onM1, onM2 } -> join(or) -> end`
 ///
@@ -495,15 +496,8 @@ mod legacy_element_wide {
 /// of its incoming flows are then taken, so Zeebe's
 /// `canActivateInclusiveGateway` rule 1 accepts unconditionally, the join
 /// fires once, routes its conditional flow, and the instance completes.
-///
-/// The join's outgoing conditions read the head of the route schedule
-/// (`route[1]`), which the scenario holds as the join's single-entry choice —
-/// a bare string once dereferenced. Nano evaluated `list contains` on that
-/// scalar as an error, raised an `ExpressionEvaluation` incident on the fired
-/// join, and stranded the instance.
-#[test]
-fn inclusive_join_fed_by_two_event_gateway_activations_fires() {
-    let def = ProcessBuilder::new("evt-or-join")
+fn evt_gateway_or_join(conditions: [&str; 2]) -> ProcessDefinition {
+    ProcessBuilder::new("evt-or-join")
         .start_event("start")
         .parallel_gateway("fork")
         .exclusive_gateway("merge")
@@ -520,13 +514,88 @@ fn inclusive_join_fed_by_two_event_gateway_activations_fires() {
         .connect("gw", "onM2")
         .connect("onM1", "join")
         .connect("onM2", "join")
-        // The corpus's per-flow route conditions (generate.mjs): the head
-        // choice `route[1]` is the activation's chosen flow-id list — here a
-        // single entry, so `route[1]` is the bare string "f8".
-        .connect_when("join", "end", "=list contains(route[1], \"f8\")")
-        .connect_when("join", "end", "=list contains(route[1], \"f9\")")
+        .connect_when("join", "end", conditions[0])
+        .connect_when("join", "end", conditions[1])
         .build()
+        .unwrap()
+}
+
+/// The #1755 corpus reproducer itself: the corpus's per-flow route conditions
+/// (generate.mjs) read the head of the gateway's remaining choice sequence —
+/// `route_G3[1]`, the activation's chosen flow-id LIST — and the schedule
+/// arrives NESTED (`route = [["f8"]]`) on the M2 publish: the enumeration
+/// (enumerate.mjs) buffers the join's route suffix while no job has completed
+/// yet and folds it into the message's variables, which the engine merges
+/// into the instance before the resumed token drains to the join. The
+/// stranded instance was the enumeration never delivering that suffix on a
+/// publish (the join read a stale/absent route), not the engine's routing:
+/// with the nested head delivered on M2, `list contains(route[1], "f8")`
+/// routes and the instance completes.
+#[test]
+fn inclusive_join_routes_the_nested_route_delivered_on_the_m2_publish() {
+    let def = evt_gateway_or_join([
+        "=list contains(route[1], \"f8\")",
+        "=list contains(route[1], \"f9\")",
+    ]);
+    let mut engine = Engine::new();
+    let key = start(&mut engine, def, vars(&[("key", Value::Str("k".into()))]));
+
+    let first = engine
+        .apply_command(Command::correlate_message("M1", "k"))
         .unwrap();
+    assert_eq!(completions(&first, "onM1"), 1, "M1 resumes one race");
+    assert!(
+        !first
+            .iter()
+            .any(|e| matches!(e, Event::ParallelJoinFired { .. })),
+        "the join must wait: the other race's onM2 can still reach it: {first:#?}"
+    );
+
+    // The corpus's M2 publish carries the nested route schedule (fuzz-corpus
+    // `Gen_f598076d15-shrinkr13x31-o1`): `route[1]` is the list `["f8"]`.
+    let second = engine
+        .apply_command(Command::correlate_message_with(
+            "M2",
+            "k",
+            vars(&[(
+                "route",
+                Value::List(vec![Value::List(vec![Value::Str("f8".into())])]),
+            )]),
+        ))
+        .unwrap();
+    assert_eq!(completions(&second, "onM2"), 1, "M2 resumes the other race");
+    assert_eq!(
+        second
+            .iter()
+            .filter(|e| matches!(e, Event::ParallelJoinFired { .. }))
+            .count(),
+        1,
+        "both incoming flows taken: the inclusive join fires exactly once: {second:#?}"
+    );
+    assert_eq!(completions(&second, "join"), 1);
+    assert!(
+        !second
+            .iter()
+            .any(|e| matches!(e, Event::IncidentRaised { .. })),
+        "the fired join routes its nested head choice, raising no incident: {second:#?}"
+    );
+    assert!(
+        engine.is_completed(key),
+        "the instance completes once the join routes to `end`"
+    );
+}
+
+/// The scalar-coercion half of #1755, kept separately from the corpus
+/// reproducer: a route variable dereferenced to its single-entry head choice
+/// is a bare scalar, and `list contains` on it compares against the scalar
+/// (DMN: a scalar is a singleton list in a list context) instead of raising
+/// an `ExpressionEvaluation` incident that strands the fired join.
+#[test]
+fn inclusive_join_routes_a_scalar_head_choice_without_an_incident() {
+    let def = evt_gateway_or_join([
+        "=list contains(route[1], \"f8\")",
+        "=list contains(route[1], \"f9\")",
+    ]);
     let mut engine = Engine::new();
     let key = start(
         &mut engine,
