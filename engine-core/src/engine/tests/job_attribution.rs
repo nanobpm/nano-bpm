@@ -1069,14 +1069,46 @@ fn cascade_deadlines_ignore_unrelated_activated_jobs_on_both_iteration_sides() {
         deadlines.into_iter().collect::<Vec<_>>(),
         vec![(target, 1_000)]
     );
-    // Complete the others: now activations (1) are fewer than reached job
-    // history, exercising the activation-set side.
-    for job in &activated[1..] {
-        e.apply_command(Command::complete_job(job.key)).unwrap();
-    }
+    // Activation-set side: a sequential three-job process where the target
+    // instance accumulates retained job history (two completed jobs) while an
+    // unrelated instance keeps a live activation, so reached jobs (3) exceed
+    // live activations (2) and the unrelated job must be filtered out.
+    let seq = ProcessBuilder::new("seq3")
+        .start_event("s")
+        .service_task("t1", "seq_a")
+        .service_task("t2", "seq_b")
+        .service_task("t3", "seq_c")
+        .end_event("e")
+        .connect("s", "t1")
+        .connect("t1", "t2")
+        .connect("t2", "t3")
+        .connect("t3", "e")
+        .build()
+        .unwrap();
+    let mut e = Engine::new();
+    e.apply_command(Command::SetLenientCompletion { lenient: true })
+        .unwrap();
+    e.apply_command(Command::DeployProcess(seq)).unwrap();
+    e.apply_command(Command::create_instance("seq3")).unwrap();
+    e.apply_command(Command::create_instance("seq3")).unwrap();
+    let firsts = e.activate_jobs("seq_a", "W", 2, 1_000, 0);
+    assert_eq!(firsts.len(), 2);
+    let (mine, other) = (firsts[0].key, firsts[1].key);
+    let instance_key = e.state().jobs[&mine].instance_key;
+    e.apply_command(Command::complete_job(mine)).unwrap();
+    let second = e.activate_jobs("seq_b", "W", 1, 2_000, 0)[0].key;
+    e.apply_command(Command::complete_job(second)).unwrap();
+    let target = e.activate_jobs("seq_c", "W", 1, 3_000, 0)[0].key;
+    assert_eq!(e.state().jobs[&target].instance_key, instance_key);
+    let reached_jobs = e.state().jobs_by_instance[&instance_key].len();
+    assert!(
+        reached_jobs > e.state().activated_jobs.len(),
+        "precondition: activation-set branch ({reached_jobs} reached jobs)"
+    );
+    assert!(e.state().activated_jobs.contains(&other));
     let deadlines = e.resolve_cascade_terminal_deadlines(&Command::CancelInstance { instance_key });
     assert_eq!(
         deadlines.into_iter().collect::<Vec<_>>(),
-        vec![(target, 1_000)]
+        vec![(target, 3_000)]
     );
 }
