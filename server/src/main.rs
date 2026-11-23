@@ -7920,8 +7920,10 @@ fn apply_create_instance_direct(
     journal: &mut Journal,
     command: Command,
     fallback_process_id: &str,
+    operation_reference: Option<i64>,
 ) -> Result<CreatedInstanceDirect, EngineError> {
-    let (events, commit) = journal.apply_command_at(command, now_millis())?;
+    let (events, commit) =
+        journal.apply_command_ref_at(command, now_millis(), operation_reference)?;
     let instance_key = events
         .iter()
         .find_map(Event::instance_key)
@@ -8028,6 +8030,19 @@ impl ServerImpl {
             ),
         };
         let await_completion = await_completion.unwrap_or(false);
+
+        // The caller's `operationReference` (#1602): both instruction variants
+        // carry it; it is threaded onto the command envelope so every record
+        // the create produces — locally, through Raft, or on a forwarded peer —
+        // is stamped with it (#1556's generic propagation).
+        let operation_reference = match body {
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                b,
+            ) => b.operation_reference,
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
+                b,
+            ) => b.operation_reference,
+        };
 
         // Decode the request variables off the engine thread so the 50 KB JSON →
         // engine `Value` conversion runs in parallel rather than serially on the
@@ -8146,6 +8161,7 @@ impl ServerImpl {
                         await_completion,
                         fetch_variables.cloned(),
                         request_timeout,
+                        operation_reference,
                     )
                     .await
                 {
@@ -8163,6 +8179,7 @@ impl ServerImpl {
                         await_completion,
                         fetch_variables.cloned(),
                         request_timeout,
+                        operation_reference,
                     )
                     .await);
             }
@@ -8178,6 +8195,7 @@ impl ServerImpl {
                     await_completion,
                     fetch_variables.cloned(),
                     request_timeout,
+                    operation_reference,
                 )
                 .await);
         }
@@ -8229,6 +8247,7 @@ impl ServerImpl {
                     await_completion,
                     fetch_variables.cloned(),
                     request_timeout,
+                    operation_reference,
                 )
                 .await
             {
@@ -8255,6 +8274,7 @@ impl ServerImpl {
                     await_completion,
                     fetch_variables.cloned(),
                     request_timeout,
+                    operation_reference,
                 )
                 .await);
         }
@@ -8276,33 +8296,38 @@ impl ServerImpl {
             // (#1582): it stays charged until the actor finishes the create,
             // even if this caller is cancelled first.
             let accounting = CreateAccounting::enter(self, payload_bytes);
-            let rx = self.submit_create_detached(accounting, move |engine| {
-                // Resolve the version selector to a concrete process id +
-                // (key | version). A by-key request is matched across all
-                // retained versions; an unknown key is a 400 (the create
-                // endpoint has no 404 variant).
-                let (process_id, sel_key, sel_ver) =
-                    resolve_create_selector(engine.state(), by_id, by_key, by_version)?;
-                let created = apply_create_instance_direct(
-                    engine,
-                    Command::create_instance_versioned(
-                        process_id.clone(),
-                        variables,
-                        tags_vec,
-                        business_id_str,
-                        sel_key,
-                        sel_ver,
-                    ),
-                    &process_id,
-                )
-                .map_err(|e| match e {
-                    EngineError::ProcessNotFound { process_id } => {
-                        (400, format!("No deployed process with id '{process_id}'."))
-                    }
-                    other => (500, other.to_string()),
-                })?;
-                Ok((process_id, created))
-            });
+            let rx = self.submit_create_detached(
+                accounting,
+                move |engine| {
+                    // Resolve the version selector to a concrete process id +
+                    // (key | version). A by-key request is matched across all
+                    // retained versions; an unknown key is a 400 (the create
+                    // endpoint has no 404 variant).
+                    let (process_id, sel_key, sel_ver) =
+                        resolve_create_selector(engine.state(), by_id, by_key, by_version)?;
+                    let created = apply_create_instance_direct(
+                        engine,
+                        Command::create_instance_versioned(
+                            process_id.clone(),
+                            variables,
+                            tags_vec,
+                            business_id_str,
+                            sel_key,
+                            sel_ver,
+                        ),
+                        &process_id,
+                        operation_reference,
+                    )
+                    .map_err(|e| match e {
+                        EngineError::ProcessNotFound { process_id } => {
+                            (400, format!("No deployed process with id '{process_id}'."))
+                        }
+                        other => (500, other.to_string()),
+                    })?;
+                    Ok((process_id, created))
+                },
+                operation_reference,
+            );
             Self::observe_create(rx).await
         };
 
@@ -11900,13 +11925,14 @@ impl ServerImpl {
         &self,
         accounting: CreateAccounting,
         apply: F,
+        operation_reference: Option<i64>,
     ) -> tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>
     where
         F: FnOnce(&mut Journal) -> Result<T, (u16, String)> + Send + 'static,
         T: CreateOutcome + Send + 'static,
     {
         let engine = self.engine.for_create().clone();
-        self.submit_create_detached_on(accounting, engine, apply)
+        self.submit_create_detached_on(accounting, engine, apply, operation_reference)
     }
 
     /// [`Self::submit_create_detached`] onto a caller-chosen create actor.
@@ -11919,6 +11945,7 @@ impl ServerImpl {
         accounting: CreateAccounting,
         engine: DeepthiHandle,
         apply: F,
+        operation_reference: Option<i64>,
     ) -> tokio::sync::oneshot::Receiver<Result<T, (u16, String)>>
     where
         F: FnOnce(&mut Journal) -> Result<T, (u16, String)> + Send + 'static,
@@ -11954,9 +11981,12 @@ impl ServerImpl {
                 // open (the create-then-publish ordering clients rely on,
                 // #1582). The wait is bounded by the re-drive budget, and a
                 // dropped receiver (caller cancelled) is fine: routing already
-                // ran to completion inside this detached task. The create path
-                // maps no `operationReference` yet (#1602) — `None`.
-                server.drive_subscription_routing(routable, None).await;
+                // ran to completion inside this detached task. The create's own
+                // `operationReference` (#1602) rides the routed follow-ups, so
+                // the records they produce on other partitions carry it too.
+                server
+                    .drive_subscription_routing(routable, operation_reference)
+                    .await;
                 server.signal_jobs_available();
                 let _ = tx.send(outcome);
                 return;
@@ -12972,6 +13002,7 @@ impl ServerImpl {
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
         origin_protocol: &str,
+        operation_reference: Option<i64>,
     ) -> Result<serde_json::Value, (u16, String)> {
         // Placement protection (ADR 0014): a node that is saturated sheds the
         // forwarded create back to the ingress node (503 with the placement-shed
@@ -13002,8 +13033,16 @@ impl ServerImpl {
         // the returned commit is already ready).
         let (process_id, created) = if !self.raft.is_empty() {
             let (process_id, version, definition_key, instance_key, sync_completed, routable) =
-                self.raft_create_core(by_id, by_key, None, variables, tags, business_id)
-                    .await?;
+                self.raft_create_core(
+                    by_id,
+                    by_key,
+                    None,
+                    variables,
+                    tags,
+                    business_id,
+                    operation_reference,
+                )
+                .await?;
             (
                 process_id,
                 CreatedInstanceDirect {
@@ -13025,29 +13064,34 @@ impl ServerImpl {
             // The admission charge is TRANSFERRED into the detached owner
             // (#1582), held until the actor finishes the create.
             let accounting = CreateAccounting::enter(self, payload_bytes);
-            let rx = self.submit_create_detached(accounting, move |engine| {
-                let (process_id, sel_key, sel_ver) =
-                    resolve_create_selector(engine.state(), by_id, by_key, None)?;
-                let created = apply_create_instance_direct(
-                    engine,
-                    Command::create_instance_versioned(
-                        process_id.clone(),
-                        variables,
-                        tags,
-                        business_id,
-                        sel_key,
-                        sel_ver,
-                    ),
-                    &process_id,
-                )
-                .map_err(|e| match e {
-                    EngineError::ProcessNotFound { process_id } => {
-                        (400, format!("No deployed process with id '{process_id}'."))
-                    }
-                    other => (500, other.to_string()),
-                })?;
-                Ok((process_id, created))
-            });
+            let rx = self.submit_create_detached(
+                accounting,
+                move |engine| {
+                    let (process_id, sel_key, sel_ver) =
+                        resolve_create_selector(engine.state(), by_id, by_key, None)?;
+                    let created = apply_create_instance_direct(
+                        engine,
+                        Command::create_instance_versioned(
+                            process_id.clone(),
+                            variables,
+                            tags,
+                            business_id,
+                            sel_key,
+                            sel_ver,
+                        ),
+                        &process_id,
+                        operation_reference,
+                    )
+                    .map_err(|e| match e {
+                        EngineError::ProcessNotFound { process_id } => {
+                            (400, format!("No deployed process with id '{process_id}'."))
+                        }
+                        other => (500, other.to_string()),
+                    })?;
+                    Ok((process_id, created))
+                },
+                operation_reference,
+            );
             Self::observe_create(rx).await?
         };
         let CreatedInstanceDirect {
@@ -13110,6 +13154,7 @@ impl ServerImpl {
         await_completion: bool,
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
+        operation_reference: Option<i64>,
     ) -> apis::process_instance::CreateProcessInstanceResponse {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
         let outcome = self
@@ -13123,6 +13168,7 @@ impl ServerImpl {
                 await_completion,
                 fetch_variables,
                 request_timeout,
+                operation_reference,
             )
             .await;
         match outcome {
@@ -13177,6 +13223,7 @@ impl ServerImpl {
         await_completion: bool,
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
+        operation_reference: Option<i64>,
     ) -> ForwardCreateOutcome {
         let res = match self.peer_link(node).await {
             Ok(link) => {
@@ -13190,6 +13237,7 @@ impl ServerImpl {
                     fetch_variables,
                     request_timeout,
                     "rest",
+                    operation_reference,
                 )
                 .await
             }
@@ -13289,6 +13337,7 @@ impl ServerImpl {
         await_completion: bool,
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
+        operation_reference: Option<i64>,
     ) -> Option<apis::process_instance::CreateProcessInstanceResponse> {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
         let mut tried: Vec<u32> = Vec::new();
@@ -13310,6 +13359,7 @@ impl ServerImpl {
                     await_completion,
                     fetch_variables.clone(),
                     request_timeout,
+                    operation_reference,
                 )
                 .await;
             match outcome {
@@ -13368,6 +13418,7 @@ impl ServerImpl {
         business_id: Option<String>,
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
+        operation_reference: Option<i64>,
     ) -> apis::process_instance::CreateProcessInstanceResponse {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
         let started = std::time::Instant::now();
@@ -13409,6 +13460,7 @@ impl ServerImpl {
                     fetch_variables.clone(),
                     request_timeout,
                     "stream",
+                    operation_reference,
                 )
                 .await;
 
@@ -22468,28 +22520,33 @@ impl ServerImpl {
             // The admission charge is TRANSFERRED into the detached owner
             // (#1582), held until the actor finishes the create.
             let accounting = CreateAccounting::enter(self, payload_bytes);
-            let rx = self.submit_create_detached(accounting, move |engine| {
-                let (process_id, sel_key, sel_ver) =
-                    resolve_create_selector(engine.state(), by_id, by_key, None)?;
-                apply_create_instance_direct(
-                    engine,
-                    Command::create_instance_versioned(
-                        process_id.clone(),
-                        variables,
-                        Vec::new(),
+            let rx = self.submit_create_detached(
+                accounting,
+                move |engine| {
+                    let (process_id, sel_key, sel_ver) =
+                        resolve_create_selector(engine.state(), by_id, by_key, None)?;
+                    apply_create_instance_direct(
+                        engine,
+                        Command::create_instance_versioned(
+                            process_id.clone(),
+                            variables,
+                            Vec::new(),
+                            None,
+                            sel_key,
+                            sel_ver,
+                        ),
+                        &process_id,
                         None,
-                        sel_key,
-                        sel_ver,
-                    ),
-                    &process_id,
-                )
-                .map_err(|e| match e {
-                    EngineError::ProcessNotFound { process_id } => {
-                        (400, format!("No deployed process with id '{process_id}'."))
-                    }
-                    other => (500, other.to_string()),
-                })
-            });
+                    )
+                    .map_err(|e| match e {
+                        EngineError::ProcessNotFound { process_id } => {
+                            (400, format!("No deployed process with id '{process_id}'."))
+                        }
+                        other => (500, other.to_string()),
+                    })
+                },
+                None,
+            );
             Self::observe_create(rx).await?
         };
         // The stream create reports only the key + completion; the projected
@@ -22610,6 +22667,9 @@ impl ServerImpl {
                 None,
                 None,
                 "stream",
+                // The stream create protocol carries no `operationReference`
+                // (only the REST instruction does, #1602) — `None`.
+                None,
             )
             .await
             .map_err(|e| (502u16, e.to_string()))?;
@@ -22741,6 +22801,9 @@ impl ServerImpl {
                 variables.clone(),
                 Vec::new(),
                 None,
+                // The stream create protocol carries no `operationReference`
+                // (only the REST instruction does, #1602) — `None`.
+                None,
             )
             .await
         {
@@ -22802,6 +22865,7 @@ impl ServerImpl {
         await_completion: bool,
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
+        operation_reference: Option<i64>,
     ) -> apis::process_instance::CreateProcessInstanceResponse {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
         // Non-await creates use the bounded, leader-re-resolving forward so a
@@ -22819,6 +22883,7 @@ impl ServerImpl {
                     business_id,
                     fetch_variables,
                     request_timeout,
+                    operation_reference,
                 )
                 .await;
         }
@@ -22834,6 +22899,7 @@ impl ServerImpl {
                     await_completion,
                     fetch_variables,
                     request_timeout,
+                    operation_reference,
                 )
                 .await
             }
@@ -22872,6 +22938,7 @@ impl ServerImpl {
         await_completion: bool,
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
+        operation_reference: Option<i64>,
     ) -> apis::process_instance::CreateProcessInstanceResponse {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
 
@@ -22887,6 +22954,7 @@ impl ServerImpl {
                     await_completion,
                     fetch_variables,
                     request_timeout,
+                    operation_reference,
                 )
                 .await;
         }
@@ -22899,6 +22967,7 @@ impl ServerImpl {
                 variables,
                 tags.clone(),
                 business_id.clone(),
+                operation_reference,
             )
             .await;
         let (process_id, version, definition_key, instance_key, sync_completed, _routable) =
@@ -22917,6 +22986,7 @@ impl ServerImpl {
                             await_completion,
                             fetch_variables,
                             request_timeout,
+                            operation_reference,
                         )
                         .await;
                 }
@@ -22976,6 +23046,7 @@ impl ServerImpl {
     /// 503 if this node leads no partition (the caller decides whether to forward
     /// or shed).
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     async fn raft_create_core(
         &self,
         by_id: Option<String>,
@@ -22984,6 +23055,7 @@ impl ServerImpl {
         variables: std::collections::BTreeMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
+        operation_reference: Option<i64>,
     ) -> Result<
         (
             String,
@@ -23044,7 +23116,7 @@ impl ServerImpl {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let proposed = part
-                .propose_result(
+                .propose_result_ref(
                     Command::create_instance_versioned(
                         process_id_for_propose,
                         variables,
@@ -23054,6 +23126,7 @@ impl ServerImpl {
                         sel_ver,
                     ),
                     now_millis(),
+                    operation_reference,
                 )
                 .await
                 .map_err(|e| match e {
@@ -23099,11 +23172,11 @@ impl ServerImpl {
                     // budget, and a dropped receiver (caller cancelled) is fine:
                     // routing already ran to completion inside this task.
                     if !routable.is_empty() {
-                        // The synced spec's create-request instruction carries
-                        // `operationReference` on the *instruction*, but the
-                        // create path does not map it yet (#1602) — `None`.
+                        // The create's own `operationReference` (#1602) rides the
+                        // routed follow-ups too, so the records they produce on
+                        // other partitions carry the same reference.
                         server
-                            .drive_subscription_routing(routable.clone(), None)
+                            .drive_subscription_routing(routable.clone(), operation_reference)
                             .await;
                     }
                     server.signal_jobs_available();
@@ -23188,7 +23261,7 @@ impl ServerImpl {
             )
         };
         match self
-            .forward_create_bounded(by_id, by_key, wire_vars, Vec::new(), None, None, None)
+            .forward_create_bounded(by_id, by_key, wire_vars, Vec::new(), None, None, None, None)
             .await
         {
             R::Status200_TheProcessInstanceWasCreated(result) => result
@@ -43592,6 +43665,7 @@ mod clustered_startup_tests {
                 false,
                 None,
                 None,
+                None,
             )
             .await;
         let result = match resp {
@@ -45859,6 +45933,26 @@ mod clustered_startup_tests {
         ServerImpl,
         Vec<tokio::task::JoinHandle<()>>,
     ) {
+        boot_rf3_intake_cluster_inner(digest, leader_durable, activation, spill, extra, None).await
+    }
+
+    /// Backing helper for every RF=3 cluster boot. `journal_root`, when set,
+    /// backs each node's partitions with a disk-segmented shared writer under
+    /// `<journal_root>/node<i>` (instead of in-memory journals), so a test can
+    /// read the persisted record envelopes each replica journaled.
+    async fn boot_rf3_intake_cluster_inner(
+        digest: bool,
+        leader_durable: bool,
+        activation: Option<ActivationPolicy>,
+        spill: Option<fn() -> SpillConfig>,
+        extra: Vec<ProcessDefinition>,
+        journal_root: Option<std::path::PathBuf>,
+    ) -> (
+        ServerImpl,
+        ServerImpl,
+        ServerImpl,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
         let mut listeners = Vec::new();
         let mut ports = Vec::new();
         for i in 0..3u32 {
@@ -45880,11 +45974,31 @@ mod clustered_startup_tests {
                 num_partitions: 3,
                 replication_factor: 3,
             };
-            let journals: Vec<Journal> = topology
-                .local_partitions()
-                .iter()
-                .map(|p| Journal::in_memory_partition(*p))
-                .collect();
+            let owned = topology.local_partitions();
+            let journals: Vec<Journal> = match &journal_root {
+                None => owned
+                    .iter()
+                    .map(|p| Journal::in_memory_partition(*p))
+                    .collect(),
+                Some(root) => {
+                    let dir = root.join(format!("node{node_id}"));
+                    let varstore = Arc::new(varstore::VarStore::open(None).expect("varstore"));
+                    let (writer, recovery) =
+                        SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore))
+                            .expect("open segmented writer");
+                    let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+                        recovery.engines.into_iter().collect();
+                    owned
+                        .iter()
+                        .map(|&p| {
+                            let engine = engines
+                                .remove(&p)
+                                .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                            Journal::from_engine_shared(p, engine, true, &writer)
+                        })
+                        .collect()
+                }
+            };
             build_server_in_memory(journals, topology)
         };
         let mut node0 = build_node(0);
@@ -48140,6 +48254,120 @@ mod clustered_startup_tests {
                 }
             }
         }
+    }
+
+    /// #1602 (PR #1851 review): under Raft (RF=3) a REST create's
+    /// `operationReference` must survive the Raft proposal — both for a create
+    /// placed on a partition this gateway leads AND for one forwarded to a peer
+    /// leader — and land on the persisted record envelopes the partition's
+    /// leader journals. (Follower replicas host in-memory replica engines —
+    /// `replica_engine_for` — and persist nothing but the Raft log entry, whose
+    /// `RaftRequest.operation_reference` is the same value the leader applied.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raft_rest_create_persists_operation_reference_on_the_leader() {
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        let root = std::env::temp_dir().join(format!(
+            "nanobpmn-1602-raft-ref-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let (node0, node1, node2, _h) =
+            boot_rf3_intake_cluster_inner(false, false, None, None, Vec::new(), Some(root.clone()))
+                .await;
+
+        const REF: i64 = 0x1602_0003;
+        // Creates round-robin over the 3 partitions: node 0 leads partition 0
+        // (local Raft create) and forwards the rest to the peer leaders.
+        let mut instances = std::collections::BTreeMap::new();
+        for _ in 0..6 {
+            let mut instruction =
+                models::ProcessInstanceCreationInstructionById::new("intake".to_string());
+            instruction.operation_reference = Some(REF);
+            let body = models::ProcessInstanceCreationInstruction::from(instruction);
+            let resp = node0
+                .create_process_instance_impl(&body)
+                .await
+                .expect("rest create returns a response");
+            let Resp::Status200_TheProcessInstanceWasCreated(result) = resp else {
+                panic!("rest create through raft should be 200, got {resp:?}");
+            };
+            let key: u64 = result
+                .process_instance_key
+                .0
+                .parse()
+                .expect("numeric instance key");
+            instances.insert(key, nanobpmn_engine_core::partition_of(key));
+        }
+        let partitions: std::collections::BTreeSet<u64> = instances.values().copied().collect();
+        assert!(
+            partitions.contains(&0) && partitions.len() > 1,
+            "the creates must cover a local (partition 0) and a forwarded placement: {partitions:?}"
+        );
+
+        let read_records = |node: u32| -> Vec<nanobpmn_engine_core::Record> {
+            std::fs::read_dir(root.join(format!("node{node}")))
+                .expect("read journal dir")
+                .map(|e| e.expect("dir entry").path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+                })
+                .flat_map(|p| seglog::read_segment_records(&p).expect("read segment"))
+                .collect()
+        };
+        // Each partition's leader (node `p` leads partition `p`) must journal
+        // every create placed on it, each of its records carrying REF.
+        for node in 0..3u32 {
+            let led: std::collections::BTreeMap<u64, u64> = instances
+                .iter()
+                .filter(|(_, p)| **p == u64::from(node))
+                .map(|(k, p)| (*k, *p))
+                .collect();
+            let mut records = read_records(node);
+            for _ in 0..500 {
+                let all_created = led.keys().all(|k| {
+                    records.iter().any(|r| {
+                        r.event.instance_key() == Some(*k)
+                            && matches!(r.event, Event::ProcessInstanceCreated { .. })
+                    })
+                });
+                if all_created {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                records = read_records(node);
+            }
+            for (key, partition) in &led {
+                let create_records: Vec<_> = records
+                    .iter()
+                    .filter(|r| r.event.instance_key() == Some(*key))
+                    .collect();
+                assert!(
+                    create_records
+                        .iter()
+                        .any(|r| matches!(r.event, Event::ProcessInstanceCreated { .. })),
+                    "node {node} journals instance {key} (partition {partition}): {create_records:?}"
+                );
+                for r in &create_records {
+                    assert_eq!(
+                        r.operation_reference,
+                        Some(REF),
+                        "node {node}, partition {partition}: every create record carries the reference: {r:?}"
+                    );
+                }
+            }
+        }
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -52734,6 +52962,123 @@ mod subscription_placement_tests {
         );
     }
 
+    /// #1602 (red-first): a REST `createProcessInstance` carrying an
+    /// `operationReference` on the instruction stamps it on EVERY record the
+    /// create produces — the `ProcessInstanceCreated` and the whole element
+    /// cascade — journaled as record envelopes, exactly like Zeebe's generic
+    /// propagation (#1556). The create's cross-partition subscription routing
+    /// inherits the same reference.
+    ///
+    /// Disk-backed (segmented shared writer): the assertion reads the journaled
+    /// record envelopes, not just the in-memory engine output, so it proves the
+    /// reference survives persistence.
+    #[tokio::test]
+    async fn rest_create_stamps_operation_reference_on_every_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-1602-create-ref-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+        let varstore = Arc::new(varstore::VarStore::open(None).unwrap());
+        let (writer, recovery) =
+            SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore)).unwrap();
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|&p| {
+                let engine = engines
+                    .remove(&p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                Journal::from_engine_shared(p, engine, true, &writer)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the message-catch process deploys onto every partition");
+
+        const REF: i64 = 0x1602;
+        let mut instruction =
+            models::ProcessInstanceCreationInstructionById::new("await-payment".to_string());
+        instruction.operation_reference = Some(REF);
+        instruction.variables = Some(std::collections::HashMap::from([(
+            "orderId".to_string(),
+            types::Object(serde_json::Value::String("order-1602".to_string())),
+        )]));
+        let body =
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                instruction,
+            );
+        let resp = server
+            .create_process_instance_impl(&body)
+            .await
+            .expect("create returns a response");
+        let apis::process_instance::CreateProcessInstanceResponse::Status200_TheProcessInstanceWasCreated(result) =
+            resp
+        else {
+            panic!("create must succeed: {resp:?}");
+        };
+        let instance_key: u64 = result
+            .process_instance_key
+            .0
+            .parse()
+            .expect("numeric instance key");
+
+        // Every journaled record of the create cascade carries REF. The deploy
+        // records (unreferenced) prove the stamp is the create's, not a blanket
+        // partition-wide tag.
+        drop(server);
+        let records: Vec<nanobpmn_engine_core::Record> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| seglog::read_segment_records(&p).unwrap())
+            .collect();
+
+        let create_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.event.instance_key() == Some(instance_key))
+            .collect();
+        assert!(
+            create_records
+                .iter()
+                .any(|r| matches!(r.event, Event::ProcessInstanceCreated { .. })),
+            "the create produced the instance: {create_records:?}"
+        );
+        for record in &create_records {
+            assert_eq!(
+                record.operation_reference,
+                Some(REF),
+                "every record of the create cascade carries the reference: {record:?}"
+            );
+        }
+        assert!(
+            records.iter().any(|r| r.operation_reference.is_none()),
+            "the unreferenced deploy records prove the stamp is the create's own"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1600 (#1556 step 4, red-first): a publish carrying an
     /// `operationReference` stamps it on EVERY record the publish produces —
     /// including the records produced on OTHER partitions by the routed
@@ -53115,23 +53460,32 @@ mod subscription_placement_tests {
         variables.insert("orderId".to_string(), Value::Str(order.clone()));
         // The caller is CANCELLED immediately: it never observes the outcome.
         let accounting = CreateAccounting::enter(&server, 0);
-        let rx = server.submit_create_detached(accounting, move |engine| {
-            let (process_id, sel_key, sel_ver) =
-                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
-            apply_create_instance_direct(
-                engine,
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    variables,
-                    Vec::new(),
+        let rx = server.submit_create_detached(
+            accounting,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
                     None,
-                    sel_key,
-                    sel_ver,
-                ),
-                &process_id,
-            )
-            .map_err(|e| (500, e.to_string()))
-        });
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
         drop(rx);
 
         // The detached owner still applied the create, awaited durability, and
@@ -53172,23 +53526,32 @@ mod subscription_placement_tests {
     async fn detached_create_reports_apply_errors() {
         let server = single_node_multi_partition();
         let accounting = CreateAccounting::enter(&server, 0);
-        let rx = server.submit_create_detached(accounting, move |engine| {
-            let (process_id, sel_key, sel_ver) =
-                resolve_create_selector(engine.state(), Some("not-deployed".into()), None, None)?;
-            apply_create_instance_direct(
-                engine,
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    std::collections::BTreeMap::new(),
-                    Vec::new(),
+        let rx = server.submit_create_detached(
+            accounting,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("not-deployed".into()),
                     None,
-                    sel_key,
-                    sel_ver,
-                ),
-                &process_id,
-            )
-            .map_err(|e| (500, e.to_string()))
-        });
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        std::collections::BTreeMap::new(),
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
         let err = match ServerImpl::observe_create(rx).await {
             Ok(_) => panic!("an unknown process id is rejected"),
             Err(err) => err,
@@ -53217,26 +53580,35 @@ mod subscription_placement_tests {
             .await
             .expect("deploy");
         let accounting = CreateAccounting::enter(&server, 0);
-        let rx = server.submit_create_detached(accounting, move |engine| {
-            let (process_id, sel_key, sel_ver) =
-                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
-            let mut created = apply_create_instance_direct(
-                engine,
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    std::collections::BTreeMap::new(),
-                    Vec::new(),
+        let rx = server.submit_create_detached(
+            accounting,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
                     None,
-                    sel_key,
-                    sel_ver,
-                ),
-                &process_id,
-            )
-            .map_err(|e| (500, e.to_string()))?;
-            // Simulate the writer dying before it could persist the create.
-            created.commit = Commit::failed();
-            Ok(created)
-        });
+                    None,
+                )?;
+                let mut created = apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        std::collections::BTreeMap::new(),
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))?;
+                // Simulate the writer dying before it could persist the create.
+                created.commit = Commit::failed();
+                Ok(created)
+            },
+            None,
+        );
         let err = match ServerImpl::observe_create(rx).await {
             Ok(_) => panic!("a create that never persisted must not be acknowledged"),
             Err(err) => err,
@@ -53313,23 +53685,33 @@ mod subscription_placement_tests {
             server.pipeline_bytes.load(Ordering::Relaxed),
             bytes_before + payload_bytes
         );
-        let rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
-            let (process_id, sel_key, sel_ver) =
-                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
-            apply_create_instance_direct(
-                engine,
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    std::collections::BTreeMap::new(),
-                    Vec::new(),
+        let rx = server.submit_create_detached_on(
+            accounting,
+            create_engine,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
                     None,
-                    sel_key,
-                    sel_ver,
-                ),
-                &process_id,
-            )
-            .map_err(|e| (500, e.to_string()))
-        });
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        std::collections::BTreeMap::new(),
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
         // Cancel the caller while its create is still QUEUED behind the barrier.
         drop(rx);
 
@@ -53413,25 +53795,34 @@ mod subscription_placement_tests {
         // the test releases it — the stand-in for a slow routing target.
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
         let accounting = CreateAccounting::enter(&server, 0);
-        let rx = server.submit_create_detached(accounting, move |engine| {
-            let (process_id, sel_key, sel_ver) =
-                resolve_create_selector(engine.state(), Some("await-payment".into()), None, None)?;
-            let mut created = apply_create_instance_direct(
-                engine,
-                Command::create_instance_versioned(
-                    process_id.clone(),
-                    variables,
-                    Vec::new(),
+        let rx = server.submit_create_detached(
+            accounting,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
                     None,
-                    sel_key,
-                    sel_ver,
-                ),
-                &process_id,
-            )
-            .map_err(|e| (500, e.to_string()))?;
-            created.commit = Commit::from_ack(ack_rx);
-            Ok(created)
-        });
+                    None,
+                )?;
+                let mut created = apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))?;
+                created.commit = Commit::from_ack(ack_rx);
+                Ok(created)
+            },
+            None,
+        );
 
         // While the durability gate is shut the observer must be UNANSWERED —
         // the reply is gated on durability, and routing has not even started.
