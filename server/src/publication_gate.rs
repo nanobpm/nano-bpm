@@ -124,18 +124,33 @@ impl PublicationGate {
         let until = tokio::time::Instant::now() + deadline;
         let key = (name.to_string(), correlation_key.to_string());
         loop {
-            // Take this key's notifier and arm it under the lock: the final
-            // release removes the entry and notifies under the same lock, so
-            // it cannot slip between the check and the await.
-            let released = match self.lock().get(&key) {
-                Some(p) => Arc::clone(&p.released),
-                None => return GateWait::Released,
+            // Look up this key's notifier AND arm it while holding the lock.
+            // Releases (and the re-registration of a cleared key, which
+            // installs a fresh notifier) also take the lock, so the armed
+            // notifier is always the one the current entry's final release
+            // will notify: no release or same-key re-registration can slip
+            // between the lookup and arming.
+            let released = {
+                let guard = self.lock();
+                match guard.get(&key) {
+                    Some(p) => Arc::clone(&p.released),
+                    None => return GateWait::Released,
+                }
             };
             let notified = released.notified();
             tokio::pin!(notified);
-            notified.as_mut().enable();
-            if !self.is_pending(name, correlation_key) {
-                return GateWait::Released;
+            {
+                let guard = self.lock();
+                match guard.get(&key) {
+                    // Arm under the lock, then re-validate identity: if the
+                    // entry was released and re-registered meanwhile, the
+                    // waiter must park on the NEW notifier, so restart.
+                    Some(p) if Arc::ptr_eq(&p.released, &released) => {
+                        notified.as_mut().enable();
+                    }
+                    Some(_) => continue,
+                    None => return GateWait::Released,
+                }
             }
             if tokio::time::timeout_at(until, notified).await.is_err() {
                 return if self.is_pending(name, correlation_key) {
@@ -262,5 +277,37 @@ mod tests {
         );
         drop(b);
         assert!(futures_util::FutureExt::now_or_never(notified.as_mut()).is_some());
+    }
+    /// A release followed by a same-key re-registration installs a fresh
+    /// notifier; a waiter must park on the current one, so releasing the new
+    /// registration wakes it long before the deadline.
+    #[tokio::test]
+    async fn same_key_reregistration_wakes_on_the_current_notifier() {
+        let gate = PublicationGate::default();
+        let first = gate.register(&[opening("m", "k")]).expect("first");
+        let stale = gate
+            .lock()
+            .get(&("m".to_string(), "k".to_string()))
+            .map(|p| Arc::clone(&p.released))
+            .expect("pending");
+        drop(first);
+        let second = gate.register(&[opening("m", "k")]).expect("second");
+        let current = gate
+            .lock()
+            .get(&("m".to_string(), "k".to_string()))
+            .map(|p| Arc::clone(&p.released))
+            .expect("pending");
+        assert!(!Arc::ptr_eq(&stale, &current));
+        let waiter = {
+            let gate = gate.clone();
+            tokio::spawn(async move { gate.wait("m", "k", Duration::from_secs(30)).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(second);
+        let out = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("woken by the current notifier, not the deadline");
+        assert_eq!(out.expect("join"), GateWait::Released);
     }
 }
