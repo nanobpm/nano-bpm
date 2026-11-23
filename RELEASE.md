@@ -11,6 +11,8 @@ This repo ships **four independent release trains**, each with its own tag schem
 
 The train table lives in code: `TRAINS` in [`scripts/release-tags.mjs`](scripts/release-tags.mjs). Its tests fail CI if a workflow's tag trigger drifts from it, or if a new tag-triggered release workflow isn't registered.
 
+**Only a release tag on `main` publishes.** Every publishing job is gated on a tag ref and first runs [`assert-release-ref`](.github/actions/assert-release-ref/action.yml), which fails unless the tag matches its train's pattern and its commit is on `main`. A manual "Run workflow" from a branch builds but publishes nothing. (Such a run once put a side-branch server into the c8ctl plugin for seven weeks: #1830.) `scripts/release-ref-gate.test.mjs` fails CI if any publishing job, including one in a new workflow, lacks either gate.
+
 Details on each are in the per-package `RELEASING.md` (see below); this document is the orchestration checklist.
 
 ## Version streams
