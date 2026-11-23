@@ -499,6 +499,48 @@ fn fn_source(name: &str) -> Option<String> {
     None
 }
 
+/// Whether a handler body (Rust source) really reads the request's
+/// `operationReference` and hands it on: comments are stripped, then a
+/// `.operation_reference` field read must be followed by a later bare use of
+/// the bound value (an argument or struct field passed onward). A mention only
+/// in a comment, or a binding that is never used (forwarding `None` instead),
+/// does not count.
+fn forwards_operation_reference(src: &str) -> bool {
+    let code: String = src
+        .lines()
+        .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    const FIELD: &str = "operation_reference";
+    let Some(read) = code.find(&format!(".{FIELD}")) else {
+        return false;
+    };
+    let after = read + 1 + FIELD.len();
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code[after..].match_indices(FIELD).any(|(i, _)| {
+        let at = after + i;
+        let prev = code[..at].chars().next_back();
+        let next = code[at + FIELD.len()..].chars().next();
+        prev.is_some_and(|c| !is_ident(c) && c != '.')
+            && !next.is_some_and(is_ident)
+            && !code[..at].trim_end().ends_with("let")
+            && !code[..at].trim_end().ends_with("let mut")
+    })
+}
+
+#[test]
+fn forwards_operation_reference_rejects_dropping_handlers() {
+    let good = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    self.cancel_core(k, operation_reference)\n}";
+    assert!(forwards_operation_reference(good));
+    let comment_only = "fn h(body: &Option<B>) {\n    // reads body.operation_reference (not really)\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(comment_only));
+    let bound_dropped = "fn h(body: &Option<B>) {\n    let operation_reference = body.as_ref().and_then(|b| b.operation_reference);\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(bound_dropped));
+    let never_read =
+        "fn h(body: &Option<B>) {\n    let x = body.is_some();\n    self.cancel_core(k, None)\n}";
+    assert!(!forwards_operation_reference(never_read));
+}
+
 /// Defect-class guard (#1606): an `operationReference` request field the
 /// manifest marks as honoured (no `unhonoured #N` note) must actually be read
 /// by the served operation's handler and handed on toward the `_ref` engine
@@ -507,8 +549,8 @@ fn fn_source(name: &str) -> Option<String> {
 /// `OVERRIDES` delegation passed only `path_params`, silently dropping the
 /// value. The guard derives, from the spec, every served operation whose body
 /// reaches an honoured `*.operationReference`, and requires that operation's
-/// handler (resolved through `OVERRIDES`) to receive `body` and read
-/// `operation_reference`.
+/// handler (resolved through `OVERRIDES`) to read `.operation_reference` and
+/// pass the bound value onward (see `forwards_operation_reference`).
 #[test]
 fn honoured_operation_references_are_forwarded_by_their_handler() {
     let manifest = read_manifest();
@@ -535,8 +577,7 @@ fn honoured_operation_references_are_forwarded_by_their_handler() {
             dropped.push(format!("{op}: no OVERRIDES handler ({reaches:?})"));
             continue;
         };
-        let forwards = fn_source(handler)
-            .is_some_and(|src| src.contains("body") && src.contains("operation_reference"));
+        let forwards = fn_source(handler).is_some_and(|src| forwards_operation_reference(&src));
         if !forwards {
             dropped.push(format!("{op} -> {handler}: drops {reaches:?}"));
         }

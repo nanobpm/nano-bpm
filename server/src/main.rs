@@ -37459,6 +37459,101 @@ mod clustered_startup_tests {
         items
     }
 
+    /// #1606: `DeleteDecisionInstanceRequest.operationReference` is threaded
+    /// through to the `_ref` funnel, so the journaled `DecisionInstanceDeleted`
+    /// record carries the request's reference. Disk-backed: asserts the
+    /// persisted envelope, so a regression back to `None` turns this red.
+    #[tokio::test]
+    async fn delete_decision_instance_stamps_operation_reference() {
+        use apis::decision_instance::DeleteDecisionInstanceResponse as DelResp;
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-1606-delete-decision-ref-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+        let varstore = Arc::new(varstore::VarStore::open(None).unwrap());
+        let (writer, recovery) =
+            SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore)).unwrap();
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|&p| {
+                let engine = engines
+                    .remove(&p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                Journal::from_engine_shared(p, engine, true, &writer)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+
+        deploy_issue_1292(&server, "hallo", true).await;
+        start_greeter(&server, "de").await;
+        let rows = decision_rows(&server, 2).await;
+        let eval_key = rows[0].decision_evaluation_key.0.clone();
+        let eval_key_num: u64 = eval_key.parse().expect("numeric evaluation key");
+
+        const DELETE_REF: i64 = 0x0016_0605;
+        let resp = server
+            .delete_decision_instance_impl(
+                &models::DeleteDecisionInstancePathParams {
+                    decision_evaluation_key: eval_key,
+                },
+                &Some(models::DeleteDecisionInstanceRequest {
+                    operation_reference: Some(DELETE_REF),
+                }),
+            )
+            .await
+            .expect("delete returns a response");
+        assert!(
+            matches!(
+                resp,
+                DelResp::Status204_TheDecisionInstanceIsMarkedForDeletion
+            ),
+            "delete must succeed: {resp:?}"
+        );
+
+        drop(server);
+        let records: Vec<nanobpmn_engine_core::Record> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| seglog::read_segment_records(&p).unwrap())
+            .collect();
+        let refs: Vec<Option<i64>> = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.event,
+                    Event::DecisionInstanceDeleted { decision_evaluation_key, .. }
+                        if *decision_evaluation_key == eval_key_num
+                )
+            })
+            .map(|r| r.operation_reference)
+            .collect();
+        assert!(
+            !refs.is_empty(),
+            "no DecisionInstanceDeleted journaled: {records:?}"
+        );
+        assert!(
+            refs.iter().all(|r| *r == Some(DELETE_REF)),
+            "the deletion record carries the request's reference: {refs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Issue #1292 (Zeebe parity): every evaluation of the same decision is its
     /// own decision instance, keyed by a per-evaluation key minted from the
     /// partition key generator (`BpmnDecisionBehavior` → `keyGenerator.nextKey()`)
