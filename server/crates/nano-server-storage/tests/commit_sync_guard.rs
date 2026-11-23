@@ -751,9 +751,15 @@ fn is_in_memory_receiver(body: &str, apply_at: usize) -> bool {
     let Some(recv) = receiver_before(body, apply_at) else {
         return false;
     };
-    ["let mut ", "let "].iter().any(|kw| {
-        let binding = format!("{kw}{recv} =");
-        body[..apply_at].rfind(&binding).is_some_and(|at| {
+    // The *most recent* binding of the receiver across both forms decides:
+    // a later `let mut j = Journal::open(..)` shadows an earlier
+    // `let j = Journal::in_memory()`, so an older in-memory binding must not
+    // exempt the apply.
+    ["let mut ", "let "]
+        .iter()
+        .filter_map(|kw| body[..apply_at].rfind(&format!("{kw}{recv} =")))
+        .max()
+        .is_some_and(|at| {
             let stmt_end = body[at..].find(';').map_or(body.len(), |n| at + n);
             // No reassignment of the receiver between its binding and the apply.
             let reassigned = body[stmt_end..apply_at].split([';', '{', '}']).any(|stmt| {
@@ -767,7 +773,6 @@ fn is_in_memory_receiver(body: &str, apply_at: usize) -> bool {
                 .collect();
             !reassigned && init.contains("::in_memory")
         })
-    })
 }
 
 /// The `(fn name, offending observation)` pairs in `src`: a disk observation
@@ -957,6 +962,27 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
         }
     "#;
     assert_eq!(violations(reassigned).len(), 1);
+
+    // …and so does shadowing it with a newer persistent binding: the most
+    // recent binding across `let` / `let mut` decides, not either one alone.
+    let shadowed = r#"
+        fn t() {
+            let j = Journal::in_memory();
+            let mut j = Journal::open(&path).unwrap();
+            let _ = j.apply_command(c).unwrap();
+            let got = fs::read(&path).unwrap();
+        }
+    "#;
+    assert_eq!(violations(shadowed).len(), 1);
+    let shadowed_back = r#"
+        fn t() {
+            let mut j = Journal::open(&path).unwrap();
+            let j = Journal::in_memory();
+            let _ = j.apply_command(c).unwrap();
+            let got = fs::read(&path).unwrap();
+        }
+    "#;
+    assert!(violations(shadowed_back).is_empty());
 
     // A trailing comma still discards the commit slot (one line and multiline).
     let trailing_comma = r#"
