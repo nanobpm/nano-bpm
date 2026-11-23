@@ -113,13 +113,40 @@ export async function stubProjectFiles(
   );
 }
 
-/** Open `resources/processes/agent-task.bpmn` in the workspace tree so the
- *  modeler mounts. */
-export async function openModel(page: Page): Promise<void> {
+/** Open the stubbed `.bpmn` and return once the modeler has settled on it
+ *  (see `waitForModelLoaded`). `settledOn` is the id of a shape in the model the
+ *  spec stubbed, so "settled" means "this document is on the canvas". */
+export async function openModel(page: Page, settledOn: string): Promise<void> {
   await page.getByText("resources", { exact: true }).first().click();
   await page.getByText("processes", { exact: true }).first().click();
   await page.getByText("agent-task.bpmn", { exact: true }).first().click();
+  await waitForModelLoaded(page, settledOn);
 }
+
+/** Wait until the modeler has imported the document (its `elementId` shape is
+ *  on the canvas) AND has no load still queued (`data-load-state="idle"` on the
+ *  canvas container, published by BpmnModeler's load chain). Interacting before
+ *  then races a pending import, which clears the canvas and resets the
+ *  selection and properties panel under the test (issue #1048). This is the
+ *  readiness signal: wait on it, never on a sleep.
+ *
+ *  The ceiling is explicit because this one wait spans the lazy modeler chunk
+ *  (compiled on first hit by the vite dev server), the file fetch and the
+ *  import, which on a loaded runner can exceed the 5s default expect budget. It
+ *  is a bound on a signal, not a delay: the wait returns the moment the
+ *  document is on an idle canvas. */
+export async function waitForModelLoaded(
+  page: Page,
+  elementId: string,
+): Promise<void> {
+  await expect(
+    page.locator(
+      `[data-load-state="idle"] .djs-element[data-element-id="${elementId}"]`,
+    ),
+  ).not.toHaveCount(0, { timeout: MODEL_LOAD_CEILING_MS });
+}
+
+const MODEL_LOAD_CEILING_MS = 30_000;
 
 /** Intercept the workspace's file-write (`PUT …/file?path=…`, sent as raw
  *  `text/plain` — see the generated `saveProjectFile`) and hand the serialised
