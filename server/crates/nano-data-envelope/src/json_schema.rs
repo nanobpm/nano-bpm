@@ -300,9 +300,19 @@ impl Obj {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(Value::Object(props)) = schema.get("properties") {
+        let props = schema.get("properties").and_then(Value::as_object);
+        if let Some(props) = props {
             for (name, s) in props {
                 obj.set(name, s.clone(), required.contains(name));
+            }
+        }
+        // A required name absent from `properties` is still required: keep it
+        // as an unconstrained (`{}`) property rather than silently dropping it.
+        if let Some(Value::Array(names)) = schema.get("required") {
+            for name in names.iter().filter_map(Value::as_str) {
+                if !props.is_some_and(|p| p.contains_key(name)) {
+                    obj.set(name, json!({}), true);
+                }
             }
         }
         obj
@@ -1302,6 +1312,44 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(ok.schema["required"], json!(["a"]));
+    }
+
+    /// A registry schema may require a name it does not declare in
+    /// `properties`; that requirement must survive conversion (as an
+    /// unconstrained required property), for root and carried types alike.
+    #[test]
+    fn required_only_registry_fields_are_preserved() {
+        let reg: HashMap<String, Value> = HashMap::from([
+            (
+                "Order".to_string(),
+                json!({"type": "object", "properties": {}, "required": ["id"]}),
+            ),
+            (
+                "Customer".to_string(),
+                json!({"type": "object", "required": ["email"]}),
+            ),
+        ]);
+        let root =
+            start_event_input_schema(&crate::scan_bpmn(&doc("", ENVELOPE)), "start", None, &reg)
+                .unwrap()
+                .unwrap();
+        assert_eq!(root.schema["required"], json!(["id"]), "{}", root.schema);
+        assert_eq!(root.schema["properties"]["id"], json!({}));
+        let xml = doc(
+            r#"<nano:shape id="Order"><nano:carry ref="Customer" /></nano:shape>"#,
+            ENVELOPE,
+        );
+        let carried = start_event_input_schema(&crate::scan_bpmn(&xml), "start", None, &reg)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            carried.schema["required"],
+            json!(["email"]),
+            "{}",
+            carried.schema
+        );
+        assert_eq!(carried.schema["properties"]["email"], json!({}));
+        assert!(carried.unresolved.is_empty(), "{:?}", carried.unresolved);
     }
 
     /// A `$ref` that is data, not a schema keyword — a property literally
