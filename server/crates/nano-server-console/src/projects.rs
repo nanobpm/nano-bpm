@@ -3507,6 +3507,15 @@ pub enum DataError {
     Busy(String),
 }
 
+/// Leading text of every [`DataError::Busy`] message. It is the single marker
+/// the REST layer uses to tell gateway back-pressure apart from the other
+/// `503` (no JS runtime) once the error has been collapsed to an `ApiResult`,
+/// so it can answer `503` + `Retry-After` (#1837).
+pub const DATA_GATEWAY_BUSY_PREFIX: &str = "data gateway busy:";
+/// Seconds a client refused with [`DataError::Busy`] should wait before
+/// retrying — the `Retry-After` value on the REST data routes (#1837).
+pub const DATA_GATEWAY_BUSY_RETRY_AFTER_SECS: i32 = 1;
+
 /// Default cap on concurrently running datasource gateway subprocesses
 /// (`urban data` / embedded `data-cli.ts`) across the whole console (#1329).
 /// Each one is a Node process (pair) of ~130 MB RSS, so an unbounded burst
@@ -3591,7 +3600,7 @@ impl DataGatewayLimiter {
         };
         if !reserved {
             return Err(DataError::Busy(format!(
-                "data gateway busy: {} ops running and {} queued; retry shortly",
+                "{DATA_GATEWAY_BUSY_PREFIX} {} ops running and {} queued; retry shortly",
                 self.concurrency, self.queue
             )));
         }
@@ -12498,7 +12507,8 @@ mod tests {
         drive_until("one request queued", || queued(&limiter) == 1).await;
         let refused = limiter.acquire().await;
         assert!(
-            matches!(refused, Err(DataError::Busy(_))),
+            // The prefix is what the REST layer keys `503` + `Retry-After` on (#1837).
+            matches!(&refused, Err(DataError::Busy(m)) if m.starts_with(DATA_GATEWAY_BUSY_PREFIX)),
             "overflow must be refused as Busy, got {:?}",
             refused.map(drop)
         );
