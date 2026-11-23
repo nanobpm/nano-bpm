@@ -576,8 +576,6 @@ fn schema_too_deep(v: &Value, levels: usize) -> bool {
     false
 }
 
-/// An estimate of a schema value's size in bytes (string and key lengths plus
-/// one per node). Recursion is bounded by [`MAX_DEPTH`]-limited nesting.
 /// The top-level keywords of a registry object schema [`Obj::from_schema`]
 /// preserves (or that carry no constraint).
 const REGISTRY_ROOT_KEYWORDS: &[&str] = &[
@@ -591,11 +589,18 @@ const REGISTRY_ROOT_KEYWORDS: &[&str] = &[
     "$comment",
 ];
 
+/// Data-carrying keywords whose values are literal data, not schemas: a
+/// `"$ref"` key inside an object here (e.g. a `const` of `{"$ref": 1}`) is a
+/// field name, never a schema reference.
+const DATA_KEYWORDS: &[&str] = &["enum", "const", "default", "examples"];
+
 /// Whether a registry schema lies within the subset the derivation copies
 /// faithfully: an object (`type`, if present, is `"object"`) whose root uses
-/// only [`REGISTRY_ROOT_KEYWORDS`] and which contains no `$ref` anywhere
-/// (its target would not be copied, leaving it dangling). Iterative, so a
-/// deep schema cannot overflow the stack.
+/// only [`REGISTRY_ROOT_KEYWORDS`] and which contains no `$ref` in any schema
+/// position (its target would not be copied, leaving it dangling). A `$ref`
+/// that is data — a property literally named `"$ref"`, or a key of an object
+/// value under [`DATA_KEYWORDS`] — is not a reference and stays supported.
+/// Iterative, so a deep schema cannot overflow the stack.
 fn registry_schema_supported(schema: &Value) -> bool {
     let Some(root) = schema.as_object() else {
         return false;
@@ -609,22 +614,36 @@ fn registry_schema_supported(schema: &Value) -> bool {
     if root.get("type").is_some_and(|t| t != "object") {
         return false;
     }
-    let mut pending = vec![schema];
+    // Every entry is a schema position: the root, or a value nested under
+    // one (a property's schema, an `items` schema, …).
+    let mut pending: Vec<&Value> = vec![schema];
     while let Some(v) = pending.pop() {
-        match v {
-            Value::Object(m) => {
-                if m.contains_key("$ref") {
-                    return false;
+        let Value::Object(m) = v else { continue };
+        if m.contains_key("$ref") {
+            return false;
+        }
+        for (k, child) in m {
+            // The keys of `properties` are property names (data), so a
+            // property literally named `"$ref"` is fine; its values are
+            // schemas and stay on the walk. Data-carrying keywords hold
+            // literal data — a `"$ref"` key inside one is a field name,
+            // never a reference. Everything else (annotations, `type`,
+            // nested schema keywords) is descended into.
+            if k == "properties" {
+                if let Value::Object(props) = child {
+                    pending.extend(props.values());
                 }
-                pending.extend(m.values());
+            } else if !DATA_KEYWORDS.contains(&k.as_str()) {
+                pending.extend(child.as_array().into_iter().flatten());
+                pending.push(child);
             }
-            Value::Array(a) => pending.extend(a),
-            _ => {}
         }
     }
     true
 }
 
+/// An estimate of a schema value's size in bytes (string and key lengths plus
+/// one per node). Recursion is bounded by [`MAX_DEPTH`]-limited nesting.
 fn value_size(v: &Value) -> usize {
     match v {
         Value::String(s) => s.len() + 1,
@@ -1283,5 +1302,60 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(ok.schema["required"], json!(["a"]));
+    }
+
+    /// A `$ref` that is data, not a schema keyword — a property literally
+    /// named `"$ref"`, or a `"$ref"` key inside an object value under
+    /// `enum` / `const` / `default` / `examples` — is not a reference, so it
+    /// stays within the supported subset.
+    #[test]
+    fn a_data_ref_is_not_an_unsupported_registry_schema() {
+        let cases = [
+            // A property literally named `$ref`.
+            json!({"type": "object",
+                   "properties": {"$ref": {"type": "string"}}}),
+            // `"$ref"` keys inside data values (enum/const/default/examples).
+            json!({"type": "object",
+                   "properties": {"a": {"type": "object",
+                                        "const": {"$ref": "#/x"},
+                                        "default": {"$ref": "#/y"},
+                                        "enum": [{"$ref": "#/z"}],
+                                        "examples": [{"$ref": "#/w"}]}}}),
+        ];
+        for schema in cases {
+            let mut reg = HashMap::new();
+            reg.insert("Order".to_string(), schema.clone());
+            let e = start_event_input_schema(
+                &crate::scan_bpmn(&doc("", ENVELOPE)),
+                "start",
+                None,
+                &reg,
+            );
+            assert!(e.is_ok(), "data $ref rejected: {schema} -> {e:?}");
+        }
+        // A real `$ref` in a schema position is still rejected, even nested
+        // under a property or a non-`properties` keyword like `items`.
+        for schema in [
+            json!({"type": "object", "properties": {"a": {"$ref": "#/x"}}}),
+            json!({"type": "object",
+                   "properties": {"a": {"type": "array", "items": {"$ref": "#/x"}}}}),
+            // A property named `$ref` whose SCHEMA holds a real `$ref`.
+            json!({"type": "object", "properties": {"$ref": {"$ref": "#/x"}}}),
+        ] {
+            let mut reg = HashMap::new();
+            reg.insert("Order".to_string(), schema.clone());
+            let e = start_event_input_schema(
+                &crate::scan_bpmn(&doc("", ENVELOPE)),
+                "start",
+                None,
+                &reg,
+            )
+            .map(|_| ());
+            assert_eq!(
+                e,
+                Err(("Order".into(), SchemaError::UnsupportedRegistrySchema)),
+                "schema-position $ref accepted: {schema}"
+            );
+        }
     }
 }
