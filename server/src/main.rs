@@ -11440,35 +11440,16 @@ impl ServerImpl {
             .collect()
     }
 
-    /// Routes the cross-partition subscription follow-ups carried in `events` (and
-    /// any they transitively produce) to the partition that must apply them. When
-    /// the target partition is owned by **this** node it is applied locally and
-    /// its follow-ups are folded back into the worklist; when it is owned by a
-    /// **peer**, the source event is forwarded over the Falcon protocol and the
-    /// owning node drives its own pump (so the recursion continues there). A
-    /// no-op single-partition.
-    ///
-    /// **Uncancellable (#1582).** Every caller reaches this only AFTER the source
-    /// command committed, so the routing it performs is post-commit work that a
-    /// caller-side timeout / dropped request future must never abort — a lost
-    /// follow-up would otherwise be unrecoverable (the retried parent is deduped
-    /// to a no-op). The pump therefore runs as a detached task; awaiting it only
-    /// observes completion, and dropping the await leaves it running.
-    ///
-    /// `operation_reference` is the `operationReference` of the request whose
-    /// committed records produced these follow-ups (#1556 step 4, #1600): it is
-    /// stamped on every record each routed command produces, on every partition
-    /// it routes to, and carried onward on any follow-ups those records route
-    /// in turn — so a caller's reference reaches the whole routed cascade.
     /// Whether a committed create may answer BEFORE its cross-partition
     /// subscription opens are routed (#1604). The publication gate is
     /// node-local, so it only orders publishes that apply on this node. That
-    /// holds on a single node. In a multi-node cluster a publish can enter, or
-    /// fan out to, a node whose gate never saw the open, so creates there keep
-    /// the route-before-answer ordering. Likewise, when Raft is active,
-    /// partition recovery happens asynchronously in `raft_bootstrap` after the
-    /// HTTP listener starts, so creates under Raft retain route-before-answer
-    /// until Raft boot recovery pre-registers pending opens before serving.
+    /// holds on a single non-Raft node. In a multi-node cluster a publish can
+    /// enter, or fan out to, a node whose gate never saw the open, so creates
+    /// there keep the route-before-answer ordering. Likewise, when Raft is
+    /// active, partition recovery happens asynchronously in `raft_bootstrap`
+    /// after the HTTP listener starts, so creates under Raft retain
+    /// route-before-answer until Raft boot recovery pre-registers pending opens
+    /// before serving.
     fn create_answers_before_routing(&self) -> bool {
         !self.peers.has_peers() && !raft_enabled()
     }
@@ -11487,12 +11468,12 @@ impl ServerImpl {
 
     /// The one canonical answer/route ordering for a committed create (#1582,
     /// #1604), shared by the non-Raft detached owner and `raft_create_core`.
-    /// On a single node: register the pending opens on the publication gate,
-    /// answer, route, then release the gate (also on drop if this task dies).
-    /// With peers: route first, then answer. A publish issued once the create
-    /// returns then finds the subscription open on whatever node applies it.
-    /// The create path maps no `operationReference` yet (#1602), so routing
-    /// passes `None`.
+    /// On a single non-Raft node: register the pending opens on the publication
+    /// gate, answer, route, then release the gate (also on drop if this task
+    /// dies). With peers or under Raft: route first, then answer. A publish
+    /// issued once the create returns then finds the subscription open on
+    /// whatever node applies it. The create's own `operationReference` (#1602)
+    /// rides the routed follow-ups.
     async fn answer_and_route_create(
         &self,
         routable: Vec<Event>,
@@ -11518,6 +11499,26 @@ impl ServerImpl {
         }
     }
 
+    /// Routes the cross-partition subscription follow-ups carried in `events` (and
+    /// any they transitively produce) to the partition that must apply them. When
+    /// the target partition is owned by **this** node it is applied locally and
+    /// its follow-ups are folded back into the worklist; when it is owned by a
+    /// **peer**, the source event is forwarded over the Falcon protocol and the
+    /// owning node drives its own pump (so the recursion continues there). A
+    /// no-op single-partition.
+    ///
+    /// **Uncancellable (#1582).** Every caller reaches this only AFTER the source
+    /// command committed, so the routing it performs is post-commit work that a
+    /// caller-side timeout / dropped request future must never abort — a lost
+    /// follow-up would otherwise be unrecoverable (the retried parent is deduped
+    /// to a no-op). The pump therefore runs as a detached task; awaiting it only
+    /// observes completion, and dropping the await leaves it running.
+    ///
+    /// `operation_reference` is the `operationReference` of the request whose
+    /// committed records produced these follow-ups (#1556 step 4, #1600): it is
+    /// stamped on every record each routed command produces, on every partition
+    /// it routes to, and carried onward on any follow-ups those records route
+    /// in turn — so a caller's reference reaches the whole routed cascade.
     async fn drive_subscription_routing(
         &self,
         events: Vec<Event>,
@@ -23053,9 +23054,9 @@ impl ServerImpl {
                 _definition_key,
                 instance_key,
                 sync_completed,
-                // Routing runs inside `raft_create_core`'s detached task
-                // (#1582), ordered against publishes by the publication gate
-                // (#1604); the events are only reported.
+                // Routing runs before the answer inside `raft_create_core`'s
+                // detached task via `answer_and_route_create` (#1582, #1604);
+                // the events are only reported.
                 _routable,
             )) => {
                 self.signal_jobs_available();
@@ -23250,9 +23251,9 @@ impl ServerImpl {
             };
 
         crate::metrics::record_create("rest");
-        // Routing runs inside `raft_create_core`'s detached task (#1582
-        // cancellation safety), with create-then-publish ordering provided by
-        // the publication gate (#1604); nothing further to route here.
+        // Routing runs before the answer inside `raft_create_core`'s detached
+        // task via `answer_and_route_create` (#1582 cancellation safety, #1604);
+        // nothing further to route here.
         self.signal_jobs_available();
 
         let (variables_out, process_completed) = if await_completion {
@@ -23340,9 +23341,10 @@ impl ServerImpl {
         // create without its cross-partition routing — the Raft batcher keeps
         // running past the cancellation, and the detached task still observes
         // the proposal outcome and routes. The result is handed back over a
-        // oneshot in the order `answer_and_route_create` decides (#1604): at
-        // commit with the opens gated on a single node, after routing with
-        // peers. Either way a publish issued the moment the create returns is
+        // oneshot in the order `answer_and_route_create` decides (#1604):
+        // under Raft (`create_answers_before_routing()` is false), routing
+        // completes before the answer. Either way a publish issued the moment
+        // the create returns is
         // not discarded as unmatched. Awaiting the receiver only
         // OBSERVES the outcome; dropping it leaves the work running.
         let server = self.clone();
@@ -23400,8 +23402,7 @@ impl ServerImpl {
             match proposed {
                 Ok((instance_key, sync_completed, routable)) => {
                     // The canonical answer/route ordering (#1582, #1604):
-                    // gate-then-answer on a single node, route-then-answer
-                    // with peers. See `answer_and_route_create`.
+                    // under Raft, route-then-answer. See `answer_and_route_create`.
                     let reported = routable.clone();
                     server
                         .answer_and_route_create(routable, operation_reference, move || {

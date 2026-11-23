@@ -18,8 +18,7 @@
 //!
 //! The registry is node-local: it orders only publishes that apply on the node
 //! whose create owner routes the opens. Creates answer early only on a single
-//! node. With peers they keep route-before-answer, because a publish can apply
-//! on a node whose gate never saw the open (see
+//! non-Raft node. With peers or under Raft they keep route-before-answer (see
 //! `ServerImpl::answer_and_route_create`).
 
 use std::collections::HashMap;
@@ -50,7 +49,9 @@ pub(crate) enum GateWait {
     Clear,
     /// The publish waited until every pending open was routed.
     Released,
-    /// The deadline elapsed with an open still pending; the publish proceeds.
+    /// The deadline elapsed with an open still pending; the caller rejects the
+    /// publish as retryable rather than applying it against a missing
+    /// subscription.
     TimedOut,
 }
 
