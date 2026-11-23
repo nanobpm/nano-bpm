@@ -226,6 +226,32 @@ export type TraceIncident = {
     reason: string;
     raisedAt: number;
     resolvedAt: number | null;
+    /**
+     * The instance variables the failing element saw (present only when variable capture is enabled).
+     */
+    variables?: TraceVariables;
+};
+
+/**
+ * A captured variable map. `values` (variable name -> value) is omitted, with `truncated: true`, when the snapshot exceeded the byte cap.
+ */
+export type TraceVariables = {
+    truncated: boolean;
+    bytes: number;
+    values?: {
+        [key: string]: unknown;
+    };
+};
+
+/**
+ * One recorded external input on the trace's Tier-2 stimulus log.
+ */
+export type TraceStimulus = {
+    seq: number;
+    at: number;
+    kind: string;
+    reference?: string;
+    variables?: TraceVariables;
 };
 
 export type InstanceTrace = {
@@ -241,6 +267,22 @@ export type InstanceTrace = {
     elements: Array<TraceElement>;
     incidents: Array<TraceIncident>;
     path: Array<string>;
+    /**
+     * The instance creation inputs (present only when variable capture is enabled).
+     */
+    creationVariables?: TraceVariables;
+    /**
+     * The terminal root variable state (present only when variable capture is enabled and the instance has ended).
+     */
+    terminalVariables?: TraceVariables;
+    /**
+     * The ordered recorded-input log (present only when stimulus capture is enabled).
+     */
+    stimuli?: Array<TraceStimulus>;
+    /**
+     * True when the per-instance stimulus cap was reached and later inputs were dropped (omitted when false).
+     */
+    stimuliTruncated?: boolean;
 };
 
 /**

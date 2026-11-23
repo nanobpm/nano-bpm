@@ -1967,4 +1967,94 @@ mod tests {
             nano_server_console::projects::PLATFORMS.len()
         );
     }
+
+    /// Drift guard (#1760): every field of the trace-store `InstanceTraceDto`
+    /// (and its nested DTOs) must survive the `GET /console/api/traces/{key}`
+    /// conversion through the generated `InstanceTrace` model. A DTO field the
+    /// spec does not declare is silently dropped by `from_dto`, so the JSON
+    /// before and after the round-trip must be identical for a fully-populated
+    /// trace.
+    #[test]
+    fn instance_trace_dto_round_trips_every_field_through_the_generated_model() {
+        use nano_server_console::trace::{
+            ElementDto, IncidentDto, InstanceTraceDto, JobDto, StimulusDto, VariablesDto,
+        };
+        let vars = |n: i64| VariablesDto {
+            truncated: false,
+            bytes: 7,
+            values: Some(serde_json::json!({ "n": n, "nested": { "a": [1, "x"] } })),
+        };
+        let dto = InstanceTraceDto {
+            instance_key: "1".into(),
+            process_id: "p".into(),
+            version: Some(2),
+            business_id: Some("b".into()),
+            tags: vec!["t".into()],
+            started_at: 10,
+            ended_at: Some(20),
+            duration_ms: Some(10),
+            outcome: "completed",
+            elements: vec![ElementDto {
+                element_id: "task".into(),
+                element_instance_key: "3".into(),
+                scope: "1".into(),
+                entered_at: 11,
+                exited_at: Some(19),
+                duration_ms: Some(8),
+                incidents: 1,
+                job: Some(JobDto {
+                    job_type: "work".into(),
+                    worker: Some("w".into()),
+                    created_at: 12,
+                    activated_at: Some(13),
+                    completed_at: Some(18),
+                    wait_ms: Some(1),
+                    queue_ms: Some(1),
+                    service_ms: Some(5),
+                    attempts: 2,
+                    failures: 1,
+                }),
+            }],
+            incidents: vec![IncidentDto {
+                element_id: "task".into(),
+                element_instance_key: "3".into(),
+                kind: "JobNoRetries".into(),
+                reason: "r".into(),
+                raised_at: 14,
+                resolved_at: Some(15),
+                variables: Some(vars(1)),
+            }],
+            path: vec!["start".into(), "task".into()],
+            creation_variables: Some(vars(2)),
+            terminal_variables: Some(vars(3)),
+            stimuli: Some(vec![
+                StimulusDto {
+                    seq: 0,
+                    at: 13,
+                    kind: "jobComplete",
+                    reference: Some("3".into()),
+                    variables: Some(vars(4)),
+                },
+                StimulusDto {
+                    seq: 1,
+                    at: 16,
+                    kind: "message",
+                    reference: None,
+                    variables: Some(VariablesDto {
+                        truncated: true,
+                        bytes: 99,
+                        values: None,
+                    }),
+                },
+            ]),
+            stimuli_truncated: true,
+        };
+        let before = serde_json::to_value(&dto).unwrap();
+        let model: nanobpm_console_api::models::InstanceTrace = from_dto(dto);
+        let after = serde_json::to_value(&model).unwrap();
+        assert_eq!(
+            after, before,
+            "generated InstanceTrace drops or reshapes DTO fields"
+        );
+    }
 }

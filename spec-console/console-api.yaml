@@ -1833,6 +1833,31 @@ components:
         reason: { type: string }
         raisedAt: { type: integer, format: int64 }
         resolvedAt: { type: integer, format: int64, nullable: true }
+        variables:
+          description: The instance variables the failing element saw (present only when variable capture is enabled).
+          allOf: [ { $ref: '#/components/schemas/TraceVariables' } ]
+    TraceVariables:
+      type: object
+      description: >-
+        A captured variable map. `values` (variable name -> value) is omitted,
+        with `truncated: true`, when the snapshot exceeded the byte cap.
+      required: [truncated, bytes]
+      properties:
+        truncated: { type: boolean }
+        bytes: { type: integer, format: int64 }
+        values:
+          type: object
+          additionalProperties: true
+    TraceStimulus:
+      type: object
+      description: One recorded external input on the trace's Tier-2 stimulus log.
+      required: [seq, at, kind]
+      properties:
+        seq: { type: integer, format: int32 }
+        at: { type: integer, format: int64 }
+        kind: { type: string }
+        reference: { type: string }
+        variables: { $ref: '#/components/schemas/TraceVariables' }
     InstanceTrace:
       type: object
       required: [instanceKey, processId, version, businessId, tags, startedAt, endedAt, durationMs, outcome, elements, incidents, path]
@@ -1857,6 +1882,19 @@ components:
         path:
           type: array
           items: { type: string }
+        creationVariables:
+          description: The instance creation inputs (present only when variable capture is enabled).
+          allOf: [ { $ref: '#/components/schemas/TraceVariables' } ]
+        terminalVariables:
+          description: The terminal root variable state (present only when variable capture is enabled and the instance has ended).
+          allOf: [ { $ref: '#/components/schemas/TraceVariables' } ]
+        stimuli:
+          type: array
+          description: The ordered recorded-input log (present only when stimulus capture is enabled).
+          items: { $ref: '#/components/schemas/TraceStimulus' }
+        stimuliTruncated:
+          type: boolean
+          description: True when the per-instance stimulus cap was reached and later inputs were dropped (omitted when false).
 
     TraceConfig:
       type: object
