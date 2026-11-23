@@ -3155,6 +3155,11 @@ export type GetDataSourcesErrors = {
      * Not found
      */
     404: string;
+    /**
+     * The datasource gateway is saturated (#1329/#1837): every gateway slot is busy and the wait queue is full, so the request was refused as back-pressure. Retry after the number of seconds in `Retry-After`.
+     *
+     */
+    503: string;
 };
 
 export type GetDataSourcesError = GetDataSourcesErrors[keyof GetDataSourcesErrors];
@@ -3190,6 +3195,11 @@ export type GetDataSchemaErrors = {
      * Not found
      */
     404: string;
+    /**
+     * The datasource gateway is saturated (#1329/#1837): every gateway slot is busy and the wait queue is full, so the request was refused as back-pressure. Retry after the number of seconds in `Retry-After`.
+     *
+     */
+    503: string;
 };
 
 export type GetDataSchemaError = GetDataSchemaErrors[keyof GetDataSchemaErrors];
@@ -3225,6 +3235,11 @@ export type QueryDataErrors = {
      * Not found
      */
     404: string;
+    /**
+     * The datasource gateway is saturated (#1329/#1837): every gateway slot is busy and the wait queue is full, so the request was refused as back-pressure. Retry after the number of seconds in `Retry-After`.
+     *
+     */
+    503: string;
 };
 
 export type QueryDataError = QueryDataErrors[keyof QueryDataErrors];
@@ -3260,6 +3275,11 @@ export type ExecDataErrors = {
      * Not found
      */
     404: string;
+    /**
+     * The datasource gateway is saturated (#1329/#1837): every gateway slot is busy and the wait queue is full, so the request was refused as back-pressure. Retry after the number of seconds in `Retry-After`.
+     *
+     */
+    503: string;
 };
 
 export type ExecDataError = ExecDataErrors[keyof ExecDataErrors];
@@ -3295,6 +3315,11 @@ export type ExecDataScriptErrors = {
      * Not found
      */
     404: string;
+    /**
+     * The datasource gateway is saturated (#1329/#1837): every gateway slot is busy and the wait queue is full, so the request was refused as back-pressure. Retry after the number of seconds in `Retry-After`.
+     *
+     */
+    503: string;
 };
 
 export type ExecDataScriptError = ExecDataScriptErrors[keyof ExecDataScriptErrors];
@@ -3330,6 +3355,11 @@ export type GetDataMigrationsErrors = {
      * Not found
      */
     404: string;
+    /**
+     * The datasource gateway is saturated (#1329/#1837): every gateway slot is busy and the wait queue is full, so the request was refused as back-pressure. Retry after the number of seconds in `Retry-After`.
+     *
+     */
+    503: string;
 };
 
 export type GetDataMigrationsError = GetDataMigrationsErrors[keyof GetDataMigrationsErrors];
@@ -3365,6 +3395,11 @@ export type MigrateDataErrors = {
      * Not found
      */
     404: string;
+    /**
+     * The datasource gateway is saturated (#1329/#1837): every gateway slot is busy and the wait queue is full, so the request was refused as back-pressure. Retry after the number of seconds in `Retry-After`.
+     *
+     */
+    503: string;
 };
 
 export type MigrateDataError = MigrateDataErrors[keyof MigrateDataErrors];
@@ -3400,6 +3435,11 @@ export type RegenerateDomainTypesErrors = {
      * Not found
      */
     404: string;
+    /**
+     * The datasource gateway is saturated (#1329/#1837): every gateway slot is busy and the wait queue is full, so the request was refused as back-pressure. Retry after the number of seconds in `Retry-After`.
+     *
+     */
+    503: string;
 };
 
 export type RegenerateDomainTypesError = RegenerateDomainTypesErrors[keyof RegenerateDomainTypesErrors];
@@ -3435,6 +3475,11 @@ export type PreviewDomainTypesErrors = {
      * Not found
      */
     404: string;
+    /**
+     * The datasource gateway is saturated (#1329/#1837): every gateway slot is busy and the wait queue is full, so the request was refused as back-pressure. Retry after the number of seconds in `Retry-After`.
+     *
+     */
+    503: string;
 };
 
 export type PreviewDomainTypesError = PreviewDomainTypesErrors[keyof PreviewDomainTypesErrors];

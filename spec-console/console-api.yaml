@@ -950,6 +950,7 @@ paths:
               schema: { $ref: '#/components/schemas/DataSourcesResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DataGatewayBusy' }
 
   /projects/{name}/data/{source}/schema:
     get:
@@ -967,6 +968,7 @@ paths:
               schema: { $ref: '#/components/schemas/DataSchemaResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DataGatewayBusy' }
 
   /projects/{name}/data/{source}/query:
     post:
@@ -989,6 +991,7 @@ paths:
               schema: { $ref: '#/components/schemas/DataQueryResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DataGatewayBusy' }
 
   /projects/{name}/data/{source}/exec:
     post:
@@ -1011,6 +1014,7 @@ paths:
               schema: { $ref: '#/components/schemas/DataExecResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DataGatewayBusy' }
 
   /projects/{name}/data/{source}/script:
     post:
@@ -1038,6 +1042,7 @@ paths:
               schema: { $ref: '#/components/schemas/DataExecResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DataGatewayBusy' }
 
   /projects/{name}/data/{source}/migrations:
     get:
@@ -1055,6 +1060,7 @@ paths:
               schema: { $ref: '#/components/schemas/DataMigrationsResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DataGatewayBusy' }
 
   /projects/{name}/data/{source}/migrate:
     post:
@@ -1072,6 +1078,7 @@ paths:
               schema: { $ref: '#/components/schemas/DataMigrateResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DataGatewayBusy' }
 
   /projects/{name}/data/{source}/domaintypes:
     post:
@@ -1096,6 +1103,7 @@ paths:
               schema: { $ref: '#/components/schemas/DomainTypesResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DataGatewayBusy' }
 
   /projects/{name}/data/{source}/domaintypes/preview:
     post:
@@ -1130,6 +1138,7 @@ paths:
               schema: { $ref: '#/components/schemas/DomainTypesResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DataGatewayBusy' }
 
   /server/update:
     get:
@@ -1518,6 +1527,19 @@ components:
         The service is currently unavailable — a transient, retryable Raft
         condition (a leader handoff pause or an in-progress election). The
         operator action can be retried once the cluster settles.
+      content:
+        text/plain:
+          schema: { type: string }
+
+    DataGatewayBusy:
+      description: >
+        The datasource gateway is saturated (#1329/#1837): every gateway slot is
+        busy and the wait queue is full, so the request was refused as
+        back-pressure. Retry after the number of seconds in `Retry-After`.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying the request.
+          schema: { type: integer, format: int32 }
       content:
         text/plain:
           schema: { type: string }
