@@ -4103,6 +4103,22 @@ impl ServerImpl {
         for journal in journals.iter() {
             journal.collect_live_instance_keys(&mut live_keys);
         }
+        // #1604: capture any cross-partition `Opening` subscriptions whose
+        // canonical target partition did not durably receive the open before a
+        // crash, and pre-register them on the publication gate BEFORE this
+        // constructor returns — so no post-restart publish can overtake boot
+        // recovery and be discarded as unmatched.
+        // Under Raft, each hosted partition's authoritative state is restored
+        // asynchronously inside `raft_bootstrap`; `create_answers_before_routing`
+        // therefore gates early answers on `!raft_enabled()` as well, so the
+        // non-Raft journals here are always authoritative at construction time.
+        let publication_gate = publication_gate::PublicationGate::default();
+        let recovered_pending_opens = if topology.is_single_node() && !raft_enabled() {
+            pending_subscription_opens_from_journals(&journals, topology.num_partitions)
+        } else {
+            Vec::new()
+        };
+        let recovered_gate_guard = publication_gate.register(&recovered_pending_opens);
         let reconciled = store.reconcile_orphaned_active(&live_keys);
         if reconciled > 0 {
             tracing::info!(
@@ -4428,7 +4444,7 @@ impl ServerImpl {
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
         );
-        Self {
+        let server = Self {
             engine,
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
@@ -4492,7 +4508,7 @@ impl ServerImpl {
             )),
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             route_redrives: Arc::new(AtomicU64::new(0)),
-            publication_gate: publication_gate::PublicationGate::default(),
+            publication_gate,
             #[cfg(test)]
             publication_gate_deadline_override: Arc::new(std::sync::Mutex::new(None)),
             partition_rebuild_locks: Arc::new(std::sync::Mutex::new(
@@ -4509,7 +4525,25 @@ impl ServerImpl {
             job_statistics: JobStatisticsState::default(),
             #[cfg(feature = "console")]
             trace_store: Arc::new(nano_trace_store::TraceStore::from_env()),
+        };
+        if !recovered_pending_opens.is_empty() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let srv = server.clone();
+                rt.spawn(async move {
+                    srv.drive_subscription_routing(recovered_pending_opens, None)
+                        .await;
+                    drop(recovered_gate_guard);
+                });
+            } else {
+                tracing::warn!(
+                    count = recovered_pending_opens.len(),
+                    "pending subscription opens recovered outside a Tokio runtime; \
+                     releasing publication gate"
+                );
+                drop(recovered_gate_guard);
+            }
         }
+        server
     }
 }
 
@@ -4531,6 +4565,67 @@ impl ServerImpl {
 /// `*_versions` map, so re-installing an already-known version is a no-op.
 fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
     deployment_replication_events_from_state(deploy_journal.engine().state())
+}
+
+/// Synthesises `MessageSubscriptionOpening` follow-ups for every cross-partition
+/// subscription still in `Opening` state after crash recovery whose canonical
+/// target partition does not yet hold (and has not tombstoned) it (#1604).
+///
+/// When a single-node server answers a create at commit and crashes before the
+/// detached routing pump persists `OpenMessageSubscription` on the target
+/// partition, replay restores the source's `Opening` record while the target
+/// remains empty. Returning these events lets boot register them on the
+/// [`publication_gate`] BEFORE serving publications and re-drive them to the
+/// target partition.
+///
+/// Each reconstructed event carries `delivery_key: 0` (the original source
+/// delivery key is not stored on `MessageSubscription`), which is still safe
+/// and idempotent: `Command::OpenMessageSubscription` checks both
+/// `routed_deliveries.is_tombstoned(subscription_key)` and
+/// `message_subscriptions.contains_key(&subscription_key)` before emitting
+/// `MessageSubscriptionCreated`.
+fn pending_subscription_opens_from_journals(
+    journals: &[Journal],
+    num_partitions: u64,
+) -> Vec<Event> {
+    if num_partitions <= 1 {
+        return Vec::new();
+    }
+    let by_partition: std::collections::HashMap<u64, &nanobpmn_engine_core::State> = journals
+        .iter()
+        .map(|j| (j.partition_id(), j.engine().state()))
+        .collect();
+    let mut pending = Vec::new();
+    for journal in journals {
+        let source_partition = journal.partition_id();
+        for sub in journal.engine().state().message_subscriptions.values() {
+            if sub.state != nanobpmn_engine_core::MessageSubscriptionState::Opening {
+                continue;
+            }
+            let target =
+                nanobpmn_engine_core::subscription_partition(&sub.correlation_key, num_partitions);
+            if target == source_partition {
+                continue;
+            }
+            if let Some(target_state) = by_partition.get(&target)
+                && (target_state.message_subscriptions.contains_key(&sub.key)
+                    || target_state.routed_deliveries.is_tombstoned(sub.key))
+            {
+                continue;
+            }
+            pending.push(Event::MessageSubscriptionOpening {
+                subscription_key: sub.key,
+                instance_key: sub.instance_key,
+                element_instance_key: sub.element_instance_key,
+                element_id: sub.element_id.clone(),
+                message_name: sub.message_name.clone(),
+                correlation_key: sub.correlation_key.clone(),
+                kind: sub.kind.clone(),
+                delivery_key: 0,
+            });
+        }
+    }
+    pending
 }
 
 /// Every deployed version of one resource kind, keyed (and ordered) by its
@@ -11370,9 +11465,12 @@ impl ServerImpl {
     /// node-local, so it only orders publishes that apply on this node. That
     /// holds on a single node. In a multi-node cluster a publish can enter, or
     /// fan out to, a node whose gate never saw the open, so creates there keep
-    /// the route-before-answer ordering.
+    /// the route-before-answer ordering. Likewise, when Raft is active,
+    /// partition recovery happens asynchronously in `raft_bootstrap` after the
+    /// HTTP listener starts, so creates under Raft retain route-before-answer
+    /// until Raft boot recovery pre-registers pending opens before serving.
     fn create_answers_before_routing(&self) -> bool {
-        !self.peers.has_peers()
+        !self.peers.has_peers() && !raft_enabled()
     }
 
     fn effective_publication_gate_deadline(&self) -> std::time::Duration {
@@ -53976,11 +54074,9 @@ mod subscription_placement_tests {
         // the create returns correlates — it waits for the subscription open on
         // its canonical partition, so the message is not discarded as unmatched.
         let (_message_key, correlated) = server
-            .correlate_message_local(
+            .correlate_message_cluster(
                 "payment-received".to_string(),
                 order.clone(),
-                std::collections::BTreeMap::new(),
-                None,
                 None,
                 None,
                 None,
@@ -54079,11 +54175,9 @@ mod subscription_placement_tests {
             let order = order.clone();
             tokio::spawn(async move {
                 server
-                    .correlate_message_local(
+                    .correlate_message_cluster(
                         "payment-received".to_string(),
                         order,
-                        std::collections::BTreeMap::new(),
-                        None,
                         None,
                         None,
                         None,
@@ -54511,6 +54605,175 @@ mod subscription_placement_tests {
             }
             other => panic!("retried correlate after stall cleared must correlate, got: {other:?}"),
         }
+    }
+
+    /// #1604 (crash recovery): if a single-node server crashes AFTER the
+    /// create was answered at commit but BEFORE the cross-partition
+    /// `OpenMessageSubscription` became durable on the target partition,
+    /// restarting from the durable journals must recover the pending `Opening`
+    /// subscription, register it on the publication gate BEFORE accepting
+    /// publications, and re-drive the open to the target partition so a
+    /// publish issued immediately after restart correlates instead of being
+    /// discarded as unmatched.
+    #[tokio::test]
+    async fn restart_after_create_before_subscription_open_recovers_and_gates_publish() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpm-1604-restart-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _dir_guard = DirGuard(dir.clone());
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+
+        // Boot 1: deploy the message-catch process and create an instance on a
+        // partition whose canonical subscription partition is DIFFERENT, while
+        // stalling the target partition's actor so the create commits and
+        // answers BEFORE the target open is applied/persisted.
+        let (created_instance_key, order, target_partition, _held_release) = {
+            let (shared, recovery) =
+                SharedWriter::open_segmented(&dir, &owned, 4, None).expect("open segmented boot 1");
+            let fresh = recovery.fresh;
+            let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+                recovery.engines.into_iter().collect();
+            let journals: Vec<Journal> = owned
+                .iter()
+                .map(|p| {
+                    let engine = engines
+                        .remove(p)
+                        .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(*p));
+                    Journal::from_engine_shared(*p, engine, fresh, &shared)
+                })
+                .collect();
+            let server = build_server_in_memory(journals, topology.clone());
+            server
+                .deploy_centralized(
+                    vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                    "<default>".into(),
+                )
+                .await
+                .expect("deploy");
+            let create_partition = server.engine.for_create().stats().partition;
+            let create_engine = server
+                .engine_handle_for(create_partition)
+                .expect("create partition is local");
+            let order = cross_partition_order(create_partition);
+            let target = nanobpmn_engine_core::subscription_partition(&order, 4);
+            let target_engine = server
+                .engine_handle_for(target)
+                .expect("target partition is local");
+
+            // Stall the target actor so the routed `OpenMessageSubscription`
+            // never reaches it before the simulated crash.
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+            let _barrier = tokio::spawn(async move {
+                target_engine
+                    .with_low(move |_journal| {
+                        let _ = parked_tx.send(());
+                        release_rx.blocking_recv().ok();
+                    })
+                    .await;
+            });
+            parked_rx.await.expect("barrier holds target actor");
+
+            let mut variables = std::collections::BTreeMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let accounting = CreateAccounting::enter(&server, 0);
+            let rx = server.submit_create_detached_on(accounting, create_engine, move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
+                    None,
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                )
+                .map_err(|e| (500, e.to_string()))
+            });
+            let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                .await
+                .expect("create answered at commit despite stalled target")
+                .expect("detached owner alive")
+                .expect("create applied");
+            // Keep `release_tx` alive past Boot 2's recovery open so Boot 1's
+            // detached routing task cannot unblock and write the target open
+            // while we reopen the durable directory (simulating a process
+            // crash where the target open never reached disk).
+            (created.instance_key, order, target, release_tx)
+        };
+
+        // Boot 2: recover from the same durable journal directory.
+        let (shared, recovery) =
+            SharedWriter::open_segmented(&dir, &owned, 4, None).expect("open segmented boot 2");
+        let fresh = recovery.fresh;
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        // Confirm the pre-condition: the target partition did NOT durably open
+        // the subscription before the crash.
+        assert!(
+            engines
+                .get(&target_partition)
+                .map(|e| e.state().message_subscriptions.is_empty())
+                .unwrap_or(true),
+            "pre-condition: target partition has no durable subscription before recovery"
+        );
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|p| {
+                let engine = engines
+                    .remove(p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(*p));
+                Journal::from_engine_shared(*p, engine, fresh, &shared)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+
+        // Publish IMMEDIATELY after restart (no sleep): the publication gate
+        // must hold the publish until startup recovery finishes re-driving the
+        // pending `Opening` subscription, so the message correlates instead of
+        // being discarded as unmatched.
+        let (_message_key, correlated) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.correlate_message_cluster(
+                "payment-received".to_string(),
+                order.clone(),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("publish completes after startup recovery")
+        .expect("publish applies");
+        assert_eq!(
+            correlated,
+            Some(created_instance_key),
+            "publish immediately after restart must correlate to the recovered instance"
+        );
     }
 
     /// #1582: a source with no replica of the target rotates its forwards
