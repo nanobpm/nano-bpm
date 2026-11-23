@@ -12120,16 +12120,25 @@ impl Engine {
         // user task once per child (#1528 review).
         let parked = match teardown_idx {
             Some(index) => index.first_created_user_task(child_eik),
-            None => self
-                .state
-                .user_tasks
-                .values()
-                .find(|t| {
-                    t.instance_key == instance_key
-                        && t.element_instance_key == child_eik
-                        && t.state == state::UserTaskState::Created
-                })
-                .map(|t| t.key),
+            None => {
+                // The `None` fallback scans every retained user task; a caller
+                // tearing down N children must not pay it N times — every
+                // teardown loop builds the shared index once and passes it
+                // through. The probe lets a regression test assert that scan
+                // count, exactly as `cancel_created_user_tasks_on` does.
+                #[cfg(test)]
+                self.user_task_scan_count
+                    .set(self.user_task_scan_count.get() + 1);
+                self.state
+                    .user_tasks
+                    .values()
+                    .find(|t| {
+                        t.instance_key == instance_key
+                            && t.element_instance_key == child_eik
+                            && t.state == state::UserTaskState::Created
+                    })
+                    .map(|t| t.key)
+            }
         };
         if let Some(user_task_key) = parked {
             events.push(Event::UserTaskCanceled {
