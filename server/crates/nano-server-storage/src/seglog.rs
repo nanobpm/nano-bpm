@@ -4240,9 +4240,13 @@ mod tests {
             crate::journal::Journal::open_segmented(&dir).expect("open segmented");
         let shared = Arc::clone(&recovery.shared);
 
-        let _ = journal
+        let (_, deploy_commit) = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
+        // Order the later on-disk snapshot read after the writer's append of
+        // this commit (#1477: the guard requires a sync point before any disk
+        // observation that follows a discarded commit).
+        deploy_commit.blocking_wait();
         let mut keys = Vec::new();
         for i in 0..4 {
             let mut vars = std::collections::BTreeMap::new();
