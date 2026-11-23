@@ -3501,6 +3501,140 @@ pub enum DataError {
     /// The datasource operation itself returned `{ ok: false, error }`
     /// (bad SQL, unknown source, missing manifest, …).
     Op(String),
+    /// Back-pressure (#1329): every gateway slot is busy *and* the wait queue
+    /// is full, so the request was refused instead of spawning yet another
+    /// Node process pair. Transient — the caller should retry later.
+    Busy(String),
+}
+
+/// Default cap on concurrently running datasource gateway subprocesses
+/// (`urban data` / embedded `data-cli.ts`) across the whole console (#1329).
+/// Each one is a Node process (pair) of ~130 MB RSS, so an unbounded burst
+/// swaps a small host into a stall; this keeps the worst case at K pairs.
+const DATA_GATEWAY_DEFAULT_CONCURRENCY: usize = 2;
+/// Default number of requests allowed to *wait* for a gateway slot before
+/// further requests are refused with [`DataError::Busy`] (#1329).
+const DATA_GATEWAY_DEFAULT_QUEUE: usize = 32;
+/// Env override for [`DATA_GATEWAY_DEFAULT_CONCURRENCY`] (positive integer).
+const DATA_GATEWAY_CONCURRENCY_ENV: &str = "NANOBPMN_DATA_GATEWAY_CONCURRENCY";
+/// Env override for [`DATA_GATEWAY_DEFAULT_QUEUE`] (non-negative integer).
+const DATA_GATEWAY_QUEUE_ENV: &str = "NANOBPMN_DATA_GATEWAY_QUEUE";
+/// Default wall-clock bound on one gateway op (spawn → exit). A hung child
+/// would otherwise hold one of the few limiter slots forever and starve every
+/// datasource op in the console (#1329); on expiry the child is killed
+/// (`kill_on_drop`) and its slot released.
+const DATA_GATEWAY_DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Env override for [`DATA_GATEWAY_DEFAULT_TIMEOUT_SECS`] (positive seconds).
+const DATA_GATEWAY_TIMEOUT_ENV: &str = "NANOBPMN_DATA_GATEWAY_TIMEOUT";
+
+/// Bounds how many datasource gateway subprocesses run at once, with a bounded
+/// wait queue behind them (#1329): at most `concurrency` children are alive,
+/// at most `queue` further requests wait, and anything beyond that is refused
+/// with [`DataError::Busy`] — back-pressure instead of runaway memory.
+pub(crate) struct DataGatewayLimiter {
+    permits: tokio::sync::Semaphore,
+    waiting: std::sync::atomic::AtomicUsize,
+    concurrency: usize,
+    queue: usize,
+    timeout: std::time::Duration,
+}
+
+impl DataGatewayLimiter {
+    /// Test-only convenience constructor. Its only callers are the
+    /// `#[cfg(unix)]` limiter tests, so gate it to Unix test targets too —
+    /// otherwise the Windows `--all-targets` Clippy gate (`-D warnings`)
+    /// flags it as an unused associated function.
+    #[cfg(all(test, unix))]
+    pub(crate) fn new(concurrency: usize, queue: usize) -> Self {
+        Self::with_timeout(
+            concurrency,
+            queue,
+            std::time::Duration::from_secs(DATA_GATEWAY_DEFAULT_TIMEOUT_SECS),
+        )
+    }
+
+    /// Like [`Self::new`] with an explicit per-op timeout (zero is clamped up
+    /// to 1 ms so a misconfiguration cannot disable every op silently).
+    pub(crate) fn with_timeout(
+        concurrency: usize,
+        queue: usize,
+        timeout: std::time::Duration,
+    ) -> Self {
+        let concurrency = concurrency.max(1);
+        Self {
+            permits: tokio::sync::Semaphore::new(concurrency),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            concurrency,
+            queue,
+            timeout: timeout.max(std::time::Duration::from_millis(1)),
+        }
+    }
+
+    /// Take a gateway slot, waiting in the bounded queue if all are busy.
+    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, DataError> {
+        if let Ok(p) = self.permits.try_acquire() {
+            return Ok(p);
+        }
+        // Reserve a queue place atomically; refuse when the queue is full.
+        let mut w = self.waiting.load(Ordering::Acquire);
+        let reserved = loop {
+            if w >= self.queue {
+                break false;
+            }
+            match self
+                .waiting
+                .compare_exchange_weak(w, w + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break true,
+                Err(cur) => w = cur,
+            }
+        };
+        if !reserved {
+            return Err(DataError::Busy(format!(
+                "data gateway busy: {} ops running and {} queued; retry shortly",
+                self.concurrency, self.queue
+            )));
+        }
+        // Release the queue place even if this future is dropped mid-wait.
+        struct Leave<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _leave = Leave(&self.waiting);
+        self.permits
+            .acquire()
+            .await
+            .map_err(|e| DataError::Gateway(format!("data gateway limiter closed: {e}")))
+    }
+}
+
+/// The process-wide gateway limiter, sized once from the env overrides.
+fn data_gateway_limiter() -> &'static DataGatewayLimiter {
+    static LIMITER: OnceLock<DataGatewayLimiter> = OnceLock::new();
+    LIMITER.get_or_init(|| {
+        let read = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(d)
+        };
+        let timeout_secs = read(DATA_GATEWAY_TIMEOUT_ENV, 0);
+        let timeout_secs = if timeout_secs == 0 {
+            DATA_GATEWAY_DEFAULT_TIMEOUT_SECS
+        } else {
+            timeout_secs as u64
+        };
+        DataGatewayLimiter::with_timeout(
+            read(
+                DATA_GATEWAY_CONCURRENCY_ENV,
+                DATA_GATEWAY_DEFAULT_CONCURRENCY,
+            ),
+            read(DATA_GATEWAY_QUEUE_ENV, DATA_GATEWAY_DEFAULT_QUEUE),
+            std::time::Duration::from_secs(timeout_secs),
+        )
+    })
 }
 
 /// Whether `name` resolves to an **Urban-shaped app** — one carrying a
@@ -3873,30 +4007,205 @@ fn gateway_output_parse_error(err: &serde_json::Error, raw_len: usize, trimmed: 
 }
 
 async fn pipe_data_gateway(
+    cmd: Command,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, DataError> {
+    pipe_data_gateway_limited(data_gateway_limiter(), cmd, request).await
+}
+
+/// [`pipe_data_gateway`] against an explicit [`DataGatewayLimiter`]: the child
+/// is spawned only while holding a slot, and the slot is held until the child
+/// has exited (`wait`), so at most `concurrency` gateway processes are ever
+/// alive at once (#1329).
+async fn pipe_data_gateway_limited(
+    limiter: &DataGatewayLimiter,
     mut cmd: Command,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
-    use tokio::io::AsyncWriteExt;
+    let _permit = limiter.acquire().await?;
 
     cmd.env("NO_COLOR", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Lead a fresh process group so a timeout/cancel can reap the whole tree:
+    // `urban data` is a wrapper that forks a Node worker, and `kill_on_drop`
+    // alone would kill only the wrapper and orphan the worker (#1329).
+    #[cfg(unix)]
+    cmd.process_group(0);
 
+    let body = serde_json::to_vec(request)
+        .map_err(|e| DataError::Gateway(format!("serialize request: {e}")))?;
     let mut child = cmd
         .spawn()
         .map_err(|e| DataError::Gateway(format!("spawn data gateway: {e}")))?;
-    let body = serde_json::to_vec(request)
-        .map_err(|e| DataError::Gateway(format!("serialize request: {e}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
+    // Declared after `_permit`, so on cancellation (this future dropped) the
+    // tree is SIGKILLed *before* the permit is released. On Windows the guard
+    // also owns the `Child` and the permit through the blocking `taskkill /T`
+    // wait, so the wrapper cannot be reaped by `kill_on_drop` before taskkill
+    // has walked its descendants.
+    let mut tree = GatewayTreeGuard::new(child.id());
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // Bound the whole spawn → exit span so a hung child cannot hold its slot
+    // forever (#1329). On expiry, kill the whole process tree and reap the
+    // leader while still holding the permit.
+    let res = tokio::time::timeout(
+        limiter.timeout,
+        run_data_gateway_child(&mut child, stdin, stdout, stderr, body),
+    )
+    .await;
+    let out = match res {
+        Ok(Ok(out)) => {
+            tree.disarm();
+            out
+        }
+        Ok(Err(e)) => {
+            // The op failed before the child was reaped (e.g. a non-BrokenPipe
+            // stdin write error): the child may still be running, so kill the
+            // whole tree and wait for the leader before releasing the slot —
+            // the same cleanup the timeout arm performs.
+            tree.kill(&mut child, &_permit).await;
+            reap_gateway_bounded(&mut child, GATEWAY_REAP_GRACE).await;
+            return Err(e);
+        }
+        Err(_) => {
+            tree.kill(&mut child, &_permit).await;
+            reap_gateway_bounded(&mut child, GATEWAY_REAP_GRACE).await;
+            return Err(DataError::Gateway(format!(
+                "data gateway timed out after {:?}",
+                limiter.timeout
+            )));
+        }
+    };
+    parse_data_gateway_output(out)
+}
+
+/// Kills a data gateway's whole process tree (group on Unix, `taskkill /T` on
+/// Windows) unless disarmed — the cancellation-safe cleanup for
+/// [`pipe_data_gateway_limited`] (#1329).
+struct GatewayTreeGuard(Option<u32>);
+
+impl GatewayTreeGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+
+    /// Terminate the whole tree. On Unix this is a non-blocking group SIGKILL
+    /// (the caller then reaps the leader with `child.wait()`). On Windows
+    /// `taskkill /T` must finish walking the descendant tree BEFORE the
+    /// wrapper `Child` is dropped — `kill_on_drop(true)` would otherwise
+    /// TerminateProcess the wrapper first and reparent the workers out from
+    /// under taskkill — so the wait runs on a blocking thread while the
+    /// caller keeps `child` and the limiter permit borrowed across the
+    /// `.await`, keeping both alive until tree termination completes.
+    async fn kill(
+        &mut self,
+        _child: &mut tokio::process::Child,
+        _permit: &tokio::sync::SemaphorePermit<'_>,
+    ) {
+        let Some(pid) = self.0.take() else { return };
+        #[cfg(unix)]
+        kill_group_by_pid(pid);
+        #[cfg(windows)]
+        {
+            let killed = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+            })
+            .await;
+            let ok = matches!(&killed, Ok(Ok(st)) if st.success());
+            if !ok {
+                // taskkill missing from PATH or failed: fall back to
+                // terminating the direct child so the bounded reap that
+                // follows can still release the slot (#1329).
+                tracing::warn!(
+                    pid,
+                    ?killed,
+                    "data gateway: taskkill /T failed; falling back to direct-child kill"
+                );
+                let _ = _child.start_kill();
+            }
+        }
+        let _ = pid;
+    }
+}
+
+/// Upper bound on reaping a gateway leader after its tree was killed (#1329).
+const GATEWAY_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Reap `child` after a tree kill, but never wait longer than `grace`: if tree
+/// termination failed (e.g. Windows `taskkill` unavailable) an unbounded
+/// `wait()` would pin the limiter slot forever. On expiry, force-kill the
+/// direct child, log the cleanup failure and return so the slot is released.
+/// Returns whether the child was reaped within `grace`.
+async fn reap_gateway_bounded(
+    child: &mut tokio::process::Child,
+    grace: std::time::Duration,
+) -> bool {
+    if tokio::time::timeout(grace, child.wait()).await.is_ok() {
+        return true;
+    }
+    let _ = child.start_kill();
+    tracing::error!(
+        pid = ?child.id(),
+        ?grace,
+        "data gateway: process did not exit after tree kill; releasing its slot"
+    );
+    false
+}
+
+impl Drop for GatewayTreeGuard {
+    fn drop(&mut self) {
+        // Best-effort backstop for the cancellation path, where the future is
+        // dropped and no `child` handle is available to order against. Unix
+        // group SIGKILL is exact; on Windows prefer the ordered
+        // [`Self::kill`] path (timeout / op-error arms), which every
+        // in-function exit takes — this Drop only fires when the caller itself
+        // is cancelled.
+        let Some(pid) = self.0.take() else { return };
+        #[cfg(unix)]
+        kill_group_by_pid(pid);
+        #[cfg(windows)]
+        {
+            // Fire-and-forget: `Drop` may run on a runtime thread, so never
+            // block on `taskkill`'s exit here.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        let _ = pid;
+    }
+}
+
+/// Feed the gateway child `body` on stdin and collect its output.
+async fn run_data_gateway_child(
+    child: &mut tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    body: Vec<u8>,
+) -> Result<std::process::Output, DataError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if let Some(mut stdin) = stdin {
         // A gateway that fails fast can exit before (or while) reading its
         // request, closing the read end of the pipe. The write then fails with
         // `BrokenPipe` (EPIPE) — that is not the real error, it is a symptom of
-        // the child having already exited. Swallow it and fall through to
-        // `wait_with_output` so the child's actual stdout/stderr and exit status
-        // surface the true cause instead of being masked by "write request:
-        // Broken pipe".
+        // the child having already exited. Swallow it and fall through so the
+        // child's actual stdout/stderr and exit status surface the true cause
+        // instead of being masked by "write request: Broken pipe".
         match stdin.write_all(&body).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
@@ -3904,10 +4213,31 @@ async fn pipe_data_gateway(
         }
         // Drop stdin (via scope) so the gateway's stdin reader sees EOF.
     }
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(|e| DataError::Gateway(format!("await data gateway: {e}")))?;
+    let read_out = async {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout {
+            s.read_to_end(&mut buf).await?;
+        }
+        Ok::<_, std::io::Error>(buf)
+    };
+    let read_err = async {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr {
+            s.read_to_end(&mut buf).await?;
+        }
+        Ok::<_, std::io::Error>(buf)
+    };
+    let (status, out, err) = tokio::join!(child.wait(), read_out, read_err);
+    let gw = |e: std::io::Error| DataError::Gateway(format!("await data gateway: {e}"));
+    Ok(std::process::Output {
+        status: status.map_err(gw)?,
+        stdout: out.map_err(gw)?,
+        stderr: err.map_err(gw)?,
+    })
+}
+
+/// Interpret a finished gateway child's output as the JSON reply.
+fn parse_data_gateway_output(out: std::process::Output) -> Result<serde_json::Value, DataError> {
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stderr = stderr.trim();
@@ -3964,6 +4294,36 @@ async fn pipe_data_gateway(
 /// (`{ op, source?, sql?, params? }`); the resolved result object is returned on
 /// success.
 pub async fn run_data_op(
+    project: &str,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, DataError> {
+    // Per-op trace line (#1329) so the next request spike can be attributed:
+    // project, op, source, outcome and duration.
+    let op = request
+        .get("op")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let source = request
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let started = std::time::Instant::now();
+    let res = run_data_op_inner(project, request).await;
+    tracing::debug!(
+        project,
+        op = %op,
+        source = %source,
+        ok = res.is_ok(),
+        busy = matches!(res, Err(DataError::Busy(_))),
+        duration_ms = started.elapsed().as_millis() as u64,
+        "data op"
+    );
+    res
+}
+
+async fn run_data_op_inner(
     project: &str,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
@@ -7997,6 +8357,30 @@ mod tests {
         env_lock()
     }
 
+    /// Is `pid` a zombie — killed but not yet reaped? Only the Unix gateway
+    /// timeout test asks (a SIGKILLed descendant can linger as a zombie while
+    /// init/subreaper catches up, and `kill(pid, 0)` still succeeds for one).
+    /// Linux reads the state field of `/proc/<pid>/stat` (the field after the
+    /// parenthesised comm, which may itself contain spaces); other Unixes have
+    /// no portable zombie probe, so conservatively answer "not a zombie". The
+    /// `cfg!` (not `#[cfg]`) keeps the whole body linted on every clippy
+    /// target — a `#[cfg(not(target_os = "linux"))]` arm would be compiled by
+    /// no clippy-matrix entry and fail the live coverage guard.
+    #[cfg(unix)]
+    fn is_zombie(pid: i32) -> bool {
+        if !cfg!(target_os = "linux") {
+            let _ = pid;
+            return false;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit(')')
+            .next()
+            .and_then(|rest| rest.split_whitespace().next().map(|state| state == "Z"))
+            == Some(true)
+    }
+
     fn temp_root() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
@@ -12021,6 +12405,345 @@ mod tests {
             }
             other => panic!("expected DataError::Gateway, got {other:?}"),
         }
+    }
+
+    /// Deterministically drive the scheduler until `cond` holds: yields to
+    /// the (current-thread) runtime instead of sleeping, so it cannot race on
+    /// a loaded runner. Bounded so a regression fails instead of hanging.
+    #[cfg(unix)]
+    async fn drive_until(what: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never reached: {what}");
+    }
+
+    #[cfg(unix)]
+    fn queued(l: &DataGatewayLimiter) -> usize {
+        l.waiting.load(Ordering::Acquire)
+    }
+
+    /// #1329: a burst of N concurrent requests never has more than K holders
+    /// of a gateway slot, the rest wait in the queue, and all eventually run.
+    /// Each holder parks on an explicit gate the test opens one at a time —
+    /// no sleeps, no wall clock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn limiter_bounds_concurrent_holders() {
+        use std::sync::atomic::AtomicUsize;
+        const K: usize = 2;
+        const N: usize = 8;
+        let limiter = Arc::new(DataGatewayLimiter::new(K, N));
+        let live = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        // Releasing a holder = adding one permit to this gate.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let tasks: Vec<_> = (0..N)
+            .map(|_| {
+                let (limiter, live, max, done, gate) = (
+                    limiter.clone(),
+                    live.clone(),
+                    max.clone(),
+                    done.clone(),
+                    gate.clone(),
+                );
+                tokio::spawn(async move {
+                    let _permit = limiter.acquire().await.expect("queued op admitted");
+                    let now = live.fetch_add(1, Ordering::AcqRel) + 1;
+                    max.fetch_max(now, Ordering::AcqRel);
+                    gate.acquire().await.expect("gate open").forget();
+                    live.fetch_sub(1, Ordering::AcqRel);
+                    done.fetch_add(1, Ordering::AcqRel);
+                })
+            })
+            .collect();
+        drive_until("K holders + N-K queued", || {
+            live.load(Ordering::Acquire) == K && queued(&limiter) == N - K
+        })
+        .await;
+        for released in 1..=N {
+            gate.add_permits(1);
+            drive_until("a holder finished", || {
+                done.load(Ordering::Acquire) == released
+            })
+            .await;
+            assert!(live.load(Ordering::Acquire) <= K);
+        }
+        for t in tasks {
+            t.await.expect("task completes");
+        }
+        assert_eq!(
+            max.load(Ordering::Acquire),
+            K,
+            "cap reached, never exceeded"
+        );
+        assert_eq!(queued(&limiter), 0, "queue drained");
+        assert_eq!(limiter.permits.available_permits(), K, "all slots returned");
+    }
+
+    /// #1329: past the bounded wait queue, a request is refused with
+    /// `DataError::Busy` (→ 503) instead of waiting; the queued one proceeds
+    /// once the slot frees, and the limiter recovers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn limiter_refuses_when_queue_is_full() {
+        let limiter = Arc::new(DataGatewayLimiter::new(1, 1));
+        let held = limiter.acquire().await.expect("free slot");
+        let l2 = limiter.clone();
+        let waiter = tokio::spawn(async move { l2.acquire().await.map(drop) });
+        drive_until("one request queued", || queued(&limiter) == 1).await;
+        let refused = limiter.acquire().await;
+        assert!(
+            matches!(refused, Err(DataError::Busy(_))),
+            "overflow must be refused as Busy, got {:?}",
+            refused.map(drop)
+        );
+        drop(held);
+        waiter
+            .await
+            .expect("task completes")
+            .expect("queued op admitted once the slot frees");
+        assert_eq!(queued(&limiter), 0);
+        drop(
+            limiter
+                .acquire()
+                .await
+                .expect("limiter recovers after the burst"),
+        );
+    }
+
+    /// #1329: cancelling a request while it is queued for a slot (task abort
+    /// or future drop — e.g. the HTTP client disconnected) releases its queue
+    /// reservation: nothing leaks, nothing deadlocks, later requests proceed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn limiter_releases_reservation_when_queued_request_is_cancelled() {
+        let limiter = Arc::new(DataGatewayLimiter::new(1, 1));
+        let held = limiter.acquire().await.expect("free slot");
+
+        // (a) Abort a spawned task parked in the queue.
+        let l2 = limiter.clone();
+        let waiter = tokio::spawn(async move { l2.acquire().await.map(drop) });
+        drive_until("request queued", || queued(&limiter) == 1).await;
+        waiter.abort();
+        assert!(waiter.await.expect_err("aborted").is_cancelled());
+        assert_eq!(queued(&limiter), 0, "aborted waiter released its place");
+
+        // (b) Drop a queued future in place (select! losing branch).
+        {
+            let fut = limiter.acquire();
+            tokio::pin!(fut);
+            tokio::select! {
+                biased;
+                _ = fut.as_mut() => panic!("must queue behind the held slot"),
+                () = std::future::ready(()) => {}
+            }
+            assert_eq!(queued(&limiter), 1);
+        }
+        assert_eq!(queued(&limiter), 0, "dropped future released its place");
+
+        // The single queue place is free again: a new request queues, not Busy.
+        let l3 = limiter.clone();
+        let next = tokio::spawn(async move { l3.acquire().await.map(drop) });
+        drive_until("next request queued", || queued(&limiter) == 1).await;
+        // No permit was consumed by the cancelled waiters: releasing the
+        // held slot admits the next request (no deadlock).
+        drop(held);
+        next.await
+            .expect("task completes")
+            .expect("later request proceeds");
+        assert_eq!(queued(&limiter), 0);
+        assert_eq!(limiter.permits.available_permits(), 1, "slot returned");
+    }
+
+    /// #1329: a cancelled request that already HOLDS a slot returns it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn limiter_returns_slot_when_holder_is_cancelled() {
+        let limiter = Arc::new(DataGatewayLimiter::new(1, 0));
+        let l2 = limiter.clone();
+        let holder = tokio::spawn(async move {
+            let _p = l2.acquire().await.expect("free slot");
+            std::future::pending::<()>().await;
+        });
+        drive_until("slot taken", || limiter.permits.available_permits() == 0).await;
+        holder.abort();
+        let _ = holder.await;
+        assert_eq!(limiter.permits.available_permits(), 1);
+        drop(limiter.acquire().await.expect("slot reusable after cancel"));
+    }
+
+    /// #1329: end-to-end guard for the live-CHILD bound through
+    /// [`pipe_data_gateway_limited`] itself (not just `acquire`): a burst of
+    /// concurrent gateway calls never has more than K stub children alive,
+    /// the overflow request is refused as Busy without spawning a child, and
+    /// every admitted request completes. Each stub child is explicitly gated
+    /// on a release file, so the K-live state is held until the test opens it.
+    /// This fails if the wrapper spawned before admission, or released its
+    /// permit before the child exited.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_data_gateway_bounds_live_children_and_refuses_overflow_without_spawning() {
+        const K: usize = 2;
+        const Q: usize = 1;
+        let dir = std::env::temp_dir().join(format!(
+            "nano-gw-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let live = dir.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let release = dir.join("release");
+        let spawned = dir.join("spawned");
+        let seen = dir.join("seen");
+        // Each child: record its spawn and the number of live siblings
+        // (including itself), wait for the gate, then leave the live set
+        // before exiting.
+        let script = format!(
+            "cat >/dev/null; echo x >> '{sp}'; touch '{live}'/$$; \
+             ls '{live}' | wc -l >> '{seen}'; \
+             while [ ! -e '{rel}' ]; do sleep 0.02; done; \
+             rm -f '{live}'/$$; printf '{{\"ok\":true}}'",
+            sp = spawned.display(),
+            live = live.display(),
+            seen = seen.display(),
+            rel = release.display(),
+        );
+        let mk = || {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&script);
+            c
+        };
+        let count_lines = |p: &std::path::Path| {
+            std::fs::read_to_string(p)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let limiter = Arc::new(DataGatewayLimiter::new(K, Q));
+        let req = serde_json::json!({ "op": "schema" });
+        let tasks: Vec<_> = (0..K + Q)
+            .map(|_| {
+                let (l, cmd, req) = (limiter.clone(), mk(), req.clone());
+                tokio::spawn(async move { pipe_data_gateway_limited(&l, cmd, &req).await })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !(count_lines(&spawned) == K
+            && std::fs::read_dir(&live).unwrap().count() == K
+            && queued(&limiter) == Q)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never reached K live children + Q queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Overflow: refused as Busy and no child is spawned for it.
+        let r = pipe_data_gateway_limited(&limiter, mk(), &req).await;
+        assert!(
+            matches!(r, Err(DataError::Busy(_))),
+            "overflow must be Busy, got {r:?}"
+        );
+        assert_eq!(count_lines(&spawned), K, "overflow spawned a child");
+        std::fs::write(&release, b"").unwrap();
+        for t in tasks {
+            t.await
+                .expect("task completes")
+                .expect("admitted request succeeds");
+        }
+        assert_eq!(count_lines(&spawned), K + Q, "every admitted request ran");
+        let max_seen = std::fs::read_to_string(&seen)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().parse::<usize>().unwrap())
+            .max()
+            .unwrap();
+        assert!(max_seen <= K, "{max_seen} live children exceeded K={K}");
+        assert_eq!(limiter.permits.available_permits(), K);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1329: reaping after a tree kill is bounded — a child that survives
+    /// (cleanup failed) must not pin the slot via an unbounded `wait()`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_gateway_bounded_gives_up_after_grace() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let reaped = reap_gateway_bounded(&mut child, std::time::Duration::from_millis(150)).await;
+        assert!(!reaped, "a surviving child is reported as not reaped");
+        let _ = child.wait().await;
+    }
+
+    /// #1329: a hung gateway child must not hold its limiter slot forever —
+    /// it times out as `DataError::Gateway` and the next request is admitted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_data_gateway_times_out_hung_child_and_frees_slot() {
+        let limiter = DataGatewayLimiter::with_timeout(1, 0, std::time::Duration::from_millis(200));
+        let req = serde_json::json!({ "op": "schema" });
+        // The hung "wrapper" forks a descendant (like `urban data` → Node) and
+        // records its pid; the timeout must reap the descendant too.
+        let pidfile = std::env::temp_dir().join(format!(
+            "nano-gw-desc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut hung = Command::new("sh");
+        hung.arg("-c").arg(format!(
+            "cat >/dev/null; sleep 30 & echo $! > '{}'; wait",
+            pidfile.display()
+        ));
+        let r = pipe_data_gateway_limited(&limiter, hung, &req).await;
+        assert!(
+            matches!(&r, Err(DataError::Gateway(m)) if m.contains("timed out")),
+            "hung child must time out, got {r:?}"
+        );
+        let desc: i32 = std::fs::read_to_string(&pidfile)
+            .expect("descendant pid recorded")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        let _ = std::fs::remove_file(&pidfile);
+        // The descendant was SIGKILLed with the group. `kill(pid, 0)` alone
+        // also succeeds for a *zombie* — a killed descendant whose reaper
+        // (init or a subreaper, after the wrapper died with it) has not yet
+        // collected it — so probe for "still running", not "pid exists": on
+        // Linux `/proc/<pid>/stat` state `Z` counts as terminated. Elsewhere
+        // there is no zombie state to distinguish, and the signal-0 probe is
+        // exact.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only probes for existence.
+            let alive = unsafe { libc::kill(desc, 0) } == 0;
+            let running = alive && !is_zombie(desc);
+            if !running {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant {desc} outlived the gateway timeout"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("cat >/dev/null; printf '{\"ok\":true}'");
+        pipe_data_gateway_limited(&limiter, cmd, &req)
+            .await
+            .expect("slot is released after a timeout");
     }
 
     #[test]
