@@ -6,6 +6,7 @@ import {
 import "@bpmn-io/form-js/dist/assets/form-js.css";
 import "@bpmn-io/form-js/dist/assets/form-js-editor.css";
 import { createFormDataBindingModule } from "../lib/formDataBindingProperties";
+import { DocumentLoadGate, gatedImport } from "../lib/documentLoadGate";
 
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | { [key: string]: JsonValue } | JsonValue[];
@@ -70,6 +71,9 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
     const disposedRef = useRef(false);
     // Serializes schema loads. importSchema must never overlap.
     const opChainRef = useRef<Promise<unknown>>(Promise.resolve());
+    // Re-delivering the document the editor already holds is a no-op
+    // (issue #1048): a duplicate import would wipe the user's selection.
+    const loadGateRef = useRef(new DocumentLoadGate<FormJsEditor>());
     // Suppress the change callback for programmatic loads (import/createBlank).
     const suppressChange = useRef(false);
     const suppressTimerRef = useRef<number | null>(null);
@@ -125,6 +129,8 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
 
       const handleChanged = () => {
         if (suppressChange.current) return;
+        // The editor now diverges from the last imported document.
+        loadGateRef.current.invalidate();
         onChangeRef.current?.();
       };
 
@@ -153,10 +159,17 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
         if (!editor || disposedRef.current) return "";
         return JSON.stringify(editor.getSchema() as unknown, null, 2);
       },
-      importSchema: (json: string) =>
-        runLoad((editor) => editor.importSchema(parseSchema(json))),
-      createBlank: () =>
-        runLoad((editor) => editor.importSchema(createEmptySchema())),
+      importSchema(json: string) {
+        const editor = editorRef.current;
+        if (!editor) return Promise.resolve();
+        return gatedImport(loadGateRef.current, editor, json, runLoad, (e) =>
+          e.importSchema(parseSchema(json)),
+        );
+      },
+      createBlank() {
+        loadGateRef.current.invalidate();
+        return runLoad((editor) => editor.importSchema(createEmptySchema()));
+      },
     }));
 
     return <div ref={containerRef} className="h-full w-full bg-white" />;

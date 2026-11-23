@@ -87,6 +87,7 @@ import {
   type AgentModdleElement,
   type AgentModeling,
 } from "../lib/agentTask";
+import { DocumentLoadGate, gatedImport } from "../lib/documentLoadGate";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";
@@ -514,6 +515,19 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     // Serializes document loads. importXML/createDiagram must never overlap;
     // every load is chained after the previous one so they run one at a time.
     const opChainRef = useRef<Promise<unknown>>(Promise.resolve());
+    // Makes re-delivering the document the modeler already holds a no-op
+    // (issue #1048): a duplicate import would wipe the user's selection.
+    const loadGateRef = useRef(new DocumentLoadGate<Modeler>());
+    // Loads queued but not yet settled; mirrored onto the canvas container as
+    // `data-load-state` ("loading" | "idle") so callers (and e2e tests) can wait
+    // on the real readiness signal instead of a wall-clock budget.
+    const pendingLoadsRef = useRef(0);
+    const publishLoadState = () => {
+      containerRef.current?.setAttribute(
+        "data-load-state",
+        pendingLoadsRef.current > 0 ? "loading" : "idle",
+      );
+    };
     // Suppress the change callback for programmatic loads (import/createDiagram),
     // so opening a model doesn't immediately look dirty.
     const suppressChange = useRef(false);
@@ -548,6 +562,8 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     ): Promise<void> => {
       const modeler = modelerRef.current;
       if (!modeler) return Promise.resolve();
+      pendingLoadsRef.current += 1;
+      publishLoadState();
       const run = opChainRef.current.then(async () => {
         if (disposedRef.current || modelerRef.current !== modeler) return;
         suppressChange.current = true;
@@ -560,6 +576,12 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           suppressChange.current = false;
         }
       });
+      void run
+        .catch(() => {})
+        .finally(() => {
+          pendingLoadsRef.current -= 1;
+          publishLoadState();
+        });
       // Keep the chain alive even when this op fails, so one bad import doesn't
       // wedge every later load.
       opChainRef.current = run.catch(() => {});
@@ -1195,6 +1217,8 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       }
       const handleChanged = () => {
         if (suppressChange.current) return;
+        // The canvas now diverges from the last imported document.
+        loadGateRef.current.invalidate();
         onChangeRef.current?.();
       };
       modeler.on("commandStack.changed", handleChanged);
@@ -1236,8 +1260,17 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         const { xml } = await modeler.saveXML({ format: true });
         return xml;
       },
-      importXml: (xml: string) => runLoad((m) => m.importXML(xml)),
-      createBlank: () => runLoad((m) => m.createDiagram()),
+      importXml(xml: string) {
+        const modeler = modelerRef.current;
+        if (!modeler) return Promise.resolve();
+        return gatedImport(loadGateRef.current, modeler, xml, runLoad, (m) =>
+          m.importXML(xml),
+        );
+      },
+      createBlank() {
+        loadGateRef.current.invalidate();
+        return runLoad((m) => m.createDiagram());
+      },
       getProcessId() {
         const modeler = modelerRef.current;
         if (!modeler || disposedRef.current) return null;

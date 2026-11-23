@@ -1,6 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import Modeler from "dmn-js/lib/Modeler";
 import type { FeelVariable } from "../lib/dmnDomainVariables";
+import { DocumentLoadGate, gatedImport } from "../lib/documentLoadGate";
 import "dmn-js/dist/assets/diagram-js.css";
 import "dmn-js/dist/assets/dmn-js-shared.css";
 import "dmn-js/dist/assets/dmn-js-drd.css";
@@ -85,6 +86,9 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
     const disposedRef = useRef(false);
     // Serializes document loads. importXML must never overlap.
     const opChainRef = useRef<Promise<unknown>>(Promise.resolve());
+    // Re-delivering the document the editor already holds is a no-op
+    // (issue #1048): a duplicate import would wipe the user's selection.
+    const loadGateRef = useRef(new DocumentLoadGate<Modeler>());
     // Suppress the change callback for programmatic loads (import/createBlank).
     const suppressChange = useRef(false);
     const suppressTimerRef = useRef<number | null>(null);
@@ -177,6 +181,8 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
 
       const handleChanged = () => {
         if (suppressChange.current) return;
+        // The editor now diverges from the last imported document.
+        loadGateRef.current.invalidate();
         onChangeRef.current?.();
       };
 
@@ -213,7 +219,13 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
         ).getActiveView?.();
         activeDecisionIdRef.current = view?.element?.id;
         attachActiveViewerChangeListener();
-        handleChanged();
+        // Switching views (DRD <-> decision table) is navigation, not an edit:
+        // the document is untouched, so the load gate must NOT be invalidated —
+        // otherwise a duplicate XML delivered after a view switch re-imports and
+        // resets the active view + selection (issue #1048). Only surface the
+        // change notification, suppression-guarded like handleChanged.
+        if (suppressChange.current) return;
+        onChangeRef.current?.();
       };
 
       modeler.on("views.changed", handleViewsChanged);
@@ -250,8 +262,17 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
         const { xml } = await modeler.saveXML({ format: true });
         return xml;
       },
-      importXml: (xml: string) => runLoad((m) => m.importXML(xml)),
-      createBlank: () => runLoad((m) => m.importXML(EMPTY_DMN)),
+      importXml(xml: string) {
+        const modeler = modelerRef.current;
+        if (!modeler) return Promise.resolve();
+        return gatedImport(loadGateRef.current, modeler, xml, runLoad, (m) =>
+          m.importXML(xml),
+        );
+      },
+      createBlank() {
+        loadGateRef.current.invalidate();
+        return runLoad((m) => m.importXML(EMPTY_DMN));
+      },
     }));
 
     return <div ref={containerRef} className="h-full w-full bg-white" />;
