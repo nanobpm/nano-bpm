@@ -6,7 +6,7 @@ import {
 import "@bpmn-io/form-js/dist/assets/form-js.css";
 import "@bpmn-io/form-js/dist/assets/form-js-editor.css";
 import { createFormDataBindingModule } from "../lib/formDataBindingProperties";
-import { DocumentLoadGate, type LoadAttempt } from "../lib/documentLoadGate";
+import { DocumentLoadGate, gatedImport } from "../lib/documentLoadGate";
 
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | { [key: string]: JsonValue } | JsonValue[];
@@ -162,27 +162,9 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
       importSchema(json: string) {
         const editor = editorRef.current;
         if (!editor) return Promise.resolve();
-        // The attempt token keys the gate record to THIS load, so a stale
-        // failure/settle from a superseded attempt (e.g. the first A in an
-        // A → B → A sequence) cannot clear or capture into a newer record.
-        const attempt: { current?: LoadAttempt } = {};
-        const duplicate = loadGateRef.current.shouldLoad(editor, json, attempt);
-        // A duplicate request awaits the ORIGINAL in-flight import (rejection
-        // included) instead of resolving immediately — resolving early would
-        // let a caller treat a still-pending, possibly-failing import as done.
-        if (duplicate) return duplicate;
-        const run = runLoad(async (e) => {
-          try {
-            await e.importSchema(parseSchema(json));
-          } catch (err) {
-            // Only re-arm when the gate still records THIS import — a newer
-            // document may have been delivered while this one was in flight.
-            loadGateRef.current.invalidateIf(editor, json, attempt.current);
-            throw err;
-          }
-        });
-        loadGateRef.current.settle(editor, json, run, attempt.current);
-        return run;
+        return gatedImport(loadGateRef.current, editor, json, runLoad, (e) =>
+          e.importSchema(parseSchema(json)),
+        );
       },
       createBlank() {
         loadGateRef.current.invalidate();

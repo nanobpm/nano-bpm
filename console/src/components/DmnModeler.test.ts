@@ -66,18 +66,16 @@ test("views.changed still surfaces the change notification, suppression-guarded"
 
 test("the gate is invalidated only by real divergence (edit / blank / failed import)", () => {
   // Every gate mutation in the component must be one of: the edit handler, a
-  // blank load, or the stale-failure re-arm. A new call site that invalidates
-  // on navigation reopens the selection-wipe.
+  // blank load, or the stale-failure re-arm (which lives in the shared
+  // gatedImport helper). A new call site that invalidates on navigation
+  // reopens the selection-wipe.
   const invalidations = [
     ...source.matchAll(/loadGateRef\.current\.(invalidate|invalidateIf)\(/g),
   ].map((m) => m[0]);
   assert.deepEqual(
     invalidations.sort(),
-    [
-      "loadGateRef.current.invalidate(",
-      "loadGateRef.current.invalidate(",
-      "loadGateRef.current.invalidateIf(",
-    ],
-    "expected exactly: edit handler + createBlank invalidate, import-failure invalidateIf",
+    ["loadGateRef.current.invalidate(", "loadGateRef.current.invalidate("],
+    "expected exactly: edit handler + createBlank invalidate",
   );
+  assert.match(source, /return gatedImport\(/);
 });

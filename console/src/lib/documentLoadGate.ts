@@ -114,3 +114,33 @@ export class DocumentLoadGate<I> {
     }
   }
 }
+
+/** The one canonical gated-import wiring shared by every graphical editor
+ *  (BpmnModeler, DmnModeler, FormEditor). Deliver `doc` into `instance`
+ *  through `gate`: a duplicate delivery awaits the original in-flight import
+ *  (rejection included); a fresh delivery enqueues `importDoc` through the
+ *  editor's serial `runLoad` queue, re-arms the gate only if THIS attempt
+ *  fails, and registers the run so later duplicates share it. */
+export function gatedImport<I>(
+  gate: DocumentLoadGate<I>,
+  instance: I,
+  doc: string,
+  runLoad: (loader: (i: I) => Promise<unknown>) => Promise<void>,
+  importDoc: (i: I) => Promise<unknown>,
+): Promise<void> {
+  const attempt: { current?: LoadAttempt } = {};
+  const duplicate = gate.shouldLoad(instance, doc, attempt);
+  if (duplicate) return duplicate;
+  const run = runLoad(async (i) => {
+    try {
+      await importDoc(i);
+    } catch (e) {
+      // Only re-arm when the gate still records THIS attempt — a newer
+      // document may have been delivered while this one was in flight.
+      gate.invalidateIf(instance, doc, attempt.current);
+      throw e;
+    }
+  });
+  gate.settle(instance, doc, run, attempt.current);
+  return run;
+}
