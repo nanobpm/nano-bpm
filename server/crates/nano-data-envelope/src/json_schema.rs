@@ -79,6 +79,12 @@ pub enum SchemaError {
     /// a type of the registry: the contract is unknown, so calls are rejected
     /// rather than validated against a weaker (legacy) schema.
     UnresolvedEnvelope,
+    /// A registry type's schema lies outside the supported subset (an object
+    /// schema of only `type`/`properties`/`required` plus annotations, with no
+    /// `$ref` anywhere): copying only its properties would drop definitions
+    /// (`$defs`, leaving dangling `$ref`s) or object-level constraints
+    /// (`additionalProperties`, …), silently weakening the contract.
+    UnsupportedRegistrySchema,
 }
 
 impl std::fmt::Display for SchemaError {
@@ -97,6 +103,11 @@ impl std::fmt::Display for SchemaError {
             Self::CyclicProjection => write!(
                 f,
                 "it projects fields from a shape that is part of a reference cycle"
+            ),
+            Self::UnsupportedRegistrySchema => write!(
+                f,
+                "a registry type's schema uses keywords outside the supported subset \
+                 (`type: object`, `properties`, `required`, annotations; no `$ref`)"
             ),
             Self::UnresolvedEnvelope => write!(
                 f,
@@ -161,7 +172,7 @@ pub fn start_event_input_schema(
     process_id: Option<&str>,
     registry: &dyn TypeRegistry,
 ) -> Result<Option<EnvelopeSchema>, (String, SchemaError)> {
-    let Some(shape_id) = scan.start_message_envelope(start_element_id) else {
+    let Some(shape_id) = scan.start_message_envelope(start_element_id, process_id) else {
         return Ok(None);
     };
     envelope_schema(&scan.shapes, shape_id, process_id, registry)
@@ -353,6 +364,10 @@ impl<'a> Resolver<'a> {
         let schema = self.registry.object_schema(id)?;
         if schema_too_deep(&schema, MAX_DEPTH.saturating_sub(depth)) {
             self.fail(SchemaError::TooDeep);
+            return None;
+        }
+        if !registry_schema_supported(&schema) {
+            self.fail(SchemaError::UnsupportedRegistrySchema);
             return None;
         }
         if !self.charge(value_size(&schema)) {
@@ -563,6 +578,53 @@ fn schema_too_deep(v: &Value, levels: usize) -> bool {
 
 /// An estimate of a schema value's size in bytes (string and key lengths plus
 /// one per node). Recursion is bounded by [`MAX_DEPTH`]-limited nesting.
+/// The top-level keywords of a registry object schema [`Obj::from_schema`]
+/// preserves (or that carry no constraint).
+const REGISTRY_ROOT_KEYWORDS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "title",
+    "description",
+    "$schema",
+    "$id",
+    "$comment",
+];
+
+/// Whether a registry schema lies within the subset the derivation copies
+/// faithfully: an object (`type`, if present, is `"object"`) whose root uses
+/// only [`REGISTRY_ROOT_KEYWORDS`] and which contains no `$ref` anywhere
+/// (its target would not be copied, leaving it dangling). Iterative, so a
+/// deep schema cannot overflow the stack.
+fn registry_schema_supported(schema: &Value) -> bool {
+    let Some(root) = schema.as_object() else {
+        return false;
+    };
+    if root
+        .keys()
+        .any(|k| !REGISTRY_ROOT_KEYWORDS.contains(&k.as_str()))
+    {
+        return false;
+    }
+    if root.get("type").is_some_and(|t| t != "object") {
+        return false;
+    }
+    let mut pending = vec![schema];
+    while let Some(v) = pending.pop() {
+        match v {
+            Value::Object(m) => {
+                if m.contains_key("$ref") {
+                    return false;
+                }
+                pending.extend(m.values());
+            }
+            Value::Array(a) => pending.extend(a),
+            _ => {}
+        }
+    }
+    true
+}
+
 fn value_size(v: &Value) -> usize {
     match v {
         Value::String(s) => s.len() + 1,
@@ -1119,5 +1181,107 @@ mod tests {
         assert_eq!(shape("startB").as_deref(), Some("B"));
         // An unnamed message (the engine falls back to its id as the name).
         assert_eq!(shape("startC").as_deref(), Some("A"));
+    }
+
+    /// Two processes in one resource may reuse a start id; each process's
+    /// tool must resolve ITS start's message envelope, never the first
+    /// process's (element ids are unique only per process).
+    #[test]
+    fn reused_start_id_resolves_per_owning_process() {
+        let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
+              <bpmn:process id="p1">
+                <bpmn:extensionElements><nano:shapes>
+                  <nano:shape id="A"><nano:extend name="a" type="string" /></nano:shape>
+                </nano:shapes></bpmn:extensionElements>
+                <bpmn:startEvent id="start"><bpmn:messageEventDefinition messageRef="mA" /></bpmn:startEvent>
+              </bpmn:process>
+              <bpmn:process id="p2">
+                <bpmn:extensionElements><nano:shapes>
+                  <nano:shape id="B"><nano:extend name="b" type="string" /></nano:shape>
+                </nano:shapes></bpmn:extensionElements>
+                <bpmn:startEvent id="start"><bpmn:messageEventDefinition messageRef="mB" /></bpmn:startEvent>
+              </bpmn:process>
+              <bpmn:message id="mA" name="a">
+                <bpmn:extensionElements><zeebe:properties><zeebe:property name="io.nanobpm.dataEnvelope.in" value="A" /></zeebe:properties></bpmn:extensionElements>
+              </bpmn:message>
+              <bpmn:message id="mB" name="b">
+                <bpmn:extensionElements><zeebe:properties><zeebe:property name="io.nanobpm.dataEnvelope.in" value="B" /></zeebe:properties></bpmn:extensionElements>
+              </bpmn:message>
+            </bpmn:definitions>"#;
+        let scan = crate::scan_bpmn(xml);
+        let shape = |p: &str| {
+            start_event_input_schema(&scan, "start", Some(p), &())
+                .unwrap()
+                .map(|e| e.shape)
+        };
+        assert_eq!(shape("p1").as_deref(), Some("A"));
+        assert_eq!(shape("p2").as_deref(), Some("B"));
+        assert_eq!(shape("p3"), None);
+    }
+
+    /// A registry schema outside the supported subset (definitions, `$ref`s,
+    /// object-level constraints, a non-object root) is rejected — as the root
+    /// envelope and as a nested ref — never copied with its constraints or
+    /// definitions silently dropped.
+    #[test]
+    fn unsupported_registry_schemas_are_rejected() {
+        let local = |inner: &str| {
+            doc(
+                &format!(r#"<nano:shape id="Order"><nano:carry ref="{inner}" /></nano:shape>"#),
+                ENVELOPE,
+            )
+        };
+        let cases = [
+            json!({"type": "object", "$defs": {"A": {"type": "string"}},
+                   "properties": {"a": {"$ref": "#/$defs/A"}}}),
+            json!({"type": "object", "properties": {"a": {"$ref": "#/x"}}}),
+            json!({"type": "object", "additionalProperties": false,
+                   "properties": {"a": {"type": "string"}}}),
+            json!({"type": "object", "minProperties": 1}),
+            json!({"type": "string"}),
+            json!(["not", "an", "object"]),
+        ];
+        for schema in cases {
+            // As the root envelope.
+            let mut reg = HashMap::new();
+            reg.insert("Order".to_string(), schema.clone());
+            let e = start_event_input_schema(
+                &crate::scan_bpmn(&doc("", ENVELOPE)),
+                "start",
+                None,
+                &reg,
+            )
+            .map(|_| ());
+            assert_eq!(
+                e,
+                Err(("Order".into(), SchemaError::UnsupportedRegistrySchema)),
+                "root {schema}"
+            );
+            // As a nested ref of a local shape.
+            let mut reg = HashMap::new();
+            reg.insert("Ext".to_string(), schema.clone());
+            let e = start_event_input_schema(&crate::scan_bpmn(&local("Ext")), "start", None, &reg)
+                .map(|_| ());
+            assert_eq!(
+                e,
+                Err(("Order".into(), SchemaError::UnsupportedRegistrySchema)),
+                "nested {schema}"
+            );
+        }
+        // The supported subset (with annotations) still resolves.
+        let mut reg = HashMap::new();
+        reg.insert(
+            "Order".to_string(),
+            json!({"type": "object", "title": "O", "description": "d",
+                   "properties": {"a": {"type": "string", "description": "x"}},
+                   "required": ["a"]}),
+        );
+        let ok =
+            start_event_input_schema(&crate::scan_bpmn(&doc("", ENVELOPE)), "start", None, &reg)
+                .unwrap()
+                .unwrap();
+        assert_eq!(ok.schema["required"], json!(["a"]));
     }
 }

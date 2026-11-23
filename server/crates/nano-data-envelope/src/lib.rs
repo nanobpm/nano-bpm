@@ -139,6 +139,9 @@ pub struct MessageDef {
 /// of its `messageEventDefinition`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageStart {
+    /// The owning process's id: element ids are unique only per process, so
+    /// two processes in one resource may reuse a start id.
+    pub process: Option<String>,
     pub element_id: String,
     pub message_ref: String,
 }
@@ -149,11 +152,20 @@ impl BpmnScan {
     /// (never the — possibly evaluated, fallen-back or shared — subscription
     /// message name). `None` when the start event, its message, or the
     /// message's envelope is absent.
-    pub fn start_message_envelope(&self, start_element_id: &str) -> Option<&str> {
-        let start = self
-            .message_starts
-            .iter()
-            .find(|s| s.element_id == start_element_id)?;
+    ///
+    /// `process_id` scopes the lookup to the owning process (element ids are
+    /// unique only per process, so a resource with several processes may
+    /// reuse a start id); with `Some`, a start owned by another process never
+    /// matches. `None` takes the first start with that id.
+    pub fn start_message_envelope(
+        &self,
+        start_element_id: &str,
+        process_id: Option<&str>,
+    ) -> Option<&str> {
+        let start = self.message_starts.iter().find(|s| {
+            s.element_id == start_element_id
+                && process_id.is_none_or(|p| s.process.as_deref() == Some(p))
+        })?;
         self.message_defs
             .iter()
             .find(|m| m.id == start.message_ref)?
@@ -609,6 +621,7 @@ fn record_ids(acc: &Accum, defs: &mut Vec<MessageDef>, starts: &mut Vec<MessageS
             // start: extra (vendor / inert) event definitions don't hide it.
             if let Some(message_ref) = acc.message_ref.clone() {
                 starts.push(MessageStart {
+                    process: acc.key.clone(),
                     element_id: id,
                     message_ref,
                 });
@@ -1520,7 +1533,11 @@ mod tests {
                 ),
             );
             let scan = scan_bpmn(&defs(&body));
-            assert_eq!(scan.start_message_envelope("s"), Some("Order"), "{extra}");
+            assert_eq!(
+                scan.start_message_envelope("s", Some("p")),
+                Some("Order"),
+                "{extra}"
+            );
         }
     }
 
