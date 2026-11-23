@@ -475,6 +475,7 @@ impl RaftTransport for PeerTransport {
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
         FEATURE_CLUSTER_VARIABLES, FEATURE_REPLICATED_LENIENT_COMPLETION,
+        FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
     let RaftRpcRequest::AppendEntries(r) = req else {
@@ -486,6 +487,13 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
             continue;
         };
         for item in &batch.items {
+            // A retained entry stamped while the group was fully upgraded must
+            // not ship to a peer that would ignore the stamps (#1856 review).
+            if !item.terminal_deadlines.is_empty()
+                && !required.contains(&FEATURE_TERMINAL_DEADLINES)
+            {
+                required.push(FEATURE_TERMINAL_DEADLINES);
+            }
             let feature = match item.command {
                 Command::SetLenientCompletion { .. } => FEATURE_REPLICATED_LENIENT_COMPLETION,
                 Command::CreateClusterVariable { .. }
@@ -519,6 +527,7 @@ mod codec_tests {
                     command,
                     now: 0,
                     operation_reference: None,
+                    terminal_deadlines: std::collections::BTreeMap::new(),
                 },
             ])),
         };
@@ -564,6 +573,22 @@ mod codec_tests {
                 vec![nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_VARIABLES]
             );
         }
+        // #1856 review: a stamped entry is never shipped to a peer that would
+        // ignore the deadline map; an unstamped one requires nothing.
+        let mut stamped = entry(Command::CancelInstance { instance_key: 1 });
+        if let EntryPayload::Normal(batch) = &mut stamped.payload {
+            batch.items[0].terminal_deadlines.insert(7, 1_000);
+        }
+        assert_eq!(
+            required_features_for(&req(vec![stamped])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_TERMINAL_DEADLINES]
+        );
+        assert!(
+            required_features_for(&req(vec![entry(Command::CancelInstance {
+                instance_key: 1
+            })]))
+            .is_empty()
+        );
         assert!(
             required_features_for(&req(vec![Entry::<RaftConfig> {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),

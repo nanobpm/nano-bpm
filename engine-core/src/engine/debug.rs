@@ -139,7 +139,12 @@ impl Engine {
         now: u64,
         breakpoints: Vec<BreakCondition>,
     ) -> Result<DebugSession, EngineError> {
-        let (log, queue) = self.plan_command_at(command, now)?;
+        // No envelope stamps on the debug path; `plan_command_at` clears any
+        // left over by an earlier command. A rejected plan must not leave the
+        // command's own `JobAttribution` stamp behind either (#1856 review).
+        let (log, queue) = self
+            .plan_command_at(command, now, None)
+            .inspect_err(|_| self.terminal_deadline_stamps.clear())?;
         let mut session = DebugSession {
             log,
             paused: Some(Paused { queue, cursor: 0 }),
@@ -184,6 +189,9 @@ impl Engine {
             Some(paused) => session.paused = Some(paused),
             None => {
                 self.finish_command(&session.log);
+                // The run is over: drop its per-command deadline stamps
+                // (kept while paused, since the remaining steps still read them).
+                self.terminal_deadline_stamps.clear();
                 session.paused = None;
             }
         }

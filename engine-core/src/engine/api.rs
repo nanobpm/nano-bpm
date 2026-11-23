@@ -122,6 +122,259 @@ impl Engine {
         });
     }
 
+    /// Whether `command` can terminate a soft-activated job on this partition
+    /// (directly or by cascade) — the single source of truth for which
+    /// commands need the leader-side proposal stamp (#1570). Exhaustive with
+    /// no catch-all, so a new `Command` variant must make a deliberate choice.
+    pub fn command_may_cascade_soft_jobs(command: &Command) -> bool {
+        match command {
+            Command::CancelInstance { .. }
+            | Command::ModifyInstance { .. }
+            | Command::MigrateInstance { .. }
+            | Command::CorrelateMessageSubscription { .. }
+            | Command::ActivateAdHocActivities { .. }
+            | Command::CompleteJob { .. }
+            | Command::FailJob { .. }
+            | Command::ThrowJobError { .. }
+            | Command::CompleteUserTask { .. }
+            | Command::AssignUserTask { .. }
+            | Command::UnassignUserTask { .. }
+            | Command::UpdateUserTask { .. }
+            | Command::ResolveIncident { .. }
+            | Command::SetVariables { .. }
+            | Command::CorrelateMessage { .. }
+            | Command::TriggerTimers { .. }
+            | Command::BroadcastSignal { .. } => true,
+            Command::DeployProcess(_)
+            | Command::DeployResources(_)
+            | Command::DeployDecisionRequirements(_)
+            | Command::DeployForms(_)
+            | Command::DeployGenericResources(_)
+            | Command::DeployBundle(_)
+            | Command::DeleteDecisionInstance { .. }
+            | Command::CreateClusterVariable { .. }
+            | Command::UpdateClusterVariable { .. }
+            | Command::DeleteClusterVariable { .. }
+            | Command::EvaluateDecision { .. }
+            | Command::CreateInstance { .. }
+            | Command::ActivateJobs { .. }
+            | Command::ActivateJobsByKey { .. }
+            | Command::ExpireJobs { .. }
+            | Command::ExpireJobsByDurability { .. }
+            | Command::UpdateJobRetries { .. }
+            | Command::UpdateJobTimeout { .. }
+            | Command::UpdateJob { .. }
+            | Command::EvaluateConditionalStartEvents { .. }
+            | Command::OpenMessageSubscription { .. }
+            | Command::CloseMessageSubscription { .. }
+            | Command::SuspendInstance { .. }
+            | Command::ResumeInstance { .. }
+            | Command::DispatchStartInstance { .. }
+            | Command::CreateAgentInstance { .. }
+            | Command::UpdateAgentInstance { .. }
+            | Command::CompleteAgentInstance { .. }
+            | Command::QuarantineOffheapOrphan { .. }
+            | Command::QuarantineColdOrphan { .. }
+            | Command::SetLenientCompletion { .. } => false,
+        }
+    }
+
+    /// Resolves the live soft-activation deadlines of every soft-activated job
+    /// on this partition that `command` could terminate by cascade (#1570).
+    ///
+    /// Called on the PROPOSING leader right before `command` enters the Raft
+    /// log (alongside [`Self::stamp_terminal_attribution`]). The returned map
+    /// rides the replicated command envelope (`ReplicatedCommand::terminal_deadlines`)
+    /// and is supplied to [`Engine::apply_command_records_stamped_at`] on every
+    /// replica, so `JobCanceled.deadline` agrees across replicas while
+    /// preserving Camunda's "keep the last deadline on CANCELED" for soft jobs.
+    ///
+    /// Only leader-local (soft) activations with a live deadline are included:
+    /// durable activations already replicate their lock and read it from
+    /// replicated state at [`Self::job_terminal_deadline`]. Returning an empty
+    /// map when no soft jobs are active keeps the wire format byte-identical on
+    /// the common path.
+    ///
+    /// Resolved against the proposer's APPLIED state: a subscription, timer or
+    /// terminate path opened by an earlier command that is still queued in the
+    /// same propose batch (not yet applied) is not seen, so a soft job it
+    /// cancels records `deadline: None` — identically on every replica, since
+    /// the stamp is replicated, so this is a precision gap, never a divergence.
+    ///
+    /// Resident-only: an instance spilled to cold storage hides the call-activity
+    /// links through it. A host with a cold tier must use
+    /// [`Self::resolve_cascade_terminal_deadlines_with`] and supply its cold
+    /// topology, or a soft job above or below a cold intermediate is cancelled
+    /// with `deadline: None` (#1856 review).
+    pub fn resolve_cascade_terminal_deadlines(&self, command: &Command) -> BTreeMap<Key, u64> {
+        self.resolve_cascade_terminal_deadlines_with(command, &NoColdTopology)
+    }
+
+    /// [`Self::resolve_cascade_terminal_deadlines`], walking the call-activity
+    /// tree through cold (non-resident) instances via `cold` (#1856 review).
+    /// Cold instances hold no live activation lock themselves (a locked job
+    /// keeps its instance hot), so only the LINKS through them are needed:
+    /// the walk ascends through a cold parent and descends through cold
+    /// children to reach every resident soft job of the cascade's tree.
+    pub fn resolve_cascade_terminal_deadlines_with(
+        &self,
+        command: &Command,
+        cold: &dyn ColdTopology,
+    ) -> BTreeMap<Key, u64> {
+        if self.state.activated_jobs.is_empty() || !Self::command_may_cascade_soft_jobs(command) {
+            return BTreeMap::new();
+        }
+        let mut roots: Vec<Key> = Vec::new();
+        match command {
+            Command::CancelInstance { instance_key }
+            | Command::ModifyInstance { instance_key, .. }
+            | Command::MigrateInstance { instance_key, .. }
+            | Command::CorrelateMessageSubscription { instance_key, .. } => {
+                roots.push(*instance_key);
+            }
+            Command::ActivateAdHocActivities {
+                ad_hoc_instance_key,
+                ..
+            } => {
+                if let Some(instance_key) = self.resolve_scope(*ad_hoc_instance_key) {
+                    roots.push(instance_key);
+                }
+            }
+            Command::CompleteJob { job_key, .. }
+            | Command::FailJob { job_key, .. }
+            | Command::ThrowJobError { job_key, .. } => {
+                if let Some(job) = self.state.jobs.get(job_key) {
+                    roots.push(job.instance_key);
+                }
+            }
+            Command::CompleteUserTask { user_task_key, .. }
+            | Command::AssignUserTask { user_task_key, .. }
+            | Command::UnassignUserTask { user_task_key }
+            | Command::UpdateUserTask { user_task_key, .. } => {
+                if let Some(task) = self.state.user_tasks.get(user_task_key) {
+                    roots.push(task.instance_key);
+                }
+            }
+            Command::ResolveIncident { incident_key } => {
+                if let Some(incident) = self.state.incidents.get(incident_key) {
+                    roots.push(incident.instance_key);
+                }
+            }
+            Command::SetVariables { scope_key, .. } => {
+                if let Some(instance_key) = self.resolve_scope(*scope_key) {
+                    roots.push(instance_key);
+                }
+            }
+            Command::CorrelateMessage {
+                message_name,
+                correlation_key,
+                ..
+            } => {
+                for sub in self.state.message_subscriptions.values() {
+                    if sub.state == state::MessageSubscriptionState::Open
+                        && sub.message_name == *message_name
+                        && sub.correlation_key == *correlation_key
+                    {
+                        roots.push(sub.instance_key);
+                    }
+                }
+            }
+            Command::TriggerTimers { now } => {
+                for timer in self.state.timers.values() {
+                    if timer.state == state::TimerState::Created && timer.due_at <= *now {
+                        roots.push(timer.instance_key);
+                    }
+                }
+            }
+            Command::BroadcastSignal { signal_name, .. } => {
+                for sub in self.state.signal_subscriptions.values() {
+                    if sub.state == state::MessageSubscriptionState::Open
+                        && sub.signal_name == *signal_name
+                    {
+                        roots.push(sub.instance_key);
+                    }
+                }
+            }
+            // Non-cascading commands: rejected by the predicate above.
+            _ => return BTreeMap::new(),
+        }
+        // Cold instances the command addresses (paged in on apply): their
+        // resident ancestors/descendants are in the cascade too.
+        roots.extend(cold.command_roots(command));
+        if roots.is_empty() {
+            return BTreeMap::new();
+        }
+        // A cascade propagates UP across call activities too (a child
+        // completing/erroring can drive its parent to a terminate end event or
+        // an interrupting boundary), so first ascend each root to its
+        // top-level ancestor, then walk all call-activity descendants
+        // (resident via `children_by_parent`, cold via `cold`), collecting
+        // every live soft-activated job's deadline. Both directions pass
+        // through cold intermediates (#1856 review).
+        let parent_of = |key: Key| match self.state.instances.get(&key) {
+            Some(instance) => instance.parent_process_instance_key,
+            None => cold.parent_of(key),
+        };
+        let roots: Vec<Key> = roots
+            .into_iter()
+            .map(|mut key| {
+                let mut hops = BTreeSet::new();
+                while hops.insert(key) {
+                    match parent_of(key) {
+                        Some(parent) => key = parent,
+                        None => break,
+                    }
+                }
+                key
+            })
+            .collect();
+        let mut roots = roots;
+        let mut seen = BTreeSet::new();
+        let mut deadlines = BTreeMap::new();
+        while let Some(instance_key) = roots.pop() {
+            if !seen.insert(instance_key) {
+                continue;
+            }
+            if let Some(children) = self.state.children_by_parent.get(&instance_key) {
+                roots.extend(children.iter().copied());
+            }
+            roots.extend(cold.children_of(instance_key));
+        }
+        // Scan only live activations, never each instance's retained job
+        // history (completed/canceled jobs stay in `jobs_by_instance` until
+        // eviction) nor the engine-wide activation set when the cascade is
+        // small: iterate whichever candidate side is smaller, so the cost is
+        // bounded by min(reached instances' job lists, live activations) and
+        // does not grow with unrelated activated jobs (#1856 review).
+        let reached_jobs: usize = seen
+            .iter()
+            .filter_map(|k| self.state.jobs_by_instance.get(k))
+            .map(|jobs| jobs.len())
+            .sum();
+        let candidates: Vec<Key> = if reached_jobs <= self.state.activated_jobs.len() {
+            seen.iter()
+                .filter_map(|k| self.state.jobs_by_instance.get(k))
+                .flat_map(|jobs| jobs.iter().copied())
+                .filter(|k| self.state.activated_jobs.contains(k))
+                .collect()
+        } else {
+            self.state.activated_jobs.iter().copied().collect()
+        };
+        for job_key in candidates {
+            if let Some(job) = self.state.jobs.get(&job_key) {
+                if seen.contains(&job.instance_key)
+                    && job.state == state::JobState::Activated
+                    && !job.has_replicated_lock()
+                {
+                    if let Some(deadline) = job.deadline {
+                        deadlines.insert(job_key, deadline);
+                    }
+                }
+            }
+        }
+        deadlines
+    }
+
     /// Soft activation leases this engine holds, with the activating worker
     /// for each — broadcast in the lease digest so a promoted leader restores
     /// the real attribution, not a sentinel (#963). Same set as
@@ -755,7 +1008,7 @@ impl Engine {
             // first-terminal-wins over any stamp.
             return terminal_end.deadline;
         }
-        if job.lease_token.is_some() || job.durable_activation {
+        if job.has_replicated_lock() {
             // A durable (journaled) activation: the lock is replicated, so its
             // CURRENT deadline is identical on every replica — including any
             // `UpdateJobTimeout` applied after the proposer stamped. The
@@ -763,13 +1016,12 @@ impl Engine {
             // activation without one still journals its deadline.
             job.deadline
         } else {
-            // The current command's proposer-stamped deadline (#1494): carried
-            // on the replicated command, so identical on every replica even
-            // for a soft lock this replica never saw. An unstamped soft
-            // (leader-local) activation has nothing replicated to restate.
-            self.terminal_deadline_stamp
-                .filter(|(stamped_key, _)| *stamped_key == job_key)
-                .and_then(|(_, deadline)| deadline)
+            // The current command's proposer-stamped deadline (#1494, #1570):
+            // carried on the replicated command (either via `JobAttribution` or
+            // `ReplicatedCommand::terminal_deadlines`), so identical on every
+            // replica even for a soft lock this replica never saw. An unstamped
+            // soft (leader-local) activation has nothing replicated to restate.
+            self.terminal_deadline_stamps.get(&job_key).copied()
         }
     }
 }

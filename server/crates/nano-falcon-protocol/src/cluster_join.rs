@@ -67,6 +67,13 @@ pub const FEATURE_REPLICA_DIGEST: &str = "replica-digest-v1";
 /// permanently disabling divergence comparison between them.
 pub const FEATURE_REPLICA_DIGEST_CUTOVER: &str = "replica-digest-cutover-v1";
 
+/// Envelope soft-job terminal deadlines (#1570): this binary applies
+/// `ReplicatedCommand::terminal_deadlines`. A pre-#1570 binary decodes but
+/// IGNORES the map (recording `deadline: None`), so a leader emits stamps only
+/// while every member advertises this, and never ships a stamped entry to a
+/// peer that does not.
+pub const FEATURE_TERMINAL_DEADLINES: &str = "terminal-deadlines-v1";
+
 /// Every replicated-command feature this binary supports — the single source
 /// of truth for what the handshake advertises.
 pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
@@ -74,6 +81,7 @@ pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_CLUSTER_VARIABLES,
     FEATURE_REPLICA_DIGEST,
     FEATURE_REPLICA_DIGEST_CUTOVER,
+    FEATURE_TERMINAL_DEADLINES,
 ];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.
