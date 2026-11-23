@@ -52,6 +52,7 @@ const RECEIVER_SYNC_METHODS: &[&str] = &[
     "rotate",
     "flush",
     "shutdown",
+    "barrier",
 ];
 
 /// Receiver methods that sync only when they actually rotated: on a
@@ -116,23 +117,25 @@ fn unconditional_at(region: &str, at: usize) -> bool {
 
 /// Whether `region` contains an unconditional sync point for the journal
 /// `recv` was applied on, returning its offset: a writer-ordered method called
-/// *on that same receiver* (a rotation must be unwrapped to prove it ran),
-/// `drop(<recv>)`, or `blocking_wait()` on a commit bound from a *later*
-/// apply on that receiver whose result is unwrapped (an eventless later apply
-/// returns a ready commit covering nothing; only a fallible result proves a
-/// write was queued, FIFO behind the discarded one). Calls are matched
-/// identifier-bounded and followed by `(`, so `rotated`/`flushed` never
-/// count. Unrelated drops and waits on stale or foreign commits order nothing.
-fn sync_point_at(region: &str, recv: &str) -> Option<usize> {
+/// *on that same receiver* (a rotation must be unwrapped to prove it ran), or
+/// `drop(<recv>)` when `recv` is bound *by value* in this function (dropping
+/// the owned journal closes it, draining the writer; dropping a `&mut Journal`
+/// is a no-op that orders nothing). Calls are matched identifier-bounded and
+/// followed by `(`, so `rotated`/`flushed` never count. Unrelated drops and
+/// waits on stale or foreign commits order nothing. A wait on a *later*
+/// apply's commit is not a sync point: non-emptiness of that apply's events
+/// cannot be proven statically, and an eventless later apply returns a ready
+/// commit covering nothing — so only the discarded apply's own handle (checked
+/// in `violations`), a writer-queued message, or a close/reopen proves the
+/// write landed. `body` is the whole function text: the by-value binding may
+/// precede the apply, which `region` starts after.
+fn sync_point_at(region: &str, recv: &str, body: &str) -> Option<usize> {
     if recv.is_empty() {
         return None;
     }
     let b = region.as_bytes();
     let mut hits = Vec::new();
-    for name in RECEIVER_SYNC_METHODS
-        .iter()
-        .chain(["blocking_wait", "drop"].iter())
-    {
+    for name in RECEIVER_SYNC_METHODS.iter().chain(["drop"].iter()) {
         let mut from = 0;
         while let Some(off) = region[from..].find(name) {
             let at = from + off;
@@ -152,12 +155,7 @@ fn sync_point_at(region: &str, recv: &str) -> Option<usize> {
                         .take_while(|c| *c != ')')
                         .filter(|c| !c.is_whitespace())
                         .collect();
-                    !dotted && arg == recv
-                }
-                "blocking_wait" => {
-                    dotted
-                        && receiver_before(region, at - 1)
-                            .is_some_and(|h| commit_bound_from(&region[..at], &h, recv))
+                    !dotted && arg == recv && bound_by_value(body, recv)
                 }
                 _ => {
                     dotted
@@ -178,35 +176,49 @@ fn sync_point_at(region: &str, recv: &str) -> Option<usize> {
     hits.into_iter().min()
 }
 
-/// Whether `before` binds `handle` as the commit of an apply on `recv`
-/// (`let (_, handle) = recv.apply_command…` / `let handle = recv.apply…`)
-/// whose result is unwrapped (`.unwrap()` / `.expect(…)` / `?`). The unwrap
-/// requirement proves the apply actually queued a write: an eventless later
-/// apply (`ExpireJobs` with nothing to expire) returns `Commit::ready()`
-/// without enqueueing anything, so waiting on it orders nothing behind the
-/// discarded write.
-fn commit_bound_from(before: &str, handle: &str, recv: &str) -> bool {
-    let mut from = 0;
-    while let Some(off) = before[from..].find(APPLY) {
-        let at = from + off;
-        from = at + APPLY.len();
-        if receiver_before(before, at).as_deref() != Some(recv) {
-            continue;
-        }
-        let chain = apply_result_suffix(before, at);
-        // The result must be unwrapped (`.unwrap()` / `.expect(…)` / `?`,
-        // optionally projecting `.1`): an eventless apply returns a ready
-        // commit covering nothing, and only a fallible result proves the
-        // write was queued. The projection form binds the commit itself, so
-        // any pattern works (`let late = …unwrap().1`).
-        let proven = !chain.is_empty()
-            && (!strip_unwrap_chain(&chain).starts_with(['.', '('].as_slice())
-                || chain.ends_with(".1"));
-        if commit_slot(before, at).is_some_and(|slot| slot == handle) && proven {
-            return true;
-        }
-    }
-    false
+/// Whether `recv` is bound *by value* anywhere in `region`'s function
+/// (`let recv = …` / `let mut recv = …`), so `drop(recv)` moves and closes the
+/// owned journal. A receiver that is only ever a `&mut Journal` reference
+/// (`let journal = &mut *real;`, a `&mut Journal` parameter) makes
+/// `drop(recv)` a no-op: the reference dies, the write stays pending.
+fn bound_by_value(region: &str, recv: &str) -> bool {
+    ["let mut ", "let "].iter().any(|kw| {
+        let binding = format!("{kw}{recv} =");
+        let at = region
+            .find(&binding)
+            .or_else(|| region.find(&binding.replace(" =", "=")));
+        at.is_some_and(|at| {
+            let stmt_end = region[at..].find(';').map_or(region.len(), |n| at + n);
+            let stmt: String = region[at..stmt_end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            // An initializer that *is* a reference (`= &…` / `= &mut …`) binds
+            // a reference: dropping it is a no-op, not a close. A `&` deeper
+            // in the expression (a `&dir` argument) is just an argument.
+            let init = stmt.split('=').nth(1).unwrap_or("");
+            !init.starts_with('&')
+        })
+    })
+}
+
+/// Whether `handle` is rebound or `recv` shadowed in `after` (the text from
+/// the apply call to the wait). Either breaks the tie between the wait's
+/// handle name and the apply's commit: `handle = Commit::ready()` makes the
+/// wait resolve immediately, and `let recv = <other journal>` means the apply
+/// ran on a different journal than the discarded write did.
+fn rebound_after(after: &str, handle: &str, recv: &str) -> bool {
+    after.split([';', '{', '}']).any(|stmt| {
+        let stmt: String = stmt.chars().filter(|c| !c.is_whitespace()).collect();
+        let rebinds_handle = stmt
+            .strip_prefix(handle)
+            .or_else(|| stmt.strip_prefix(&format!("mut {handle}")))
+            .is_some_and(|rest| rest.starts_with('=') && !rest.starts_with("=="));
+        let shadows_recv = ["let mut ", "let "]
+            .iter()
+            .any(|kw| stmt.starts_with(&format!("{kw}{recv}=")));
+        rebinds_handle || shadows_recv
+    })
 }
 
 /// The binding of the commit (last tuple slot, or the whole pattern) in the
@@ -472,7 +484,27 @@ fn discards_commit(body: &str, apply_at: usize) -> bool {
             && !stmt.starts_with("return")
             && stmt.matches('(').count() == stmt.matches(')').count();
     }
-    commit_slot(body, apply_at).is_some_and(|slot| slot.starts_with('_'))
+    let slot = commit_slot(body, apply_at);
+    // A named handle that is rebound before its wait (`late = Commit::ready()`)
+    // no longer names the apply's commit: the wait resolves immediately and the
+    // pending write races the observation — the commit is effectively dropped.
+    slot.is_some_and(|slot| {
+        slot.starts_with('_') || {
+            let recv = receiver_before(body, apply_at).unwrap_or_default();
+            let tail = &body[call_args_end(body, apply_at)..];
+            let rebound = tail
+                .match_indices(&format!("{slot}.blocking_wait()"))
+                .any(|(at, _)| {
+                    (at == 0 || !is_ident(tail.as_bytes()[at - 1]))
+                        && rebound_after(&tail[..at], &slot, &recv)
+                });
+            // No wait at all on a named handle also drops the commit.
+            let awaited = tail
+                .match_indices(&format!("{slot}.blocking_wait()"))
+                .any(|(at, _)| at == 0 || !is_ident(tail.as_bytes()[at - 1]));
+            rebound || !awaited
+        }
+    })
 }
 
 /// The `suffix` of an apply statement with its unwrapping chain removed:
@@ -575,16 +607,14 @@ fn violations(src: &str) -> Vec<(String, String)> {
                 // point and the observation. Conditionals *before* the sync
                 // point do not weaken it — every path still reaches it.
                 let region = &tail[..obs_at];
-                let synced = sync_point_at(region, &recv).is_some()
+                let synced = sync_point_at(region, &recv, &body).is_some()
                     || commit_slot(&body, apply_at).is_some_and(|slot| {
-                        // The wait must name the bound handle exactly:
-                        // `_commit.blocking_wait()` awaits `_commit`, not a
-                        // different `commit` variable.
                         !slot.is_empty()
                             && region
                                 .match_indices(&format!("{slot}.blocking_wait()"))
                                 .any(|(at, _)| {
                                     (at == 0 || !is_ident(region.as_bytes()[at - 1]))
+                                        && !rebound_after(&region[..at], &slot, &recv)
                                         && unconditional_at(region, at)
                                 })
                     });
@@ -804,12 +834,13 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
     assert!(violations(tied).is_empty());
     let dropped = r#"
         fn t() {
+            let journal = Journal::open_segmented(&dir).expect("open").0;
             let _ = journal.apply_command(c).unwrap();
             drop(journal);
             let u = shared.uncompacted_usage();
         }
     "#;
-    assert!(violations(dropped).is_empty());
+    assert_eq!(violations(dropped), Vec::<(String, String)>::new());
 
     // A sync point *before* a conditional still executes on every path: the
     // `?` only makes the suffix after it conditional.
@@ -850,7 +881,9 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
             let u = shared.uncompacted_usage();
         }
     "#;
-    assert!(violations(later_wait).is_empty());
+    // A later apply's wait is NOT a sync point (see the eventless-later block
+    // below): the guard cannot prove the later apply queued a write.
+    assert_eq!(violations(later_wait).len(), 1);
 
     // A deferred closure or short-circuited call may never run.
     let deferred = r#"
@@ -966,11 +999,13 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
     "#;
     assert!(violations(project_commit).is_empty());
 
-    // A later apply's commit covers the discarded write only when that apply
-    // queued a write: an eventless `ExpireJobs` returns `Commit::ready()`
-    // without enqueueing anything, so a wait on it orders nothing. Only an
-    // unwrapped result proves the queueing; a raw `let (_, late) = …;`
-    // binding leaves the commit possibly ready.
+    // A later apply's commit can never prove it covers the discarded write:
+    // non-emptiness of its events is not statically provable, and an eventless
+    // apply returns `Commit::ready()` without enqueueing anything — so a wait
+    // on it orders nothing, even when the result is unwrapped (an Ok result
+    // says nothing about a queued write: `persist` returns a ready commit for
+    // an empty batch). Only the discarded apply's own handle, a writer-queued
+    // message (rotation/barrier), or a close/reopen syncs.
     let eventless_later = r#"
         fn t() {
             let _ = journal.apply_command(Command::DeployProcess(demo())).unwrap();
@@ -988,7 +1023,7 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
             let u = shared.uncompacted_usage();
         }
     "#;
-    assert!(violations(queued_later).is_empty());
+    assert_eq!(violations(queued_later).len(), 1);
     let projected_later = r#"
         fn t() {
             let _ = journal.apply_command(c).unwrap();
@@ -997,7 +1032,72 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
             let u = shared.uncompacted_usage();
         }
     "#;
-    assert!(violations(projected_later).is_empty());
+    assert_eq!(violations(projected_later).len(), 1);
+
+    // `barrier()` is the canonical writer-FIFO sync: it queues an empty write
+    // behind every pending append, so waiting on it covers the discarded write.
+    let barrier_wait = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            journal.barrier().blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(barrier_wait).is_empty());
+    let barrier_bound = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let b = journal.barrier();
+            b.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(barrier_bound).is_empty());
+
+    // Dropping a `&mut Journal` reference is a no-op — the write stays pending.
+    // Only dropping a journal bound by value closes it and drains the writer.
+    let drop_ref = r#"
+        fn t(journal: &mut Journal) {
+            let _ = journal.apply_command(c).unwrap();
+            drop(journal);
+            let b = fs::read(&p).unwrap();
+        }
+    "#;
+    assert_eq!(violations(drop_ref).len(), 1);
+    let drop_ref_alias = r#"
+        fn t() {
+            let journal = &mut *real;
+            let _ = journal.apply_command(c).unwrap();
+            drop(journal);
+            let b = fs::read(&p).unwrap();
+        }
+    "#;
+    assert_eq!(violations(drop_ref_alias).len(), 1);
+
+    // A wait's handle must still name the apply's commit at the wait: rebinding
+    // the handle, or shadowing the receiver to a different journal, breaks it.
+    let rebound_handle = r#"
+        fn t() {
+            let (_, mut late) = journal.apply_command(c).unwrap();
+            late = Commit::ready();
+            late.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(
+        violations(rebound_handle),
+        vec![("t".to_string(), "uncompacted_usage(".to_string())]
+    );
+    let shadowed_receiver = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let journal = Journal::open_segmented(&dir2).expect("open").0;
+            let (_, late) = journal.apply_command(d).unwrap();
+            late.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(shadowed_receiver).len(), 1);
 
     // A rotation must be unwrapped on its *own* result chain: an unrelated
     // unwrap elsewhere in the statement does not prove the rotation ran.
