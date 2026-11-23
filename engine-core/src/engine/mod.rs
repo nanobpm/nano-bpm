@@ -19002,8 +19002,10 @@ impl OwnedByInstance for state::Timer {
     fn instance_key(&self) -> Key {
         // #1482: test-only op-count instrumentation for the streaming
         // decomposition guard below — the concrete accessor a per-instance
-        // rescan regression would drive N times per entity.
-        #[cfg(test)]
+        // rescan regression would drive N times per entity. Gated on
+        // `feature = "serde"` to match the `decompose_scaling` module it
+        // counts for, so `cargo check --tests` without serde still compiles.
+        #[cfg(all(test, feature = "serde"))]
         decompose_scaling::TIMER_OWNER_READS.with(|r| r.set(r.get() + 1));
         self.instance_key
     }
