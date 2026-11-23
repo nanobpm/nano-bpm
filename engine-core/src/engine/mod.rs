@@ -218,6 +218,12 @@ pub struct Engine {
     /// Test-only count of scope-map scans by `cancel_scope_tree_events`.
     #[cfg(test)]
     pub(crate) scope_scan_count: std::cell::Cell<usize>,
+    /// Test-only count of process instances `cascade_cancel_children` examined
+    /// as candidate call-activity children (#1827). The cascade runs on every
+    /// command that ends an instance, so it must look up the ended parents'
+    /// children, never walk the resident instance map.
+    #[cfg(test)]
+    pub(crate) cascade_scan_count: std::cell::Cell<usize>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -735,6 +741,8 @@ impl Engine {
             user_task_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             scope_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
@@ -912,6 +920,8 @@ impl Engine {
             user_task_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             scope_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
@@ -2538,6 +2548,10 @@ impl Engine {
             self.run(&mut log, queue);
             self.cascade_cancel_children(&mut log, 0);
             self.finish_command(&log);
+            // Every engine test exercises the parent -> children index the
+            // cascade reads (#1827): a write path that bypassed it fails here.
+            #[cfg(test)]
+            self.state.assert_children_index_covers_instances();
             log
         });
         self.operation_reference = None;
@@ -18244,50 +18258,62 @@ impl Engine {
             })
             .collect();
         // Only an instance whose definition contains a call activity can own a
-        // child, so prune the rest before the resident-instance scan: a batch
-        // of N independent `start → timer → end` fires then costs O(1) per
-        // fire instead of an O(resident) scan each (r4642363545). An instance
+        // child, so prune the rest before the index lookup (r4642363545). An instance
         // no longer resident (unknown definition) is kept — fail safe.
         ended.retain(|k| self.may_own_call_activity_child(*k));
         if ended.is_empty() {
             return;
         }
+        // Walk the parent -> children index (#1827) one generation at a time:
+        // each round looks up only the instances that ended in the previous
+        // one, so the cascade costs O(children) instead of a scan of every
+        // resident instance on every command that ends an instance.
+        let mut frontier = ended;
         loop {
-            let mut children: Vec<Key> = self
-                .state
-                .instances
-                .values()
-                .filter(|i| {
-                    // A cascade cancel is not interruptible, so it must also
-                    // sweep children already mid-drain (`Terminating`, e.g. a
-                    // child whose own cancel deferred on a user-task canceling
-                    // listener) — otherwise the parent's termination orphans
-                    // them. `discard_and_terminate_instance` force-completes
-                    // that deferred drain — and children an operator
-                    // `Suspended`: suspension pauses progress, it does not
-                    // detach the child from its ending parent.
-                    matches!(
-                        i.state,
-                        ProcessInstanceState::Active
-                            | ProcessInstanceState::Terminating
-                            | ProcessInstanceState::Suspended
-                    ) && i
-                        .parent_process_instance_key
-                        .map(|p| ended.contains(&p))
-                        .unwrap_or(false)
+            let mut children: Vec<Key> = frontier
+                .iter()
+                .filter_map(|parent| self.state.children_by_parent.get(parent))
+                .flatten()
+                .copied()
+                .filter(|child| {
+                    #[cfg(test)]
+                    self.cascade_scan_count
+                        .set(self.cascade_scan_count.get() + 1);
+                    // The index is a superset of the live links; the instance
+                    // itself is authoritative. A cascade cancel is not
+                    // interruptible, so it must also sweep children already
+                    // mid-drain (`Terminating`, e.g. a child whose own cancel
+                    // deferred on a user-task canceling listener) — otherwise
+                    // the parent's termination orphans them.
+                    // `discard_and_terminate_instance` force-completes that
+                    // deferred drain — and children an operator `Suspended`:
+                    // suspension pauses progress, it does not detach the child
+                    // from its ending parent.
+                    self.state.instances.get(child).is_some_and(|i| {
+                        matches!(
+                            i.state,
+                            ProcessInstanceState::Active
+                                | ProcessInstanceState::Terminating
+                                | ProcessInstanceState::Suspended
+                        ) && i
+                            .parent_process_instance_key
+                            .is_some_and(|p| frontier.contains(&p))
+                    })
                 })
-                .map(|i| i.key)
                 .collect();
             if children.is_empty() {
                 break;
             }
             children.sort_unstable();
+            children.dedup();
+            let mut next = BTreeSet::new();
             for child in children {
                 self.discard_and_terminate_instance(log, child);
                 if self.may_own_call_activity_child(child) {
-                    ended.insert(child);
+                    next.insert(child);
                 }
             }
+            frontier = next;
         }
     }
 

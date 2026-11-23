@@ -2519,6 +2519,17 @@ pub struct State {
     /// when a job is created and the whole entry is removed when the instance is
     /// evicted.
     pub jobs_by_instance: BTreeMap<Key, std::collections::BTreeSet<Key>>,
+    /// Reverse index of process instance key → the keys of its resident
+    /// call-activity child instances (#1827). Ending an instance cascades a
+    /// cancel to its children; with this index that is `O(its children)`
+    /// rather than a scan of every resident instance, which made each
+    /// completion cost `O(total backlog)`. Derived from
+    /// `instances[*].parent_process_instance_key` and maintained only by
+    /// [`State::insert_instance`] / [`State::remove_instance`], the sole
+    /// writers of `instances` in this crate. In-memory only: rebuilt by
+    /// [`State::rebuild_children_index`] on snapshot restore.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub children_by_parent: BTreeMap<Key, std::collections::BTreeSet<Key>>,
     /// Per-process-definition **in-flight instance count** (created but not yet
     /// terminal), keyed by BPMN process id. Maintained by [`apply_event`] at
     /// `ProcessInstanceCreated` (+1) and the terminal transitions
@@ -3108,6 +3119,87 @@ impl State {
         Self::default()
     }
 
+    /// Inserts (or overwrites) a process instance, keeping
+    /// [`State::children_by_parent`] in lockstep. With
+    /// [`State::remove_instance`], the only writer of `instances` in this crate
+    /// (#1827); the test-build invariant
+    /// [`State::assert_children_index_covers_instances`] catches a bypass.
+    pub fn insert_instance(&mut self, instance: ProcessInstance) {
+        let key = instance.key;
+        if let Some(parent) = instance.parent_process_instance_key {
+            self.children_by_parent
+                .entry(parent)
+                .or_default()
+                .insert(key);
+        }
+        if let Some(previous) = self.instances.insert(key, instance) {
+            // An overwrite that re-parented the instance (never expected, but
+            // keep the index exact rather than leak the old link).
+            let new_parent = self.instances[&key].parent_process_instance_key;
+            if previous.parent_process_instance_key != new_parent {
+                if let Some(old) = previous.parent_process_instance_key {
+                    self.unlink_child(old, key);
+                }
+            }
+        }
+    }
+
+    /// Removes a process instance, unlinking it from its parent's entry in
+    /// [`State::children_by_parent`]. Its own entry as a parent is kept: its
+    /// children may stay resident (e.g. the parent alone was spilled to cold
+    /// storage and will be rehydrated), and each child unlinks itself when it is
+    /// removed, so an entry empties (and is dropped) with its last child.
+    pub fn remove_instance(&mut self, key: Key) -> Option<ProcessInstance> {
+        let instance = self.instances.remove(&key)?;
+        if let Some(parent) = instance.parent_process_instance_key {
+            self.unlink_child(parent, key);
+        }
+        Some(instance)
+    }
+
+    fn unlink_child(&mut self, parent: Key, child: Key) {
+        if let Some(children) = self.children_by_parent.get_mut(&parent) {
+            children.remove(&child);
+            if children.is_empty() {
+                self.children_by_parent.remove(&parent);
+            }
+        }
+    }
+
+    /// Re-derives [`State::children_by_parent`] from `instances` in one pass.
+    /// The index is serde-skipped, so a restored snapshot carries it empty.
+    pub fn rebuild_children_index(&mut self) {
+        self.children_by_parent.clear();
+        for instance in self.instances.values() {
+            if let Some(parent) = instance.parent_process_instance_key {
+                self.children_by_parent
+                    .entry(parent)
+                    .or_default()
+                    .insert(instance.key);
+            }
+        }
+    }
+
+    /// Test-build invariant (#1827): every resident instance with a parent is
+    /// listed under that parent in [`State::children_by_parent`]. A missing
+    /// link would let a cancelled parent orphan its child, so any write to
+    /// `instances` that bypasses [`State::insert_instance`] fails here.
+    #[cfg(test)]
+    pub(crate) fn assert_children_index_covers_instances(&self) {
+        for instance in self.instances.values() {
+            if let Some(parent) = instance.parent_process_instance_key {
+                assert!(
+                    self.children_by_parent
+                        .get(&parent)
+                        .is_some_and(|c| c.contains(&instance.key)),
+                    "children_by_parent misses child {} of parent {parent}: an \
+                     `instances` write bypassed State::insert_instance",
+                    instance.key
+                );
+            }
+        }
+    }
+
     /// The executable definition an instance runs against — resolved through the
     /// instance's pinned `process_definition_key` so it is always the version the
     /// instance was created on, even after a newer version is redeployed (Zeebe
@@ -3394,7 +3486,7 @@ pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) 
     reconstruct_owed_activations(&mut instance, &incidents);
     instance.resolve_legacy_join_scopes();
     let key = instance.key;
-    state.instances.insert(key, instance);
+    state.insert_instance(instance);
     for job in jobs {
         let job_key = job.key;
         state
