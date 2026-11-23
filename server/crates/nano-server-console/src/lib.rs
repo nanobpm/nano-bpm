@@ -5600,6 +5600,42 @@ fn data_error(e: projects::DataError) -> (StatusCode, String) {
     }
 }
 
+/// If `err` is datasource-gateway back-pressure ([`projects::DataError::Busy`]),
+/// the `Retry-After` seconds to send with the `503`; `None` for every other
+/// error (including the non-transient no-runtime `503`) (#1837).
+pub fn data_busy_retry_after(err: &(StatusCode, String)) -> Option<i32> {
+    (err.0 == StatusCode::SERVICE_UNAVAILABLE
+        && err.1.starts_with(projects::DATA_GATEWAY_BUSY_PREFIX))
+    .then_some(projects::DATA_GATEWAY_BUSY_RETRY_AFTER_SECS)
+}
+
+#[cfg(test)]
+mod data_busy_tests {
+    use super::*;
+
+    /// #1837: the real `Busy` error (as produced by the limiter's message
+    /// format) is recognized; the other 503 (no runtime) is not.
+    #[test]
+    fn busy_is_recognized_only_for_gateway_back_pressure() {
+        let busy = data_error(projects::DataError::Busy(format!(
+            "{} 1 ops running and 0 queued; retry shortly",
+            projects::DATA_GATEWAY_BUSY_PREFIX
+        )));
+        assert_eq!(
+            data_busy_retry_after(&busy),
+            Some(projects::DATA_GATEWAY_BUSY_RETRY_AFTER_SECS)
+        );
+        assert_eq!(
+            data_busy_retry_after(&data_error(projects::DataError::NoRuntime)),
+            None
+        );
+        assert_eq!(
+            data_busy_retry_after(&data_error(projects::DataError::Op("bad".into()))),
+            None
+        );
+    }
+}
+
 /// Run one datasource op and surface it as an `ApiResult`.
 async fn project_data_op(name: &str, request: serde_json::Value) -> ApiResult {
     projects::run_data_op(name, request)
