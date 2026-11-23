@@ -32,6 +32,71 @@ use common::server_command;
 /// The generated REST layer mounts every route under this base path.
 const BASE_PATH: &str = "/v2";
 
+/// The harness's time budgets — the **single documented source** for every
+/// deadline/timeout this file applies to a server child (#1821).
+///
+/// Each failure names the budget it hit (see [`Budget`]) so an intermittent
+/// failure is diagnosable from its message alone. These are not retry knobs:
+/// widening one blindly hides a real defect (AGENTS.md: no flaky tests).
+///
+/// Why they are sized as they are: on macOS a debug server binary (~450 MB,
+/// ad-hoc/unsigned) spawned from under cargo/nextest can sit in
+/// `_dyld_start` for several seconds before `main` runs (exec-side
+/// code-signing validation; investigated in #1821), so the *port* budget
+/// absorbs that exec floor. Once bound, the server reaches readiness in
+/// ~100 ms, and a single request (including a durable fsync commit) is far
+/// below the I/O budget on an idle machine.
+mod budget {
+    use std::time::Duration;
+
+    /// From `spawn()` until the child prints `LISTENING_PORT=<n>`.
+    pub const PORT: Duration = Duration::from_secs(30);
+    /// From the port being reported until the router answers HTTP.
+    pub const READY: Duration = Duration::from_secs(30);
+    /// Socket read/write timeout for one request/response exchange.
+    pub const REQUEST_IO: Duration = Duration::from_secs(10);
+    /// Polling window for the eventually-consistent read model.
+    pub const READ_MODEL_CONVERGE: Duration = Duration::from_secs(5);
+    /// Polling window for a cold single-voter Raft group to elect a leader.
+    pub const LEADER_ELECTION: Duration = Duration::from_secs(30);
+}
+
+/// Which harness budget a failure exhausted — rendered into every timeout
+/// panic so the message, not a re-run, identifies the slow phase.
+#[derive(Debug, Clone, Copy)]
+enum Budget {
+    Port,
+    Ready,
+    RequestIo,
+}
+
+impl Budget {
+    fn limit(self) -> Duration {
+        match self {
+            Budget::Port => budget::PORT,
+            Budget::Ready => budget::READY,
+            Budget::RequestIo => budget::REQUEST_IO,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Budget::Port => "port budget (budget::PORT)",
+            Budget::Ready => "readiness budget (budget::READY)",
+            Budget::RequestIo => "request I/O budget (budget::REQUEST_IO)",
+        }
+    }
+
+    /// The diagnostic every budget failure panics with.
+    fn exceeded(self, what: &str, elapsed: Duration, detail: &dyn std::fmt::Display) -> String {
+        format!(
+            "{what}: {} of {:?} exceeded after {elapsed:?}: {detail}",
+            self.name(),
+            self.limit()
+        )
+    }
+}
+
 /// A unique temp directory that removes itself (and everything under it) on drop,
 /// so a passing or panicking test never leaves files behind.
 struct ScratchDir {
@@ -91,13 +156,21 @@ fn read_listening_port(child: &mut Child) -> (u16, std::thread::JoinHandle<()>) 
             }
         }
     });
-    let port = match rx.recv_timeout(Duration::from_secs(30)) {
+    let started = Instant::now();
+    let port = match rx.recv_timeout(budget::PORT) {
         Ok(port) => port,
         Err(e) => {
             kill_child_tree(child);
             let _ = child.wait();
             let _ = stdout_thread.join();
-            panic!("server never reported its listening port: {e}");
+            panic!(
+                "{}",
+                Budget::Port.exceeded(
+                    "server never reported its listening port",
+                    started.elapsed(),
+                    &e
+                )
+            );
         }
     };
     (port, stdout_thread)
@@ -158,8 +231,8 @@ impl ServerProcess {
     /// Polls a wired route until the server returns an HTTP response, so callers
     /// never race the bind/serve startup window.
     fn wait_until_ready(&self) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
+        let started = Instant::now();
+        while started.elapsed() < budget::READY {
             if let Some((status, _)) =
                 try_request(self.port, "GET", &path("/process-instances/0"), None)
             {
@@ -170,7 +243,14 @@ impl ServerProcess {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("server on port {} never became ready", self.port);
+        panic!(
+            "{}",
+            Budget::Ready.exceeded(
+                &format!("server on port {} never became ready", self.port),
+                started.elapsed(),
+                &"no HTTP response to the readiness probe"
+            )
+        );
     }
 
     fn request(&self, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
@@ -190,7 +270,7 @@ impl ServerProcess {
         body: Option<&str>,
         accept: impl Fn(u16, &str) -> bool,
     ) -> (u16, String) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + budget::READ_MODEL_CONVERGE;
         loop {
             let (status, resp) = self.request(method, path, body);
             if accept(status, &resp) || Instant::now() >= deadline {
@@ -250,14 +330,7 @@ fn body_has_demo_definition(body: &str) -> bool {
 /// the whole response to EOF. Returns `(status_code, body)` or `None` if the TCP
 /// connection could not be established (used by the readiness poll).
 fn try_request(port: u16, method: &str, path: &str, body: Option<&str>) -> Option<(u16, String)> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("set read timeout");
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .expect("set write timeout");
-
+    let stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     let body = body.unwrap_or("");
     let request = format!(
         "{method} {path} HTTP/1.1\r\n\
@@ -269,24 +342,56 @@ fn try_request(port: u16, method: &str, path: &str, body: Option<&str>) -> Optio
          {body}",
         body.len()
     );
-    stream.write_all(request.as_bytes()).expect("write request");
-    stream.flush().expect("flush request");
+    Some(exchange(
+        stream,
+        &format!("{method} {path}"),
+        request.as_bytes(),
+        budget::REQUEST_IO,
+    ))
+}
+
+/// Sends one `Connection: close` request over `stream` and reads the response
+/// to EOF, bounding each socket read/write by `io_budget`. Any I/O failure
+/// panics with a [`Budget::RequestIo`] diagnostic naming the request, the
+/// budget and the elapsed time, instead of a bare `expect("read response")`.
+fn exchange(
+    mut stream: TcpStream,
+    what: &str,
+    request: &[u8],
+    io_budget: Duration,
+) -> (u16, String) {
+    let started = Instant::now();
+    let fail = |e: std::io::Error| -> ! {
+        let msg = format!(
+            "{what}: {} of {io_budget:?} exceeded after {:?}: {e}",
+            Budget::RequestIo.name(),
+            started.elapsed()
+        );
+        panic!("{msg}")
+    };
+    stream
+        .set_read_timeout(Some(io_budget))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(io_budget))
+        .expect("set write timeout");
+    stream.write_all(request).unwrap_or_else(|e| fail(e));
+    stream.flush().unwrap_or_else(|e| fail(e));
 
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read response");
+    stream.read_to_end(&mut raw).unwrap_or_else(|e| fail(e));
     let raw = String::from_utf8_lossy(&raw);
 
     let status = raw
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse().ok())
-        .expect("parse status line");
+        .unwrap_or_else(|| panic!("{what}: unparseable status line in {raw:?}"));
     let body = raw
         .split_once("\r\n\r\n")
         .map(|(_, body)| body.to_string())
         .unwrap_or_default();
-
-    Some((status, body))
+    (status, body)
 }
 
 /// Creates an instance of the pre-seeded `demo` process and returns its key.
@@ -319,10 +424,7 @@ fn deploy_bpmn(port: u16, xml: &str) -> (u16, String) {
          --{boundary}--\r\n"
     );
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for deploy");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("set read timeout");
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for deploy");
     let request = format!(
         "POST {} HTTP/1.1\r\n\
          Host: localhost\r\n\
@@ -334,24 +436,12 @@ fn deploy_bpmn(port: u16, xml: &str) -> (u16, String) {
         path("/deployments"),
         body.len()
     );
-    stream
-        .write_all(request.as_bytes())
-        .expect("write deploy request");
-    stream.flush().expect("flush deploy request");
-
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read deploy response");
-    let raw = String::from_utf8_lossy(&raw);
-    let status = raw
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .expect("parse status line");
-    let body = raw
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or_default();
-    (status, body)
+    exchange(
+        stream,
+        "POST /deployments",
+        request.as_bytes(),
+        budget::REQUEST_IO,
+    )
 }
 
 #[test]
@@ -1590,7 +1680,7 @@ fn boot_replicated_activation(journal: &Path) -> ServerProcess {
 fn create_demo_instance_with_vars_replicated(server: &ServerProcess) -> String {
     // Raft leader election on a cold single-voter group can take several seconds
     // in a debug build; poll well past that before giving up.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + budget::LEADER_ELECTION;
     let instance_key = loop {
         let (status, body) = server.request(
             "POST",
@@ -2493,4 +2583,39 @@ fn process_definition_search_honours_name_wildcard_and_version() {
     assert_eq!(status, 404, "unknown key must 404");
 
     server.shutdown();
+}
+
+/// #1821 guard: a request that outlives the I/O budget must panic with a
+/// message naming the budget it hit (not a bare "read response"), so the next
+/// intermittent failure is diagnosable from its message.
+#[test]
+fn a_stalled_response_names_the_request_io_budget() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    // Accept and hold the connection open without ever responding.
+    let holder = std::thread::spawn(move || {
+        let (conn, _) = listener.accept().expect("accept");
+        std::thread::sleep(Duration::from_secs(2));
+        drop(conn);
+    });
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let result = std::panic::catch_unwind(|| {
+        exchange(
+            stream,
+            "GET /stalled",
+            b"GET /stalled HTTP/1.1\r\nHost: x\r\n\r\n",
+            Duration::from_millis(200),
+        )
+    });
+    let payload = result.expect_err("a stalled response must panic");
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(msg.contains("GET /stalled"), "names the request: {msg}");
+    assert!(
+        msg.contains("request I/O budget (budget::REQUEST_IO)"),
+        "names the budget: {msg}"
+    );
+    holder.join().expect("holder thread");
 }
