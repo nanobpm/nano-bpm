@@ -2309,15 +2309,15 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("real"), root.join("models/link")).unwrap();
         let resolved = rels(&root);
-        let mut cases = vec![
+        let cases: &[&str] = &[
             "models/a.bpmn",
             "models/target/t.bpmn",
             "models/target/one.bpmn",
             "Models/upper.bpmn",
+            #[cfg(unix)]
+            "models/link/r.bpmn",
         ];
-        #[cfg(unix)]
-        cases.push("models/link/r.bpmn");
-        for rel in cases {
+        for &rel in cases {
             assert_eq!(
                 resolved.contains(&rel.to_string()),
                 is_process_model_path(&root, rel),
