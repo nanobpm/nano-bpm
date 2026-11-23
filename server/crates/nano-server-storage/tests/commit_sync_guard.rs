@@ -185,11 +185,12 @@ fn sync_point_at(region: &str, recv: &str, body: &str) -> Option<usize> {
 
 /// Whether the `barrier()` call at `at` has its returned `Commit` awaited: an
 /// unawaited barrier queues a message but orders nothing for the caller. The
-/// wait is either chained (`.barrier().blocking_wait()`, `.wait()`,
-/// `.wait_durable()`) or on its `let` binding, unconditionally, later in
-/// `region`.
+/// wait is either chained (`.barrier().blocking_wait()`, `.wait().await`,
+/// `.wait_durable().await`) or on its `let` binding, unconditionally, later in
+/// `region`. `wait`/`wait_durable` are `async`: without `.await` the future is
+/// discarded and nothing is waited on.
 fn barrier_awaited(region: &str, at: usize) -> bool {
-    const WAITS: &[&str] = &[".blocking_wait()", ".wait()", ".wait_durable()"];
+    const WAITS: &[&str] = &[".blocking_wait()", ".wait().await", ".wait_durable().await"];
     let chain = call_result_chain(region, at + "barrier".len());
     if WAITS.iter().any(|w| chain.starts_with(w)) {
         return true;
@@ -1294,4 +1295,20 @@ fn guard_requires_a_proven_ordered_wait_or_sync() {
         }
     "#;
     assert_eq!(violations(whole_tuple_projection_only).len(), 1);
+    // `wait`/`wait_durable` are async: a discarded (un-`.await`ed) future
+    // waits on nothing, chained or via the binding.
+    for src in [
+        "fn t() { let _ = journal.apply_command(c).unwrap(); let _ = journal.barrier().wait(); shared.uncompacted_usage(); }",
+        "fn t() { let _ = journal.apply_command(c).unwrap(); let _ = journal.barrier().wait_durable(); shared.uncompacted_usage(); }",
+        "fn t() { let _ = journal.apply_command(c).unwrap(); let b = journal.barrier(); let _ = b.wait(); shared.uncompacted_usage(); }",
+        "fn t() { let _ = journal.apply_command(c).unwrap(); let b = journal.barrier(); let _ = b.wait_durable(); shared.uncompacted_usage(); }",
+    ] {
+        assert_eq!(violations(src).len(), 1, "{src}");
+    }
+    for src in [
+        "async fn t() { let _ = journal.apply_command(c).unwrap(); journal.barrier().wait().await; shared.uncompacted_usage(); }",
+        "async fn t() { let _ = journal.apply_command(c).unwrap(); let b = journal.barrier(); b.wait_durable().await; shared.uncompacted_usage(); }",
+    ] {
+        assert!(violations(src).is_empty(), "{src}");
+    }
 }
