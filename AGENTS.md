@@ -129,6 +129,20 @@ crate that is failing it — these are the traps the fleet hit:
   DUCKDB_DOWNLOAD_LIB=1 cargo nextest run --no-default-features
   ```
 
+- **Windows-only code is clippy-gated too (#1372).** `cfg(windows)` /
+  `not(unix)` / `target_env = "msvc"` code in `server` and `processos` is linted
+  by the `*-windows*` entries of `scripts/clippy-matrix.json`, which cross-check
+  `x86_64-pc-windows-msvc` from the Linux runner via `cargo xwin clippy`
+  (check only, no link) inside the existing `server` / `processos` required
+  jobs — no extra required check. Locally: `rustup target add
+  x86_64-pc-windows-msvc && cargo install --locked cargo-xwin`, then
+  `node scripts/clippy-matrix.mjs run --id processos-windows` (or
+  `--id server-windows-all-features`). cargo-xwin also needs `clang` and
+  `llvm-lib` on PATH (cc-rs's MSVC archiver) — install the distro `llvm` /
+  `clang` packages (CI does via the build-tools action's `apt: llvm`). The
+  matrix guard fails if an MSVC entry
+  does not set `xwin`, or if a new Windows-only site is frozen instead of linted.
+
 ## Long builds and test runs (agent sessions)
 
 Agent harnesses bound a single tool command by a configured execution limit
