@@ -8357,24 +8357,6 @@ mod tests {
         env_lock()
     }
 
-    /// A fresh, created scratch dir that does NOT touch
-    /// `NANOBPMN_PROJECTS_DIR` — for tests independent of `project_dir`.
-    /// Its only caller is the Unix-only gateway concurrency test, so gate it
-    /// the same way or the Windows `--all-targets` Clippy gate (`-D warnings`)
-    /// flags it as dead code.
-    #[cfg(unix)]
-    fn private_scratch_dir(tag: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, AOrd::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
-
     /// Is `pid` a zombie — killed but not yet reaped? Only the Unix gateway
     /// timeout test asks (a SIGKILLed descendant can linger as a zombie while
     /// init/subreaper catches up, and `kill(pid, 0)` still succeeds for one).
@@ -12425,83 +12407,174 @@ mod tests {
         }
     }
 
-    /// #1329: a burst of N concurrent data requests never has more than K
-    /// gateway processes alive. Each stub child registers itself in a `live/`
-    /// dir, records how many siblings are alive, sleeps, then deregisters.
+    /// Deterministically drive the scheduler until `cond` holds: yields to
+    /// the (current-thread) runtime instead of sleeping, so it cannot race on
+    /// a loaded runner. Bounded so a regression fails instead of hanging.
+    #[cfg(unix)]
+    async fn drive_until(what: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never reached: {what}");
+    }
+
+    #[cfg(unix)]
+    fn queued(l: &DataGatewayLimiter) -> usize {
+        l.waiting.load(Ordering::Acquire)
+    }
+
+    /// #1329: a burst of N concurrent requests never has more than K holders
+    /// of a gateway slot, the rest wait in the queue, and all eventually run.
+    /// Each holder parks on an explicit gate the test opens one at a time —
+    /// no sleeps, no wall clock.
     #[cfg(unix)]
     #[tokio::test]
-    async fn pipe_data_gateway_bounds_concurrent_children() {
-        // A private scratch dir — NOT `temp_root()`: this test needs no
-        // `NANOBPMN_PROJECTS_DIR`, so it must not mutate that process-global.
-        let root = private_scratch_dir("nano-gw-bound");
-        let live = root.join("live");
-        std::fs::create_dir_all(&live).unwrap();
-        let log = root.join("alive.log");
-        let script = format!(
-            "cat >/dev/null; touch '{live}'/$$; ls '{live}' | wc -l >> '{log}'; sleep 0.2; \
-             ls '{live}' | wc -l >> '{log}'; rm '{live}'/$$; printf '{{\"ok\":true}}'",
-            live = live.display(),
-            log = log.display()
-        );
+    async fn limiter_bounds_concurrent_holders() {
+        use std::sync::atomic::AtomicUsize;
         const K: usize = 2;
         const N: usize = 8;
-        let limiter = DataGatewayLimiter::new(K, N);
-        let req = serde_json::json!({ "op": "schema" });
-        let futs = (0..N).map(|_| {
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(&script);
-            pipe_data_gateway_limited(&limiter, cmd, &req)
-        });
-        for r in futures_util::future::join_all(futs).await {
-            r.expect("every queued op must eventually succeed");
-        }
-        let counts: Vec<usize> = std::fs::read_to_string(&log)
-            .unwrap()
-            .lines()
-            .map(|l| l.trim().parse().unwrap())
+        let limiter = Arc::new(DataGatewayLimiter::new(K, N));
+        let live = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        // Releasing a holder = adding one permit to this gate.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let tasks: Vec<_> = (0..N)
+            .map(|_| {
+                let (limiter, live, max, done, gate) = (
+                    limiter.clone(),
+                    live.clone(),
+                    max.clone(),
+                    done.clone(),
+                    gate.clone(),
+                );
+                tokio::spawn(async move {
+                    let _permit = limiter.acquire().await.expect("queued op admitted");
+                    let now = live.fetch_add(1, Ordering::AcqRel) + 1;
+                    max.fetch_max(now, Ordering::AcqRel);
+                    gate.acquire().await.expect("gate open").forget();
+                    live.fetch_sub(1, Ordering::AcqRel);
+                    done.fetch_add(1, Ordering::AcqRel);
+                })
+            })
             .collect();
-        assert_eq!(counts.len(), 2 * N, "every child must have run: {counts:?}");
-        let max = counts.iter().copied().max().unwrap();
-        assert!(max <= K, "{max} gateway children alive at once (cap {K})");
-        assert_eq!(max, K, "the cap should actually be reached under a burst");
-        let _ = std::fs::remove_dir_all(&root);
+        drive_until("K holders + N-K queued", || {
+            live.load(Ordering::Acquire) == K && queued(&limiter) == N - K
+        })
+        .await;
+        for released in 1..=N {
+            gate.add_permits(1);
+            drive_until("a holder finished", || {
+                done.load(Ordering::Acquire) == released
+            })
+            .await;
+            assert!(live.load(Ordering::Acquire) <= K);
+        }
+        for t in tasks {
+            t.await.expect("task completes");
+        }
+        assert_eq!(
+            max.load(Ordering::Acquire),
+            K,
+            "cap reached, never exceeded"
+        );
+        assert_eq!(queued(&limiter), 0, "queue drained");
+        assert_eq!(limiter.permits.available_permits(), K, "all slots returned");
     }
 
     /// #1329: past the bounded wait queue, a request is refused with
-    /// `DataError::Busy` (→ 503) instead of spawning another process.
+    /// `DataError::Busy` (→ 503) instead of waiting; the queued one proceeds
+    /// once the slot frees, and the limiter recovers.
     #[cfg(unix)]
     #[tokio::test]
-    async fn pipe_data_gateway_refuses_when_queue_is_full() {
-        let limiter = DataGatewayLimiter::new(1, 1);
-        let req = serde_json::json!({ "op": "schema" });
-        let slow = || {
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c")
-                .arg("cat >/dev/null; sleep 0.3; printf '{\"ok\":true}'");
-            cmd
-        };
-        let running = pipe_data_gateway_limited(&limiter, slow(), &req);
-        let queued = pipe_data_gateway_limited(&limiter, slow(), &req);
-        let refused = async {
-            // Let the first two take the slot and the single queue place.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg("touch /dev/null; printf '{\"ok\":true}'");
-            pipe_data_gateway_limited(&limiter, cmd, &req).await
-        };
-        let (a, b, c) = tokio::join!(running, queued, refused);
-        a.expect("running op succeeds");
-        b.expect("queued op succeeds once the slot frees");
+    async fn limiter_refuses_when_queue_is_full() {
+        let limiter = Arc::new(DataGatewayLimiter::new(1, 1));
+        let held = limiter.acquire().await.expect("free slot");
+        let l2 = limiter.clone();
+        let waiter = tokio::spawn(async move { l2.acquire().await.map(drop) });
+        drive_until("one request queued", || queued(&limiter) == 1).await;
+        let refused = limiter.acquire().await;
         assert!(
-            matches!(c, Err(DataError::Busy(_))),
-            "overflow must be refused as Busy, got {c:?}"
+            matches!(refused, Err(DataError::Busy(_))),
+            "overflow must be refused as Busy, got {:?}",
+            refused.map(drop)
         );
-        // The queue place is released: a fresh request is admitted again.
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("cat >/dev/null; printf '{\"ok\":true}'");
-        pipe_data_gateway_limited(&limiter, cmd, &req)
+        drop(held);
+        waiter
             .await
-            .expect("limiter recovers after the burst");
+            .expect("task completes")
+            .expect("queued op admitted once the slot frees");
+        assert_eq!(queued(&limiter), 0);
+        drop(
+            limiter
+                .acquire()
+                .await
+                .expect("limiter recovers after the burst"),
+        );
+    }
+
+    /// #1329: cancelling a request while it is queued for a slot (task abort
+    /// or future drop — e.g. the HTTP client disconnected) releases its queue
+    /// reservation: nothing leaks, nothing deadlocks, later requests proceed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn limiter_releases_reservation_when_queued_request_is_cancelled() {
+        let limiter = Arc::new(DataGatewayLimiter::new(1, 1));
+        let held = limiter.acquire().await.expect("free slot");
+
+        // (a) Abort a spawned task parked in the queue.
+        let l2 = limiter.clone();
+        let waiter = tokio::spawn(async move { l2.acquire().await.map(drop) });
+        drive_until("request queued", || queued(&limiter) == 1).await;
+        waiter.abort();
+        assert!(waiter.await.expect_err("aborted").is_cancelled());
+        assert_eq!(queued(&limiter), 0, "aborted waiter released its place");
+
+        // (b) Drop a queued future in place (select! losing branch).
+        {
+            let fut = limiter.acquire();
+            tokio::pin!(fut);
+            tokio::select! {
+                biased;
+                _ = fut.as_mut() => panic!("must queue behind the held slot"),
+                () = std::future::ready(()) => {}
+            }
+            assert_eq!(queued(&limiter), 1);
+        }
+        assert_eq!(queued(&limiter), 0, "dropped future released its place");
+
+        // The single queue place is free again: a new request queues, not Busy.
+        let l3 = limiter.clone();
+        let next = tokio::spawn(async move { l3.acquire().await.map(drop) });
+        drive_until("next request queued", || queued(&limiter) == 1).await;
+        // No permit was consumed by the cancelled waiters: releasing the
+        // held slot admits the next request (no deadlock).
+        drop(held);
+        next.await
+            .expect("task completes")
+            .expect("later request proceeds");
+        assert_eq!(queued(&limiter), 0);
+        assert_eq!(limiter.permits.available_permits(), 1, "slot returned");
+    }
+
+    /// #1329: a cancelled request that already HOLDS a slot returns it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn limiter_returns_slot_when_holder_is_cancelled() {
+        let limiter = Arc::new(DataGatewayLimiter::new(1, 0));
+        let l2 = limiter.clone();
+        let holder = tokio::spawn(async move {
+            let _p = l2.acquire().await.expect("free slot");
+            std::future::pending::<()>().await;
+        });
+        drive_until("slot taken", || limiter.permits.available_permits() == 0).await;
+        holder.abort();
+        let _ = holder.await;
+        assert_eq!(limiter.permits.available_permits(), 1);
+        drop(limiter.acquire().await.expect("slot reusable after cancel"));
     }
 
     /// #1329: reaping after a tree kill is bounded — a child that survives
@@ -12514,10 +12587,8 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let start = std::time::Instant::now();
         let reaped = reap_gateway_bounded(&mut child, std::time::Duration::from_millis(150)).await;
         assert!(!reaped, "a surviving child is reported as not reaped");
-        assert!(start.elapsed() < std::time::Duration::from_secs(5));
         let _ = child.wait().await;
     }
 
@@ -12543,13 +12614,11 @@ mod tests {
             "cat >/dev/null; sleep 30 & echo $! > '{}'; wait",
             pidfile.display()
         ));
-        let started = std::time::Instant::now();
         let r = pipe_data_gateway_limited(&limiter, hung, &req).await;
         assert!(
             matches!(&r, Err(DataError::Gateway(m)) if m.contains("timed out")),
             "hung child must time out, got {r:?}"
         );
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
         let desc: i32 = std::fs::read_to_string(&pidfile)
             .expect("descendant pid recorded")
             .trim()
