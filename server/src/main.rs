@@ -21,6 +21,7 @@ mod mcp;
 mod optional_body_guard;
 #[cfg(feature = "console")]
 mod provisioning;
+mod publication_gate;
 mod query;
 #[cfg(test)]
 mod request_field_guard;
@@ -2914,6 +2915,33 @@ mod converted_lock_poison_tests {
     }
 }
 
+/// Why [`ServerImpl::correlate_message_cluster`] did not correlate.
+#[derive(Debug)]
+enum CorrelateError {
+    /// The engine rejected the publish (an out-of-range business id) — 400.
+    Engine(EngineError),
+    /// A matching subscription open is still pending past the publication-gate
+    /// deadline (#1604): retryable 503, never an unmatched apply.
+    SubscriptionOpenPending,
+}
+
+impl From<EngineError> for CorrelateError {
+    fn from(e: EngineError) -> Self {
+        Self::Engine(e)
+    }
+}
+
+impl std::fmt::Display for CorrelateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine(e) => write!(f, "{e}"),
+            Self::SubscriptionOpenPending => f.write_str(
+                "a matching subscription open is still being routed; retry the publication",
+            ),
+        }
+    }
+}
+
 /// One recorded terminal status of a job's lifecycle as reported by a worker:
 /// `Completed` or `Failed`. Thrown BPMN errors are tracked separately (they are
 /// business errors, not job failures — see [`JobStatisticsState::errors`]).
@@ -2997,6 +3025,25 @@ const ROUTE_REDRIVE: RouteRedrive = RouteRedrive {
     base: std::time::Duration::from_millis(50),
     cap: std::time::Duration::from_secs(1),
 };
+
+impl RouteRedrive {
+    /// Worst-case wall time of one routed delivery under this budget: every
+    /// backoff sleep plus `per_attempt` for each attempt.
+    fn worst_case(&self, per_attempt: std::time::Duration) -> std::time::Duration {
+        (1..self.max_attempts)
+            .map(|a| self.backoff(a))
+            .sum::<std::time::Duration>()
+            + per_attempt.saturating_mul(self.max_attempts)
+    }
+}
+
+/// How long a publish waits on a pending subscription open (#1604): derived
+/// from the routing re-drive budget, so the gate never gives up while the
+/// create owner may still deliver the open, yet never blocks forever on a dead
+/// target.
+fn publication_gate_deadline() -> std::time::Duration {
+    ROUTE_REDRIVE.worst_case(write_forward_timeout().max(ROUTE_ATTEMPT_OBSERVE))
+}
 
 /// How long ONE routing attempt observes a LOCAL Raft proposal before giving
 /// up and letting the re-drive retry (#1582). Detached from the write itself —
@@ -3806,6 +3853,15 @@ pub struct ServerImpl {
     /// the bounded re-drive; lets the RF=3 leader-change tests prove the retry
     /// path was actually exercised.
     route_redrives: Arc<AtomicU64>,
+    /// Pending cross-partition subscription opens of just-answered creates
+    /// (#1604): publishes for a pending `(name, correlation key)` wait (bounded)
+    /// until the create's routing owner has opened the subscription.
+    publication_gate: publication_gate::PublicationGate,
+    /// Test-only override for [`publication_gate_deadline`], so tests can
+    /// exercise gate expiry deterministically in milliseconds rather than
+    /// waiting out the full production re-drive budget.
+    #[cfg(test)]
+    publication_gate_deadline_override: Arc<std::sync::Mutex<Option<std::time::Duration>>>,
     /// Per-partition lock serializing a core REBUILD (promote / rebuild-as-receiver /
     /// shutdown auto-recovery): the old core is fully shut down and awaited, then the
     /// new core is constructed and registered, all under the partition's lock. Without
@@ -4047,6 +4103,22 @@ impl ServerImpl {
         for journal in journals.iter() {
             journal.collect_live_instance_keys(&mut live_keys);
         }
+        // #1604: capture any cross-partition `Opening` subscriptions whose
+        // canonical target partition did not durably receive the open before a
+        // crash, and pre-register them on the publication gate BEFORE this
+        // constructor returns — so no post-restart publish can overtake boot
+        // recovery and be discarded as unmatched.
+        // Under Raft, each hosted partition's authoritative state is restored
+        // asynchronously inside `raft_bootstrap`; `create_answers_before_routing`
+        // therefore gates early answers on `!raft_enabled()` as well, so the
+        // non-Raft journals here are always authoritative at construction time.
+        let publication_gate = publication_gate::PublicationGate::default();
+        let recovered_pending_opens = if topology.is_single_node() && !raft_enabled() {
+            pending_subscription_opens_from_journals(&journals, topology.num_partitions)
+        } else {
+            Vec::new()
+        };
+        let recovered_gate_guard = publication_gate.register(&recovered_pending_opens);
         let reconciled = store.reconcile_orphaned_active(&live_keys);
         if reconciled > 0 {
             tracing::info!(
@@ -4372,7 +4444,7 @@ impl ServerImpl {
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
         );
-        Self {
+        let server = Self {
             engine,
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
@@ -4436,6 +4508,9 @@ impl ServerImpl {
             )),
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             route_redrives: Arc::new(AtomicU64::new(0)),
+            publication_gate,
+            #[cfg(test)]
+            publication_gate_deadline_override: Arc::new(std::sync::Mutex::new(None)),
             partition_rebuild_locks: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -4450,7 +4525,25 @@ impl ServerImpl {
             job_statistics: JobStatisticsState::default(),
             #[cfg(feature = "console")]
             trace_store: Arc::new(nano_trace_store::TraceStore::from_env()),
+        };
+        if !recovered_pending_opens.is_empty() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let srv = server.clone();
+                rt.spawn(async move {
+                    srv.drive_subscription_routing(recovered_pending_opens, None)
+                        .await;
+                    drop(recovered_gate_guard);
+                });
+            } else {
+                tracing::warn!(
+                    count = recovered_pending_opens.len(),
+                    "pending subscription opens recovered outside a Tokio runtime; \
+                     releasing publication gate"
+                );
+                drop(recovered_gate_guard);
+            }
         }
+        server
     }
 }
 
@@ -4472,6 +4565,67 @@ impl ServerImpl {
 /// `*_versions` map, so re-installing an already-known version is a no-op.
 fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
     deployment_replication_events_from_state(deploy_journal.engine().state())
+}
+
+/// Synthesises `MessageSubscriptionOpening` follow-ups for every cross-partition
+/// subscription still in `Opening` state after crash recovery whose canonical
+/// target partition does not yet hold (and has not tombstoned) it (#1604).
+///
+/// When a single-node server answers a create at commit and crashes before the
+/// detached routing pump persists `OpenMessageSubscription` on the target
+/// partition, replay restores the source's `Opening` record while the target
+/// remains empty. Returning these events lets boot register them on the
+/// [`publication_gate`] BEFORE serving publications and re-drive them to the
+/// target partition.
+///
+/// Each reconstructed event carries `delivery_key: 0` (the original source
+/// delivery key is not stored on `MessageSubscription`), which is still safe
+/// and idempotent: `Command::OpenMessageSubscription` checks both
+/// `routed_deliveries.is_tombstoned(subscription_key)` and
+/// `message_subscriptions.contains_key(&subscription_key)` before emitting
+/// `MessageSubscriptionCreated`.
+fn pending_subscription_opens_from_journals(
+    journals: &[Journal],
+    num_partitions: u64,
+) -> Vec<Event> {
+    if num_partitions <= 1 {
+        return Vec::new();
+    }
+    let by_partition: std::collections::HashMap<u64, &nanobpmn_engine_core::State> = journals
+        .iter()
+        .map(|j| (j.partition_id(), j.engine().state()))
+        .collect();
+    let mut pending = Vec::new();
+    for journal in journals {
+        let source_partition = journal.partition_id();
+        for sub in journal.engine().state().message_subscriptions.values() {
+            if sub.state != nanobpmn_engine_core::MessageSubscriptionState::Opening {
+                continue;
+            }
+            let target =
+                nanobpmn_engine_core::subscription_partition(&sub.correlation_key, num_partitions);
+            if target == source_partition {
+                continue;
+            }
+            if let Some(target_state) = by_partition.get(&target)
+                && (target_state.message_subscriptions.contains_key(&sub.key)
+                    || target_state.routed_deliveries.is_tombstoned(sub.key))
+            {
+                continue;
+            }
+            pending.push(Event::MessageSubscriptionOpening {
+                subscription_key: sub.key,
+                instance_key: sub.instance_key,
+                element_instance_key: sub.element_instance_key,
+                element_id: sub.element_id.clone(),
+                message_name: sub.message_name.clone(),
+                correlation_key: sub.correlation_key.clone(),
+                kind: sub.kind.clone(),
+                delivery_key: 0,
+            });
+        }
+    }
+    pending
 }
 
 /// Every deployed version of one resource kind, keyed (and ordered) by its
@@ -8360,11 +8514,11 @@ impl ServerImpl {
         // Record REST create
         crate::metrics::record_create("rest");
 
-        // The detached owner blocked on durability AND drove the cross-partition
-        // routing pump before answering (#1582): a returned 200 means the create
-        // is fsynced and a publish issued now finds the subscription open (the
-        // create-then-publish ordering clients rely on); cancelling this handler
-        // at any point strands nothing.
+        // The detached owner blocked on durability before answering (#1582) and
+        // routes afterwards: a returned 200 means the create is fsynced, and a
+        // publish issued now waits on the publication gate (#1604) until its
+        // subscription is open (the create-then-publish ordering clients rely
+        // on); cancelling this handler at any point strands nothing.
         self.signal_jobs_available();
 
         // Resolve the final response. Without awaitCompletion we report whatever
@@ -11015,7 +11169,27 @@ impl ServerImpl {
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         business_id: Option<String>,
         operation_reference: Option<i64>,
-    ) -> Result<(Option<u64>, Option<u64>), EngineError> {
+    ) -> Result<(Option<u64>, Option<u64>), CorrelateError> {
+        // Publication gate (#1604): a create answers at commit and routes its
+        // cross-partition subscription opens afterwards, so a publish issued
+        // the moment the create returned must not overtake the open (it would
+        // correlate against nothing and be discarded). Wait — bounded — until
+        // every pending open for this `(name, correlation key)` is routed. If
+        // the open is STILL pending at the deadline (e.g. the serial routing
+        // pump is stalled on another target), fail closed with a retryable
+        // error rather than applying unmatched and silently losing the message.
+        if self
+            .publication_gate
+            .wait(
+                &name,
+                &correlation_key,
+                self.effective_publication_gate_deadline(),
+            )
+            .await
+            == publication_gate::GateWait::TimedOut
+        {
+            return Err(CorrelateError::SubscriptionOpenPending);
+        }
         let engine_vars: std::collections::BTreeMap<String, Value> = variables
             .as_ref()
             .map(|m| {
@@ -11264,6 +11438,65 @@ impl ServerImpl {
             .filter(|e| Self::is_routable_event(e))
             .cloned()
             .collect()
+    }
+
+    /// Whether a committed create may answer BEFORE its cross-partition
+    /// subscription opens are routed (#1604). The publication gate is
+    /// node-local, so it only orders publishes that apply on this node. That
+    /// holds on a single non-Raft node. In a multi-node cluster a publish can
+    /// enter, or fan out to, a node whose gate never saw the open, so creates
+    /// there keep the route-before-answer ordering. Likewise, when Raft is
+    /// active, partition recovery happens asynchronously in `raft_bootstrap`
+    /// after the HTTP listener starts, so creates under Raft retain
+    /// route-before-answer until Raft boot recovery pre-registers pending opens
+    /// before serving.
+    fn create_answers_before_routing(&self) -> bool {
+        !self.peers.has_peers() && !raft_enabled()
+    }
+
+    fn effective_publication_gate_deadline(&self) -> std::time::Duration {
+        #[cfg(test)]
+        if let Some(d) = *self
+            .publication_gate_deadline_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return d;
+        }
+        publication_gate_deadline()
+    }
+
+    /// The one canonical answer/route ordering for a committed create (#1582,
+    /// #1604), shared by the non-Raft detached owner and `raft_create_core`.
+    /// On a single non-Raft node: register the pending opens on the publication
+    /// gate, answer, route, then release the gate (also on drop if this task
+    /// dies). With peers or under Raft: route first, then answer. A publish
+    /// issued once the create returns then finds the subscription open on
+    /// whatever node applies it. The create's own `operationReference` (#1602)
+    /// rides the routed follow-ups.
+    async fn answer_and_route_create(
+        &self,
+        routable: Vec<Event>,
+        operation_reference: Option<i64>,
+        answer: impl FnOnce(),
+    ) {
+        if self.create_answers_before_routing() {
+            let pending = self.publication_gate.register(&routable);
+            self.signal_jobs_available();
+            answer();
+            if !routable.is_empty() {
+                self.drive_subscription_routing(routable, operation_reference)
+                    .await;
+            }
+            drop(pending);
+        } else {
+            if !routable.is_empty() {
+                self.drive_subscription_routing(routable, operation_reference)
+                    .await;
+            }
+            self.signal_jobs_available();
+            answer();
+        }
     }
 
     /// Routes the cross-partition subscription follow-ups carried in `events` (and
@@ -11893,20 +12126,19 @@ impl ServerImpl {
     /// oneshot. The caller merely OBSERVES the outcome; cancelling that
     /// observation strands nothing.
     ///
-    /// The answer is sent only AFTER the routing pump has driven the
-    /// cross-partition subscription follow-ups: clients rely on the
-    /// create-then-publish ordering `main` has always given — a publish issued
-    /// the moment the create returns must find the subscription already open,
-    /// or the unmatched message is discarded and the instance stays parked
-    /// (#1582). The cost of that guarantee is bounded: a stalled subscription
-    /// target can delay the create response by at most the bounded re-drive
-    /// budget ([`ROUTE_REDRIVE`]: 16 attempts of exponential backoff capped at
-    /// 1s, plus the per-attempt forward deadline), never indefinitely. Routing
+    /// On a single node the answer is sent at commit, BEFORE the routing pump
+    /// drives the cross-partition subscription follow-ups (#1604), so a
+    /// stalled subscription target never delays the create response; the
+    /// pending opens are registered with the publication gate
+    /// ([`publication_gate`]) first, and a publish for the same
+    /// `(name, correlation key)` waits — bounded by
+    /// [`publication_gate_deadline`] — until the open is routed. With peers
+    /// the node-local gate cannot order a publish applied elsewhere, so the
+    /// opens are routed before answering ([`Self::answer_and_route_create`]).
+    /// Routing
     /// still completes when the caller has gone away: a dropped receiver
     /// (caller cancelled) leaves this task running to completion, exactly as
-    /// [`Self::raft_create_core`] routes after Raft commit. The latency-optimal
-    /// alternative — answer at commit and gate publications on pending
-    /// subscription opens — is tracked as #1604.
+    /// [`Self::raft_create_core`] routes after Raft commit.
     ///
     /// `accounting` is the admission charge (processing slot + payload bytes)
     /// entered on the caller before submission; it is MOVED in here and held
@@ -11976,19 +12208,14 @@ impl ServerImpl {
                     )));
                     return;
                 }
-                // Route the follow-ups FIRST, then answer: a publish issued the
-                // moment the create returns must find the subscription already
-                // open (the create-then-publish ordering clients rely on,
-                // #1582). The wait is bounded by the re-drive budget, and a
-                // dropped receiver (caller cancelled) is fine: routing already
-                // ran to completion inside this detached task. The create's own
-                // `operationReference` (#1602) rides the routed follow-ups, so
-                // the records they produce on other partitions carry it too.
+                // Single node: answer at commit, then route, with the opens
+                // gated (#1604). With peers: route, then answer (the gate is
+                // node-local). See `answer_and_route_create`.
                 server
-                    .drive_subscription_routing(routable, operation_reference)
+                    .answer_and_route_create(routable, operation_reference, move || {
+                        let _ = tx.send(outcome);
+                    })
                     .await;
-                server.signal_jobs_available();
-                let _ = tx.send(outcome);
                 return;
             }
             // A dropped receiver (caller cancelled) is fine; the apply already
@@ -13108,12 +13335,12 @@ impl ServerImpl {
         // `nanobpm_creates_total` reflects real instances 1:1 instead of
         // double-counting every forwarded create (once at ingress, once here).
         crate::metrics::record_create(origin_protocol);
-        // The non-Raft branch's detached owner awaited durability AND drove the
-        // cross-partition routing pump before answering (#1582); under Raft the
-        // proposal is durable at commit and `raft_create_core` routes before
-        // answering too. Either way the create is committed and its
-        // subscriptions routed by the time we answer, so a publish issued right
-        // after finds them open.
+        // The non-Raft branch's detached owner awaited durability before
+        // answering (#1582); under Raft the proposal is durable at commit.
+        // Both order answer and routing via `answer_and_route_create` (#1604):
+        // single node answers at commit with the opens gated; with peers the
+        // opens are routed first. Either way a publish issued right after
+        // correlates.
         self.signal_jobs_available();
         let (variables_out, process_completed) = if await_completion {
             self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
@@ -13573,8 +13800,15 @@ impl ServerImpl {
             .await
         {
             Ok(correlated) => correlated,
-            // An out-of-range businessId (the only correlation failure).
-            Err(e) => {
+            Err(e @ CorrelateError::SubscriptionOpenPending) => {
+                return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "UNAVAILABLE",
+                    503,
+                    e.to_string(),
+                )));
+            }
+            // An out-of-range businessId (the only engine correlation failure).
+            Err(e @ CorrelateError::Engine(_)) => {
                 return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                     "INVALID_ARGUMENT",
                     400,
@@ -13632,8 +13866,15 @@ impl ServerImpl {
             .await
         {
             Ok(correlated) => correlated,
-            // An out-of-range businessId (the only correlation failure).
-            Err(e) => {
+            Err(e @ CorrelateError::SubscriptionOpenPending) => {
+                return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "UNAVAILABLE",
+                    503,
+                    e.to_string(),
+                )));
+            }
+            // An out-of-range businessId (the only engine correlation failure).
+            Err(e @ CorrelateError::Engine(_)) => {
                 return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                     "INVALID_ARGUMENT",
                     400,
@@ -22553,9 +22794,9 @@ impl ServerImpl {
         // definition key/version are unused here.
         let instance_key = created.instance_key;
         let sync_completed = created.sync_completed;
-        // The detached owner already awaited durability and drove the
-        // cross-partition routing pump before answering (#1582), so a publish
-        // issued now finds the subscription open.
+        // The detached owner already awaited durability (#1582); a publish
+        // issued now waits on the publication gate (#1604) until the
+        // subscription is open.
         self.signal_jobs_available();
         // Non-Raft local commit for a stream create: count it once, here at the
         // node that mints the instance. (Under Raft this function returns early
@@ -22813,9 +23054,9 @@ impl ServerImpl {
                 _definition_key,
                 instance_key,
                 sync_completed,
-                // Routing ran inside `raft_create_core`'s detached task BEFORE
-                // the answer (#1582 cancellation safety + create-then-publish
-                // ordering); the events are only reported.
+                // Routing runs before the answer inside `raft_create_core`'s
+                // detached task via `answer_and_route_create` (#1582, #1604);
+                // the events are only reported.
                 _routable,
             )) => {
                 self.signal_jobs_available();
@@ -23010,8 +23251,8 @@ impl ServerImpl {
             };
 
         crate::metrics::record_create("rest");
-        // Routing ran inside `raft_create_core`'s detached task BEFORE the
-        // answer (#1582 cancellation safety + create-then-publish ordering);
+        // Routing runs before the answer inside `raft_create_core`'s detached
+        // task via `answer_and_route_create` (#1582 cancellation safety, #1604);
         // nothing further to route here.
         self.signal_jobs_available();
 
@@ -23100,17 +23341,12 @@ impl ServerImpl {
         // create without its cross-partition routing — the Raft batcher keeps
         // running past the cancellation, and the detached task still observes
         // the proposal outcome and routes. The result is handed back over a
-        // oneshot only AFTER the routing re-drive has driven the
-        // cross-partition subscription follow-ups: clients rely on the
-        // create-then-publish ordering `main` has always given — a publish
-        // issued the moment the create returns must find the subscription
-        // already open, or the unmatched message is discarded and the instance
-        // stays parked (#1582). The cost is bounded: a stalled subscription
-        // target can delay the create response by at most the bounded re-drive
-        // budget ([`ROUTE_REDRIVE`]), never indefinitely. Awaiting the receiver
-        // only OBSERVES the outcome; dropping it leaves the work running. The
-        // latency-optimal alternative — answer at commit and gate publications
-        // on pending subscription opens — is tracked as #1604.
+        // oneshot in the order `answer_and_route_create` decides (#1604):
+        // under Raft (`create_answers_before_routing()` is false), routing
+        // completes before the answer. Either way a publish issued the moment
+        // the create returns is
+        // not discarded as unmatched. Awaiting the receiver only
+        // OBSERVES the outcome; dropping it leaves the work running.
         let server = self.clone();
         let process_id_for_propose = process_id.clone();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -23165,22 +23401,14 @@ impl ServerImpl {
                 });
             match proposed {
                 Ok((instance_key, sync_completed, routable)) => {
-                    // Route the follow-ups FIRST, then answer: a publish issued
-                    // the moment the create returns must find the subscription
-                    // already open (the create-then-publish ordering clients
-                    // rely on, #1582). The wait is bounded by the re-drive
-                    // budget, and a dropped receiver (caller cancelled) is fine:
-                    // routing already ran to completion inside this task.
-                    if !routable.is_empty() {
-                        // The create's own `operationReference` (#1602) rides the
-                        // routed follow-ups too, so the records they produce on
-                        // other partitions carry the same reference.
-                        server
-                            .drive_subscription_routing(routable.clone(), operation_reference)
-                            .await;
-                    }
-                    server.signal_jobs_available();
-                    let _ = result_tx.send(Ok((instance_key, sync_completed, routable)));
+                    // The canonical answer/route ordering (#1582, #1604):
+                    // under Raft, route-then-answer. See `answer_and_route_create`.
+                    let reported = routable.clone();
+                    server
+                        .answer_and_route_create(routable, operation_reference, move || {
+                            let _ = result_tx.send(Ok((instance_key, sync_completed, reported)));
+                        })
+                        .await;
                 }
                 Err(err) => {
                     let _ = result_tx.send(Err(err));
@@ -34706,10 +34934,10 @@ mod clustered_startup_tests {
         assert_eq!(server.required_cluster_features().await, Some(Vec::new()));
         let handle = server.engine_handle_for(0).expect("partition 0 hosted");
         handle.spawn_job(|_journal| panic!("kill the engine actor"));
-        for _ in 0..200 {
-            if !handle.is_alive() {
-                break;
-            }
+        // Bounded by wall time, not iterations: under full-suite load the
+        // actor thread's unwind can take well over a second to be observed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while handle.is_alive() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(!handle.is_alive(), "precondition: actor is dead");
@@ -53750,13 +53978,12 @@ mod subscription_placement_tests {
         );
     }
 
-    /// #1582: the non-Raft detached create owner drives the cross-partition
-    /// routing pump BEFORE answering its observer, so a client that publishes a
-    /// message the moment the create returns finds the subscription already
-    /// open — the create-then-publish ordering `main` has always given. An
-    /// answer-before-routing implementation lets that immediate publish
-    /// overtake the subscription open; the unmatched message is discarded and
-    /// the instance stays parked.
+    /// #1582 / #1604: a client that publishes a message the moment the
+    /// non-Raft detached create returns must correlate — the create-then-publish
+    /// ordering `main` has always given. The create answers at commit and the
+    /// publication gate holds the immediate publish until the routed
+    /// subscription open has landed; without it the unmatched message would be
+    /// discarded and the instance would stay parked.
     ///
     /// Deterministic: the create's `Commit` is replaced by a
     /// [`Commit::from_ack`] the test holds open, so the owner provably parks in
@@ -53833,26 +54060,24 @@ mod subscription_placement_tests {
             "no answer before the create is durable"
         );
 
-        // Open the gate: the write is now durable. The owner drives the routing
-        // pump FIRST and answers only once the cross-partition subscription is
-        // open, so the observer resolves with routing already complete.
+        // Open the gate: the write is now durable. The owner answers at commit
+        // and routes afterwards, with the open registered on the publication
+        // gate first.
         ack_tx.send(()).expect("the durability gate is held");
         let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
-            .expect("the create is answered once routing has run")
+            .expect("the create is answered once durable")
             .expect("the detached owner is alive")
             .expect("the create applied");
         assert!(created.instance_key > 0, "a real instance key");
 
-        // The guarantee the ordering buys: a publish issued the MOMENT the
-        // create returns correlates — the subscription is already open on its
-        // canonical partition, so the message is not discarded as unmatched.
+        // The guarantee the publication gate buys: a publish issued the MOMENT
+        // the create returns correlates — it waits for the subscription open on
+        // its canonical partition, so the message is not discarded as unmatched.
         let (_message_key, correlated) = server
-            .correlate_message_local(
+            .correlate_message_cluster(
                 "payment-received".to_string(),
                 order.clone(),
-                std::collections::BTreeMap::new(),
-                None,
                 None,
                 None,
                 None,
@@ -53863,6 +54088,745 @@ mod subscription_placement_tests {
             correlated,
             Some(created.instance_key),
             "a publish right after the create answer correlates to the new instance"
+        );
+    }
+
+    /// A correlation key whose canonical subscription partition differs from
+    /// `partition`, so its opening follow-up is genuinely routed.
+    fn cross_partition_order(partition: u64) -> String {
+        (0..256u32)
+            .map(|i| format!("gate-{i}"))
+            .find(|order| nanobpmn_engine_core::subscription_partition(order, 4) != partition)
+            .expect("a cross-partition correlation key exists")
+    }
+
+    /// #1604: the detached create owner answers at COMMIT, not after routing —
+    /// a stalled subscription target must not withhold the create response.
+    /// The subscription partition's actor is parked by a barrier, so the
+    /// routed open cannot be delivered; the create must still be answered,
+    /// with its open registered as pending on the publication gate. A publish
+    /// issued right after then waits and correlates once the target recovers.
+    #[tokio::test]
+    async fn detached_create_answers_at_commit_while_subscription_target_stalls() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let create_partition = server.engine.for_create().stats().partition;
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+        let order = cross_partition_order(create_partition);
+        let target = nanobpmn_engine_core::subscription_partition(&order, 4);
+        let target_engine = server
+            .engine_handle_for(target)
+            .expect("the subscription partition is local");
+
+        // Stall the subscription target: a barrier holds its actor.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = tokio::spawn(async move {
+            target_engine
+                .with_low(move |_journal| {
+                    let _ = parked_tx.send(());
+                    release_rx.blocking_recv().ok();
+                })
+                .await;
+        });
+        parked_rx.await.expect("the barrier holds the target actor");
+
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached_on(
+            accounting,
+            create_engine,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
+                    None,
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the create is answered at commit despite the stalled target")
+            .expect("the detached owner is alive")
+            .expect("the create applied");
+        assert!(
+            server
+                .publication_gate
+                .is_pending("payment-received", &order),
+            "the in-flight open is registered on the publication gate"
+        );
+
+        let publisher = {
+            let server = server.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                server
+                    .correlate_message_cluster(
+                        "payment-received".to_string(),
+                        order,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!publisher.is_finished(), "the publish waits for the open");
+
+        release_tx.send(()).expect("the barrier is parked");
+        barrier.await.expect("the barrier completes");
+        let (_key, correlated) = tokio::time::timeout(std::time::Duration::from_secs(5), publisher)
+            .await
+            .expect("the publish proceeds once the open is routed")
+            .expect("the publisher task")
+            .expect("the publish applies");
+        assert_eq!(correlated, Some(created.instance_key));
+        assert!(
+            !server
+                .publication_gate
+                .is_pending("payment-received", &order)
+        );
+    }
+
+    /// #1604 (cluster): the publication gate is node-local, so it cannot order
+    /// a publish that enters, or fans out to, another node. With peers the
+    /// create must therefore keep route-before-answer: while the subscription
+    /// target is stalled the create is NOT answered and nothing is parked on
+    /// the gate; once the target recovers the create answers with its open
+    /// already routed, so an immediate publish on any node correlates.
+    #[tokio::test]
+    async fn multi_node_create_routes_before_answering() {
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into(), "http://n1".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let local = topology.local_partitions();
+        assert!(
+            local.len() >= 2,
+            "node 0 owns several partitions: {local:?}"
+        );
+        let journals: Vec<Journal> = local
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+        assert!(!server.create_answers_before_routing());
+        let create_partition = local[0];
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let order = (0..256u32)
+            .map(|i| format!("gate-{i}"))
+            .find(|o| {
+                let t = nanobpmn_engine_core::subscription_partition(o, 4);
+                t != create_partition && local.contains(&t)
+            })
+            .expect("a key routed to another local partition");
+        let target = nanobpmn_engine_core::subscription_partition(&order, 4);
+        let target_engine = server
+            .engine_handle_for(target)
+            .expect("the subscription partition is local");
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = tokio::spawn(async move {
+            target_engine
+                .with_low(move |_journal| {
+                    let _ = parked_tx.send(());
+                    release_rx.blocking_recv().ok();
+                })
+                .await;
+        });
+        parked_rx.await.expect("the barrier holds the target actor");
+
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+        let accounting = CreateAccounting::enter(&server, 0);
+        let mut rx = server.submit_create_detached_on(
+            accounting,
+            create_engine,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
+                    None,
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "with peers the create is not answered before its open is routed"
+        );
+        assert!(
+            !server
+                .publication_gate
+                .is_pending("payment-received", &order),
+            "with peers nothing relies on the node-local gate"
+        );
+
+        release_tx.send(()).expect("the barrier is parked");
+        barrier.await.expect("the barrier completes");
+        let created = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .expect("the create is answered once routed")
+            .expect("the detached owner is alive")
+            .expect("the create applied");
+        // Publish on the subscription partition only (the node-local apply):
+        // no gate is involved, so the open must already be there.
+        let (_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".to_string(),
+                order.clone(),
+                std::collections::BTreeMap::new(),
+                None,
+                Some(vec![target]),
+                None,
+                None,
+            )
+            .await
+            .expect("the publish applies");
+        assert_eq!(correlated, Some(created.instance_key));
+    }
+
+    /// #1604: a publish for a `(name, correlation key)` with a pending
+    /// subscription open must WAIT for the open instead of correlating against
+    /// nothing (and being discarded as unmatched). The create is applied
+    /// directly on its actor so its opening follow-up is held un-routed while
+    /// registered on the gate — exactly the window between a create's
+    /// commit-time answer and its routing owner delivering the open.
+    #[tokio::test]
+    async fn publish_waits_on_a_pending_subscription_open() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let create_partition = server.engine.for_create().stats().partition;
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+        let order = cross_partition_order(create_partition);
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+        let created = create_engine
+            .with_low(move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
+                    None,
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            })
+            .await
+            .expect("the create applied");
+        let routable = created.routable.clone();
+        let pending = server
+            .publication_gate
+            .register(&routable)
+            .expect("the create carries a cross-partition opening");
+
+        let publisher = {
+            let server = server.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                server
+                    .correlate_message_cluster(
+                        "payment-received".to_string(),
+                        order,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !publisher.is_finished(),
+            "a publish must not overtake a pending subscription open"
+        );
+
+        // The routing owner delivers the open, then releases the gate.
+        server.drive_subscription_routing(routable, None).await;
+        drop(pending);
+        let (_key, correlated) = tokio::time::timeout(std::time::Duration::from_secs(5), publisher)
+            .await
+            .expect("the publish proceeds once the open is routed")
+            .expect("the publisher task")
+            .expect("the publish applies");
+        assert_eq!(correlated, Some(created.instance_key));
+    }
+
+    /// Two parallel message catches whose correlation keys route to two
+    /// distinct partitions (`=keyA` and `=keyB`), used to verify that a stall
+    /// on the first routed target cannot cause a publish to the healthy second
+    /// target to overtake its still-pending subscription open and lose the
+    /// message (#1604).
+    const PARALLEL_TWO_CATCH_BPMN: &str = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="await-two-messages">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="fork" />
+          <bpmn:intermediateCatchEvent id="catch_a">
+            <bpmn:messageEventDefinition messageRef="Msg_A" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:intermediateCatchEvent id="catch_b">
+            <bpmn:messageEventDefinition messageRef="Msg_B" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:parallelGateway id="join" />
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="fork" />
+          <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="catch_a" />
+          <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="catch_b" />
+          <bpmn:sequenceFlow id="f3" sourceRef="catch_a" targetRef="join" />
+          <bpmn:sequenceFlow id="f4" sourceRef="catch_b" targetRef="join" />
+          <bpmn:sequenceFlow id="f5" sourceRef="join" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="Msg_A" name="msg-a">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=keyA" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+        <bpmn:message id="Msg_B" name="msg-b">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=keyB" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+
+    /// #1604: when a create opens subscriptions on two different partitions, a
+    /// stall on the FIRST routed target holds the serial routing pump past the
+    /// gate deadline, leaving the SECOND subscription unsubmitted. Publishing
+    /// or correlating to the healthy second target must fail retryably (503)
+    /// rather than proceeding unmatched and silently losing the message; once
+    /// the stall clears and the open lands, a retried publish/correlate
+    /// succeeds and correlates.
+    #[tokio::test]
+    async fn two_target_stall_past_gate_deadline_fails_retryably_instead_of_losing_message() {
+        let server = single_node_multi_partition();
+        *server
+            .publication_gate_deadline_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Duration::from_millis(80));
+        server
+            .deploy_centralized(
+                vec![("await-two.bpmn".into(), PARALLEL_TWO_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+
+        let create_partition = server.engine.for_create().stats().partition;
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+
+        // Pick two correlation keys that map to two DISTINCT partitions, both
+        // distinct from `create_partition`. Note: `drive_subscription_routing_now`
+        // pops from the back of `work`, so `catch_b` is routed first and
+        // `catch_a` second — stall whichever target is popped first.
+        let key_a = cross_partition_order(create_partition);
+        let target_a = nanobpmn_engine_core::subscription_partition(&key_a, 4);
+        let key_b = (0..256u32)
+            .map(|i| format!("gate-b-{i}"))
+            .find(|k| {
+                let t = nanobpmn_engine_core::subscription_partition(k, 4);
+                t != create_partition && t != target_a
+            })
+            .expect("a second distinct cross-partition correlation key exists");
+        let target_b = nanobpmn_engine_core::subscription_partition(&key_b, 4);
+        assert_ne!(target_a, target_b);
+
+        // Stall `target_b` (the first target popped by `work.pop()`), leaving
+        // `target_a` completely healthy.
+        let stalled_engine = server
+            .engine_handle_for(target_b)
+            .expect("the stalled target partition is local");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = tokio::spawn(async move {
+            stalled_engine
+                .with_low(move |_journal| {
+                    let _ = parked_tx.send(());
+                    release_rx.blocking_recv().ok();
+                })
+                .await;
+        });
+        parked_rx.await.expect("the barrier holds target_b's actor");
+
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("keyA".to_string(), Value::Str(key_a.clone()));
+        variables.insert("keyB".to_string(), Value::Str(key_b.clone()));
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached_on(
+            accounting,
+            create_engine,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-two-messages".into()),
+                    None,
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the create answers at commit despite stalled target_b")
+            .expect("the detached owner is alive")
+            .expect("the create applied");
+        assert!(
+            server.publication_gate.is_pending("msg-a", &key_a),
+            "msg-a's open is pending while target_b stalls the serial pump"
+        );
+
+        // Publish to the HEALTHY second target (`msg-a` / `key_a`) while
+        // `target_b` stays stalled past the 80ms gate deadline. Must return a
+        // retryable 503 — NOT 200 (unmatched, silently losing the message).
+        let publish_req = models::MessagePublicationRequest {
+            name: "msg-a".to_string(),
+            correlation_key: Some(key_a.clone()),
+            time_to_live: None,
+            message_id: None,
+            variables: None,
+            tenant_id: None,
+            business_id: None,
+        };
+        let pub_resp = server
+            .publish_message_impl(&publish_req)
+            .await
+            .expect("handler returns response");
+        assert!(
+            matches!(
+                pub_resp,
+                apis::message::PublishMessageResponse::Status503_TheServiceIsCurrentlyUnavailable(
+                    _
+                )
+            ),
+            "publish to healthy target_a while open is still pending must fail retryably with 503, got: {pub_resp:?}"
+        );
+
+        // Same for `correlate_message_impl`: must return retryable 503, NOT
+        // 404 (which would falsely claim no subscription matched).
+        let corr_req = models::MessageCorrelationRequest {
+            name: "msg-a".to_string(),
+            correlation_key: Some(key_a.clone()),
+            variables: None,
+            tenant_id: None,
+            business_id: None,
+        };
+        let corr_resp = server
+            .correlate_message_impl(&corr_req)
+            .await
+            .expect("handler returns response");
+        assert!(
+            matches!(
+                corr_resp,
+                apis::message::CorrelateMessageResponse::Status503_TheServiceIsCurrentlyUnavailable(
+                    _
+                )
+            ),
+            "correlate to healthy target_a while open is still pending must fail retryably with 503, got: {corr_resp:?}"
+        );
+
+        // Release target_b's stall; the routing pump now delivers both opens
+        // and releases the gate. Retrying correlation for msg-a must succeed
+        // and correlate to the instance.
+        release_tx.send(()).expect("the barrier is parked");
+        barrier.await.expect("the barrier completes");
+        let retry_resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.correlate_message_impl(&corr_req),
+        )
+        .await
+        .expect("retry completes once stall clears")
+        .expect("handler returns response");
+        match retry_resp {
+            apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(res) => {
+                assert_eq!(res.process_instance_key.0, created.instance_key.to_string());
+            }
+            other => panic!("retried correlate after stall cleared must correlate, got: {other:?}"),
+        }
+    }
+
+    /// #1604 (crash recovery): if a single-node server crashes AFTER the
+    /// create was answered at commit but BEFORE the cross-partition
+    /// `OpenMessageSubscription` became durable on the target partition,
+    /// restarting from the durable journals must recover the pending `Opening`
+    /// subscription, register it on the publication gate BEFORE accepting
+    /// publications, and re-drive the open to the target partition so a
+    /// publish issued immediately after restart correlates instead of being
+    /// discarded as unmatched.
+    #[tokio::test]
+    async fn restart_after_create_before_subscription_open_recovers_and_gates_publish() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpm-1604-restart-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _dir_guard = DirGuard(dir.clone());
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+
+        // Boot 1: deploy the message-catch process and create an instance on a
+        // partition whose canonical subscription partition is DIFFERENT, while
+        // stalling the target partition's actor so the create commits and
+        // answers BEFORE the target open is applied/persisted.
+        let crash_image = dir.with_extension("crash-image");
+        let _ = std::fs::remove_dir_all(&crash_image);
+        let _crash_image_guard = DirGuard(crash_image.clone());
+        fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                let dest = to.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_dir_recursive(&entry.path(), &dest)?;
+                } else {
+                    std::fs::copy(entry.path(), &dest)?;
+                }
+            }
+            Ok(())
+        }
+        let (created_instance_key, order, target_partition) = {
+            let (shared, recovery) =
+                SharedWriter::open_segmented(&dir, &owned, 4, None).expect("open segmented boot 1");
+            let fresh = recovery.fresh;
+            let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+                recovery.engines.into_iter().collect();
+            let journals: Vec<Journal> = owned
+                .iter()
+                .map(|p| {
+                    let engine = engines
+                        .remove(p)
+                        .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(*p));
+                    Journal::from_engine_shared(*p, engine, fresh, &shared)
+                })
+                .collect();
+            let server = build_server_in_memory(journals, topology.clone());
+            server
+                .deploy_centralized(
+                    vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                    "<default>".into(),
+                )
+                .await
+                .expect("deploy");
+            let create_partition = server.engine.for_create().stats().partition;
+            let create_engine = server
+                .engine_handle_for(create_partition)
+                .expect("create partition is local");
+            let order = cross_partition_order(create_partition);
+            let target = nanobpmn_engine_core::subscription_partition(&order, 4);
+            let target_engine = server
+                .engine_handle_for(target)
+                .expect("target partition is local");
+
+            // Stall the target actor so the routed `OpenMessageSubscription`
+            // never reaches it before the simulated crash.
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+            let _barrier = tokio::spawn(async move {
+                target_engine
+                    .with_low(move |_journal| {
+                        let _ = parked_tx.send(());
+                        release_rx.blocking_recv().ok();
+                    })
+                    .await;
+            });
+            parked_rx.await.expect("barrier holds target actor");
+
+            let mut variables = std::collections::BTreeMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let accounting = CreateAccounting::enter(&server, 0);
+            let rx = server.submit_create_detached_on(
+                accounting,
+                create_engine,
+                move |engine| {
+                    let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                        engine.state(),
+                        Some("await-payment".into()),
+                        None,
+                        None,
+                    )?;
+                    apply_create_instance_direct(
+                        engine,
+                        Command::create_instance_versioned(
+                            process_id.clone(),
+                            variables,
+                            Vec::new(),
+                            None,
+                            sel_key,
+                            sel_ver,
+                        ),
+                        &process_id,
+                        None,
+                    )
+                    .map_err(|e| (500, e.to_string()))
+                },
+                None,
+            );
+            let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                .await
+                .expect("create answered at commit despite stalled target")
+                .expect("detached owner alive")
+                .expect("create applied");
+            // Simulate the crash by taking a crash image: copy the durable
+            // directory while the target actor is still stalled (the create is
+            // durable, the target open is not). Boot 2 recovers from the copy,
+            // so nothing Boot 1 still does after its barrier is released (its
+            // routing owner applying the queued open, its writer flushing) can
+            // ever write into the log Boot 2 reopens.
+            copy_dir_recursive(&dir, &crash_image).expect("copy crash image");
+            drop(release_tx);
+            (created.instance_key, order, target)
+        };
+
+        // Boot 2: recover from the crash image, never Boot 1's live directory.
+        let (shared, recovery) = SharedWriter::open_segmented(&crash_image, &owned, 4, None)
+            .expect("open segmented boot 2");
+        let fresh = recovery.fresh;
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        // Confirm the pre-condition: the target partition did NOT durably open
+        // the subscription before the crash.
+        assert!(
+            engines
+                .get(&target_partition)
+                .map(|e| e.state().message_subscriptions.is_empty())
+                .unwrap_or(true),
+            "pre-condition: target partition has no durable subscription before recovery"
+        );
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|p| {
+                let engine = engines
+                    .remove(p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(*p));
+                Journal::from_engine_shared(*p, engine, fresh, &shared)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+
+        // Publish IMMEDIATELY after restart (no sleep): the publication gate
+        // must hold the publish until startup recovery finishes re-driving the
+        // pending `Opening` subscription, so the message correlates instead of
+        // being discarded as unmatched.
+        let (_message_key, correlated) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.correlate_message_cluster(
+                "payment-received".to_string(),
+                order.clone(),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("publish completes after startup recovery")
+        .expect("publish applies");
+        assert_eq!(
+            correlated,
+            Some(created_instance_key),
+            "publish immediately after restart must correlate to the recovered instance"
         );
     }
 
