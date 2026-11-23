@@ -486,6 +486,12 @@ jobs:
         # An apt mirror outage must not fail required jobs: native build tools
         # come only through .github/actions/build-tools (release downloads).
         run: node --test scripts/no-bare-apt.test.mjs
+      - name: Only main-reachable release tags publish (#1830)
+        # Every job that publishes (npm, release assets, S3, Maven, a write to
+        # another repo, OIDC trusted publishing, a release script) must be
+        # tag-gated AND run .github/actions/assert-release-ref; a manual run
+        # from a branch once shipped a side-branch server in the plugin.
+        run: node --test scripts/release-ref-gate.test.mjs
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
