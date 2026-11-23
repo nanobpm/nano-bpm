@@ -54,45 +54,19 @@ const RECEIVER_SYNC_METHODS: &[&str] = &[
     "shutdown",
 ];
 
-/// Calls that await a commit regardless of the receiver they are invoked on:
-/// the commit's own `blocking_wait`, or `drop(journal…` (the writer drains on
-/// drop). Matched as *calls* — an identifier-bounded name followed by `(` — so
-/// identifiers that merely contain a name (`rotated`, `flushed`) are never
-/// mistaken for a sync point.
-const FREE_SYNC_CALLS: &[&str] = &["blocking_wait", "drop"];
+/// Receiver methods that sync only when they actually rotated: on a
+/// non-segmented journal they return `None` without queuing anything, so the
+/// result must be unwrapped (`.expect`/`.unwrap`/`?`) to prove a rotation ran.
+const CHECKED_SYNC_METHODS: &[&str] = &["snapshot_and_rotate", "streaming_snapshot_and_rotate"];
 
 fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
-/// Offset of the first call to any of `names` in `hay`: the name must not be
-/// preceded by an identifier byte and must be followed (after optional
-/// whitespace) by `(`.
-fn first_call(hay: &str, names: &[&str]) -> Option<usize> {
-    let b = hay.as_bytes();
-    names
-        .iter()
-        .filter_map(|name| {
-            let mut from = 0;
-            while let Some(off) = hay[from..].find(name) {
-                let at = from + off;
-                from = at + name.len();
-                if at > 0 && is_ident(b[at - 1]) {
-                    continue;
-                }
-                let rest = hay[from..].trim_start();
-                if !rest.starts_with('(') {
-                    continue;
-                }
-                return Some(at);
-            }
-            None
-        })
-        .min()
-}
-
-/// The identifier a `.method(` call at `dot_at` is invoked on (the text
-/// immediately before the dot), or `None` when there is no receiver.
+/// The full receiver expression a `.method(` call at `dot_at` is invoked on
+/// (the field path immediately before the dot, e.g. `a.journal`), or `None`
+/// when there is no plain receiver. The whole path is kept so `a.journal` and
+/// `b.journal` are never conflated.
 fn receiver_before(hay: &str, dot_at: usize) -> Option<String> {
     if dot_at == 0 || hay.as_bytes()[dot_at - 1] == b'.' {
         return None; // a path (`Journal::open`) or a float, not a receiver
@@ -101,78 +75,142 @@ fn receiver_before(hay: &str, dot_at: usize) -> Option<String> {
         .trim_end()
         .chars()
         .rev()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect();
+    let recv = recv.trim_start_matches('.').to_string();
     (!recv.is_empty()).then_some(recv)
 }
 
-/// Whether `region` contains a sync point for the journal `recv` was applied
-/// on, returning its offset: a writer-ordered method called *on that same
-/// receiver*, or a receiver-independent await (`blocking_wait`, `drop(journal…`).
+/// The statement containing byte `at` of `region` (between the nearest
+/// `;`/`{`/`}` delimiters).
+fn stmt_around(region: &str, at: usize) -> &str {
+    let start = region[..at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
+    let end = region[at..]
+        .find([';', '{', '}'])
+        .map_or(region.len(), |n| at + n);
+    &region[start..end]
+}
+
+/// Whether a sync call at `at` executes on every path that reaches the end of
+/// `region`: it is not inside a block opened within `region` (an `if`/`match`/
+/// loop body, a match arm, a closure body), not in a deferred closure
+/// (`|| journal.rotate()`), and not short-circuited (`c && journal.flush()`).
+/// Conditionals that *complete* before it, or a `?` before it, do not weaken
+/// it: a path that skips it also skips the observation.
+fn unconditional_at(region: &str, at: usize) -> bool {
+    let mut depth = 0usize;
+    for &c in &region.as_bytes()[..at] {
+        match c {
+            b'{' => depth += 1,
+            // Closing a block opened before the region leaves depth at 0.
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let stmt = stmt_around(region, at);
+    depth == 0 && !(stmt.contains('|') || stmt.contains("=>") || stmt.contains("&&"))
+}
+
+/// Whether `region` contains an unconditional sync point for the journal
+/// `recv` was applied on, returning its offset: a writer-ordered method called
+/// *on that same receiver* (a rotation must be unwrapped to prove it ran),
+/// `drop(<recv>)`, or `blocking_wait()` on a commit bound from a *later*
+/// apply on that receiver (FIFO behind the discarded write). Calls are matched
+/// identifier-bounded and followed by `(`, so `rotated`/`flushed` never
+/// count. Unrelated drops and waits on stale or foreign commits order nothing.
 fn sync_point_at(region: &str, recv: &str) -> Option<usize> {
+    if recv.is_empty() {
+        return None;
+    }
     let b = region.as_bytes();
-    let tied = RECEIVER_SYNC_METHODS.iter().filter_map(|name| {
+    let mut hits = Vec::new();
+    for name in RECEIVER_SYNC_METHODS
+        .iter()
+        .chain(["blocking_wait", "drop"].iter())
+    {
         let mut from = 0;
         while let Some(off) = region[from..].find(name) {
             let at = from + off;
             from = at + name.len();
-            if at > 0 && is_ident(b[at - 1]) {
+            if (at > 0 && is_ident(b[at - 1])) || (from < b.len() && is_ident(b[from])) {
                 continue;
             }
-            if !region[from..].trim_start().starts_with('(') {
+            let rest = region[from..].trim_start();
+            if !rest.starts_with('(') {
                 continue;
             }
-            // `.name(` — the receiver is the identifier before the dot.
-            if b[at - 1] == b'.' && receiver_before(region, at - 1).as_deref() == Some(recv) {
-                return Some(at);
+            let dotted = at > 0 && b[at - 1] == b'.';
+            let ok = match *name {
+                "drop" => {
+                    let arg: String = rest[1..]
+                        .chars()
+                        .take_while(|c| *c != ')')
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    !dotted && arg == recv
+                }
+                "blocking_wait" => {
+                    dotted
+                        && receiver_before(region, at - 1)
+                            .is_some_and(|h| commit_bound_from(&region[..at], &h, recv))
+                }
+                _ => {
+                    dotted
+                        && receiver_before(region, at - 1).as_deref() == Some(recv)
+                        && (!CHECKED_SYNC_METHODS.contains(name) || {
+                            let stmt = stmt_around(region, at);
+                            stmt.contains(".expect(")
+                                || stmt.contains(".unwrap()")
+                                || stmt.contains('?')
+                        })
+                }
+            };
+            if ok && unconditional_at(region, at) {
+                hits.push(at);
             }
         }
-        None
-    });
-    tied.chain(
-        FREE_SYNC_CALLS
-            .iter()
-            .filter_map(|name| first_call(region, std::slice::from_ref(name))),
-    )
-    .min()
+    }
+    hits.into_iter().min()
 }
 
-/// The index of the first byte of `region` that is NOT reachable on every
-/// control-flow path: the start of the smallest enclosing `{…}` that follows a
-/// conditional keyword (`if`/`else`/`match`/`while`/`for`/`loop`) or a `?` /
-/// `=>` (an early-returning call or a match arm) — `None` when the whole
-/// region is unconditional. A sync point at or after this offset may never
-/// execute, so it cannot order the observation; one *before* it still can.
-fn conditional_from(region: &str) -> Option<usize> {
-    let b = region.as_bytes();
-    let mut best = region.len();
-    for kw in ["if", "else", "match", "while", "for", "loop"] {
-        let mut from = 0;
-        while let Some(off) = region[from..].find(kw) {
-            let at = from + off;
-            from = at + kw.len();
-            let prev_ok = at == 0 || !is_ident(b[at - 1]);
-            let next_ok = from >= region.len() || !is_ident(b[from]);
-            if !(prev_ok && next_ok) {
-                continue;
-            }
-            if let Some(rel) = region[from..].find('{') {
-                best = best.min(from + rel);
-            }
+/// Whether `before` binds `handle` as the commit of an apply on `recv`
+/// (`let (_, handle) = recv.apply_command…` / `let handle = recv.apply…`).
+fn commit_bound_from(before: &str, handle: &str, recv: &str) -> bool {
+    let mut from = 0;
+    while let Some(off) = before[from..].find(APPLY) {
+        let at = from + off;
+        from = at + APPLY.len();
+        if receiver_before(before, at).as_deref() != Some(recv) {
+            continue;
+        }
+        if commit_slot(before, at).is_some_and(|slot| slot == handle) {
+            return true;
         }
     }
-    for (i, &c) in b.iter().enumerate() {
-        if c == b'?' {
-            best = best.min(i);
-        }
-        if c == b'=' && b.get(i + 1) == Some(&b'>') {
-            best = best.min(i);
-        }
-    }
-    (best < region.len()).then_some(best)
+    false
+}
+
+/// The binding of the commit (last tuple slot, or the whole pattern) in the
+/// `let` statement ending at `apply_at`; `None` when nothing is bound.
+fn commit_slot(body: &str, apply_at: usize) -> Option<String> {
+    let stmt_start = body[..apply_at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
+    let stmt: String = body[stmt_start..apply_at]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let pat = stmt.strip_prefix("let")?;
+    let pat = pat.strip_prefix("mut").unwrap_or(pat);
+    let pat = &pat[..pat.find('=')?];
+    let pat = pat.split(':').next().unwrap_or("");
+    let last = match pat.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+        // A trailing comma leaves an empty final component; skip empty slots.
+        Some(inner) => inner.rsplit(',').find(|s| !s.is_empty()).unwrap_or(""),
+        None => pat,
+    };
+    Some(last.trim_start_matches("mut").to_string())
 }
 
 /// Replaces string/char literals and comments with spaces (keeping byte
@@ -200,8 +238,11 @@ fn strip_literals(src: &str) -> String {
                 blank(&mut out, i, end);
                 i = end;
             }
+            // `r"…"`/`r#"…"#`, and the raw byte string `br#"…"#`.
             b'r' if matches!(b.get(i + 1), Some(b'#' | b'"'))
-                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+                && (i == 0
+                    || !is_ident(b[i - 1])
+                    || (b[i - 1] == b'b' && (i == 1 || !is_ident(b[i - 2])))) =>
             {
                 let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
                 if b.get(i + 1 + hashes) != Some(&b'"') {
@@ -265,8 +306,18 @@ fn fn_bodies(src: &str) -> Vec<(String, String)> {
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
         // The body opens at the first `{` not preceded by a `;` (a bodyless
-        // trait method declaration ends at `;`).
-        let Some(rel) = s[at..].find(['{', ';']) else {
+        // trait method declaration ends at `;`) — ignoring delimiters nested in
+        // the parameter list or a type (`key: &[u8; 32]`).
+        let mut nest = 0i64;
+        let Some(rel) = bytes[at..].iter().position(|&c| {
+            match c {
+                b'(' | b'[' => nest += 1,
+                b')' | b']' => nest -= 1,
+                b'{' | b';' if nest <= 0 => return true,
+                _ => {}
+            }
+            false
+        }) else {
             break;
         };
         let open = at + rel;
@@ -305,25 +356,14 @@ fn discards_commit(body: &str, apply_at: usize) -> bool {
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    let Some(pat) = stmt.strip_prefix("let") else {
+    if !stmt.starts_with("let") {
         // No binding at all: an expression statement discards the commit,
         // unless the value is assigned/returned/passed on.
         return !stmt.contains('=')
             && !stmt.starts_with("return")
             && stmt.matches('(').count() == stmt.matches(')').count();
-    };
-    let pat = pat.strip_prefix("mut").unwrap_or(pat);
-    let Some(eq) = pat.find('=') else {
-        return false;
-    };
-    let pat = pat[..eq].split(':').next().unwrap_or("");
-    let last = match pat.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
-        // The commit is the last tuple slot; a trailing comma leaves an empty
-        // final component, so skip empty slots.
-        Some(inner) => inner.rsplit(',').find(|s| !s.is_empty()).unwrap_or(""),
-        None => pat,
-    };
-    last.trim_start_matches("mut").starts_with('_')
+    }
+    commit_slot(body, apply_at).is_some_and(|slot| slot.starts_with('_'))
 }
 
 /// Whether the journal `apply_at` is called on was built in memory
@@ -381,9 +421,7 @@ fn violations(src: &str) -> Vec<(String, String)> {
                 // point and the observation. Conditionals *before* the sync
                 // point do not weaken it — every path still reaches it.
                 let region = &tail[..obs_at];
-                let synced = sync_point_at(region, &recv).is_some_and(|sync_at| {
-                    conditional_from(region).is_none_or(|cut| sync_at < cut)
-                });
+                let synced = sync_point_at(region, &recv).is_some();
                 if !synced {
                     found.push((name.clone(), obs.to_string()));
                     break;
@@ -593,7 +631,7 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
     let tied = r#"
         fn t() {
             let _ = journal.apply_command(c).unwrap();
-            journal.snapshot_and_rotate();
+            journal.snapshot_and_rotate().expect("rotate");
             let u = shared.uncompacted_usage();
         }
     "#;
@@ -612,12 +650,109 @@ fn guard_flags_the_1477_shape_and_accepts_the_fix() {
     let synced_then_fallible = r#"
         fn t() {
             let _ = journal.apply_command(c).unwrap();
-            journal.snapshot_and_rotate();
+            journal.snapshot_and_rotate().expect("rotate");
             let x = fallible()?;
             let u = shared.uncompacted_usage();
         }
     "#;
     assert!(violations(synced_then_fallible).is_empty());
+
+    // An unrelated drop, or a wait on a commit from *before* the discarded
+    // write (or from another journal), does not cover the pending append.
+    let unrelated_drop = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            drop(events);
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(unrelated_drop).len(), 1);
+    let stale_wait = r#"
+        fn t() {
+            let (_e, early) = journal.apply_command(a).unwrap();
+            let _ = journal.apply_command(c).unwrap();
+            early.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(stale_wait).len(), 1);
+    let later_wait = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let (_e, late) = journal.apply_command(d).unwrap();
+            late.blocking_wait();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(later_wait).is_empty());
+
+    // A deferred closure or short-circuited call may never run.
+    let deferred = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let later = || journal.snapshot_and_rotate().expect("r");
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(deferred).len(), 1);
+    let short_circuit = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            let ok = flag && journal.flush().is_ok();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(short_circuit).len(), 1);
+
+    // …but an unconditional sync after a `?` or a completed conditional holds.
+    let after_fallible = r#"
+        fn t() -> Result<()> {
+            let _ = journal.apply_command(c)?;
+            if x { y(); }
+            journal.snapshot_and_rotate()?;
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert!(violations(after_fallible).is_empty());
+
+    // An unchecked rotation may be a no-op (non-segmented journal → `None`).
+    let unchecked_rotation = r#"
+        fn t() {
+            let _ = journal.apply_command(c).unwrap();
+            journal.snapshot_and_rotate();
+            let b = fs::read(&p).unwrap();
+        }
+    "#;
+    assert_eq!(violations(unchecked_rotation).len(), 1);
+
+    // Field-qualified receivers are compared as whole paths.
+    let other_field = r#"
+        fn t() {
+            let _ = a.journal.apply_command(c).unwrap();
+            b.journal.snapshot_and_rotate().expect("r");
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(other_field).len(), 1);
+
+    // A raw byte string with embedded quotes/braces must not hide later fns.
+    let raw_bytes = r##"
+        fn a() { let x = br#"{"k":"v"#; }
+        fn racy() {
+            let _ = journal.apply_command(c).unwrap();
+            let u = shared.uncompacted_usage();
+        }
+    "##;
+    assert_eq!(violations(raw_bytes).len(), 1);
+
+    // An array type's `;` in the signature is not a bodyless declaration.
+    let array_param = r#"
+        fn t(key: &[u8; 32]) {
+            let _ = journal.apply_command(c).unwrap();
+            let u = shared.uncompacted_usage();
+        }
+    "#;
+    assert_eq!(violations(array_param).len(), 1);
 
     // Text inside string literals and comments is not code.
     let literal = r#"
