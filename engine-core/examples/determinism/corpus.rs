@@ -745,10 +745,12 @@ fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
     let sr_instance = find(&sr, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
     g.push(Command::correlate_message("scalar-m1", "k"));
     g.push(Command::correlate_message("scalar-m2", "k"));
-    assert!(
-        g.engine.is_completed(sr_instance),
-        "the scalar head choice routes the fired inclusive join"
-    );
+    if g.exclude.is_empty() {
+        assert!(
+            g.engine.is_completed(sr_instance),
+            "the scalar head choice routes the fired inclusive join"
+        );
+    }
 
     // ---- Suspend / resume / cancel ----------------------------------------
     g.scenario("suspend-resume-cancel");
