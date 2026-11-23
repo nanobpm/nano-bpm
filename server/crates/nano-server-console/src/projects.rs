@@ -8270,6 +8270,20 @@ mod tests {
         env_lock()
     }
 
+    /// A fresh, created scratch dir that does NOT touch
+    /// `NANOBPMN_PROJECTS_DIR` — for tests independent of `project_dir`.
+    fn private_scratch_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, AOrd::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
     fn temp_root() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
@@ -8423,16 +8437,8 @@ mod tests {
 
     #[test]
     fn ondisk_generated_models_returns_only_provenance_marked() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let proc_dir = root.join("resources").join("processes");
         std::fs::create_dir_all(&proc_dir).unwrap();
         // A generated model (carries the provenance marker) — surfaced.
@@ -8491,16 +8497,8 @@ mod tests {
     /// filesystem — needs no datasource/runtime.
     #[test]
     fn datasource_fingerprint_changes_on_manifest_edit_and_reimport() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
 
         // A workspace project with a manifest declaring a datasource.
         let proj = root.join("fp");
@@ -8581,16 +8579,8 @@ mod tests {
 
     #[test]
     fn import_project_ref_slugs_spaced_name_and_keeps_display() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let ext = ext_app_dir("spaced");
         std::fs::write(
             ext.join("nano.app.json"),
@@ -8655,16 +8645,8 @@ mod tests {
 
     #[test]
     fn import_project_ref_refuses_to_shadow_a_workspace_project() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         std::fs::create_dir_all(root.join("taken")).unwrap(); // a real workspace project dir
         let ext = ext_app_dir("shadow");
         std::fs::write(ext.join("nanobpm.project.json"), "{}").unwrap();
@@ -8674,16 +8656,8 @@ mod tests {
 
     #[test]
     fn list_projects_tags_source_and_remove_ref_reverts() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         // one workspace project + one imported-by-reference project
         std::fs::create_dir_all(root.join("local")).unwrap();
         let ext = ext_app_dir("listed");
@@ -8810,16 +8784,8 @@ mod tests {
 
     #[test]
     fn project_dir_prefers_workspace_and_ignores_a_corrupted_ref() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         // A real workspace directory shadows any reference of the same name.
         std::fs::create_dir_all(root.join("both")).unwrap();
         std::fs::write(
@@ -8860,16 +8826,8 @@ mod tests {
 
     #[test]
     fn list_projects_does_not_duplicate_a_ref_shadowed_by_a_workspace_dir() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         // A workspace dir and a same-named ref file coexist (e.g. the workspace
         // project was created after the ref, or hand-placed state). project_dir
         // prefers the workspace dir; the listing must not also emit a `path` tile.
@@ -8887,16 +8845,8 @@ mod tests {
 
     #[test]
     fn delete_project_with_both_a_workspace_dir_and_a_ref_removes_the_dir_and_the_ref() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let ext = ext_app_dir("coexist");
         std::fs::write(
             ext.join("nano.app.json"),
@@ -8926,16 +8876,8 @@ mod tests {
 
     #[test]
     fn rename_project_stays_workspace_scoped_and_ignores_refs() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         // A real workspace project (with a config) that also carries a stale ref
         // of its own name — a directory rename must win and drop the pointer.
         create_project("src", "S", "starter").expect("create src");
@@ -9131,16 +9073,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn app_ui_detected_handshake_port_wins_over_declared() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         // A project whose manifest declares a fixed UI port (8090). Without the
         // handshake, app_ui would surface 8090.
         let dir = root.join("workforce");
@@ -9177,16 +9111,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn app_ui_ignores_detected_port_when_ui_disabled() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let dir = root.join("headless");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -9214,16 +9140,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn app_ui_does_not_insert_supervisor_entry() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let dir = root.join("ghost");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -9442,16 +9360,8 @@ mod tests {
 
     #[test]
     fn gui_template_sets_app_and_serves_public() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let cfg = create_project("gdemo", "", "gui-starter").expect("create");
         assert_eq!(cfg.app, "node-gui");
         let dir = root.join("gdemo");
@@ -9461,16 +9371,8 @@ mod tests {
 
     #[test]
     fn urban_template_scaffolds_app_manifest_and_dirs() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let cfg = create_project("Home_Heating", "", "urban-starter").expect("create");
         assert_eq!(cfg.app, "urban");
         assert_eq!(cfg.template.as_deref(), Some("urban-starter"));
@@ -9691,16 +9593,8 @@ mod tests {
 
     #[test]
     fn workflow_template_scaffolds_a_lean_code_first_project() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let cfg = create_project("pr_bot", "", "workflow-starter").expect("create");
         // Recorded as its own template; a Node console app (the run supervisor
         // drives it via `node --experimental-strip-types`).
@@ -9869,16 +9763,8 @@ mod tests {
 
     #[test]
     fn create_project_slugs_a_spaced_name_and_keeps_the_display_name() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let cfg = create_project("Home Heating", "warm floors", "starter").expect("create");
         assert_eq!(cfg.name, "home-heating");
         assert_eq!(cfg.display_name.as_deref(), Some("Home Heating"));
@@ -9991,16 +9877,8 @@ mod tests {
 
     #[test]
     fn rename_project_slugs_the_new_name_and_updates_the_display_name() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         create_project("plain", "", "starter").expect("create");
         let cfg = rename_project("plain", "Warm House").expect("rename");
         assert_eq!(cfg.name, "warm-house");
@@ -10211,16 +10089,8 @@ mod tests {
 
     #[test]
     fn installed_example_pack_is_scaffolded() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let ext = root.join("ext-store");
         let pack = ext.join("nanobpm__example-demo");
         std::fs::create_dir_all(pack.join("app/src")).unwrap();
@@ -10247,16 +10117,8 @@ mod tests {
     /// starter). Everything must come from the pack.
     #[test]
     fn java_pack_scaffold_does_not_get_node_files() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let ext = root.join("ext-store");
         let pack = ext.join("nanobpm__example-throughput-jvm");
         std::fs::create_dir_all(pack.join("app/src/main/java/com/example")).unwrap();
@@ -10316,16 +10178,8 @@ mod tests {
     /// With litter present, an installed example pack must still scaffold.
     #[test]
     fn pack_template_survives_stray_files_in_extensions_root() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let ext = root.join("ext-store");
         std::fs::create_dir_all(&ext).unwrap();
         // The litter, named to sort BEFORE the pack dir in any readdir order
@@ -10366,16 +10220,8 @@ mod tests {
     /// projects on the JS/TS runtime.
     #[test]
     fn lang_pack_template_sets_lang_to_the_pack_id() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let ext = root.join("ext-store");
         let pack = ext.join("nanobpm__nano-ide-lang-java");
         std::fs::create_dir_all(pack.join("templates/java-starter")).unwrap();
@@ -10399,16 +10245,8 @@ mod tests {
     /// POM (most specific) rather than the aggregator.
     #[test]
     fn multi_module_java_pack_prefers_module_pom_over_root_pom() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let ext = root.join("ext-store");
         let pack = ext.join("nanobpm__app-embedded-multi");
         std::fs::create_dir_all(pack.join("templates/multi-starter/microservice")).unwrap();
@@ -10438,16 +10276,8 @@ mod tests {
     /// decouples running projects from pack updates/uninstalls.
     #[test]
     fn pack_scaffold_snapshots_toolchain_into_project() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let ext = root.join("ext-store");
         let pack = ext.join("nanobpm__app-embedded-jvm");
         std::fs::create_dir_all(pack.join("templates/embedded-jvm-starter/microservice")).unwrap();
@@ -10941,16 +10771,8 @@ mod tests {
 
     #[test]
     fn create_scaffolds_a_runnable_project() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let cfg = create_project("demo", "a demo", "starter").expect("create");
         assert_eq!(cfg.name, "demo");
         assert_eq!(cfg.deploy_target, "http://localhost:8080");
@@ -11018,16 +10840,8 @@ mod tests {
 
     #[test]
     fn throughput_template_scaffolds_demo_files() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         create_project("bench", "", "throughput").expect("create");
         let dir = root.join("bench");
         assert!(dir.join("main.ts").is_file());
@@ -11038,16 +10852,8 @@ mod tests {
 
     #[test]
     fn throughput_stream_template_scaffolds_sdk_demo() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         create_project("bench-stream", "", "throughput-stream").expect("create");
         let dir = root.join("bench-stream");
         assert!(dir.join("main.ts").is_file());
@@ -11739,16 +11545,8 @@ mod tests {
     /// (keep the embedded emitters).
     #[test]
     fn is_urban_app_detects_nano_app_manifest() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "shapecheck";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -11769,16 +11567,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn gen_with_urban_spawns_gen_in_the_project_dir() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "urbanapp";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -11817,16 +11607,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn gen_with_urban_passes_no_models_when_requested() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "urbanapp-nomodels";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -11855,16 +11637,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn finalize_after_update_regenerates_urban_app() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "finalize-urban";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -11900,16 +11674,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn finalize_after_update_is_a_noop_for_legacy_projects() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "finalize-legacy";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -11953,16 +11719,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn urban_gen_is_fresh_reads_the_check_exit_code() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let dir = root.join("freshcheck");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -11997,16 +11755,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn ensure_urban_boot_ready_gens_when_facade_is_stale() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "boot-stale";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12050,16 +11800,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn ensure_urban_boot_ready_skips_gen_when_fresh() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "boot-fresh";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12099,16 +11841,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn ensure_urban_boot_ready_is_a_noop_for_legacy_projects() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "boot-legacy";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12141,16 +11875,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn ensure_urban_boot_ready_warns_when_toolkit_unresolved() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "boot-notoolkit";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12315,16 +12041,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn gen_with_urban_maps_a_failure_to_an_error_with_stderr() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "failapp";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12349,16 +12067,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn gen_with_urban_failure_without_output_still_reports_exit_status() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "silentfail";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12399,16 +12109,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn gen_via_urban_rejects_a_legacy_shaped_project() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "legacyapp";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12464,16 +12166,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn run_data_op_routes_urban_app_to_urban_data() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "urban-data-app";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12527,16 +12221,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn run_data_op_falls_back_to_embedded_when_urban_lacks_data_op() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let name = "urban-old-toolkit-app";
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12630,16 +12316,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn pipe_data_gateway_bounds_concurrent_children() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // A private scratch dir — NOT `temp_root()`: this test needs no
+        // `NANOBPMN_PROJECTS_DIR`, so it must not mutate that process-global.
+        let root = private_scratch_dir("nano-gw-bound");
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
         let log = root.join("alive.log");
@@ -14343,16 +14022,8 @@ mod tests {
     /// `ensure_project_sdk`, without clobbering the maker's other fields.
     #[test]
     fn ensure_project_sdk_heals_a_depless_package_json() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let dir = root.join("legacy");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -14391,16 +14062,8 @@ mod tests {
     /// byte-for-byte untouched (rewrite only on change).
     #[test]
     fn heal_respects_the_devdependencies_bucket_and_skips_covered_manifests() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let dir = root.join("covered");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -14425,16 +14088,8 @@ mod tests {
     /// stopping at the first readable-but-broken file and dropping deps).
     #[test]
     fn required_npm_deps_falls_through_a_broken_node_json_to_node_jsonc() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let dir = root.join("mixed");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("node.json"), "{ not valid json ").unwrap();
@@ -14466,16 +14121,8 @@ mod tests {
     /// `npm install` never fetched, and the worker fails at import time.
     #[test]
     fn required_npm_deps_reads_the_legacy_deno_json_alias() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let dir = root.join("legacy");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -14512,16 +14159,8 @@ mod tests {
     /// to resolve the imports. Mirror of `stripJsonc` in `node_loader.mjs`.
     #[test]
     fn required_npm_deps_reads_a_commented_node_jsonc() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let dir = root.join("jsonc");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -14582,16 +14221,8 @@ mod tests {
 
     #[test]
     fn compute_update_available_compares_recorded_vs_installed() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         let ext = root.join("ext-store");
         let pack = ext.join("nanobpm__app-x");
         std::fs::create_dir_all(&pack).unwrap();
@@ -15230,16 +14861,8 @@ mod tests {
 
     #[test]
     fn maybe_bump_scaffold_version_persists_only_with_a_breadcrumb() {
-        // A private scratch dir — NOT `temp_root()`, which mutates the
-        // process-global `NANOBPMN_PROJECTS_DIR` and would race other tests.
-        let root = std::env::temp_dir().join(format!(
-            "nano-gw-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let _g = lock();
+        let root = temp_root();
         std::fs::create_dir_all(root.join("proj")).unwrap();
         let mut cfg = ProjectConfig::new("proj", "");
         // No scaffolded_from → nothing to bump.
