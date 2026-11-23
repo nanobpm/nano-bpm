@@ -1727,6 +1727,7 @@ async fn handle_client_frame(
             fetch_variables,
             request_timeout,
             origin_protocol,
+            operation_reference,
         } => {
             // Local-only: create on one of THIS peer's own partitions and answer
             // with the full result JSON. The peer never re-forwards, so there is
@@ -1755,6 +1756,7 @@ async fn handle_client_frame(
                         fetch_variables,
                         request_timeout,
                         origin_protocol.as_deref().unwrap_or("rest"),
+                        operation_reference,
                     )
                     .await
                 {

@@ -754,6 +754,13 @@ pub enum ClientFrame {
         /// value is treated as `"rest"`).
         #[serde(default)]
         origin_protocol: Option<String>,
+        /// The REST create instruction's `operationReference` (#1602), stamped
+        /// on every record the create produces on the owner (#1556's generic
+        /// propagation). `#[serde(default)]` keeps the frame wire-compatible
+        /// with peers that predate the field (a missing value is `None`); the
+        /// stream create protocol carries no reference and always sends `None`.
+        #[serde(default)]
+        operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway forwards a GET-by-key read to the peer
     /// that owns the key's partition. Each node only projects its own partitions
