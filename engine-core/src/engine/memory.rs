@@ -113,6 +113,8 @@ impl Engine {
             #[cfg(test)]
             scope_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
+            resource_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: std::collections::BTreeSet::new(),

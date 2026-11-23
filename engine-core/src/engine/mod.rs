@@ -218,6 +218,13 @@ pub struct Engine {
     /// Test-only count of scope-map scans by `cancel_scope_tree_events`.
     #[cfg(test)]
     pub(crate) scope_scan_count: std::cell::Cell<usize>,
+    /// Test-only probe (#1767): counts every full scan of the job / timer /
+    /// subscription / incident maps a teardown performs (per-element fallbacks
+    /// and [`boundary::TeardownIndex`] builds), so a regression test can assert
+    /// an N-child teardown scans a constant number of times, never once per
+    /// child. Never snapshotted; always 0 in production builds.
+    #[cfg(test)]
+    pub(crate) resource_scan_count: std::cell::Cell<usize>,
     /// Test-only count of process instances `cascade_cancel_children` examined
     /// as candidate call-activity children (#1827). The cascade runs on every
     /// command that ends an instance, so it must look up the ended parents'
@@ -742,6 +749,8 @@ impl Engine {
             #[cfg(test)]
             scope_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
+            resource_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
@@ -920,6 +929,8 @@ impl Engine {
             user_task_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             scope_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            resource_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
@@ -11656,8 +11667,7 @@ impl Engine {
         // N-child teardown is O(total user tasks + N) rather than each child
         // rescanning the whole `state.user_tasks` map (#1528 review). The index
         // preserves per-bucket key order, so the emitted events are unchanged.
-        let user_tasks_by_eik =
-            (!active.is_empty()).then(|| self.created_user_tasks_by_element_instance(instance_key));
+        let teardown_idx = (!active.is_empty()).then(|| self.teardown_index(instance_key));
         // An ad-hoc container child (a JOB_WORKER ad-hoc MI child, #1170) owns its
         // OWN active tool scope (`adhoc_instances[child].active`), its agent job,
         // and an `adhoc_instances` runtime record — none of which the leaf-only
@@ -11670,7 +11680,7 @@ impl Engine {
         // instead, using the body as the enclosing container key; a non-ad-hoc
         // child (service task, sub-process, call activity) keeps the leaf path.
         // Scopes to flag torn down for this drain; applied AFTER the loop because
-        // `user_tasks_by_eik` borrows `self.state` immutably for its duration, so
+        // `teardown_idx` borrows `self.state` immutably for its duration, so
         // the `&mut self.torn_down_scopes` inserts must wait until it is dropped.
         let mut torn_down: Vec<Key> = Vec::new();
         for child in &active {
@@ -11679,7 +11689,7 @@ impl Engine {
                     instance_key,
                     body_key,
                     *child,
-                    user_tasks_by_eik.as_ref(),
+                    teardown_idx.as_ref(),
                 ));
             } else {
                 // A non-ad-hoc MI child may itself be an embedded SUB-PROCESS that
@@ -11702,18 +11712,17 @@ impl Engine {
                 // the child element instance itself (#1170).
                 // The descendants' teardown is nested INSIDE the child's
                 // TERMINATING/TERMINATED pair (Zeebe depth-first order, #1535).
-                let inner =
-                    self.scope_teardown_events(instance_key, *child, user_tasks_by_eik.as_ref());
+                let inner = self.scope_teardown_events(instance_key, *child, teardown_idx.as_ref());
                 torn_down.push(*child);
                 events.extend(self.cancel_mi_child_events(
                     instance_key,
                     *child,
                     inner,
-                    user_tasks_by_eik.as_ref(),
+                    teardown_idx.as_ref(),
                 ));
             }
         }
-        drop(user_tasks_by_eik);
+        drop(teardown_idx);
         self.torn_down_scopes.extend(torn_down);
         // Disarm every boundary event armed on the BODY as the loop enters
         // completion (before end listeners, mirroring the sub-process/ad-hoc
@@ -11913,36 +11922,6 @@ impl Engine {
         (events, followups)
     }
 
-    /// Indexes every `Created` user task by its owning element-instance key, for
-    /// a single teardown pass. Building this once and sharing it across the
-    /// per-child cancellation steps turns an N-child teardown from O(N ×
-    /// total user tasks) — each child rescanning the whole `state.user_tasks`
-    /// map — into O(total user tasks + N) (#1528 review). Each bucket preserves
-    /// ascending key order (the source map is key-ordered), so the events a
-    /// bucket drives stay byte-identical to the per-call scan they replace.
-    ///
-    /// Only tasks of `instance_key` are indexed: a teardown never reaches
-    /// another instance's tasks through this index, so unrelated backlog is not
-    /// copied into it (#1528 review).
-    fn created_user_tasks_by_element_instance(
-        &self,
-        instance_key: Key,
-    ) -> BTreeMap<Key, Vec<&state::UserTask>> {
-        #[cfg(test)]
-        self.user_task_scan_count
-            .set(self.user_task_scan_count.get() + 1);
-        let mut index: BTreeMap<Key, Vec<&state::UserTask>> = BTreeMap::new();
-        for task in self.state.user_tasks.values() {
-            if task.instance_key == instance_key && task.state == state::UserTaskState::Created {
-                index
-                    .entry(task.element_instance_key)
-                    .or_default()
-                    .push(task);
-            }
-        }
-        index
-    }
-
     /// Tears down `root` and every element instance nested inside it,
     /// depth-first: each element's TERMINATING precedes the teardown of its
     /// DIRECT scope children (recursively), and its TERMINATED follows them
@@ -11951,7 +11930,7 @@ impl Engine {
         &self,
         instance_key: Key,
         root: Key,
-        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+        teardown_idx: Option<&boundary::TeardownIndex<'_>>,
     ) -> Vec<Event> {
         // Build the parent → direct-children index ONCE (a single pass over the
         // instance's scope map) and recurse over it, so an N-deep tool is
@@ -11965,7 +11944,7 @@ impl Engine {
                 children.entry(*parent).or_default().push(*child);
             }
         }
-        self.cancel_scope_subtree_events(instance_key, root, &children, user_tasks_by_eik)
+        self.cancel_scope_subtree_events(instance_key, root, &children, teardown_idx)
     }
 
     fn cancel_scope_subtree_events(
@@ -11973,18 +11952,13 @@ impl Engine {
         instance_key: Key,
         root: Key,
         children: &BTreeMap<Key, Vec<Key>>,
-        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+        teardown_idx: Option<&boundary::TeardownIndex<'_>>,
     ) -> Vec<Event> {
         let mut inner = Vec::new();
         for &d in children.get(&root).map(Vec::as_slice).unwrap_or_default() {
-            inner.extend(self.cancel_scope_subtree_events(
-                instance_key,
-                d,
-                children,
-                user_tasks_by_eik,
-            ));
+            inner.extend(self.cancel_scope_subtree_events(instance_key, d, children, teardown_idx));
         }
-        self.cancel_mi_child_events(instance_key, root, inner, user_tasks_by_eik)
+        self.cancel_mi_child_events(instance_key, root, inner, teardown_idx)
     }
 
     /// The `canceling` task-listener gate of an early multi-instance body
@@ -12088,16 +12062,16 @@ impl Engine {
     /// which would report unfinished work as completed (#1528 review). Returns
     /// events (it does not emit) so it composes inside a `process_step` result.
     ///
-    /// `user_tasks_by_eik` is the per-teardown element-instance → `Created`
+    /// `teardown_idx` is the per-teardown element-instance → `Created`
     /// user-task index built once by [`Self::complete_multi_instance_body`] (see
-    /// [`Self::created_user_tasks_by_element_instance`]); `None` (the default for
+    /// [`Self::teardown_index`]); `None` (the default for
     /// callers outside that teardown) falls back to scanning `state.user_tasks`.
     fn cancel_mi_child_events(
         &self,
         instance_key: Key,
         child_eik: Key,
         inner: Vec<Event>,
-        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+        teardown_idx: Option<&boundary::TeardownIndex<'_>>,
     ) -> Vec<Event> {
         let element_id = self
             .element_id_of_instance(instance_key, child_eik)
@@ -12123,7 +12097,7 @@ impl Engine {
         if let Some(callee) = self.call_activity_child_of(child_eik) {
             events.extend(self.discard_instance_events(callee));
         }
-        if let Some(job_key) = self.active_job_on(child_eik) {
+        if let Some(job_key) = self.active_job_with(child_eik, teardown_idx) {
             events.push(Event::JobCanceled {
                 job_key,
                 instance_key,
@@ -12131,8 +12105,8 @@ impl Engine {
                 deadline: None, // stamped centrally in `emit` (#1440)
             });
         }
-        events.extend(self.cancel_all_timers_on(child_eik));
-        events.extend(self.cancel_all_subscriptions_on(child_eik));
+        events.extend(self.cancel_all_timers_with(child_eik, teardown_idx));
+        events.extend(self.cancel_all_subscriptions_with(child_eik, teardown_idx));
         // A human task parked on this element instance must be explicitly
         // cancelled: completing the element instance alone leaves its
         // `state.user_tasks` entry in `Created` (see `state::apply` — only
@@ -12144,11 +12118,8 @@ impl Engine {
         // index when one was built (the common cancel-remaining path), so an
         // N-child teardown is O(N) overall rather than scanning every retained
         // user task once per child (#1528 review).
-        let parked = match user_tasks_by_eik {
-            Some(index) => index
-                .get(&child_eik)
-                .and_then(|tasks| tasks.iter().find(|t| t.instance_key == instance_key))
-                .map(|t| t.key),
+        let parked = match teardown_idx {
+            Some(index) => index.first_created_user_task(child_eik),
             None => self
                 .state
                 .user_tasks
@@ -12181,7 +12152,7 @@ impl Engine {
         // A leaf child with no incident yields nothing here, so the behaviour is
         // byte-identical in the common case — mirrors the interrupting-boundary
         // teardown's body-root incident resolution.
-        events.extend(self.resolve_incidents_on(instance_key, child_eik));
+        events.extend(self.resolve_incidents_with(instance_key, child_eik, teardown_idx));
         // The child is CANCELLED (its completion condition's remaining instances,
         // an ad-hoc container torn down early), not completed: report it with
         // `ElementTerminating`/`ElementTerminated` — never
@@ -12212,7 +12183,7 @@ impl Engine {
         instance_key: Key,
         container_key: Key,
         child: Key,
-        user_tasks_by_eik: Option<&BTreeMap<Key, Vec<&state::UserTask>>>,
+        teardown_idx: Option<&boundary::TeardownIndex<'_>>,
     ) -> Vec<Event> {
         let mut events = Vec::new();
         // Is this active child itself a nested ad-hoc container (#631)? If so it
@@ -12243,10 +12214,10 @@ impl Engine {
                     instance_key,
                     child,
                     *grandchild,
-                    user_tasks_by_eik,
+                    teardown_idx,
                 ));
             }
-            if let Some(job_key) = self.active_job_on(child) {
+            if let Some(job_key) = self.active_job_with(child, teardown_idx) {
                 events.push(Event::JobCanceled {
                     job_key,
                     instance_key,
@@ -12254,8 +12225,8 @@ impl Engine {
                     deadline: None, // stamped centrally in `emit` (#1440)
                 });
             }
-            events.extend(self.cancel_all_timers_on(child));
-            events.extend(self.cancel_all_subscriptions_on(child));
+            events.extend(self.cancel_all_timers_with(child, teardown_idx));
+            events.extend(self.cancel_all_subscriptions_with(child, teardown_idx));
             // Resolve any incident parked on the nested container ROOT itself
             // (a failed agent job's `JobNoRetries`, an ioMapping failure) before
             // completing it — same root-incident gap as `cancel_mi_child_events`:
@@ -12267,7 +12238,7 @@ impl Engine {
             // terminal first, so the reducer's `Failed`-only resurrection guard
             // keeps it cancelled. Yields nothing when the container has no
             // incident, so the behaviour is byte-identical in the common case.
-            events.extend(self.resolve_incidents_on(instance_key, child));
+            events.extend(self.resolve_incidents_with(instance_key, child, teardown_idx));
             // The nested container is CANCELLED with its MI body, not completed:
             // terminate its element instance (#1535) rather than report it as
             // completed (#1528 review — same class as `cancel_mi_child_events`).
@@ -12291,7 +12262,7 @@ impl Engine {
             // Each nested scope level's teardown is itself nested inside its own
             // parent's pair (recursively), so a multi-level tool stays
             // depth-first (#1528 review).
-            events.extend(self.cancel_scope_tree_events(instance_key, child, user_tasks_by_eik));
+            events.extend(self.cancel_scope_tree_events(instance_key, child, teardown_idx));
         }
         // A `callActivity` tool (issue #1159) is a leaf in the ad-hoc scope tree
         // but drives a distinct CHILD PROCESS INSTANCE hanging off this tool
@@ -14277,14 +14248,13 @@ impl Engine {
             // own live tools down (each hangs off a dedicated inner instance)
             // before the child completes; a natural completion has none active.
             if cancel {
-                let user_tasks_by_eik = (!active.is_empty())
-                    .then(|| self.created_user_tasks_by_element_instance(instance_key));
+                let teardown_idx = (!active.is_empty()).then(|| self.teardown_index(instance_key));
                 for child in &active {
                     events.extend(self.cancel_adhoc_active_child(
                         instance_key,
                         container_key,
                         *child,
-                        user_tasks_by_eik.as_ref(),
+                        teardown_idx.as_ref(),
                     ));
                 }
                 // Resolve any incident parked on the CONTAINER itself (a failed
@@ -14340,14 +14310,13 @@ impl Engine {
         // descendants + agent job + ad-hoc state), which `cancel_adhoc_active_child`
         // handles — cancelling it as a leaf would orphan its internals.
         if cancel {
-            let user_tasks_by_eik = (!active.is_empty())
-                .then(|| self.created_user_tasks_by_element_instance(instance_key));
+            let teardown_idx = (!active.is_empty()).then(|| self.teardown_index(instance_key));
             for child in &active {
                 events.extend(self.cancel_adhoc_active_child(
                     instance_key,
                     container_key,
                     *child,
-                    user_tasks_by_eik.as_ref(),
+                    teardown_idx.as_ref(),
                 ));
             }
             // Resolve any incident parked on the CONTAINER itself (a failed

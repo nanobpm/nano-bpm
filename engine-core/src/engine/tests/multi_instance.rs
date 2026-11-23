@@ -2768,3 +2768,103 @@ fn queued_parallel_sibling_is_dropped_once_the_body_starts_completing() {
         ProcessInstanceState::Completed
     );
 }
+
+/// #1767: tearing down an MI body with N still-running children must scan the
+/// global resource maps (jobs, timers, subscriptions, incidents, user tasks) a
+/// CONSTANT number of times — via the shared per-teardown `TeardownIndex` —
+/// never once per child, which made early completion O(N × |resources|).
+/// Asserted for both leaf service-task children (jobs) and user-task children.
+#[test]
+fn early_multi_instance_teardown_scans_resource_maps_independently_of_child_count() {
+    fn scans_for(n: i64, user_task: bool) -> (usize, usize) {
+        let builder = ProcessBuilder::new("mi-scale").start_event("start");
+        let builder = if user_task {
+            builder.user_task("each")
+        } else {
+            builder.service_task("each", "work")
+        };
+        let def = builder
+            .with_multi_instance(
+                "each",
+                crate::model::MultiInstance {
+                    input_collection: "=items".to_string(),
+                    input_element: Some("item".to_string()),
+                    output_collection: None,
+                    output_element: None,
+                    completion_condition: Some("=true".to_string()),
+                    cancel_remaining_instances: true,
+                    sequential: false,
+                },
+            )
+            .end_event("done")
+            .connect("start", "each")
+            .connect("each", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "mi-scale",
+                vars(&[("items", Value::List((0..n).map(Value::Int).collect()))]),
+            ))
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let finish = if user_task {
+            let tasks: Vec<Key> = engine
+                .state()
+                .user_tasks
+                .values()
+                .filter(|t| t.state == state::UserTaskState::Created)
+                .map(|t| t.key)
+                .collect();
+            assert_eq!(tasks.len(), n as usize);
+            Command::CompleteUserTask {
+                user_task_key: tasks[0],
+                variables: Default::default(),
+            }
+        } else {
+            let jobs = engine.activate_jobs("work", "W", n as usize, 60_000, 0);
+            assert_eq!(jobs.len(), n as usize);
+            Command::complete_job(jobs[0].key)
+        };
+        engine.resource_scan_count.set(0);
+        engine.user_task_scan_count.set(0);
+        engine.apply_command(finish).unwrap();
+        assert!(
+            engine.instance(key).is_none()
+                || engine.instance(key).unwrap().multi_instances.is_empty(),
+            "the body completed early"
+        );
+        assert!(
+            engine
+                .state()
+                .jobs
+                .values()
+                .all(|j| j.state != state::JobState::Created
+                    && j.state != state::JobState::Activated),
+            "every sibling job is cancelled"
+        );
+        assert!(
+            engine
+                .state()
+                .user_tasks
+                .values()
+                .all(|t| t.state != state::UserTaskState::Created),
+            "every sibling user task is cancelled"
+        );
+        (
+            engine.resource_scan_count.get(),
+            engine.user_task_scan_count.get(),
+        )
+    }
+    for user_task in [false, true] {
+        let small = scans_for(4, user_task);
+        let large = scans_for(64, user_task);
+        assert_eq!(
+            small, large,
+            "teardown resource-map scans must not grow with child count \
+             (user_task={user_task}): N=4 {small:?} vs N=64 {large:?}"
+        );
+    }
+}
