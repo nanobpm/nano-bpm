@@ -205,9 +205,16 @@ pub fn envelope_schema(
     let mut stack = Vec::new();
     let obj = match resolver.find(shape_id) {
         Some(shape) => resolver.object(shape, &mut stack),
-        None => resolver
-            .external(shape_id)
-            .ok_or(SchemaError::UnresolvedEnvelope)?,
+        None => match resolver.external(shape_id, 0) {
+            Some(obj) => obj,
+            // A registry root that hit a limit is not "unresolved".
+            None => {
+                return Err(resolver
+                    .error
+                    .get()
+                    .unwrap_or(SchemaError::UnresolvedEnvelope));
+            }
+        },
     };
     if let Some(e) = resolver.error.get() {
         return Err(e);
@@ -339,8 +346,15 @@ impl<'a> Resolver<'a> {
 
     /// A registry type's object, charged against the byte budget; `None`
     /// when the registry does not know it (or a limit is hit).
-    fn external(&self, id: &str) -> Option<Obj> {
+    /// `depth` is the enclosing shape-reference nesting: a registry schema's
+    /// own nesting is checked (iteratively) against what is left of
+    /// [`MAX_DEPTH`] before any recursive sizing or copying.
+    fn external(&self, id: &str, depth: usize) -> Option<Obj> {
         let schema = self.registry.object_schema(id)?;
+        if schema_too_deep(&schema, MAX_DEPTH.saturating_sub(depth)) {
+            self.fail(SchemaError::TooDeep);
+            return None;
+        }
         if !self.charge(value_size(&schema)) {
             return None;
         }
@@ -370,7 +384,7 @@ impl<'a> Resolver<'a> {
         if self.error.get().is_some() {
             return None;
         }
-        let found = self.external(id);
+        let found = self.external(id, stack.len());
         if found.is_none() && self.error.get().is_none() {
             self.report(op, id);
         }
@@ -525,6 +539,26 @@ impl<'a> Resolver<'a> {
         stack.pop();
         obj
     }
+}
+
+/// Whether `v` nests deeper than `levels` shape levels. One shape level of
+/// an object schema is two JSON levels (`properties` → property schema),
+/// plus one for the root. Iterative, so it is safe on arbitrarily deep input.
+fn schema_too_deep(v: &Value, levels: usize) -> bool {
+    let limit = levels.saturating_mul(2).saturating_add(1);
+    let mut todo: Vec<(&Value, usize)> = vec![(v, 1)];
+    while let Some((v, d)) = todo.pop() {
+        let children: Box<dyn Iterator<Item = &Value>> = match v {
+            Value::Array(a) => Box::new(a.iter()),
+            Value::Object(m) => Box::new(m.values()),
+            _ => continue,
+        };
+        if d > limit {
+            return true;
+        }
+        todo.extend(children.map(|c| (c, d + 1)));
+    }
+    false
 }
 
 /// An estimate of a schema value's size in bytes (string and key lengths plus
@@ -940,6 +974,38 @@ mod tests {
             start_event_input_schema(&scan, "other", None, &()),
             Ok(None)
         );
+    }
+
+    /// Review of #1842: a registry schema deeper than MAX_DEPTH (as a root
+    /// or behind a shape ref) is TooDeep; an oversized registry root is
+    /// TooLarge, never misreported as UnresolvedEnvelope.
+    #[test]
+    fn registry_roots_and_refs_honour_depth_and_size_limits() {
+        let mut deep = json!({ "type": "string" });
+        for _ in 0..(MAX_DEPTH + 2) {
+            deep = json!({ "type": "object", "properties": { "x": deep } });
+        }
+        let root = |reg: &HashMap<String, Value>| {
+            start_event_input_schema(&crate::scan_bpmn(&doc("", ENVELOPE)), "start", None, reg)
+                .map(|o| o.map(|e| e.schema))
+        };
+        let reg = HashMap::from([("Order".to_string(), deep.clone())]);
+        assert_eq!(root(&reg), Err(("Order".into(), SchemaError::TooDeep)));
+        let xml = doc(
+            r#"<nano:shape id="Order"><nano:carry ref="Deep" /></nano:shape>"#,
+            ENVELOPE,
+        );
+        let reg = HashMap::from([("Deep".to_string(), deep)]);
+        assert_eq!(
+            start_event_input_schema(&crate::scan_bpmn(&xml), "start", None, &reg).map(|_| ()),
+            Err(("Order".into(), SchemaError::TooDeep))
+        );
+        let big = "x".repeat(MAX_EXPANDED_BYTES + 1);
+        let reg = HashMap::from([(
+            "Order".to_string(),
+            json!({ "type": "object", "properties": { big: { "type": "string" } } }),
+        )]);
+        assert_eq!(root(&reg), Err(("Order".into(), SchemaError::TooLarge)));
     }
 
     /// Issue #1748: an envelope ref the model does not declare (and no

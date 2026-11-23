@@ -594,8 +594,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
 
 /// Record a closed message / message-start carrier by element id (issue
 /// #1748): a message by its `id` with its own envelope, a start event with
-/// exactly one event definition that is a `messageEventDefinition` by its
-/// `id` and `messageRef`.
+/// a `messageEventDefinition` by its `id` and `messageRef`.
 fn record_ids(acc: &Accum, defs: &mut Vec<MessageDef>, starts: &mut Vec<MessageStart>) {
     let Some(id) = acc.elem_id.clone() else {
         return;
@@ -606,9 +605,9 @@ fn record_ids(acc: &Accum, defs: &mut Vec<MessageDef>, starts: &mut Vec<MessageS
             input_type: acc.input_type.clone(),
         }),
         Kind::Start => {
-            if acc.event_defs == 1
-                && let Some(message_ref) = acc.message_ref.clone()
-            {
+            // Keyed on `messageRef` alone, as the engine selects a message
+            // start: extra (vendor / inert) event definitions don't hide it.
+            if let Some(message_ref) = acc.message_ref.clone() {
                 starts.push(MessageStart {
                     element_id: id,
                     message_ref,
@@ -1500,6 +1499,29 @@ mod tests {
                 output_type: None,
             }]
         );
+    }
+
+    /// Review of #1842: extra (vendor or inert) event definitions beside a
+    /// `messageEventDefinition` do not hide the message start's envelope.
+    #[test]
+    fn message_start_with_extra_event_definitions_keeps_its_envelope() {
+        for extra in [
+            "<bpmn:terminateEventDefinition />",
+            "<zeebe:customEventDefinition />",
+        ] {
+            let body = format!(
+                "{}<bpmn:process id=\"p\">{}</bpmn:process>",
+                message("orderPlaced", IN_ORDER),
+                start_event(
+                    "s",
+                    &format!(
+                        "{extra}<bpmn:messageEventDefinition messageRef=\"Msg_orderPlaced\" />"
+                    ),
+                ),
+            );
+            let scan = scan_bpmn(&defs(&body));
+            assert_eq!(scan.start_message_envelope("s"), Some("Order"), "{extra}");
+        }
     }
 
     #[test]
