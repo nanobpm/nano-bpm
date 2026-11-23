@@ -30914,14 +30914,26 @@ mod snapshot_health_tick_tests {
         // samples and return. Awaiting the loop's return is the deterministic
         // completion signal — every tick's effects (including the actor
         // quarantine query) have landed by then.
+        // Count threshold reads: the loop reads them exactly once per sample,
+        // so the count proves one sample per tick (the gauges alone would be
+        // overwritten identically by extra or missing samples).
+        let samples = std::sync::atomic::AtomicUsize::new(0);
         storage_usage_sampler_loop(
             Arc::clone(&recovery.shared),
             std::slice::from_ref(&handle).to_vec(),
             &h,
-            || tiny_budget.clone(),
+            || {
+                samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tiny_budget.clone()
+            },
             futures_util::stream::iter([(), (), ()]),
         )
         .await;
+        assert_eq!(
+            samples.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "exactly one sample per injected tick"
+        );
 
         let r = h.report(Instant::now(), &tiny_budget);
         assert!(r.uncompacted_bytes > 1, "tick sampled the backlog: {r:?}");
@@ -30973,10 +30985,19 @@ mod snapshot_health_tick_tests {
         // — has fully landed. The stream below flips `landed` on that re-poll;
         // the test awaits it instead of sleeping or racing the actor mailbox.
         let landed = Arc::new(tokio::sync::Notify::new());
+        // Signalled on the stream's FIRST poll: the loop has reached its tick
+        // wait, so any sample-before-tick regression would already have run.
+        let first_poll = Arc::new(tokio::sync::Notify::new());
         let ticks = {
             let landed = Arc::clone(&landed);
+            let first_poll = Arc::clone(&first_poll);
             let mut yielded = false;
+            let mut polled = false;
             futures_util::stream::poll_fn(move |cx| {
+                if !polled {
+                    polled = true;
+                    first_poll.notify_one();
+                }
                 if yielded {
                     yielded = false;
                     landed.notify_one();
@@ -31007,10 +31028,10 @@ mod snapshot_health_tick_tests {
             }
         });
 
-        // No tick sent: the sampler is parked on the channel. The assertion is
-        // the robust direction — the gauges MUST still be unset (any spurious
-        // sample would set them), however the scheduler interleaves.
-        tokio::task::yield_now().await;
+        // No tick sent: wait until the sampler has polled the (empty) tick
+        // stream, so it has provably reached its tick wait; the gauges MUST
+        // still be unset (any sample before the first tick would set them).
+        first_poll.notified().await;
         let r = h.report(Instant::now(), &tiny_budget);
         assert_eq!(r.uncompacted_bytes, 0, "no tick, no sample: {r:?}");
 
