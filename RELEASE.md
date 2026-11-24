@@ -1,13 +1,12 @@
 # Releasing nano-bpm
 
-This repo ships **four independent release trains**, each with its own tag scheme, workflow, and destination. Cutting a "complete" release means tagging every bumped train from the same merged commit on `main` with `make release-tags` (below). The script derives each tag from its train's version source and pushes **one tag per `git push`**.
+This repo ships **three release trains**, each with its own tag scheme, workflow, and destination. Cutting a "complete" release means tagging every bumped train from the same merged commit on `main` with `make release-tags` (below). The script derives each tag from its train's version source and pushes **one tag per `git push`**.
 
 | # | Product | Tag | Workflow | Destination |
 |---|---------|-----|----------|-------------|
-| 1 | Nano gateway (`nanobpm-gateway-rest-server`) + ProcessOS binaries | `v*` | `publish-c8ctl-binaries.yml`, `publish-processos-binaries.yml` | Gateway: the rolling `binaries` release of `jwulf/c8ctl-plugin-nano`, which then cuts its own plugin release. ProcessOS: this repo's `v*` release. Both: S3 mirror |
+| 1 | Nano gateway (`nanobpm-gateway-rest-server`) + ProcessOS binaries + `@nanobpm/engine-wasm` (in-browser engine, same version) | `v*` | `publish-c8ctl-binaries.yml`, `publish-processos-binaries.yml`, `release-bojtos-npm.yml` | Gateway: the rolling `binaries` release of `jwulf/c8ctl-plugin-nano`, which then cuts its own plugin release. ProcessOS: this repo's `v*` release. Both: S3 mirror. engine-wasm: npmjs.com (see [`docs/releasing-bojtos-npm.md`](docs/releasing-bojtos-npm.md)) |
 | 2 | `@nanobpm/nano-bernd` (embedded engine, npm) | `nano-bernd-npm-v*` | `release-nano-bernd-npm.yml` | npmjs.com |
 | 3 | `io.github.jwulf:nano-bernd` (embedded engine, JVM) | `nano-bernd-jvm-v*` | `release-nano-bernd-jvm.yml` | Maven Central |
-| 4 | `@nanobpm/engine-wasm` (in-browser engine, consumed by Bojtos) | `bojtos-npm-v*` | `release-bojtos-npm.yml` | npmjs.com (see [`docs/releasing-bojtos-npm.md`](docs/releasing-bojtos-npm.md)) |
 
 The train table lives in code: `TRAINS` in [`scripts/release-tags.mjs`](scripts/release-tags.mjs). Its tests fail CI if a workflow's tag trigger drifts from it, or if a new tag-triggered release workflow isn't registered.
 
@@ -26,7 +25,7 @@ The trains share one `nano_engine` codebase (compiled to native for #1, wasm for
   - **Patch**: host-side fixes with the same ABI.
 - The two `nano-bernd` packages (npm + JVM) **always share a version** — they're two hosts wrapping the same wasm blob. Never release one without the other.
 
-- **engine-wasm** (`bojtos-npm-v*`) has its own SemVer. CI's `engine-wasm (release drift guard)` fails once `engine-core` changes after the last `bojtos-npm-v*` tag unless a bump is pending. A change to its JS/DTO surface (for example a renamed field) is breaking, so it gets a minor bump while the version is 0.x.
+- **engine-wasm** shares the gateway version (#1871): `server vX.Y.Z` ⇔ `@nanobpm/engine-wasm X.Y.Z`, published from the same `v*` tag. Its version is stamped from `server/Cargo.toml` at build time; `engine-wasm/pkg.package.json` carries none. A running server reports it as `nano.engineWasmVersion` in `GET /v2/topology`.
 
 The versions are independent — bumping one does not require bumping another.
 
@@ -46,10 +45,9 @@ Do this from a clean `main` after all release-worthy PRs have merged.
 
 ### 1. Bump versions in a single PR
 
-- **Gateway/ProcessOS**: bump the workspace/`server/Cargo.toml` (and `processos/Cargo.toml`) `version = "…"` fields.
+- **Gateway/ProcessOS**: bump the workspace/`server/Cargo.toml` (and `processos/Cargo.toml`) `version = "…"` fields. This is also the `@nanobpm/engine-wasm` version (#1871); refresh `console/package-lock.json`'s recorded `../engine-wasm/pkg` version with `make console-wasm && (cd console && npm install)`.
 - **nano-bernd npm**: bump `clients/nano-bernd/package.json` `"version"`, then run `npm install` in that directory so `package-lock.json` stays in sync.
 - **nano-bernd JVM**: bump `clients/nano-bernd-jvm/pom.xml` `<version>`.
-- **engine-wasm**: bump `engine-wasm/pkg.package.json` `"version"`, that template is the only version source (`engine-wasm/pkg/` is a gitignored build output; the release workflow builds it from the tag and checks the built version matches).
 
 If the FFI ABI changed on this train, also update `EXPECTED_ABI_VERSION` in `clients/nano-bernd/src/index.ts` and `EmbeddedEngine.EXPECTED_ABI_VERSION` in `clients/nano-bernd-jvm/src/main/java/io/github/jwulf/nano/bernd/EmbeddedEngine.java`, and bump `ABI_VERSION` in `engine-core/scripts/emit-dist.mjs` + `engine-core/scripts/verify-wasm-ffi.mjs`. CI enforces the match.
 
@@ -65,7 +63,7 @@ and paste the operator-facing warning from the "Release-note line" in
 changelog is generated from commit subjects and does not carry it. A release
 with an unpublished boundary warning must not be distributed.
 
-Open a PR titled e.g. `chore(release): gateway v0.0.24 + nano-bernd 0.3.0 + engine-wasm 0.10.0`, converge review, merge.
+Open a PR titled e.g. `chore(release): gateway v0.0.24 + nano-bernd 0.3.0`, converge review, merge.
 
 ### 1a. Call out every determinism upgrade boundary in the release notes
 
@@ -126,7 +124,7 @@ make release-tags PUSH=1   # tag HEAD and push each NEW tag, one push per tag
 
 The script (`scripts/release-tags.mjs`):
 
-- **Derives** each tag from the train's version source, so a tag can't disagree with the version it publishes. It refuses to run if the nano-bernd npm and JVM versions differ, or if the engine-wasm template and built versions differ.
+- **Derives** each tag from the train's version source, so a tag can't disagree with the version it publishes. It refuses to run if the nano-bernd npm and JVM versions differ.
 - **Only cuts trains whose version isn't already tagged on the remote.** Trains you didn't bump are skipped.
 - **Requires** a clean tree whose `HEAD` is `origin/main`.
 - **Pushes each tag in its own `git push`.** Never batch release tags: **GitHub creates no push events when more than three tags are pushed at once**, so every workflow is silently skipped. v0.0.24 pushed four tags in one push and nothing ran (#1289).
@@ -211,9 +209,9 @@ Typical durations:
 
 ## Releasing only some trains
 
-`make release-tags` cuts only the trains whose version is bumped and not yet tagged, so a partial release needs no special handling. Just bump what you're releasing. To restrict explicitly, run `node scripts/release-tags.mjs --only engine-wasm,gateway --push`. Selecting just one nano-bernd host is rejected: name both or neither. `make release-engine-wasm` is shorthand for `--only engine-wasm --push`.
+`make release-tags` cuts only the trains whose version is bumped and not yet tagged, so a partial release needs no special handling. Just bump what you're releasing. To restrict explicitly, run `node scripts/release-tags.mjs --only gateway --push` (this also publishes `@nanobpm/engine-wasm`). Selecting just one nano-bernd host is rejected: name both or neither.
 
-- Engine bugfix that affects the gateway only → bump the gateway only. If `engine-core` changed, CI also requires an engine-wasm bump.
+- Engine bugfix → bump the gateway; `@nanobpm/engine-wasm` releases with it at the same version.
 - Host-side fix in `EmbeddedEngine` (either language) → bump the nano-bernd patch version in **both** hosts. They must stay in sync, and the script refuses to run if they differ.
 - FFI-only change with no host update → bump nano-bernd minor and release every train (the gateway also embeds the FFI code path via the console feature).
 

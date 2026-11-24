@@ -64,6 +64,11 @@ crate-type = ["lib", "cdylib"]
 name = "feel_diff"
 test = true
 
+# On-actor snapshot-clone profile (issue #50); needs serde for Engine::snapshot().
+[[example]]
+name = "snapshot_clone"
+required-features = ["serde"]
+
 [lints.rust]
 # Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
 # warning (unused code, deprecations, future-incompat lints, linker_messages,

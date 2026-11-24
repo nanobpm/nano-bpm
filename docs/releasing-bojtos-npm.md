@@ -7,7 +7,7 @@ the Rust in-browser engine — to npm.
 > `@nanobpm/bojtos-react` were extracted to the standalone public repo
 > [`nanobpm/bojtos`](https://github.com/nanobpm/bojtos) and are published from
 > there (see that repo's `docs/releasing.md`). They consume `@nanobpm/engine-wasm`
-> from npm. This repo only publishes `engine-wasm`, whose source lives here
+> from npm (the console overrides that to its same-commit build). This repo only publishes `engine-wasm`, whose source lives here
 > (built from the Rust engine via `make console-wasm`).
 
 ## How it works
@@ -37,61 +37,58 @@ Actions**:
 
 After that, tagged releases publish automatically with no secret.
 
-## Cutting a release
+## One engine version (#1871)
 
-1. Bump the version in `engine-wasm/pkg.package.json` (the source of truth for
-   `@nanobpm/engine-wasm`; `make console-wasm` copies it into the gitignored
-   build output `engine-wasm/pkg/package.json`, which is never committed).
-2. Commit, open a PR, merge to `main`.
-3. Tag from `main` and push with the helper. It is a thin wrapper over the
-   canonical `scripts/release-tags.mjs` (see [`RELEASE.md`](../RELEASE.md)). It
-   reads the version from the template, checks that the tag is new on the
-   remote, and that `HEAD` is a clean `origin/main`. It then tags, pushes the tag
-   on its own, and confirms `release-bojtos-npm` started:
-   ```bash
-   make release-engine-wasm
-   ```
-   When cutting several trains together, use `make release-tags PUSH=1` instead.
-   Never push release tags in one batch: GitHub skips workflows for pushes of
-   more than three tags.
-4. The `release-bojtos-npm` workflow builds the wasm from source, verifies the
-   tag matches the package version, and publishes via OIDC.
-5. Verify on npmjs.com:
-   - <https://www.npmjs.com/package/@nanobpm/engine-wasm>
+`server vX.Y.Z` ⇔ `@nanobpm/engine-wasm X.Y.Z`. There is no separate
+engine-wasm version or tag train:
 
-## Guardrails (so a stale engine-wasm can't ship silently)
+- **Version.** `engine-wasm/pkg.package.json` carries no `version`.
+  `make console-wasm` stamps it from `server/Cargo.toml`
+  (`engine-wasm/scripts/stamp-pkg.mjs`) and records the build commit in
+  `pkg/build-info.json` (exported as `@nanobpm/engine-wasm/build-info`).
+- **Release.** Every gateway release tag `vX.Y.Z` triggers
+  `release-bojtos-npm.yml` (the filename is kept: it is the npm Trusted
+  Publisher). It builds the package from the tag, checks the stamped version
+  equals the tag and the build commit equals the tagged commit
+  (`scripts/engine-parity.mjs`), and publishes via OIDC. The old
+  `bojtos-npm-v*` tags (last: `bojtos-npm-v0.11.2`) are retired.
+- **Console.** The console depends on `file:../engine-wasm/pkg`, the build of
+  its own commit, never an npm range. Its bundle records the embedded engine as
+  `dist/engine-wasm.json`, which the gateway release checks against the server.
+- **Discovery.** A running server reports its engine as
+  `nano.engineWasmVersion` in `GET /v2/topology`; pin `@nanobpm/engine-wasm` to
+  exactly that version to test against the engine it runs.
 
-`@nanobpm/engine-wasm` is just a wasm build of `engine-core`, published *only* on
-a hand-pushed `bojtos-npm-v*` tag. Two independent drift modes are guarded in CI
-so neither can slip through unnoticed:
+So cutting a release is just the gateway release in [`RELEASE.md`](../RELEASE.md):
+bump `server/Cargo.toml`, merge, `make release-tags PUSH=1`. Verify with
+<https://www.npmjs.com/package/@nanobpm/engine-wasm>.
 
-- **Staleness (engine changed, wasm not republished).** The
-  `engine-wasm (release drift guard)` CI job fails a build when any wasm input
-  — `engine-core/**`, `engine-wasm/src/**`, `engine-wasm/Cargo.toml`,
-  `engine-wasm/Cargo.lock` or `engine-wasm/pkg.package.json` — has changed since
-  the last `bojtos-npm-v*` tag but the version hasn't been bumped past it
-  (`Cargo.toml`/`Cargo.lock` count because a dependency or feature change alters
-  the produced wasm without touching `engine-core` or `engine-wasm/src`). In
-  other words: once the engine moves, an *unreleased* version bump
-  must always be pending — the pending `pkg.package.json` version must be
-  **strictly greater** than the last published `bojtos-npm-v*` tag (a patch bump
-  like `0.3.0 → 0.3.1` is enough; the guard compares with `sort -V`, so any
-  higher version passes). The **first** engine change after a release must cross
-  that threshold; later changes pass until that version is actually tagged and
-  released, after which they must bump again. Cut the pending release with
-  `make release-engine-wasm`.
+> **Versioning note.** The first release under this scheme publishes
+> `0.0.x` (the gateway's version) after the retired train's `0.11.2`. npm moves
+> the `latest` dist-tag to the newest *publish*, so `latest` points at the
+> gateway-versioned release; consumers on a `^0.11` range stay on 0.11.x until
+> they pin the server's version.
+
+## Guardrails
+
+- **Staleness / skew (engine changed, wasm not republished or not embedded).**
+  Impossible by construction: every server release publishes the engine at the
+  same version from the same tag, and the console embeds the same-commit build.
+  CI guards it: `scripts/engine-parity.mjs` runs on the CI-built package
+  (`engine-wasm-ffi (dist + verify)`), on the console's installed package
+  (`console (typecheck + test)`), on the release console bundle
+  (`publish-c8ctl-binaries.yml`) and on the published package
+  (`release-bojtos-npm.yml`), failing if version or commit differ from the
+  server's.
 
 - **Surface gap (engine gained a capability the wrapper doesn't expose).** A
-  package bump can't catch a *new* `engine-core` `Command` that should be
+  version match can't catch a *new* `engine-core` `Command` that should be
   surfaced through the `TestEngine` wasm facade but isn't — the wasm still
   compiles. `engine-wasm/src/surface_parity.rs` closes this with an exhaustive,
   wildcard-free `match` over every `Command` variant: adding a variant in
   `engine-core` makes the match non-exhaustive and **fails the `wasm32`
   type-check** (`make engine-wasm-check`, run in the `engine-wasm-ffi` CI job)
   until an author consciously surfaces it or records why it's excluded.
-
-> **New required checks:** consider adding `engine-wasm (release drift guard)` to
-> branch protection so the staleness guard is merge-blocking, not just advisory.
 
 ## Manual dry-run (local, no publish)
 

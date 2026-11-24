@@ -135,6 +135,8 @@ nano-server-storage = { path = "crates/nano-server-storage", features = ["test-h
 nano-server-raft = { path = "crates/nano-server-raft", features = ["test-hooks"] }
 # The #1702 mixed-version join tests override the advertised handshake version.
 nano-falcon-protocol = { path = "crates/nano-falcon-protocol", features = ["test-hooks"] }
+# Paused (fake) time for the #1866 background re-drive tests.
+tokio = { version = "1", features = ["test-util"] }
 
 # The self-contained single-node distribution: bundle the web console (cluster
 # console, BPMN modeler, process-instance explorer, embedded workers) into the

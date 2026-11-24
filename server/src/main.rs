@@ -22,10 +22,13 @@ mod optional_body_guard;
 #[cfg(feature = "console")]
 mod provisioning;
 mod publication_gate;
+#[cfg(test)]
+mod publication_gate_retry_after_tests;
 mod query;
 #[cfg(test)]
 mod request_field_guard;
 mod response_contract;
+mod retry_after;
 mod secrets;
 mod stub_impls;
 
@@ -2959,6 +2962,16 @@ enum RoutedApply {
     Failed(u16, String),
 }
 
+/// Why [`ServerImpl::route_with_redrive`] did not deliver a follow-up (#1866).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteFailure {
+    /// Permanently rejected (a 4xx): never re-driven.
+    Rejected,
+    /// The bounded re-drive ran out of attempts on transient failures: an
+    /// open is handed to the unbounded background re-drive.
+    Exhausted,
+}
+
 /// Classified outcome of ONE delivery attempt of a routed cross-partition
 /// follow-up (#1582) — the decision [`ServerImpl::route_with_redrive`] retries on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3862,6 +3875,15 @@ pub struct ServerImpl {
     /// waiting out the full production re-drive budget.
     #[cfg(test)]
     publication_gate_deadline_override: Arc<std::sync::Mutex<Option<std::time::Duration>>>,
+    /// Undelivered cross-partition subscription opens awaiting the
+    /// background re-drive (#1866, see [`ServerImpl::spawn_failed_open_redrive`]).
+    failed_opens: publication_gate::FailedOpens,
+    /// Test-only fault injection (#1866): panics the routing pump task.
+    #[cfg(test)]
+    fail_routing_pump_for_test: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only: panic the pump right after an apply produced follow-ups.
+    #[cfg(test)]
+    fail_routing_cascade_for_test: Arc<std::sync::atomic::AtomicBool>,
     /// Per-partition lock serializing a core REBUILD (promote / rebuild-as-receiver /
     /// shutdown auto-recovery): the old core is fully shut down and awaited, then the
     /// new core is constructed and registered, all under the partition's lock. Without
@@ -4511,6 +4533,11 @@ impl ServerImpl {
             publication_gate,
             #[cfg(test)]
             publication_gate_deadline_override: Arc::new(std::sync::Mutex::new(None)),
+            failed_opens: publication_gate::FailedOpens::default(),
+            #[cfg(test)]
+            fail_routing_pump_for_test: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_routing_cascade_for_test: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             partition_rebuild_locks: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -4530,9 +4557,12 @@ impl ServerImpl {
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 let srv = server.clone();
                 rt.spawn(async move {
-                    srv.drive_subscription_routing(recovered_pending_opens, None)
+                    let routed = srv
+                        .drive_subscription_routing(recovered_pending_opens, None)
                         .await;
-                    drop(recovered_gate_guard);
+                    if let Some(guard) = recovered_gate_guard {
+                        guard.settle(routed);
+                    }
                 });
             } else {
                 tracing::warn!(
@@ -11008,6 +11038,11 @@ impl ServerImpl {
             nano: Some(models::NanoEngineInfo {
                 engine: "nanobpmn".to_string(),
                 version: Some(version),
+                // One engine version (#1871): `@nanobpm/engine-wasm` is stamped
+                // with this crate's server/Cargo.toml version and published from
+                // the same `v*` tag, so this names the exact wasm build of the
+                // engine this server runs.
+                engine_wasm_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 falcon_path: "/falcon".to_string(),
             }),
         };
@@ -11248,7 +11283,10 @@ impl ServerImpl {
         // the open is STILL pending at the deadline (e.g. the serial routing
         // pump is stalled on another target), fail closed with a retryable
         // error rather than applying unmatched and silently losing the message.
-        if self
+        // If the open's routing pump FAILED (#1866) the publish proceeds as
+        // today — unmatched it is dropped, a correlate returns not-found —
+        // while the open is re-driven in the background (`failed_opens`).
+        match self
             .publication_gate
             .wait(
                 &name,
@@ -11256,9 +11294,18 @@ impl ServerImpl {
                 self.effective_publication_gate_deadline(),
             )
             .await
-            == publication_gate::GateWait::TimedOut
         {
-            return Err(CorrelateError::SubscriptionOpenPending);
+            publication_gate::GateWait::TimedOut => {
+                return Err(CorrelateError::SubscriptionOpenPending);
+            }
+            publication_gate::GateWait::Failed => {
+                tracing::debug!(
+                    message_name = %name,
+                    "publication gate released by a failed subscription open; \
+                     the open is re-driven in the background"
+                );
+            }
+            publication_gate::GateWait::Clear | publication_gate::GateWait::Released => {}
         }
         let engine_vars: std::collections::BTreeMap<String, Value> = variables
             .as_ref()
@@ -11554,11 +11601,13 @@ impl ServerImpl {
             let pending = self.publication_gate.register(&routable);
             self.signal_jobs_available();
             answer();
-            if !routable.is_empty() {
-                self.drive_subscription_routing(routable, operation_reference)
+            let routed = routable.is_empty()
+                || self
+                    .drive_subscription_routing(routable, operation_reference)
                     .await;
+            if let Some(pending) = pending {
+                pending.settle(routed);
             }
-            drop(pending);
         } else {
             if !routable.is_empty() {
                 self.drive_subscription_routing(routable, operation_reference)
@@ -11589,23 +11638,83 @@ impl ServerImpl {
     /// stamped on every record each routed command produces, on every partition
     /// it routes to, and carried onward on any follow-ups those records route
     /// in turn — so a caller's reference reaches the whole routed cascade.
+    ///
+    /// Returns whether every routed follow-up was delivered (#1866): `false`
+    /// when the pump task failed (panicked) or a delivery was rejected or ran
+    /// out of re-drive attempts, so a publication-gate owner can release its
+    /// opens as failed rather than routed. Every keyed
+    /// `MessageSubscriptionOpening` left undelivered by a failed pump or an
+    /// exhausted (transient) re-drive is recorded in `failed_opens` for the
+    /// unbounded background re-drive; a permanently rejected (4xx) one is
+    /// not, since retrying cannot help.
     async fn drive_subscription_routing(
         &self,
         events: Vec<Event>,
         operation_reference: Option<i64>,
-    ) {
+    ) -> bool {
         if self.engine.topology().num_partitions <= 1 {
-            return;
+            return true;
         }
+        // Supervision — including recording what stays undelivered — runs in
+        // its own detached task, so a caller that stops awaiting (a dropped
+        // request future) only stops observing: the failure is still recorded
+        // for the background re-drive.
         let server = self.clone();
-        let pump = tokio::spawn(async move {
+        let supervisor = tokio::spawn(async move {
             server
-                .drive_subscription_routing_now(events, operation_reference)
+                .supervise_subscription_routing(events, operation_reference)
                 .await
         });
-        if let Err(e) = pump.await {
-            tracing::warn!("subscription routing pump task failed: {e}");
+        supervisor.await.unwrap_or_else(|e| {
+            tracing::warn!("subscription routing supervisor task failed: {e}");
+            false
+        })
+    }
+
+    /// The detached supervisor behind [`Self::drive_subscription_routing`]:
+    /// runs the pump in its own task and records every open/close the pump
+    /// still owned when it ended (exhausted, or lost to a panic mid-cascade)
+    /// in `failed_opens`. Returns whether everything was delivered.
+    async fn supervise_subscription_routing(
+        &self,
+        events: Vec<Event>,
+        operation_reference: Option<i64>,
+    ) -> bool {
+        let owned: Arc<std::sync::Mutex<Vec<Event>>> = Arc::default();
+        let claimed: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+        let server = self.clone();
+        let pump_owned = owned.clone();
+        let pump_claimed = claimed.clone();
+        let pump = tokio::spawn(async move {
+            server
+                .drive_subscription_routing_now(
+                    events,
+                    operation_reference,
+                    &pump_owned,
+                    &pump_claimed,
+                )
+                .await
+        });
+        let delivered = match pump.await {
+            Ok(delivered) => delivered,
+            Err(e) => {
+                tracing::warn!("subscription routing pump task failed: {e}");
+                false
+            }
+        };
+        let undelivered = std::mem::take(&mut *owned.lock().unwrap_or_else(|e| e.into_inner()));
+        // Record BEFORE releasing the claims: a close routed while the pump
+        // owned an open has marked it superseded, and `record` drops it.
+        let recorded = self.failed_opens.record(&undelivered, operation_reference);
+        let claimed = std::mem::take(&mut *claimed.lock().unwrap_or_else(|e| e.into_inner()));
+        self.failed_opens.release(&claimed);
+        if recorded > 0 {
+            tracing::warn!(
+                count = recorded,
+                "undelivered subscription opens queued for background re-drive"
+            );
         }
+        delivered
     }
 
     /// Routes follow-ups of a routed apply that committed AFTER its observer
@@ -11621,28 +11730,142 @@ impl ServerImpl {
         Box::pin(async move {
             server
                 .drive_subscription_routing(events, operation_reference)
-                .await
+                .await;
         })
     }
 
     /// The routing pump body behind [`Self::drive_subscription_routing`]; only
-    /// ever run inside that detached task.
+    /// ever run inside that detached task. Every subscription open/close takes
+    /// recovery ownership in `owned` as it enters the work list (initial or
+    /// produced mid-cascade) and gives it up only once delivered or
+    /// permanently rejected, so whatever is left when the pump ends — by
+    /// exhaustion or by a panic at any point — is what the supervisor records.
     async fn drive_subscription_routing_now(
         &self,
         events: Vec<Event>,
         operation_reference: Option<i64>,
-    ) {
+        owned: &std::sync::Mutex<Vec<Event>>,
+        claimed: &std::sync::Mutex<Vec<u64>>,
+    ) -> bool {
+        let take_ownership = |events: &[Event]| {
+            let keys = self.failed_opens.claim(events);
+            claimed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(keys);
+            owned.lock().unwrap_or_else(|e| e.into_inner()).extend(
+                events
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            Event::MessageSubscriptionOpening { .. }
+                                | Event::MessageSubscriptionClosing { .. }
+                        )
+                    })
+                    .cloned(),
+            );
+        };
+        let release = |event: &Event| {
+            let mut owned = owned.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = owned.iter().position(|e| e == event) {
+                owned.swap_remove(i);
+            }
+        };
+        take_ownership(&events);
+        #[cfg(test)]
+        if self
+            .fail_routing_pump_for_test
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("injected subscription routing pump failure (test)");
+        }
         let num_partitions = self.engine.topology().num_partitions;
         let mut work = events;
+        let mut all_delivered = true;
         while let Some(event) = work.pop() {
             let Some((target, command)) = Self::route_event(&event, num_partitions) else {
                 continue;
             };
-            work.extend(
-                self.route_with_redrive(target, command, event, operation_reference)
-                    .await,
-            );
+            self.failed_opens.note_routing(&event);
+            match self
+                .route_with_redrive(target, command, event.clone(), operation_reference)
+                .await
+            {
+                Ok(produced) => {
+                    take_ownership(&produced);
+                    #[cfg(test)]
+                    if !produced.is_empty()
+                        && self
+                            .fail_routing_cascade_for_test
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        panic!("injected mid-cascade routing pump failure (test)");
+                    }
+                    release(&event);
+                    work.extend(produced);
+                }
+                Err(RouteFailure::Rejected) => {
+                    all_delivered = false;
+                    release(&event);
+                }
+                Err(RouteFailure::Exhausted) => all_delivered = false,
+            }
         }
+        all_delivered
+    }
+
+    /// One pass of the background re-drive (#1866): routes again every
+    /// undelivered open/close pending at least
+    /// [`publication_gate::FAILED_OPEN_REDRIVE_AGE`]. One that fails again is
+    /// re-recorded by the pump, so attempts are unbounded. Entries are grouped
+    /// by target partition and the groups run concurrently (serial within a
+    /// group), so a stalled partition's backlog never delays a healthy one.
+    async fn redrive_failed_opens(&self) {
+        let num_partitions = self.engine.topology().num_partitions;
+        let mut by_target: std::collections::BTreeMap<u64, Vec<(Event, Option<i64>)>> =
+            std::collections::BTreeMap::new();
+        for (event, operation_reference) in self.failed_opens.take_due() {
+            let target = Self::route_event(&event, num_partitions).map_or(0, |(t, _)| t);
+            by_target
+                .entry(target)
+                .or_default()
+                .push((event, operation_reference));
+        }
+        let groups = by_target.into_values().map(|group| {
+            let server = self.clone();
+            tokio::spawn(async move {
+                for (event, operation_reference) in group {
+                    server
+                        .drive_subscription_routing(vec![event.clone()], operation_reference)
+                        .await;
+                    server.failed_opens.finish(&event);
+                }
+            })
+        });
+        let groups: Vec<_> = groups.collect();
+        for group in groups {
+            if let Err(e) = group.await {
+                tracing::warn!("failed-open re-drive group failed: {e}");
+            }
+        }
+    }
+
+    /// Spawns the Zeebe-style background re-drive of failed subscription opens
+    /// (cf. `PendingMessageSubscriptionChecker`): every
+    /// [`publication_gate::FAILED_OPEN_REDRIVE_INTERVAL`].
+    fn spawn_failed_open_redrive(&self) -> tokio::task::JoinHandle<()> {
+        let server = self.clone();
+        // Anchor the schedule at the spawn call, not at the task's first poll.
+        let interval = publication_gate::FAILED_OPEN_REDRIVE_INTERVAL;
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        tokio::spawn(async move {
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                server.redrive_failed_opens().await;
+            }
+        })
     }
 
     /// Delivers one routed follow-up to partition `target` with a **bounded
@@ -11662,7 +11885,7 @@ impl ServerImpl {
         command: Command,
         event: Event,
         operation_reference: Option<i64>,
-    ) -> Vec<Event> {
+    ) -> Result<Vec<Event>, RouteFailure> {
         let mut last = String::new();
         // An unkeyed (zero / legacy) routed command has no dedup, so a retry
         // after an ambiguous outcome could apply it twice: deliver it at most
@@ -11677,7 +11900,7 @@ impl ServerImpl {
                 .apply_routed_command(target, command.clone(), operation_reference)
                 .await
             {
-                RoutedApply::Applied(produced) => return produced,
+                RoutedApply::Applied(produced) => return Ok(produced),
                 RoutedApply::Failed(status, message) => RouteAttempt::from_status(status, message),
                 // Led by a peer (or a leadership gap): forward to the current
                 // writer, re-resolved on every attempt.
@@ -11687,12 +11910,12 @@ impl ServerImpl {
                 }
             };
             match outcome {
-                RouteAttempt::Delivered => return Vec::new(),
+                RouteAttempt::Delivered => return Ok(Vec::new()),
                 RouteAttempt::Rejected(status, message) => {
                     tracing::warn!(
                         "subscription routing on partition {target} rejected ({status}): {message}"
                     );
-                    return Vec::new();
+                    return Err(RouteFailure::Rejected);
                 }
                 RouteAttempt::Transient(reason) => last = reason,
             }
@@ -11700,7 +11923,7 @@ impl ServerImpl {
         tracing::warn!(
             "subscription routing on partition {target} not delivered after {max_attempts} attempts: {last}"
         );
-        Vec::new()
+        Err(RouteFailure::Exhausted)
     }
 
     /// How many delivery attempts the re-drive may make for `command`: the
@@ -32732,6 +32955,9 @@ async fn main() {
     let snapshot_blockers_srv = server.clone();
     let snapshot_blocker_cancel_srv = server.clone();
 
+    // Background re-drive of failed cross-partition subscription opens (#1866).
+    let _failed_open_redrive = server.spawn_failed_open_redrive();
+
     // Raft partition-liveness supervisor. An openraft core can enter `Shutdown`
     // (e.g. on an unrecoverable storage error) and then silently stop applying,
     // stranding that partition's share of instances/jobs — the mechanism behind
@@ -32901,6 +33127,10 @@ async fn main() {
     // deliberately outside its scope. Off/lenient/strict via
     // NANOBPM_RESPONSE_VALIDATION (default: strict).
     app = app.layer(axum::middleware::from_fn(response_contract::guard));
+    // Retry-After on every 503 lacking one (#1869): the generated 503 variants
+    // carry no headers, so the publication-gate 503s (#1604/#1866) and the
+    // rest of the class would otherwise give clients no retry hint.
+    app = retry_after::layer(app);
 
     // disabled it 404s, removing the endpoint from the attack surface. Computed
     // on scrape, so it costs nothing at steady state.
@@ -43857,6 +44087,15 @@ mod clustered_startup_tests {
             nano.version.is_some(),
             "nano advertises the gateway version"
         );
+        // #1871: the matching `@nanobpm/engine-wasm` npm version is the version
+        // engine-wasm/scripts/stamp-pkg.mjs stamps — server/Cargo.toml's — so a
+        // downstream app can pin exactly the engine this server runs.
+        let cargo_version = include_str!("../Cargo.toml")
+            .lines()
+            .find_map(|l| l.strip_prefix("version = \""))
+            .and_then(|v| v.strip_suffix('"'))
+            .expect("server/Cargo.toml [package] version");
+        assert_eq!(nano.engine_wasm_version.as_deref(), Some(cargo_version));
     }
 
     #[tokio::test]
@@ -54908,14 +55147,447 @@ mod subscription_placement_tests {
         );
 
         // The routing owner delivers the open, then releases the gate.
-        server.drive_subscription_routing(routable, None).await;
-        drop(pending);
+        let routed = server.drive_subscription_routing(routable, None).await;
+        assert!(routed, "the open is delivered");
+        pending.complete();
         let (_key, correlated) = tokio::time::timeout(std::time::Duration::from_secs(5), publisher)
             .await
             .expect("the publish proceeds once the open is routed")
             .expect("the publisher task")
             .expect("the publish applies");
         assert_eq!(correlated, Some(created.instance_key));
+    }
+
+    /// Creates an `await-payment` instance through the detached create owner
+    /// (`answer_and_route_create`), whose opening routes cross-partition.
+    async fn create_await_payment_detached(server: &ServerImpl, order: &str) -> u64 {
+        let create_partition = server.engine.for_create().stats().partition;
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.to_string()));
+        let accounting = CreateAccounting::enter(server, 0);
+        let rx = server.submit_create_detached_on(
+            accounting,
+            create_engine,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-payment".into()),
+                    None,
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the create is answered")
+            .expect("the detached owner is alive")
+            .expect("the create applied")
+            .instance_key
+    }
+
+    /// #1866: when the create's routing pump task FAILS (here: an injected
+    /// panic), the gate still releases (it never wedges) and the gated publish
+    /// proceeds as today — published unmatched (200), not refused — while the
+    /// undelivered open is queued for the background re-drive.
+    #[tokio::test]
+    async fn failed_routing_pump_releases_the_gated_publish_and_queues_the_open() {
+        let server = single_node_multi_partition();
+        assert!(server.create_answers_before_routing());
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let create_partition = server.engine.for_create().stats().partition;
+        let order = cross_partition_order(create_partition);
+
+        // Hold the key pending so the publish is parked on the gate BEFORE
+        // the failing pump releases it.
+        let probe = server
+            .publication_gate
+            .register(&[Event::MessageSubscriptionOpening {
+                subscription_key: 1,
+                instance_key: 2,
+                element_instance_key: 3,
+                element_id: "probe".into(),
+                message_name: "payment-received".into(),
+                correlation_key: order.clone(),
+                kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+                delivery_key: 4,
+            }])
+            .expect("probe registered");
+        server
+            .fail_routing_pump_for_test
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let publisher = {
+            let server = server.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                server
+                    .publish_message_impl(&models::MessagePublicationRequest {
+                        name: "payment-received".to_string(),
+                        correlation_key: Some(order),
+                        time_to_live: None,
+                        message_id: None,
+                        variables: None,
+                        tenant_id: None,
+                        business_id: None,
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!publisher.is_finished(), "the publish waits on the gate");
+        let _instance = create_await_payment_detached(&server, &order).await;
+        probe.complete();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), publisher)
+            .await
+            .expect("the failed pump releases the gate (it never wedges)")
+            .expect("the publisher task")
+            .expect("handler returns response");
+        assert!(
+            matches!(
+                resp,
+                apis::message::PublishMessageResponse::Status200_TheMessageWasPublished(_)
+            ),
+            "a publish gated on a failed open proceeds as today, got: {resp:?}"
+        );
+        assert_eq!(
+            server.failed_opens.len(),
+            1,
+            "the undelivered open is queued for the background re-drive"
+        );
+    }
+
+    /// #1866 (fake time): after a failed pump a correlate returns not-found;
+    /// the background re-drive leaves a too-young open alone, then — once it
+    /// has been pending past the minimum age — applies it, after which a
+    /// publish correlates to the waiting instance.
+    #[tokio::test]
+    async fn failed_open_is_redriven_in_the_background_then_correlates() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let create_partition = server.engine.for_create().stats().partition;
+        let order = cross_partition_order(create_partition);
+        server
+            .fail_routing_pump_for_test
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let instance = create_await_payment_detached(&server, &order).await;
+        // Wait for the detached owner's failed pump to queue the open.
+        for _ in 0..100 {
+            if server.failed_opens.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.failed_opens.len(), 1, "the failed open is queued");
+        // Fake time from here on: the re-drive's age / interval are driven by
+        // `tokio::time::advance`, never by the wall clock.
+        tokio::time::pause();
+        server
+            .fail_routing_pump_for_test
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let resp = server
+            .correlate_message_impl(&models::MessageCorrelationRequest {
+                name: "payment-received".to_string(),
+                correlation_key: Some(order.clone()),
+                variables: None,
+                tenant_id: None,
+                business_id: None,
+            })
+            .await
+            .expect("handler returns response");
+        assert!(
+            matches!(
+                resp,
+                apis::message::CorrelateMessageResponse::Status404_NotFound(_)
+            ),
+            "with the open undelivered a correlate is not-found, got: {resp:?}"
+        );
+
+        // A pass before the minimum age re-drives nothing.
+        server.redrive_failed_opens().await;
+        assert_eq!(server.failed_opens.len(), 1, "too young to re-drive");
+
+        // The ticker's first pass (one interval in) re-drives the aged open.
+        let ticker = server.spawn_failed_open_redrive();
+        tokio::time::advance(
+            crate::publication_gate::FAILED_OPEN_REDRIVE_INTERVAL
+                + std::time::Duration::from_millis(1),
+        )
+        .await;
+        let mut correlated = None;
+        for _ in 0..100 {
+            if server.failed_opens.is_empty() {
+                let (_key, c) = server
+                    .correlate_message_cluster(
+                        "payment-received".to_string(),
+                        order.clone(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("publish");
+                if c.is_some() {
+                    correlated = c;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        ticker.abort();
+        assert!(server.failed_opens.is_empty(), "the re-drive took the open");
+        assert_eq!(
+            correlated,
+            Some(instance),
+            "after the re-drive a publish correlates"
+        );
+    }
+
+    /// Two sequential message catches on the same correlation key, under the
+    /// `await-payment` process id so [`create_await_payment_detached`] drives it:
+    /// correlating the first produces the second catch's open mid-cascade.
+    const TWO_SEQUENTIAL_CATCH_BPMN: &str = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="await-payment">
+          <bpmn:startEvent id="s" />
+          <bpmn:intermediateCatchEvent id="first">
+            <bpmn:messageEventDefinition messageRef="Message_1" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:intermediateCatchEvent id="second">
+            <bpmn:messageEventDefinition messageRef="Message_2" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="first" />
+          <bpmn:sequenceFlow id="f1" sourceRef="first" targetRef="second" />
+          <bpmn:sequenceFlow id="f2" sourceRef="second" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="Message_1" name="payment-received">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=orderId" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+        <bpmn:message id="Message_2" name="goods-shipped">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=orderId" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+
+    /// #1866: a pump panic AFTER an apply produced a new open (mid-cascade)
+    /// must not lose that open — the pump owns every open as it enters the
+    /// work list, so the supervisor queues it for the background re-drive.
+    #[tokio::test]
+    async fn mid_cascade_pump_panic_keeps_the_produced_open_for_redrive() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![(
+                    "await-payment.bpmn".into(),
+                    TWO_SEQUENTIAL_CATCH_BPMN.into(),
+                )],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let create_partition = server.engine.for_create().stats().partition;
+        let order = cross_partition_order(create_partition);
+        let instance = create_await_payment_detached(&server, &order).await;
+        // Wait until the first catch's open is routed and correlatable.
+        let mut correlated = None;
+        for _ in 0..100 {
+            server
+                .fail_routing_cascade_for_test
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let (_key, c) = server
+                .correlate_message_cluster(
+                    "payment-received".to_string(),
+                    order.clone(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("publish");
+            if c.is_some() {
+                correlated = c;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(correlated, Some(instance), "the first catch correlates");
+        let mut queued = Vec::new();
+        for _ in 0..100 {
+            queued = server.failed_opens.queued();
+            if !queued.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            queued.iter().any(|e| matches!(
+                e,
+                Event::MessageSubscriptionOpening { element_id, .. } if element_id.as_str() == "second"
+            )),
+            "the open produced mid-cascade is queued for re-drive, got: {queued:?}"
+        );
+    }
+
+    /// #1866: a caller that stops awaiting the routing (a dropped request
+    /// future) must not stop the failure from being recorded — supervision
+    /// runs detached, the caller only observes.
+    #[tokio::test]
+    async fn cancelled_routing_caller_still_queues_the_failed_open() {
+        let server = single_node_multi_partition();
+        let order = cross_partition_order(server.engine.for_create().stats().partition);
+        server
+            .fail_routing_pump_for_test
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let open = Event::MessageSubscriptionOpening {
+            subscription_key: 11,
+            instance_key: 12,
+            element_instance_key: 13,
+            element_id: "catch".into(),
+            message_name: "m".into(),
+            correlation_key: order,
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            delivery_key: 14,
+        };
+        // Poll the routing exactly once (spawning its detached work), then
+        // drop the caller's future before that work has run.
+        use std::future::Future;
+        let mut caller = Box::pin(server.drive_subscription_routing(vec![open], None));
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(caller.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the caller has not observed completion");
+        drop(caller);
+        for _ in 0..100 {
+            if server.failed_opens.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.failed_opens.len(),
+            1,
+            "the failed open is queued despite the cancelled caller"
+        );
+    }
+
+    /// #1866: a re-drive pass must not let a stalled partition's backlog
+    /// starve a healthy one — the open for the healthy target is applied
+    /// while the stalled target is still parked.
+    #[tokio::test]
+    async fn redrive_of_a_stalled_partition_does_not_starve_a_healthy_one() {
+        let server = single_node_multi_partition();
+        let keys: Vec<String> = (0..256u32).map(|i| format!("fair-{i}")).collect();
+        let stalled_key = keys[0].clone();
+        let stalled = nanobpmn_engine_core::subscription_partition(&stalled_key, 4);
+        let healthy_key = keys
+            .iter()
+            .find(|k| nanobpmn_engine_core::subscription_partition(k, 4) != stalled)
+            .expect("a second partition")
+            .clone();
+        let healthy = nanobpmn_engine_core::subscription_partition(&healthy_key, 4);
+        let open = |sk: u64, key: &str| Event::MessageSubscriptionOpening {
+            subscription_key: sk,
+            instance_key: sk + 1,
+            element_instance_key: sk + 2,
+            element_id: "catch".into(),
+            message_name: "m".into(),
+            correlation_key: key.into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            delivery_key: sk + 3,
+        };
+        // The stalled target's open is queued first, so a serial pass would
+        // block on it before reaching the healthy one.
+        tokio::time::pause();
+        server
+            .failed_opens
+            .record(&[open(100, &stalled_key), open(200, &healthy_key)], None);
+        tokio::time::advance(
+            crate::publication_gate::FAILED_OPEN_REDRIVE_AGE + std::time::Duration::from_millis(1),
+        )
+        .await;
+        tokio::time::resume();
+
+        let target_engine = server.engine_handle_for(stalled).expect("local");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = tokio::spawn(async move {
+            target_engine
+                .with_low(move |_journal| {
+                    let _ = parked_tx.send(());
+                    release_rx.blocking_recv().ok();
+                })
+                .await;
+        });
+        parked_rx
+            .await
+            .expect("the barrier holds the stalled actor");
+
+        let pass = {
+            let server = server.clone();
+            tokio::spawn(async move { server.redrive_failed_opens().await })
+        };
+        let healthy_engine = server.engine_handle_for(healthy).expect("local");
+        let mut applied = false;
+        for _ in 0..200 {
+            applied = healthy_engine
+                .with_low(|journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .message_subscriptions
+                        .contains_key(&200)
+                })
+                .await;
+            if applied {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            applied,
+            "the healthy partition's open is re-driven while the other stalls"
+        );
+        assert!(!pass.is_finished(), "the stalled partition is still parked");
+        let _ = release_tx.send(());
+        barrier.await.expect("barrier");
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass)
+            .await
+            .expect("the pass finishes once the stall clears")
+            .expect("pass task");
     }
 
     /// Two parallel message catches whose correlation keys route to two

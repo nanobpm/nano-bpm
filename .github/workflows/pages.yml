@@ -67,6 +67,11 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Build engine-wasm/pkg (the console's same-commit engine dep, #1871)
+        # console/package.json depends on @nanobpm/engine-wasm via
+        # `file:../engine-wasm/pkg` (a gitignored build output, #668), so the
+        # console `npm ci` below needs it built from this commit.
+        uses: ./.github/actions/engine-wasm-pkg
       - name: Build bundled docs (served at /docs on nanobpm.io)
         # The same generator the gateway uses to embed /docs in the app. It
         # renders USERGUIDE.md + docs/*.md into console/public/docs/*.html, which
