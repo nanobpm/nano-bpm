@@ -91,4 +91,7 @@ jobs:
       - name: Publish (OIDC)
         env:
           NPM_CONFIG_PROVENANCE: 'false'
-        run: node scripts/bojtos-release.mjs
+        # Explicit `--tag latest`: the gateway-versioned scheme (#1871) resets
+        # the version below the old independent 0.11.x line, and npm >= 11
+        # refuses an *implicit* `latest` on a lower version.
+        run: node scripts/bojtos-release.mjs --tag latest
