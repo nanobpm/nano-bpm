@@ -207,15 +207,36 @@ impl WorkerRegistry {
 /// invalidated by it; [`run_serve_op`] re-validates the lease before it
 /// registers as a waiter or spawns, so a request resolved before retirement
 /// can never start a worker afterwards.
+///
+/// The slot is keyed by the canonical directory, which several project
+/// aliases may share; deleting one alias keeps the slot alive for the others.
+/// A lease therefore also carries an optional, separately revocable *name
+/// binding* ([`Lease::bound_to`]), re-checked at every point the lease is —
+/// including after the async waits for the project's turn and admission — so
+/// a deleted alias can never run an op through its sibling's slot.
 pub(super) struct Lease {
     dir: PathBuf,
     slot: Slot,
+    binding: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl Lease {
-    /// Whether retirement has invalidated this lease.
+    /// Attach a name binding: the lease counts as revoked once `still_binds`
+    /// returns `false`.
+    pub(super) fn bound_to(
+        mut self,
+        still_binds: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.binding = Some(Box::new(still_binds));
+        self
+    }
+
+    /// Whether retirement (or loss of the name binding) has invalidated this
+    /// lease.
     fn revoked(&self, registry: &WorkerRegistry) -> bool {
-        self.slot.active().retired || !registry.is_registered(&self.dir, &self.slot)
+        self.slot.active().retired
+            || !registry.is_registered(&self.dir, &self.slot)
+            || self.binding.as_ref().is_some_and(|b| !b())
     }
 }
 
@@ -226,6 +247,7 @@ pub(super) fn lease(limiter: &DataGatewayLimiter, dir: &Path) -> Option<Lease> {
     Some(Lease {
         dir: dir.to_path_buf(),
         slot,
+        binding: None,
     })
 }
 
@@ -1123,8 +1145,10 @@ pub(super) async fn run_serve_op(
     let _permit = tokio::time::timeout_at(deadline, limiter.acquire_with(ticket))
         .await
         .map_err(|_| timed_out(limiter))??;
-    // Take our worker first: from here it is counted by our permit.
-    if slot.active().retired {
+    // Take our worker first: from here it is counted by our permit. The
+    // turn/admission waits above are async, so re-validate the whole lease
+    // (retirement *and* name binding, #1881) before touching the worker.
+    if lease.revoked(&limiter.workers) {
         return Err(retired());
     }
     let mut use_ = InUse {
@@ -1172,12 +1196,26 @@ pub(super) async fn run_serve_op(
         // was retired meanwhile, this worker must not run: reap it before
         // returning (and before `_waiting` drops), so a drain that sees
         // waiters==0 never races a still-live worker holding the project dir.
+        // The teardown/reap waits above are async too: a lost name binding
+        // fails the op here, before any request reaches the worker (#1881).
+        // The worker itself stays: it serves the surviving sibling aliases.
+        let unbound = lease.binding.as_ref().is_some_and(|b| !b());
         let retired_now = {
             let mut a = slot.active();
             if !a.retired {
-                a.pid = use_.worker.as_ref().and_then(|w| w.pid);
+                if unbound {
+                    if let Some(w) = use_.worker.take() {
+                        if limiter.workers.is_registered(dir, &slot) {
+                            *slot.idle() = Some(w);
+                        } else {
+                            use_.worker = Some(w);
+                        }
+                    }
+                } else {
+                    a.pid = use_.worker.as_ref().and_then(|w| w.pid);
+                }
             }
-            a.retired
+            a.retired || unbound
         };
         if retired_now {
             if let Some(w) = use_.worker.take() {
@@ -1269,6 +1307,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(spawn_count(&spawns), 1);
+        drop(retire_project_worker_blocking(&lim, &dir).unwrap());
+    }
+
+    /// #1881: an alias deleted while its op waits for the project's turn
+    /// (a sibling alias keeps the shared slot alive) fails closed after the
+    /// wait, sends nothing, and leaves the sibling's warm worker running.
+    #[tokio::test]
+    async fn name_binding_lost_during_admission_fails_closed_and_keeps_worker() {
+        use std::sync::atomic::AtomicBool;
+        let dir = project("binding");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        // A sibling alias warms the shared worker.
+        run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert_eq!(spawn_count(&spawns), 1);
+        let bound = Arc::new(AtomicBool::new(true));
+        let b = bound.clone();
+        let l = lease(&lim, &dir)
+            .unwrap()
+            .bound_to(move || b.load(Ordering::SeqCst));
+        let slot = l.slot.clone();
+        let turn = slot.turn.lock().await;
+        let req = serde_json::json!({"op":"schema"});
+        let r = {
+            let op = super::run_serve_op(&lim, &stub, l, &req);
+            tokio::pin!(op);
+            // Park the op behind the held turn, then delete the alias.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut op)
+                    .await
+                    .is_err()
+            );
+            bound.store(false, Ordering::SeqCst);
+            drop(turn);
+            op.await
+        };
+        assert!(matches!(r, Err(DataError::NoProject)), "{r:?}");
+        assert!(slot.idle().is_some(), "the sibling's worker was torn down");
+        run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert_eq!(spawn_count(&spawns), 1, "the sibling had to respawn");
         drop(retire_project_worker_blocking(&lim, &dir).unwrap());
     }
 

@@ -4521,16 +4521,22 @@ async fn run_data_op_inner(
     // The lease tracks the canonical directory, which an alias shares with
     // other names; the *name* binding is checked separately, here and again
     // after the probes, because deleting one alias keeps the shared slot alive.
-    let name_still_binds = || {
-        project_dir(project)
-            .filter(|d| d.is_dir())
-            .map(|d| dunce::canonicalize(&d).unwrap_or(d))
-            .as_deref()
-            == Some(dir.as_path())
+    // The name check travels with the lease (`Lease::bound_to`), so
+    // `run_serve_op` re-validates it after its own async waits too.
+    let name_still_binds = {
+        let (project, dir) = (project.to_string(), dir.clone());
+        move || {
+            project_dir(&project)
+                .filter(|d| d.is_dir())
+                .map(|d| dunce::canonicalize(&d).unwrap_or(d))
+                .as_deref()
+                == Some(dir.as_path())
+        }
     };
     let lease = if is_urban {
-        let lease =
-            urban_data_worker::lease(data_gateway_limiter(), &dir).ok_or(DataError::NoProject)?;
+        let lease = urban_data_worker::lease(data_gateway_limiter(), &dir)
+            .ok_or(DataError::NoProject)?
+            .bound_to(name_still_binds.clone());
         if !name_still_binds() {
             return Err(DataError::NoProject);
         }
@@ -4573,6 +4579,10 @@ async fn run_data_op_inner(
             // `--serve` is rejected with an upgrade instruction.
             if !super::urban::urban_supports_data_serve(&urban).await {
                 return Err(DataError::Gateway(UPGRADE_URBAN_FOR_SERVE.to_string()));
+            }
+            // A second probe is another async gap (#1881): revalidate.
+            if !name_still_binds() {
+                return Err(DataError::NoProject);
             }
             let lease = lease.ok_or_else(|| {
                 DataError::Gateway(
@@ -5044,7 +5054,10 @@ fn dir_shared_with_other_project(name: &str, dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(projects_root()) else {
         return false;
     };
-    entries.flatten().any(|entry| {
+    let entries: Vec<_> = entries.flatten().collect();
+    let listed: std::collections::HashSet<std::ffi::OsString> =
+        entries.iter().map(|e| e.file_name()).collect();
+    entries.iter().any(|entry| {
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             return false;
@@ -5060,7 +5073,7 @@ fn dir_shared_with_other_project(name: &str, dir: &Path) -> bool {
         } else {
             return false;
         };
-        if other == name || is_own_entry(name, &path) {
+        if other == name || is_own_entry(name, other, &path, &listed) {
             return false;
         }
         project_dir(other)
@@ -5072,11 +5085,24 @@ fn dir_shared_with_other_project(name: &str, dir: &Path) -> bool {
 /// Whether `path` is the very directory-entry `name` itself occupies (its
 /// workspace dir or reference file) under another spelling — e.g. `MyApp`
 /// listed by `read_dir` when deleting `myapp` on a case-insensitive
-/// filesystem. Compared by file identity, so genuinely distinct entries on a
-/// case-sensitive filesystem stay distinct (#1881).
-fn is_own_entry(name: &str, path: &Path) -> bool {
+/// filesystem (#1881). Only a case-variant spelling can be the same entry:
+/// a hard link under a different name (`twin`) is an independently removable
+/// alias, and if `read_dir` also lists the exact spelling `name`, the variant
+/// is a distinct entry on a case-sensitive filesystem.
+fn is_own_entry(
+    name: &str,
+    other: &str,
+    path: &Path,
+    listed: &std::collections::HashSet<std::ffi::OsString>,
+) -> bool {
+    if !other.eq_ignore_ascii_case(name) {
+        return false;
+    }
     let own = [Some(projects_root().join(name)), project_ref_file(name)];
-    own.iter().flatten().any(|o| same_fs_entry(o, path))
+    own.iter().flatten().any(|o| {
+        let exact_listed = o.file_name().is_some_and(|f| listed.contains(f));
+        !exact_listed && same_fs_entry(o, path)
+    })
 }
 
 fn same_fs_entry(a: &Path, b: &Path) -> bool {
@@ -9089,9 +9115,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shared_dir_detection_ignores_the_deleted_names_own_entry_under_another_spelling() {
-        // Simulates a case-insensitive filesystem: `read_dir` lists the deleted
-        // name's own ref file under a different spelling (here a hard link).
+    fn shared_dir_detection_counts_hard_linked_aliases_as_distinct() {
+        // A hard link is a separate, independently removable directory entry:
+        // deleting `myapp` leaves `twin` resolving to the checkout (#1881).
         let _g = lock();
         let _root = temp_root();
         let ext = ext_app_dir("caseins");
@@ -9108,9 +9134,18 @@ mod tests {
         .unwrap();
         let dir = project_dir("myapp").unwrap();
         assert!(
-            !dir_shared_with_other_project("myapp", &dir),
-            "the deleted alias's own entry must not count as another project"
+            dir_shared_with_other_project("myapp", &dir),
+            "a hard-linked ref under another name is a surviving alias"
         );
+        std::fs::remove_file(projects_root().join("twin.project-ref.json")).unwrap();
+        // A case-variant hard link coexisting with the exact spelling is a
+        // distinct entry (case-sensitive filesystem), so it counts too.
+        let variant = projects_root().join("MyApp.project-ref.json");
+        if std::fs::hard_link(project_ref_file("myapp").unwrap(), &variant).is_ok() {
+            assert!(dir_shared_with_other_project("myapp", &dir));
+            std::fs::remove_file(&variant).unwrap();
+        }
+        assert!(!dir_shared_with_other_project("myapp", &dir));
         // A genuinely distinct alias still counts.
         import_project_ref("other", ext.to_str().unwrap()).unwrap();
         assert!(dir_shared_with_other_project("myapp", &dir));
