@@ -15,7 +15,11 @@ import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 const indentOf = (line) => line.match(/^ */)[0].length;
-const isDefault = (v) => /github\.token|secrets\.GITHUB_TOKEN|\$GITHUB_TOKEN\b/.test(v);
+// Expression contexts (`github.token`, `secrets.GITHUB_TOKEN`) are
+// case-insensitive in GitHub Actions; shell env vars are not.
+const isDefault = (v) =>
+  /github\s*\.\s*token|secrets\s*\.\s*github_token|secrets\s*\[\s*['"]github_token['"]\s*\]/i.test(v) ||
+  /\$\{?GITHUB_TOKEN\b/.test(v);
 
 /** Offending `gh pr create` lines: the enclosing step has no step-level
  * GH_TOKEN, or it may resolve to GITHUB_TOKEN (including as a `||` fallback). */
@@ -60,6 +64,11 @@ test('prCreateOffenders flags GITHUB_TOKEN and missing tokens', () => {
   assert.deepEqual(prCreateOffenders(step('${{ github.token }}')).length, 1);
   assert.deepEqual(prCreateOffenders(step('${{ secrets.GITHUB_TOKEN }}')).length, 1);
   assert.deepEqual(prCreateOffenders(step('${{ secrets.X || secrets.GITHUB_TOKEN }}')).length, 1);
+  // Expression contexts are case-insensitive.
+  assert.deepEqual(prCreateOffenders(step('${{ secrets.APP || secrets.github_token }}')).length, 1);
+  assert.deepEqual(prCreateOffenders(step('${{ GitHub.Token }}')).length, 1);
+  assert.deepEqual(prCreateOffenders(step("${{ secrets['GITHUB_TOKEN'] }}")).length, 1);
+  assert.deepEqual(prCreateOffenders(step('${GITHUB_TOKEN}')).length, 1);
   // A later step's App token must not mask a missing token in this one.
   assert.deepEqual(prCreateOffenders(step(null)).length, 1);
   assert.deepEqual(prCreateOffenders(step('${{ steps.app-token.outputs.token }}')), []);
