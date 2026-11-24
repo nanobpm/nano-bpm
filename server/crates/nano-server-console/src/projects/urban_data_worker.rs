@@ -74,10 +74,10 @@ const RETIRE_DRAIN: Duration = Duration::from_secs(15);
 
 struct Worker {
     child: Child,
-    /// The launcher's pid, recorded at spawn — on Unix also its process-group
-    /// id. Teardown kills by this, never by `child.id()`, which is `None` once
-    /// the leader has been reaped while forked descendants may live on.
-    pid: Option<u32>,
+    /// The worker's process tree, recorded at spawn ([`Tree`]). Teardown kills
+    /// by this, never by `child.id()`, which is `None` once the leader has been
+    /// reaped while forked descendants may live on.
+    pid: Tree,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     fingerprint: u64,
@@ -87,6 +87,242 @@ struct Worker {
     in_flight: bool,
     last_used: Instant,
     stderr_tail: Arc<Mutex<String>>,
+}
+
+/// A worker's process tree, recorded at spawn: the launcher's pid (on Unix
+/// also its process-group id) and, on Windows, the Job Object the launcher —
+/// and so every descendant it starts — was assigned to (#1879). `taskkill /T`
+/// walks the tree from a live parent, so once a `.cmd` shim (pnpm/yarn) has
+/// exited it cannot reach the surviving Node process; the job can.
+#[derive(Clone, Default)]
+struct Tree {
+    pid: Option<u32>,
+    #[cfg(windows)]
+    job: Option<Arc<win_job::Job>>,
+}
+
+impl std::fmt::Debug for Tree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.pid.fmt(f)
+    }
+}
+
+impl Tree {
+    /// Record a freshly spawned launcher's tree. On Windows the launcher is
+    /// spawned `CREATE_SUSPENDED` (see `spawn_worker`), put in a Job Object,
+    /// and only then resumed, so it cannot start its Node descendant outside
+    /// the job (#1879). If containment fails it is still resumed, and teardown
+    /// falls back to `taskkill /T`. Resuming a launcher that was not spawned
+    /// suspended is a no-op.
+    fn contain(child: &Child) -> Self {
+        #[cfg(windows)]
+        let job = child.raw_handle().and_then(|h| {
+            win_job::Job::contain(h.cast())
+                .map_err(|e| tracing::warn!(error = %e, "data worker: no Job Object"))
+                .ok()
+                .map(Arc::new)
+        });
+        #[cfg(windows)]
+        if let Some(pid) = child.id()
+            && let Err(e) = win_job::resume_process(pid)
+        {
+            tracing::warn!(error = %e, "data worker: resume launcher failed");
+        }
+        Self {
+            pid: child.id(),
+            #[cfg(windows)]
+            job,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<Option<u32>> for Tree {
+    fn from(pid: Option<u32>) -> Self {
+        Self {
+            pid,
+            #[cfg(windows)]
+            job: None,
+        }
+    }
+}
+
+impl Tree {
+    /// Whether liveness comes from a Job Object. A job's `ActiveProcesses`
+    /// counts only running members (Windows has no zombies), so a nonempty
+    /// job is never released on the zombie grace (#1879).
+    fn job_backed(&self) -> bool {
+        #[cfg(windows)]
+        return self.job.is_some();
+        #[cfg(not(windows))]
+        false
+    }
+}
+
+/// Windows Job Object containment for a data worker's tree (#1879): the
+/// counterpart of the Unix process group. The job is created with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so dropping the last handle kills any
+/// survivor; teardown calls `TerminateJobObject`, and an empty job
+/// (`ActiveProcesses == 0`) is the liveness test that holds the `Reaping`
+/// ticket and the `ReapHold`.
+#[cfg(windows)]
+mod win_job {
+    use std::ffi::c_void;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    use super::Liveness;
+
+    /// Resume every thread of `pid` (a `CREATE_SUSPENDED` process has only
+    /// its main thread). A thread that is not suspended is left untouched.
+    pub(super) fn resume_process(pid: u32) -> std::io::Result<()> {
+        // SAFETY: a thread snapshot of the whole system; checked below.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snap.is_null() || snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        struct Snapshot(HANDLE);
+        impl Drop for Snapshot {
+            fn drop(&mut self) {
+                // SAFETY: the snapshot handle is owned and closed exactly once.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+        let snap = Snapshot(snap);
+        // SAFETY: an all-zero struct with `dwSize` set is a valid in/out buffer.
+        let mut te: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        te.dwSize = size_of_u32::<THREADENTRY32>();
+        let mut resumed = 0usize;
+        let mut err = None;
+        // SAFETY: valid snapshot handle and correctly sized entry.
+        let mut more = unsafe { Thread32First(snap.0, &mut te) } != 0;
+        while more {
+            if te.th32OwnerProcessID == pid {
+                // SAFETY: plain open of a thread id; checked below.
+                let t = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, te.th32ThreadID) };
+                if t.is_null() {
+                    err = Some(std::io::Error::last_os_error());
+                } else {
+                    // SAFETY: `t` is a valid thread handle, closed right after.
+                    unsafe {
+                        if ResumeThread(t) == u32::MAX {
+                            err = Some(std::io::Error::last_os_error());
+                        } else {
+                            resumed += 1;
+                        }
+                        CloseHandle(t);
+                    }
+                }
+            }
+            // SAFETY: as for `Thread32First`.
+            more = unsafe { Thread32Next(snap.0, &mut te) } != 0;
+        }
+        match err {
+            Some(e) if resumed == 0 => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    pub(super) struct Job(HANDLE);
+
+    // SAFETY: a job handle is a kernel object handle, usable from any thread;
+    // every operation on it here is a thread-safe Win32 call.
+    unsafe impl Send for Job {}
+    // SAFETY: as above; no interior state beyond the handle.
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        /// Create a kill-on-close job and assign `process` to it. Processes
+        /// the launcher starts afterwards inherit the job.
+        pub(super) fn contain(process: HANDLE) -> std::io::Result<Self> {
+            // SAFETY: null security attributes and name create an anonymous job.
+            let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if h.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let job = Job(h);
+            // SAFETY: an all-zero struct is a valid "no limits" value.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `info` is the struct this information class expects, and
+            // the size passed is its size.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&info).cast::<c_void>(),
+                    size_of_u32::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: both handles are valid for the duration of the call.
+            if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(job)
+        }
+
+        /// Kill every process in the job.
+        pub(super) fn terminate(&self) {
+            // SAFETY: the handle is valid until `drop`.
+            if unsafe { TerminateJobObject(self.0, 1) } == 0 {
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    "data worker: TerminateJobObject failed"
+                );
+            }
+        }
+
+        /// `Gone` once the job holds no active process. A failed query fails
+        /// closed (`Eperm`: never released as gone or as zombies).
+        pub(super) fn liveness(&self) -> Liveness {
+            // SAFETY: an all-zero struct is a valid out-buffer.
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` is the struct this information class fills, and
+            // the size passed is its size.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.0,
+                    JobObjectBasicAccountingInformation,
+                    std::ptr::from_mut(&mut info).cast::<c_void>(),
+                    size_of_u32::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Liveness::Eperm;
+            }
+            if info.ActiveProcesses == 0 {
+                Liveness::Gone
+            } else {
+                Liveness::Signalable
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // Kill-on-close: closing the last handle kills any survivor.
+            // SAFETY: the handle is owned and closed exactly once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn size_of_u32<T>() -> u32 {
+        u32::try_from(std::mem::size_of::<T>()).unwrap_or(u32::MAX)
+    }
 }
 
 #[derive(Default)]
@@ -115,7 +351,7 @@ struct SlotInner {
 
 #[derive(Default)]
 struct Active {
-    pid: Option<u32>,
+    pid: Option<Tree>,
     retired: bool,
 }
 
@@ -289,29 +525,29 @@ fn kill_and_reap_blocking(limiter: &DataGatewayLimiter, slot: &Slot, w: Worker) 
     let budget = limiter.reaping.clone();
     let mut child = w.child;
     let pid = w.pid;
-    budget.kill(pid, &mut child);
+    budget.kill(&pid, &mut child);
     let give_up = Instant::now() + budget.grace();
     loop {
-        if worker_gone(&budget, &mut child, pid) {
+        if worker_gone(&budget, &mut child, &pid) {
             return true;
         }
         if Instant::now() >= give_up {
             break;
         }
         // Re-kill: a descendant may outlive the reaped leader.
-        budget.kill(pid, &mut child);
+        budget.kill(&pid, &mut child);
         std::thread::sleep(Duration::from_millis(10));
     }
-    warn_unreaped(pid);
+    warn_unreaped(&pid);
     std::thread::spawn(move || {
         let _ticket = ticket;
         let _hold = hold;
         let mut zombies = ZombieGrace::default();
-        while !worker_gone(&budget, &mut child, pid) {
-            budget.kill(pid, &mut child);
+        while !worker_gone(&budget, &mut child, &pid) {
+            budget.kill(&pid, &mut child);
             let leader_reaped = child_exited(&mut child);
-            if zombies.expired(&budget, pid, leader_reaped, Instant::now()) {
-                warn_zombies(pid);
+            if zombies.expired(&budget, &pid, leader_reaped, Instant::now()) {
+                warn_zombies(&pid);
                 return;
             }
             std::thread::sleep(REAP_RETRY);
@@ -346,7 +582,7 @@ impl ZombieGrace {
     fn expired(
         &mut self,
         budget: &ReapBudget,
-        pid: Option<u32>,
+        pid: &Tree,
         leader_reaped: bool,
         now: Instant,
     ) -> bool {
@@ -355,7 +591,7 @@ impl ZombieGrace {
             self.eperm_warned = true;
             warn_eperm(pid);
         }
-        if !leader_reaped || liveness != Liveness::Signalable {
+        if !leader_reaped || liveness != Liveness::Signalable || pid.job_backed() {
             self.since = None;
             return false;
         }
@@ -364,7 +600,7 @@ impl ZombieGrace {
     }
 }
 
-fn warn_eperm(pid: Option<u32>) {
+fn warn_eperm(pid: &Tree) {
     tracing::warn!(
         pgid = ?pid,
         "data worker group has a member SIGKILL cannot reach (EPERM); \
@@ -372,7 +608,7 @@ fn warn_eperm(pid: Option<u32>) {
     );
 }
 
-fn warn_zombies(pid: Option<u32>) {
+fn warn_zombies(pid: &Tree) {
     tracing::warn!(
         pgid = ?pid,
         "data worker group still probes alive after SIGKILL and the zombie grace; \
@@ -390,7 +626,7 @@ fn child_exited(child: &mut Child) -> bool {
 /// A worker counts as exited only when its leader is reaped **and** its
 /// process group is empty: a launcher (pnpm/yarn shim, wrapper) may exit and
 /// be reaped while forked descendants keep running (#1836).
-fn worker_gone(budget: &ReapBudget, child: &mut Child, pid: Option<u32>) -> bool {
+fn worker_gone(budget: &ReapBudget, child: &mut Child, pid: &Tree) -> bool {
     child_exited(child) && budget.liveness(pid) == Liveness::Gone
 }
 
@@ -399,8 +635,13 @@ fn worker_gone(budget: &ReapBudget, child: &mut Child, pid: Option<u32>) -> bool
 /// reaped the pgid is only held while the group has members, so a reaped
 /// leader's group is signalled only after probing it non-empty — never by a
 /// stale pid the kernel may have reused (#1836).
-fn group_signal_safe(child: &mut Child, pid: Option<u32>) -> bool {
-    pid.is_some() && (matches!(child.try_wait(), Ok(None)) || group_alive(pid))
+fn group_signal_safe(child: &mut Child, pid: &Tree) -> bool {
+    // A Job Object handle can never name an unrelated tree: always safe.
+    #[cfg(windows)]
+    if pid.job.is_some() {
+        return true;
+    }
+    pid.pid.is_some() && (matches!(child.try_wait(), Ok(None)) || group_alive(pid))
 }
 
 /// Result of probing a worker's process group.
@@ -416,15 +657,20 @@ enum Liveness {
 }
 
 /// Whether any process remains in the group led by `pid`.
-fn group_alive(pid: Option<u32>) -> bool {
+fn group_alive(pid: &Tree) -> bool {
     group_liveness(pid) != Liveness::Gone
 }
 
-/// Probe the group led by `pid` (Unix). Windows has no group probe here (see
-/// the Job Object follow-up), so it reports none.
-fn group_liveness(pid: Option<u32>) -> Liveness {
+/// Probe the worker's tree: on Unix the process group led by its pid, on
+/// Windows its Job Object (empty job = gone, #1879). A Windows worker whose job
+/// could not be created has no probe, so it reports none.
+fn group_liveness(pid: &Tree) -> Liveness {
+    #[cfg(windows)]
+    if let Some(job) = &pid.job {
+        return job.liveness();
+    }
     #[cfg(unix)]
-    if let Some(pid) = pid.filter(|p| *p != 0) {
+    if let Some(pid) = pid.pid.filter(|p| *p != 0) {
         let Ok(pgid) = i32::try_from(pid) else {
             return Liveness::Gone;
         };
@@ -443,7 +689,7 @@ fn group_liveness(pid: Option<u32>) -> Liveness {
     Liveness::Gone
 }
 
-fn warn_unreaped(pid: Option<u32>) {
+fn warn_unreaped(pid: &Tree) {
     tracing::warn!(
         ?pid,
         "data worker did not exit after kill; holding its slot and budget until it does"
@@ -504,7 +750,7 @@ pub(super) fn retire_project_worker_blocking<'a>(
         {
             let mut a = slot.active();
             a.retired = true;
-            if let Some(pid) = a.pid {
+            if let Some(pid) = &a.pid {
                 // The in-flight op sees EOF, fails, and leaves the slot.
                 // Signalled under the `active` lock: the op clears `pid`
                 // under this lock before it can reap the leader, so the
@@ -515,7 +761,7 @@ pub(super) fn retire_project_worker_blocking<'a>(
         }
         let idle = slot.idle().take();
         if let Some(w) = idle {
-            idle_pids.push(w.pid);
+            idle_pids.push(w.pid.clone());
             // An unreaped worker keeps its place on `slot`: the drain below
             // then fails closed instead of handing over a live directory.
             kill_and_reap_blocking(limiter, slot, w);
@@ -527,7 +773,7 @@ pub(super) fn retire_project_worker_blocking<'a>(
         .any(|s| s.waiters.load(Ordering::Acquire) > 0)
     {
         if Instant::now() >= give_up {
-            for pid in idle_pids.iter().copied() {
+            for pid in &idle_pids {
                 if limiter.reaping.liveness(pid) == Liveness::Eperm {
                     warn_eperm(pid);
                 }
@@ -564,33 +810,41 @@ pub(crate) struct ReapBudget {
 }
 
 impl ReapBudget {
-    /// Kill a process group (blocking `taskkill` on Windows).
-    fn kill_group(&self, pid: u32) {
+    /// Kill a worker's whole tree: its process group on Unix, its Job Object
+    /// on Windows (#1879) — falling back to a blocking `taskkill /T` when the
+    /// job could not be created at spawn.
+    fn kill_group(&self, tree: &Tree) {
+        let Some(pid) = tree.pid else {
+            return;
+        };
         #[cfg(test)]
         self.group_signals.fetch_add(1, Ordering::AcqRel);
         #[cfg(test)]
         if self.ignore_kill.load(Ordering::Acquire) {
             return;
         }
+        #[cfg(windows)]
+        if let Some(job) = &tree.job {
+            job.terminate();
+            return;
+        }
         super::kill_group_by_pid(pid);
     }
 
     /// Kill the worker's group and the child itself (blocking on Windows).
-    fn kill(&self, pid: Option<u32>, child: &mut Child) {
+    fn kill(&self, pid: &Tree, child: &mut Child) {
         #[cfg(test)]
         if self.ignore_kill.load(Ordering::Acquire) {
             return;
         }
-        if let Some(pid) = pid
-            && group_signal_safe(child, Some(pid))
-        {
+        if group_signal_safe(child, pid) {
             self.kill_group(pid);
         }
         let _ = child.start_kill();
     }
 
     /// Probe the worker's group (faked in tests).
-    fn liveness(&self, pid: Option<u32>) -> Liveness {
+    fn liveness(&self, pid: &Tree) -> Liveness {
         #[cfg(test)]
         match self.fake_liveness.load(Ordering::Acquire) {
             1 => return Liveness::Signalable,
@@ -628,16 +882,15 @@ impl ReapBudget {
 /// Kill a worker's whole tree — by the pid recorded at spawn, whether or not
 /// the leader has already been reaped — and wait (bounded by the reap grace)
 /// for the leader to be reaped and the group to empty. Returns whether it did.
-async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>) -> bool {
-    async fn kill_group(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>) {
+async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child, pid: &Tree) -> bool {
+    async fn kill_group(budget: &Arc<ReapBudget>, child: &mut Child, pid: &Tree) {
         if !group_signal_safe(child, pid) {
             return;
         }
-        if let Some(pid) = pid {
-            // Blocking on Windows (`taskkill` status); cheap signal on Unix.
-            let b = budget.clone();
-            let _ = tokio::task::spawn_blocking(move || b.kill_group(pid)).await;
-        }
+        // Possibly blocking on Windows (`taskkill` fallback); cheap on Unix.
+        let b = budget.clone();
+        let tree = pid.clone();
+        let _ = tokio::task::spawn_blocking(move || b.kill_group(&tree)).await;
     }
     kill_group(budget, child, pid).await;
     #[cfg(test)]
@@ -669,7 +922,7 @@ async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>
 
 /// Keep killing and reaping a worker that outlived its grace until it (and
 /// its whole group) exits.
-async fn reap_until_exit(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>) {
+async fn reap_until_exit(budget: &Arc<ReapBudget>, child: &mut Child, pid: &Tree) {
     warn_unreaped(pid);
     let mut zombies = ZombieGrace::default();
     while !kill_tree(budget, child, pid).await {
@@ -701,8 +954,8 @@ impl Drop for Reaping {
 }
 
 /// Kill a worker's process group without blocking the calling (possibly
-/// async, possibly `Drop`) context: the kill — a blocking `taskkill` on
-/// Windows — and the reap run on a blocking thread / background task that
+/// async, possibly `Drop`) context: the kill — on Windows `TerminateJobObject`
+/// or the blocking `taskkill` fallback — and the reap run on a blocking thread / background task that
 /// owns the `Child`. Until the reap completes the worker stays counted in
 /// [`DataGatewayLimiter`]'s `reaping` budget, since it is still a live process,
 /// and holds a [`Waiting`] place on its project's `slot`, so a retirement drain
@@ -714,15 +967,11 @@ fn kill_detached(limiter: &DataGatewayLimiter, slot: &Slot, mut w: Worker) {
     // The Unix group signal is a cheap syscall: send it now so the worker
     // stops at once, whatever happens to the background task.
     #[cfg(unix)]
-    if let Some(pid) = pid {
-        limiter.reaping.kill_group(pid);
-    }
+    limiter.reaping.kill_group(&pid);
     let Ok(rt) = tokio::runtime::Handle::try_current() else {
         // No runtime (shutdown): best effort, inline. `kill_on_drop` backs it.
         #[cfg(not(unix))]
-        if let Some(pid) = pid {
-            super::kill_group_by_pid(pid);
-        }
+        limiter.reaping.kill_group(&pid);
         let _ = w.child.start_kill();
         drop(ticket);
         drop(hold);
@@ -734,8 +983,8 @@ fn kill_detached(limiter: &DataGatewayLimiter, slot: &Slot, mut w: Worker) {
         let _hold = hold;
         // Not reaped in time: still a live process — keep the ticket and the
         // slot place until it really exits.
-        if !kill_tree(&budget, &mut w.child, pid).await {
-            reap_until_exit(&budget, &mut w.child, pid).await;
+        if !kill_tree(&budget, &mut w.child, &pid).await {
+            reap_until_exit(&budget, &mut w.child, &pid).await;
         }
     });
 }
@@ -829,9 +1078,15 @@ fn spawn_worker(urban: &Path, dir: &Path, fingerprint: u64) -> Result<Worker, Da
     // worker (#1329).
     #[cfg(unix)]
     cmd.process_group(0);
+    // Start suspended so `Tree::contain` can put the launcher in its Job
+    // Object before it runs a single instruction, and so before any Node
+    // descendant exists outside the job (#1879); `contain` resumes it.
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
     let mut child = cmd
         .spawn()
         .map_err(|e| DataError::Gateway(format!("spawn data worker: {e}")))?;
+    let tree = Tree::contain(&child);
     let missing = || DataError::Gateway("data worker: stdio not piped".to_string());
     let stdin = child.stdin.take().ok_or_else(missing)?;
     let stdout = child.stdout.take().ok_or_else(missing)?;
@@ -864,7 +1119,7 @@ fn spawn_worker(urban: &Path, dir: &Path, fingerprint: u64) -> Result<Worker, Da
     });
     tracing::debug!(dir = %dir.display(), pid = ?child.id(), "data worker started");
     Ok(Worker {
-        pid: child.id(),
+        pid: tree,
         child,
         stdin,
         stdout: BufReader::new(stdout),
@@ -908,14 +1163,14 @@ async fn teardown_owned(
             ..
         } = w;
         let exited = if graceful {
-            retire_child(&budget, &mut child, stdin, pid).await
+            retire_child(&budget, &mut child, stdin, &pid).await
         } else {
             drop(stdin);
-            kill_tree(&budget, &mut child, pid).await
+            kill_tree(&budget, &mut child, &pid).await
         };
         let _ = tx.send(exited);
         if !exited {
-            reap_until_exit(&budget, &mut child, pid).await;
+            reap_until_exit(&budget, &mut child, &pid).await;
         }
     });
     rx.await.unwrap_or(false)
@@ -928,7 +1183,7 @@ async fn retire_child(
     budget: &Arc<ReapBudget>,
     child: &mut Child,
     stdin: ChildStdin,
-    pid: Option<u32>,
+    pid: &Tree,
 ) -> bool {
     drop(stdin);
     if tokio::time::timeout(RETIRE_GRACE, child.wait())
@@ -1193,7 +1448,7 @@ pub(super) async fn run_serve_op(
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             if let Some(h) = hook {
-                h(use_.worker.as_ref().and_then(|w| w.pid));
+                h(use_.worker.as_ref().and_then(|w| w.pid.pid));
             }
         }
     }
@@ -1218,7 +1473,7 @@ pub(super) async fn run_serve_op(
                         }
                     }
                 } else {
-                    a.pid = use_.worker.as_ref().and_then(|w| w.pid);
+                    a.pid = use_.worker.as_ref().map(|w| w.pid.clone());
                 }
             }
             a.retired || unbound
@@ -1883,7 +2138,7 @@ mod tests {
         let slot = lim.workers.slot_for(&dir);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let pid = loop {
-            if let Some(p) = slot.active().pid {
+            if let Some(p) = slot.active().pid.as_ref().and_then(|t| t.pid) {
                 break p;
             }
             assert!(std::time::Instant::now() < deadline, "op never started");
@@ -2430,12 +2685,12 @@ mod tests {
         let mut now = t0;
         // Leader unreaped: never expires, however long.
         for _ in 0..1000 {
-            assert!(!z.expired(&budget, Some(1), false, now));
+            assert!(!z.expired(&budget, &Tree::from(Some(1)), false, now));
             now += REAP_RETRY;
         }
         let reaped_at = now;
         let released = loop {
-            if z.expired(&budget, Some(1), true, now) {
+            if z.expired(&budget, &Tree::from(Some(1)), true, now) {
                 break now;
             }
             now += REAP_RETRY;
@@ -2453,7 +2708,7 @@ mod tests {
         let mut z = ZombieGrace::default();
         let mut now = Instant::now();
         for _ in 0..1000 {
-            assert!(!z.expired(&budget, Some(1), true, now));
+            assert!(!z.expired(&budget, &Tree::from(Some(1)), true, now));
             now += REAP_RETRY;
         }
     }
@@ -2517,10 +2772,10 @@ mod tests {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "exit 0"]).process_group(0);
         let mut child = cmd.spawn().unwrap();
-        let pid = child.id();
+        let pid = Tree::from(child.id());
         child.wait().await.unwrap();
-        assert!(kill_tree(&budget, &mut child, pid).await);
-        budget.kill(pid, &mut child);
+        assert!(kill_tree(&budget, &mut child, &pid).await);
+        budget.kill(&pid, &mut child);
         assert_eq!(budget.group_signals.load(Ordering::Acquire), 0);
     }
 
@@ -2556,5 +2811,80 @@ mod tests {
             launcher
         );
         assert_ne!(before, crate::urban::toolkit_identity(&bin));
+    }
+}
+
+/// Windows Job Object containment (#1879): the counterpart of the Unix
+/// exited-launcher tests above.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// A launcher that starts a long-lived descendant and exits at once (the
+    /// `.cmd` shim shape): the job keeps the descendant visible, teardown
+    /// kills it, and only then is the tree reported gone.
+    #[tokio::test]
+    async fn exited_launcher_descendant_is_contained_and_killed() {
+        let budget = Arc::new(ReapBudget::default());
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", "/B", "ping", "-n", "120", "127.0.0.1"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let tree = Tree::contain(&child);
+        assert!(tree.job.is_some(), "launcher not assigned to a job");
+        child.wait().await.unwrap();
+        // The launcher is gone; its descendant must still count as live.
+        assert_eq!(budget.liveness(&tree), Liveness::Signalable);
+        assert!(!worker_gone(&budget, &mut child, &tree));
+        // A nonempty job with its launcher reaped never expires the zombie
+        // grace: Windows has no zombies, so the holds stay until it empties.
+        let mut grace = ZombieGrace::default();
+        let t0 = Instant::now();
+        assert!(!grace.expired(&budget, &tree, true, t0));
+        assert!(!grace.expired(&budget, &tree, true, t0 + ZOMBIE_GRACE * 10));
+        assert!(kill_tree(&budget, &mut child, &tree).await);
+        assert_eq!(budget.liveness(&tree), Liveness::Gone);
+        assert!(worker_gone(&budget, &mut child, &tree));
+    }
+
+    /// A launcher spawned suspended (as `spawn_worker` does) is assigned to
+    /// the job before it runs and is then resumed: it runs to completion and
+    /// its descendant is inside the job from its first instruction.
+    #[tokio::test]
+    async fn suspended_launcher_is_contained_then_resumed() {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "exit", "0"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED)
+            .stdout(std::process::Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let tree = Tree::contain(&child);
+        assert!(tree.job.is_some(), "launcher not assigned to a job");
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("suspended launcher was never resumed")
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// An empty job is gone; a job whose last handle drops kills its members.
+    #[tokio::test]
+    async fn dropping_the_job_kills_the_tree() {
+        let mut child = Command::new("ping")
+            .args(["-n", "120", "127.0.0.1"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let tree = Tree::contain(&child);
+        assert_eq!(group_liveness(&tree), Liveness::Signalable);
+        drop(tree);
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("kill-on-close did not kill the member")
+            .unwrap();
+        assert!(!status.success());
     }
 }
