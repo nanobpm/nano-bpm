@@ -3870,6 +3870,11 @@ pub struct ServerImpl {
     /// (#1604): publishes for a pending `(name, correlation key)` wait (bounded)
     /// until the create's routing owner has opened the subscription.
     publication_gate: publication_gate::PublicationGate,
+    /// Peers this node has seen advertise `FEATURE_CLUSTER_PUBLICATION_GATE`
+    /// (#1845). Such a peer may hold early-answered pending opens, so once it
+    /// becomes unreachable the cluster gate fails CLOSED for it rather than
+    /// skipping it (see [`ServerImpl::cluster_publication_gate_wait`]).
+    gate_capable_peers: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     /// Test-only override for [`publication_gate_deadline`], so tests can
     /// exercise gate expiry deterministically in milliseconds rather than
     /// waiting out the full production re-drive budget.
@@ -4533,6 +4538,7 @@ impl ServerImpl {
             publication_gate,
             #[cfg(test)]
             publication_gate_deadline_override: Arc::new(std::sync::Mutex::new(None)),
+            gate_capable_peers: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             failed_opens: publication_gate::FailedOpens::default(),
             #[cfg(test)]
             fail_routing_pump_for_test: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -11567,13 +11573,24 @@ impl ServerImpl {
         if raft_enabled() {
             return false;
         }
-        !self.peers.has_peers()
-            || self
-                .peers
-                .all_peers_support(
-                    nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE,
-                )
-                .await
+        let topology = self.engine.topology();
+        let mut all = true;
+        for node in (0..topology.num_nodes()).filter(|&n| n != topology.node_id) {
+            match self.peers.link(node).await {
+                Ok(link)
+                    if link.supports(
+                        nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE,
+                    ) =>
+                {
+                    self.gate_capable_peers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(node);
+                }
+                _ => all = false,
+            }
+        }
+        all
     }
 
     /// The cluster-wide publication gate (#1845): waits — bounded by the gate
@@ -11584,10 +11601,16 @@ impl ServerImpl {
     /// one deadline (plus transport margin). Only peers advertising
     /// `FEATURE_CLUSTER_PUBLICATION_GATE` are asked — a peer that does not
     /// never answers a create early (see
-    /// [`Self::create_answers_before_routing`]), so it has nothing pending. An
-    /// unreachable or erroring peer is skipped best-effort, exactly like the
-    /// publish fan-out that would have to reach it: a node a publish cannot
-    /// reach is a node it cannot correlate on either.
+    /// [`Self::create_answers_before_routing`]), so it has nothing pending.
+    /// A probe failure on a peer known to serve the gate FAILS CLOSED
+    /// (`TimedOut`, a retryable rejection): a refused or malformed reply, a
+    /// transport error/timeout, or the peer becoming unreachable after this
+    /// node saw it advertise the feature. The pending open lives on the create
+    /// node while the subscription's target partition may sit on a third node
+    /// this publish CAN reach, so skipping the probe would let the publish
+    /// overtake the open and silently drop the message. Only a peer never seen
+    /// to serve the gate (e.g. down since this node started) is skipped, so a
+    /// dead node does not make every publish in the cluster unavailable.
     async fn cluster_publication_gate_wait(
         &self,
         name: &str,
@@ -11605,7 +11628,22 @@ impl ServerImpl {
                 let link = match self.peers.link(node).await {
                     Ok(link) => link,
                     Err(e) => {
-                        tracing::debug!(node, "publication gate: peer unreachable, skipped: {e}");
+                        let seen = self
+                            .gate_capable_peers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .contains(&node);
+                        if seen {
+                            tracing::warn!(
+                                node,
+                                "publication gate: gate-serving peer unreachable, failing closed: {e}"
+                            );
+                            return publication_gate::GateWait::TimedOut;
+                        }
+                        tracing::debug!(
+                            node,
+                            "publication gate: peer never seen serving the gate is unreachable, skipped: {e}"
+                        );
                         return publication_gate::GateWait::Clear;
                     }
                 };
@@ -11614,6 +11652,10 @@ impl ServerImpl {
                 {
                     return publication_gate::GateWait::Clear;
                 }
+                self.gate_capable_peers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(node);
                 match link
                     .await_pending_opens(name.to_string(), correlation_key.to_string(), deadline)
                     .await
@@ -11627,22 +11669,25 @@ impl ServerImpl {
                         .unwrap_or_else(|| {
                             tracing::warn!(
                                 node,
-                                "publication gate: malformed peer reply {:?}, skipped",
+                                "publication gate: malformed peer reply {:?}, failing closed",
                                 res.body
                             );
-                            publication_gate::GateWait::Clear
+                            publication_gate::GateWait::TimedOut
                         }),
                     Ok(res) => {
                         tracing::warn!(
                             node,
                             status = res.status,
-                            "publication gate: peer refused the probe, skipped"
+                            "publication gate: peer refused the probe, failing closed"
                         );
-                        publication_gate::GateWait::Clear
+                        publication_gate::GateWait::TimedOut
                     }
                     Err(e) => {
-                        tracing::warn!(node, "publication gate: peer probe failed, skipped: {e}");
-                        publication_gate::GateWait::Clear
+                        tracing::warn!(
+                            node,
+                            "publication gate: peer probe failed, failing closed: {e}"
+                        );
+                        publication_gate::GateWait::TimedOut
                     }
                 }
             });
@@ -57011,6 +57056,48 @@ mod subscription_placement_tests {
                 .expect("the publish applies");
         assert_eq!(correlated, Some(created.instance_key));
         assert!(!n0.publication_gate.is_pending("msg-a", &key_a));
+    }
+
+    /// #1845 (fail closed): once node 1 has seen node 0 serve the cluster
+    /// gate, a publish entering through node 1 cannot ask node 0's gate when
+    /// node 0 becomes unreachable, so it cannot know whether node 0
+    /// holds an early-answered pending open whose target partition node 1 can
+    /// still reach. The gate must fail closed (`TimedOut`, retryable), never
+    /// report `Clear` and let the publish overtake the open.
+    #[tokio::test]
+    async fn unreachable_peer_fails_the_cluster_gate_closed() {
+        let (n0, n1) = two_node_cluster().await;
+        n1.peers.fail_node(0).await;
+        assert_eq!(
+            n1.cluster_publication_gate_wait("msg-a", "k").await,
+            crate::publication_gate::GateWait::Clear,
+            "a peer never seen serving the gate cannot hold early-answered opens \
+             known to this node; skipping it keeps publishes available"
+        );
+        n1.peers.heal_node(0).await;
+        assert!(
+            n1.create_answers_before_routing().await,
+            "node 1 sees node 0 serve the cluster gate"
+        );
+        assert_eq!(
+            n1.cluster_publication_gate_wait("msg-a", "k").await,
+            crate::publication_gate::GateWait::Clear,
+            "a reachable, idle peer leaves the gate clear"
+        );
+        n1.peers.fail_node(0).await;
+        assert_eq!(
+            n1.cluster_publication_gate_wait("msg-a", "k").await,
+            crate::publication_gate::GateWait::TimedOut,
+            "an unreachable peer must fail the gate closed"
+        );
+        let refused = n1
+            .correlate_message_cluster("msg-a".into(), "k".into(), None, None, None)
+            .await;
+        assert!(
+            matches!(refused, Err(CorrelateError::SubscriptionOpenPending)),
+            "the publish must be rejected retryably, got {refused:?}"
+        );
+        drop(n0);
     }
 }
 
