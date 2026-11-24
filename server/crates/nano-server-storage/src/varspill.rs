@@ -464,32 +464,46 @@ impl Clone for RowPin {
 
 impl Drop for RowPin {
     fn drop(&mut self) {
-        // The pins lock is held across the deferred deletes (lock order:
-        // `pins` then `conn`), so a concurrent `put`/`put_cold` — which holds
-        // the same lock across its INSERT and undefer — is serialized with the
-        // release: it either undefers before the deletes are taken, or writes
-        // after they ran. Never in between, where the release would delete the
-        // fresh row (#1880).
         let mut pins = self.store.pins.lock().unwrap_or_else(|e| e.into_inner());
         pins.count = pins.count.saturating_sub(1);
-        if pins.count > 0 {
-            return;
-        }
-        let spill = std::mem::take(&mut pins.spill);
-        let cold = std::mem::take(&mut pins.cold);
-        // A key still deferred in both tables is an ordinary forget; one a
-        // rewrite took back out of a table is deleted from the other only.
-        let both: Vec<Key> = spill.intersection(&cold).copied().collect();
-        // A failure is latched (with its keys) in `forget_faults`, exactly as
-        // for an undeferred delete.
-        let _ = self.store.forget_now(&both);
-        for (table, keys) in [
-            (GcTable::Spill, spill.difference(&cold).copied().collect()),
-            (GcTable::Cold, cold.difference(&spill).copied().collect()),
-        ] {
-            self.store.delete_single_table(table, keys);
-        }
         drop(pins);
+        self.store.drain_deferred();
+    }
+}
+
+/// One bounded slice of the deferred-delete backlog (#1880), split by the
+/// table(s) each key's delete still applies to.
+#[derive(Default)]
+struct DeferredBatch {
+    /// Deferred in both tables: an ordinary forget.
+    both: Vec<Key>,
+    /// Deferred in `spill` only (its `cold` row was rewritten, or GC deferred
+    /// a spill-only orphan).
+    spill: Vec<Key>,
+    /// Deferred in `cold` only.
+    cold: Vec<Key>,
+}
+
+impl RowPins {
+    /// Takes up to `max` keys off the deferred sets, or `None` when empty.
+    fn take_batch(&mut self, max: usize) -> Option<DeferredBatch> {
+        let mut batch = DeferredBatch::default();
+        let mut taken = 0;
+        while taken < max {
+            if let Some(key) = self.spill.pop_first() {
+                if self.cold.remove(&key) {
+                    batch.both.push(key);
+                } else {
+                    batch.spill.push(key);
+                }
+            } else if let Some(key) = self.cold.pop_first() {
+                batch.cold.push(key);
+            } else {
+                break;
+            }
+            taken += 1;
+        }
+        (taken > 0).then_some(batch)
     }
 }
 
@@ -937,6 +951,33 @@ impl VarSpillStore {
         }
     }
 
+    /// Applies the deferred deletes once no [`RowPin`] is alive (#1880), in
+    /// [`FORGET_CHUNK`]-sized batches. Each batch is taken **and** deleted
+    /// under the pins lock (lock order: `pins` then `conn`), so a concurrent
+    /// `put`/`put_cold` — which holds the same lock across its INSERT and
+    /// undefer — either undefers its key before the batch is taken or writes
+    /// after the batch's delete ran: the drain never deletes a fresh row. The
+    /// lock is released between batches, so a large backlog never blocks
+    /// spills, retirements or pins for longer than one chunk. A pin taken
+    /// mid-drain stops it; that pin's own release drains the rest.
+    fn drain_deferred(&self) {
+        loop {
+            let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+            if pins.count > 0 {
+                return;
+            }
+            let Some(batch) = pins.take_batch(FORGET_CHUNK) else {
+                return;
+            };
+            // A failure is latched (with its keys) in `forget_faults`, exactly
+            // as for an undeferred delete.
+            let _ = self.forget_now(&batch.both);
+            self.delete_single_table(GcTable::Spill, batch.spill);
+            self.delete_single_table(GcTable::Cold, batch.cold);
+            drop(pins);
+        }
+    }
+
     /// Records `keys` for a deferred delete when a [`RowPin`] is alive.
     /// Returns whether it did (the caller then skips the immediate delete).
     fn defer_if_pinned(&self, keys: &[Key]) -> bool {
@@ -1292,6 +1333,21 @@ impl VarSpillStore {
                 .filter(|k| !live.contains(k) && !referenced.contains(k))
                 .collect();
             if !orphans.is_empty() {
+                // Serialized with snapshot pins (#1880): while a capture holds
+                // a pin, an orphan's delete is deferred to the pin's release,
+                // so the GC never reaps a row an in-flight snapshot still
+                // reads (e.g. a captured instance that terminated after the
+                // capture). The pins lock is held across the delete so a pin
+                // cannot be taken between the check and the delete.
+                let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+                if pins.count > 0 {
+                    collected += orphans.len() as u64;
+                    match deletes {
+                        GcTable::Spill => pins.spill.extend(orphans),
+                        GcTable::Cold => pins.cold.extend(orphans),
+                    }
+                    continue;
+                }
                 // Table- and partition-scoped delete: this pass reaps only its
                 // own table's orphan rows that THIS partition minted (see the
                 // fn-level docs for why both-tables / cross-partition deletion
@@ -1308,6 +1364,7 @@ impl VarSpillStore {
                 .inspect_err(|err| {
                     self.faults.record(err, orphans.clone());
                 })?;
+                drop(pins);
                 collected += deleted;
             }
         }
@@ -2081,6 +2138,95 @@ mod tests {
                 "iteration {i}: fresh spill row deleted by pin release"
             );
         }
+    }
+
+    // #1880 review: the orphan GC must honour snapshot pins like `forget`
+    // does — a captured row whose instance terminated after the capture is an
+    // orphan to the GC but still read by the in-flight snapshot writer.
+    #[test]
+    fn gc_orphans_defers_deletes_while_a_row_pin_is_held() {
+        let store = Arc::new(VarSpillStore::open(None).unwrap());
+        store.put_cold(1, &cold_snapshot(1, "a")).unwrap();
+        store.put(2, &vars("b")).unwrap();
+        let none = BTreeSet::new();
+        let pin = store.pin_rows();
+        assert_eq!(store.gc_orphans(&none, &none, 0).unwrap(), 2);
+        assert!(
+            store.try_get_cold(1).unwrap().is_some(),
+            "pinned cold row kept"
+        );
+        assert!(store.try_get(2).unwrap().is_some(), "pinned spill row kept");
+        drop(pin);
+        assert!(
+            store.try_get_cold(1).unwrap().is_none(),
+            "deferred GC applied"
+        );
+        assert!(store.try_get(2).unwrap().is_none(), "deferred GC applied");
+    }
+
+    // #1880 review: a GC-deferred single-table orphan is deleted from its own
+    // table only, and a row rewritten while pinned survives the deferred GC.
+    #[test]
+    fn gc_deferred_under_pin_is_table_scoped_and_undone_by_rewrite() {
+        let store = Arc::new(VarSpillStore::open(None).unwrap());
+        store.put_cold(1, &cold_snapshot(1, "a")).unwrap();
+        store.put(1, &vars("a")).unwrap();
+        store.put(2, &vars("b")).unwrap();
+        let none = BTreeSet::new();
+        // Key 1 is spill-referenced (its spill row protected) but not live:
+        // only its cold row is an orphan.
+        let referenced = BTreeSet::from([1]);
+        let pin = store.pin_rows();
+        store.gc_orphans(&none, &referenced, 0).unwrap();
+        store.put(2, &vars("b2")).unwrap();
+        drop(pin);
+        assert!(
+            store.try_get_cold(1).unwrap().is_none(),
+            "cold orphan reaped"
+        );
+        assert_eq!(
+            store.try_get(1).unwrap(),
+            Some(vars("a")),
+            "referenced spill row kept"
+        );
+        assert_eq!(
+            store.try_get(2).unwrap(),
+            Some(vars("b2")),
+            "rewrite survives"
+        );
+    }
+
+    // #1880 review: the release drains a backlog larger than one chunk in
+    // bounded batches.
+    #[test]
+    fn row_pin_release_drains_multi_chunk_backlog() {
+        let store = Arc::new(VarSpillStore::open(None).unwrap());
+        let n = (FORGET_CHUNK * 2 + 7) as u64;
+        for key in 1..=n {
+            store.put(key, &vars("v")).unwrap();
+        }
+        let pin = store.pin_rows();
+        store.forget(&(1..=n).collect::<Vec<_>>()).unwrap();
+        let mut batches = 0;
+        {
+            let pins = store.pins.lock().unwrap();
+            let mut probe = RowPins {
+                count: 0,
+                spill: pins.spill.clone(),
+                cold: pins.cold.clone(),
+            };
+            while let Some(b) = probe.take_batch(FORGET_CHUNK) {
+                assert!(b.both.len() <= FORGET_CHUNK);
+                batches += 1;
+            }
+        }
+        assert_eq!(batches, 3);
+        drop(pin);
+        for key in 1..=n {
+            assert!(store.try_get(key).unwrap().is_none(), "key {key} deleted");
+        }
+        let pins = store.pins.lock().unwrap();
+        assert!(pins.spill.is_empty() && pins.cold.is_empty());
     }
 
     #[test]

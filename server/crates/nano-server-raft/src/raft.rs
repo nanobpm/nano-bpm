@@ -11042,12 +11042,51 @@ mod tests {
                 }
             })
         };
-        for t in tasks {
-            t.await.expect("load task");
-        }
+        // Bounded: a fail-stopped follower pair loses quorum, which would
+        // otherwise park `propose` (and the completion pollers) forever
+        // instead of reporting the regression.
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            for t in tasks {
+                t.await.expect("load task");
+            }
+        })
+        .await
+        .expect("load phase timed out (quorum lost — a replica fail-stopped?)");
         compacting.store(false, Ordering::Relaxed);
         compactor.await.expect("compactor");
         wait_all_applied(&parts).await;
+        // Matching applied indices do not prove the snapshots succeeded: a
+        // snapshot storage error shuts the core down after its last apply.
+        // Force one more snapshot on every voter and wait (bounded) for its
+        // publication at the final applied index, then check core health.
+        for (id, p) in parts.iter().enumerate() {
+            let target = p.raft.metrics().borrow().last_applied.map(|l| l.index);
+            // A trigger landing while a build is in flight is a no-op, so
+            // re-trigger until the publication reaches the target.
+            let mut published = false;
+            for _ in 0..60 {
+                p.raft.trigger().snapshot().await.expect("trigger snapshot");
+                let raft = &p.raft;
+                if wait_until(500, || {
+                    raft.metrics().borrow().snapshot.map(|l| l.index) >= target
+                })
+                .await
+                {
+                    published = true;
+                    break;
+                }
+            }
+            assert!(
+                published,
+                "node {id} did not publish a snapshot at {target:?}: {:?}",
+                p.raft.metrics().borrow()
+            );
+            assert!(
+                p.raft.metrics().borrow().running_state.is_ok(),
+                "node {id} Raft core shut down: {:?}",
+                p.raft.metrics().borrow().running_state
+            );
+        }
         for (id, p) in parts.iter().enumerate() {
             assert_eq!(p.divergence(), None, "node {id} diverged");
         }
