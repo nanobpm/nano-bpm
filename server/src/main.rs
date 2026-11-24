@@ -49660,6 +49660,52 @@ mod clustered_startup_tests {
         }
     }
 
+    /// #1908 test control: terminate `key` on this replica's engine ONLY (it
+    /// stays resident), so a retirement frame reaping it proves the frame landed.
+    async fn terminate_on_replica(handle: &DeepthiHandle, key: nanobpmn_engine_core::Key) {
+        handle
+            .with(move |journal| {
+                let _ = journal
+                    .apply_command(nanobpmn_engine_core::Command::cancel_instance(key))
+                    .expect("the replica terminates the control instance");
+                assert!(
+                    journal.engine().state().instances.contains_key(&key),
+                    "the terminated control stays resident until retired"
+                );
+            })
+            .await;
+    }
+
+    /// Create instances on `node` until one lands on partition 0 (led by node 0;
+    /// creates are spread across partitions).
+    async fn create_on_partition0(node: &ServerImpl) -> nanobpmn_engine_core::Key {
+        for _ in 0..64 {
+            let (key, _c) = node
+                .create_for_stream(Some("intake".into()), None, Default::default())
+                .await
+                .expect("leader-durable create acks on the sole voter");
+            if nanobpmn_engine_core::partition_of(key) == 0 {
+                return key;
+            }
+        }
+        panic!("no create landed on partition 0");
+    }
+
+    /// Poll until `key` is gone from the replica — the retirement frame's
+    /// positive, observable effect.
+    async fn await_reaped(handle: &DeepthiHandle, key: nanobpmn_engine_core::Key) {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if !handle
+                .with(move |journal| journal.engine().state().instances.contains_key(&key))
+                .await
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the retirement frame never reaped the terminal control instance");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_retirement_digest_never_reaps_a_live_instance_from_a_lagging_follower() {
         // #1908: the leader broadcasts a retirement digest naming instances it
@@ -49672,12 +49718,12 @@ mod clustered_startup_tests {
         // applies.
         let (node0, node1, node2) = boot_rf3_leader_durable_cluster().await;
 
+        // A control instance, made terminal on the follower only: its reaping is
+        // the positive proof that the digest frame was processed.
+        let control = create_on_partition0(&node0).await;
+
         // Create on partition 0 (led by node 0). It ships to the learners.
-        let (instance_key, _c) = node0
-            .create_for_stream(Some("intake".into()), None, Default::default())
-            .await
-            .expect("leader-durable create acks on the sole voter");
-        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+        let instance_key = create_on_partition0(&node0).await;
 
         // Wait until node 1's replica engine has materialized the instance (it is
         // Active here — the learner never sees the leader-local completion).
@@ -49693,6 +49739,7 @@ mod clustered_startup_tests {
                         .state()
                         .instances
                         .contains_key(&instance_key)
+                        && journal.engine().state().instances.contains_key(&control)
                 })
                 .await
             {
@@ -49702,6 +49749,7 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(replicated, "the create ships to the learner replica engine");
+        terminate_on_replica(&learner_handle, control).await;
 
         // Simulate the leader completing + exporter-evicting the instance: the
         // exporter buffers its key for the retirement digest. Then run one digest
@@ -49712,12 +49760,12 @@ mod clustered_startup_tests {
             .unwrap()
             .entry(0)
             .or_default()
-            .push(instance_key);
+            .extend([control, instance_key]);
         node0.run_retirement_digest().await;
 
-        // Give the fire-and-forget frame ample time to land, then prove the live
-        // instance (Active on the learner) is still resident.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Await the frame's positive effect (the terminal control is reaped),
+        // then prove the live instance (Active on the learner) is still resident.
+        await_reaped(&learner_handle, control).await;
         assert!(
             learner_handle
                 .with(move |journal| {
@@ -49749,12 +49797,11 @@ mod clustered_startup_tests {
         // applies.
         let (node0, node1, node2) = boot_rf3_leader_durable_cluster().await;
 
+        // A lower-keyed control instance, terminated on the follower only: its
+        // reaping proves the watermark frame was processed.
+        let k0 = create_on_partition0(&node0).await;
         // A create on partition 0 (led by node 0); it ships to the learners.
-        let (k1, _c1) = node0
-            .create_for_stream(Some("intake".into()), None, Default::default())
-            .await
-            .expect("leader-durable create acks on the sole voter");
-        assert_eq!(nanobpmn_engine_core::partition_of(k1), 0);
+        let k1 = create_on_partition0(&node0).await;
 
         let learner_handle = node1
             .engine_handle_for(0)
@@ -49762,7 +49809,10 @@ mod clustered_startup_tests {
         let mut replicated = false;
         for _ in 0..LEADER_SHIP_POLL_ITERS {
             if learner_handle
-                .with(move |journal| journal.engine().state().instances.contains_key(&k1))
+                .with(move |journal| {
+                    let instances = &journal.engine().state().instances;
+                    instances.contains_key(&k0) && instances.contains_key(&k1)
+                })
                 .await
             {
                 replicated = true;
@@ -49771,6 +49821,8 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(replicated, "the create ships to the learner replica engine");
+        assert!(k0 < k1);
+        terminate_on_replica(&learner_handle, k0).await;
 
         // The owner runs ahead of the follower: it terminates + evicts `k1`
         // locally (an entry the follower has not applied), so its mark passes `k1`
@@ -49781,7 +49833,10 @@ mod clustered_startup_tests {
                 let _ = journal
                     .apply_command(nanobpmn_engine_core::Command::cancel_instance(k1))
                     .expect("the owner terminates k1");
-                journal.evict_instances(&[k1]);
+                let _ = journal
+                    .apply_command(nanobpmn_engine_core::Command::cancel_instance(k0))
+                    .expect("the owner terminates k0");
+                journal.evict_instances(&[k0, k1]);
                 assert!(journal.retirement_low_water() > k1);
             })
             .await;
@@ -49794,7 +49849,7 @@ mod clustered_startup_tests {
         // broadcasts the advanced low-water mark to the followers.
         node0.run_retirement_digest().await;
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        await_reaped(&learner_handle, k0).await;
         assert!(
             learner_handle
                 .with(move |journal| journal.engine().state().instances.contains_key(&k1))

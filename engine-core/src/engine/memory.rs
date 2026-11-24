@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// [`Engine::retire_below`] examines at most `max_remove * RETIRE_BELOW_SCAN_FACTOR`
+/// resident instances per call (never fewer than [`RETIRE_BELOW_MIN_SCAN`]), so a
+/// live backlog below the owner's mark costs bounded work per tick (#1908).
+const RETIRE_BELOW_SCAN_FACTOR: usize = 4;
+const RETIRE_BELOW_MIN_SCAN: usize = 64;
+
 /// The variable upserts produced by [`Engine::drain_dirty_vars`]: each dirty,
 /// resident (non-spilled) instance's key paired with a cheap `Arc` clone of its
 /// current variable map, for the host to serialize into the durable var store.
@@ -117,6 +123,7 @@ impl Engine {
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
+            retire_cursor: 0,
             dirty_vars: std::collections::BTreeSet::new(),
             forgotten_vars: std::collections::BTreeSet::new(),
             torn_down_scopes: std::collections::BTreeSet::new(),
@@ -395,17 +402,44 @@ impl Engine {
     /// live instances are never touched, exactly like
     /// [`Engine::retire_instances`].
     pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> Vec<Key> {
-        if self.state.instances.is_empty() || max_remove == 0 {
+        let scan_budget = max_remove
+            .saturating_mul(RETIRE_BELOW_SCAN_FACTOR)
+            .max(RETIRE_BELOW_MIN_SCAN);
+        self.retire_below_bounded(low_water, max_remove, scan_budget)
+    }
+
+    /// [`Engine::retire_below`] with an explicit bound on the number of
+    /// resident instances EXAMINED per call (not just reaped): a large live
+    /// backlog below the mark must not be rescanned in full every tick on the
+    /// single-writer actor. The scan resumes from a cursor and wraps to the
+    /// start once it reaches `low_water`, so a terminal instance behind a long
+    /// live prefix is still reached within a bounded number of calls.
+    pub(crate) fn retire_below_bounded(
+        &mut self,
+        low_water: Key,
+        max_remove: usize,
+        scan_budget: usize,
+    ) -> Vec<Key> {
+        if self.state.instances.is_empty() || max_remove == 0 || scan_budget == 0 {
             return Vec::new();
         }
-        let victims: BTreeSet<Key> = self
-            .state
-            .instances
-            .range(..low_water)
-            .map(|(&k, _)| k)
-            .filter(|&k| self.is_terminal_instance(k))
-            .take(max_remove)
-            .collect();
+        let start = if self.retire_cursor < low_water {
+            self.retire_cursor
+        } else {
+            0
+        };
+        let mut victims: BTreeSet<Key> = BTreeSet::new();
+        let mut next_cursor = 0; // wrap by default: the window reached `low_water`
+        for (examined, (&k, _)) in self.state.instances.range(start..low_water).enumerate() {
+            if examined == scan_budget || victims.len() == max_remove {
+                next_cursor = k;
+                break;
+            }
+            if self.is_terminal_instance(k) {
+                victims.insert(k);
+            }
+        }
+        self.retire_cursor = next_cursor;
         self.remove_instance_set(&victims);
         victims.into_iter().collect()
     }

@@ -243,6 +243,11 @@ pub struct Engine {
     /// unchanged); set by the host from `NANOBPMN_LEAN_SNAPSHOT`. Not part of the
     /// snapshot — it is pure host-side bookkeeping and never affects determinism.
     track_dirty_vars: bool,
+    /// Resumable scan position for [`Engine::retire_below`] (#1908): the next
+    /// key to examine, so each call examines a bounded window of the resident
+    /// backlog and successive calls sweep all of it. Host-side bookkeeping
+    /// only — not part of the snapshot, never affects determinism.
+    retire_cursor: Key,
     /// Instances whose process-level variables changed since the last
     /// [`drain_dirty_vars`](Engine::drain_dirty_vars) (i.e. since the last
     /// snapshot checkpoint). Only populated when [`track_dirty_vars`] is set.
@@ -745,6 +750,7 @@ impl Engine {
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
+            retire_cursor: 0,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),
@@ -925,6 +931,7 @@ impl Engine {
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
+            retire_cursor: 0,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),

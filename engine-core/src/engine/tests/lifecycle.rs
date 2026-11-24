@@ -3473,6 +3473,41 @@ fn retire_below_reaps_only_locally_terminal_instances_under_the_mark() {
     assert!(engine.retire_below(low_water, 100).is_empty(), "idempotent");
 }
 
+/// #1908: `retire_below` must bound the instances it EXAMINES per call, not
+/// only the ones it reaps — otherwise a large live backlog below the mark is
+/// rescanned in full every tick on the single-writer actor. The scan resumes
+/// from a cursor, so terminal instances behind a live prefix are still reached.
+#[test]
+fn retire_below_bounds_examined_instances_and_resumes_past_a_live_prefix() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let mut keys: Vec<Key> = (0..10).map(|_| create_order(&mut engine)).collect();
+    keys.sort_unstable();
+    // A live prefix of 8, then two terminal instances, all below the mark.
+    complete_order(&mut engine, keys[8]);
+    complete_order(&mut engine, keys[9]);
+    let low_water = keys[9] + 1;
+
+    // Budget 3: calls examine [0..3), [3..6), [6..9) — the third reaps keys[8].
+    assert!(engine.retire_below_bounded(low_water, 100, 3).is_empty());
+    assert!(engine.retire_below_bounded(low_water, 100, 3).is_empty());
+    assert_eq!(
+        engine.retire_below_bounded(low_water, 100, 3),
+        vec![keys[8]]
+    );
+    assert_eq!(
+        engine.retire_below_bounded(low_water, 100, 3),
+        vec![keys[9]]
+    );
+    // The cursor wraps: the live prefix is rescanned, nothing more is reaped.
+    assert!(engine.retire_below_bounded(low_water, 100, 3).is_empty());
+    for &k in &keys[..8] {
+        assert!(engine.instance(k).is_some(), "live instances are kept");
+    }
+}
+
 /// `retirement_low_water` is the smallest still-`Active` key (so a follower can
 /// drop everything below it), and the next mintable key once nothing is active
 /// (so a quiescent owner tells followers to drop their whole backlog).
