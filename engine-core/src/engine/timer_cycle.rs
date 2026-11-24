@@ -151,26 +151,38 @@ fn parse_start(raw: &str) -> Option<u64> {
     if body.contains('@') {
         return None;
     }
-    if !valid_start_syntax(body) {
-        return None;
-    }
-    let dt = DateTime::parse(body)?;
-    dt.time.offset_seconds?;
+    let (local, offset_secs) = split_start_offset(body)?;
+    // FEEL's offset parser keeps only hours and minutes, so the local
+    // date-time is read as UTC and the full (second-resolution) offset is
+    // applied here.
+    let dt = DateTime::parse(&format!("{local}Z"))?;
+    let millis = dt.epoch_nanos() / 1_000_000 - i128::from(offset_secs) * 1000;
     // A start before the epoch is simply overdue: fire immediately.
-    u64::try_from((dt.epoch_nanos() / 1_000_000).max(0)).ok()
+    u64::try_from(millis.max(0)).ok()
 }
 
 /// Strict `ZonedDateTime` clock/offset validation for a cycle start
 /// (`…Thh:mm[:ss[.f+]](Z|±hh:mm[:ss])`): FEEL's lenient date-time parser
 /// would otherwise normalise `24:30`, `:60` or an offset `+99:99`.
-fn valid_start_syntax(body: &str) -> bool {
-    let Some((_, rest)) = body.split_once('T') else {
-        return false;
-    };
-    let (clock, offset) = match rest.find(['Z', '+', '-']) {
-        Some(i) => rest.split_at(i),
-        None => return false,
-    };
+/// Returns the body without its offset and the offset in seconds.
+fn split_start_offset(body: &str) -> Option<(&str, i32)> {
+    let (date, rest) = body.split_once('T')?;
+    let (clock, offset) = rest.split_at(rest.find(['Z', '+', '-'])?);
+    if !valid_start_syntax(clock, offset) {
+        return None;
+    }
+    let local = &body[..date.len() + 1 + clock.len()];
+    if offset == "Z" {
+        return Some((local, 0));
+    }
+    let mut secs = 0i32;
+    for (part, unit) in offset[1..].split(':').zip([3600, 60, 1]) {
+        secs += part.parse::<i32>().ok()? * unit;
+    }
+    Some((local, if offset.starts_with('-') { -secs } else { secs }))
+}
+
+fn valid_start_syntax(clock: &str, offset: &str) -> bool {
     let two = |s: &str, max: u32| {
         s.len() == 2
             && s.bytes().all(|b| b.is_ascii_digit())
@@ -463,13 +475,21 @@ fn parse_dow(field: &str) -> Option<DayOfWeek> {
     let iso = |spring: u32| if spring == 0 { 7 } else { spring };
     let mut dow = DayOfWeek::default();
     for item in field.split(',') {
-        if let Some((day, k)) = item.split_once('#') {
+        if item == "L" {
+            // cron-utils treats a bare `L` weekday as plain weekday 7 (Sunday).
+            dow.days |= 1 << 7;
+        } else if let Some((day, k)) = item.split_once('#') {
             let day = iso(parse_value(day, 0, 7, &DAY_NAMES, 0)?);
             dow.nth.push((day, parse_value(k, 1, 5, &[], 0)?));
         } else if let Some(day) = item.strip_suffix('L').filter(|d| !d.is_empty()) {
             dow.last_of_month |= 1 << iso(parse_value(day, 0, 7, &DAY_NAMES, 0)?);
         } else {
-            let spring = parse_calendar_set(item, 0, 7, &DAY_NAMES)?;
+            // cron-utils maps a standalone step anchor of 7 to 0 (`7/2` == `0/2`).
+            let item = match item.strip_prefix("7/") {
+                Some(step) => format!("0/{step}"),
+                None => item.to_string(),
+            };
+            let spring = parse_calendar_set(&item, 0, 7, &DAY_NAMES)?;
             for d in 0..=7u32 {
                 if spring & (1 << d) != 0 {
                     dow.days |= 1 << iso(d);
@@ -492,6 +512,38 @@ mod tests {
 
     fn cron(expr: &str) -> Cron {
         Cron::parse(expr).unwrap_or_else(|| panic!("{expr} must parse"))
+    }
+
+    #[test]
+    fn start_offset_keeps_seconds() {
+        assert_eq!(
+            parse_start("2026-01-01T06:00:00+00:00:30"),
+            Some(at(2026, 1, 1, 5, 59, 30))
+        );
+        assert_eq!(
+            parse_start("2026-01-01T06:00:00-01:30:15"),
+            Some(at(2026, 1, 1, 7, 30, 15))
+        );
+        assert_eq!(
+            parse_start("2026-01-01T06:00+02:00"),
+            Some(at(2026, 1, 1, 4, 0, 0))
+        );
+    }
+
+    #[test]
+    fn bare_l_weekday_is_sunday() {
+        assert_eq!(cron("0 0 0 ? * L"), cron("0 0 0 ? * SUN"));
+        // 2026-01-01 is a Thursday; next Sunday is 2026-01-04.
+        assert_eq!(
+            cron("0 0 0 ? * L").next_after(at(2026, 1, 1, 0, 0, 0)),
+            Some(at(2026, 1, 4, 0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn weekday_step_anchor_seven_is_zero() {
+        assert_eq!(cron("0 0 0 ? * 7/2"), cron("0 0 0 ? * 0/2"));
+        assert_eq!(cron("0 0 0 ? * 7/2"), cron("0 0 0 ? * SUN,TUE,THU,SAT"));
     }
 
     #[test]
