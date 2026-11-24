@@ -103,7 +103,8 @@ jobs:
           # Push with the App token, not checkout's persisted GITHUB_TOKEN: a
           # GITHUB_TOKEN push does not trigger the PR's required CI (#1907).
           git config --unset-all http.https://github.com/.extraheader || true
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$branch"
+          gh auth setup-git
+          git push origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "parity(fuzz): minimal reproducers from seed $SEED" \
             --body "Recorded by the nightly differential fuzz (run ${{ github.run_id }}, seed $SEED). Each case links its filed parity issue. Part of #1240."
