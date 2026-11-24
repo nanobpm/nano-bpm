@@ -20,6 +20,12 @@
         "multi-instance-cancel-remaining (#1528)",
         "scalar-list-routing (#1755)"
       ]
+    },
+    {
+      "version": "0.12.0",
+      "entries": [
+        "scalar-list-routing (#1755)"
+      ]
     }
   ]
 }
