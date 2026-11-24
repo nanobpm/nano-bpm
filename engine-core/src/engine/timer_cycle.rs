@@ -502,6 +502,9 @@ fn parse_dow(field: &str) -> Option<DayOfWeek> {
                 }
             };
             let range = match range.split_once('-') {
+                // `0-7` / `SUN-7` spans the whole week (cron-utils keeps the
+                // inclusive endpoints): expand as `0-6`, not the aliased `0-0`.
+                Some((a, "7")) if alias(a) == "0" || a == "SUN" => format!("{}-6", alias(a)),
                 Some((a, b)) => format!("{}-{}", alias(a), alias(b)),
                 None => alias(range),
             };
@@ -563,6 +566,11 @@ mod tests {
         assert_eq!(cron("0 0 0 ? * FRI-MON/2"), cron("0 0 0 ? * FRI,SUN"));
         assert_eq!(cron("0 0 0 ? * 5-1/2"), cron("0 0 0 ? * 5-7/2"));
         assert_eq!(cron("0 0 0 ? * MON-7"), cron("0 0 0 ? * MON-SUN"));
+        // Full-week ranges spelled with the `7` Sunday alias stay full-week.
+        assert_eq!(cron("0 0 0 ? * 0-7"), cron("0 0 0 ? * *"));
+        assert_eq!(cron("0 0 0 ? * SUN-7"), cron("0 0 0 ? * *"));
+        assert_eq!(cron("0 0 0 ? * 0-7/2"), cron("0 0 0 ? * SUN,TUE,THU,SAT"));
+        assert_eq!(cron("0 0 0 ? * SUN-7/2"), cron("0 0 0 ? * SUN,TUE,THU,SAT"));
     }
 
     #[test]
