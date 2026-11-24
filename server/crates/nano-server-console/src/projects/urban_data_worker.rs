@@ -31,7 +31,15 @@
 //!   per-project wait queue is bounded (Busy back-pressure) and holds no
 //!   execution permit.
 //! - **Retired with its project**: deleting or renaming a project calls
-//!   [`retire_project_worker_blocking`], which drops the slot and kills the worker.
+//!   [`retire_project_worker_blocking`], which tombstones the path, kills the
+//!   idle *and* any in-flight worker's process group, and waits for every op on
+//!   the slot to leave before the directory is touched. Ops on a tombstoned path
+//!   fail fast and never spawn; a worker of a retired slot is never parked.
+//! - **Bounded protocol reads**: a stdout reply line longer than
+//!   [`MAX_REPLY_LINE_BYTES`] is a protocol error that kills the worker; stderr
+//!   is drained in bounded chunks.
+//! - **One request in flight per worker** (the project turn). That is what makes
+//!   accepting the worker's `{id:null}` parse-error reply as ours safe.
 //! - **Orphan-free**: the console holds the worker's stdin, so if the console
 //!   dies the worker sees EOF and exits; timeouts kill its whole process group.
 
@@ -41,7 +49,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use super::{DataError, DataGatewayLimiter};
@@ -52,6 +60,12 @@ const STDERR_TAIL_BYTES: usize = 2048;
 const RETIRE_GRACE: Duration = Duration::from_secs(2);
 /// An idle worker unused for this long is retired on the next sweep.
 const IDLE_TTL: Duration = Duration::from_secs(300);
+/// Longest stdout reply line accepted from a worker; longer is a protocol
+/// error (the worker is killed) rather than unbounded console memory.
+const MAX_REPLY_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// How long project retirement waits for in-flight ops (already killed) to
+/// leave the slot before failing the delete/rename closed.
+const RETIRE_DRAIN: Duration = Duration::from_secs(15);
 
 struct Worker {
     child: Child,
@@ -79,9 +93,24 @@ struct SlotInner {
     /// always evictable — even while an op holds the turn and waits for a
     /// permit (#1836: a locked-but-unadmitted worker must still count).
     idle: Mutex<Option<Worker>>,
+    /// The in-use worker's pid and the slot's retired flag. An op records its
+    /// worker here (and parks it) only while `retired` is false, under this
+    /// lock; retirement sets `retired` under it, so it sees — and kills —
+    /// every worker the slot will ever run.
+    active: Mutex<Active>,
+}
+
+#[derive(Default)]
+struct Active {
+    pid: Option<u32>,
+    retired: bool,
 }
 
 impl SlotInner {
+    fn active(&self) -> std::sync::MutexGuard<'_, Active> {
+        self.active.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn idle(&self) -> std::sync::MutexGuard<'_, Option<Worker>> {
         self.idle.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -92,15 +121,34 @@ type Slot = Arc<SlotInner>;
 /// The per-project worker slots, keyed on the canonical project directory.
 /// Owned by a [`DataGatewayLimiter`], so its budget bounds them.
 #[derive(Default)]
-pub(crate) struct WorkerRegistry(Mutex<HashMap<PathBuf, Slot>>);
+pub(crate) struct WorkerRegistry {
+    slots: Mutex<HashMap<PathBuf, Slot>>,
+    /// Paths whose directory is being deleted/renamed (count of concurrent
+    /// retirements). Always locked after `slots`.
+    tombstones: Mutex<HashMap<PathBuf, usize>>,
+}
 
 impl WorkerRegistry {
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Slot>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn tombstones(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, usize>> {
+        self.tombstones.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
     fn slot_for(&self, dir: &Path) -> Slot {
         self.map().entry(dir.to_path_buf()).or_default().clone()
+    }
+
+    /// The slot for `dir`, unless its directory is being deleted/renamed.
+    fn live_slot_for(&self, dir: &Path) -> Option<Slot> {
+        let mut map = self.map();
+        if self.tombstones().contains_key(dir) {
+            return None;
+        }
+        Some(map.entry(dir.to_path_buf()).or_default().clone())
     }
 
     /// Whether `slot` is still the registered slot for `dir`.
@@ -116,40 +164,96 @@ impl WorkerRegistry {
     }
 }
 
-/// Stop the project's worker (if any) and forget its slot: called when a
-/// project is deleted or renamed so no idle Node worker outlives it (nor holds
-/// its directory as CWD, which blocks removal on Windows). The kill and reap
-/// complete **before** this returns (bounded by `GATEWAY_REAP_GRACE`), so the
-/// caller's directory removal/move cannot race a dying worker that still
-/// pins the directory (#1836). It blocks the calling thread for that span;
-/// callers are synchronous filesystem operations. An op in flight on the slot
-/// keeps its worker until it finishes, then kills it instead of parking it,
-/// because the slot is no longer registered.
-pub(super) fn retire_project_worker_blocking(limiter: &DataGatewayLimiter, dir: &Path) {
-    // Callers key on the canonical dir; accept either spelling here.
-    let canon = dunce::canonicalize(dir).ok();
-    let removed: Vec<Slot> = {
-        let mut map = limiter.workers.map();
-        [Some(dir.to_path_buf()), canon]
-            .into_iter()
-            .flatten()
-            .filter_map(|k| map.remove(&k))
-            .collect()
-    };
-    for slot in removed {
-        let w = slot.idle().take();
-        if let Some(mut w) = w {
-            let _ticket = Reaping::new(limiter);
-            if let Some(pid) = w.child.id() {
-                super::kill_group_by_pid(pid);
-            }
-            let _ = w.child.start_kill();
-            let give_up = Instant::now() + super::GATEWAY_REAP_GRACE;
-            while !matches!(w.child.try_wait(), Ok(Some(_)) | Err(_)) && Instant::now() < give_up {
-                std::thread::sleep(Duration::from_millis(10));
+/// Holds a project path tombstoned while its directory is deleted/renamed:
+/// ops on it fail fast and spawn nothing. Dropping it lifts the tombstone.
+#[must_use = "the tombstone lifts when this guard drops"]
+pub(super) struct Retired<'a> {
+    registry: &'a WorkerRegistry,
+    keys: Vec<PathBuf>,
+}
+
+impl Drop for Retired<'_> {
+    fn drop(&mut self) {
+        let mut t = self.registry.tombstones();
+        for k in &self.keys {
+            if let Some(n) = t.get_mut(k) {
+                *n -= 1;
+                if *n == 0 {
+                    t.remove(k);
+                }
             }
         }
     }
+}
+
+fn kill_and_reap_blocking(limiter: &DataGatewayLimiter, mut w: Worker) {
+    let _ticket = Reaping::new(limiter);
+    if let Some(pid) = w.child.id() {
+        super::kill_group_by_pid(pid);
+    }
+    let _ = w.child.start_kill();
+    let give_up = Instant::now() + super::GATEWAY_REAP_GRACE;
+    while !matches!(w.child.try_wait(), Ok(Some(_)) | Err(_)) && Instant::now() < give_up {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Retire the project's worker(s) before its directory is deleted/renamed
+/// (#1836): tombstone the path (new ops fail fast, nothing is spawned), kill
+/// the idle worker and the **in-flight** one (whole process group), then wait
+/// (bounded by [`RETIRE_DRAIN`]) until every op has left the slot, so the
+/// directory operation sees no writer. Hold the returned guard for the length
+/// of the directory operation. Blocks the calling thread — call it from a
+/// blocking context. Fails closed (`WouldBlock`) if an op does not drain.
+pub(super) fn retire_project_worker_blocking<'a>(
+    limiter: &'a DataGatewayLimiter,
+    dir: &Path,
+) -> std::io::Result<Retired<'a>> {
+    // Callers key on the canonical dir; accept either spelling here.
+    let canon = dunce::canonicalize(dir).ok();
+    let mut keys = vec![dir.to_path_buf()];
+    keys.extend(canon.filter(|c| c != dir));
+    let removed: Vec<Slot> = {
+        let mut map = limiter.workers.map();
+        let mut t = limiter.workers.tombstones();
+        for k in &keys {
+            *t.entry(k.clone()).or_default() += 1;
+        }
+        keys.iter().filter_map(|k| map.remove(k)).collect()
+    };
+    let guard = Retired {
+        registry: &limiter.workers,
+        keys,
+    };
+    for slot in &removed {
+        let pid = {
+            let mut a = slot.active();
+            a.retired = true;
+            a.pid
+        };
+        if let Some(pid) = pid {
+            // The in-flight op sees EOF, fails, and leaves the slot.
+            super::kill_group_by_pid(pid);
+        }
+        let idle = slot.idle().take();
+        if let Some(w) = idle {
+            kill_and_reap_blocking(limiter, w);
+        }
+    }
+    let give_up = Instant::now() + RETIRE_DRAIN;
+    while removed
+        .iter()
+        .any(|s| s.waiters.load(Ordering::Acquire) > 0)
+    {
+        if Instant::now() >= give_up {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "project busy: a data operation did not stop in time",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(guard)
 }
 
 /// Live-process accounting for worker teardowns in flight: killed workers
@@ -300,12 +404,18 @@ fn spawn_worker(urban: &Path, dir: &Path, fingerprint: u64) -> Result<Worker, Da
     // a bounded tail for crash diagnostics.
     let tail = stderr_tail.clone();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            tracing::debug!(target: "data_worker", "{line}");
+        // Fixed-size chunks, never whole lines: a newline-free flood cannot
+        // grow console memory.
+        let mut stderr = stderr;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let chunk = String::from_utf8_lossy(&buf[..n]);
+            tracing::debug!(target: "data_worker", "{chunk}");
             let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
-            t.push_str(&line);
-            t.push('\n');
+            t.push_str(&chunk);
             if t.len() > STDERR_TAIL_BYTES {
                 let mut cut = t.len() - STDERR_TAIL_BYTES;
                 while !t.is_char_boundary(cut) {
@@ -393,11 +503,23 @@ async fn exchange(
     }
     let want = serde_json::json!(id);
     loop {
-        let mut buf = String::new();
-        let n = match w.stdout.read_line(&mut buf).await {
+        let mut raw = Vec::new();
+        let n = match (&mut w.stdout)
+            .take(MAX_REPLY_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut raw)
+            .await
+        {
             Ok(n) => n,
             Err(e) => return Err(with_stderr(w, format!("data worker read failed: {e}"))),
         };
+        if n > MAX_REPLY_LINE_BYTES {
+            // The caller kills a worker whose exchange failed.
+            return Err(with_stderr(
+                w,
+                format!("data worker reply line exceeds {MAX_REPLY_LINE_BYTES} bytes"),
+            ));
+        }
+        let buf = String::from_utf8_lossy(&raw);
         if n == 0 {
             let status = w.child.wait().await.ok();
             let msg = match status {
@@ -412,7 +534,9 @@ async fn exchange(
         }
         match serde_json::from_str::<serde_json::Value>(text) {
             // Our reply, or the worker's `{id:null, ok:false}` answer to a line
-            // it could not parse (only ever ours: one request is in flight).
+            // it could not parse. Only ever ours because the project turn keeps
+            // exactly one request in flight per worker — accepting `id:null`
+            // relies on that invariant.
             Ok(v)
                 if v.get("id") == Some(&want) || v.get("id") == Some(&serde_json::Value::Null) =>
             {
@@ -444,11 +568,13 @@ impl Drop for Waiting {
 /// needed to stop a hung or abandoned operation.
 struct InUse<'a> {
     limiter: &'a DataGatewayLimiter,
+    slot: Slot,
     worker: Option<Worker>,
 }
 
 impl Drop for InUse<'_> {
     fn drop(&mut self) {
+        self.slot.active().pid = None;
         if let Some(w) = self.worker.take() {
             kill_detached(self.limiter, w);
         }
@@ -475,7 +601,8 @@ pub(super) async fn run_serve_op(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
     let deadline = tokio::time::Instant::now() + limiter.timeout;
-    let slot = limiter.workers.slot_for(dir);
+    let retired = || DataError::NoProject;
+    let slot = limiter.workers.live_slot_for(dir).ok_or_else(retired)?;
     // Bound the per-project queue: at most one holder + `queue` waiters.
     let prev = slot.waiters.fetch_add(1, Ordering::AcqRel);
     let _waiting = Waiting(slot.clone());
@@ -500,8 +627,12 @@ pub(super) async fn run_serve_op(
         .await
         .map_err(|_| timed_out(limiter))??;
     // Take our worker first: from here it is counted by our permit.
+    if slot.active().retired {
+        return Err(retired());
+    }
     let mut use_ = InUse {
         limiter,
+        slot: slot.clone(),
         worker: slot.idle().take(),
     };
     enforce_resident_budget(limiter);
@@ -525,6 +656,16 @@ pub(super) async fn run_serve_op(
     if use_.worker.is_none() {
         use_.worker = Some(spawn_worker(urban, dir, fingerprint)?);
     }
+    {
+        // Publish the in-use pid so retirement can kill it; if the project
+        // was retired meanwhile, this worker must not run (InUse kills it).
+        let mut a = slot.active();
+        if a.retired {
+            drop(a);
+            return Err(retired());
+        }
+        a.pid = use_.worker.as_ref().and_then(|w| w.child.id());
+    }
     let result = match use_.worker.as_mut() {
         Some(w) => {
             let id = w.next_id;
@@ -540,9 +681,18 @@ pub(super) async fn run_serve_op(
     };
     let ok = matches!(result, Ok(Ok(_)));
     if let Some(w) = use_.worker.take() {
-        if ok && limiter.workers.is_registered(dir, &slot) {
-            *slot.idle() = Some(w);
-        } else {
+        // Parked under `active`, so retirement cannot miss it.
+        let reject = {
+            let mut a = slot.active();
+            a.pid = None;
+            if ok && !a.retired && limiter.workers.is_registered(dir, &slot) {
+                *slot.idle() = Some(w);
+                None
+            } else {
+                Some(w)
+            }
+        };
+        if let Some(w) = reject {
             // Failed/timed-out (possibly desynced) worker, or one whose
             // project was retired while this op ran: never park it.
             kill_worker(w).await;
@@ -721,7 +871,7 @@ mod tests {
         let a = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
             .await
             .unwrap();
-        retire_project_worker_blocking(&lim, &dir);
+        drop(retire_project_worker_blocking(&lim, &dir).unwrap());
         assert!(!lim.workers.map().contains_key(&dir), "slot not forgotten");
         let pid = a["pid"].as_i64().unwrap() as i32;
         // Retirement is complete on return (no polling): the caller removes
@@ -737,6 +887,103 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(a["pid"], b["pid"]);
+    }
+
+    /// #1836: deleting/renaming a project while an op is in flight kills the
+    /// in-flight worker's group and waits for the op to leave before the
+    /// directory is touched; while the path is tombstoned, a new op fails fast
+    /// and spawns nothing; once the tombstone lifts, ops work again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retire_kills_in_flight_worker_and_blocks_new_ops() {
+        let dir = project("retire-inflight");
+        let spawns = dir.join("spawns.txt");
+        let stub = gated_stub(&dir, &spawns, true);
+        let lim = Arc::new(limiter());
+        let (l, s, d) = (lim.clone(), stub.clone(), dir.clone());
+        let op = tokio::spawn(async move {
+            run_serve_op(&l, &s, &d, &serde_json::json!({"op":"write"})).await
+        });
+        let slot = lim.workers.slot_for(&dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let pid = loop {
+            if let Some(p) = slot.active().pid {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline, "op never started");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let (l, d) = (lim.clone(), dir.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let retire = tokio::task::spawn_blocking(move || {
+            let guard = retire_project_worker_blocking(&l, &d).unwrap();
+            // On return the op has left the slot: no writer remains.
+            assert_eq!(slot.waiters.load(Ordering::Acquire), 0);
+            // SAFETY: signal 0 only probes the (killed) group for existence.
+            assert_ne!(
+                unsafe { libc::kill(-(pid as i32), 0) },
+                0,
+                "worker group alive"
+            );
+            let _ = rx.blocking_recv();
+            drop(guard);
+        });
+        let r = op.await.unwrap();
+        assert!(
+            r.is_err(),
+            "in-flight op must fail when its project is retired: {r:?}"
+        );
+        // Mid-delete: the tombstone refuses the op before any spawn.
+        let before = spawn_count(&spawns);
+        while !lim.workers.tombstones().contains_key(&dir) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let mid = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"x"})).await;
+        assert!(matches!(mid, Err(DataError::NoProject)), "{mid:?}");
+        assert_eq!(spawn_count(&spawns), before, "op spawned mid-delete");
+        assert!(
+            !lim.workers.map().contains_key(&dir),
+            "slot re-created mid-delete"
+        );
+        tx.send(()).unwrap();
+        retire.await.unwrap();
+        assert!(lim.workers.tombstones().is_empty());
+        std::fs::write(dir.join("gate"), "").unwrap();
+        run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"x"}))
+            .await
+            .unwrap();
+    }
+
+    /// An over-long stdout line is a protocol error that kills the worker.
+    #[tokio::test]
+    async fn overlong_reply_line_kills_worker() {
+        let dir = project("overlong");
+        let stub = dir.join("urban-flood-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nread -r line\nhead -c {} /dev/zero | tr '\\0' a\necho\nsleep 30\n",
+                dir.join("pid").display(),
+                MAX_REPLY_LINE_BYTES + 10
+            ),
+        );
+        let lim = limiter();
+        let r = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"x"})).await;
+        assert!(
+            matches!(r, Err(DataError::Gateway(ref m)) if m.contains("exceeds")),
+            "{r:?}"
+        );
+        let pid: i32 = std::fs::read_to_string(dir.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes for existence.
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "flooding worker still alive"
+        );
+        assert!(lim.workers.slot_for(&dir).idle().is_none());
     }
 
     /// A project recreated at the same path gets a fresh worker even when the

@@ -4948,7 +4948,9 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     // resurrect as an imported project once its directory is gone.
     let workspace_dir = projects_root().join(name);
     // #1836: no `urban data --serve` worker may outlive (or pin) its project.
-    urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &dir);
+    // The guard keeps the path tombstoned (no op runs or spawns there) until
+    // the directory operation below is done.
+    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &dir)?;
     if workspace_dir.is_dir() {
         // Drop a coexisting ref before removing the directory; propagate an IO
         // error so a pointer that can't be removed can't silently resurrect the
@@ -4986,7 +4988,9 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     // external path and move the workspace project outside the root.
     let from = projects_root().join(old);
     // #1836: the worker is keyed on (and anchored in) the old directory.
-    urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &from);
+    // Held across the move: no op runs or spawns in `from` meanwhile.
+    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &from)
+        .map_err(|e| e.to_string())?;
     if !from.is_dir() {
         // A pure imported-by-reference project (no workspace dir) can't be
         // renamed by a directory move; remove and re-import under the new name.
