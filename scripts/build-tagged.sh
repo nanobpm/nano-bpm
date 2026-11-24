@@ -77,7 +77,11 @@ make -s generate
 
 # --- 2. Console SPA (cached by content hash of every SPA source tree) ----------
 if [ "$CONSOLE" = 1 ]; then
-  KEY=$( { git rev-parse "$FULL:console" "$FULL:process-explorer" "$FULL:engine-wasm" "$FULL:spec" "$FULL:server/crates/nano-search" "$FULL:read-model" "$FULL:engine-core" "$FULL:scripts" "$FULL:spec-patches" "$FULL:openapi-generator-config.yaml" "$FULL:Makefile"; } 2>/dev/null | sha256sum | cut -c1-16 )
+  # Hash each input separately: a ref predating an input (e.g. nano-search)
+  # gets a deterministic MISSING marker instead of aborting under pipefail.
+  KEY=$( for p in console process-explorer engine-wasm spec server/crates/nano-search read-model engine-core scripts spec-patches openapi-generator-config.yaml Makefile; do
+      git rev-parse --verify --quiet "$FULL:$p" 2>/dev/null || echo "MISSING:$p"
+    done | sha256sum | cut -c1-16 )
   CACHED_DIST="$DIST_CACHE/$KEY"
   if [ -d "$CACHED_DIST" ]; then
     echo "--- console/dist cache HIT ($KEY) ---"

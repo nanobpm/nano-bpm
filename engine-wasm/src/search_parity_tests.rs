@@ -188,16 +188,32 @@ fn check_filters(op: &Op) -> usize {
         // per-element filter properties.
         let is_array = op.sample[&prop].is_array();
         let wrap = |f: J| if is_array { json!([f]) } else { f };
-        let shorthand = json!({ "filter": { &prop: wrap(v.clone()) } }).to_string();
-        assert!(
-            compare(op, &shorthand).is_some(),
-            "{}: {shorthand} rejected",
-            op.name
-        );
+        // Every request carries the op's baseline filter (e.g. history's
+        // `commitStatus: PENDING`, without which every history query matches
+        // nothing); the tested property overrides it.
+        let with_base = |cond: J| {
+            let mut f = op.page_filter.clone();
+            f.as_object_mut()
+                .expect("page_filter is an object")
+                .insert(prop.clone(), cond);
+            json!({ "filter": f })
+        };
+        let shorthand = with_base(wrap(v.clone())).to_string();
+        let hit =
+            compare(op, &shorthand).unwrap_or_else(|| panic!("{}: {shorthand} rejected", op.name));
+        // A real fixture value must match rows, so the comparison is never
+        // two empty results.
+        if !op.sample[&prop].is_null() {
+            assert!(
+                !hit["items"].as_array().expect("items").is_empty(),
+                "{}: {shorthand} matched no rows",
+                op.name
+            );
+        }
         let mut bodies = Vec::new();
         for o in &ops {
             for operand in operands(o, &v) {
-                bodies.push(json!({ "filter": { &prop: wrap(json!({ o.as_str(): operand })) } }));
+                bodies.push(with_base(wrap(json!({ o.as_str(): operand }))));
             }
         }
         for body in bodies {
