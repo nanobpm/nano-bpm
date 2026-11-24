@@ -3488,6 +3488,8 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+mod urban_data_worker;
+
 /// Errors from the datasource gateway, mapped to HTTP status by the caller.
 #[derive(Debug)]
 pub enum DataError {
@@ -4268,13 +4270,20 @@ fn parse_data_gateway_output(out: std::process::Output) -> Result<serde_json::Va
         }));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut val: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
+    let val: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
         DataError::Gateway(gateway_output_parse_error(
             &e,
             out.stdout.len(),
             text.trim(),
         ))
     })?;
+    interpret_gateway_reply(val)
+}
+
+/// Interpret a parsed gateway reply object (`{ ok: true, … }` / `{ ok: false,
+/// error }`): the single place both the single-shot pipe and the long-lived
+/// `urban data --serve` worker ([`urban_data_worker`]) map a reply to a result.
+fn interpret_gateway_reply(mut val: serde_json::Value) -> Result<serde_json::Value, DataError> {
     let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     if !ok {
         let msg = val
@@ -4449,11 +4458,12 @@ async fn run_data_op_inner(
                         .to_string(),
                 )
             })?;
-            let mut cmd = Command::new(&urban);
-            // `urban data` reads the JSON request on stdin (root "." + manifest
-            // "nano.app.json" default), anchored at the project dir as CWD.
-            cmd.current_dir(&dir).arg("data");
-            return pipe_data_gateway(cmd, &request).await;
+            // #1836: every op goes through the project's one long-lived
+            // `urban data --serve` worker (NDJSON over stdin/stdout, anchored at
+            // the project dir as CWD; @nanobpm/urban >= 0.100.0), so a warm
+            // worker answers without starting a new Node process.
+            return urban_data_worker::run_serve_op(data_gateway_limiter(), &urban, &dir, &request)
+                .await;
         }
         DataGatewayPath::Embedded => {}
     }
@@ -12284,12 +12294,12 @@ mod tests {
         .unwrap();
 
         // The stub advertises the `urban data` op in `--help` (so the capability
-        // probe routes here), records its subcommand (`data`) + CWD, drains the
-        // request on stdin, and emits the gateway's `{ok:true,…}` reply.
+        // probe routes here), records its subcommand (`data --serve`) + CWD, and
+        // answers each NDJSON request line with the `{id,ok:true,…}` reply.
         let stub = root.join("urban-data-stub.sh");
         write_urban_stub(
             &stub,
-            "case \"$*\" in *--help*) printf 'urban data — datasource op gateway\\n'; exit 0;; esac\ncat >/dev/null\nprintf '{\"ok\":true,\"routed\":\"urban-data\"}\\n'\n",
+            "case \"$*\" in *--help*) printf 'urban data — datasource op gateway\\n'; exit 0;; esac\nwhile IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"ok\":true,\"routed\":\"urban-data\"}\\n' \"$id\"; done\n",
         );
         unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
 
@@ -12307,8 +12317,8 @@ mod tests {
         let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
         assert_eq!(
             sentinel.lines().next(),
-            Some("data"),
-            "urban not invoked with `data`: {sentinel:?}"
+            Some("data --serve"),
+            "urban not invoked as the `data --serve` worker: {sentinel:?}"
         );
         // …and the embedded `data-cli.ts` was never materialised for the Urban app.
         assert!(
