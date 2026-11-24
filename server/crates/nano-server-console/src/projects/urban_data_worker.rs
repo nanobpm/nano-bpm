@@ -35,6 +35,11 @@
 //!   idle *and* any in-flight worker's process group, and waits for every op on
 //!   the slot to leave before the directory is touched. Ops on a tombstoned path
 //!   fail fast and never spawn; a worker of a retired slot is never parked.
+//!   A retired slot stays discoverable until every op and teardown on it has
+//!   gone, so a retry after a timed-out retirement fails closed too.
+//! - **No replacement beside a survivor**: a worker that outlives its kill
+//!   grace keeps a hold on its slot; the next spawn for that project waits
+//!   (within the op deadline) until it has really exited.
 //! - **Bounded protocol reads**: a stdout reply line longer than
 //!   [`MAX_REPLY_LINE_BYTES`] is a protocol error that kills the worker; stderr
 //!   is drained in bounded chunks.
@@ -82,8 +87,12 @@ struct Worker {
 
 #[derive(Default)]
 struct SlotInner {
-    /// Ops waiting for (or holding) this project's turn.
+    /// Ops waiting for (or holding) this project's turn, plus teardowns
+    /// still owning one of the slot's processes.
     waiters: AtomicUsize,
+    /// Teardowns of this slot's workers that have not yet seen the process
+    /// exit. While non-zero no replacement worker is spawned (#1836).
+    unreaped: AtomicUsize,
     /// Serialises ops for one project (one request in flight per worker).
     /// Holds no process: waiting on it pins nothing.
     turn: tokio::sync::Mutex<()>,
@@ -126,6 +135,11 @@ pub(crate) struct WorkerRegistry {
     /// Paths whose directory is being deleted/renamed (count of concurrent
     /// retirements). Always locked after `slots`.
     tombstones: Mutex<HashMap<PathBuf, usize>>,
+    /// Slots removed by a retirement whose ops/teardowns may still be alive.
+    /// While any of them holds a waiter its path stays unavailable (no new
+    /// slot, no new retirement), even after a timed-out retirement lifted its
+    /// tombstone (#1836). Always locked after `tombstones`.
+    retiring: Mutex<HashMap<PathBuf, Vec<Slot>>>,
 }
 
 impl WorkerRegistry {
@@ -137,6 +151,25 @@ impl WorkerRegistry {
         self.tombstones.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn retiring(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Vec<Slot>>> {
+        self.retiring.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether a retired slot for `dir` still has an op or teardown alive;
+    /// prunes the drained ones.
+    fn retiring_busy(&self, dir: &Path) -> bool {
+        let mut r = self.retiring();
+        let Some(v) = r.get_mut(dir) else {
+            return false;
+        };
+        v.retain(|s| s.waiters.load(Ordering::Acquire) > 0);
+        if v.is_empty() {
+            r.remove(dir);
+            return false;
+        }
+        true
+    }
+
     #[cfg(test)]
     fn slot_for(&self, dir: &Path) -> Slot {
         self.map().entry(dir.to_path_buf()).or_default().clone()
@@ -145,7 +178,7 @@ impl WorkerRegistry {
     /// The slot for `dir`, unless its directory is being deleted/renamed.
     fn live_slot_for(&self, dir: &Path) -> Option<Slot> {
         let mut map = self.map();
-        if self.tombstones().contains_key(dir) {
+        if self.tombstones().contains_key(dir) || self.retiring_busy(dir) {
             return None;
         }
         Some(map.entry(dir.to_path_buf()).or_default().clone())
@@ -183,6 +216,10 @@ impl Drop for Retired<'_> {
                 }
             }
         }
+        // Forget retired slots that have drained (bounded bookkeeping).
+        for k in &self.keys {
+            self.registry.retiring_busy(k);
+        }
     }
 }
 
@@ -194,8 +231,7 @@ impl Drop for Retired<'_> {
 /// Returns whether the process exited within the grace.
 fn kill_and_reap_blocking(limiter: &DataGatewayLimiter, slot: &Slot, w: Worker) -> bool {
     let ticket = Reaping::new(limiter);
-    slot.waiters.fetch_add(1, Ordering::AcqRel);
-    let hold = Waiting(slot.clone());
+    let hold = ReapHold::new(slot);
     let budget = limiter.reaping.clone();
     let mut child = w.child;
     let pid = child.id();
@@ -257,7 +293,10 @@ pub(super) fn retire_project_worker_blocking<'a>(
         let mut t = limiter.workers.tombstones();
         // An overlapping retirement may still be draining this path's
         // worker: fail closed rather than let the directory op race it.
-        if keys.iter().any(|k| t.contains_key(k)) {
+        if keys
+            .iter()
+            .any(|k| t.contains_key(k) || limiter.workers.retiring_busy(k))
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "project busy: another delete/rename of it is in progress",
@@ -266,7 +305,18 @@ pub(super) fn retire_project_worker_blocking<'a>(
         for k in &keys {
             *t.entry(k.clone()).or_default() += 1;
         }
-        keys.iter().filter_map(|k| map.remove(k)).collect()
+        let removed: Vec<Slot> = keys.iter().filter_map(|k| map.remove(k)).collect();
+        // Keep them discoverable until they drain, whatever this call's
+        // outcome: a retry or a new op must not race a surviving worker.
+        if !removed.is_empty() {
+            let mut r = limiter.workers.retiring();
+            for k in &keys {
+                r.entry(k.clone())
+                    .or_default()
+                    .extend(removed.iter().cloned());
+            }
+        }
+        removed
     };
     let guard = Retired {
         registry: &limiter.workers,
@@ -417,8 +467,7 @@ impl Drop for Reaping {
 fn kill_detached(limiter: &DataGatewayLimiter, slot: &Slot, mut w: Worker) {
     let pid = w.child.id();
     let ticket = Reaping::new(limiter);
-    slot.waiters.fetch_add(1, Ordering::AcqRel);
-    let hold = Waiting(slot.clone());
+    let hold = ReapHold::new(slot);
     // The Unix group signal is a cheap syscall: send it now so the worker
     // stops at once, whatever happens to the background task.
     #[cfg(unix)]
@@ -588,8 +637,7 @@ async fn teardown_owned(
     graceful: bool,
 ) -> bool {
     let ticket = Reaping::new(limiter);
-    slot.waiters.fetch_add(1, Ordering::AcqRel);
-    let hold = Waiting(slot.clone());
+    let hold = ReapHold::new(slot);
     let budget = limiter.reaping.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -714,6 +762,42 @@ async fn exchange(
     }
 }
 
+/// Held by a teardown until its process has exited: keeps a waiter place on
+/// the slot (a retirement drain waits) and blocks a replacement spawn.
+struct ReapHold(Slot);
+impl ReapHold {
+    fn new(slot: &Slot) -> Self {
+        slot.waiters.fetch_add(1, Ordering::AcqRel);
+        slot.unreaped.fetch_add(1, Ordering::AcqRel);
+        Self(slot.clone())
+    }
+}
+impl Drop for ReapHold {
+    fn drop(&mut self) {
+        self.0.unreaped.fetch_sub(1, Ordering::AcqRel);
+        self.0.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Wait (until `deadline`) for every teardown of `slot`'s workers to see its
+/// process exit, so a replacement never runs beside a surviving predecessor.
+async fn await_predecessors_reaped(
+    limiter: &DataGatewayLimiter,
+    slot: &Slot,
+    deadline: tokio::time::Instant,
+) -> Result<(), DataError> {
+    while slot.unreaped.load(Ordering::Acquire) > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DataError::Gateway(format!(
+                "data gateway timed out after {:?}: previous data worker has not exited",
+                limiter.timeout
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
 /// Decrements a slot's waiter count when the op leaves (even if cancelled).
 struct Waiting(Slot);
 impl Drop for Waiting {
@@ -814,6 +898,9 @@ pub(super) async fn run_serve_op(
         }
     }
     if use_.worker.is_none() {
+        // A predecessor that outlived its kill grace still owns the project
+        // dir: no replacement until it is really gone.
+        await_predecessors_reaped(limiter, &slot, deadline).await?;
         use_.worker = Some(spawn_worker(urban, dir, fingerprint)?);
         #[cfg(test)]
         {
@@ -921,6 +1008,18 @@ mod tests {
                  done\n",
                 spawns = spawns.display()
             ),
+        );
+        stub
+    }
+
+    /// A worker that survives stdin EOF and ignores SIGTERM: only a real
+    /// SIGKILL stops it, so a test with `ignore_kill` set genuinely exercises
+    /// a worker that outlives teardown.
+    fn stubborn_stub(dir: &Path) -> PathBuf {
+        let stub = dir.join("urban-stubborn-stub.sh");
+        write_stub(
+            &stub,
+            "#!/bin/sh\ntrap '' TERM HUP\nwhile IFS= read -r line; do :; done\nwhile :; do sleep 0.05; done\n",
         );
         stub
     }
@@ -1102,7 +1201,8 @@ mod tests {
     async fn unreaped_idle_worker_blocks_retirement_and_holds_budget() {
         let dir = project("unreaped-idle");
         let spawns = dir.join("spawns.txt");
-        let stub = serve_stub(&dir, &spawns, 0);
+        let stub = stubborn_stub(&dir);
+        let serve = serve_stub(&dir, &spawns, 0);
         let lim = limiter();
         lim.reaping.ignore_kill.store(true, Ordering::Release);
         lim.reaping.short_waits.store(true, Ordering::Release);
@@ -1121,8 +1221,70 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "worker should be alive");
         assert_eq!(lim.reaping.count.load(Ordering::Acquire), 1);
         assert_eq!(slot.waiters.load(Ordering::Acquire), 1);
+        // The failed retirement lifted its tombstone, but the surviving
+        // worker keeps the path unavailable: a retry fails closed and a new
+        // op neither gets a slot nor spawns a replacement.
+        let retry = retire_project_worker_blocking(&lim, &dir);
+        assert!(
+            matches!(&retry, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "retry must fail closed while the worker lives"
+        );
+        drop(retry);
+        let op = run_serve_op(&lim, &serve, &dir, &serde_json::json!({"op":"schema"})).await;
+        assert!(matches!(op, Err(DataError::NoProject)), "{op:?}");
+        assert_eq!(
+            spawn_count(&spawns),
+            0,
+            "replacement spawned beside survivor"
+        );
         lim.reaping.ignore_kill.store(false, Ordering::Release);
         wait_released(&lim, &slot, pid).await;
+        // Once it is gone the path is usable again.
+        drop(retire_project_worker_blocking(&lim, &dir).unwrap());
+        run_serve_op(&lim, &serve, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+    }
+
+    /// #1836: restarting a project's worker never spawns the replacement while
+    /// the predecessor outlives its kill: the op waits (within its deadline)
+    /// until the predecessor is really gone, and only then spawns.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_waits_for_surviving_predecessor() {
+        let dir = project("restart-survivor");
+        let spawns = dir.join("spawns.txt");
+        let serve = serve_stub(&dir, &spawns, 0);
+        let lim = Arc::new(limiter());
+        lim.reaping.ignore_kill.store(true, Ordering::Release);
+        lim.reaping.short_waits.store(true, Ordering::Release);
+        let mut w = spawn_worker(&stubborn_stub(&dir), &dir, 0).unwrap();
+        w.in_flight = true; // forces a restart on the next op
+        let pid = w.child.id().unwrap() as i32;
+        let slot = lim.workers.slot_for(&dir);
+        *slot.idle() = Some(w);
+        let survivor_alive_at_spawn = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let seen = survivor_alive_at_spawn.clone();
+        *lim.after_spawn.lock().unwrap() = Some(Box::new(move |_| {
+            // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
+            seen.store(unsafe { libc::kill(pid, 0) } == 0, Ordering::Release);
+        }));
+        let l2 = lim.clone();
+        let sp = spawns.clone();
+        let release = tokio::spawn(async move {
+            // Well past the (short) kill grace: the op is now waiting.
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            assert_eq!(spawn_count(&sp), 0, "spawned before predecessor exited");
+            l2.reaping.ignore_kill.store(false, Ordering::Release);
+        });
+        let op = run_serve_op(&lim, &serve, &dir, &serde_json::json!({"op":"schema"})).await;
+        release.await.unwrap();
+        op.unwrap();
+        assert!(
+            !survivor_alive_at_spawn.load(Ordering::Acquire),
+            "replacement spawned beside a surviving predecessor"
+        );
+        assert_eq!(spawn_count(&spawns), 1);
     }
 
     /// #1836: the async teardown path keeps an unreaped worker's budget
@@ -1131,8 +1293,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unreaped_teardown_holds_budget_until_exit() {
         let dir = project("unreaped-teardown");
-        let spawns = dir.join("spawns.txt");
-        let stub = serve_stub(&dir, &spawns, 0);
+        let stub = stubborn_stub(&dir);
         let lim = limiter();
         lim.reaping.ignore_kill.store(true, Ordering::Release);
         lim.reaping.short_waits.store(true, Ordering::Release);
