@@ -376,29 +376,37 @@ jobs:
     name: Prune expired determinism allowlist entries
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    # Job-level: the workflow default is contents: read, and this job pushes
-    # its pruning branch.
+    # Job-level: the workflow default is contents: read. The push and the PR
+    # use the GitHub App token (its own installation permissions), so
+    # GITHUB_TOKEN needs nothing beyond read here.
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     steps:
+      # GitHub Actions may not create PRs with GITHUB_TOKEN ("GitHub Actions is
+      # not permitted to create or approve pull requests", #1907), and a
+      # GITHUB_TOKEN push/PR would not trigger the required CI anyway. Mint a
+      # short-lived GitHub App installation token instead. Fails closed (with
+      # an actionable error) when the App is not configured.
+      - name: Mint the release-automation GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
       - uses: actions/checkout@v5
-        # The PR branches from (and targets) main, not the tag. The token is
-        # persisted for the push, so prefer the PAT/App token (see GH_TOKEN).
+        # The PR branches from (and targets) main, not the tag. The App token
+        # is persisted for the push so the branch triggers CI.
         with:
           ref: main
-          token: ${{ secrets.ALLOWLIST_PRUNE_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
       - name: Open and queue the allowlist pruning PR
         env:
-          # A PR opened (or branch pushed) with GITHUB_TOKEN does not trigger
-          # the required pull_request CI, so the queue could never land it.
-          # ALLOWLIST_PRUNE_TOKEN (a repo-scoped GitHub App token or PAT with
-          # contents + pull-requests write) makes its checks run; without it
-          # the job still opens the PR and a human must re-trigger its CI.
-          GH_TOKEN: ${{ secrets.ALLOWLIST_PRUNE_TOKEN || secrets.GITHUB_TOKEN }}
+          # Never GITHUB_TOKEN here: it cannot create PRs (#1907). Pinned by
+          # scripts/no-github-token-pr-create.test.mjs.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ github.ref_name }}
         shell: bash
         run: |
