@@ -347,6 +347,9 @@ pub struct SpillStores {
     /// before the write fails closed (#1447), so the off-thread Raft snapshot
     /// writer still reports the orphan to the leader-propose machinery.
     pub absences: Option<crate::journal::OrphanInbox>,
+    /// Row pins taken at capture (#1880): they keep every captured off-heap
+    /// row readable until the write is done. See [`crate::varspill::RowPin`].
+    pub pins: Vec<crate::varspill::RowPin>,
 }
 
 /// Store-backed streaming write (#1337): the production entry point. Streams
@@ -384,6 +387,7 @@ pub fn write_streaming_snapshot_from_stores(
         varstore,
         legacy,
         absences,
+        pins: _pins,
     } = stores;
     write_streaming_snapshot(StreamWrite {
         path,
@@ -774,6 +778,7 @@ fn write_multi_streaming_snapshot_inner(
             varstore,
             legacy,
             absences,
+            pins: _pins,
         } = stores;
         // Reuse the single-partition spill-resolution closure logic per row.
         let resolve = |snap: &mut InstanceSnapshot| {
@@ -1531,6 +1536,7 @@ mod tests {
                 varstore: Some(varstore),
                 legacy: None,
                 absences: None,
+                pins: Vec::new(),
             },
             false,
         );
@@ -1588,6 +1594,7 @@ mod tests {
                 varstore: Some(varstore),
                 legacy: Some(cold),
                 absences: Some(absences.clone()),
+                pins: Vec::new(),
             },
             false,
         );
