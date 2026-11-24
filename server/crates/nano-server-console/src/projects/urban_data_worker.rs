@@ -528,13 +528,27 @@ pub(super) fn enforce_resident_budget(limiter: &DataGatewayLimiter) {
     idle.sort_by_key(|g| std::cmp::Reverse(g.0));
     for (i, (last, slot)) in idle.into_iter().enumerate() {
         if i >= allowed_idle || last.elapsed() >= IDLE_TTL {
-            let w = slot.idle().take();
-            if let Some(w) = w {
+            // Keep the idle mutex held through `kill_detached`, so its
+            // `ReapHold` is registered before any retirement can observe the
+            // slot empty with no waiters while the process is still alive.
+            let mut guard = slot.idle();
+            if let Some(w) = guard.take() {
                 tracing::debug!(pid = ?w.child.id(), "data worker evicted (resident budget)");
                 kill_detached(limiter, &slot, w);
             }
+            drop(guard);
         }
     }
+}
+
+/// Idle resident workers: live processes not counted by any permit.
+pub(super) fn idle_resident_count(limiter: &DataGatewayLimiter) -> usize {
+    limiter
+        .workers
+        .snapshot()
+        .into_iter()
+        .filter(|(_, slot)| slot.idle().is_some())
+        .count()
 }
 
 /// Identity of the toolkit + manifest + project directory a worker was started
@@ -1862,6 +1876,46 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), wait)
             .await
             .expect("capacity not released once the teardown completed");
+    }
+
+    /// Retained idle workers are live processes too: with concurrency 2, two
+    /// warm idle workers and one running op, evicting one leaves
+    /// `running + idle + reaping = 3`, so admission must wait for the
+    /// teardown rather than spawn a third (#1836).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_counts_retained_idle_workers() {
+        let lim = limiter();
+        lim.reaping.ignore_kill.store(true, Ordering::Release);
+        lim.reaping.short_waits.store(true, Ordering::Release);
+        let mut pids = Vec::new();
+        for tag in ["idle-a", "idle-b"] {
+            let dir = project(tag);
+            let w = spawn_worker(&stubborn_stub(&dir), &dir, 0).unwrap();
+            pids.push(w.child.id().unwrap());
+            *lim.workers.slot_for(&dir).idle() = Some(w);
+        }
+        let _permit = lim.acquire().await.unwrap();
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            lim.await_teardown_capacity(),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "spawned beside a retained idle worker and a pending teardown"
+        );
+        lim.reaping.ignore_kill.store(false, Ordering::Release);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            lim.await_teardown_capacity(),
+        )
+        .await
+        .expect("capacity not released once the teardown completed");
+        for pid in pids {
+            // SAFETY: best-effort cleanup of the test's own children.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
     }
 
     /// With a pending teardown the piped (embedded `data-cli.ts`) gateway refuses (Busy) instead of

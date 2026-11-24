@@ -3649,8 +3649,8 @@ impl DataGatewayLimiter {
     }
 
     /// Wait (while holding a permit) until the live-process budget has room
-    /// for the caller's process: `running ops + reaping teardowns <=
-    /// concurrency`. A permit freed by a cancelled op, or an idle worker just
+    /// for the caller's process: `running ops + idle resident workers +
+    /// reaping teardowns <= concurrency`. A permit freed by a cancelled op, or an idle worker just
     /// evicted, may still be a live process mid-teardown (Windows `taskkill`,
     /// reap); spawning before it is gone would exceed the bound (#1836).
     /// Callers bound this with their op deadline.
@@ -3659,13 +3659,22 @@ impl DataGatewayLimiter {
             let notified = self.reaping.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            // Evict any idle worker past the allowance (moving it into
+            // `reaping`, which notifies on exit), then count every live
+            // process: running, retained idle, and still-reaping.
+            urban_data_worker::enforce_resident_budget(self);
             let running = self
                 .concurrency
                 .saturating_sub(self.permits.available_permits());
-            if running + self.reaping.count.load(Ordering::Acquire) <= self.concurrency {
+            let live = running
+                + urban_data_worker::idle_resident_count(self)
+                + self.reaping.count.load(Ordering::Acquire);
+            if live <= self.concurrency {
                 return;
             }
-            notified.await;
+            // Idle workers returning/leaving do not notify: re-check on a
+            // short poll as well.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), notified).await;
         }
     }
 }
