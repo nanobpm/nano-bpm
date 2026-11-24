@@ -68,6 +68,14 @@ fn console_error(msg: &str) {
 /// without a conscious `TestEngine` decision.
 mod surface_parity;
 
+#[cfg(all(test, feature = "read-model", not(target_arch = "wasm32")))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only module (feature-gated, so the clippy.toml test exemptions do not apply)"
+)]
+mod search_parity_tests;
+
 /// A simulated engine instance bound to one modeler session.
 #[wasm_bindgen]
 pub struct TestEngine {

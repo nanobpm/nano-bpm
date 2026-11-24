@@ -52,6 +52,15 @@ nanobpmn-read-model = { path = "../read-model", default-features = false, featur
 # `required` lists (the source the published `readmodel-types` derive from).
 serde_yaml = "0.9"
 
+# Host-only: the server/WASM search parity guard (src/search_parity_tests.rs,
+# #1883) projects the same event log into the server's sharded `ReadModel` and
+# runs the gateway's body handling (serde + generated validation) beside the
+# WASM methods. Host target only: the server storage crate cannot build for
+# wasm32 (the engine-wasm-wasm32 clippy entry compiles dev-deps for wasm32).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+nano-server-storage = { path = "../server/crates/nano-server-storage" }
+validator = "0.20"
+
 [features]
 # Off-by-default. When enabled, `TestEngine` holds an in-memory `ReadStore` fed
 # from the same event log and exposes the REST read methods (`getFormByKey`,

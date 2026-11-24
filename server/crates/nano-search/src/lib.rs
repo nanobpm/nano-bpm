@@ -16,7 +16,7 @@ pub mod agent;
 pub mod convert;
 pub mod query;
 
-pub use nanobpm_gateway_rest::{models, types};
+pub use nanobpm_gateway_rest::{models, strict, types};
 
 /// Why a shared search pipeline failed.
 #[derive(Debug)]
@@ -51,61 +51,15 @@ pub fn parse_search_query<T>(json: &str) -> Result<Option<T>, String>
 where
     T: serde::de::DeserializeOwned + serde::Serialize + validator::Validate,
 {
-    let trimmed = json.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let raw: serde_json::Value =
-        serde_json::from_str(trimmed).map_err(|e| format!("invalid search query: {e}"))?;
-    let query: Option<T> =
-        serde_json::from_value(raw.clone()).map_err(|e| format!("invalid search query: {e}"))?;
+    // The SAME strict decoder the gateway's `StrictOptionalJson` extractor
+    // runs (generated `strict` module), so the two surfaces cannot drift.
+    let query = nanobpm_gateway_rest::strict::decode_strict::<T>(json.as_bytes())
+        .map_err(|e| format!("invalid search query: {e}"))?;
     if let Some(q) = &query {
-        let canonical =
-            serde_json::to_value(q).map_err(|e| format!("invalid search query: {e}"))?;
-        reject_unknown_properties(&raw, &canonical, "")?;
         q.validate()
             .map_err(|e| format!("invalid search query: {e}"))?;
     }
     Ok(query)
-}
-
-/// Every non-null property of `raw` must survive the round trip through the
-/// generated model (`canonical`); one that does not is unknown to the spec.
-fn reject_unknown_properties(
-    raw: &serde_json::Value,
-    canonical: &serde_json::Value,
-    path: &str,
-) -> Result<(), String> {
-    use serde_json::Value;
-    match (raw, canonical) {
-        (Value::Object(r), Value::Object(c)) => {
-            for (key, value) in r {
-                if value.is_null() {
-                    continue;
-                }
-                let here = if path.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{path}.{key}")
-                };
-                match c.get(key) {
-                    Some(cv) => reject_unknown_properties(value, cv, &here)?,
-                    None => {
-                        return Err(format!(
-                            "invalid search query: unknown property `{here}` (not in the spec)"
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        (Value::Array(r), Value::Array(c)) if r.len() == c.len() => {
-            r.iter().zip(c).enumerate().try_for_each(|(i, (rv, cv))| {
-                reject_unknown_properties(rv, cv, &format!("{path}[{i}]"))
-            })
-        }
-        _ => Ok(()),
-    }
 }
 
 #[cfg(test)]
