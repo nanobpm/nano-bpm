@@ -247,10 +247,34 @@ impl Commit {
         drop(self.into_inner());
     }
 
+    /// Runs `f` with the drop bomb disarmed on this thread (#1855): every
+    /// `Pending` commit dropped inside `f` is treated as [`detach`](Self::detach)ed.
+    ///
+    /// For generic plumbing that must discard a value which *may* own commit
+    /// receipts it cannot name — e.g. an engine-actor reply whose caller was
+    /// cancelled before delivery. The command already ran and its write is
+    /// in flight; nobody is left to observe its durability, so abandoning the
+    /// receipt is exactly as safe as an explicit `detach`. Nests correctly.
+    pub fn detaching<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DETACH_SCOPE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(DETACH_SCOPE.with(|c| c.replace(true)));
+        f()
+    }
+
     /// Moves the inner state out, disarming the drop bomb.
     fn into_inner(mut self) -> CommitInner {
         std::mem::replace(&mut self.0, CommitInner::Ready)
     }
+}
+
+thread_local! {
+    // Set inside `Commit::detaching`: pending commits dropped there are detached.
+    static DETACH_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Drop bomb (#1855): in debug/test builds, dropping a `Pending` commit without
@@ -263,6 +287,7 @@ impl Drop for Commit {
     fn drop(&mut self) {
         if cfg!(debug_assertions)
             && matches!(self.0, CommitInner::Pending(_))
+            && !DETACH_SCOPE.with(|c| c.get())
             && !std::thread::panicking()
         {
             panic!(
@@ -5559,6 +5584,20 @@ mod tests {
         Commit::from_ack(rx).blocking_wait();
         drop(Commit::ready());
         drop(Commit::failed());
+    }
+
+    #[test]
+    fn pending_commits_dropped_inside_a_detaching_scope_are_silent() {
+        let (_tx, rx) = oneshot::channel::<()>();
+        let pending = Commit::from_ack(rx);
+        Commit::detaching(move || drop(pending));
+        // Nested scopes restore the outer state, and the scope ends afterwards.
+        Commit::detaching(|| Commit::detaching(|| ()));
+        let armed = std::panic::catch_unwind(|| {
+            let (_tx, rx) = oneshot::channel::<()>();
+            drop(Commit::from_ack(rx));
+        });
+        assert_eq!(armed.is_err(), cfg!(debug_assertions), "bomb re-armed");
     }
 
     #[cfg(debug_assertions)]

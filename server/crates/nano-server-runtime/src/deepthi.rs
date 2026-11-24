@@ -564,7 +564,12 @@ impl DeepthiHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let job: Job = Box::new(move |journal| {
             // A dropped receiver (caller cancelled) is fine; the command still ran.
-            let _ = reply_tx.send(f(journal));
+            // The undeliverable reply may own pending commit receipts; nobody is
+            // left to wait on them, so drop it as detached rather than tripping
+            // the #1855 drop bomb on (and killing) the engine thread.
+            if let Err(undelivered) = reply_tx.send(f(journal)) {
+                crate::journal::Commit::detaching(move || drop(undelivered));
+            }
         });
         self.mb.push(Priority::High, job);
         // `Err` means the sender was dropped without answering: the actor is
@@ -595,7 +600,12 @@ impl DeepthiHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let job: Job = Box::new(move |journal| {
             // A dropped receiver (caller cancelled) is fine; the command still ran.
-            let _ = reply_tx.send(f(journal));
+            // The undeliverable reply may own pending commit receipts; nobody is
+            // left to wait on them, so drop it as detached rather than tripping
+            // the #1855 drop bomb on (and killing) the engine thread.
+            if let Err(undelivered) = reply_tx.send(f(journal)) {
+                crate::journal::Commit::detaching(move || drop(undelivered));
+            }
         });
         self.mb.push(priority, job);
         // A `None` here means the engine thread unwound mid-command (its
@@ -716,6 +726,34 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("condition not met within 3s");
+    }
+
+    /// #1855: a caller cancelled before its reply is delivered must not let the
+    /// undeliverable reply's pending `Commit` trip the drop bomb on (and kill)
+    /// the engine thread.
+    #[test]
+    fn cancelled_request_with_pending_commit_keeps_actor_alive() {
+        let h = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats = Arc::clone(h.stats());
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        h.spawn_job(move |_journal| {
+            let _ = gate_rx.recv();
+        });
+        let (_ack_tx, ack_rx) = oneshot::channel::<()>();
+        use std::future::Future;
+        let mut fut = Box::pin(h.with_priority(Priority::High, move |_journal| {
+            crate::journal::Commit::from_ack(ack_rx)
+        }));
+        // Poll once so the job is enqueued, then cancel the caller.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        drop(fut);
+        gate_tx.send(()).expect("release gate");
+        wait_until(|| stats.jobs.load(Ordering::Relaxed) >= 2);
+        h.spawn_job(|_journal| {});
+        wait_until(|| stats.jobs.load(Ordering::Relaxed) >= 3);
+        assert!(stats.alive.load(Ordering::Relaxed), "actor survived");
     }
 
     #[test]

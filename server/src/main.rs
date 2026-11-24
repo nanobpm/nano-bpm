@@ -33425,17 +33425,21 @@ async fn main() {
                             // Without Raft this journal is the partition's only
                             // replica: reconcile the lenient flag directly (#1661).
                             reconcile_lenient_completion_local(journal, lenient, now);
-                            let (fired, _commit) = journal.trigger_timers(now);
+                            let (fired, commit) = journal.trigger_timers(now);
+                            // Fire-and-forget tick: nothing reads disk after it and
+                            // follow-ups are re-derived from engine state (#1855).
+                            commit.detach();
                             #[allow(
                                 clippy::expect_used,
                                 reason = "invariant by construction: ExpireJobsByDurability is an internal timer-driven command that cannot be rejected"
                             )]
-                            let (leased_expired, _lease_commit) = journal
+                            let (leased_expired, lease_commit) = journal
                                 .apply_command_at(
                                     Command::ExpireJobsByDurability { now, durable: true },
                                     now,
                                 )
                                 .expect("expiry cannot reject");
+                            lease_commit.detach();
                             let expired = journal.expire_jobs(now);
                             // Shed to disk if hot RAM is over the high-water mark
                             // (cheap no-op below it / when unset): active-backlog
