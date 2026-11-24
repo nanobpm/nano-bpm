@@ -3492,6 +3492,11 @@ pub struct ServerImpl {
     /// and consumed on the next park — the dispatcher never sleeps to the
     /// backstop tick while there is pushable work. See [`signal_jobs_available`].
     dispatch_wake: Arc<tokio::sync::Notify>,
+    /// Serializes deployment owners (#1855): each detached deploy owner holds
+    /// this across the deploy-actor apply, commit wait and partition fan-out, so
+    /// an identical retry (which emits no events) cannot return success while a
+    /// cancelled predecessor's fan-out of the same definition is still running.
+    deploy_pipeline: Arc<tokio::sync::Mutex<()>>,
     /// Notified by the read-model exporter after every projected batch, so an
     /// `awaitCompletion` create request can wake the moment its instance reaches
     /// a terminal state (the exporter is the single point through which all
@@ -4474,6 +4479,7 @@ impl ServerImpl {
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
+            deploy_pipeline: Arc::new(tokio::sync::Mutex::new(())),
             instances_changed: Arc::new(tokio::sync::Notify::new()),
             backpressure,
             sla_mode,
@@ -18643,6 +18649,10 @@ impl ServerImpl {
                         ))
                     };
                 let task = tokio::spawn(async move {
+                    // Held until the fan-out finishes: a retry's owner queues
+                    // behind any in-flight (possibly cancelled) deploy, so its
+                    // success implies every earlier apply is fully replicated.
+                    let _serial = owner.deploy_pipeline.clone().lock_owned().await;
                     let (
                         events,
                         commit,
@@ -53276,6 +53286,9 @@ mod subscription_placement_tests {
         )
         .await;
         // An identical retry must leave every partition able to instantiate it.
+        // Deploy owners are serialized (`deploy_pipeline`), so the retry
+        // returns only after the cancelled owner's fan-out (if it applied
+        // first) has completed — the assertions below are race-free.
         server
             .deploy_resources_locally(vec![proc], &names, Vec::new(), &empty, "<default>")
             .await
