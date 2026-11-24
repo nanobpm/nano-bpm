@@ -418,6 +418,11 @@ STRICT_JSON_EXTRACTOR = """
 /// `scripts/postprocess-generated.py`, #1883): like `OptionalJson`, but a
 /// property the spec does not define is a 400, via the same
 /// `crate::strict::decode_strict` the in-browser engine uses.
+///
+/// Body buffering, the empty-body acceptance and the JSON `Content-Type`
+/// check (415) are DELEGATED to `OptionalJson`, so the two extractors cannot
+/// drift on those rules. A strict rejection answers with the spec's error
+/// contract: an `application/problem+json` `ProblemDetail`.
 #[derive(Debug, Clone, Default)]
 pub struct StrictOptionalJson<T>(pub Option<T>);
 
@@ -429,15 +434,34 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        use axum::response::IntoResponse;
-
-        let bytes = <Bytes as FromRequest<S>>::from_request(req, state)
-            .await
-            .map_err(IntoResponse::into_response)?;
+        let OptionalJson(raw) =
+            <OptionalJson<serde_json::Value> as FromRequest<S>>::from_request(req, state).await?;
+        let Some(raw) = raw else {
+            return Ok(StrictOptionalJson(None));
+        };
+        let bytes = serde_json::to_vec(&raw).map_err(|e| strict_rejection(e.to_string()))?;
         crate::strict::decode_strict(&bytes)
             .map(StrictOptionalJson)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())
+            .map_err(strict_rejection)
     }
+}
+
+/// A strict-decode rejection as the spec's 400 `ProblemDetail`.
+fn strict_rejection(detail: String) -> Response {
+    use axum::response::IntoResponse;
+
+    let problem = models::ProblemDetail::new(
+        "Bad Request".to_string(),
+        400,
+        detail,
+        String::new(),
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
+        axum::Json(problem),
+    )
+        .into_response()
 }
 """
 

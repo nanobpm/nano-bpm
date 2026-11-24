@@ -436,9 +436,21 @@ print-wasm-pack-version: ## Print the pinned wasm-pack version (used by .github/
 # CC_/AR_wasm32_unknown_unknown wins; empty when no toolchain is found.
 # The read-model variant searches through the shared nanobpmn-search crate,
 # which depends on the MODELS-ONLY build of the git-ignored generated/ REST crate
-# (#1883). Generate it when absent (needs Java + uv, like `make generate`); a
-# phony recipe step, not a file prerequisite, so it works from a spaced path.
-WASM_REST_CODEGEN = test -f "$(PROJECT_ROOT)/generated/Cargo.toml" || "$(PROJECT_ROOT)/scripts/generate.sh"
+# (#1883). Generate it when absent OR STALE — any codegen input (spec, spec
+# patches, generator config, generate/preprocess/postprocess scripts) newer than
+# generated/Cargo.toml — so a checkout generated before a generator change is
+# refreshed, never trusted on mere existence (needs Java + uv, like
+# `make generate`). A phony recipe step, not a file prerequisite, so it works
+# from a spaced path. Cargo resolves optional path deps even with the feature
+# off, so EVERY engine-wasm cargo invocation runs this first.
+WASM_REST_CODEGEN = m="$(PROJECT_ROOT)/generated/Cargo.toml"; \
+	if [ ! -f "$$m" ] || [ -n "$$(find "$(PROJECT_ROOT)/spec" "$(PROJECT_ROOT)/spec-patches" \
+		"$(PROJECT_ROOT)/openapi-generator-config.yaml" "$(PROJECT_ROOT)/scripts/generate.sh" \
+		"$(PROJECT_ROOT)/scripts/preprocess-spec.py" "$(PROJECT_ROOT)/scripts/postprocess-generated.py" \
+		"$(PROJECT_ROOT)/scripts/lib-openapi-generator.sh" \
+		-newer "$$m" -print 2>/dev/null | head -n 1)" ]; then \
+		"$(PROJECT_ROOT)/scripts/generate.sh"; \
+	fi
 
 WASM_READ_MODEL_ENV = $(shell "$(PROJECT_ROOT)/scripts/wasm-cc-env.sh")
 
@@ -491,7 +503,8 @@ engine-wasm-event-subprocess-e2e: console-wasm ## Run the event sub-process end-
 	cd "$(WASM_DIR)/tests/event-subprocess-e2e" && npm install && npm test
 
 .PHONY: engine-wasm-check
-engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)
+engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target, and Java + uv to generate the REST models crate when absent/stale)
+	@$(WASM_REST_CODEGEN)
 	cd "$(WASM_DIR)" && cargo check --target wasm32-unknown-unknown
 
 .PHONY: engine-wasm-check-read-model
