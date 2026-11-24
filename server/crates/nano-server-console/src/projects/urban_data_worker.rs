@@ -170,7 +170,7 @@ impl WorkerRegistry {
         true
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn slot_for(&self, dir: &Path) -> Slot {
         self.map().entry(dir.to_path_buf()).or_default().clone()
     }
