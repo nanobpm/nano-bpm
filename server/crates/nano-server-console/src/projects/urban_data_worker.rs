@@ -147,6 +147,18 @@ impl From<Option<u32>> for Tree {
     }
 }
 
+impl Tree {
+    /// Whether liveness comes from a Job Object. A job's `ActiveProcesses`
+    /// counts only running members (Windows has no zombies), so a nonempty
+    /// job is never released on the zombie grace (#1879).
+    fn job_backed(&self) -> bool {
+        #[cfg(windows)]
+        return self.job.is_some();
+        #[cfg(not(windows))]
+        false
+    }
+}
+
 /// Windows Job Object containment for a data worker's tree (#1879): the
 /// counterpart of the Unix process group. The job is created with
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so dropping the last handle kills any
@@ -579,7 +591,7 @@ impl ZombieGrace {
             self.eperm_warned = true;
             warn_eperm(pid);
         }
-        if !leader_reaped || liveness != Liveness::Signalable {
+        if !leader_reaped || liveness != Liveness::Signalable || pid.job_backed() {
             self.since = None;
             return false;
         }
@@ -2815,19 +2827,11 @@ mod windows_tests {
     async fn exited_launcher_descendant_is_contained_and_killed() {
         let budget = Arc::new(ReapBudget::default());
         let mut cmd = Command::new("cmd");
-        cmd.args([
-            "/C",
-            "start",
-            "\"\"",
-            "/B",
-            "ping",
-            "-n",
-            "120",
-            "127.0.0.1",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        cmd.args(["/C", "start", "", "/B", "ping", "-n", "120", "127.0.0.1"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
         let mut child = cmd.spawn().unwrap();
         let tree = Tree::contain(&child);
         assert!(tree.job.is_some(), "launcher not assigned to a job");
@@ -2835,6 +2839,12 @@ mod windows_tests {
         // The launcher is gone; its descendant must still count as live.
         assert_eq!(budget.liveness(&tree), Liveness::Signalable);
         assert!(!worker_gone(&budget, &mut child, &tree));
+        // A nonempty job with its launcher reaped never expires the zombie
+        // grace: Windows has no zombies, so the holds stay until it empties.
+        let mut grace = ZombieGrace::default();
+        let t0 = Instant::now();
+        assert!(!grace.expired(&budget, &tree, true, t0));
+        assert!(!grace.expired(&budget, &tree, true, t0 + ZOMBIE_GRACE * 10));
         assert!(kill_tree(&budget, &mut child, &tree).await);
         assert_eq!(budget.liveness(&tree), Liveness::Gone);
         assert!(worker_gone(&budget, &mut child, &tree));
@@ -2864,6 +2874,7 @@ mod windows_tests {
     async fn dropping_the_job_kills_the_tree() {
         let mut child = Command::new("ping")
             .args(["-n", "120", "127.0.0.1"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED)
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
