@@ -155,9 +155,7 @@ impl Engine {
     }
 
     /// Resumes a paused session, running until the next breakpoint or, if none
-    /// fires, to quiescence — at which point the post-drain tail
-    /// ([`finish_command`](Self::finish_command)) runs and the session is no longer
-    /// paused. A no-op on an already-finished session.
+    /// fires, to quiescence — at which point the session is no longer paused. A no-op on an already-finished session.
     pub fn debug_resume(&mut self, session: &mut DebugSession) {
         let Some(paused) = session.paused.take() else {
             return;
@@ -183,12 +181,11 @@ impl Engine {
 
     /// Stores the outcome of a `run_with` back into the session: either it paused
     /// (carry the state forward) or it drained, in which case the command's
-    /// post-drain tail runs exactly once.
+    /// per-command deadline stamps are dropped exactly once.
     fn settle(&mut self, session: &mut DebugSession, result: Option<Paused>) {
         match result {
             Some(paused) => session.paused = Some(paused),
             None => {
-                self.finish_command(&session.log);
                 // The run is over: drop its per-command deadline stamps
                 // (kept while paused, since the remaining steps still read them).
                 self.terminal_deadline_stamps.clear();
