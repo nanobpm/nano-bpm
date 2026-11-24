@@ -18,7 +18,8 @@ const indentOf = (line) => line.match(/^ */)[0].length;
 // Expression contexts (`github.token`, `secrets.GITHUB_TOKEN`) are
 // case-insensitive in GitHub Actions; shell env vars are not.
 const isDefault = (v) =>
-  /github\s*\.\s*token|secrets\s*\.\s*github_token|secrets\s*\[\s*['"]github_token['"]\s*\]/i.test(v) ||
+  // Both dot and bracket property-access notation, for both contexts.
+  /\bgithub\s*(?:\.\s*token\b|\[\s*['"]token['"]\s*\])|\bsecrets\s*(?:\.\s*github_token\b|\[\s*['"]github_token['"]\s*\])/i.test(v) ||
   /\$\{?GITHUB_TOKEN\b/.test(v);
 
 /** Offending `gh pr create` lines: the enclosing step has no step-level
@@ -68,6 +69,9 @@ test('prCreateOffenders flags GITHUB_TOKEN and missing tokens', () => {
   assert.deepEqual(prCreateOffenders(step('${{ secrets.APP || secrets.github_token }}')).length, 1);
   assert.deepEqual(prCreateOffenders(step('${{ GitHub.Token }}')).length, 1);
   assert.deepEqual(prCreateOffenders(step("${{ secrets['GITHUB_TOKEN'] }}")).length, 1);
+  assert.deepEqual(prCreateOffenders(step("${{ github['token'] }}")).length, 1);
+  assert.deepEqual(prCreateOffenders(step('${{ github["TOKEN"] }}')).length, 1);
+  assert.deepEqual(prCreateOffenders(step("${{ secrets.APP || github['token'] }}")).length, 1);
   assert.deepEqual(prCreateOffenders(step('${GITHUB_TOKEN}')).length, 1);
   // A later step's App token must not mask a missing token in this one.
   assert.deepEqual(prCreateOffenders(step(null)).length, 1);
