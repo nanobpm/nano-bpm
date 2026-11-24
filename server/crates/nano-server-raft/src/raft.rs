@@ -10876,4 +10876,187 @@ mod tests {
         assert!(predecessor.begin_receiving_snapshot().await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// #1880: a 3-voter partition under the benchmark's load shape —
+    /// concurrent creates carrying a 10 KB variable payload proposed to the
+    /// leader, interleaved with leader-local (soft) activations and replicated
+    /// completions — must never trip the replica-divergence fail-stop: every
+    /// replica applies the same committed entries to the same state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_voters_stay_convergent_under_concurrent_create_complete_load() {
+        use nanobpmn_engine_core::Value;
+
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let transport: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let store_dir = unique_log_dir(&format!("1880-spill-{id}"));
+            std::fs::create_dir_all(&store_dir).expect("store dir");
+            let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+            engine
+                .with(move |j| {
+                    let spill = Arc::new(
+                        nano_server_storage::varspill::VarSpillStore::open(Some(
+                            &store_dir.join("var-spill.sqlite"),
+                        ))
+                        .expect("open spill store"),
+                    );
+                    // One store per node backs both tiers, as in production.
+                    j.set_spill(Arc::clone(&spill), 0);
+                    j.set_cold_spill(spill, 1, 0);
+                    j.set_replicated_apply(true);
+                })
+                .await;
+            let p = RaftPartition::bootstrap_member(id, 0, engine, transport.clone(), None, false)
+                .await
+                .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        let parts = Arc::new(parts);
+        let leader = &parts[0];
+        leader
+            .propose(
+                Command::DeployProcess(
+                    ProcessBuilder::new("bench")
+                        .start_event("s")
+                        .service_task("t", "work")
+                        .end_event("e")
+                        .connect("s", "t")
+                        .connect("t", "e")
+                        .build()
+                        .expect("valid process"),
+                ),
+                1_000,
+            )
+            .await
+            .expect("deploy");
+        leader
+            .propose(Command::SetLenientCompletion { lenient: true }, 1_001)
+            .await
+            .expect("lenient");
+        let payload = "x".repeat(10 * 1024);
+        let clock = Arc::new(AtomicU64::new(2_000));
+        let creates_per_producer = 60u64;
+        let producers = 25u64;
+        let mut tasks = Vec::new();
+        for _ in 0..producers {
+            let parts = Arc::clone(&parts);
+            let clock = Arc::clone(&clock);
+            let payload = payload.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..creates_per_producer {
+                    let mut vars = BTreeMap::new();
+                    vars.insert("payload".to_string(), Value::Str(payload.clone()));
+                    let now = clock.fetch_add(1, Ordering::Relaxed);
+                    parts[0]
+                        .propose(Command::create_instance_with("bench", vars), now)
+                        .await
+                        .expect("create");
+                }
+            }));
+        }
+        let total = producers * creates_per_producer;
+        let completed = Arc::new(AtomicU64::new(0));
+        for w in 0..10u64 {
+            let parts = Arc::clone(&parts);
+            let clock = Arc::clone(&clock);
+            let completed = Arc::clone(&completed);
+            tasks.push(tokio::spawn(async move {
+                while completed.load(Ordering::Relaxed) < total {
+                    let now = clock.fetch_add(1, Ordering::Relaxed);
+                    let jobs = parts[0]
+                        .sm_engine()
+                        .with(move |j| {
+                            j.activate_jobs_with_fetch(
+                                "work",
+                                format!("w{w}"),
+                                8,
+                                60_000,
+                                now,
+                                Vec::new(),
+                            )
+                        })
+                        .await;
+                    if jobs.is_empty() {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        continue;
+                    }
+                    for job in jobs {
+                        let now = clock.fetch_add(1, Ordering::Relaxed);
+                        let item = parts[0]
+                            .propose_result(
+                                Command::complete_job_with(
+                                    job.key,
+                                    BTreeMap::from([
+                                        ("payload".to_string(), Value::Str("done".into())),
+                                        ("w".to_string(), Value::Int(w as i64)),
+                                    ]),
+                                ),
+                                now,
+                            )
+                            .await
+                            .expect("complete");
+                        if item.error.is_none() {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+        }
+        // Compaction churn: every node snapshots (and the leader purges its
+        // log) mid-load, so lagging followers resync through snapshot installs.
+        let compacting = Arc::new(AtomicBool::new(true));
+        let compactor = {
+            let parts = Arc::clone(&parts);
+            let compacting = Arc::clone(&compacting);
+            tokio::spawn(async move {
+                while compacting.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    for p in parts.iter() {
+                        let _ = p.raft.trigger().snapshot().await;
+                    }
+                    // The leader's background tick sheds hot RAM (leader-local).
+                    parts[0]
+                        .sm_engine()
+                        .with(|j| {
+                            j.maybe_var_spill_pressure();
+                            j.maybe_cold_spill();
+                        })
+                        .await;
+                    let applied = parts[0].raft.metrics().borrow().snapshot;
+                    if let Some(applied) = applied {
+                        let _ = parts[0].raft.trigger().purge_log(applied.index).await;
+                    }
+                }
+            })
+        };
+        for t in tasks {
+            t.await.expect("load task");
+        }
+        compacting.store(false, Ordering::Relaxed);
+        compactor.await.expect("compactor");
+        wait_all_applied(&parts).await;
+        for (id, p) in parts.iter().enumerate() {
+            assert_eq!(p.divergence(), None, "node {id} diverged");
+        }
+        let claims: Vec<_> = parts.iter().map(|p| p.digest_claim()).collect();
+        assert!(claims[0].is_some(), "the leader recorded a chain");
+        assert_eq!(claims[0], claims[1], "follower 1 chain differs");
+        assert_eq!(claims[0], claims[2], "follower 2 chain differs");
+        for p in parts.iter() {
+            p.raft.shutdown().await.ok();
+        }
+    }
 }

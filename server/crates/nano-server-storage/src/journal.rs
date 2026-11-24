@@ -4856,12 +4856,33 @@ impl Journal {
             // snapshot writer: a definitive absence it hits is reported to the
             // leader-propose machinery (#1447) before the build fails closed.
             absences: self.replicated_apply.then(|| self.orphans.inbox.clone()),
+            pins: self.pin_offheap_rows(),
         };
         Some((
             crate::snapstream::StreamingCapture { control, resident },
             cold_keys,
             stores,
         ))
+    }
+
+    /// Pins every distinct classic off-heap store (cold tier and variable
+    /// spill, usually one shared store) for a snapshot capture (#1880), so the
+    /// off-thread writer can read each row the capture references even when a
+    /// later command rehydrates it. See [`crate::varspill::RowPin`].
+    fn pin_offheap_rows(&self) -> Vec<crate::varspill::RowPin> {
+        let mut stores: Vec<&Arc<VarSpillStore>> = Vec::new();
+        for store in [
+            self.cold.as_ref().map(|c| &c.store),
+            self.spill.as_ref().map(|s| &s.store),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !stores.iter().any(|seen| Arc::ptr_eq(seen, store)) {
+                stores.push(store);
+            }
+        }
+        stores.into_iter().map(VarSpillStore::pin_rows).collect()
     }
 
     /// Streaming/sidecar counterpart of [`try_engine_snapshot`](Journal::try_engine_snapshot)
