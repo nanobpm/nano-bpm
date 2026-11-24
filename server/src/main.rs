@@ -11673,11 +11673,18 @@ impl ServerImpl {
         operation_reference: Option<i64>,
     ) -> bool {
         let owned: Arc<std::sync::Mutex<Vec<Event>>> = Arc::default();
+        let claimed: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
         let server = self.clone();
         let pump_owned = owned.clone();
+        let pump_claimed = claimed.clone();
         let pump = tokio::spawn(async move {
             server
-                .drive_subscription_routing_now(events, operation_reference, &pump_owned)
+                .drive_subscription_routing_now(
+                    events,
+                    operation_reference,
+                    &pump_owned,
+                    &pump_claimed,
+                )
                 .await
         });
         let delivered = match pump.await {
@@ -11688,7 +11695,11 @@ impl ServerImpl {
             }
         };
         let undelivered = std::mem::take(&mut *owned.lock().unwrap_or_else(|e| e.into_inner()));
+        // Record BEFORE releasing the claims: a close routed while the pump
+        // owned an open has marked it superseded, and `record` drops it.
         let recorded = self.failed_opens.record(&undelivered, operation_reference);
+        let claimed = std::mem::take(&mut *claimed.lock().unwrap_or_else(|e| e.into_inner()));
+        self.failed_opens.release(&claimed);
         if recorded > 0 {
             tracing::warn!(
                 count = recorded,
@@ -11726,8 +11737,14 @@ impl ServerImpl {
         events: Vec<Event>,
         operation_reference: Option<i64>,
         owned: &std::sync::Mutex<Vec<Event>>,
+        claimed: &std::sync::Mutex<Vec<u64>>,
     ) -> bool {
         let take_ownership = |events: &[Event]| {
+            let keys = self.failed_opens.claim(events);
+            claimed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(keys);
             owned.lock().unwrap_or_else(|e| e.into_inner()).extend(
                 events
                     .iter()

@@ -284,11 +284,14 @@ fn routed_subscription(event: &Event) -> Option<(u64, bool)> {
 
 #[derive(Default)]
 struct FailedOpensInner {
-    queue: Vec<FailedOpen>,
-    /// Subscriptions whose open a re-drive pass is delivering right now.
-    in_flight: HashSet<u64>,
-    /// In-flight opens a close superseded meanwhile: should that open fail
-    /// again it is dropped, never re-queued (#1866).
+    /// The latest undelivered intent per subscription key: O(1) to record,
+    /// replace or supersede (#1866).
+    queue: HashMap<u64, FailedOpen>,
+    /// Subscriptions whose open some routing pump currently owns (an
+    /// original pump, a mid-cascade follow-up, or a re-drive), refcounted.
+    in_flight: HashMap<u64, usize>,
+    /// Owned opens a close superseded meanwhile: should such an open fail it
+    /// is dropped, never queued (#1866).
     superseded: HashSet<u64>,
 }
 
@@ -296,11 +299,12 @@ struct FailedOpensInner {
 /// supersede them) whose routing failed (#1866). Unbounded in attempts: an
 /// entry leaves only when re-driven (a re-drive that fails again records it
 /// afresh). It holds the **latest intent** per subscription: a close routed
-/// (or queued) for a subscription drops its queued open, so a cancelled
-/// instance's open is never re-driven into a live subscription — whether the
-/// close was delivered (its recipient tombstone may later be evicted) or
-/// itself exhausted during the same outage (then the close is re-driven
-/// instead). Cheap to clone.
+/// (or queued) for a subscription drops its queued open, and marks any open
+/// a pump still owns as superseded, so a cancelled instance's open is never
+/// queued or re-driven into a live subscription — whether the close was
+/// delivered (its recipient tombstone may later be evicted) or itself
+/// exhausted during the same outage (then the close is re-driven instead).
+/// Cheap to clone.
 #[derive(Clone, Default)]
 pub(crate) struct FailedOpens {
     inner: Arc<Mutex<FailedOpensInner>>,
@@ -308,7 +312,8 @@ pub(crate) struct FailedOpens {
 
 impl FailedOpens {
     /// Records every keyed subscription open/close in `events` as undelivered
-    /// now. Other events are ignored. Returns how many were recorded.
+    /// now. Other events are ignored. Returns how many were recorded. Each
+    /// event costs O(1).
     pub(crate) fn record(&self, events: &[Event], operation_reference: Option<i64>) -> usize {
         let now = tokio::time::Instant::now();
         let mut g = self.lock();
@@ -319,32 +324,60 @@ impl FailedOpens {
             };
             if is_close {
                 g.supersede(key);
-                g.queue
-                    .retain(|f| routed_subscription(&f.event) != Some((key, true)));
             } else if g.superseded.contains(&key)
-                || g.queue.iter().any(|f| {
-                    routed_subscription(&f.event).is_some_and(|(k, close)| k == key && close)
-                })
+                || g.queue
+                    .get(&key)
+                    .is_some_and(|f| matches!(routed_subscription(&f.event), Some((_, true))))
             {
                 // A close already superseded this open.
                 continue;
-            } else {
-                g.queue
-                    .retain(|f| routed_subscription(&f.event).map(|(k, _)| k) != Some(key));
             }
-            g.queue.push(FailedOpen {
-                since: now,
-                event: event.clone(),
-                operation_reference,
-            });
+            g.queue.insert(
+                key,
+                FailedOpen {
+                    since: now,
+                    event: event.clone(),
+                    operation_reference,
+                },
+            );
             recorded += 1;
         }
         recorded
     }
 
+    /// Marks every keyed open in `events` as owned by a routing pump until
+    /// [`Self::release`]: a close routed meanwhile supersedes it, so a later
+    /// [`Self::record`] of it is dropped. Returns the claimed keys.
+    pub(crate) fn claim(&self, events: &[Event]) -> Vec<u64> {
+        let mut g = self.lock();
+        let mut claimed = Vec::new();
+        for event in events {
+            if let Some((key, false)) = routed_subscription(event) {
+                *g.in_flight.entry(key).or_default() += 1;
+                claimed.push(key);
+            }
+        }
+        claimed
+    }
+
+    /// Gives up claims taken by [`Self::claim`]; a key's supersession marker
+    /// is dropped once no pump owns it any more.
+    pub(crate) fn release(&self, keys: &[u64]) {
+        let mut g = self.lock();
+        for key in keys {
+            if let Some(n) = g.in_flight.get_mut(key) {
+                *n -= 1;
+                if *n == 0 {
+                    g.in_flight.remove(key);
+                    g.superseded.remove(key);
+                }
+            }
+        }
+    }
+
     /// Notes that a close for `event`'s subscription is being routed: any
-    /// queued open of it is dropped and an in-flight one will not be
-    /// re-queued. A no-op for any event that is not a keyed close.
+    /// queued open of it is dropped and an owned one will not be queued. A
+    /// no-op for any event that is not a keyed close.
     pub(crate) fn note_routing(&self, event: &Event) {
         if let Some((key, true)) = routed_subscription(event) {
             self.lock().supersede(key);
@@ -352,19 +385,22 @@ impl FailedOpens {
     }
 
     /// Removes and returns every entry pending at least
-    /// [`FAILED_OPEN_REDRIVE_AGE`], marking it in flight until
+    /// [`FAILED_OPEN_REDRIVE_AGE`] (oldest first), claiming each open until
     /// [`Self::finish`].
     pub(crate) fn take_due(&self) -> Vec<(Event, Option<i64>)> {
         let now = tokio::time::Instant::now();
         let mut g = self.lock();
-        let (due, keep): (Vec<_>, Vec<_>) = g
+        let keys: Vec<u64> = g
             .queue
-            .drain(..)
-            .partition(|f| now.saturating_duration_since(f.since) >= FAILED_OPEN_REDRIVE_AGE);
-        g.queue = keep;
+            .iter()
+            .filter(|(_, f)| now.saturating_duration_since(f.since) >= FAILED_OPEN_REDRIVE_AGE)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut due: Vec<FailedOpen> = keys.iter().filter_map(|k| g.queue.remove(k)).collect();
+        due.sort_by_key(|f| f.since);
         for f in &due {
             if let Some((key, false)) = routed_subscription(&f.event) {
-                g.in_flight.insert(key);
+                *g.in_flight.entry(key).or_default() += 1;
             }
         }
         due.into_iter()
@@ -372,13 +408,10 @@ impl FailedOpens {
             .collect()
     }
 
-    /// Ends the in-flight window of a re-driven entry taken by
-    /// [`Self::take_due`].
+    /// Ends the claim of a re-driven entry taken by [`Self::take_due`].
     pub(crate) fn finish(&self, event: &Event) {
         if let Some((key, false)) = routed_subscription(event) {
-            let mut g = self.lock();
-            g.in_flight.remove(&key);
-            g.superseded.remove(&key);
+            self.release(&[key]);
         }
     }
 
@@ -397,7 +430,10 @@ impl FailedOpens {
     /// The queued events, oldest first.
     #[cfg(test)]
     pub(crate) fn queued(&self) -> Vec<Event> {
-        self.lock().queue.iter().map(|f| f.event.clone()).collect()
+        let g = self.lock();
+        let mut v: Vec<&FailedOpen> = g.queue.values().collect();
+        v.sort_by_key(|f| f.since);
+        v.into_iter().map(|f| f.event.clone()).collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FailedOpensInner> {
@@ -407,11 +443,16 @@ impl FailedOpens {
 
 impl FailedOpensInner {
     /// A close for subscription `key` supersedes its open: drop a queued
-    /// open, and keep an in-flight one from being re-queued.
+    /// open, and keep an owned one from being queued.
     fn supersede(&mut self, key: u64) {
-        self.queue
-            .retain(|f| routed_subscription(&f.event) != Some((key, false)));
-        if self.in_flight.contains(&key) {
+        if self
+            .queue
+            .get(&key)
+            .is_some_and(|f| matches!(routed_subscription(&f.event), Some((_, false))))
+        {
+            self.queue.remove(&key);
+        }
+        if self.in_flight.contains_key(&key) {
             self.superseded.insert(key);
         }
     }
@@ -508,6 +549,44 @@ mod tests {
         assert!(q.is_empty());
         // After the window closes a fresh open of the key is queued again.
         assert_eq!(q.record(&[opening("m", "k")], None), 1);
+    }
+
+    /// #1866: a close delivered while the ORIGINAL pump (not a re-drive)
+    /// still owns the open supersedes it, so the supervisor recording the
+    /// open's failure afterwards drops it instead of queuing a reopen.
+    #[tokio::test]
+    async fn an_original_pump_open_superseded_by_a_close_is_not_queued() {
+        let q = FailedOpens::default();
+        let claimed = q.claim(&[opening("m", "k")]);
+        q.note_routing(&closing("m", "k"));
+        assert_eq!(q.record(&[opening("m", "k")], None), 0, "superseded");
+        q.release(&claimed);
+        assert!(q.is_empty());
+    }
+
+    /// #1866: overlapping owners of one open keep the supersession marker
+    /// until the last releases.
+    #[tokio::test]
+    async fn supersession_outlives_all_but_the_last_owner() {
+        let q = FailedOpens::default();
+        let a = q.claim(&[opening("m", "k")]);
+        let b = q.claim(&[opening("m", "k")]);
+        q.note_routing(&closing("m", "k"));
+        q.release(&a);
+        assert_eq!(q.record(&[opening("m", "k")], None), 0, "still owned");
+        q.release(&b);
+        assert_eq!(q.record(&[opening("m", "k")], None), 1);
+    }
+
+    /// #1866: the queue keeps one latest intent per subscription, so
+    /// re-recording replaces rather than accumulates.
+    #[tokio::test]
+    async fn re_recording_replaces_the_entry() {
+        let q = FailedOpens::default();
+        for _ in 0..3 {
+            q.record(&[opening("m", "k")], None);
+        }
+        assert_eq!(q.len(), 1);
     }
 
     /// A fails and wakes the parked waiter, but B re-registers the same key
