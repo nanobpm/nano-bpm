@@ -17851,7 +17851,12 @@ impl ServerImpl {
         // result flags `isTruncated`.
         let truncate = query_params.truncate_values.unwrap_or(true);
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let vars = self.store.variables();
+        // Push the indexed equality / `$in` predicates down into the read store
+        // (#1886) so a selective search reads only candidate rows instead of
+        // full-scanning the table; the matcher below keeps full semantics.
+        let vars = self
+            .store
+            .variables_matching(&variable_search_pushdown(filter));
 
         let mut matched: Vec<&readstore::VariableRow> = vars
             .iter()
@@ -26830,7 +26835,12 @@ fn root_variables_index(
     if requested.is_empty() {
         return idx;
     }
-    for v in store.variables() {
+    // Only the requested names are read, via the `name` index (#1886).
+    let pushdown = readstore::VariablePushdown {
+        names: Some(requested.iter().cloned().collect()),
+        ..Default::default()
+    };
+    for v in store.variables_matching(&pushdown) {
         // Root-scope only: a nested-scope variable has `scope_key != instance_key`.
         if v.scope_key == v.instance_key && requested.contains(&v.name) {
             idx.entry(v.instance_key)
@@ -27071,6 +27081,32 @@ fn truncate_value(value: &str, truncate: bool) -> (String, bool) {
     }
 }
 
+/// Derives the read-store pushdown for a variables search (#1886) from the
+/// request filter: the indexed `variableKey` / `processInstanceKey` /
+/// `scopeKey` / `name` equality and `$in` predicates. A tenant filter other
+/// than `<default>` matches nothing (mirroring the in-memory matcher). The
+/// result is a superset of the true match set; the caller re-applies the full
+/// spec-derived matcher on the reduced rows.
+fn variable_search_pushdown(
+    filter: Option<&models::VariableFilter>,
+) -> readstore::VariablePushdown {
+    let Some(f) = filter else {
+        return readstore::VariablePushdown::default();
+    };
+    let mut p = readstore::VariablePushdown {
+        keys: query::key_candidates(query::variable_key_candidates(&f.variable_key)),
+        instance_keys: query::key_candidates(query::process_instance_key_candidates(
+            &f.process_instance_key,
+        )),
+        scope_keys: query::key_candidates(query::scope_key_candidates(&f.scope_key)),
+        names: query::string_candidates(&f.name),
+    };
+    if f.tenant_id.as_ref().is_some_and(|t| t != "<default>") {
+        p.keys = Some(Vec::new());
+    }
+    p
+}
+
 /// Projects a [`VariableRow`] into the generated `VariableSearchResult`, applying
 /// value truncation per the request's `truncateValues` setting.
 fn variable_search_result(
@@ -27307,7 +27343,12 @@ impl UserTaskVariableIndex {
         if root_names.is_empty() && local_names.is_empty() {
             return idx;
         }
-        for v in store.variables() {
+        // Only the referenced names are read, via the `name` index (#1886).
+        let pushdown = readstore::VariablePushdown {
+            names: Some(root_names.union(&local_names).cloned().collect()),
+            ..Default::default()
+        };
+        for v in store.variables_matching(&pushdown) {
             if v.scope_key == v.instance_key && root_names.contains(&v.name) {
                 idx.process_instance
                     .entry(v.instance_key)
