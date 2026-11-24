@@ -128,6 +128,8 @@ const BUILTINS: &[&str] = &[
     // simply returns the value unchanged (the description/type/schema/options
     // metadata is consumed by the connector/job worker, not here).
     "fromAi",
+    // Zeebe extension (`FeelFunctionProvider`): builds a `timeCycle` string.
+    "cycle",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -171,6 +173,30 @@ pub fn params(name: &str) -> Option<&'static [&'static str]> {
         "fromAi" => &["value", "description", "type", "schema", "options"],
         _ => return None,
     })
+}
+
+/// Zeebe's `cycle` FEEL function (`FeelFunctionProvider`, #1878):
+/// `cycle(interval)` → `"R/<interval>"`, `cycle(repetitions, interval)` →
+/// `"R<n>/<interval>"` (a `null` count is unbounded, a fractional count is
+/// truncated as Java's `intValue`). `interval` is a days-time or
+/// years-months duration; any other argument yields `null` (Zeebe returns a
+/// `ValError`, which FEEL surfaces as `null`).
+fn cycle_builtin(args: &[FeelVal]) -> FeelVal {
+    let interval = |v: &FeelVal| match v {
+        FeelVal::DtDur(d) => Some(d.format()),
+        FeelVal::YmDur(d) => Some(d.format()),
+        _ => None,
+    };
+    let text = match args {
+        [d] => interval(d).map(|d| format!("R/{d}")),
+        [FeelVal::Null, d] => interval(d).map(|d| format!("R/{d}")),
+        [n @ (FeelVal::Int(_) | FeelVal::Double(_)), d] => n
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .and_then(|n| interval(d).map(|d| format!("R{}/{d}", n.trunc() as i64))),
+        _ => None,
+    };
+    text.map(FeelVal::Str).unwrap_or(FeelVal::Null)
 }
 
 fn arg(args: &[FeelVal], i: usize) -> FeelVal {
@@ -253,6 +279,7 @@ pub fn call(
         "date and time" => datetime_builtin(&args),
         "duration" => Ok(parse_duration(&want_str(&arg(&args, 0), "duration")?).unwrap_or(Null)),
         "years and months duration" => years_months_between(&arg(&args, 0), &arg(&args, 1)),
+        "cycle" => Ok(cycle_builtin(&args)),
         "from json" => Ok(from_json(&want_str(&arg(&args, 0), "from json")?).unwrap_or(Null)),
         "to json" => Ok(Str(to_json(&arg(&args, 0)))),
 
@@ -1615,5 +1642,50 @@ fn interval_bool(name: &str, a: &FeelVal, b: &FeelVal) -> Option<bool> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod cycle_tests {
+    use std::collections::BTreeMap;
+
+    use crate::model::Value;
+
+    fn eval(expr: &str, vars: &[(&str, Value)]) -> Value {
+        let ctx: BTreeMap<String, Value> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        crate::feel::eval(expr, &ctx).unwrap()
+    }
+
+    /// Zeebe `FeelCycleFunctionTest`.
+    #[test]
+    fn cycle_matches_zeebe() {
+        let s = |v: &str| Value::Str(v.to_string());
+        assert_eq!(eval("cycle(interval)", &[]), Value::Null);
+        assert_eq!(eval(r#"cycle(duration("PT1H"))"#, &[]), s("R/PT1H"));
+        assert_eq!(eval(r#"cycle(duration("PT12H"))"#, &[]), s("R/PT12H"));
+        assert_eq!(eval(r#"cycle(duration("P2M"))"#, &[]), s("R/P2M"));
+        let three = [("repetitions", Value::Int(3))];
+        assert_eq!(
+            eval(r#"cycle(repetitions, duration("PT1H"))"#, &three),
+            s("R3/PT1H")
+        );
+        assert_eq!(
+            eval(r#"cycle(repetitions, duration("P2M"))"#, &three),
+            s("R3/P2M")
+        );
+        let null = [("repetitions", Value::Null)];
+        assert_eq!(
+            eval(r#"cycle(repetitions, duration("PT1H"))"#, &null),
+            s("R/PT1H")
+        );
+        assert_eq!(
+            eval(r#"cycle(repetitions, duration("P2M"))"#, &null),
+            s("R/P2M")
+        );
+        assert_eq!(eval(r#"cycle(2.9, duration("PT1M"))"#, &[]), s("R2/PT1M"));
+        assert_eq!(eval(r#"cycle("PT1H")"#, &[]), Value::Null);
     }
 }

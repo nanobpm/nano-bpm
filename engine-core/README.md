@@ -270,6 +270,18 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   (`timeDuration`) is retained with no due time (`next_due_at: None`) so it never
   fires again. Like all timers the engine stays **clock-free** and the schedule is
   durable across restarts.
+- **Timer cycle dialects (Zeebe parity, #1878)** — every `timeCycle` (timer
+  start event, cycle boundary, event sub-process timer start) accepts the same
+  forms Zeebe does, statically or as a FEEL expression: an ISO-8601 repeating
+  interval `R[n]/<duration>`, one **with a start date** `R[n]/<start>/<duration>`
+  (first due at the start, or immediately if it is past), and a Spring-style
+  6-field **cron** expression (`0 0 */12 * * ?`, `L`, `W`, `#`, `MON-FRI`,
+  `@daily` macros; evaluated in UTC; unbounded). Zeebe's end-date form
+  `R[n]/<duration>/<end>` is rejected, as Zeebe rejects it. The FEEL `cycle()`
+  built-in (`cycle(duration("PT1H"))` → `"R/PT1H"`, `cycle(3, …)` → `"R3/…"`)
+  is supported, and a timer start expression can read cluster variables. A
+  fired cycle re-arms at `max(previous due + interval, now)` (cron: its next
+  match after that), so missed fires collapse as in Zeebe.
 - **Conditional start events** (a process-level `startEvent` with a
   `conditionalEventDefinition`) create instances on demand from a **conditional
   evaluation**. They open no subscription: an `EvaluateConditionalStartEvents {

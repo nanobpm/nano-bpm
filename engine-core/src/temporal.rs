@@ -190,29 +190,36 @@ pub struct Cycle {
 pub fn parse_cycle(raw: &str) -> Option<Cycle> {
     let s = raw.trim();
     let (repetitions, interval) = match s.split_once('/') {
-        Some((repeat, interval)) => {
-            let count = repeat.strip_prefix('R')?;
-            let repetitions = if count.is_empty() {
-                None
-            } else if count.bytes().all(|b| b.is_ascii_digit()) {
-                // `R0` (a cycle that never fires) is rejected rather than
-                // accepted as `Some(0)`: every arming path would otherwise
-                // schedule (and fire) the initial occurrence (#1596).
-                match count.parse::<u32>().ok()? {
-                    0 => return None,
-                    n => Some(n),
-                }
-            } else {
-                return None;
-            };
-            (repetitions, interval)
-        }
+        Some(_) => split_repetitions(s)?,
         None => (None, s),
     };
     Some(Cycle {
         repetitions,
         interval_millis: parse_duration_millis(interval)?,
     })
+}
+
+/// Splits the `R[n]/` repetition prefix off an ISO-8601 repeating interval,
+/// returning the count (`None` for an unbounded `R/`) and the remainder after
+/// the first `/`. Returns `None` if the prefix is malformed or the count is
+/// `R0` — a cycle that never fires is rejected rather than accepted as
+/// `Some(0)`: every arming path would otherwise schedule (and fire) the
+/// initial occurrence (#1596). The single source of the prefix grammar for
+/// both [`parse_cycle`] and the engine's full `timeCycle` parser (#1878).
+pub fn split_repetitions(s: &str) -> Option<(Option<u32>, &str)> {
+    let (repeat, rest) = s.split_once('/')?;
+    let count = repeat.strip_prefix('R')?;
+    let repetitions = if count.is_empty() {
+        None
+    } else if count.bytes().all(|b| b.is_ascii_digit()) {
+        match count.parse::<u32>().ok()? {
+            0 => return None,
+            n => Some(n),
+        }
+    } else {
+        return None;
+    };
+    Some((repetitions, rest))
 }
 
 /// Accumulates an integer-valued unit (`num` × `factor` nanoseconds). Returns
