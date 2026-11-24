@@ -622,9 +622,7 @@ impl Engine {
             return Ok(None);
         };
         let vars = self.variables_for_element(instance_key, scope_eik);
-        let due_at = self
-            .resolve_timer(&vars, Some(&def), previous_due_at, 0)?
-            .due_at;
+        let due_at = self.resolve_cycle_rearm(&vars, Some(&def), previous_due_at, 0)?;
         Ok(Some(Event::TimerCreated {
             timer_key: self.mint_key(),
             instance_key,

@@ -1,6 +1,6 @@
 [package]
 name = "processos"
-version = "0.0.28"
+version = "0.12.1"
 edition = "2021"
 description = "ProcessOS — the runtime process-optimization plane for Nano BPM. Stage T1: ingest Nano's trace/metrics export and serve an Insights report. Talks to Nano only over its public contracts; Nano never depends on this crate."
 

@@ -1174,21 +1174,15 @@ impl Engine {
                     &def.expr,
                     vars,
                     "cycle",
-                    crate::temporal::parse_cycle,
+                    crate::engine::timer_cycle::TimerCycle::parse,
                 )?;
-                Ok(resolved(
-                    base_now.saturating_add(cycle.interval_millis),
-                    cycle.interval_millis,
-                    cycle.repetitions,
-                ))
+                let (due_at, repetitions) = cycle.first_due(base_now);
+                Ok(resolved(due_at, cycle.interval_millis(), repetitions))
             }
             crate::model::TimerDefKind::Date => {
-                let dt = expression::evaluate_timer(
-                    &def.expr,
-                    vars,
-                    "date-time",
-                    crate::feel::temporal::DateTime::parse,
-                )?;
+                let dt = expression::evaluate_timer(&def.expr, vars, "date-time", |s| {
+                    crate::feel::temporal::DateTime::parse(s.trim())
+                })?;
                 Ok(resolved(
                     (dt.epoch_nanos() / 1_000_000).max(0) as u64,
                     0,
@@ -1200,6 +1194,54 @@ impl Engine {
 
     /// Looks up the FEEL timer expression declared on `element_id` in the process
     /// definition that owns `instance_key` (if any).
+    /// Resolves the next due date of a fired **cycle** timer (Zeebe
+    /// `TimerTriggerProcessor.rescheduleTimer`): the cycle definition is
+    /// re-evaluated against `vars` (a FEEL cycle sees current variables), then
+    /// an interval cycle re-arms at `previous_due_at + interval`, or at
+    /// `now + interval` when that is not after now
+    /// ([`crate::engine::timer_cycle::rearm_after`]), and a cron cycle at its next match after `max(previous_due_at,
+    /// now)` — see [`crate::engine::timer_cycle`]. Without a declared definition the
+    /// static `fallback_millis` period is used with the same re-arm rule.
+    pub(crate) fn resolve_cycle_rearm(
+        &self,
+        vars: &BTreeMap<String, Value>,
+        def: Option<&crate::model::TimerDef>,
+        previous_due_at: u64,
+        fallback_millis: u64,
+    ) -> Result<u64, expression::Failure> {
+        match def {
+            Some(def) if def.kind == crate::model::TimerDefKind::Cycle => {
+                let cycle = expression::evaluate_timer(
+                    &def.expr,
+                    vars,
+                    "cycle",
+                    crate::engine::timer_cycle::TimerCycle::parse,
+                )?;
+                Ok(cycle.next_due(previous_due_at, self.now))
+            }
+            Some(def) => Ok(self
+                .resolve_timer(vars, Some(def), previous_due_at, fallback_millis)?
+                .due_at),
+            // Same missed-fire collapse as a declared interval cycle.
+            None => Ok(crate::engine::timer_cycle::rearm_fixed(
+                previous_due_at,
+                self.now,
+                fallback_millis,
+            )),
+        }
+    }
+
+    /// The variables a process-level **start event** expression sees: no
+    /// instance scope exists yet, so only the replicated
+    /// [cluster variables](crate::cluster_vars) (global + default tenant,
+    /// overlaid exactly as for an instance) — Zeebe evaluates a timer
+    /// start event's expression with the deployment's tenant and no variable
+    /// scope (#1878).
+    pub(crate) fn start_event_variables(&self) -> BTreeMap<String, Value> {
+        let overlaid = self.overlay_cluster_variables(Arc::new(BTreeMap::new()));
+        Arc::try_unwrap(overlaid).unwrap_or_else(|shared| (*shared).clone())
+    }
+
     pub(crate) fn timer_def_of(
         &self,
         instance_key: Key,

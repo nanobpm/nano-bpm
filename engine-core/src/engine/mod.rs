@@ -30,6 +30,7 @@ mod memory;
 mod migration;
 mod modify;
 mod resolve;
+pub(crate) mod timer_cycle;
 pub use debug::{BreakCondition, DebugSession};
 use resolve::{rearm_repetitions, JobProps, ResolvedUserTask};
 
@@ -242,6 +243,11 @@ pub struct Engine {
     /// unchanged); set by the host from `NANOBPMN_LEAN_SNAPSHOT`. Not part of the
     /// snapshot — it is pure host-side bookkeeping and never affects determinism.
     track_dirty_vars: bool,
+    /// Resumable scan position for [`Engine::retire_below`] (#1908): the next
+    /// key to examine, so each call examines a bounded window of the resident
+    /// backlog and successive calls sweep all of it. Host-side bookkeeping
+    /// only — not part of the snapshot, never affects determinism.
+    retire_cursor: Key,
     /// Instances whose process-level variables changed since the last
     /// [`drain_dirty_vars`](Engine::drain_dirty_vars) (i.e. since the last
     /// snapshot checkpoint). Only populated when [`track_dirty_vars`] is set.
@@ -250,18 +256,6 @@ pub struct Engine {
     /// variable rows must be deleted from the store. Only populated when
     /// [`track_dirty_vars`] is set.
     forgotten_vars: BTreeSet<Key>,
-    /// Follower-only safety net for the retirement digest (RF>1). A leader completes
-    /// and exporter-evicts an instance and broadcasts its key, but under leader-durable
-    /// the ack happens on the leader before the async learner has applied the
-    /// instance's `CreateInstance`, so [`Engine::retire_instances`] finds the key
-    /// absent. Rather than drop the retirement (and leak the instance once its create
-    /// lands), the absent key is remembered here; the next `apply_command_at` that
-    /// materializes it retires it immediately. Populated only on a follower replica
-    /// (a leader never receives a retirement digest, so this stays empty and the
-    /// per-command check is free). Bounded — it only ever holds keys in the brief
-    /// window between a retirement and its create, so it drains continuously. NOT
-    /// part of the snapshot; pure host-side bookkeeping, never affects determinism.
-    retired_tombstones: BTreeSet<Key>,
     /// Sub-process scopes torn down (by a scoped terminate end or an interrupting
     /// boundary) during the command currently draining. A scoped teardown removes
     /// every descendant token but deliberately leaves the enclosing sub-process
@@ -756,9 +750,9 @@ impl Engine {
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
+            retire_cursor: 0,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
-            retired_tombstones: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
@@ -937,9 +931,9 @@ impl Engine {
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
+            retire_cursor: 0,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
-            retired_tombstones: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
@@ -2172,7 +2166,10 @@ impl Engine {
             // `TimerStartEventSubscription` validation, #1398) — never a
             // subscription named after the expression text or a static
             // fallback timer. Resolve all before anything is emitted.
-            let empty = BTreeMap::new();
+            // Cluster variables DO resolve here: Zeebe's timer factory
+            // evaluates with the deployment's tenant, whose evaluation
+            // context layers the cluster-variable scopes (#1878).
+            let empty = self.start_event_variables();
             let mut resolved_starts = Vec::with_capacity(typed_starts.len());
             for start in typed_starts {
                 let (start_element_id, start_kind, start_timer_def, start_properties) = (
@@ -2519,9 +2516,8 @@ impl Engine {
     ///
     /// Structure: [`plan_command_at`](Self::plan_command_at) translates the
     /// command into an initial `(log, queue)`, the RTC [`run`](Self::run) drives
-    /// the queue to quiescence, and [`finish_command`](Self::finish_command)
-    /// performs the post-drain tail. The debug entrypoints reuse the same
-    /// planner + tail with a *stepping* driver in place of `run`.
+    /// the queue to quiescence. The debug entrypoints reuse the same planner
+    /// with a *stepping* driver in place of `run`.
     pub fn apply_command_at(
         &mut self,
         command: Command,
@@ -2589,7 +2585,6 @@ impl Engine {
                 .map(|(mut log, queue)| {
                     self.run(&mut log, queue);
                     self.cascade_cancel_children(&mut log, 0);
-                    self.finish_command(&log);
                     // Every engine test exercises the parent -> children index the
                     // cascade reads (#1827): a write path that bypassed it fails here.
                     #[cfg(test)]
@@ -2599,32 +2594,6 @@ impl Engine {
         self.operation_reference = None;
         self.terminal_deadline_stamps.clear();
         result
-    }
-
-    /// Post-drain tail shared by [`apply_command_at`](Self::apply_command_at) and
-    /// the debug entrypoints. Instance completion now happens at the fixpoint
-    /// drain point inside [`run_with`](Self::run_with) (so a debug
-    /// `ProcessCompleted` breakpoint can observe it through the driver); the only
-    /// work left here is the follower-only tombstone reap, which is orthogonal to
-    /// completion. Runs after the queue has drained to quiescence.
-    fn finish_command(&mut self, log: &[Event]) {
-        // Follower-only safety net: if a retirement digest raced ahead of an
-        // instance's create on this replica (leader-durable async-learner lag), the
-        // key was tombstoned; now that the create has materialized the instance,
-        // reap it immediately so it cannot linger as a never-retired `Active` shell.
-        // Near-free when nothing is pending (a leader never tombstones).
-        if !self.retired_tombstones.is_empty() {
-            let created: Vec<Key> = log
-                .iter()
-                .filter_map(|e| match e {
-                    Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
-                    _ => None,
-                })
-                .collect();
-            if !created.is_empty() {
-                self.reap_tombstoned(&created);
-            }
-        }
     }
 
     /// Translates `command` into the initial `(log, queue)` the fixpoint loop
@@ -6744,7 +6713,26 @@ impl Engine {
         // A bounded `Rn/…` start cycle stops re-arming after its
         // n-th fire (#1596).
         let next_due_at = if timer.repeating && rearm_repetitions(timer.repetitions).is_some() {
-            Some(due_at.saturating_add(timer.interval_millis))
+            // Re-evaluate the start event's cycle (Zeebe re-runs the timer
+            // factory on reschedule): an interval cycle re-arms one period
+            // after the fired due date, a cron cycle at its next match
+            // (#1878). If the definition is gone or no longer evaluates, a
+            // fixed period keeps its schedule and a cron cycle stops.
+            let interval_millis = timer.interval_millis;
+            let def = self
+                .state
+                .process_by_key(timer.process_definition_key)
+                .and_then(|p| p.definition.element(&start_element_id))
+                .and_then(|e| e.timer.clone());
+            let vars = self.start_event_variables();
+            match self.resolve_cycle_rearm(&vars, def.as_ref(), due_at, interval_millis) {
+                Ok(next) => Some(next),
+                // Collapse missed fires exactly as the evaluated path does.
+                Err(_) if interval_millis > 0 => {
+                    Some(timer_cycle::rearm_fixed(due_at, self.now, interval_millis))
+                }
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -6949,11 +6937,11 @@ impl Engine {
             }
             // Token quiescence. Complete any instance whose tokens have all
             // retired — the terminal tail shared with `apply_command_at`, folded
-            // into the loop (rather than run post-return in `finish_command`) so a
+            // into the loop (rather than run post-return) so a
             // `ProcessCompleted` breakpoint can observe the completion through the
             // driver, exactly like every other event. Idempotent: a completed
             // instance is no longer `Active`, so a resume pass and
-            // `finish_command`'s tombstone tail find nothing left to complete, and
+            // later pass finds nothing left to complete, and
             // the production (`RunToCompletion`) log is byte-identical — completion
             // is still emitted once, at the same quiescence point.
             let completed_from = log.len();
@@ -9178,14 +9166,14 @@ impl Engine {
         };
         let timer_def = self.timer_def_of(instance_key, boundary_element_id);
         let vars = self.variables_for_element(instance_key, element_instance_key);
-        let next =
-            self.resolve_timer(&vars, timer_def.as_ref(), previous_due_at, duration_millis)?;
+        let next_due_at =
+            self.resolve_cycle_rearm(&vars, timer_def.as_ref(), previous_due_at, duration_millis)?;
         Ok(Some(Event::TimerCreated {
             timer_key: self.mint_key(),
             instance_key,
             element_instance_key,
             element_id: element_id.to_string(),
-            due_at: next.due_at,
+            due_at: next_due_at,
             kind: state::TimerKind::NonInterruptingBoundary {
                 boundary_element_id: boundary_element_id.to_string(),
             },

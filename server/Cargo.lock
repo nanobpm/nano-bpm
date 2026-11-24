@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "nanobpm-gateway-rest-server"
-version = "0.0.28"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -97,20 +97,18 @@ pub fn local_version_header() -> String {
 }
 
 fn advertised_version() -> &'static str {
-    advertised_version_override()
-        .map(|f| f())
-        .unwrap_or(env!("NANOBPM_VERSION"))
+    advertised_version_override().unwrap_or(env!("NANOBPM_VERSION"))
 }
 
 #[cfg(feature = "test-hooks")]
-fn advertised_version_override() -> Option<fn() -> &'static str> {
+fn advertised_version_override() -> Option<&'static str> {
     ADVERTISED_VERSION_OVERRIDE
         .get()
         .and_then(|f| *f.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 #[cfg(not(feature = "test-hooks"))]
-fn advertised_version_override() -> Option<fn() -> &'static str> {
+fn advertised_version_override() -> Option<&'static str> {
     None
 }
 
@@ -119,23 +117,18 @@ fn advertised_version_override() -> Option<fn() -> &'static str> {
 /// mixed-version join tests (#1702) set this to model a member running a
 /// different release. Process-global; tests that set it must not run in
 /// parallel with each other.
+///
+/// Accepts ANY version: tests derive versions from the upgrade-boundary
+/// ledger, which grows with every release, so a fixed list of accepted
+/// strings broke the v0.12.0 release PR.
 #[cfg(feature = "test-hooks")]
 pub fn set_advertised_version_override(version: Option<&'static str>) {
     let cell = ADVERTISED_VERSION_OVERRIDE.get_or_init(Default::default);
-    *cell.lock().unwrap_or_else(|e| e.into_inner()) = version.map(|v| -> fn() -> &'static str {
-        // Const-promotable closures, one per override the tests use; a fn
-        // pointer keeps the cell `Sync` without lifetime plumbing.
-        match v {
-            "0.0.27" => || "0.0.27",
-            "0.0.28" => || "0.0.28",
-            "0.0.29" => || "0.0.29",
-            other => panic!("unsupported advertised-version override {other:?}"),
-        }
-    });
+    *cell.lock().unwrap_or_else(|e| e.into_inner()) = version;
 }
 
 #[cfg(feature = "test-hooks")]
-type VersionOverride = std::sync::Mutex<Option<fn() -> &'static str>>;
+type VersionOverride = std::sync::Mutex<Option<&'static str>>;
 
 #[cfg(feature = "test-hooks")]
 static ADVERTISED_VERSION_OVERRIDE: std::sync::OnceLock<VersionOverride> =
