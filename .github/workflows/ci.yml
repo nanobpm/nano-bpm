@@ -499,6 +499,11 @@ jobs:
         # An apt mirror outage must not fail required jobs: native build tools
         # come only through .github/actions/build-tools (release downloads).
         run: node --test scripts/no-bare-apt.test.mjs
+      - name: No PR creation with GITHUB_TOKEN (#1907)
+        # GITHUB_TOKEN may not create PRs here; a release step that tries
+        # pushes its branch and then fails, losing the PR. Every `gh pr create`
+        # step must use a GitHub App token (actions/create-github-app-token).
+        run: node --test scripts/no-github-token-pr-create.test.mjs
       - name: Only main-reachable release tags publish (#1830)
         # Every job that publishes (npm, release assets, S3, Maven, a write to
         # another repo, OIDC trusted publishing, a release script) must be

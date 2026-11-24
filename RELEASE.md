@@ -149,12 +149,16 @@ prune opens nothing. The append-only `upgrade-boundaries.json` ledger is never
 touched: expiring an allowlist entry never lifts the cluster-join restriction
 it recorded (#1702).
 
-The job authenticates with the `ALLOWLIST_PRUNE_TOKEN` repository secret (a
-repo-scoped GitHub App token or PAT with contents + pull-requests write) when
-set: a PR opened with the default `GITHUB_TOKEN` does not trigger its required
-CI, so without the secret the PR opens but a human must re-trigger its checks
-before it can merge. A re-run after a failed `gh pr create` reuses the
-already-pushed branch.
+The job authenticates with a GitHub App installation token minted by
+`actions/create-github-app-token` from the `RELEASE_APP_ID` repository
+variable and the `RELEASE_APP_PRIVATE_KEY` repository secret (the App needs
+Contents + Pull requests write on this repo). `GITHUB_TOKEN` cannot be used:
+GitHub Actions is not permitted to create pull requests here (#1907), and a
+PR it opened would not trigger the required CI anyway. Without the App the job
+fails at its first step, before pushing anything.
+`scripts/no-github-token-pr-create.test.mjs` (CI) fails any workflow step that
+runs `gh pr create` with `GITHUB_TOKEN`. A re-run after a failed
+`gh pr create` reuses the already-pushed branch.
 
 **If the pruning PR never appears** (the job failed or was skipped): run the
 prune by hand from a clean `main` and open the PR yourself:
