@@ -387,8 +387,10 @@ pub fn write_streaming_snapshot_from_stores(
         varstore,
         legacy,
         absences,
-        pins: _pins,
+        pins,
     } = stores;
+    // Shared by both readers; held until the write is done (#1880, #1885).
+    let pins = Arc::new(pins);
     write_streaming_snapshot(StreamWrite {
         path,
         header_line,
@@ -399,7 +401,8 @@ pub fn write_streaming_snapshot_from_stores(
         cold: cold_keys,
         read_cold: {
             let absences = absences.clone();
-            move |key| read_cold_from_store(key, cold_store.as_ref(), absences.as_ref())
+            let pins = Arc::clone(&pins);
+            move |key| read_cold_from_store(key, cold_store.as_ref(), absences.as_ref(), &pins)
         },
         resolve_spilled: move |snap| {
             resolve_spilled_from_stores(
@@ -408,6 +411,7 @@ pub fn write_streaming_snapshot_from_stores(
                 spill_store.as_ref(),
                 legacy.as_ref(),
                 absences.as_ref(),
+                &pins,
             )
         },
         control_only,
@@ -778,7 +782,7 @@ fn write_multi_streaming_snapshot_inner(
             varstore,
             legacy,
             absences,
-            pins: _pins,
+            pins,
         } = stores;
         // Reuse the single-partition spill-resolution closure logic per row.
         let resolve = |snap: &mut InstanceSnapshot| {
@@ -788,6 +792,7 @@ fn write_multi_streaming_snapshot_inner(
                 spill_store.as_ref(),
                 legacy.as_ref(),
                 absences.as_ref(),
+                &pins,
             )
         };
         let push = |chunk: &mut Vec<(u64, InstanceSnapshot)>,
@@ -809,7 +814,7 @@ fn write_multi_streaming_snapshot_inner(
             push(&mut chunk, &mut w, snap)?;
         }
         for key in cold_keys {
-            let snap = read_cold_from_store(key, cold_store.as_ref(), absences.as_ref())?;
+            let snap = read_cold_from_store(key, cold_store.as_ref(), absences.as_ref(), &pins)?;
             push(&mut chunk, &mut w, snap)?;
         }
     }
@@ -868,11 +873,12 @@ fn read_cold_from_store(
     key: Key,
     cold_store: Option<&Arc<VarSpillStore>>,
     absences: Option<&crate::journal::OrphanInbox>,
+    pins: &[crate::varspill::RowPin],
 ) -> std::io::Result<InstanceSnapshot> {
     let store = cold_store
         .ok_or_else(|| invalid_data("cold index references a key but no cold store is wired"))?;
     match store
-        .try_get_cold(key)
+        .try_get_cold_as_of(key, pins)
         .map_err(|e| invalid_data(&e.to_string()))?
     {
         Some(snap) => Ok(snap),
@@ -893,6 +899,7 @@ fn resolve_spilled_from_stores(
     spill_store: Option<&Arc<VarSpillStore>>,
     legacy: Option<&Arc<VarSpillStore>>,
     absences: Option<&crate::journal::OrphanInbox>,
+    pins: &[crate::varspill::RowPin],
 ) -> std::io::Result<()> {
     let key = snap.instance.key;
     let resolved = if let Some(vs) = varstore {
@@ -920,7 +927,7 @@ fn resolve_spilled_from_stores(
                 // row or its whole-instance cold row (which carries variables
                 // inline); either means the payload survives.
                 let legacy_row = legacy_store
-                    .try_has_legacy_payload(key)
+                    .try_has_legacy_payload_as_of(key, pins)
                     .map_err(|e| invalid_data(&e.to_string()))?;
                 if legacy_row {
                     return Err(invalid_data(&format!(
@@ -933,7 +940,8 @@ fn resolve_spilled_from_stores(
             }
         }
     } else if let Some(sp) = spill_store {
-        sp.try_get(key).map_err(|e| invalid_data(&e.to_string()))?
+        sp.try_get_as_of(key, pins)
+            .map_err(|e| invalid_data(&e.to_string()))?
     } else {
         None
     };
@@ -1607,6 +1615,122 @@ mod tests {
         assert!(
             !absences.contains(key),
             "no orphan recorded while the cold tier holds the payload"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1885: a capture pins the off-heap rows it references, but a captured
+    // instance can be rehydrated, mutated and RE-SPILLED (`put_cold` / `put`)
+    // before the off-thread writer reads its row. The snapshot must still
+    // serialize the row AS OF THE CAPTURE — never the newer row, which would
+    // pair newer instance data with the capture's older applied index. Covers
+    // both the cold tier and the variable-spill tier, deterministically:
+    // capture → mutate → re-spill → serialize.
+    #[test]
+    fn streaming_snapshot_reads_rows_as_of_capture_despite_respill() {
+        let engine = engine_with_instances(2);
+        let (control, instances) = Engine::decompose_state_for_streaming(engine.state().clone());
+        let mut it = instances.into_iter();
+        let cold_snap = it.next().expect("cold instance");
+        let mut spilled_snap = it.next().expect("spilled instance");
+        let cold_key = cold_snap.instance.key;
+        let spilled_key = spilled_snap.instance.key;
+        let captured = |key: Key| -> String {
+            let snap = if key == cold_key {
+                &cold_snap
+            } else {
+                &spilled_snap
+            };
+            match snap.instance.variables.get("data") {
+                Some(Value::Str(s)) => s.clone(),
+                other => panic!("missing payload: {other:?}"),
+            }
+        };
+        let (cold_payload, spilled_payload) = (captured(cold_key), captured(spilled_key));
+
+        // One shared store, as in production: the cold row and the spill row.
+        let store = Arc::new(VarSpillStore::open(None).expect("store"));
+        store.put_cold(cold_key, &cold_snap).expect("seed cold row");
+        store
+            .put(spilled_key, &spilled_snap.instance.variables)
+            .expect("seed spill row");
+        spilled_snap.instance.variables = Arc::new(BTreeMap::new());
+        spilled_snap.instance.variables_spilled = true;
+
+        // Capture: the pin is taken with the routing keys / spilled flags.
+        let pins = vec![store.pin_rows()];
+
+        // Mutate + re-spill both rows after the capture, before the write.
+        let mut newer_cold = cold_snap.clone();
+        let mut vars = (*newer_cold.instance.variables).clone();
+        vars.insert("data".to_string(), Value::Str("NEWER-cold".to_string()));
+        newer_cold.instance.variables = Arc::new(vars);
+        store
+            .put_cold(cold_key, &newer_cold)
+            .expect("re-spill cold");
+        let mut newer_vars = BTreeMap::new();
+        newer_vars.insert("data".to_string(), Value::Str("NEWER-spill".to_string()));
+        store.put(spilled_key, &newer_vars).expect("re-spill vars");
+
+        let path = tmp_path("respill-1885");
+        write_streaming_snapshot_from_stores(
+            &path,
+            &header_line(),
+            7,
+            None,
+            StreamingCapture {
+                control: control_snapshot(&control, &engine),
+                resident: vec![spilled_snap],
+            },
+            &[cold_key],
+            SpillStores {
+                cold: Some(Arc::clone(&store)),
+                spill: Some(Arc::clone(&store)),
+                varstore: None,
+                legacy: None,
+                absences: None,
+                pins,
+            },
+            false,
+        )
+        .expect("streaming write");
+
+        let mut restored: BTreeMap<Key, String> = BTreeMap::new();
+        read_streaming_snapshot(
+            &path,
+            |_control, _covered| {},
+            |snap| {
+                let data = match snap.instance.variables.get("data") {
+                    Some(Value::Str(s)) => s.clone(),
+                    other => panic!("restored instance missing payload: {other:?}"),
+                };
+                restored.insert(snap.instance.key, data);
+            },
+        )
+        .expect("streaming read");
+        assert_eq!(
+            restored.get(&cold_key),
+            Some(&cold_payload),
+            "cold row must serialize as of the capture, not the re-spilled row"
+        );
+        assert_eq!(
+            restored.get(&spilled_key),
+            Some(&spilled_payload),
+            "spill row must serialize as of the capture, not the re-spilled row"
+        );
+
+        // The pin (owned by the write) is released: the live rows are the newer
+        // ones and the side table no longer shadows them.
+        let live = store.try_get(spilled_key).expect("read").expect("row");
+        assert_eq!(
+            live.get("data"),
+            Some(&Value::Str("NEWER-spill".to_string()))
+        );
+        let live_cold = store.try_get_cold(cold_key).expect("read").expect("row");
+        assert_eq!(
+            live_cold.instance.variables.get("data"),
+            Some(&Value::Str("NEWER-cold".to_string()))
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
