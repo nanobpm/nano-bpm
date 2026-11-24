@@ -56,13 +56,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::Receiver;
-use std::sync::mpsc::{Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use nanobpmn_engine_core::{InstanceSnapshot, Key, Value};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::sqlite_space::{
     enable_incremental_auto_vacuum, freelist_bytes, page_stats, reclaim_freelist_step,
@@ -409,6 +409,12 @@ pub struct VarSpillStore {
     /// deletes are deferred so an in-flight streaming snapshot can still read
     /// every row its capture referenced.
     pins: Arc<Mutex<RowPins>>,
+    /// Checkpoint budget for deferred drains (#1880): keys drained since the
+    /// last drain-triggered `wal_checkpoint(TRUNCATE)`, and the threshold
+    /// (`wal_checkpoint_keys`). Mirrors the forget worker's `since_ckpt`, so
+    /// retirements routed through pin releases still bound WAL growth.
+    drained_since_ckpt: std::sync::atomic::AtomicU64,
+    ckpt_keys: u64,
     /// Test-only fault-injection seam shared with the forget worker.
     #[cfg(test)]
     fault_injection: Arc<ForgetFaultInjection>,
@@ -618,6 +624,8 @@ impl VarSpillStore {
             forget,
             faults,
             pins: Arc::default(),
+            drained_since_ckpt: std::sync::atomic::AtomicU64::new(0),
+            ckpt_keys: wal_checkpoint_keys(),
             #[cfg(test)]
             fault_injection,
         })
@@ -971,10 +979,32 @@ impl VarSpillStore {
             };
             // A failure is latched (with its keys) in `forget_faults`, exactly
             // as for an undeferred delete.
+            let drained = (batch.both.len() + batch.spill.len() + batch.cold.len()) as u64;
             let _ = self.forget_now(&batch.both);
             self.delete_single_table(GcTable::Spill, batch.spill);
             self.delete_single_table(GcTable::Cold, batch.cold);
             drop(pins);
+            self.account_drained(drained);
+        }
+    }
+
+    /// Counts `n` drained keys toward the WAL checkpoint budget and, once it
+    /// reaches `ckpt_keys`, runs `wal_checkpoint(TRUNCATE)` (#1880 review):
+    /// with `wal_autocheckpoint=0`, deferred drains would otherwise bypass the
+    /// forget worker's backstop and grow the WAL without bound. Runs outside
+    /// the pins lock, so it never blocks spills or pins; a failure is latched
+    /// in `forget_faults`, like the worker's checkpoint failure.
+    fn account_drained(&self, n: u64) {
+        let prev = self.drained_since_ckpt.fetch_add(n, Ordering::Relaxed);
+        if prev.saturating_add(n) < self.ckpt_keys {
+            return;
+        }
+        self.drained_since_ckpt.store(0, Ordering::Relaxed);
+        self.activity.fetch_add(1, Ordering::Relaxed);
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(err) = guard.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            drop(guard);
+            self.faults.record(&err, Vec::new());
         }
     }
 
@@ -2227,6 +2257,41 @@ mod tests {
         }
         let pins = store.pins.lock().unwrap();
         assert!(pins.spill.is_empty() && pins.cold.is_empty());
+    }
+
+    // #1880 review: deferred drains count toward the WAL checkpoint budget,
+    // so sustained pinned retirement cannot grow the WAL without bound.
+    #[test]
+    fn row_pin_release_drain_checkpoints_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-pin-ckpt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let mut store = VarSpillStore::open(Some(&path)).unwrap();
+        store.ckpt_keys = 8;
+        let store = Arc::new(store);
+        let wal = dir.join("var-spill.sqlite-wal");
+        for key in 1..=16u64 {
+            store.put(key, &vars("v")).unwrap();
+        }
+        let pin = store.pin_rows();
+        store.forget_async_owned((1..=16).collect());
+        store.flush_forgets();
+        drop(pin);
+        for key in 1..=16u64 {
+            assert!(store.try_get(key).unwrap().is_none(), "key {key} deleted");
+        }
+        let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_len, 0, "deferred drain truncated the WAL");
+        assert!(store.forget_faults().error().is_none());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
