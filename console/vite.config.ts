@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { readFileSync } from "node:fs";
@@ -47,6 +47,37 @@ const profile =
   process.env.VITE_CONSOLE_PROFILE === "observe" ? "observe" : "studio";
 const isStudio = profile === "studio";
 
+// The engine the studio's test-run panel embeds (#1871): the same-commit
+// `engine-wasm/pkg` build (`file:` dep), stamped by
+// engine-wasm/scripts/stamp-pkg.mjs with the server's version and the build
+// commit. Record it in the bundle as `engine-wasm.json` so a release/CI guard
+// (scripts/engine-parity.mjs) can prove the console's engine and the server's
+// come from the same commit and version. Missing build info fails the build:
+// an unstamped engine is exactly the drift this guards against.
+function engineBuildInfo(): Plugin {
+  return {
+    name: "nano-engine-build-info",
+    apply: "build",
+    generateBundle() {
+      const file = fileURLToPath(
+        new URL(
+          "./node_modules/@nanobpm/engine-wasm/build-info.json",
+          import.meta.url,
+        ),
+      );
+      let source: string;
+      try {
+        source = readFileSync(file, "utf8");
+      } catch {
+        throw new Error(
+          `missing ${file}: build engine-wasm/pkg from this commit first (make console-wasm), then npm install`,
+        );
+      }
+      this.emitFile({ type: "asset", fileName: "engine-wasm.json", source });
+    },
+  };
+}
+
 // The console is served by the gateway under the `/console/` path prefix
 // (see server/src/console/mod.rs), so the built asset URLs must be prefixed too.
 export default defineConfig({
@@ -54,7 +85,7 @@ export default defineConfig({
   define: {
     __STUDIO__: JSON.stringify(isStudio),
   },
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), engineBuildInfo()],
   // `@bpmn-io/form-js-editor` pins its own nested `preact` (10.15.x) while the
   // form *viewer* it renders through — plus `@bpmn-io/properties-panel` and
   // diagram-js — resolve the hoisted `preact` (10.29.x). Two preact copies means
@@ -78,13 +109,12 @@ export default defineConfig({
     // Match the console tsconfig's `preserveSymlinks`: `@nanobpm/nano-app-schema`
     // is a `file:` dep (`../spec-app`) symlinked into `node_modules`. Resolving
     // via its realpath (Rollup's default) can miss the hoisted copy, so follow
-    // the symlink path rooted here instead. `@nanobpm/engine-wasm` now comes from
-    // npm transitively (via the published `@nanobpm/bojtos-*` packages), so it no
-    // longer needs the symlink treatment — but the setting is retained for the
-    // remaining `file:` dep.
+    // the symlink path rooted here instead. The same applies to
+    // `@nanobpm/engine-wasm`, a `file:` dep on the same-commit `../engine-wasm/pkg`
+    // build (#1871).
     preserveSymlinks: true,
   },
-  // The published `@nanobpm/engine-wasm` (wasm-pack `--target web` output) resolves
+  // `@nanobpm/engine-wasm` (the same-commit wasm-pack `--target web` output) resolves
   // its binary via `new URL('nanobpmn_engine_bg.wasm', import.meta.url)`. Excluding
   // it from esbuild's dependency pre-bundling keeps that asset reference intact so
   // Vite emits the `.wasm` as a hashed asset instead of esbuild rewriting the

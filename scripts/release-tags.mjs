@@ -17,7 +17,7 @@
 // Usage:
 //   node scripts/release-tags.mjs                 # dry run: show the plan
 //   node scripts/release-tags.mjs --push          # tag HEAD (must be origin/main) and push
-//   node scripts/release-tags.mjs --only engine-wasm --push
+//   node scripts/release-tags.mjs --only gateway --push
 //
 // Requires `git` and, for --push, an authenticated `gh` (to confirm the runs).
 
@@ -64,7 +64,11 @@ export const TRAINS = [
     id: "gateway",
     tagPrefix: "v",
     version: (read) => cargoPackageVersion(read("server/Cargo.toml")),
-    workflows: ["publish-c8ctl-binaries.yml", "publish-processos-binaries.yml"],
+    // release-bojtos-npm.yml publishes @nanobpm/engine-wasm at the SAME version
+    // from the SAME tag (#1871): `server vX.Y.Z` <=> `@nanobpm/engine-wasm X.Y.Z`.
+    // There is no separate engine-wasm train or version source: the package
+    // version is stamped from server/Cargo.toml (engine-wasm/scripts/stamp-pkg.mjs).
+    workflows: ["publish-c8ctl-binaries.yml", "publish-processos-binaries.yml", "release-bojtos-npm.yml"],
   },
   {
     id: "nano-bernd-npm",
@@ -77,15 +81,6 @@ export const TRAINS = [
     tagPrefix: "nano-bernd-jvm-v",
     version: (read) => berndVersion(read),
     workflows: ["release-nano-bernd-jvm.yml"],
-  },
-  {
-    id: "engine-wasm",
-    tagPrefix: "bojtos-npm-v",
-    // The template is the only source of truth: engine-wasm/pkg/ is a build
-    // output (gitignored, #668), and release-bojtos-npm.yml builds it from the
-    // tagged source and checks the built version equals the tag.
-    version: (read) => packageJsonVersion(read("engine-wasm/pkg.package.json")),
-    workflows: ["release-bojtos-npm.yml"],
   },
 ];
 

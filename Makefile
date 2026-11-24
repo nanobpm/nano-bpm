@@ -401,7 +401,8 @@ console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine
 		rm -f "$(PROJECT_ROOT)/engine-wasm/pkg/readmodel/.gitignore"; \
 		echo "  -> use-after-free DX guard (scripts/inject-free-guard.mjs)"; \
 		node "$(PROJECT_ROOT)/engine-wasm/scripts/inject-free-guard.mjs" "$(PROJECT_ROOT)/engine-wasm/pkg/lean/nanobpmn_engine.js" "$(PROJECT_ROOT)/engine-wasm/pkg/readmodel/nanobpmn_engine.js"; \
-		cp "$(PROJECT_ROOT)/engine-wasm/pkg.package.json" "$(PROJECT_ROOT)/engine-wasm/pkg/package.json"; \
+		echo "  -> stamp package.json + build-info.json (version derived from server/Cargo.toml, #1871)"; \
+		node "$(PROJECT_ROOT)/engine-wasm/scripts/stamp-pkg.mjs" "$(PROJECT_ROOT)" "$(PROJECT_ROOT)/engine-wasm/pkg"; \
 		cp "$(PROJECT_ROOT)/engine-wasm/README.md" "$(PROJECT_ROOT)/engine-wasm/pkg/README.md"; \
 		echo "  -> readmodel-types (pkg/readmodel-types, derived DTO types)"; \
 		mkdir -p "$(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types"; \
@@ -502,10 +503,6 @@ clippy-matrix-guard: ## Coverage guard: fail if a production crate, cargo featur
 release-tags: ## Cut release tags for every train whose version is bumped but untagged (dry run; PUSH=1 to tag origin/main HEAD and push). One tag per push + confirms each release workflow started — see RELEASE.md.
 	@case "$(PUSH)" in ""|1) ;; *) echo "PUSH must be 1 (push) or unset (dry run), got '$(PUSH)'" >&2; exit 1;; esac
 	node "$(PROJECT_ROOT)/scripts/release-tags.mjs" $(if $(filter 1,$(PUSH)),--push)
-
-.PHONY: release-engine-wasm
-release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-v<pkg version> on origin/main HEAD and push it (CI OIDC-publishes). Thin wrapper over scripts/release-tags.mjs.
-	node "$(PROJECT_ROOT)/scripts/release-tags.mjs" --only engine-wasm --push
 
 .PHONY: processos-build
 processos-build: ## Build ProcessOS, the separate optimization-plane server (Stage T1: Insights)

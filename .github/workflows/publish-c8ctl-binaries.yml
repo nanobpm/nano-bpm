@@ -152,6 +152,9 @@ jobs:
           set -euo pipefail
           npm ci
           npm run build
+          # The console must embed the engine-wasm build of THIS commit at the
+          # server's version (#1871): the bundle records it as engine-wasm.json.
+          node ../scripts/engine-parity.mjs dist/engine-wasm.json
 
       - name: Upload prebuilt sources
         uses: actions/upload-artifact@v6

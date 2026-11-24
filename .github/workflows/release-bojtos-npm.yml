@@ -1,8 +1,18 @@
 name: release-bojtos-npm
 
-# Triggered by tags of the form `bojtos-npm-v0.1.0`. Builds & publishes the
-# @nanobpm/engine-wasm package (the wasm-pack build of the Rust in-browser
-# engine) to the npm registry.
+# Publishes @nanobpm/engine-wasm (the wasm-pack build of the Rust in-browser
+# engine) to the npm registry from every gateway release tag `vX.Y.Z` (#1871).
+#
+# One engine version: `server vX.Y.Z` <=> `@nanobpm/engine-wasm X.Y.Z`. The
+# package version is not kept anywhere of its own — `make console-wasm`
+# stamps it from server/Cargo.toml (engine-wasm/scripts/stamp-pkg.mjs), the
+# same source scripts/release-tags.mjs derives the `v*` tag from, and records
+# the build commit in build-info.json. So the engine a server runs, the engine
+# its console embeds, and the npm package downstream apps test against are the
+# same commit and the same version. (The separate `bojtos-npm-v*` train is
+# retired; its last tag was bojtos-npm-v0.11.2.)
+#
+# The filename is kept: it is the Trusted Publisher configured on npmjs.com.
 #
 # The Bojtos framework packages that consume it — @nanobpm/bojtos-kit and
 # @nanobpm/bojtos-react — were extracted to their own repo (nanobpm/bojtos) and
@@ -11,9 +21,7 @@ name: release-bojtos-npm
 #
 # Authentication is npm OIDC trusted publishing — NO NPM_TOKEN. engine-wasm
 # must have a Trusted Publisher configured on npmjs.com pointing at this repo +
-# this workflow file (see docs/releasing-bojtos-npm.md). The very first publish
-# was done locally by a maintainer (it created the package so the Trusted
-# Publisher could be configured); thereafter this workflow publishes on tag.
+# this workflow file (see docs/releasing-bojtos-npm.md).
 #
 # Note: npm provenance is intentionally disabled (NPM_CONFIG_PROVENANCE=false) —
 # provenance requires a public source repository, and nano-bpm is private.
@@ -21,12 +29,12 @@ name: release-bojtos-npm
 on:
   push:
     tags:
-      - 'bojtos-npm-v*'
+      - 'v*'
   workflow_dispatch: {}
 
 jobs:
   publish:
-    if: startsWith(github.ref, 'refs/tags/bojtos-npm-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     name: Publish engine-wasm
     runs-on: ubuntu-24.04
     permissions:
@@ -40,7 +48,7 @@ jobs:
       # Only a main-reachable release tag may publish (#1830).
       - uses: ./.github/actions/assert-release-ref
         with:
-          tag-pattern: '^bojtos-npm-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          tag-pattern: '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
       - uses: actions/setup-node@v5
         with:
@@ -68,14 +76,16 @@ jobs:
           # A release build starts cold rather than from a PR-populated cache.
           rust-cache: 'false'
 
-      - name: Verify tag matches package version
+      - name: Verify tag, package version and build commit match the server
         run: |
-          tag_version="${GITHUB_REF_NAME#bojtos-npm-v}"
+          tag_version="${GITHUB_REF_NAME#v}"
           pkg_version=$(node -p "require('./engine-wasm/pkg/package.json').version")
           if [[ "$pkg_version" != "$tag_version" ]]; then
             echo "::error::tag $tag_version does not match engine-wasm/pkg version $pkg_version"
             exit 1
           fi
+          # Same version AND same commit as the server this tag releases (#1871).
+          node scripts/engine-parity.mjs engine-wasm/pkg/build-info.json --commit "$GITHUB_SHA"
           echo "releasing @nanobpm/engine-wasm $tag_version"
 
       - name: Publish (OIDC)
