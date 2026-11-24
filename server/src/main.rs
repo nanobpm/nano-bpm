@@ -28732,8 +28732,13 @@ fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now:
     if !lenient || journal.engine().replicated_lenient_completion() {
         return;
     }
-    if let Err(e) = journal.apply_command_at(Command::SetLenientCompletion { lenient }, now) {
-        tracing::error!("applying SetLenientCompletion {{ lenient: {lenient} }} failed: {e}");
+    match journal.apply_command_at(Command::SetLenientCompletion { lenient }, now) {
+        // Fire-and-forget: the flag is in-memory immediately and its
+        // durability rides on the next awaited commit / shutdown fsync (#1855).
+        Ok((_, commit)) => commit.detach(),
+        Err(e) => {
+            tracing::error!("applying SetLenientCompletion {{ lenient: {lenient} }} failed: {e}");
+        }
     }
 }
 
@@ -31341,13 +31346,15 @@ mod snapshot_health_tick_tests {
                 ))
                 .unwrap()
                 .1
-                .blocking_wait();
+                .wait()
+                .await;
             for _ in 0..50 {
                 journal
                     .apply_command(Command::create_instance("p"))
                     .unwrap()
                     .1
-                    .blocking_wait();
+                    .wait()
+                    .await;
             }
         } // crash: no snapshot was ever taken, nothing was compacted.
 
