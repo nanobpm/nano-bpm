@@ -3553,7 +3553,7 @@ pub(crate) struct DataGatewayLimiter {
     workers: urban_data_worker::WorkerRegistry,
     /// Killed serve workers whose teardown (Windows `taskkill`, reap) has not
     /// finished yet: still live processes, so they count against the budget.
-    reaping: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    reaping: std::sync::Arc<urban_data_worker::ReapBudget>,
 }
 
 impl DataGatewayLimiter {
@@ -3641,6 +3641,27 @@ impl DataGatewayLimiter {
             .acquire()
             .await
             .map_err(|e| DataError::Gateway(format!("data gateway limiter closed: {e}")))
+    }
+
+    /// Wait (while holding a permit) until the live-process budget has room
+    /// for the caller's process: `running ops + reaping teardowns <=
+    /// concurrency`. A permit freed by a cancelled op, or an idle worker just
+    /// evicted, may still be a live process mid-teardown (Windows `taskkill`,
+    /// reap); spawning before it is gone would exceed the bound (#1836).
+    /// Callers bound this with their op deadline.
+    pub(super) async fn await_teardown_capacity(&self) {
+        loop {
+            let notified = self.reaping.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let running = self
+                .concurrency
+                .saturating_sub(self.permits.available_permits());
+            if running + self.reaping.count.load(Ordering::Acquire) <= self.concurrency {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -4069,6 +4090,9 @@ async fn pipe_data_gateway_limited(
     let _permit = limiter.acquire().await?;
     // Idle resident serve workers count against the same live-process budget.
     urban_data_worker::enforce_resident_budget(limiter);
+    tokio::time::timeout(limiter.timeout, limiter.await_teardown_capacity())
+        .await
+        .map_err(|_| limiter.busy())?;
 
     cmd.env("NO_COLOR", "1")
         .stdin(std::process::Stdio::piped())
@@ -4924,7 +4948,7 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     // resurrect as an imported project once its directory is gone.
     let workspace_dir = projects_root().join(name);
     // #1836: no `urban data --serve` worker may outlive (or pin) its project.
-    urban_data_worker::retire_project_worker(data_gateway_limiter(), &dir);
+    urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &dir);
     if workspace_dir.is_dir() {
         // Drop a coexisting ref before removing the directory; propagate an IO
         // error so a pointer that can't be removed can't silently resurrect the
@@ -4962,7 +4986,7 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     // external path and move the workspace project outside the root.
     let from = projects_root().join(old);
     // #1836: the worker is keyed on (and anchored in) the old directory.
-    urban_data_worker::retire_project_worker(data_gateway_limiter(), &from);
+    urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &from);
     if !from.is_dir() {
         // A pure imported-by-reference project (no workspace dir) can't be
         // renamed by a directory move; remove and re-import under the new name.

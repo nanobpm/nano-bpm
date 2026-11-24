@@ -31,7 +31,7 @@
 //!   per-project wait queue is bounded (Busy back-pressure) and holds no
 //!   execution permit.
 //! - **Retired with its project**: deleting or renaming a project calls
-//!   [`retire_project_worker`], which drops the slot and kills the worker.
+//!   [`retire_project_worker_blocking`], which drops the slot and kills the worker.
 //! - **Orphan-free**: the console holds the worker's stdin, so if the console
 //!   dies the worker sees EOF and exits; timeouts kill its whole process group.
 
@@ -118,10 +118,14 @@ impl WorkerRegistry {
 
 /// Stop the project's worker (if any) and forget its slot: called when a
 /// project is deleted or renamed so no idle Node worker outlives it (nor holds
-/// its directory as CWD, which blocks removal on Windows). An op in flight on
-/// the slot keeps its worker until it finishes, then kills it instead of
-/// parking it, because the slot is no longer registered.
-pub(super) fn retire_project_worker(limiter: &DataGatewayLimiter, dir: &Path) {
+/// its directory as CWD, which blocks removal on Windows). The kill and reap
+/// complete **before** this returns (bounded by `GATEWAY_REAP_GRACE`), so the
+/// caller's directory removal/move cannot race a dying worker that still
+/// pins the directory (#1836). It blocks the calling thread for that span;
+/// callers are synchronous filesystem operations. An op in flight on the slot
+/// keeps its worker until it finishes, then kills it instead of parking it,
+/// because the slot is no longer registered.
+pub(super) fn retire_project_worker_blocking(limiter: &DataGatewayLimiter, dir: &Path) {
     // Callers key on the canonical dir; accept either spelling here.
     let canon = dunce::canonicalize(dir).ok();
     let removed: Vec<Slot> = {
@@ -134,25 +138,43 @@ pub(super) fn retire_project_worker(limiter: &DataGatewayLimiter, dir: &Path) {
     };
     for slot in removed {
         let w = slot.idle().take();
-        if let Some(w) = w {
-            kill_detached(limiter, w);
+        if let Some(mut w) = w {
+            let _ticket = Reaping::new(limiter);
+            if let Some(pid) = w.child.id() {
+                super::kill_group_by_pid(pid);
+            }
+            let _ = w.child.start_kill();
+            let give_up = Instant::now() + super::GATEWAY_REAP_GRACE;
+            while !matches!(w.child.try_wait(), Ok(Some(_)) | Err(_)) && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }
 
+/// Live-process accounting for worker teardowns in flight: killed workers
+/// whose kill/reap has not finished are still live processes, so they count
+/// against the budget, and admission waits on `notify` for them to go.
+#[derive(Default)]
+pub(crate) struct ReapBudget {
+    pub(super) count: AtomicUsize,
+    pub(super) notify: tokio::sync::Notify,
+}
+
 /// Counts one worker teardown against the live-process budget until dropped.
-struct Reaping(Arc<AtomicUsize>);
+struct Reaping(Arc<ReapBudget>);
 
 impl Reaping {
     fn new(limiter: &DataGatewayLimiter) -> Self {
-        limiter.reaping.fetch_add(1, Ordering::AcqRel);
+        limiter.reaping.count.fetch_add(1, Ordering::AcqRel);
         Self(limiter.reaping.clone())
     }
 }
 
 impl Drop for Reaping {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0.count.fetch_sub(1, Ordering::AcqRel);
+        self.0.notify.notify_waiters();
     }
 }
 
@@ -204,7 +226,7 @@ pub(super) fn enforce_resident_budget(limiter: &DataGatewayLimiter) {
     let running = limiter
         .concurrency
         .saturating_sub(limiter.permits.available_permits());
-    let reaping = limiter.reaping.load(Ordering::Acquire);
+    let reaping = limiter.reaping.count.load(Ordering::Acquire);
     let allowed_idle = limiter
         .concurrency
         .saturating_sub(running)
@@ -483,6 +505,9 @@ pub(super) async fn run_serve_op(
         worker: slot.idle().take(),
     };
     enforce_resident_budget(limiter);
+    tokio::time::timeout_at(deadline, limiter.await_teardown_capacity())
+        .await
+        .map_err(|_| timed_out(limiter))?;
     let fingerprint = toolkit_fingerprint(urban, dir);
 
     if let Some(mut w) = use_.worker.take() {
@@ -696,19 +721,18 @@ mod tests {
         let a = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
             .await
             .unwrap();
-        retire_project_worker(&lim, &dir);
+        retire_project_worker_blocking(&lim, &dir);
         assert!(!lim.workers.map().contains_key(&dir), "slot not forgotten");
         let pid = a["pid"].as_i64().unwrap() as i32;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Retirement is complete on return (no polling): the caller removes
+        // or moves the directory next, which a dying worker would pin.
         // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
-        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
         assert_ne!(
             unsafe { libc::kill(pid, 0) },
             0,
-            "retired worker still alive"
+            "retired worker still alive (or unreaped) when retire returned"
         );
+        assert_eq!(lim.reaping.count.load(Ordering::Acquire), 0);
         let b = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
             .await
             .unwrap();
@@ -1040,6 +1064,40 @@ mod tests {
             0,
             "queue place released"
         );
+    }
+
+    /// A teardown still in flight (an evicted or cancelled worker whose kill
+    /// has not finished) holds its share of the live-process budget: an op
+    /// that holds the only permit must not spawn until it has gone (#1836).
+    #[tokio::test]
+    async fn admission_waits_for_pending_teardown() {
+        let lim = DataGatewayLimiter::with_timeout(1, 8, std::time::Duration::from_secs(10));
+        let ticket = Reaping::new(&lim);
+        let _permit = lim.acquire().await.unwrap();
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            lim.await_teardown_capacity(),
+        )
+        .await;
+        assert!(waited.is_err(), "spawned over a teardown still in flight");
+        let wait = lim.await_teardown_capacity();
+        tokio::pin!(wait);
+        drop(ticket);
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .expect("capacity not released once the teardown completed");
+    }
+
+    /// With a pending teardown the single-shot path refuses (Busy) instead of
+    /// spawning past the bound when the teardown never finishes in time.
+    #[tokio::test]
+    async fn single_shot_respects_pending_teardown() {
+        let lim = DataGatewayLimiter::with_timeout(1, 8, std::time::Duration::from_millis(150));
+        let _ticket = Reaping::new(&lim);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "cat"]);
+        let r = super::super::pipe_data_gateway_limited(&lim, cmd, &serde_json::json!({})).await;
+        assert!(matches!(r, Err(DataError::Busy(_))), "got {r:?}");
     }
 
     /// An implementation update that leaves the launcher untouched (path,

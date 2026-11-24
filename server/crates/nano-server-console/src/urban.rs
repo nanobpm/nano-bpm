@@ -250,17 +250,50 @@ pub(crate) fn toolkit_identity(urban: &Path) -> u64 {
     stamp(urban, &mut h);
     if let Ok(real) = std::fs::canonicalize(urban) {
         real.hash(&mut h);
-        // Nearest enclosing package (bin/ sits at most a few levels deep).
-        for dir in real.ancestors().skip(1).take(4) {
-            let manifest = dir.join("package.json");
-            if let Ok(bytes) = std::fs::read(&manifest) {
+        if let Some(dir) = toolkit_package_dir(&real) {
+            if let Ok(bytes) = std::fs::read(dir.join("package.json")) {
                 bytes.hash(&mut h);
-                stamp(&dir.join("dist").join("cli.js"), &mut h);
-                break;
             }
+            stamp(&dir.join("dist").join("cli.js"), &mut h);
         }
     }
     h.finish()
+}
+
+/// The npm package directory of the `@nanobpm/urban` install a resolved
+/// launcher runs. npm shims (Windows `.cmd`/`.ps1`/extensionless shell shims,
+/// which are regular files rather than symlinks) do not live inside the
+/// package, so their layouts are resolved first: a project-local
+/// `node_modules/.bin/urban*` → `node_modules/@nanobpm/urban`, and a global
+/// `<prefix>/urban*` → `<prefix>/node_modules/@nanobpm/urban` (#1836). Only
+/// otherwise (a symlink resolved into the package) does the nearest enclosing
+/// `package.json` win — never an unrelated app/pack manifest above a shim.
+pub(crate) fn toolkit_package_dir(real: &Path) -> Option<std::path::PathBuf> {
+    let bin_dir = real.parent()?;
+    let mut shim_targets = Vec::new();
+    if bin_dir.file_name().is_some_and(|n| n == ".bin")
+        && let Some(nm) = bin_dir.parent()
+    {
+        shim_targets.push(nm.join("@nanobpm").join("urban"));
+    }
+    shim_targets.push(bin_dir.join("node_modules").join("@nanobpm").join("urban"));
+    if let Some(dir) = shim_targets
+        .into_iter()
+        .find(|d| d.join("package.json").is_file())
+    {
+        return Some(dir);
+    }
+    if bin_dir.file_name().is_some_and(|n| n == ".bin") {
+        // A shim whose package is missing: never attribute an enclosing
+        // project's manifest to the toolkit.
+        return None;
+    }
+    // Nearest enclosing package (bin/ sits at most a few levels deep).
+    real.ancestors()
+        .skip(1)
+        .take(4)
+        .find(|d| d.join("package.json").is_file())
+        .map(Path::to_path_buf)
 }
 
 /// Whether the resolved toolkit's `urban data` gateway has the long-lived
@@ -580,6 +613,66 @@ fn help_indicates_data_serve(help: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1836: npm shims (Windows `urban.cmd`, regular files) sit outside the
+    /// package, so a toolkit-only update must change the identity in both the
+    /// local `.bin` and the global-prefix layouts — the enclosing app/pack
+    /// manifest above the shim must never stand in for the toolkit's.
+    #[test]
+    fn toolkit_identity_resolves_npm_shim_layouts() {
+        let base = std::env::temp_dir().join(format!("nbpm-urban-shim-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        // (shim path, package dir) for local and global npm layouts.
+        let local_nm = base.join("app").join("node_modules");
+        let global = base.join("prefix");
+        let cases = [
+            (
+                local_nm.join(".bin").join("urban.cmd"),
+                local_nm.join("@nanobpm").join("urban"),
+            ),
+            (
+                global.join("urban.cmd"),
+                global.join("node_modules").join("@nanobpm").join("urban"),
+            ),
+        ];
+        // An enclosing app manifest that never changes.
+        std::fs::create_dir_all(base.join("app")).unwrap();
+        std::fs::write(base.join("app").join("package.json"), "{}").unwrap();
+        std::fs::write(base.join("package.json"), "{}").unwrap();
+        for (shim, pkg) in &cases {
+            std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(pkg.join("dist")).unwrap();
+            std::fs::write(shim, "@node urban\r\n").unwrap();
+            std::fs::write(pkg.join("package.json"), r#"{"version":"0.100.0"}"#).unwrap();
+            std::fs::write(pkg.join("dist").join("cli.js"), "a").unwrap();
+            let real = std::fs::canonicalize(shim).unwrap();
+            assert_eq!(
+                toolkit_package_dir(&real),
+                Some(std::fs::canonicalize(pkg).unwrap()),
+                "shim {shim:?} resolved to the wrong package"
+            );
+            let before = toolkit_identity(shim);
+            std::fs::write(pkg.join("package.json"), r#"{"version":"0.101.0"}"#).unwrap();
+            assert_ne!(
+                before,
+                toolkit_identity(shim),
+                "manifest-only update unseen"
+            );
+            let mid = toolkit_identity(shim);
+            std::fs::write(pkg.join("dist").join("cli.js"), "bb").unwrap();
+            assert_ne!(
+                mid,
+                toolkit_identity(shim),
+                "implementation-only update unseen"
+            );
+        }
+        // A `.bin` shim whose package is missing never borrows the app manifest.
+        let orphan = base.join("orphan").join("node_modules").join(".bin");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("urban.cmd"), "x").unwrap();
+        assert_eq!(toolkit_package_dir(&orphan.join("urban.cmd")), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn resolve_urban_prefers_explicit_override() {
