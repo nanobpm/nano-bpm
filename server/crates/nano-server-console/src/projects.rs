@@ -4981,6 +4981,11 @@ static DIR_LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Deletes a project directory and everything in it.
 pub fn delete_project(name: &str) -> std::io::Result<()> {
+    // Serialise deletes/renames BEFORE resolving the path, so a queued delete
+    // re-resolves `name` inside the serialized region: two concurrent deletes
+    // of one imported alias must not both hold the external checkout path, or
+    // the second would fall through to `remove_dir_all` on it (#1881).
+    let _serial = DIR_LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = project_dir(name).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid project name")
     })?;
@@ -4988,9 +4993,6 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     // so delete it. Also drop a coexisting ref so the name can't silently
     // resurrect as an imported project once its directory is gone.
     let workspace_dir = projects_root().join(name);
-    // Serialise deletes so two aliases of one directory deleted at once can't
-    // each see the other and both skip retirement (#1881).
-    let _serial = DIR_LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // #1836: no `urban data --serve` worker may outlive (or pin) its project.
     // The guard keeps the path tombstoned (no op runs or spawns there) until
     // the directory operation below is done. #1881: deleting a
@@ -5035,10 +5037,18 @@ fn dir_shared_with_other_project(name: &str, dir: &Path) -> bool {
         let Some(file_name) = file_name.to_str() else {
             return false;
         };
-        let other = file_name
-            .strip_suffix(".project-ref.json")
-            .unwrap_or(file_name);
-        if other == name || !(other != file_name || entry.path().is_dir()) {
+        // Directory names are project names verbatim (a workspace project may
+        // itself be called `app.project-ref.json`); only reference *files*
+        // carry the suffix to strip.
+        let path = entry.path();
+        let other = if path.is_dir() {
+            file_name
+        } else if let Some(stem) = file_name.strip_suffix(".project-ref.json") {
+            stem
+        } else {
+            return false;
+        };
+        if other == name {
             return false;
         }
         project_dir(other)
@@ -9010,6 +9020,49 @@ mod tests {
         assert!(
             ext.join("nano.app.json").is_file(),
             "external checkout untouched"
+        );
+    }
+
+    #[test]
+    fn concurrent_deletes_of_one_alias_keep_the_external_checkout() {
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("race");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"r","name":"R"}"#,
+        )
+        .unwrap();
+        import_project_ref("racer", ext.to_str().unwrap()).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| delete_project("racer")))
+            .collect();
+        for h in handles {
+            let _ = h.join().unwrap();
+        }
+        assert!(read_project_ref("racer").is_none(), "reference removed");
+        assert!(
+            ext.join("nano.app.json").is_file(),
+            "external checkout untouched by a queued delete"
+        );
+    }
+
+    #[test]
+    fn shared_dir_detection_keeps_ref_suffixed_directory_names_verbatim() {
+        let _g = lock();
+        let _root = temp_root();
+        let ws = projects_root().join("app.project-ref.json");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"a","name":"A"}"#,
+        )
+        .unwrap();
+        import_project_ref("alias", ws.to_str().unwrap()).unwrap();
+        let dir = project_dir("alias").unwrap();
+        assert!(
+            dir_shared_with_other_project("alias", &dir),
+            "the workspace project `app.project-ref.json` still resolves to the dir"
         );
     }
 
