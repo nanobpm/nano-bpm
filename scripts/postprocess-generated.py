@@ -310,6 +310,181 @@ def fix_optional_json_bodies(server: str) -> tuple[str, int]:
     return server, count
 
 
+# Dependencies only the axum server surface (`apis` + `server` modules) needs.
+# They become optional and are pulled in by the `server` feature, so a
+# `default-features = false` build is a MODELS-ONLY crate (serde models + types)
+# that compiles for wasm32 (#1883): `engine-wasm` deserialises the generated
+# `*SearchQuery` / serialises `*SearchQueryResult` through it instead of
+# hand-writing parsers. `tokio` (rt-multi-thread) is what cannot target wasm32.
+SERVER_ONLY_DEPS = ("async-trait", "axum", "axum-extra", "headers", "tokio", "tracing")
+
+
+def make_models_only_buildable(cargo: str, lib: str) -> tuple[str, str]:
+    """Gate the server-only surface behind the `server` feature (fail-closed)."""
+    if "\nserver = []\n" not in cargo:
+        raise SystemExit("postprocess: expected `server = []` feature in generated Cargo.toml")
+    deps = ", ".join(f'"dep:{d}"' for d in SERVER_ONLY_DEPS)
+    cargo = cargo.replace("\nserver = []\n", f"\nserver = [{deps}]\n", 1)
+    for dep in SERVER_ONLY_DEPS:
+        pat = re.compile(rf"^{re.escape(dep)} = (\{{ (.*?) \}}|\"([^\"]*)\")$", re.M | re.S)
+        m = pat.search(cargo)
+        if m is None:
+            raise SystemExit(f"postprocess: dependency `{dep}` not found in generated Cargo.toml")
+        if m.group(2) is not None:
+            new = f"{dep} = {{ {m.group(2)}, optional = true }}"
+        else:
+            new = f'{dep} = {{ version = "{m.group(3)}", optional = true }}'
+        cargo = cargo[: m.start()] + new + cargo[m.end():]
+    if "\npub mod apis;\n" not in lib:
+        raise SystemExit("postprocess: expected `pub mod apis;` in generated lib.rs")
+    lib = lib.replace("\npub mod apis;\n", '\n#[cfg(feature = "server")]\npub mod apis;\n', 1)
+    return cargo, lib
+
+
+# Request bodies decoded STRICTLY: a property the spec does not define is
+# rejected (400), never silently dropped by serde. These are the operations
+# migrated onto the shared `nanobpmn-search` layer (#1883), whose WASM surface
+# decodes through the same `strict::decode_strict`; the server/WASM parity guard
+# (engine-wasm/src/search_parity_tests.rs) fails if the two ever differ. Extend
+# this list as operations migrate (#1898).
+STRICT_BODY_MODELS = ("AgentInstanceSearchQuery", "AgentInstanceHistorySearchQuery")
+
+STRICT_MODULE = """//! Strict request-body decoding (injected by
+//! `scripts/postprocess-generated.py`, #1883).
+//!
+//! serde ignores unknown fields, so a misspelt or spec-foreign property (a
+//! filter operator a property does not support, a filter property at the top
+//! level instead of under `filter`) would otherwise decode to an EMPTY
+//! criterion and run as an unfiltered search — the wrong rows with no error.
+//! [`decode_strict`] is the single implementation shared by the gateway's
+//! `StrictOptionalJson` extractor and the in-browser engine (`nanobpmn-search`).
+
+/// Decode `json` into `T`, rejecting every non-null property that does not
+/// survive the round trip through the generated model. An empty/whitespace or
+/// `null` body is an absent body (`None`).
+pub fn decode_strict<T>(json: &[u8]) -> Result<Option<T>, String>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    if json.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let raw: serde_json::Value = serde_json::from_slice(json).map_err(|e| e.to_string())?;
+    let value: Option<T> = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+    if let Some(v) = &value {
+        let canonical = serde_json::to_value(v).map_err(|e| e.to_string())?;
+        reject_unknown_properties(&raw, &canonical, "")?;
+    }
+    Ok(value)
+}
+
+fn reject_unknown_properties(
+    raw: &serde_json::Value,
+    canonical: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    use serde_json::Value;
+    match (raw, canonical) {
+        (Value::Object(r), Value::Object(c)) => {
+            for (key, value) in r {
+                if value.is_null() {
+                    continue;
+                }
+                let here = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match c.get(key) {
+                    Some(cv) => reject_unknown_properties(value, cv, &here)?,
+                    None => return Err(format!("unknown property `{here}` (not in the spec)")),
+                }
+            }
+            Ok(())
+        }
+        (Value::Array(r), Value::Array(c)) if r.len() == c.len() => {
+            r.iter().zip(c).enumerate().try_for_each(|(i, (rv, cv))| {
+                reject_unknown_properties(rv, cv, &format!("{path}[{i}]"))
+            })
+        }
+        _ => Ok(()),
+    }
+}
+"""
+
+STRICT_JSON_EXTRACTOR = """
+
+/// Extractor for an optional JSON body decoded STRICTLY (injected by
+/// `scripts/postprocess-generated.py`, #1883): like `OptionalJson`, but a
+/// property the spec does not define is a 400, via the same
+/// `crate::strict::decode_strict` the in-browser engine uses.
+///
+/// Body buffering, the empty-body acceptance and the JSON `Content-Type`
+/// check (415) are DELEGATED to `OptionalJson`, so the two extractors cannot
+/// drift on those rules. A strict rejection answers with the spec's error
+/// contract: an `application/problem+json` `ProblemDetail`.
+#[derive(Debug, Clone, Default)]
+pub struct StrictOptionalJson<T>(pub Option<T>);
+
+impl<T, S> FromRequest<S> for StrictOptionalJson<T>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let OptionalJson(raw) =
+            <OptionalJson<serde_json::Value> as FromRequest<S>>::from_request(req, state).await?;
+        let Some(raw) = raw else {
+            return Ok(StrictOptionalJson(None));
+        };
+        let bytes = serde_json::to_vec(&raw).map_err(|e| strict_rejection(e.to_string()))?;
+        crate::strict::decode_strict(&bytes)
+            .map(StrictOptionalJson)
+            .map_err(strict_rejection)
+    }
+}
+
+/// A strict-decode rejection as the spec's 400 `ProblemDetail`.
+fn strict_rejection(detail: String) -> Response {
+    use axum::response::IntoResponse;
+
+    let problem = models::ProblemDetail::new(
+        "Bad Request".to_string(),
+        400,
+        detail,
+        String::new(),
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
+        axum::Json(problem),
+    )
+        .into_response()
+}
+"""
+
+
+def apply_strict_bodies(server: str, models: str) -> tuple[str, int]:
+    """Decode the STRICT_BODY_MODELS bodies with `StrictOptionalJson` (fail-closed)."""
+    count = 0
+    for model in STRICT_BODY_MODELS:
+        if f"pub struct {model} " not in models:
+            continue
+        server, n = re.subn(
+            rf"OptionalJson\(body\): OptionalJson<models::{model}>",
+            f"StrictOptionalJson(body): StrictOptionalJson<models::{model}>",
+            server,
+        )
+        if n != 1:
+            raise SystemExit(f"postprocess: expected one OptionalJson<models::{model}> body, found {n}")
+        count += n
+    if count:
+        server += STRICT_JSON_EXTRACTOR
+    return server, count
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"usage: {argv[0]} <generated-crate-dir>", file=sys.stderr)
@@ -334,10 +509,24 @@ def main(argv: list[str]) -> int:
 
     server_path = crate_dir / "src" / "server" / "mod.rs"
     optional_json_count = 0
+    strict_count = 0
     if server_path.is_file():
         server = server_path.read_text(encoding="utf-8")
         server, optional_json_count = fix_optional_json_bodies(server)
+        server, strict_count = apply_strict_bodies(server, models)
         server_path.write_text(server, encoding="utf-8")
+
+    cargo_path = crate_dir / "Cargo.toml"
+    lib_path = crate_dir / "src" / "lib.rs"
+    cargo, lib = make_models_only_buildable(
+        cargo_path.read_text(encoding="utf-8"), lib_path.read_text(encoding="utf-8")
+    )
+    if "\npub mod models;\n" not in lib:
+        raise SystemExit("postprocess: expected `pub mod models;` in generated lib.rs")
+    lib = lib.replace("\npub mod models;\n", "\npub mod models;\npub mod strict;\n", 1)
+    (crate_dir / "src" / "strict.rs").write_text(STRICT_MODULE, encoding="utf-8")
+    cargo_path.write_text(cargo, encoding="utf-8")
+    lib_path.write_text(lib, encoding="utf-8")
 
     print("Post-processed generated code:")
     print(f"  oneOf date-time variant occurrences fixed: {datetime_count}")
@@ -353,6 +542,8 @@ def main(argv: list[str]) -> int:
     print(f"  HTML-escaped regex patterns unescaped: {regex_count}")
     print(f"  default-tenant XSS false positive fixed: {xss_count}")
     print(f"  optional JSON bodies made bodyless-tolerant: {optional_json_count}")
+    print(f"  strictly-decoded request bodies: {strict_count}")
+    print("  models-only build gated behind the `server` feature: yes")
     return 0
 
 

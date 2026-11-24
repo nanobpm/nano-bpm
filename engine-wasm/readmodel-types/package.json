@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "gen": "openapi-ts",
-    "check": "npm run gen && git diff --exit-code -- types.gen.ts"
+    "check": "npm run gen && git diff --exit-code -- types.gen.ts && npm run typecheck",
+    "typecheck": "tsc --noEmit --strict --module nodenext --moduleResolution nodenext --skipLibCheck false exports.check.ts"
   },
   "devDependencies": {
     "@hey-api/openapi-ts": "0.99.0",
