@@ -216,6 +216,14 @@ pub(super) fn retire_project_worker_blocking<'a>(
     let removed: Vec<Slot> = {
         let mut map = limiter.workers.map();
         let mut t = limiter.workers.tombstones();
+        // An overlapping retirement may still be draining this path's
+        // worker: fail closed rather than let the directory op race it.
+        if keys.iter().any(|k| t.contains_key(k)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "project busy: another delete/rename of it is in progress",
+            ));
+        }
         for k in &keys {
             *t.entry(k.clone()).or_default() += 1;
         }
@@ -451,6 +459,27 @@ async fn kill_tree(child: &mut Child) {
 #[cfg(test)]
 pub(super) type AfterSpawnHook = Box<dyn FnOnce(Option<u32>) + Send>;
 
+/// Run a worker teardown on its own task that owns the worker, a [`Reaping`]
+/// ticket (live-process budget) and a [`Waiting`] hold on the slot (so a
+/// retirement drain waits for it), then await it. If the caller is cancelled
+/// mid-teardown the task still finishes the kill/reap: ownership never falls
+/// back to a bare `Child` drop that skips the process-group cleanup (#1836).
+async fn teardown_owned(limiter: &DataGatewayLimiter, slot: &Slot, w: Worker, graceful: bool) {
+    let ticket = Reaping::new(limiter);
+    slot.waiters.fetch_add(1, Ordering::AcqRel);
+    let hold = Waiting(slot.clone());
+    let task = tokio::spawn(async move {
+        let _ticket = ticket;
+        let _hold = hold;
+        if graceful {
+            retire_worker(w).await;
+        } else {
+            kill_worker(w).await;
+        }
+    });
+    let _ = task.await;
+}
+
 async fn kill_worker(mut w: Worker) {
     kill_tree(&mut w.child).await;
 }
@@ -649,10 +678,10 @@ pub(super) async fn run_serve_op(
         let alive = matches!(w.child.try_wait(), Ok(None));
         if !alive || w.in_flight {
             tracing::debug!(dir = %dir.display(), alive, in_flight = w.in_flight, "data worker restart");
-            kill_worker(w).await;
+            teardown_owned(limiter, &slot, w, false).await;
         } else if w.fingerprint != fingerprint {
             tracing::debug!(dir = %dir.display(), "data worker restart: toolkit/manifest changed");
-            retire_worker(w).await;
+            teardown_owned(limiter, &slot, w, true).await;
         } else {
             use_.worker = Some(w);
         }
@@ -685,7 +714,7 @@ pub(super) async fn run_serve_op(
         };
         if retired_now {
             if let Some(w) = use_.worker.take() {
-                kill_worker(w).await;
+                teardown_owned(limiter, &slot, w, false).await;
             }
             return Err(retired());
         }
@@ -719,7 +748,7 @@ pub(super) async fn run_serve_op(
         if let Some(w) = reject {
             // Failed/timed-out (possibly desynced) worker, or one whose
             // project was retired while this op ran: never park it.
-            kill_worker(w).await;
+            teardown_owned(limiter, &slot, w, false).await;
         }
     }
     match result {
@@ -882,6 +911,60 @@ mod tests {
         }
         let _ = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"})).await;
         assert_eq!(spawn_count(&spawns), 2);
+    }
+
+    /// #1836: a second delete/rename of a path whose retirement is still
+    /// in progress fails closed instead of reaching the filesystem while the
+    /// first one's worker may still be draining.
+    #[tokio::test]
+    async fn overlapping_retirement_fails_closed() {
+        let dir = project("retire-overlap");
+        let lim = limiter();
+        let first = retire_project_worker_blocking(&lim, &dir).unwrap();
+        let second = retire_project_worker_blocking(&lim, &dir);
+        assert!(
+            matches!(&second, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "overlapping retire must be rejected"
+        );
+        drop(second);
+        drop(first);
+        assert!(lim.workers.tombstones().is_empty(), "tombstone leaked");
+        drop(retire_project_worker_blocking(&lim, &dir).unwrap());
+    }
+
+    /// #1836: cancelling the caller mid-teardown must not orphan the worker:
+    /// the owned teardown task still kills and reaps it, keeping its budget
+    /// ticket and slot hold (so a retirement drain waits) until done.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_teardown_still_reaps_worker() {
+        let dir = project("teardown-cancel");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        let w = spawn_worker(&stub, &dir, 0).unwrap();
+        let pid = w.child.id().unwrap() as i32;
+        let slot = lim.workers.slot_for(&dir);
+        // Poll the teardown exactly once (it hands the worker to its task),
+        // then drop it: the caller is cancelled before the teardown ends.
+        let mut fut = Box::pin(teardown_owned(&lim, &slot, w, true));
+        let waker = std::task::Waker::noop();
+        let _ = fut
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(waker));
+        drop(fut);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
+        while unsafe { libc::kill(pid, 0) } == 0
+            || lim.reaping.count.load(Ordering::Acquire) != 0
+            || slot.waiters.load(Ordering::Acquire) != 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled teardown orphaned the worker"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Deleting/renaming a project retires its worker: the process is killed
