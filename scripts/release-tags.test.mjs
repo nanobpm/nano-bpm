@@ -20,14 +20,13 @@ import {
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const readRepo = (p) => readFileSync(join(root, p), "utf8");
 
-function fakeRepo({ gateway = "0.0.24", npm = "0.3.0", jvm = "0.3.0", wasm = "0.10.0" } = {}) {
+function fakeRepo({ gateway = "0.0.24", npm = "0.3.0", jvm = "0.3.0" } = {}) {
   const files = {
     "server/Cargo.toml": `[package]\nname = "x"\nversion = "${gateway}"\n\n[dependencies]\nfoo = { version = "9.9.9" }\n`,
     "clients/nano-bernd/package.json": JSON.stringify({ version: npm }),
     "clients/nano-bernd-jvm/pom.xml":
       `<project><parent><version>1.0.0</version></parent><artifactId>x</artifactId><version>${jvm}</version>` +
       `<dependencies><dependency><version>7.7.7</version></dependency></dependencies></project>`,
-    "engine-wasm/pkg.package.json": JSON.stringify({ version: wasm }),
   };
   return (p) => {
     if (!(p in files)) throw new Error(`unexpected read ${p}`);
@@ -48,11 +47,13 @@ test("every push carries exactly one tag, however many tags are released", () =>
   }
 });
 
-test("a full release plans more tags than GitHub accepts in a single push", () => {
-  // Guards the premise: if this ever stops being true the one-per-push rule is
-  // still correct, but it is why batching silently broke v0.0.24.
+test("a full release plans tags up to GitHub's per-push cutoff", () => {
+  // Guards the premise: v0.0.24 pushed four tags at once and GitHub dropped
+  // every push event. Since engine-wasm folded into the gateway train (#1871) a
+  // full release is exactly at the cutoff, so one more train crosses it — the
+  // one-per-push rule stays mandatory.
   const plan = planTags({ read: fakeRepo(), existingTags: [] });
-  assert.ok(plan.length > GITHUB_MAX_TAGS_PER_PUSH);
+  assert.ok(plan.length >= GITHUB_MAX_TAGS_PER_PUSH);
 });
 
 // --- derivation ---------------------------------------------------------------
@@ -61,18 +62,20 @@ test("tags are derived from each train's version source", () => {
   const plan = planTags({ read: fakeRepo(), existingTags: [] });
   assert.deepEqual(
     plan.map((p) => p.tag),
-    ["v0.0.24", "nano-bernd-npm-v0.3.0", "nano-bernd-jvm-v0.3.0", "bojtos-npm-v0.10.0"],
+    ["v0.0.24", "nano-bernd-npm-v0.3.0", "nano-bernd-jvm-v0.3.0"],
   );
 });
 
 test("already-tagged versions are marked existing, so only bumped trains are cut", () => {
   const plan = planTags({ read: fakeRepo(), existingTags: ["nano-bernd-npm-v0.3.0", "nano-bernd-jvm-v0.3.0"] });
-  assert.deepEqual(plan.filter((p) => !p.exists).map((p) => p.tag), ["v0.0.24", "bojtos-npm-v0.10.0"]);
+  assert.deepEqual(plan.filter((p) => !p.exists).map((p) => p.tag), ["v0.0.24"]);
 });
 
 test("--only restricts to named trains and rejects unknown ones", () => {
-  const plan = planTags({ read: fakeRepo(), existingTags: [], only: ["engine-wasm"] });
-  assert.deepEqual(plan.map((p) => p.tag), ["bojtos-npm-v0.10.0"]);
+  const plan = planTags({ read: fakeRepo(), existingTags: [], only: ["gateway"] });
+  assert.deepEqual(plan.map((p) => p.tag), ["v0.0.24"]);
+  // The separate engine-wasm train is gone (#1871): it releases with the gateway.
+  assert.throws(() => planTags({ read: fakeRepo(), existingTags: [], only: ["engine-wasm"] }), /unknown train/);
   assert.throws(() => planTags({ read: fakeRepo(), existingTags: [], only: ["nope"] }), /unknown train/);
 });
 
@@ -101,11 +104,11 @@ test("nano-bernd npm and JVM versions must match", () => {
   assert.throws(() => planTags({ read: fakeRepo({ jvm: "0.2.9" }), existingTags: [] }), /must always release together/);
 });
 
-test("engine-wasm version derives from the template alone, never the gitignored build output (#668)", () => {
-  // fakeRepo throws on any unlisted read, and engine-wasm/pkg/package.json is
-  // deliberately absent: it is a build output that no longer exists in a clone.
-  const plan = planTags({ read: fakeRepo({ wasm: "0.12.0" }), existingTags: [], only: ["engine-wasm"] });
-  assert.deepEqual(plan.map((t) => t.tag), ["bojtos-npm-v0.12.0"]);
+test("@nanobpm/engine-wasm publishes from the gateway's v* tag, at the gateway version (#1871)", () => {
+  const gateway = TRAINS.find((t) => t.id === "gateway");
+  assert.ok(gateway.workflows.includes("release-bojtos-npm.yml"));
+  // No other train may publish the engine package under a second version.
+  for (const t of TRAINS.filter((o) => o.id !== "gateway")) assert.ok(!t.workflows.includes("release-bojtos-npm.yml"));
 });
 
 test("version parsers ignore dependency and parent versions", () => {

@@ -98,6 +98,14 @@
           description: The nanobpmn gateway version.
           type: string
           example: 0.1.0
+        engineWasmVersion:
+          description: |
+            The npm version of the `@nanobpm/engine-wasm` package built from the
+            same commit as this server's engine (#1871). Pin
+            `@nanobpm/engine-wasm` to exactly this version to test against the
+            engine this server runs.
+          type: string
+          example: 0.1.0
         falconPath:
           description: |
             Path of the bidirectional Falcon WebSocket. Clients may

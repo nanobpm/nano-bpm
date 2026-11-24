@@ -11008,6 +11008,11 @@ impl ServerImpl {
             nano: Some(models::NanoEngineInfo {
                 engine: "nanobpmn".to_string(),
                 version: Some(version),
+                // One engine version (#1871): `@nanobpm/engine-wasm` is stamped
+                // with this crate's server/Cargo.toml version and published from
+                // the same `v*` tag, so this names the exact wasm build of the
+                // engine this server runs.
+                engine_wasm_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 falcon_path: "/falcon".to_string(),
             }),
         };
@@ -43857,6 +43862,15 @@ mod clustered_startup_tests {
             nano.version.is_some(),
             "nano advertises the gateway version"
         );
+        // #1871: the matching `@nanobpm/engine-wasm` npm version is the version
+        // engine-wasm/scripts/stamp-pkg.mjs stamps — server/Cargo.toml's — so a
+        // downstream app can pin exactly the engine this server runs.
+        let cargo_version = include_str!("../Cargo.toml")
+            .lines()
+            .find_map(|l| l.strip_prefix("version = \""))
+            .and_then(|v| v.strip_suffix('"'))
+            .expect("server/Cargo.toml [package] version");
+        assert_eq!(nano.engine_wasm_version.as_deref(), Some(cargo_version));
     }
 
     #[tokio::test]

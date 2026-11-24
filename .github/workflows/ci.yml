@@ -125,6 +125,17 @@ jobs:
               # (spec/rest-api.yaml and the files it $refs), so a spec change can
               # make the committed subset client stale.
               - 'spec/**'
+              # The studio's test engine is the same-commit engine-wasm/pkg build
+              # (#1871, a `file:` dep), so an engine change re-runs the console's
+              # engine-backed tests against the new wasm.
+              - 'engine-core/**'
+              - 'engine-wasm/**'
+              - 'read-model/**'
+              - 'Makefile'
+              - 'scripts/wasm-cc-env.sh'
+              - 'scripts/engine-parity.mjs'
+              - '.github/actions/engine-wasm-pkg/**'
+              - '.github/actions/wasm-pack-cache/**'
               - '.github/workflows/ci.yml'
             # The Urban App manifest schema/types package (@nanobpm/nano-app-schema).
             # Owns its own job (`spec-app`) and is deliberately excluded from the
@@ -424,7 +435,9 @@ jobs:
     name: engine-wasm-ffi (dist + verify)
     runs-on: ubuntu-24.04
     needs: changes
-    if: *code_gate
+    # Also on a console- or docs-only change: every job that `npm ci`s the
+    # console consumes the `engine-wasm-pkg` artifact this job builds (#1871).
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true' || needs.changes.outputs.console == 'true' || needs.changes.outputs.docs == 'true' }}
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/sccache
@@ -528,10 +541,17 @@ jobs:
         # Built exactly once per run: the probes call `npm test` directly (not
         # the make targets, whose console-wasm prerequisite would rebuild it),
         # and the same tested output is uploaded as the `engine-wasm-pkg`
-        # artifact for the dap-adapter and parity-runtime jobs.
+        # artifact for the dap-adapter, parity-runtime and console jobs.
         uses: ./.github/actions/engine-wasm-pkg
         with:
           rust-cache: 'false'
+      - name: engine-wasm/pkg carries the server's version and this commit (#1871)
+        # One engine version: the stamp (engine-wasm/scripts/stamp-pkg.mjs)
+        # derives the package version from server/Cargo.toml and records the
+        # build commit; the guard proves both match the server being built.
+        run: |
+          node --test scripts/engine-parity.test.mjs
+          node scripts/engine-parity.mjs engine-wasm/pkg/build-info.json
       - name: engine-wasm/pkg is never committed (#668)
         # A tracked file under engine-wasm/pkg would be a stale second source of
         # truth for the wasm (the class #668 removed); .gitignore keeps it out of
@@ -1371,7 +1391,7 @@ jobs:
   console:
     name: console (typecheck + test)
     runs-on: ubuntu-24.04
-    needs: changes
+    needs: [changes, engine-wasm-ffi-dist]
     # Runs on SPA/spec changes (`console` filter) and on documentation-prose
     # changes (`docs` filter) so the doc-build guard still validates a docs edit.
     # NOT on `*code_gate`: a Rust-only change no longer needs the Node console
@@ -1388,8 +1408,23 @@ jobs:
           # this job needs a Node with TypeScript type-stripping on by default
           # (>= 23.6). Matches the spec-app job.
           node-version: '24'
+      - name: Download engine-wasm/pkg (built from this run's source)
+        # The console depends on @nanobpm/engine-wasm via `file:../engine-wasm/pkg`
+        # — the same-commit build, never an npm range (#1871) — which npm ci
+        # resolves from this artifact.
+        uses: actions/download-artifact@v7
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg
       - name: Install (locked)
         run: npm ci
+      - name: Same-commit engine guard (#1871)
+        # The console's studio engine must be the engine-wasm build of THIS
+        # commit at the server's version: unit-test the guard, then check the
+        # package npm ci actually installed.
+        run: |
+          node --test ../scripts/engine-parity.test.mjs
+          node ../scripts/engine-parity.mjs node_modules/@nanobpm/engine-wasm/build-info.json
       - name: Format check (prettier)
         # Fails if any app source (src/**/*.{ts,tsx,css}) isn't Prettier-clean.
         # Fix locally with `npm run format`. Generated code (src/gen, src/wasm)
@@ -1434,7 +1469,7 @@ jobs:
     # a `data-tour` attribute is renamed. Change-gated on the console so unrelated
     # PRs never pay for a browser download; a skipped required check counts as
     # success for branch protection (see the `changes` job).
-    needs: changes
+    needs: [changes, engine-wasm-ffi-dist]
     if: needs.changes.outputs.console == 'true'
     runs-on: ubuntu-24.04
     defaults:
@@ -1445,6 +1480,14 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
+      - name: Download engine-wasm/pkg (built from this run's source)
+        # The console depends on @nanobpm/engine-wasm via `file:../engine-wasm/pkg`
+        # — the same-commit build, never an npm range (#1871) — which npm ci
+        # resolves from this artifact.
+        uses: actions/download-artifact@v7
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg
       - name: Install (locked)
         run: npm ci
       - name: Cache Playwright browsers
@@ -1473,7 +1516,7 @@ jobs:
   console-ts:
     name: console-ts (server TS typecheck + test)
     runs-on: ubuntu-24.04
-    needs: changes
+    needs: [changes, engine-wasm-ffi-dist]
     # Runs for any Rust `code` change (the embedded TS lives under
     # `server/crates/nano-server-console/src/`) AND for any `console` change:
     # the typecheck resolves its `typescript` + `@types/node` from
@@ -1489,6 +1532,14 @@ jobs:
           # directly, so this job needs a Node with TypeScript type-stripping on
           # by default (>= 23.6). Matches the console/spec-app jobs.
           node-version: '24'
+      - name: Download engine-wasm/pkg (built from this run's source)
+        # The console depends on @nanobpm/engine-wasm via `file:../engine-wasm/pkg`
+        # — the same-commit build, never an npm range (#1871) — which npm ci
+        # resolves from this artifact.
+        uses: actions/download-artifact@v7
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg
       - name: Install console deps (typecheck + @types/node)
         # The embedded server TS is type-checked with the console's own pinned
         # `typescript` + `@types/node` (the one place in the repo that `npm ci`s
@@ -1514,59 +1565,3 @@ jobs:
         run: |
           ../../../console/node_modules/.bin/tsc -p tsconfig.json
           node --experimental-strip-types --test "src/*_test.ts"
-
-  engine-wasm-release-guard:
-    name: engine-wasm (release drift guard)
-    runs-on: ubuntu-24.04
-    needs: changes
-    if: *code_gate
-    steps:
-      # Full history + tags: the guard compares the current tree against the last
-      # published engine-wasm release tag (`bojtos-npm-v*`).
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-      # Pin Node so the `node -p` version reads below don't depend on whatever the
-      # runner happens to preinstall — matches the rest of this workflow.
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '24'
-      - name: Require a pending engine-wasm bump when the engine has changed
-        # Mode-1 (staleness) guard. @nanobpm/engine-wasm is a wasm build of
-        # engine-core, published only on a hand-pushed `bojtos-npm-v*` tag — so an
-        # engine-core change can silently ship without the wasm ever being
-        # rebuilt/republished (exactly what happened at v0.0.12: engine moved
-        # across 5 PRs but @nanobpm/engine-wasm stayed at 0.3.0). This fails the
-        # build if `engine-core/**`, `engine-wasm/src/**` or the version template
-        # changed since the last release tag but the version wasn't bumped past it
-        # — i.e. an UNRELEASED bump must always be pending once the engine moves.
-        # The Mode-2 (surface-gap) guard is separate and structural: an exhaustive
-        # `match` in engine-wasm/src/surface_parity.rs that fails the wasm32
-        # type-check (engine-wasm-ffi job) when a new engine `Command` lands
-        # without a decision about surfacing it.
-        run: |
-          set -euo pipefail
-          last_tag=$(git tag -l 'bojtos-npm-v*' --sort=-v:refname | head -1)
-          if [ -z "$last_tag" ]; then
-            echo "no bojtos-npm-v* tag yet — nothing to compare against"; exit 0
-          fi
-          last_ver=${last_tag#bojtos-npm-v}
-          # The template is the only version source: engine-wasm/pkg/ is a
-          # gitignored build output (#668) that copies it at build time.
-          pkg_ver=$(node -p "require('./engine-wasm/pkg.package.json').version")
-
-          # Has the wasm-relevant source moved since the last release? Cargo.toml
-          # / Cargo.lock are inputs too: a dependency or feature change alters the
-          # produced wasm without touching engine-core or engine-wasm/src.
-          if git diff --quiet "$last_tag" -- engine-core engine-wasm/src engine-wasm/Cargo.toml engine-wasm/Cargo.lock engine-wasm/pkg.package.json; then
-            echo "engine-wasm inputs unchanged since $last_tag (v$last_ver) — ok"
-            exit 0
-          fi
-
-          # It moved → require an unreleased bump: pkg_ver must be strictly > last_ver.
-          if [ "$pkg_ver" = "$last_ver" ] || \
-             [ "$(printf '%s\n%s\n' "$last_ver" "$pkg_ver" | sort -V | tail -1)" != "$pkg_ver" ]; then
-            echo "::error file=engine-wasm/pkg.package.json::engine-core/engine-wasm changed since $last_tag but @nanobpm/engine-wasm is still $pkg_ver. Bump engine-wasm/pkg.package.json so a new release is pending; it publishes when you push bojtos-npm-v<version> ('make release-engine-wasm')."
-            exit 1
-          fi
-          echo "pending engine-wasm release $pkg_ver > last published $last_ver — ok"
