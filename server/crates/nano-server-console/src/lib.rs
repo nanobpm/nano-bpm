@@ -4439,7 +4439,13 @@ pub async fn project_delete(name: &str) -> ApiResult {
             "stop the application before deleting it".to_string(),
         ));
     }
-    match projects::delete_project(name) {
+    // `delete_project` synchronously retires the project's data worker (a
+    // bounded blocking wait), so run it off the async executor threads.
+    let owned = name.to_string();
+    let res = tokio::task::spawn_blocking(move || projects::delete_project(&owned))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(format!("delete task failed: {e}"))));
+    match res {
         Ok(()) => {
             // Drop the memoised "inbox ensured" marker (#1340) so that a later
             // project reusing this name re-creates its table on a fresh
@@ -4465,7 +4471,13 @@ pub async fn project_rename(name: &str, new_name: &str) -> ApiResult {
             "stop the application before renaming it".to_string(),
         ));
     }
-    match projects::rename_project(name, new_name.trim()) {
+    // `rename_project` synchronously retires the project's data worker (a
+    // bounded blocking wait), so run it off the async executor threads.
+    let (from, to) = (name.to_string(), new_name.trim().to_string());
+    let res = tokio::task::spawn_blocking(move || projects::rename_project(&from, &to))
+        .await
+        .unwrap_or_else(|e| Err(format!("rename task failed: {e}")));
+    match res {
         Ok(cfg) => {
             // A rename moves the project (and its datasource) to a new name and
             // frees the old one. Drop the old name's memoised "inbox ensured"
