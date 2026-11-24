@@ -17,6 +17,18 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const indentOf = (line) => line.match(/^ */)[0].length;
 // Expression contexts (`github.token`, `secrets.GITHUB_TOKEN`) are
 // case-insensitive in GitHub Actions; shell env vars are not.
+// Allowlist (fail closed): GH_TOKEN must be exactly ONE single-line
+// expression naming an App-token step output or a named non-default secret.
+// Anything else -- `||` fallbacks, `env.*` indirection, wrapped/continued
+// scalars, shell vars -- is rejected rather than pattern-matched for badness.
+const isAllowedToken = (v) => {
+  const m = v.trim().replace(/^(['"])(.*)\1$/, '$2').match(/^\$\{\{\s*([^{}]*?)\s*\}\}$/);
+  if (!m) return false;
+  const e = m[1];
+  if (/^steps\.[A-Za-z0-9_-]+\.outputs\.token$/.test(e)) return true;
+  const s = e.match(/^secrets\.([A-Za-z_][A-Za-z0-9_]*)$/);
+  return !!s && s[1].toUpperCase() !== 'GITHUB_TOKEN';
+};
 const isDefault = (v) =>
   // Both dot and bracket property-access notation, for both contexts.
   /\bgithub\s*(?:\.\s*token\b|\[\s*['"]token['"]\s*\])|\bsecrets\s*(?:\.\s*github_token\b|\[\s*['"]github_token['"]\s*\])/i.test(v) ||
@@ -28,7 +40,14 @@ export function prCreateOffenders(text) {
   const lines = text.split('\n');
   const out = [];
   lines.forEach((line, i) => {
-    if (!/\bgh\s+pr\s+create\b/.test(line.replace(/#.*$/, ''))) return;
+    // Join shell `\` continuations so `gh pr \` + `create` is still seen;
+    // the offender is reported at the line where the command starts.
+    let cmd = line.replace(/#.*$/, '');
+    for (let j = i; /\\\s*$/.test(cmd) && j + 1 < lines.length; j++) {
+      cmd = cmd.replace(/\\\s*$/, ' ') + lines[j + 1].replace(/#.*$/, '');
+    }
+    if (i > 0 && /\\\s*$/.test(lines[i - 1].replace(/#.*$/, ''))) return; // reported at start
+    if (!/\bgh\s+pr\s+create\b/.test(cmd)) return;
     // Enclosing step: this line itself when it is a list item (`- run: gh pr
     // create`), else the nearest preceding `- ` item less indented than it.
     let start = /^ *- /.test(line) ? i : -1;
@@ -48,6 +67,7 @@ export function prCreateOffenders(text) {
     // this single-line check cannot see, so a fallback could hide there.
     else if (/^[>|]/.test(tok[1].trim())) out.push(`line ${i + 1} (GH_TOKEN block scalar unsupported)`);
     else if (isDefault(tok[1])) out.push(`line ${i + 1} (GH_TOKEN is GITHUB_TOKEN)`);
+    else if (!isAllowedToken(tok[1])) out.push(`line ${i + 1} (GH_TOKEN not an allowed single expression)`);
   });
   return out;
 }
@@ -84,6 +104,17 @@ test('prCreateOffenders flags GITHUB_TOKEN and missing tokens', () => {
     assert.deepEqual(prCreateOffenders(step(`${ind}\n            ${fb}`)).length, 1);
   }
   assert.deepEqual(prCreateOffenders(step(null, '# gh pr create in a comment')), []);
+  // env indirection can resolve to the default token: fail closed.
+  assert.deepEqual(prCreateOffenders(step('${{ secrets.APP_TOKEN || env.DEFAULT_TOKEN }}')).length, 1);
+  assert.deepEqual(prCreateOffenders(step('${{ env.DEFAULT_TOKEN }}')).length, 1);
+  // Plain scalar wrapped onto the next line: first line is not a closed expression.
+  assert.deepEqual(prCreateOffenders(step('${{ secrets.APP_TOKEN ||\n            secrets.GITHUB_TOKEN }}')).length, 1);
+  // Any `||` fallback is rejected, even between non-default secrets.
+  assert.deepEqual(prCreateOffenders(step('${{ secrets.A || secrets.B }}')).length, 1);
+  assert.deepEqual(prCreateOffenders(step("'${{ secrets.C8CTL_PLUGIN_REPO_TOKEN }}'")), []);
+  // Shell line continuation splitting `gh pr` from `create`.
+  assert.deepEqual(prCreateOffenders(step(null, 'gh pr \\\n          create --base main')).length, 1);
+  assert.deepEqual(prCreateOffenders(step('${{ steps.app-token.outputs.token }}', 'gh pr \\\n          create --base main')), []);
   // Inline list-item run step: the `- run:` line is itself the enclosing step.
   const inline = (tok) =>
     `jobs:\n  j:\n    steps:\n      - run: gh pr create --base main\n        env:\n          GH_TOKEN: ${tok}\n      - name: next\n        env:\n          GH_TOKEN: \${{ steps.app-token.outputs.token }}\n        run: echo`;
