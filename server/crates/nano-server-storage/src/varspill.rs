@@ -56,13 +56,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::Receiver;
-use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use nanobpmn_engine_core::{InstanceSnapshot, Key, Value};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::sqlite_space::{
     enable_incremental_auto_vacuum, freelist_bytes, page_stats, reclaim_freelist_step,
@@ -420,14 +420,75 @@ pub struct VarSpillStore {
     fault_injection: Arc<ForgetFaultInjection>,
 }
 
-/// The pin count plus the deletes deferred while it is non-zero (#1880).
+/// The live pins, by generation, plus the deletes deferred while any pin was
+/// alive (#1880).
+///
+/// Every pin gets a generation (`next_gen` at the time it was taken), and every
+/// deferred delete records the generation of the next pin to come. A delete
+/// only has to wait for the pins that already existed when it was deferred:
+/// a capture taken later never references a row that was already forgotten.
+/// So a deferred delete drains once every live pin is at least as new as it.
+/// On a store shared across partitions, overlapping captures therefore never
+/// hold back reclamation indefinitely; no moment without any pin is needed.
 #[derive(Default)]
 struct RowPins {
-    count: usize,
+    /// Generation assigned to the next pin.
+    next_gen: u64,
+    /// Live pin count per generation (a clone shares its original's).
+    live: BTreeMap<u64, usize>,
     /// Deferred deletes of `spill` rows.
-    spill: BTreeSet<Key>,
+    spill: DeferredSet,
     /// Deferred deletes of `cold` rows.
-    cold: BTreeSet<Key>,
+    cold: DeferredSet,
+}
+
+/// Deferred deletes of one table, each tagged with the generation it waits
+/// behind (a delete tagged `g` waits for every live pin older than `g`).
+#[derive(Default, Clone)]
+struct DeferredSet {
+    by_key: BTreeMap<Key, u64>,
+    by_gen: BTreeSet<(u64, Key)>,
+}
+
+impl DeferredSet {
+    fn insert(&mut self, key: Key, generation: u64) {
+        // Keep an existing (older) tag: the row has not been rewritten since
+        // (a rewrite undefers it), so the earlier tag already covers it.
+        if let std::collections::btree_map::Entry::Vacant(e) = self.by_key.entry(key) {
+            e.insert(generation);
+            self.by_gen.insert((generation, key));
+        }
+    }
+
+    fn remove(&mut self, key: Key) -> bool {
+        match self.by_key.remove(&key) {
+            Some(generation) => self.by_gen.remove(&(generation, key)),
+            None => false,
+        }
+    }
+
+    /// Removes `key` only if its delete is drainable at `horizon`.
+    fn remove_drainable(&mut self, key: Key, horizon: u64) -> bool {
+        match self.by_key.get(&key) {
+            Some(&generation) if generation <= horizon => self.remove(key),
+            _ => false,
+        }
+    }
+
+    /// Pops the oldest-tagged key whose delete is drainable at `horizon`.
+    fn pop_drainable(&mut self, horizon: u64) -> Option<Key> {
+        let &(generation, key) = self.by_gen.first()?;
+        if generation > horizon {
+            return None;
+        }
+        self.remove(key);
+        Some(key)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
 }
 
 impl RowPins {
@@ -435,9 +496,52 @@ impl RowPins {
     /// pin's release never deletes a row newer than the one it deferred.
     fn undefer(&mut self, table: GcTable, key: Key) {
         match table {
-            GcTable::Spill => self.spill.remove(&key),
-            GcTable::Cold => self.cold.remove(&key),
+            GcTable::Spill => self.spill.remove(key),
+            GcTable::Cold => self.cold.remove(key),
         };
+    }
+
+    fn any_live(&self) -> bool {
+        !self.live.is_empty()
+    }
+
+    /// Defers deletes of `keys` from `table` behind every pin alive now.
+    fn defer(&mut self, table: GcTable, keys: impl IntoIterator<Item = Key>) {
+        let generation = self.next_gen;
+        let set = match table {
+            GcTable::Spill => &mut self.spill,
+            GcTable::Cold => &mut self.cold,
+        };
+        for key in keys {
+            set.insert(key, generation);
+        }
+    }
+
+    /// The newest deferral generation that may drain now: one waits only for
+    /// pins older than its tag, so it drains when its tag is at most the
+    /// oldest live pin's generation (or when no pin is alive).
+    fn horizon(&self) -> u64 {
+        self.live.keys().next().copied().unwrap_or(u64::MAX)
+    }
+
+    fn take_pin(&mut self) -> u64 {
+        let generation = self.next_gen;
+        self.next_gen += 1;
+        self.add_pin(generation);
+        generation
+    }
+
+    fn add_pin(&mut self, generation: u64) {
+        *self.live.entry(generation).or_default() += 1;
+    }
+
+    fn release_pin(&mut self, generation: u64) {
+        if let std::collections::btree_map::Entry::Occupied(mut e) = self.live.entry(generation) {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
     }
 }
 
@@ -459,19 +563,29 @@ impl RowPins {
 #[must_use = "the pin defers deletes only while it is held"]
 pub struct RowPin {
     store: Arc<VarSpillStore>,
+    generation: u64,
 }
 
 impl Clone for RowPin {
-    /// A clone is a second pin: deletes stay deferred until every copy drops.
+    /// A clone is a second pin of the same generation: everything the
+    /// original protects stays deferred until every copy drops.
     fn clone(&self) -> Self {
-        self.store.pin_rows()
+        self.store
+            .pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add_pin(self.generation);
+        RowPin {
+            store: Arc::clone(&self.store),
+            generation: self.generation,
+        }
     }
 }
 
 impl Drop for RowPin {
     fn drop(&mut self) {
         let mut pins = self.store.pins.lock().unwrap_or_else(|e| e.into_inner());
-        pins.count = pins.count.saturating_sub(1);
+        pins.release_pin(self.generation);
         drop(pins);
         self.store.drain_deferred();
     }
@@ -491,18 +605,20 @@ struct DeferredBatch {
 }
 
 impl RowPins {
-    /// Takes up to `max` keys off the deferred sets, or `None` when empty.
+    /// Takes up to `max` keys whose deletes may drain now (see
+    /// [`horizon`](Self::horizon)) off the deferred sets, or `None` when none.
     fn take_batch(&mut self, max: usize) -> Option<DeferredBatch> {
+        let horizon = self.horizon();
         let mut batch = DeferredBatch::default();
         let mut taken = 0;
         while taken < max {
-            if let Some(key) = self.spill.pop_first() {
-                if self.cold.remove(&key) {
+            if let Some(key) = self.spill.pop_drainable(horizon) {
+                if self.cold.remove_drainable(key, horizon) {
                     batch.both.push(key);
                 } else {
                     batch.spill.push(key);
                 }
-            } else if let Some(key) = self.cold.pop_first() {
+            } else if let Some(key) = self.cold.pop_drainable(horizon) {
                 batch.cold.push(key);
             } else {
                 break;
@@ -953,13 +1069,19 @@ impl VarSpillStore {
     /// returned [`RowPin`] drops, deletes are deferred, so every row the
     /// capture references stays readable. See [`RowPin`].
     pub fn pin_rows(self: &Arc<Self>) -> RowPin {
-        self.pins.lock().unwrap_or_else(|e| e.into_inner()).count += 1;
+        let generation = self
+            .pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_pin();
         RowPin {
             store: Arc::clone(self),
+            generation,
         }
     }
 
-    /// Applies the deferred deletes once no [`RowPin`] is alive (#1880), in
+    /// Applies the deferred deletes no live [`RowPin`] still protects (#1880:
+    /// those deferred after the oldest live pin was taken), in
     /// [`FORGET_CHUNK`]-sized batches. Each batch is taken **and** deleted
     /// under the pins lock (lock order: `pins` then `conn`), so a concurrent
     /// `put`/`put_cold` — which holds the same lock across its INSERT and
@@ -967,13 +1089,11 @@ impl VarSpillStore {
     /// after the batch's delete ran: the drain never deletes a fresh row. The
     /// lock is released between batches, so a large backlog never blocks
     /// spills, retirements or pins for longer than one chunk. A pin taken
-    /// mid-drain stops it; that pin's own release drains the rest.
+    /// mid-drain is newer than every deferral already queued, so it never
+    /// holds those back.
     fn drain_deferred(&self) {
         loop {
             let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
-            if pins.count > 0 {
-                return;
-            }
             let Some(batch) = pins.take_batch(FORGET_CHUNK) else {
                 return;
             };
@@ -1012,11 +1132,11 @@ impl VarSpillStore {
     /// Returns whether it did (the caller then skips the immediate delete).
     fn defer_if_pinned(&self, keys: &[Key]) -> bool {
         let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
-        if pins.count == 0 {
+        if !pins.any_live() {
             return false;
         }
-        pins.spill.extend(keys.iter().copied());
-        pins.cold.extend(keys.iter().copied());
+        pins.defer(GcTable::Spill, keys.iter().copied());
+        pins.defer(GcTable::Cold, keys.iter().copied());
         true
     }
 
@@ -1370,12 +1490,9 @@ impl VarSpillStore {
                 // capture). The pins lock is held across the delete so a pin
                 // cannot be taken between the check and the delete.
                 let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
-                if pins.count > 0 {
+                if pins.any_live() {
                     collected += orphans.len() as u64;
-                    match deletes {
-                        GcTable::Spill => pins.spill.extend(orphans),
-                        GcTable::Cold => pins.cold.extend(orphans),
-                    }
+                    pins.defer(deletes, orphans);
                     continue;
                 }
                 // Table- and partition-scoped delete: this pass reaps only its
@@ -2241,9 +2358,9 @@ mod tests {
         {
             let pins = store.pins.lock().unwrap();
             let mut probe = RowPins {
-                count: 0,
                 spill: pins.spill.clone(),
                 cold: pins.cold.clone(),
+                ..RowPins::default()
             };
             while let Some(b) = probe.take_batch(FORGET_CHUNK) {
                 assert!(b.both.len() <= FORGET_CHUNK);
@@ -2257,6 +2374,43 @@ mod tests {
         }
         let pins = store.pins.lock().unwrap();
         assert!(pins.spill.is_empty() && pins.cold.is_empty());
+    }
+
+    // #1880 review: on a shared store, overlapping captures must not block
+    // reclamation forever. A delete deferred before a pin was taken waits
+    // only for the pins older than it, so it drains once those release even
+    // while a newer capture is still in flight (no store-wide gap needed).
+    #[test]
+    fn overlapping_pins_reclaim_without_a_store_wide_gap() {
+        let store = Arc::new(VarSpillStore::open(None).unwrap());
+        for key in 1..=4 {
+            store.put(key, &vars("v")).unwrap();
+        }
+        let mut older = store.pin_rows();
+        store.forget(&[1]).unwrap();
+        for next in 2..=4 {
+            // A newer capture starts before the older one finishes.
+            let newer = store.pin_rows();
+            store.forget(&[next]).unwrap();
+            drop(older);
+            for done in 1..next {
+                assert!(
+                    store.try_get(done).unwrap().is_none(),
+                    "key {done} reclaimed"
+                );
+            }
+            assert!(
+                store.try_get(next).unwrap().is_some(),
+                "key {next} still held for the live capture"
+            );
+            older = newer;
+        }
+        // A clone of a pin protects what the original protected.
+        let clone = older.clone();
+        drop(older);
+        assert!(store.try_get(4).unwrap().is_some(), "clone keeps the row");
+        drop(clone);
+        assert!(store.try_get(4).unwrap().is_none());
     }
 
     // #1880 review: deferred drains count toward the WAL checkpoint budget,
