@@ -1,9 +1,9 @@
 //! `searchAgentInstances` / `searchAgentInstanceHistory`: the single
 //! spec-derived implementation both the gateway and `engine-wasm` call.
 
+use agent_model::Key;
 use nanobpmn_engine_core as agent_model;
 use nanobpmn_read_model as readstore;
-use agent_model::Key;
 
 use crate::{
     SearchError,
@@ -239,7 +239,9 @@ pub fn agent_tool_result(t: &agent_model::AgentTool) -> models::AgentTool {
 /// Maps an engine tool call to the REST `AgentInstanceToolCall`. The opaque
 /// arguments string is re-parsed into a JSON object; a non-object or unparsable
 /// payload maps to null so the field stays schema-valid.
-pub fn agent_tool_call_result(c: &agent_model::AgentHistoryToolCall) -> models::AgentInstanceToolCall {
+pub fn agent_tool_call_result(
+    c: &agent_model::AgentHistoryToolCall,
+) -> models::AgentInstanceToolCall {
     let arguments = c
         .arguments
         .as_ref()

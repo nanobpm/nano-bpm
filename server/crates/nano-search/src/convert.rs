@@ -33,4 +33,3 @@ pub fn tenant_or_default(tenant_id: &str) -> String {
         tenant_id.to_string()
     }
 }
-

@@ -70,7 +70,6 @@ pub(crate) use nano_server_storage::journal;
 pub(crate) use nano_server_storage::memory;
 pub(crate) use nano_server_storage::metrics;
 pub(crate) use nano_server_storage::readstore;
-use nanobpmn_search::{agent::agent_instance_result, convert::epoch, query};
 pub(crate) use nano_server_storage::remote_sink;
 pub(crate) use nano_server_storage::seglog;
 pub(crate) use nano_server_storage::snapshot_health;
@@ -84,6 +83,7 @@ use nanobpmn_engine_core::{
     IncidentState, Key, MAX_PARTITION_ID, ProcessBuilder, ProcessDefinition, ProcessInstanceState,
     TaskListenerJobResult, UserTaskCorrections, Value, partition_of,
 };
+use nanobpmn_search::{agent::agent_instance_result, convert::epoch, query};
 
 use crate::backpressure::{
     AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, GlobalGuard,
@@ -16986,11 +16986,10 @@ impl ServerImpl {
     ) -> Result<apis::agent_instance::SearchAgentInstancesResponse, ()> {
         use apis::agent_instance::SearchAgentInstancesResponse as Resp;
 
-        let result =
-            nanobpmn_search::agent::search_agent_instances(body.as_ref(), || {
-                self.store.try_agent_instances()
-            })
-            .map_err(|_| ())?;
+        let result = nanobpmn_search::agent::search_agent_instances(body.as_ref(), || {
+            self.store.try_agent_instances()
+        })
+        .map_err(|_| ())?;
         Ok(Resp::Status200_TheAgentInstanceSearchResult(result))
     }
 
@@ -25901,7 +25900,6 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-
 /// Maps an engine [`IncidentKind`] to the REST `errorType` taxonomy.
 fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum {
     match kind {
@@ -27462,9 +27460,6 @@ fn present<T>(field: &Option<types::Nullable<T>>) -> Option<&T> {
     }
 }
 
-
-
-
 /// Maps a REST update-status enum to the engine agent-instance status. `UPDATE`
 /// can only drive the instance to one of the *active* states (`COMPLETED` is
 /// reached solely via `COMPLETE`), so the enum has no completed arm.
@@ -27481,7 +27476,6 @@ fn agent_update_status(
     }
 }
 
-
 /// Maps a REST role enum to the engine agent-history role.
 fn agent_history_role_from(
     role: &models::AgentInstanceHistoryRoleEnum,
@@ -27494,9 +27488,6 @@ fn agent_history_role_from(
         models::AgentInstanceHistoryRoleEnum::Configuration => R::Configuration,
     }
 }
-
-
-
 
 /// Maps a REST message-content block to the engine content shape. The structured
 /// `object` payload is serialised back to the opaque JSON string the engine core
@@ -27531,7 +27522,6 @@ fn agent_content_from(c: &models::AgentInstanceMessageContent) -> agent_model::A
     }
 }
 
-
 /// Maps a REST `AgentTool` to the engine tool descriptor.
 fn agent_tool_from(t: &models::AgentTool) -> agent_model::AgentTool {
     agent_model::AgentTool {
@@ -27546,7 +27536,6 @@ fn agent_tool_from(t: &models::AgentTool) -> agent_model::AgentTool {
         },
     }
 }
-
 
 /// Maps a REST tool call to the engine tool call. The structured arguments map is
 /// serialised back to the opaque JSON string the engine stores.
@@ -27570,7 +27559,6 @@ fn agent_tool_call_from(c: &models::AgentInstanceToolCall) -> agent_model::Agent
     }
 }
 
-
 /// Maps a REST per-turn metrics block to the engine metrics. An absent or
 /// explicit-null counter is `None`. No `..Default::default()`: a counter the
 /// engine gains must be mapped here, not silently zeroed.
@@ -27590,8 +27578,6 @@ fn agent_history_metrics_from(
         duration_ms: val(&m.duration_ms),
     }
 }
-
-
 
 /// Correlates each emitted `AgentHistoryCreated` event (in request/emission
 /// order) to a submitted history item, yielding exactly one result per submitted
@@ -27703,7 +27689,6 @@ mod correlate_created_history_tests {
     }
 }
 
-
 /// Builds an engine [`agent_model::AgentHistoryTurn`] from a REST history item.
 /// The request-level `jobKey`/`jobLease` are attributed to every turn in the
 /// batch (the activation during which the batch was produced).
@@ -27776,10 +27761,6 @@ fn validate_agent_history(items: &[models::AgentInstanceHistoryItem]) -> Result<
     }
     Ok(())
 }
-
-
-
-
 
 fn created_history_from_events(
     events: &[Event],
@@ -27863,8 +27844,6 @@ fn agent_update_http_error(
         _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem),
     }
 }
-
-
 
 /// Maps an engine [`nanobpmn_engine_core::JobState`] to the REST job state enum.
 /// The engine's transient `Activated` (locked to a worker) has no distinct wire
@@ -59005,7 +58984,6 @@ mod call_activity_hierarchy_read_model_tests {
     //! (non-call-activity) instance self-roots and carries no parent — the
     //! no-regression guard. Drives the actual gateway handlers end-to-end against
     //! a real engine run, so the projection cannot silently regress.
-    use super::*;
     use nanobpmn_search::{
         agent::{
             agent_history_metrics_result, agent_message_content, agent_system_prompt,
@@ -59013,6 +58991,8 @@ mod call_activity_hierarchy_read_model_tests {
         },
         convert::ms_to_datetime,
     };
+
+    use super::*;
 
     /// A start → parking service-task → end process. The service task never
     /// completes in the test, so the instance (and, when it is a call-activity

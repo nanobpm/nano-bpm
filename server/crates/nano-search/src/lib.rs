@@ -57,8 +57,8 @@ where
     }
     let raw: serde_json::Value =
         serde_json::from_str(trimmed).map_err(|e| format!("invalid search query: {e}"))?;
-    let query: Option<T> = serde_json::from_value(raw.clone())
-        .map_err(|e| format!("invalid search query: {e}"))?;
+    let query: Option<T> =
+        serde_json::from_value(raw.clone()).map_err(|e| format!("invalid search query: {e}"))?;
     if let Some(q) = &query {
         let canonical =
             serde_json::to_value(q).map_err(|e| format!("invalid search query: {e}"))?;
@@ -99,11 +99,11 @@ fn reject_unknown_properties(
             }
             Ok(())
         }
-        (Value::Array(r), Value::Array(c)) if r.len() == c.len() => r
-            .iter()
-            .zip(c)
-            .enumerate()
-            .try_for_each(|(i, (rv, cv))| reject_unknown_properties(rv, cv, &format!("{path}[{i}]"))),
+        (Value::Array(r), Value::Array(c)) if r.len() == c.len() => {
+            r.iter().zip(c).enumerate().try_for_each(|(i, (rv, cv))| {
+                reject_unknown_properties(rv, cv, &format!("{path}[{i}]"))
+            })
+        }
         _ => Ok(()),
     }
 }
@@ -114,8 +114,16 @@ mod tests {
 
     #[test]
     fn empty_and_null_bodies_are_absent_queries() {
-        assert!(parse_search_query::<models::AgentInstanceSearchQuery>("  ").unwrap().is_none());
-        assert!(parse_search_query::<models::AgentInstanceSearchQuery>("null").unwrap().is_none());
+        assert!(
+            parse_search_query::<models::AgentInstanceSearchQuery>("  ")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_search_query::<models::AgentInstanceSearchQuery>("null")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
