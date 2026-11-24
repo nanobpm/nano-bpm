@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_parity-timer-cycle-cron" targetNamespace="http://bpmn.io/schema/bpmn" exporter="nano parity seed" exporterVersion="1.0.0">
+  <bpmn:process id="parity-timer-cycle-cron" name="Cron timer cycles" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_1" name="Start">
+      <bpmn:outgoing>Flow_s_t</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_s_t" sourceRef="StartEvent_1" targetRef="Task_Work" />
+    <bpmn:serviceTask id="Task_Work" name="Work">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_s_t</bpmn:incoming>
+      <bpmn:outgoing>Flow_t_e</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_t_e" sourceRef="Task_Work" targetRef="EndEvent_1" />
+    <bpmn:endEvent id="EndEvent_1" name="End">
+      <bpmn:incoming>Flow_t_e</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="Timer_1" name="0 0/15 * * * ?" cancelActivity="false" attachedToRef="Task_Work">
+      <bpmn:outgoing>Flow_t1</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="Timer_1_def">
+        <bpmn:timeCycle xsi:type="bpmn:tFormalExpression">0 0/15 * * * ?</bpmn:timeCycle>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_t1" sourceRef="Timer_1" targetRef="End_T1" />
+    <bpmn:endEvent id="End_T1" name="Tick 1">
+      <bpmn:incoming>Flow_t1</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="Timer_2" name="0 0 9-17 * * MON-FRI" cancelActivity="false" attachedToRef="Task_Work">
+      <bpmn:outgoing>Flow_t2</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="Timer_2_def">
+        <bpmn:timeCycle xsi:type="bpmn:tFormalExpression">0 0 9-17 * * MON-FRI</bpmn:timeCycle>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_t2" sourceRef="Timer_2" targetRef="End_T2" />
+    <bpmn:endEvent id="End_T2" name="Tick 2">
+      <bpmn:incoming>Flow_t2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="Timer_3" name="0 0 0 L * ?" cancelActivity="false" attachedToRef="Task_Work">
+      <bpmn:outgoing>Flow_t3</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="Timer_3_def">
+        <bpmn:timeCycle xsi:type="bpmn:tFormalExpression">0 0 0 L * ?</bpmn:timeCycle>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_t3" sourceRef="Timer_3" targetRef="End_T3" />
+    <bpmn:endEvent id="End_T3" name="Tick 3">
+      <bpmn:incoming>Flow_t3</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="Timer_4" name="0 0 12 1W * ?" cancelActivity="false" attachedToRef="Task_Work">
+      <bpmn:outgoing>Flow_t4</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="Timer_4_def">
+        <bpmn:timeCycle xsi:type="bpmn:tFormalExpression">0 0 12 1W * ?</bpmn:timeCycle>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_t4" sourceRef="Timer_4" targetRef="End_T4" />
+    <bpmn:endEvent id="End_T4" name="Tick 4">
+      <bpmn:incoming>Flow_t4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="Timer_5" name="@daily" cancelActivity="false" attachedToRef="Task_Work">
+      <bpmn:outgoing>Flow_t5</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="Timer_5_def">
+        <bpmn:timeCycle xsi:type="bpmn:tFormalExpression">@daily</bpmn:timeCycle>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_t5" sourceRef="Timer_5" targetRef="End_T5" />
+    <bpmn:endEvent id="End_T5" name="Tick 5">
+      <bpmn:incoming>Flow_t5</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="Timer_6" name="0 30 6 ? JAN,FEB SUN#1" cancelActivity="false" attachedToRef="Task_Work">
+      <bpmn:outgoing>Flow_t6</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="Timer_6_def">
+        <bpmn:timeCycle xsi:type="bpmn:tFormalExpression">0 30 6 ? JAN,FEB SUN#1</bpmn:timeCycle>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_t6" sourceRef="Timer_6" targetRef="End_T6" />
+    <bpmn:endEvent id="End_T6" name="Tick 6">
+      <bpmn:incoming>Flow_t6</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="parity-timer-cycle-cron">
+      <bpmndi:BPMNShape id="StartEvent_1_di" bpmnElement="StartEvent_1">
+        <dc:Bounds x="172" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Work_di" bpmnElement="Task_Work">
+        <dc:Bounds x="260" y="80" width="320" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_1_di" bpmnElement="EndEvent_1">
+        <dc:Bounds x="640" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_1_di" bpmnElement="Timer_1">
+        <dc:Bounds x="270" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_T1_di" bpmnElement="End_T1">
+        <dc:Bounds x="640" y="220" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_2_di" bpmnElement="Timer_2">
+        <dc:Bounds x="320" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_T2_di" bpmnElement="End_T2">
+        <dc:Bounds x="640" y="290" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_3_di" bpmnElement="Timer_3">
+        <dc:Bounds x="370" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_T3_di" bpmnElement="End_T3">
+        <dc:Bounds x="640" y="360" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_4_di" bpmnElement="Timer_4">
+        <dc:Bounds x="420" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_T4_di" bpmnElement="End_T4">
+        <dc:Bounds x="640" y="430" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_5_di" bpmnElement="Timer_5">
+        <dc:Bounds x="470" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_T5_di" bpmnElement="End_T5">
+        <dc:Bounds x="640" y="500" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_6_di" bpmnElement="Timer_6">
+        <dc:Bounds x="520" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_T6_di" bpmnElement="End_T6">
+        <dc:Bounds x="640" y="570" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_s_t_di" bpmnElement="Flow_s_t">
+        <di:waypoint x="208" y="120" />
+        <di:waypoint x="260" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_t_e_di" bpmnElement="Flow_t_e">
+        <di:waypoint x="580" y="120" />
+        <di:waypoint x="640" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_t1_di" bpmnElement="Flow_t1">
+        <di:waypoint x="288" y="178" />
+        <di:waypoint x="288" y="238" />
+        <di:waypoint x="640" y="238" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_t2_di" bpmnElement="Flow_t2">
+        <di:waypoint x="338" y="178" />
+        <di:waypoint x="338" y="308" />
+        <di:waypoint x="640" y="308" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_t3_di" bpmnElement="Flow_t3">
+        <di:waypoint x="388" y="178" />
+        <di:waypoint x="388" y="378" />
+        <di:waypoint x="640" y="378" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_t4_di" bpmnElement="Flow_t4">
+        <di:waypoint x="438" y="178" />
+        <di:waypoint x="438" y="448" />
+        <di:waypoint x="640" y="448" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_t5_di" bpmnElement="Flow_t5">
+        <di:waypoint x="488" y="178" />
+        <di:waypoint x="488" y="518" />
+        <di:waypoint x="640" y="518" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_t6_di" bpmnElement="Flow_t6">
+        <di:waypoint x="538" y="178" />
+        <di:waypoint x="538" y="588" />
+        <di:waypoint x="640" y="588" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

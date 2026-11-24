@@ -61,7 +61,12 @@ serialisation): `activateAndComplete`, `correlateMessage`, `broadcastSignal`,
 human rendering).
 
 The seed corpus is a small MC-derived sample — a linear service task, an
-exclusive-gateway route, and a parallel diamond — enough to exercise the spine.
+exclusive-gateway route, and a parallel diamond — enough to exercise the spine —
+plus three timer-cycle scenarios (#1916; Zeebe `timeCycle` semantics from #1878):
+`timer-cycle-cron` (Spring cron steps, ranges, `L`, `W`, `#`, macros),
+`timer-cycle-iso-start` (`R<n>/<start>/<period>` incl. offsets and calendar
+periods) and `timer-cycle-feel` (FEEL `cycle()`), each a service task with
+non-interrupting cycle boundary timers fired by `advanceTime` from the epoch.
 The **single-source corpus generator** ([#1258], `formal/corpus/`) has since
 landed; wiring this runner to its output (pointing `--corpus` at the generated
 directory) is a follow-up, with the scenario schema above as the contract.
