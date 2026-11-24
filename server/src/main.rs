@@ -41224,11 +41224,32 @@ mod clustered_startup_tests {
             "resolving the incident clears it and re-evaluates the script"
         );
 
-        // Resolving an already-cleared incident is now a not-found.
-        assert!(matches!(
-            server.resolve_incident_core(incident_key, None).await,
-            ResolveIncidentOutcome::NotFound(_)
-        ));
+        // Resolving an already-cleared incident is never re-resolved. Until the
+        // completed instance is evicted from hot engine state (asynchronously,
+        // once the exporter has projected it) the engine still holds the
+        // resolved record and refuses with "already resolved"; after eviction
+        // it is a not-found. Wait for eviction rather than racing it.
+        let mut evicted = false;
+        for _ in 0..200 {
+            match server.resolve_incident_core(incident_key, None).await {
+                ResolveIncidentOutcome::NotFound(_) => {
+                    evicted = true;
+                    break;
+                }
+                ResolveIncidentOutcome::NotResolvable(reason) => {
+                    assert!(reason.contains("already resolved"), "{reason}");
+                }
+                ResolveIncidentOutcome::Resolved => panic!("a cleared incident re-resolved"),
+                ResolveIncidentOutcome::Unavailable(d) | ResolveIncidentOutcome::Internal(d) => {
+                    panic!("unexpected resolve failure: {d}")
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            evicted,
+            "the resolved incident is evicted and becomes not-found"
+        );
     }
 
     /// The console's single "Resolve incident" button, applied to a JobNoRetries incident, must

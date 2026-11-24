@@ -237,6 +237,13 @@
       "count": 1,
       "reason": "fallback for targets that are neither Unix nor Windows: no shipped binary targets one (publish-*-binaries.yml ships Linux, macOS, Windows), so no valid build reaches it.",
       "trackedIn": null
+    },
+    {
+      "file": "server/tests/common/mod.rs",
+      "pred": "target_vendor = \"apple\"",
+      "count": 1,
+      "reason": "registers the e2e harness's pre-main inherited-pipe closer in the Mach-O __mod_init_func section; only an Apple target compiles it and the clippy matrix runs on the Linux CI runner (the sibling not(apple) .init_array arm is linted there).",
+      "trackedIn": null
     }
   ]
 }
