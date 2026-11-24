@@ -796,17 +796,28 @@ mod tests {
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
 
+        // Each closure blocks on a gate until the caller's first poll has
+        // returned Pending, so the reply is deterministically sent AFTER that
+        // poll (no race where the engine replies before the first poll).
+        let (go_a, gate_a) = std::sync::mpsc::channel::<()>();
         let (_ack_a, rx_a) = oneshot::channel::<()>();
         let mut fut = Box::pin(h.with_priority(Priority::High, move |_journal| {
+            let _ = gate_a.recv();
             crate::journal::Commit::from_ack(rx_a)
         }));
         assert!(fut.as_mut().poll(&mut cx).is_pending());
+        go_a.send(()).expect("release closure a");
         wait_until(|| stats.jobs.load(Ordering::Relaxed) >= 1);
         drop(fut); // reply is queued, never received
 
+        let (go_b, gate_b) = std::sync::mpsc::channel::<()>();
         let (_ack_b, rx_b) = oneshot::channel::<()>();
-        let mut fut = Box::pin(h.try_with(move |_journal| crate::journal::Commit::from_ack(rx_b)));
+        let mut fut = Box::pin(h.try_with(move |_journal| {
+            let _ = gate_b.recv();
+            crate::journal::Commit::from_ack(rx_b)
+        }));
         assert!(fut.as_mut().poll(&mut cx).is_pending());
+        go_b.send(()).expect("release closure b");
         wait_until(|| stats.jobs.load(Ordering::Relaxed) >= 2);
         drop(fut);
 

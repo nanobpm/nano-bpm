@@ -18636,6 +18636,10 @@ impl ServerImpl {
             Ok(t) => t,
             Err(e) => return Err(("Invalid deployment", e)),
         };
+        // Wait for durability BEFORE the replication awaits below (#1855): a
+        // caller cancelled at one of those suspension points would otherwise
+        // drop this still-`Pending` commit unwaited (the debug drop bomb).
+        commit.wait().await;
         // Replicate the new definition(s) to the other local partitions so any of
         // them can instantiate the process (the deployment itself is journaled
         // only on partition 0; replication is in-memory and re-derived on restart).
@@ -18756,7 +18760,6 @@ impl ServerImpl {
         );
         // Deployments don't create jobs, but a freshly available process means a
         // later createProcessInstance can; nothing to notify here.
-        commit.wait().await;
         Ok((result, events))
     }
 
