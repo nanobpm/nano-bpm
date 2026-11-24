@@ -279,6 +279,15 @@ fn worker_gone(child: &mut Child, pid: Option<u32>) -> bool {
     child_exited(child) && !group_alive(pid)
 }
 
+/// Whether signalling the group led by `pid` cannot hit an unrelated group.
+/// While the leader is unreaped its pid (and so the pgid) is held; once it is
+/// reaped the pgid is only held while the group has members, so a reaped
+/// leader's group is signalled only after probing it non-empty — never by a
+/// stale pid the kernel may have reused (#1836).
+fn group_signal_safe(child: &mut Child, pid: Option<u32>) -> bool {
+    pid.is_some() && (matches!(child.try_wait(), Ok(None)) || group_alive(pid))
+}
+
 /// Whether any process remains in the group led by `pid` (Unix). Windows has
 /// no group probe here (see the Job Object follow-up), so it reports none.
 fn group_alive(pid: Option<u32>) -> bool {
@@ -400,11 +409,16 @@ pub(crate) struct ReapBudget {
     /// Test seam: short reap grace and retirement drain.
     #[cfg(test)]
     short_waits: std::sync::atomic::AtomicBool,
+    /// Test seam: number of group signals sent.
+    #[cfg(test)]
+    pub(super) group_signals: AtomicUsize,
 }
 
 impl ReapBudget {
     /// Kill a process group (blocking `taskkill` on Windows).
     fn kill_group(&self, pid: u32) {
+        #[cfg(test)]
+        self.group_signals.fetch_add(1, Ordering::AcqRel);
         #[cfg(test)]
         if self.ignore_kill.load(Ordering::Acquire) {
             return;
@@ -418,8 +432,10 @@ impl ReapBudget {
         if self.ignore_kill.load(Ordering::Acquire) {
             return;
         }
-        if let Some(pid) = pid {
-            super::kill_group_by_pid(pid);
+        if let Some(pid) = pid
+            && group_signal_safe(child, Some(pid))
+        {
+            self.kill_group(pid);
         }
         let _ = child.start_kill();
     }
@@ -445,14 +461,17 @@ impl ReapBudget {
 /// the leader has already been reaped — and wait (bounded by the reap grace)
 /// for the leader to be reaped and the group to empty. Returns whether it did.
 async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>) -> bool {
-    async fn kill_group(budget: &Arc<ReapBudget>, pid: Option<u32>) {
+    async fn kill_group(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>) {
+        if !group_signal_safe(child, pid) {
+            return;
+        }
         if let Some(pid) = pid {
             // Blocking on Windows (`taskkill` status); cheap signal on Unix.
             let b = budget.clone();
             let _ = tokio::task::spawn_blocking(move || b.kill_group(pid)).await;
         }
     }
-    kill_group(budget, pid).await;
+    kill_group(budget, child, pid).await;
     #[cfg(test)]
     let skip = budget.ignore_kill.load(Ordering::Acquire);
     #[cfg(not(test))]
@@ -469,7 +488,7 @@ async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>
     }
     // Leader reaped: kill again for descendants that outlived it.
     loop {
-        kill_group(budget, pid).await;
+        kill_group(budget, child, pid).await;
         if !group_alive(pid) {
             return true;
         }
@@ -2069,6 +2088,23 @@ mod tests {
             // SAFETY: best-effort cleanup of the test's own children.
             unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         }
+    }
+
+    /// A reaped leader whose group is empty must never be signalled by its
+    /// recorded pid: the kernel may have reused it for an unrelated group
+    /// (pid/pgid reuse, #1836).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaped_empty_group_is_not_signalled() {
+        let budget = Arc::new(ReapBudget::default());
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 0"]).process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        child.wait().await.unwrap();
+        assert!(kill_tree(&budget, &mut child, pid).await);
+        budget.kill(pid, &mut child);
+        assert_eq!(budget.group_signals.load(Ordering::Acquire), 0);
     }
 
     /// With a pending teardown the piped (embedded `data-cli.ts`) gateway refuses (Busy) instead of
