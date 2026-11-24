@@ -599,6 +599,19 @@ impl ReadModel {
         self.shards.iter().flat_map(|s| s.variables()).collect()
     }
 
+    /// The variable rows satisfying `pushdown`'s indexed predicates (#1886),
+    /// concatenated across shards. Each shard resolves the predicates through
+    /// its own indexes, so a selective search touches only matching rows.
+    pub fn variables_matching(&self, pushdown: &VariablePushdown) -> Vec<VariableRow> {
+        if pushdown.is_empty_result() {
+            return Vec::new();
+        }
+        self.shards
+            .iter()
+            .flat_map(|s| s.variables_matching(pushdown))
+            .collect()
+    }
+
     // --- counts: sum across shards ---
 
     pub fn active_instance_count(&self) -> usize {
