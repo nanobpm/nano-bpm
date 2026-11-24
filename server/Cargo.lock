@@ -1617,6 +1617,7 @@ dependencies = [
  "nanobpm-gateway-rest",
  "nanobpmn-engine-core",
  "nanobpmn-read-model",
+ "nanobpmn-search",
  "openraft",
  "reqwest",
  "serde",
@@ -1653,6 +1654,19 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "nanobpmn-search"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "nanobpm-gateway-rest",
+ "nanobpmn-engine-core",
+ "nanobpmn-read-model",
+ "serde",
+ "serde_json",
+ "validator",
 ]
 
 [[package]]

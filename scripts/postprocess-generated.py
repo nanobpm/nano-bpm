@@ -310,6 +310,37 @@ def fix_optional_json_bodies(server: str) -> tuple[str, int]:
     return server, count
 
 
+# Dependencies only the axum server surface (`apis` + `server` modules) needs.
+# They become optional and are pulled in by the `server` feature, so a
+# `default-features = false` build is a MODELS-ONLY crate (serde models + types)
+# that compiles for wasm32 (#1883): `engine-wasm` deserialises the generated
+# `*SearchQuery` / serialises `*SearchQueryResult` through it instead of
+# hand-writing parsers. `tokio` (rt-multi-thread) is what cannot target wasm32.
+SERVER_ONLY_DEPS = ("async-trait", "axum", "axum-extra", "headers", "tokio", "tracing")
+
+
+def make_models_only_buildable(cargo: str, lib: str) -> tuple[str, str]:
+    """Gate the server-only surface behind the `server` feature (fail-closed)."""
+    if "\nserver = []\n" not in cargo:
+        raise SystemExit("postprocess: expected `server = []` feature in generated Cargo.toml")
+    deps = ", ".join(f'"dep:{d}"' for d in SERVER_ONLY_DEPS)
+    cargo = cargo.replace("\nserver = []\n", f"\nserver = [{deps}]\n", 1)
+    for dep in SERVER_ONLY_DEPS:
+        pat = re.compile(rf"^{re.escape(dep)} = (\{{ (.*?) \}}|\"([^\"]*)\")$", re.M | re.S)
+        m = pat.search(cargo)
+        if m is None:
+            raise SystemExit(f"postprocess: dependency `{dep}` not found in generated Cargo.toml")
+        if m.group(2) is not None:
+            new = f"{dep} = {{ {m.group(2)}, optional = true }}"
+        else:
+            new = f'{dep} = {{ version = "{m.group(3)}", optional = true }}'
+        cargo = cargo[: m.start()] + new + cargo[m.end():]
+    if "\npub mod apis;\n" not in lib:
+        raise SystemExit("postprocess: expected `pub mod apis;` in generated lib.rs")
+    lib = lib.replace("\npub mod apis;\n", '\n#[cfg(feature = "server")]\npub mod apis;\n', 1)
+    return cargo, lib
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"usage: {argv[0]} <generated-crate-dir>", file=sys.stderr)
@@ -339,6 +370,14 @@ def main(argv: list[str]) -> int:
         server, optional_json_count = fix_optional_json_bodies(server)
         server_path.write_text(server, encoding="utf-8")
 
+    cargo_path = crate_dir / "Cargo.toml"
+    lib_path = crate_dir / "src" / "lib.rs"
+    cargo, lib = make_models_only_buildable(
+        cargo_path.read_text(encoding="utf-8"), lib_path.read_text(encoding="utf-8")
+    )
+    cargo_path.write_text(cargo, encoding="utf-8")
+    lib_path.write_text(lib, encoding="utf-8")
+
     print("Post-processed generated code:")
     print(f"  oneOf date-time variant occurrences fixed: {datetime_count}")
     if optional_props:
@@ -353,6 +392,7 @@ def main(argv: list[str]) -> int:
     print(f"  HTML-escaped regex patterns unescaped: {regex_count}")
     print(f"  default-tenant XSS false positive fixed: {xss_count}")
     print(f"  optional JSON bodies made bodyless-tolerant: {optional_json_count}")
+    print("  models-only build gated behind the `server` feature: yes")
     return 0
 
 
