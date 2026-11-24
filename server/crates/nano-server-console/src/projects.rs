@@ -4220,7 +4220,6 @@ impl GatewayTreeGuard {
                 let _ = _child.start_kill();
             }
         }
-        let _ = pid;
     }
 }
 
@@ -4269,7 +4268,6 @@ impl Drop for GatewayTreeGuard {
                 .stderr(std::process::Stdio::null())
                 .spawn();
         }
-        let _ = pid;
     }
 }
 
@@ -4977,6 +4975,10 @@ pub fn create_project_with_options(
     Ok(cfg)
 }
 
+/// Serialises delete/rename so their alias-aware worker retirement decisions
+/// can't race each other (#1881).
+static DIR_LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Deletes a project directory and everything in it.
 pub fn delete_project(name: &str) -> std::io::Result<()> {
     let dir = project_dir(name).ok_or_else(|| {
@@ -4988,8 +4990,7 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     let workspace_dir = projects_root().join(name);
     // Serialise deletes so two aliases of one directory deleted at once can't
     // each see the other and both skip retirement (#1881).
-    static DELETE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _serial = DELETE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = DIR_LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // #1836: no `urban data --serve` worker may outlive (or pin) its project.
     // The guard keeps the path tombstoned (no op runs or spawns there) until
     // the directory operation below is done. #1881: deleting a
@@ -5069,8 +5070,7 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     let from = projects_root().join(old);
     // #1836: the worker is keyed on (and anchored in) the old directory.
     // Held across the move: no op runs or spawns in `from` meanwhile.
-    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &from)
-        .map_err(|e| e.to_string())?;
+    let _serial = DIR_LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !from.is_dir() {
         // A pure imported-by-reference project (no workspace dir) can't be
         // renamed by a directory move; remove and re-import under the new name.
@@ -5081,6 +5081,10 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
         }
         return Err("no such project".into());
     }
+    // #1881: only a real directory move retires the worker; a rejected
+    // reference-only rename above must not kill a shared alias's worker.
+    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &from)
+        .map_err(|e| e.to_string())?;
     // Same slug (e.g. only the capitalization/spacing of the display name
     // changed, or the display name is being cleared): there is no directory to
     // move, so update the config in place instead of erroring on the
@@ -8549,7 +8553,6 @@ mod tests {
     #[cfg(unix)]
     fn is_zombie(pid: i32) -> bool {
         if !cfg!(target_os = "linux") {
-            let _ = pid;
             return false;
         }
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
@@ -12553,6 +12556,41 @@ case \"$*\" in *--help*) {help_prelude}printf 'urban data [--serve]\\n'; exit 0;
             "deleting the last reference did not retire the worker"
         );
         assert!(ext.join("nano.app.json").is_file(), "external dir touched");
+    }
+
+    /// #1881: a rejected rename of a reference-only alias must not retire the
+    /// worker another alias of the same directory is using.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn renaming_one_alias_keeps_the_shared_data_worker() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = ext_app_dir("alias-rename");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1}"#).unwrap();
+        let log = root.join("alias-rename-spawns.txt");
+        let stub = root.join("urban-alias-rename-stub.sh");
+        serve_lifecycle_stub(&stub, &log, "");
+        import_project_ref("ralias-a", ext.to_str().unwrap()).unwrap();
+        import_project_ref("ralias-b", ext.to_str().unwrap()).unwrap();
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+        let op = |n: &'static str| run_data_op(n, serde_json::json!({ "op": "schema" }));
+        let b1 = op("ralias-b").await;
+        let renamed = tokio::task::spawn_blocking(|| rename_project("ralias-a", "ralias-c"))
+            .await
+            .unwrap();
+        let b2 = op("ralias-b").await;
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+        assert!(renamed.is_err(), "reference rename should be rejected");
+        let (b1, b2) = (b1.expect("op 1"), b2.expect("op 2"));
+        assert_eq!(
+            b1["pid"], b2["pid"],
+            "renaming alias-a retired the shared worker"
+        );
+        let spawns = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(spawns.lines().count(), 1, "worker respawned: {spawns:?}");
+        let _ = tokio::task::spawn_blocking(|| delete_project("ralias-b")).await;
+        let _ = tokio::task::spawn_blocking(|| delete_project("ralias-a")).await;
     }
 
     /// #1881: a request resolved before its project is deleted must not start
