@@ -294,10 +294,14 @@ impl Drop for Reaping {
 /// async, possibly `Drop`) context: the kill — a blocking `taskkill` on
 /// Windows — and the reap run on a blocking thread / background task that
 /// owns the `Child`. Until the reap completes the worker stays counted in
-/// [`DataGatewayLimiter`]'s `reaping` budget, since it is still a live process.
-fn kill_detached(limiter: &DataGatewayLimiter, mut w: Worker) {
+/// [`DataGatewayLimiter`]'s `reaping` budget, since it is still a live process,
+/// and holds a [`Waiting`] place on its project's `slot`, so a retirement drain
+/// (waiters==0) cannot finish while the worker may still hold the dir (#1836).
+fn kill_detached(limiter: &DataGatewayLimiter, slot: &Slot, mut w: Worker) {
     let pid = w.child.id();
     let ticket = Reaping::new(limiter);
+    slot.waiters.fetch_add(1, Ordering::AcqRel);
+    let hold = Waiting(slot.clone());
     // The Unix group signal is a cheap syscall: send it now so the worker
     // stops at once, whatever happens to the background task.
     #[cfg(unix)]
@@ -312,10 +316,12 @@ fn kill_detached(limiter: &DataGatewayLimiter, mut w: Worker) {
         }
         let _ = w.child.start_kill();
         drop(ticket);
+        drop(hold);
         return;
     };
     rt.spawn(async move {
         let _ticket = ticket;
+        let _hold = hold;
         #[cfg(not(unix))]
         if let Some(pid) = pid {
             let _ = tokio::task::spawn_blocking(move || super::kill_group_by_pid(pid)).await;
@@ -359,7 +365,7 @@ pub(super) fn enforce_resident_budget(limiter: &DataGatewayLimiter) {
             let w = slot.idle().take();
             if let Some(w) = w {
                 tracing::debug!(pid = ?w.child.id(), "data worker evicted (resident budget)");
-                kill_detached(limiter, w);
+                kill_detached(limiter, &slot, w);
             }
         }
     }
@@ -609,7 +615,7 @@ impl Drop for InUse<'_> {
     fn drop(&mut self) {
         self.slot.active().pid = None;
         if let Some(w) = self.worker.take() {
-            kill_detached(self.limiter, w);
+            kill_detached(self.limiter, &self.slot, w);
         }
     }
 }
@@ -1091,6 +1097,39 @@ mod tests {
         );
     }
 
+    /// #1836: a cancelled op's detached kill keeps a waiter hold on the slot
+    /// until the worker is reaped, so a retire drain cannot finish early.
+    #[tokio::test]
+    async fn cancelled_op_holds_slot_until_reaped() {
+        let dir = project("cancel-hold");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        let slot = lim.workers.slot_for(&dir);
+        let w = spawn_worker(&stub, &dir, toolkit_fingerprint(&stub, &dir)).unwrap();
+        let pid = w.child.id().expect("pid") as i32;
+        drop(InUse {
+            limiter: &lim,
+            slot: slot.clone(),
+            worker: Some(w),
+        });
+        assert!(
+            slot.waiters.load(Ordering::Acquire) > 0,
+            "slot released before the cancelled worker was reaped"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while slot.waiters.load(Ordering::Acquire) != 0 {
+            assert!(std::time::Instant::now() < deadline, "reap never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "worker alive after hold released"
+        );
+    }
+
     /// An over-long stdout line is a protocol error that kills the worker.
     #[tokio::test]
     async fn overlong_reply_line_kills_worker() {
@@ -1104,7 +1143,9 @@ mod tests {
                 MAX_REPLY_LINE_BYTES + 10
             ),
         );
-        let lim = limiter();
+        // Streaming 16 MiB through `head | tr` takes seconds on a loaded host;
+        // the default 10s deadline would race it, so give the exchange room.
+        let lim = DataGatewayLimiter::with_timeout(2, 8, std::time::Duration::from_secs(120));
         let r = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"x"})).await;
         assert!(
             matches!(r, Err(DataError::Gateway(ref m)) if m.contains("exceeds")),
