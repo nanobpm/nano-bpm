@@ -126,7 +126,7 @@ for (const variant of ["lean", "readmodel"]) {
         history: metricShapes.map((metrics, index) => turn(`metrics-${index}`, "ASSISTANT", { metrics })),
       }));
       if (variant === "readmodel") {
-        const rows = JSON.parse(engine.searchAgentInstanceHistory(key, '{"commitStatus":"PENDING"}')).items;
+        const rows = JSON.parse(engine.searchAgentInstanceHistory(key, '{"filter":{"commitStatus":"PENDING"}}')).items;
         metricShapes.forEach((metrics, index) => {
           assert.deepEqual(rows.find((row) => row.historyItemId === `metrics-${index}`).metrics, metrics);
         });
@@ -166,7 +166,7 @@ for (const variant of ["lean", "readmodel"]) {
         assert.equal(committed.length, 2, "only the winning activation's history commits");
         assert.ok(committed.every((item) => item.jobLeaseToken === retry.jobLeaseToken));
         const discarded = JSON.parse(engine.searchAgentInstanceHistory(
-          key, '{"commitStatus":"DISCARDED"}',
+          key, '{"filter":{"commitStatus":"DISCARDED"}}',
         )).items;
         assert.equal(discarded.length, 2 + metricShapes.length);
       }
