@@ -4091,10 +4091,13 @@ impl ServerImpl {
                 .build()
                 .expect("valid demo process");
             // Seed durability is non-critical: a fresh journal re-seeds on every
-            // start, so we don't await the commit here.
-            let _ = journals[0]
+            // start, so we don't await the commit here — detached explicitly
+            // (#1855).
+            journals[0]
                 .apply_command(Command::DeployProcess(demo))
-                .expect("deploy demo process");
+                .expect("deploy demo process")
+                .1
+                .detach();
         }
         // Replicate the deployment partition's definitions to every other
         // partition (in-memory, not journaled — re-derived here on each restart
@@ -31327,7 +31330,7 @@ mod snapshot_health_tick_tests {
         {
             let (mut journal, _recovery) =
                 journal::Journal::open_segmented(&dir).expect("open segmented");
-            let _ = journal
+            journal
                 .apply_command(Command::DeployProcess(
                     nanobpmn_engine_core::ProcessBuilder::new("p")
                         .start_event("s")
@@ -31336,11 +31339,15 @@ mod snapshot_health_tick_tests {
                         .build()
                         .unwrap(),
                 ))
-                .unwrap();
+                .unwrap()
+                .1
+                .blocking_wait();
             for _ in 0..50 {
-                let _ = journal
+                journal
                     .apply_command(Command::create_instance("p"))
-                    .unwrap();
+                    .unwrap()
+                    .1
+                    .blocking_wait();
             }
         } // crash: no snapshot was ever taken, nothing was compacted.
 
@@ -34512,7 +34519,11 @@ mod clustered_startup_tests {
             .connect("work", "end")
             .build()
             .expect("valid demo process");
-        let _ = journal.apply_command(Command::DeployProcess(demo)).unwrap();
+        journal
+            .apply_command(Command::DeployProcess(demo))
+            .unwrap()
+            .1
+            .blocking_wait();
         let (events, _) = journal
             .apply_command(Command::create_instance("demo"))
             .unwrap();
@@ -34993,18 +35004,26 @@ mod clustered_startup_tests {
             .engine
             .deploy_partition()
             .with(move |journal| {
-                let _ = journal
+                journal
                     .apply_command(Command::DeployResources(vec![process]))
-                    .expect("deploy process");
-                let _ = journal
+                    .expect("deploy process")
+                    .1
+                    .blocking_wait();
+                journal
                     .apply_command(Command::DeployDecisionRequirements(vec![drg]))
-                    .expect("deploy DRG");
-                let _ = journal
+                    .expect("deploy DRG")
+                    .1
+                    .blocking_wait();
+                journal
                     .apply_command(Command::DeployForms(vec![form]))
-                    .expect("deploy form");
-                let _ = journal
+                    .expect("deploy form")
+                    .1
+                    .blocking_wait();
+                journal
                     .apply_command(Command::DeployGenericResources(vec![resource]))
-                    .expect("deploy resource");
+                    .expect("deploy resource")
+                    .1
+                    .blocking_wait();
                 journal.state().clone()
             })
             .await;
@@ -35091,9 +35110,10 @@ mod clustered_startup_tests {
             jobs[0].instance_key, orphan0,
             "the oldest instance activates first"
         );
-        let _ = j0
-            .apply_command(Command::complete_job(jobs[0].key))
-            .unwrap();
+        j0.apply_command(Command::complete_job(jobs[0].key))
+            .unwrap()
+            .1
+            .blocking_wait();
         // Crash here: the terminal eviction forget is lost; re-write the row.
         store.put_cold(orphan0, &orphan0_row).unwrap();
         assert!(store.try_get_cold(orphan0).unwrap().is_some());
@@ -35228,7 +35248,7 @@ mod clustered_startup_tests {
     async fn raft_start_requires_cluster_variables_from_recovered_state() {
         use nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_VARIABLES as F;
         let mut journal = Journal::in_memory();
-        let _ = journal
+        journal
             .apply_command_at(
                 Command::CreateClusterVariable {
                     tenant_id: None,
@@ -35240,8 +35260,10 @@ mod clustered_startup_tests {
                 },
                 1,
             )
-            .expect("create");
-        let _ = journal
+            .expect("create")
+            .1
+            .blocking_wait();
+        journal
             .apply_command_at(
                 Command::DeleteClusterVariable {
                     tenant_id: None,
@@ -35250,7 +35272,9 @@ mod clustered_startup_tests {
                 },
                 2,
             )
-            .expect("delete");
+            .expect("delete")
+            .1
+            .blocking_wait();
         let topology = cluster::Topology {
             node_id: 0,
             peers: vec![
@@ -35341,9 +35365,11 @@ mod clustered_startup_tests {
                 .try_get_cold(key)
                 .unwrap()
                 .expect("cold row present before the cancel");
-            let _ = scratch
+            scratch
                 .apply_command(Command::cancel_instance(key))
-                .unwrap();
+                .unwrap()
+                .1
+                .blocking_wait();
             assert!(
                 store.try_get_cold(key).unwrap().is_none(),
                 "the cancel's eviction forget dropped the row"
@@ -35430,9 +35456,11 @@ mod clustered_startup_tests {
                 .try_get_cold(key)
                 .unwrap()
                 .expect("cold row present before the cancel");
-            let _ = scratch
+            scratch
                 .apply_command(Command::cancel_instance(key))
-                .unwrap();
+                .unwrap()
+                .1
+                .blocking_wait();
             store.put_cold(key, &orphan_row).unwrap();
             key
         };

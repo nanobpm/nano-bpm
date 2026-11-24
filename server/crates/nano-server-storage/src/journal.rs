@@ -154,7 +154,7 @@ impl Commit {
     /// thread is gone (shutdown / enqueue failed), it resolves immediately rather
     /// than hanging.
     pub async fn wait(self) {
-        if let CommitInner::Pending(rx) = self.0 {
+        if let CommitInner::Pending(rx) = self.into_inner() {
             let start = std::time::Instant::now();
             let _ = rx.await;
             crate::metrics::record_commit_wait(start.elapsed());
@@ -183,7 +183,7 @@ impl Commit {
     /// power-loss trade-off of that mode). Callers needing the stricter
     /// guarantee must run the journal in `sync` mode.
     pub async fn wait_durable(self) -> bool {
-        match self.0 {
+        match self.into_inner() {
             CommitInner::Ready => true,
             CommitInner::Failed => false,
             CommitInner::Pending(rx) => {
@@ -203,7 +203,7 @@ impl Commit {
     /// relayed by a detached task, so this must be called within a Tokio
     /// runtime.
     pub fn tee(self) -> (Commit, Commit) {
-        match self.0 {
+        match self.into_inner() {
             CommitInner::Ready => (Commit::ready(), Commit::ready()),
             CommitInner::Failed => (Commit::failed(), Commit::failed()),
             CommitInner::Pending(rx) => {
@@ -228,10 +228,48 @@ impl Commit {
     /// `.await`; must NOT be called from within an async runtime. Resolves
     /// immediately if the writer thread is gone (shutdown) rather than hanging.
     pub fn blocking_wait(self) {
-        if let CommitInner::Pending(rx) = self.0 {
+        if let CommitInner::Pending(rx) = self.into_inner() {
             let start = std::time::Instant::now();
             let _ = rx.blocking_recv();
             crate::metrics::record_commit_wait(start.elapsed());
+        }
+    }
+
+    /// Deliberately abandons this durability handle without waiting (#1855).
+    ///
+    /// Dropping a still-`Pending` commit is a **drop bomb** in debug/test
+    /// builds (see the `Drop` impl): a discarded commit followed by a disk
+    /// observation is the #1477 race. Sites that truly do not need the write's
+    /// durability (fire-and-forget paths whose correctness is carried by a later
+    /// barrier, shutdown) must say so explicitly with `detach`, which makes the
+    /// intent auditable (`grep '\.detach()'`).
+    pub fn detach(self) {
+        drop(self.into_inner());
+    }
+
+    /// Moves the inner state out, disarming the drop bomb.
+    fn into_inner(mut self) -> CommitInner {
+        std::mem::replace(&mut self.0, CommitInner::Ready)
+    }
+}
+
+/// Drop bomb (#1855): in debug/test builds, dropping a `Pending` commit without
+/// [`Commit::wait`] / [`Commit::wait_durable`] / [`Commit::blocking_wait`] /
+/// [`Commit::tee`] / [`Commit::detach`] panics, so an unwaited write followed by
+/// a disk read fails deterministically in every crate instead of racing the
+/// background writer. Release builds drop silently (no behaviour change).
+/// Skipped while already unwinding, so it never turns a panic into an abort.
+impl Drop for Commit {
+    fn drop(&mut self) {
+        if cfg!(debug_assertions)
+            && matches!(self.0, CommitInner::Pending(_))
+            && !std::thread::panicking()
+        {
+            panic!(
+                "a pending storage Commit was dropped without being waited \
+                 (wait / wait_durable / blocking_wait) or explicitly detached \
+                 (Commit::detach) — #1477/#1855"
+            );
         }
     }
 }
@@ -3550,6 +3588,19 @@ impl Journal {
         Ok((events, commit))
     }
 
+    /// [`apply_command`](Self::apply_command) followed by
+    /// [`Commit::blocking_wait`]: the command's events are durable when this
+    /// returns. The canonical form for synchronous callers (tests, tooling) that
+    /// do not need to overlap the write with other work — discarding the commit
+    /// instead is the #1477 race, and trips the `Commit` drop bomb (#1855).
+    /// Must NOT be called from within an async runtime (use `apply_command`
+    /// and `.wait().await` there).
+    pub fn apply_synced(&mut self, command: Command) -> Result<Arc<Vec<Event>>, EngineError> {
+        let (events, commit) = self.apply_command(command)?;
+        commit.blocking_wait();
+        Ok(events)
+    }
+
     /// Per-command variable-spill check. Sheds the oldest backlog's variables to
     /// the spill store when the resident spill-candidate set exceeds the mode's
     /// per-command cap (the fixed budget in `Budget` mode, or the emergency
@@ -4422,9 +4473,10 @@ impl Journal {
         };
         match self.engine.apply_command_at(command, now_millis()) {
             Ok(events) => {
-                // The `Commit` is the journal write's durability receipt; the
-                // incident must survive a crash, so keep the must-use explicit.
-                let _commit = self.persist(&Arc::new(events));
+                // The incident's durability is carried by the writer's ordered
+                // group commit (any later barrier covers it); nothing here waits
+                // on it, so abandon the receipt explicitly (#1855).
+                self.persist(&Arc::new(events)).detach();
                 if cold && let Some(cold) = self.cold.as_mut() {
                     cold.index.remove(key);
                 }
@@ -5461,6 +5513,42 @@ impl Drop for Journal {
 
 #[cfg(test)]
 mod tests {
+    // --- #1855: drop bomb on an unwaited pending Commit ---------------------
+
+    #[test]
+    #[should_panic(expected = "pending storage Commit was dropped")]
+    fn dropping_a_pending_commit_panics_in_debug() {
+        let (_tx, rx) = oneshot::channel::<()>();
+        drop(Commit::from_ack(rx));
+    }
+
+    #[test]
+    fn detached_waited_ready_and_failed_commits_drop_silently() {
+        let (_tx, rx) = oneshot::channel::<()>();
+        Commit::from_ack(rx).detach();
+        let (tx, rx) = oneshot::channel::<()>();
+        tx.send(()).expect("send");
+        Commit::from_ack(rx).blocking_wait();
+        drop(Commit::ready());
+        drop(Commit::failed());
+    }
+
+    #[test]
+    fn journal_apply_command_discarded_commit_panics() {
+        // The #1477 shape: `let _ = journal.apply_synced(..)` on a real
+        // file-backed journal must now fail deterministically.
+        let dir = std::env::temp_dir().join(format!("nanobpmn-drop-bomb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut journal = Journal::open(dir.join("test.journal")).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = journal.apply_command(Command::DeployProcess(demo()));
+        }));
+        drop(journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_err(), "discarding a pending commit must panic");
+    }
+
     use nanobpmn_engine_core::ProcessBuilder;
 
     use super::*;
@@ -5650,19 +5738,17 @@ mod tests {
         // Build the durable history of an instance that runs to COMPLETION.
         let mut history: Vec<Event> = Vec::new();
         let mut source = Journal::in_memory();
-        let (d, _) = source
-            .apply_command(Command::DeployProcess(demo()))
-            .unwrap();
+        let d = source.apply_synced(Command::DeployProcess(demo())).unwrap();
         history.extend(d.iter().cloned());
-        let (c, _) = source
-            .apply_command(Command::create_instance("demo"))
+        let c = source
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let key = c.iter().find_map(|e| e.instance_key()).unwrap();
         history.extend(c.iter().cloned());
         let jobs = source.activate_jobs("demo-work", "w", 1, 60_000, 0);
         assert_eq!(jobs.len(), 1);
-        let (done, _) = source
-            .apply_command(Command::complete_job(jobs[0].key))
+        let done = source
+            .apply_synced(Command::complete_job(jobs[0].key))
             .unwrap();
         assert!(done.iter().any(
             |e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)
@@ -5693,11 +5779,11 @@ mod tests {
     fn volatile_expiry_never_mutates_durable_leases() {
         let mut journal = Journal::in_memory();
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         for _ in 0..2 {
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
         }
         let (events, _) = journal
@@ -5746,10 +5832,10 @@ mod tests {
 
         let mut journal = Journal::open(&path).unwrap();
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let activation = journal
             .apply_command_at(
@@ -5766,8 +5852,9 @@ mod tests {
                 ),
                 0,
             )
-            .unwrap()
-            .0;
+            .unwrap();
+        activation.1.blocking_wait();
+        let activation = activation.0;
         let (job_key, token) = activation
             .iter()
             .find_map(|e| match e {
@@ -5812,11 +5899,9 @@ mod tests {
 
         // The in-memory journal has no writer: its barrier is already durable.
         let mut memory = Journal::in_memory();
+        let _ = memory.apply_synced(Command::DeployProcess(demo())).unwrap();
         let _ = memory
-            .apply_command(Command::DeployProcess(demo()))
-            .unwrap();
-        let _ = memory
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let activation = memory
             .apply_command_at(
@@ -5872,7 +5957,7 @@ mod tests {
 
         let mut journal = Journal::open(&path).unwrap();
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let dispatch = Command::DispatchStartInstance {
             process_id: "demo".into(),
@@ -5908,10 +5993,10 @@ mod tests {
             let mut journal = Journal::open(&path).unwrap();
             assert!(journal.is_fresh());
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             events.iter().find_map(|e| e.instance_key()).unwrap()
         };
@@ -5938,10 +6023,10 @@ mod tests {
 
     fn deploy_and_create(journal: &mut Journal) -> Key {
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
-        let (events, _) = journal
-            .apply_command(Command::create_instance("demo"))
+        let events = journal
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         events.iter().find_map(|e| e.instance_key()).unwrap()
     }
@@ -5984,10 +6069,10 @@ mod tests {
             .unwrap();
         let mut journal = cold_journal();
         for p in [leaf, mid, top] {
-            let _ = journal.apply_command(Command::DeployProcess(p)).unwrap();
+            let _ = journal.apply_synced(Command::DeployProcess(p)).unwrap();
         }
         let _ = journal
-            .apply_command(Command::create_instance("cold_top"))
+            .apply_synced(Command::create_instance("cold_top"))
             .unwrap();
         let key_of = |j: &Journal, id: &str| {
             j.engine()
@@ -6036,8 +6121,8 @@ mod tests {
         assert!(journal.instance(key).is_some());
 
         // completing the rehydrated job drives the instance to completion
-        let (events, _) = journal
-            .apply_command(Command::complete_job(jobs[0].key))
+        let events = journal
+            .apply_synced(Command::complete_job(jobs[0].key))
             .unwrap();
         assert!(events
             .iter()
@@ -6168,7 +6253,7 @@ mod tests {
     fn terminating_a_call_activity_rehydrates_and_terminates_its_cold_child() {
         let mut journal = cold_journal();
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let parent = ProcessBuilder::new("caller")
             .start_event("s")
@@ -6179,10 +6264,10 @@ mod tests {
             .build()
             .unwrap();
         let _ = journal
-            .apply_command(Command::DeployProcess(parent))
+            .apply_synced(Command::DeployProcess(parent))
             .unwrap();
-        let (events, _) = journal
-            .apply_command(Command::create_instance("caller"))
+        let events = journal
+            .apply_synced(Command::create_instance("caller"))
             .unwrap();
         let parent_key = events.iter().find_map(|e| e.instance_key()).unwrap();
         let child_key = journal
@@ -6198,8 +6283,8 @@ mod tests {
             "parent and child spilled"
         );
 
-        let (events, _) = journal
-            .apply_command(Command::ModifyInstance {
+        let events = journal
+            .apply_synced(Command::ModifyInstance {
                 instance_key: parent_key,
                 activate_instructions: vec![],
                 terminate_instructions: vec![],
@@ -6232,7 +6317,7 @@ mod tests {
     fn cold_descendant_traversal_indexes_resident_children_once() {
         let mut journal = cold_journal();
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         for (id, called) in [("top", "mid"), ("mid", "leaf"), ("leaf", "demo")] {
             let process = ProcessBuilder::new(id)
@@ -6244,11 +6329,11 @@ mod tests {
                 .build()
                 .unwrap();
             let _ = journal
-                .apply_command(Command::DeployProcess(process))
+                .apply_synced(Command::DeployProcess(process))
                 .unwrap();
         }
-        let (events, _) = journal
-            .apply_command(Command::create_instance("top"))
+        let events = journal
+            .apply_synced(Command::create_instance("top"))
             .unwrap();
         let top_key = events.iter().find_map(|e| e.instance_key()).unwrap();
         let mid_key = journal
@@ -6284,7 +6369,7 @@ mod tests {
         assert!(journal.instance(mid_key).is_some(), "mid stays resident");
 
         let _ = journal
-            .apply_command(Command::ModifyInstance {
+            .apply_synced(Command::ModifyInstance {
                 instance_key: top_key,
                 activate_instructions: vec![],
                 terminate_instructions: vec![],
@@ -6385,8 +6470,8 @@ mod tests {
         // would raise ScopeNotFound)
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("approved".to_string(), Value::Bool(true));
-        let (events, _) = journal
-            .apply_command(Command::set_variables(scope_key, vars))
+        let events = journal
+            .apply_synced(Command::set_variables(scope_key, vars))
             .unwrap();
         assert_eq!(journal.cold_count(), 0);
         assert!(journal.instance(key).is_some());
@@ -6405,9 +6490,7 @@ mod tests {
 
         // CancelInstance targets a cold instance by key: ensure_resident_for_command
         // must page it back in before the engine applies the command
-        let (events, _) = journal
-            .apply_command(Command::cancel_instance(key))
-            .unwrap();
+        let events = journal.apply_synced(Command::cancel_instance(key)).unwrap();
         assert_eq!(journal.cold_count(), 0);
         assert!(events
             .iter()
@@ -6478,8 +6561,8 @@ mod tests {
         // this unit): activate then complete its only job.
         let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 0);
         assert_eq!(jobs.len(), 1);
-        let (events, _) = journal
-            .apply_command(Command::complete_job(jobs[0].key))
+        let events = journal
+            .apply_synced(Command::complete_job(jobs[0].key))
             .unwrap();
         assert!(events.iter().any(|e| matches!(
             e,
@@ -6501,8 +6584,8 @@ mod tests {
 
         // Sanity: a genuinely Active instance IS collected, and the resident
         // Completed one stays excluded alongside it.
-        let (events, _) = journal
-            .apply_command(Command::create_instance("demo"))
+        let events = journal
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let active_key = events.iter().find_map(|e| e.instance_key()).unwrap();
         let mut live2 = std::collections::BTreeSet::new();
@@ -6558,7 +6641,7 @@ mod tests {
             .expect("orphan job activated")
             .key;
         let _ = journal
-            .apply_command(Command::complete_job(orphan_job))
+            .apply_synced(Command::complete_job(orphan_job))
             .unwrap();
         // Crash here: `evict_instances(&[orphan_key])` never runs, so its store
         // forget is lost; `live_key`'s row was dropped by its own rehydration
@@ -6628,7 +6711,7 @@ mod tests {
         // Budget 0: any variable-carrying instance spills immediately.
         journal.set_spill(Arc::clone(&store), 0);
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
 
         let mut vars = std::collections::BTreeMap::new();
@@ -6637,8 +6720,8 @@ mod tests {
         // Two instances, both parked with non-empty variables so both spill.
         let mut keys = Vec::new();
         for _ in 0..2 {
-            let (events, _) = journal
-                .apply_command(Command::create_instance_with("demo", vars.clone()))
+            let events = journal
+                .apply_synced(Command::create_instance_with("demo", vars.clone()))
                 .unwrap();
             keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
         }
@@ -6667,7 +6750,7 @@ mod tests {
         );
         let orphan_job = jobs[0].key;
         let _ = journal
-            .apply_command(Command::complete_job(orphan_job))
+            .apply_synced(Command::complete_job(orphan_job))
             .unwrap();
         // Completing rehydrates the orphan's variables (clearing its spilled
         // flag) but the crash loses the eviction forget: re-write the surviving
@@ -6702,13 +6785,13 @@ mod tests {
         let mut journal = Journal::in_memory();
         journal.set_spill(Arc::clone(&store), 0);
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
 
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
-        let (events, _) = journal
-            .apply_command(Command::create_instance_with("demo", vars))
+        let events = journal
+            .apply_synced(Command::create_instance_with("demo", vars))
             .unwrap();
         let key = events.iter().find_map(|e| e.instance_key()).unwrap();
         journal.force_spill_scan();
@@ -6717,7 +6800,7 @@ mod tests {
 
         // Suspend the parked instance: it stays nonterminal and still spilled.
         let _ = journal
-            .apply_command(Command::suspend_instance(key))
+            .apply_synced(Command::suspend_instance(key))
             .unwrap();
         assert!(matches!(
             journal.instance(key).map(|i| i.state),
@@ -6772,12 +6855,12 @@ mod tests {
             )
             .build()
             .expect("valid listener process");
-        let _ = journal.apply_command(Command::DeployProcess(def)).unwrap();
+        let _ = journal.apply_synced(Command::DeployProcess(def)).unwrap();
 
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
-        let (events, _) = journal
-            .apply_command(Command::create_instance_with("approval", vars))
+        let events = journal
+            .apply_synced(Command::create_instance_with("approval", vars))
             .unwrap();
         let key = events.iter().find_map(|e| e.instance_key()).unwrap();
         journal.force_spill_scan();
@@ -6790,9 +6873,7 @@ mod tests {
         // Cancel: the `canceling` listener defers termination, so the instance
         // parks in Terminating — still nonterminal, still spilled (cancel never
         // rehydrates a spilled payload).
-        let _ = journal
-            .apply_command(Command::cancel_instance(key))
-            .unwrap();
+        let _ = journal.apply_synced(Command::cancel_instance(key)).unwrap();
         assert!(matches!(
             journal.instance(key).map(|i| i.state),
             Some(nanobpmn_engine_core::ProcessInstanceState::Terminating)
@@ -6823,7 +6904,7 @@ mod tests {
         let suspended_key = deploy_and_create(&mut journal);
         let active_key = deploy_and_create(&mut journal);
         let _ = journal
-            .apply_command(Command::suspend_instance(suspended_key))
+            .apply_synced(Command::suspend_instance(suspended_key))
             .unwrap();
         assert!(matches!(
             journal.instance(suspended_key).map(|i| i.state),
@@ -6849,7 +6930,7 @@ mod tests {
         journal.set_spill(Arc::clone(&store), 0);
 
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
@@ -6858,8 +6939,8 @@ mod tests {
         // so maybe_spill sheds both their payloads to the store.
         let mut keys = Vec::new();
         for _ in 0..2 {
-            let (events, _) = journal
-                .apply_command(Command::create_instance_with("demo", vars.clone()))
+            let events = journal
+                .apply_synced(Command::create_instance_with("demo", vars.clone()))
                 .unwrap();
             keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
         }
@@ -6897,15 +6978,15 @@ mod tests {
         journal.set_var_spill_adaptive(Arc::clone(&store), u64::MAX, u64::MAX, u64::MAX, 0, 0);
 
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
 
         let mut keys = Vec::new();
         for _ in 0..3 {
-            let (events, _) = journal
-                .apply_command(Command::create_instance_with("demo", vars.clone()))
+            let events = journal
+                .apply_synced(Command::create_instance_with("demo", vars.clone()))
                 .unwrap();
             keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
         }
@@ -6964,12 +7045,12 @@ mod tests {
         journal.set_spill(Arc::clone(&store), 0);
 
         let _ = journal
-            .apply_command(Command::DeployProcess(nested()))
+            .apply_synced(Command::DeployProcess(nested()))
             .unwrap();
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("seed".to_string(), Value::Int(4));
-        let (events, _) = journal
-            .apply_command(Command::create_instance_with("nested", vars))
+        let events = journal
+            .apply_synced(Command::create_instance_with("nested", vars))
             .unwrap();
         let key = events.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -7039,23 +7120,23 @@ mod tests {
         let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
         journal.set_spill(Arc::clone(&store), 0);
         let _ = journal
-            .apply_command(Command::DeployProcess(def("source", false)))
+            .apply_synced(Command::DeployProcess(def("source", false)))
             .unwrap();
-        let (events, _) = journal
-            .apply_command(Command::DeployProcess(def("target", true)))
+        let events = journal
+            .apply_synced(Command::DeployProcess(def("target", true)))
             .unwrap();
         let target_key = deployed_key(&events);
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("key".to_string(), Value::Str("k1".into()));
-        let (events, _) = journal
-            .apply_command(Command::create_instance_with("source", vars))
+        let events = journal
+            .apply_synced(Command::create_instance_with("source", vars))
             .unwrap();
         let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
         journal.force_spill_scan();
         assert!(journal.engine.is_variables_spilled(inst), "spilled");
 
-        let (events, _) = journal
-            .apply_command(Command::migrate_instance(
+        let events = journal
+            .apply_synced(Command::migrate_instance(
                 inst,
                 target_key,
                 vec![("task".into(), "task".into())],
@@ -7107,12 +7188,12 @@ mod tests {
         journal.set_spill(Arc::clone(&store), 0);
 
         let _ = journal
-            .apply_command(Command::DeployProcess(fork()))
+            .apply_synced(Command::DeployProcess(fork()))
             .unwrap();
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Int(7));
-        let (events, _) = journal
-            .apply_command(Command::create_instance_with("fork", vars))
+        let events = journal
+            .apply_synced(Command::create_instance_with("fork", vars))
             .unwrap();
         let key = events.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -7165,8 +7246,8 @@ mod tests {
         // A self-contained snapshot from a peer (its own resident instance).
         let captured = {
             let mut src = Journal::in_memory();
-            let _ = src.apply_command(Command::DeployProcess(demo())).unwrap();
-            let _ = src.apply_command(Command::create_instance("demo")).unwrap();
+            let _ = src.apply_synced(Command::DeployProcess(demo())).unwrap();
+            let _ = src.apply_synced(Command::create_instance("demo")).unwrap();
             src.engine_snapshot()
         };
 
@@ -7194,14 +7275,14 @@ mod tests {
         journal.set_var_spill_adaptive(Arc::clone(&store), u64::MAX, u64::MAX, u64::MAX, 0, 1);
 
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("payload".to_string()));
 
         for _ in 0..3 {
-            let (_events, _commit) = journal
-                .apply_command(Command::create_instance_with("demo", vars.clone()))
+            let _events = journal
+                .apply_synced(Command::create_instance_with("demo", vars.clone()))
                 .unwrap();
         }
         journal.force_spill_scan();
@@ -7227,20 +7308,20 @@ mod tests {
         // the whole state including terminal instances).
         let (captured, completed_key) = {
             let mut src = Journal::in_memory_partition(0);
-            let _ = src.apply_command(Command::DeployProcess(demo())).unwrap();
+            let _ = src.apply_synced(Command::DeployProcess(demo())).unwrap();
             // Instance #1: drive it to Completed and leave it resident.
-            let (ev, _) = src.apply_command(Command::create_instance("demo")).unwrap();
+            let ev = src.apply_synced(Command::create_instance("demo")).unwrap();
             let done_key = ev.iter().find_map(|e| e.instance_key()).unwrap();
             let jobs = src.activate_jobs("demo-work", "w", 1, 1_000, 0);
             let _ = src
-                .apply_command(Command::complete_job(jobs[0].key))
+                .apply_synced(Command::complete_job(jobs[0].key))
                 .unwrap();
             assert!(matches!(
                 src.instance(done_key).map(|i| i.state),
                 Some(nanobpmn_engine_core::ProcessInstanceState::Completed)
             ));
             // Instance #2: parked on its job, still Active.
-            let _ = src.apply_command(Command::create_instance("demo")).unwrap();
+            let _ = src.apply_synced(Command::create_instance("demo")).unwrap();
             (src.engine_snapshot(), done_key)
         };
 
@@ -7268,8 +7349,8 @@ mod tests {
 
         // The exporter is still wired: a subsequent command's events flow to the
         // read-model channel.
-        let (events, _) = journal
-            .apply_command(Command::create_instance("demo"))
+        let events = journal
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let key = events.iter().find_map(|e| e.instance_key()).unwrap();
         let batch = rx
@@ -7304,10 +7385,10 @@ mod tests {
             let (mut journal, recovery) = Journal::open_segmented(&dir).expect("open segmented");
             let shared = std::sync::Arc::clone(&recovery.shared);
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key = events.iter().find_map(|e| e.instance_key()).unwrap();
             // The original report's stamp, then the retry's fresh stamp.
@@ -7316,14 +7397,14 @@ mod tests {
                 .orphan_incident_stamp(key, OrphanKind::Resident)
                 .expect("stamp the original report");
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let fresh = journal
                 .engine()
                 .orphan_incident_stamp(key, OrphanKind::Resident)
                 .expect("re-stamp the retry");
-            let (events, _) = journal
-                .apply_command(Command::QuarantineOffheapOrphan {
+            let events = journal
+                .apply_synced(Command::QuarantineOffheapOrphan {
                     instance_key: key,
                     stamp: Some(fresh),
                 })
@@ -7336,7 +7417,7 @@ mod tests {
                 })
                 .expect("the retry quarantines");
             let _ = journal
-                .apply_command(Command::ResolveIncident { incident_key })
+                .apply_synced(Command::ResolveIncident { incident_key })
                 .unwrap();
             // Snapshot+rotate, persist the snapshot (stripped to its pre-#1608
             // shape, as a pre-upgrade leader would have written it), then
@@ -7352,8 +7433,8 @@ mod tests {
                 "prefix archived cold"
             );
             // The delayed duplicate lands in the surviving tail.
-            let (events, _) = journal
-                .apply_command(Command::QuarantineOffheapOrphan {
+            let events = journal
+                .apply_synced(Command::QuarantineOffheapOrphan {
                     instance_key: key,
                     stamp: Some(stale),
                 })
@@ -7413,10 +7494,10 @@ mod tests {
         let key = {
             let (mut journal, _recovery) = Journal::open_segmented(&dir).expect("open segmented");
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key = events.iter().find_map(|e| e.instance_key()).unwrap();
             let stale = journal
@@ -7424,10 +7505,10 @@ mod tests {
                 .orphan_incident_stamp(key, OrphanKind::Resident)
                 .expect("stamp the original report");
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::QuarantineOffheapOrphan {
+            let events = journal
+                .apply_synced(Command::QuarantineOffheapOrphan {
                     instance_key: key,
                     stamp: Some(stale),
                 })
@@ -7492,18 +7573,18 @@ mod tests {
         let key = {
             let (mut journal, _recovery) = Journal::open_segmented(&dir).expect("open segmented");
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key = events.iter().find_map(|e| e.instance_key()).unwrap();
             let fresh = journal
                 .engine()
                 .orphan_incident_stamp(key, OrphanKind::Resident)
                 .expect("stamp the report");
-            let (events, _) = journal
-                .apply_command(Command::QuarantineOffheapOrphan {
+            let events = journal
+                .apply_synced(Command::QuarantineOffheapOrphan {
                     instance_key: key,
                     stamp: Some(fresh),
                 })
@@ -7516,7 +7597,7 @@ mod tests {
                 })
                 .expect("quarantines");
             let _ = journal
-                .apply_command(Command::ResolveIncident { incident_key })
+                .apply_synced(Command::ResolveIncident { incident_key })
                 .unwrap();
             key
         };
@@ -7570,18 +7651,18 @@ mod tests {
         let key = {
             let (mut journal, _recovery) = Journal::open_segmented(&dir).expect("open segmented");
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key = events.iter().find_map(|e| e.instance_key()).unwrap();
             let fresh = journal
                 .engine()
                 .orphan_incident_stamp(key, OrphanKind::Resident)
                 .expect("stamp the report");
-            let (events, _) = journal
-                .apply_command(Command::QuarantineOffheapOrphan {
+            let events = journal
+                .apply_synced(Command::QuarantineOffheapOrphan {
                     instance_key: key,
                     stamp: Some(fresh),
                 })
@@ -7594,7 +7675,7 @@ mod tests {
                 })
                 .expect("quarantines");
             let _ = journal
-                .apply_command(Command::ResolveIncident { incident_key })
+                .apply_synced(Command::ResolveIncident { incident_key })
                 .unwrap();
             key
         };
@@ -7632,7 +7713,7 @@ mod tests {
         // events are still on disk in the sealed segments.
         receiver.set_divergence_recovery(false);
         let _ = receiver
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
 
         // A LATER ordinary adoption of a pre-#1608 snapshot must still not
@@ -7691,14 +7772,14 @@ mod tests {
         let store = Arc::new(crate::varspill::VarSpillStore::open(Some(path)).unwrap());
         journal.set_spill(store, 0);
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let mut keys = Vec::new();
         for i in 0..n {
             let mut vars = std::collections::BTreeMap::new();
             vars.insert("data".to_string(), Value::Str(format!("payload-{i}")));
-            let (events, _) = journal
-                .apply_command(Command::create_instance_with("demo", vars))
+            let events = journal
+                .apply_synced(Command::create_instance_with("demo", vars))
                 .unwrap();
             keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
         }
@@ -7727,7 +7808,7 @@ mod tests {
         let store = Arc::new(crate::varspill::VarSpillStore::open(Some(spill_path)).unwrap());
         journal.set_spill(store, 0);
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let mut keys = Vec::new();
         for i in 0..n {
@@ -7877,7 +7958,7 @@ mod tests {
         // Two batches of two instances; `between` runs after the first batch.
         fn drive(journal: &mut Journal, between: fn(&mut Journal)) -> Vec<Key> {
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let mut keys = Vec::new();
             for i in 0..4 {
@@ -7887,8 +7968,8 @@ mod tests {
                 let mut vars = std::collections::BTreeMap::new();
                 vars.insert("data".to_string(), Value::Str(format!("p{i}")));
                 vars.insert("n".to_string(), Value::Int(i));
-                let (events, _) = journal
-                    .apply_command(Command::create_instance_with("demo", vars))
+                let events = journal
+                    .apply_synced(Command::create_instance_with("demo", vars))
                     .unwrap();
                 keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
             }
@@ -7967,7 +8048,7 @@ mod tests {
 
         fn drive(journal: &mut Journal, between: fn(&mut Journal)) -> Vec<Key> {
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let mut keys = Vec::new();
             for i in 0..4 {
@@ -7977,8 +8058,8 @@ mod tests {
                 let mut vars = std::collections::BTreeMap::new();
                 vars.insert("data".to_string(), Value::Str(format!("p{i}")));
                 vars.insert("n".to_string(), Value::Int(i));
-                let (events, _) = journal
-                    .apply_command(Command::create_instance_with("demo", vars))
+                let events = journal
+                    .apply_synced(Command::create_instance_with("demo", vars))
                     .unwrap();
                 keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
             }
@@ -8110,7 +8191,7 @@ mod tests {
             let mut j0 = Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
             j0.set_exporter(export_tx.clone(), Arc::new(AtomicU64::new(0)));
             j0.set_varstore(Arc::clone(&varstore));
-            let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let _ = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             let mut init = BTreeMap::new();
             init.insert("counter".to_string(), Value::Int(1));
             let (events, commit) = j0
@@ -8180,12 +8261,12 @@ mod tests {
         journal.set_cold_spill(cold_store, 1, 0);
 
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("cold-payload".to_string()));
-        let (events, _) = journal
-            .apply_command(Command::create_instance_with("demo", vars))
+        let events = journal
+            .apply_synced(Command::create_instance_with("demo", vars))
             .unwrap();
         let key = events.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -8540,7 +8621,7 @@ mod tests {
         // Intervening key-minting work commits BEFORE the stamped proposal,
         // advancing the shared allocator past the stamped episode.
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
 
         // The stamped proposal now applies SUPERSEDED.
@@ -8615,7 +8696,7 @@ mod tests {
             .orphan_incident_stamp(keys[0], OrphanKind::Resident)
             .expect("a live orphan stamps");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (events, commit) = journal
             .apply_command_at(
@@ -8681,7 +8762,7 @@ mod tests {
             .orphan_incident_stamp(keys[0], OrphanKind::Resident)
             .expect("a live orphan stamps");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (events, commit) = journal
             .apply_command_at(
@@ -8778,7 +8859,7 @@ mod tests {
             .orphan_incident_stamp(keys[0], OrphanKind::Resident)
             .expect("a live orphan stamps");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (events, commit) = journal
             .apply_command_at(
@@ -8841,7 +8922,7 @@ mod tests {
             .orphan_incident_stamp(keys[0], OrphanKind::Resident)
             .expect("a live orphan stamps");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (_events, commit) = journal
             .apply_command_at(
@@ -8906,7 +8987,7 @@ mod tests {
             .orphan_incident_stamp(keys[0], OrphanKind::Resident)
             .expect("a live orphan stamps");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (_events, commit) = journal
             .apply_command_at(
@@ -8966,7 +9047,7 @@ mod tests {
             .orphan_incident_stamp(keys[0], OrphanKind::Resident)
             .expect("a live orphan stamps");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (events, commit) = journal
             .apply_command_at(
@@ -9025,7 +9106,7 @@ mod tests {
             .orphan_incident_stamp(keys[0], OrphanKind::Resident)
             .expect("a live orphan stamps");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (events, commit) = journal
             .apply_command_at(
@@ -9101,7 +9182,7 @@ mod tests {
             .orphan_incident_stamp(keys[0], OrphanKind::Resident)
             .expect("a live orphan stamps");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (events, commit) = journal
             .apply_command_at(
@@ -9177,7 +9258,7 @@ mod tests {
             .orphan_incident_stamp(keys[0], OrphanKind::Resident)
             .expect("a live orphan stamps");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (events, commit) = journal
             .apply_command_at(
@@ -9362,13 +9443,13 @@ mod tests {
         let mut cold = Journal::in_memory();
         let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&cold_path)).unwrap());
         cold.set_cold_spill(store, 1, 0);
-        let _ = cold.apply_command(Command::DeployProcess(demo())).unwrap();
+        let _ = cold.apply_synced(Command::DeployProcess(demo())).unwrap();
         let vars = std::collections::BTreeMap::from([(
             "data".to_string(),
             nanobpmn_engine_core::Value::Str("payload-0".into()),
         )]);
-        let (events, _) = cold
-            .apply_command(Command::create_instance_with("demo", vars))
+        let events = cold
+            .apply_synced(Command::create_instance_with("demo", vars))
             .unwrap();
         let cold_key = events.iter().find_map(|e| e.instance_key()).unwrap();
         assert_eq!(keys[0], cold_key, "same deterministic key on both replicas");
@@ -9501,9 +9582,7 @@ mod tests {
         journal.orphans.inbox.record(key, OrphanKind::Cold);
         // Before the drain, a command rehydrates the instance out of the cold
         // tier: the index entry AND the row are consumed.
-        let _ = journal
-            .apply_command(Command::cancel_instance(key))
-            .unwrap();
+        let _ = journal.apply_synced(Command::cancel_instance(key)).unwrap();
         assert_eq!(journal.cold_count(), 0, "rehydrated out of the cold tier");
         assert!(
             journal.instance(key).is_some() || journal.state().instances.contains_key(&key),
@@ -9629,7 +9708,7 @@ mod tests {
             let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap());
             journal.set_cold_spill(store, 1, 0);
             let _ = journal
-                .apply_command(Command::DeployProcess(model()))
+                .apply_synced(Command::DeployProcess(model()))
                 .unwrap();
             let mut keys = Vec::new();
             for _ in 0..n {
@@ -9658,7 +9737,7 @@ mod tests {
         corrupt_row(&paths[1], "cold", "snapshot", keys[0]);
         let cmd = Command::activate_jobs("demo-work", "w", 1, 60_000, 0);
 
-        let (events, _) = healthy.apply_command(cmd.clone()).unwrap();
+        let events = healthy.apply_synced(cmd.clone()).unwrap();
         assert!(
             !events.is_empty(),
             "healthy replica activates the oldest job"
@@ -9690,7 +9769,7 @@ mod tests {
         corrupt_row(&paths[1], "cold", "snapshot", keys[1]);
         let cmd = Command::activate_jobs("demo-work", "w", 1, 60_000, 0);
 
-        let (events, _) = healthy.apply_command(cmd.clone()).unwrap();
+        let events = healthy.apply_synced(cmd.clone()).unwrap();
         assert!(!events.is_empty(), "healthy replica activates a job");
         assert_eq!(
             impaired.apply_command(cmd).err(),
@@ -9727,7 +9806,7 @@ mod tests {
         corrupt_row(&paths[1], "cold", "snapshot", keys[0]);
         let cmd = Command::TriggerTimers { now: 1_000 };
 
-        let (events, _) = healthy.apply_command(cmd.clone()).unwrap();
+        let events = healthy.apply_synced(cmd.clone()).unwrap();
         assert!(!events.is_empty(), "healthy replica fires the due timer");
         assert_eq!(
             impaired.apply_command(cmd).err(),
@@ -9754,7 +9833,7 @@ mod tests {
         let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
         journal.set_cold_spill(store, 1, 0);
         let _ = journal
-            .apply_command(Command::DeployProcess(timed_demo()))
+            .apply_synced(Command::DeployProcess(timed_demo()))
             .unwrap();
         let (events, _) = journal
             .apply_command_at(Command::create_instance("timed"), 0)
@@ -9823,7 +9902,7 @@ mod tests {
         let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
         store.forget(&[key]).unwrap();
 
-        let _ = journal.apply_command(Command::cancel_instance(key));
+        let _ = journal.apply_synced(Command::cancel_instance(key));
         assert_eq!(journal.cold_count(), 0);
         assert_eq!(journal.quarantined_orphans(), vec![key]);
         drop(journal);
@@ -10326,7 +10405,7 @@ mod tests {
             nanobpmn_engine_core::Value::Str("surviving".to_string()),
         );
         let _ = orphan_journal
-            .apply_command(Command::set_variables(key, vars))
+            .apply_synced(Command::set_variables(key, vars))
             .unwrap();
         orphan_journal.force_spill_scan();
         assert!(
@@ -10938,8 +11017,8 @@ mod tests {
             .expect("valid process");
 
         let mut source = Journal::in_memory();
-        let (process_events, _) = source
-            .apply_command(Command::DeployProcess(def))
+        let process_events = source
+            .apply_synced(Command::DeployProcess(def))
             .expect("process deploys");
         let process_definition_key = process_events
             .iter()
@@ -10970,8 +11049,8 @@ mod tests {
         let mut peer = Journal::in_memory();
         peer.install_deployment_durable(&process_events)
             .blocking_wait();
-        let (created, _) = peer
-            .apply_command(Command::create_instance("staged"))
+        let created = peer
+            .apply_synced(Command::create_instance("staged"))
             .expect("instance creates");
         assert!(
             created
@@ -10997,8 +11076,8 @@ mod tests {
                 _ => None,
             })
             .expect("an incident key");
-        let (resolved, _) = peer
-            .apply_command(Command::ResolveIncident { incident_key })
+        let resolved = peer
+            .apply_synced(Command::ResolveIncident { incident_key })
             .expect("the incident resolves");
         let created_task = resolved
             .iter()
