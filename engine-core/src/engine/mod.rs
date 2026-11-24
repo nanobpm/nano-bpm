@@ -6762,7 +6762,10 @@ impl Engine {
             let vars = self.start_event_variables();
             match self.resolve_cycle_rearm(&vars, def.as_ref(), due_at, interval_millis) {
                 Ok(next) => Some(next),
-                Err(_) if interval_millis > 0 => Some(due_at.saturating_add(interval_millis)),
+                // Collapse missed fires exactly as the evaluated path does.
+                Err(_) if interval_millis > 0 => {
+                    Some(due_at.saturating_add(interval_millis).max(self.now))
+                }
                 Err(_) => None,
             }
         } else {

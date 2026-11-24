@@ -171,6 +171,7 @@ pub fn params(name: &str) -> Option<&'static [&'static str]> {
         "get or else" => &["value", "default"],
         "round up" | "round down" | "round half up" | "round half down" => &["n", "scale"],
         "fromAi" => &["value", "description", "type", "schema", "options"],
+        "cycle" => &["repetitions", "interval"],
         _ => return None,
     })
 }
@@ -1687,5 +1688,14 @@ mod cycle_tests {
         );
         assert_eq!(eval(r#"cycle(2.9, duration("PT1M"))"#, &[]), s("R2/PT1M"));
         assert_eq!(eval(r#"cycle("PT1H")"#, &[]), Value::Null);
+        // Named-argument forms (an omitted count is unbounded).
+        assert_eq!(
+            eval(r#"cycle(interval: duration("PT1H"))"#, &[]),
+            s("R/PT1H")
+        );
+        assert_eq!(
+            eval(r#"cycle(repetitions: 3, interval: duration("PT1H"))"#, &[]),
+            s("R3/PT1H")
+        );
     }
 }

@@ -435,3 +435,50 @@ fn overdue_interval_cycle_reschedules_from_now() {
     engine.trigger_timers(1_000_000);
     assert_eq!(armed(&engine), vec![1_005_000]);
 }
+
+#[test]
+fn builder_cycle_without_timer_def_collapses_missed_fires() {
+    // A ProcessBuilder cycle carries no TimerDef; its static-period fallback
+    // must clamp to now exactly like a declared interval cycle.
+    let def = ProcessBuilder::new("built")
+        .timer_start_event_cycle("start", 5_000)
+        .end_event("end")
+        .connect("start", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    deploy_at(&mut engine, def, 0);
+    assert_eq!(start_due(&engine), Some(5_000));
+    engine.trigger_timers(1_000_000);
+    assert_eq!(start_due(&engine), Some(1_000_000));
+    engine.trigger_timers(1_000_000);
+    assert_eq!(start_due(&engine), Some(1_005_000));
+}
+
+#[test]
+fn invalid_start_expression_fallback_collapses_missed_fires() {
+    // The cluster variable backing the cycle is removed after deploy: the
+    // fixed-period fallback keeps the schedule but never re-arms before now.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::CreateClusterVariable {
+            tenant_id: None,
+            name: "tickCycle".to_string(),
+            value: Value::Str("R/PT5S".to_string()),
+            kind: ClusterVariableKind::Json,
+            metadata: BTreeMap::new(),
+            distributed: false,
+        })
+        .unwrap();
+    deploy_at(&mut engine, start_process("p", "=tickCycle"), 0);
+    assert_eq!(start_due(&engine), Some(5_000));
+    engine
+        .apply_command(Command::DeleteClusterVariable {
+            tenant_id: None,
+            name: "tickCycle".to_string(),
+            distributed: false,
+        })
+        .unwrap();
+    engine.trigger_timers(1_000_000);
+    assert_eq!(start_due(&engine), Some(1_000_000));
+}

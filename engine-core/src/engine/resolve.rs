@@ -1203,7 +1203,7 @@ impl Engine {
     /// an interval cycle re-arms at `previous_due_at + interval` (never before
     /// now) and a cron cycle at its next match after `max(previous_due_at,
     /// now)` — see [`crate::engine::timer_cycle`]. Without a declared definition the
-    /// static `fallback_millis` period is used.
+    /// static `fallback_millis` period is used (also never before now).
     pub(crate) fn resolve_cycle_rearm(
         &self,
         vars: &BTreeMap<String, Value>,
@@ -1224,7 +1224,10 @@ impl Engine {
             Some(def) => Ok(self
                 .resolve_timer(vars, Some(def), previous_due_at, fallback_millis)?
                 .due_at),
-            None => Ok(previous_due_at.saturating_add(fallback_millis)),
+            // Same missed-fire collapse as a declared interval cycle.
+            None => Ok(previous_due_at
+                .saturating_add(fallback_millis)
+                .max(self.now)),
         }
     }
 

@@ -151,9 +151,58 @@ fn parse_start(raw: &str) -> Option<u64> {
     if body.contains('@') {
         return None;
     }
+    if !valid_start_syntax(body) {
+        return None;
+    }
     let dt = DateTime::parse(body)?;
     dt.time.offset_seconds?;
-    u64::try_from(dt.epoch_nanos() / 1_000_000).ok()
+    // A start before the epoch is simply overdue: fire immediately.
+    u64::try_from((dt.epoch_nanos() / 1_000_000).max(0)).ok()
+}
+
+/// Strict `ZonedDateTime` clock/offset validation for a cycle start
+/// (`…Thh:mm[:ss[.f+]](Z|±hh:mm[:ss])`): FEEL's lenient date-time parser
+/// would otherwise normalise `24:30`, `:60` or an offset `+99:99`.
+fn valid_start_syntax(body: &str) -> bool {
+    let Some((_, rest)) = body.split_once('T') else {
+        return false;
+    };
+    let (clock, offset) = match rest.find(['Z', '+', '-']) {
+        Some(i) => rest.split_at(i),
+        None => return false,
+    };
+    let two = |s: &str, max: u32| {
+        s.len() == 2
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && s.parse::<u32>().is_ok_and(|v| v <= max)
+    };
+    let (hms, frac) = match clock.split_once('.') {
+        Some((h, f)) => (h, Some(f)),
+        None => (clock, None),
+    };
+    if frac.is_some_and(|f| f.is_empty() || f.len() > 9 || !f.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    let parts: Vec<&str> = hms.split(':').collect();
+    let clock_ok = match parts.as_slice() {
+        [h, m] => frac.is_none() && two(h, 23) && two(m, 59),
+        [h, m, s] => two(h, 23) && two(m, 59) && two(s, 59),
+        _ => false,
+    };
+    if !clock_ok {
+        return false;
+    }
+    if offset == "Z" {
+        return true;
+    }
+    let parts: Vec<&str> = offset[1..].split(':').collect();
+    match parts.as_slice() {
+        [h, m] => two(h, 18) && two(m, 59) && !(h == &"18" && m != &"00"),
+        [h, m, s] => {
+            two(h, 18) && two(m, 59) && two(s, 59) && (h != &"18" || (m == &"00" && s == &"00"))
+        }
+        _ => false,
+    }
 }
 
 /// A Spring-style (cron-utils `SPRING53`) six-field cron expression.
@@ -214,7 +263,7 @@ impl Cron {
             seconds: parse_set(sec, 0, 59, &[])?,
             minutes: parse_set(min, 0, 59, &[])?,
             hours: u32::try_from(parse_set(hour, 0, 23, &[])?).ok()?,
-            months: u16::try_from(parse_set(month, 1, 12, &MONTH_NAMES)? >> 1).ok()?,
+            months: u16::try_from(parse_calendar_set(month, 1, 12, &MONTH_NAMES)? >> 1).ok()?,
             dom: parse_dom(dom)?,
             dow: parse_dow(dow)?,
         })
@@ -328,6 +377,17 @@ fn parse_value(token: &str, min: u32, max: u32, names: &[&str], name_base: u32) 
 
 /// Parses a list of `*` / `n` / `a-b` / `x/step` items into a bitmask.
 fn parse_set(field: &str, min: u32, max: u32, names: &[&str]) -> Option<u64> {
+    parse_set_with(field, min, max, names, false)
+}
+
+/// Like [`parse_set`] for a calendar field (day-of-month, month, weekday),
+/// where cron-utils `SPRING53` leaves ranges non-strict: a descending range
+/// `a-b` wraps (`FRI-MON`, `NOV-FEB`), stepping across the wrap.
+fn parse_calendar_set(field: &str, min: u32, max: u32, names: &[&str]) -> Option<u64> {
+    parse_set_with(field, min, max, names, true)
+}
+
+fn parse_set_with(field: &str, min: u32, max: u32, names: &[&str], wrap: bool) -> Option<u64> {
     // Month names are 1-based (JAN = 1); weekday names 0-based (SUN = 0).
     let name_base = if names.len() == 12 { 1 } else { 0 };
     let mut mask = 0u64;
@@ -343,7 +403,7 @@ fn parse_set(field: &str, min: u32, max: u32, names: &[&str]) -> Option<u64> {
                 parse_value(a, min, max, names, name_base)?,
                 parse_value(b, min, max, names, name_base)?,
             );
-            if a > b {
+            if a > b && !wrap {
                 return None;
             }
             (a, b)
@@ -352,14 +412,23 @@ fn parse_set(field: &str, min: u32, max: u32, names: &[&str]) -> Option<u64> {
             // `n/step` runs from n to the field maximum.
             (v, if step.is_some() { max } else { v })
         };
-        let step = step.unwrap_or(1);
-        let mut v = lo;
-        while v <= hi {
+        let step = u64::from(step.unwrap_or(1));
+        if lo > hi {
+            // Wrapped range: walk lo..=max then min..=hi as one sequence.
+            let span = u64::from(max - min + 1);
+            let len = u64::from(max - lo + 1) + u64::from(hi - min + 1);
+            let mut i = 0u64;
+            while i < len {
+                let v = (u64::from(lo - min) + i) % span + u64::from(min);
+                mask |= 1 << v;
+                i = i.saturating_add(step);
+            }
+            continue;
+        }
+        let mut v = u64::from(lo);
+        while v <= u64::from(hi) {
             mask |= 1 << v;
-            v = match v.checked_add(step) {
-                Some(n) => n,
-                None => break,
-            };
+            v = v.saturating_add(step);
         }
     }
     Some(mask)
@@ -383,7 +452,7 @@ fn parse_dom(field: &str) -> Option<DayOfMonth> {
         } else if let Some(n) = item.strip_suffix('W') {
             dom.nearest_weekday.push(parse_value(n, 1, 31, &[], 0)?);
         } else {
-            dom.days |= u32::try_from(parse_set(item, 1, 31, &[])?).ok()?;
+            dom.days |= u32::try_from(parse_calendar_set(item, 1, 31, &[])?).ok()?;
         }
     }
     Some(dom)
@@ -400,7 +469,7 @@ fn parse_dow(field: &str) -> Option<DayOfWeek> {
         } else if let Some(day) = item.strip_suffix('L').filter(|d| !d.is_empty()) {
             dow.last_of_month |= 1 << iso(parse_value(day, 0, 7, &DAY_NAMES, 0)?);
         } else {
-            let spring = parse_set(item, 0, 7, &DAY_NAMES)?;
+            let spring = parse_calendar_set(item, 0, 7, &DAY_NAMES)?;
             for d in 0..=7u32 {
                 if spring & (1 << d) != 0 {
                     dow.days |= 1 << iso(d);
@@ -449,6 +518,88 @@ mod tests {
         ] {
             assert_eq!(Cron::parse(bad), None, "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn calendar_ranges_wrap_but_clock_ranges_stay_strict() {
+        // FRI-MON wraps through the weekend (2026-01-02 is a Friday).
+        let c = cron("0 0 9 * * FRI-MON");
+        let mut t = at(2026, 1, 1, 10, 0, 0);
+        let mut days = vec![];
+        for _ in 0..5 {
+            t = c.next_after(t).unwrap();
+            days.push(t);
+        }
+        assert_eq!(
+            days,
+            vec![
+                at(2026, 1, 2, 9, 0, 0),
+                at(2026, 1, 3, 9, 0, 0),
+                at(2026, 1, 4, 9, 0, 0),
+                at(2026, 1, 5, 9, 0, 0),
+                at(2026, 1, 9, 9, 0, 0),
+            ]
+        );
+        // NOV-FEB wraps the year; stepped wrap NOV-FEB/2 = NOV, JAN.
+        let c = cron("0 0 9 1 NOV-FEB ?");
+        assert_eq!(
+            c.next_after(at(2026, 2, 2, 0, 0, 0)),
+            Some(at(2026, 11, 1, 9, 0, 0))
+        );
+        assert_eq!(
+            c.next_after(at(2026, 12, 2, 0, 0, 0)),
+            Some(at(2027, 1, 1, 9, 0, 0))
+        );
+        let c = cron("0 0 9 1 NOV-FEB/2 ?");
+        assert_eq!(
+            c.next_after(at(2026, 11, 2, 0, 0, 0)),
+            Some(at(2027, 1, 1, 9, 0, 0))
+        );
+        assert_eq!(
+            c.next_after(at(2027, 1, 2, 0, 0, 0)),
+            Some(at(2027, 11, 1, 9, 0, 0))
+        );
+        // Day-of-month 30-2 wraps too.
+        let c = cron("0 0 0 30-2 * ?");
+        assert_eq!(
+            c.next_after(at(2026, 1, 3, 0, 0, 0)),
+            Some(at(2026, 1, 30, 0, 0, 0))
+        );
+        assert_eq!(
+            c.next_after(at(2026, 1, 31, 0, 0, 0)),
+            Some(at(2026, 2, 1, 0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn cycle_start_rejects_malformed_clock_and_offset() {
+        for bad in [
+            "R/2026-01-01T24:30:00Z/PT1H",
+            "R/2026-01-01T23:60:00Z/PT1H",
+            "R/2026-01-01T23:30:60Z/PT1H",
+            "R/2026-01-01T23:30:00+99:99/PT1H",
+            "R/2026-01-01T23:30:00+19:00/PT1H",
+            "R/2026-01-01T23:30:00+01:60/PT1H",
+            "R/2026-01-01T23:30:00+1:00/PT1H",
+            "R/2026-01-01T23:30:00./PT1H",
+            "R/2026-01-01T2:30:00Z/PT1H",
+        ] {
+            assert_eq!(TimerCycle::parse(bad), None, "{bad:?} must be rejected");
+        }
+        for good in [
+            "R/2026-01-01T23:30Z/PT1H",
+            "R/2026-01-01T23:30:59.123Z/PT1H",
+            "R/2026-01-01T23:30:00+18:00/PT1H",
+            "R/2026-01-01T23:30:00-05:30[America/New_York]/PT1H",
+        ] {
+            assert!(TimerCycle::parse(good).is_some(), "{good:?} must parse");
+        }
+    }
+
+    #[test]
+    fn pre_epoch_cycle_start_is_overdue_not_rejected() {
+        let c = TimerCycle::parse("R/1969-12-31T23:00:00Z/PT1H").expect("pre-epoch start parses");
+        assert_eq!(c.next_due(0, 7), 3_600_000);
     }
 
     #[test]
