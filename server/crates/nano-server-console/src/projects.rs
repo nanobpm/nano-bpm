@@ -3551,6 +3551,9 @@ pub(crate) struct DataGatewayLimiter {
     /// Resident `urban data --serve` workers, bounded by this limiter's
     /// budget (#1836).
     workers: urban_data_worker::WorkerRegistry,
+    /// Killed serve workers whose teardown (Windows `taskkill`, reap) has not
+    /// finished yet: still live processes, so they count against the budget.
+    reaping: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DataGatewayLimiter {
@@ -3582,46 +3585,72 @@ impl DataGatewayLimiter {
             queue,
             timeout: timeout.max(std::time::Duration::from_millis(1)),
             workers: urban_data_worker::WorkerRegistry::default(),
+            reaping: std::sync::Arc::default(),
         }
     }
 
     /// Take a gateway slot, waiting in the bounded queue if all are busy.
     async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, DataError> {
-        if let Ok(p) = self.permits.try_acquire() {
-            return Ok(p);
-        }
-        // Reserve a queue place atomically; refuse when the queue is full.
+        self.acquire_with(None).await
+    }
+
+    /// Reserve one place in the console-wide wait queue (#1329), or refuse
+    /// with [`DataError::Busy`] when it is full. The place is released when the
+    /// ticket drops, so a cancelled wait never leaks it.
+    pub(super) fn reserve_queue(&self) -> Result<QueueTicket<'_>, DataError> {
         let mut w = self.waiting.load(Ordering::Acquire);
-        let reserved = loop {
+        loop {
             if w >= self.queue {
-                break false;
+                return Err(self.busy());
             }
             match self
                 .waiting
                 .compare_exchange_weak(w, w + 1, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => break true,
+                Ok(_) => return Ok(QueueTicket(&self.waiting)),
                 Err(cur) => w = cur,
             }
+        }
+    }
+
+    /// The canonical back-pressure error: always carries
+    /// [`DATA_GATEWAY_BUSY_PREFIX`] so the REST layer answers `503` +
+    /// `Retry-After` (#1837).
+    pub(super) fn busy(&self) -> DataError {
+        DataError::Busy(format!(
+            "{DATA_GATEWAY_BUSY_PREFIX} {} ops running and {} queued; retry shortly",
+            self.concurrency, self.queue
+        ))
+    }
+
+    /// Like [`Self::acquire`], reusing an already-held queue place (`ticket`)
+    /// so an op that queued earlier (e.g. for its project's worker) is counted
+    /// once against the console-wide queue bound, not twice.
+    pub(super) async fn acquire_with(
+        &self,
+        ticket: Option<QueueTicket<'_>>,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, DataError> {
+        if let Ok(p) = self.permits.try_acquire() {
+            return Ok(p);
+        }
+        let _ticket = match ticket {
+            Some(t) => t,
+            None => self.reserve_queue()?,
         };
-        if !reserved {
-            return Err(DataError::Busy(format!(
-                "{DATA_GATEWAY_BUSY_PREFIX} {} ops running and {} queued; retry shortly",
-                self.concurrency, self.queue
-            )));
-        }
-        // Release the queue place even if this future is dropped mid-wait.
-        struct Leave<'a>(&'a std::sync::atomic::AtomicUsize);
-        impl Drop for Leave<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        let _leave = Leave(&self.waiting);
         self.permits
             .acquire()
             .await
             .map_err(|e| DataError::Gateway(format!("data gateway limiter closed: {e}")))
+    }
+}
+
+/// One reserved place in a [`DataGatewayLimiter`]'s wait queue; released on
+/// drop (including when the waiting future is cancelled).
+pub(super) struct QueueTicket<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for QueueTicket<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -4039,7 +4068,7 @@ async fn pipe_data_gateway_limited(
 ) -> Result<serde_json::Value, DataError> {
     let _permit = limiter.acquire().await?;
     // Idle resident serve workers count against the same live-process budget.
-    urban_data_worker::enforce_resident_budget(limiter, None);
+    urban_data_worker::enforce_resident_budget(limiter);
 
     cmd.env("NO_COLOR", "1")
         .stdin(std::process::Stdio::piped())

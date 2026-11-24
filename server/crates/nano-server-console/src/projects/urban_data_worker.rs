@@ -68,9 +68,23 @@ struct Worker {
 
 #[derive(Default)]
 struct SlotInner {
-    /// Ops waiting for (or holding) this project's worker.
+    /// Ops waiting for (or holding) this project's turn.
     waiters: AtomicUsize,
-    worker: tokio::sync::Mutex<Option<Worker>>,
+    /// Serialises ops for one project (one request in flight per worker).
+    /// Holds no process: waiting on it pins nothing.
+    turn: tokio::sync::Mutex<()>,
+    /// The project's worker while it is **idle** (between ops). An op takes
+    /// it out once admitted (it is then counted by the op's permit) and puts
+    /// it back when done. Eviction reads this directly, so an idle worker is
+    /// always evictable — even while an op holds the turn and waits for a
+    /// permit (#1836: a locked-but-unadmitted worker must still count).
+    idle: Mutex<Option<Worker>>,
+}
+
+impl SlotInner {
+    fn idle(&self) -> std::sync::MutexGuard<'_, Option<Worker>> {
+        self.idle.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 type Slot = Arc<SlotInner>;
@@ -119,56 +133,100 @@ pub(super) fn retire_project_worker(limiter: &DataGatewayLimiter, dir: &Path) {
             .collect()
     };
     for slot in removed {
-        if let Ok(mut g) = slot.worker.try_lock()
-            && let Some(w) = g.take()
-        {
-            kill_now(w);
+        let w = slot.idle().take();
+        if let Some(w) = w {
+            kill_detached(limiter, w);
         }
     }
 }
 
-/// Kill a worker's process group synchronously-ish (no await) and leave the
-/// wrapper to `kill_on_drop`.
-fn kill_now(mut w: Worker) {
-    if let Some(pid) = w.child.id() {
+/// Counts one worker teardown against the live-process budget until dropped.
+struct Reaping(Arc<AtomicUsize>);
+
+impl Reaping {
+    fn new(limiter: &DataGatewayLimiter) -> Self {
+        limiter.reaping.fetch_add(1, Ordering::AcqRel);
+        Self(limiter.reaping.clone())
+    }
+}
+
+impl Drop for Reaping {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Kill a worker's process group without blocking the calling (possibly
+/// async, possibly `Drop`) context: the kill — a blocking `taskkill` on
+/// Windows — and the reap run on a blocking thread / background task that
+/// owns the `Child`. Until the reap completes the worker stays counted in
+/// [`DataGatewayLimiter`]'s `reaping` budget, since it is still a live process.
+fn kill_detached(limiter: &DataGatewayLimiter, mut w: Worker) {
+    let pid = w.child.id();
+    let ticket = Reaping::new(limiter);
+    // The Unix group signal is a cheap syscall: send it now so the worker
+    // stops at once, whatever happens to the background task.
+    #[cfg(unix)]
+    if let Some(pid) = pid {
         super::kill_group_by_pid(pid);
     }
-    let _ = w.child.start_kill();
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        // No runtime (shutdown): best effort, inline. `kill_on_drop` backs it.
+        #[cfg(not(unix))]
+        if let Some(pid) = pid {
+            super::kill_group_by_pid(pid);
+        }
+        let _ = w.child.start_kill();
+        drop(ticket);
+        return;
+    };
+    rt.spawn(async move {
+        let _ticket = ticket;
+        #[cfg(not(unix))]
+        if let Some(pid) = pid {
+            let _ = tokio::task::spawn_blocking(move || super::kill_group_by_pid(pid)).await;
+        }
+        let _ = w.child.start_kill();
+        super::reap_gateway_bounded(&mut w.child, super::GATEWAY_REAP_GRACE).await;
+    });
 }
 
 /// Enforce the console-wide live-process budget (#1329). Called by every op
-/// right after it is admitted (holding a permit): idle workers of *other*
-/// projects are retired, least-recently-used first, until
-/// `idle resident + running ops <= concurrency`; any idle past [`IDLE_TTL`]
-/// goes too. Busy slots (an op holds their lock) are running ops already
-/// counted by the permits.
-pub(super) fn enforce_resident_budget(limiter: &DataGatewayLimiter, keep: Option<&Path>) {
+/// right after it is admitted (holding a permit) — and, for a serve op, after
+/// it has taken its own worker out of the idle slot, so that worker is counted
+/// by the op's permit rather than as idle. Idle workers are retired,
+/// least-recently-used first, until
+/// `idle resident + running ops + reaping <= concurrency`; any idle past
+/// [`IDLE_TTL`] goes too. Idle workers are evicted regardless of whether an op
+/// holds their project's turn, so a turn-holder waiting for a permit pins no
+/// process.
+pub(super) fn enforce_resident_budget(limiter: &DataGatewayLimiter) {
     let running = limiter
         .concurrency
         .saturating_sub(limiter.permits.available_permits());
-    let allowed_idle = limiter.concurrency.saturating_sub(running);
-    let mut guards = Vec::new();
-    for (dir, slot) in limiter.workers.snapshot() {
-        if keep == Some(dir.as_path()) {
-            continue;
-        }
-        let last = match slot.worker.try_lock() {
-            Ok(g) => g.as_ref().map(|w| w.last_used),
-            Err(_) => None,
-        };
-        if let Some(last) = last {
-            guards.push((last, slot));
-        }
-    }
+    let reaping = limiter.reaping.load(Ordering::Acquire);
+    let allowed_idle = limiter
+        .concurrency
+        .saturating_sub(running)
+        .saturating_sub(reaping);
+    let mut idle: Vec<(Instant, Slot)> = limiter
+        .workers
+        .snapshot()
+        .into_iter()
+        .filter_map(|(_, slot)| {
+            let last = slot.idle().as_ref().map(|w| w.last_used);
+            last.map(|l| (l, slot))
+        })
+        .collect();
     // Newest first; retire everything past the allowance or past the TTL.
-    guards.sort_by_key(|g| std::cmp::Reverse(g.0));
-    for (i, (last, slot)) in guards.into_iter().enumerate() {
-        if (i >= allowed_idle || last.elapsed() >= IDLE_TTL)
-            && let Ok(mut g) = slot.worker.try_lock()
-            && let Some(w) = g.take()
-        {
-            tracing::debug!(pid = ?w.child.id(), "data worker evicted (resident budget)");
-            kill_now(w);
+    idle.sort_by_key(|g| std::cmp::Reverse(g.0));
+    for (i, (last, slot)) in idle.into_iter().enumerate() {
+        if i >= allowed_idle || last.elapsed() >= IDLE_TTL {
+            let w = slot.idle().take();
+            if let Some(w) = w {
+                tracing::debug!(pid = ?w.child.id(), "data worker evicted (resident budget)");
+                kill_detached(limiter, w);
+            }
         }
     }
 }
@@ -358,36 +416,19 @@ impl Drop for Waiting {
     }
 }
 
-/// Armed while a request is on the wire: if the op's future is dropped
-/// (caller cancelled) before the reply is read, kill the worker's process
-/// group immediately and reap it in the background — no later request is
+/// Owns the worker while an op uses it: if the op's future is dropped
+/// (caller cancelled) mid-exchange, the worker is killed at once without
+/// blocking the dropping thread ([`kill_detached`]) — no later request is
 /// needed to stop a hung or abandoned operation.
-struct InFlightGuard {
-    pid: Option<u32>,
-    slot: Slot,
-    armed: bool,
+struct InUse<'a> {
+    limiter: &'a DataGatewayLimiter,
+    worker: Option<Worker>,
 }
 
-impl Drop for InFlightGuard {
+impl Drop for InUse<'_> {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Some(pid) = self.pid {
-            super::kill_group_by_pid(pid);
-        }
-        let slot = self.slot.clone();
-        let pid = self.pid;
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(async move {
-                let mut g = slot.worker.lock().await;
-                if g.as_ref()
-                    .is_some_and(|w| w.in_flight && w.child.id() == pid)
-                    && let Some(w) = g.take()
-                {
-                    kill_worker(w).await;
-                }
-            });
+        if let Some(w) = self.worker.take() {
+            kill_detached(self.limiter, w);
         }
     }
 }
@@ -417,21 +458,34 @@ pub(super) async fn run_serve_op(
     let prev = slot.waiters.fetch_add(1, Ordering::AcqRel);
     let _waiting = Waiting(slot.clone());
     if prev > limiter.queue {
-        return Err(DataError::Busy(format!(
-            "{} data ops already queued for this project; retry shortly",
-            limiter.queue
-        )));
+        return Err(limiter.busy());
     }
-    let mut guard = tokio::time::timeout_at(deadline, slot.worker.lock())
-        .await
-        .map_err(|_| timed_out(limiter))?;
-    let _permit = tokio::time::timeout_at(deadline, limiter.acquire())
+    // An op that must wait for its project's turn occupies a place in the
+    // console-wide queue for the whole wait (and keeps it through admission,
+    // counted once), so blocked projects cannot multiply the #1329 bound.
+    let (_turn, ticket) = match slot.turn.try_lock() {
+        Ok(t) => (t, None),
+        Err(_) => {
+            let ticket = limiter.reserve_queue()?;
+            let t = tokio::time::timeout_at(deadline, slot.turn.lock())
+                .await
+                .map_err(|_| timed_out(limiter))?;
+            (t, Some(ticket))
+        }
+    };
+
+    let _permit = tokio::time::timeout_at(deadline, limiter.acquire_with(ticket))
         .await
         .map_err(|_| timed_out(limiter))??;
-    enforce_resident_budget(limiter, Some(dir));
+    // Take our worker first: from here it is counted by our permit.
+    let mut use_ = InUse {
+        limiter,
+        worker: slot.idle().take(),
+    };
+    enforce_resident_budget(limiter);
     let fingerprint = toolkit_fingerprint(urban, dir);
 
-    if let Some(mut w) = guard.take() {
+    if let Some(mut w) = use_.worker.take() {
         let alive = matches!(w.child.try_wait(), Ok(None));
         if !alive || w.in_flight {
             tracing::debug!(dir = %dir.display(), alive, in_flight = w.in_flight, "data worker restart");
@@ -440,24 +494,18 @@ pub(super) async fn run_serve_op(
             tracing::debug!(dir = %dir.display(), "data worker restart: toolkit/manifest changed");
             retire_worker(w).await;
         } else {
-            *guard = Some(w);
+            use_.worker = Some(w);
         }
     }
-    if guard.is_none() {
-        *guard = Some(spawn_worker(urban, dir, fingerprint)?);
+    if use_.worker.is_none() {
+        use_.worker = Some(spawn_worker(urban, dir, fingerprint)?);
     }
-    let result = match guard.as_mut() {
+    let result = match use_.worker.as_mut() {
         Some(w) => {
             let id = w.next_id;
             w.next_id += 1;
             w.last_used = Instant::now();
-            let mut armed = InFlightGuard {
-                pid: w.child.id(),
-                slot: slot.clone(),
-                armed: true,
-            };
             let r = tokio::time::timeout_at(deadline, exchange(w, id, request)).await;
-            armed.armed = false;
             w.last_used = Instant::now();
             r
         }
@@ -466,10 +514,12 @@ pub(super) async fn run_serve_op(
         ))),
     };
     let ok = matches!(result, Ok(Ok(_)));
-    if !ok || !limiter.workers.is_registered(dir, &slot) {
-        // Failed/timed-out (possibly desynced) worker, or one whose project was
-        // retired while this op ran: never park it.
-        if let Some(w) = guard.take() {
+    if let Some(w) = use_.worker.take() {
+        if ok && limiter.workers.is_registered(dir, &slot) {
+            *slot.idle() = Some(w);
+        } else {
+            // Failed/timed-out (possibly desynced) worker, or one whose
+            // project was retired while this op ran: never park it.
             kill_worker(w).await;
         }
     }
@@ -603,7 +653,7 @@ mod tests {
     }
 
     async fn stderr_seen(slot: &Slot) -> bool {
-        let mut g = slot.worker.lock().await;
+        let mut g = slot.idle();
         let Some(w) = g.as_mut() else { return false };
         let exited = matches!(w.child.try_wait(), Ok(Some(_)));
         exited
@@ -796,7 +846,7 @@ mod tests {
                 .unwrap();
             let mut live = 0;
             for (_, slot) in lim.workers.snapshot() {
-                if slot.worker.lock().await.is_some() {
+                if slot.idle().is_some() {
                     live += 1;
                 }
             }
@@ -851,7 +901,10 @@ mod tests {
         assert_eq!(slot.waiters.load(Ordering::Acquire), 2);
         // A third op for the same project exceeds holder + queue(1): Busy.
         let busy = run_serve_op(&lim, &stub, &slow_dir, &serde_json::json!({"op":"slow"})).await;
-        assert!(matches!(busy, Err(DataError::Busy(_))), "{busy:?}");
+        assert!(
+            matches!(busy, Err(DataError::Busy(ref m)) if m.starts_with(super::super::DATA_GATEWAY_BUSY_PREFIX)),
+            "per-project Busy must carry the shared prefix (503 + Retry-After): {busy:?}"
+        );
         // The queued waiter holds no permit: another project completes while
         // the blocked project cannot progress (its gate is still closed).
         let other = project("waiters-other");
@@ -894,6 +947,99 @@ mod tests {
         // Old behaviour: ~timeout waiting + a full timeout exchanging.
         assert!(elapsed < timeout + timeout / 2, "{elapsed:?}");
         assert!(first.await.unwrap().is_err(), "gate never opens");
+    }
+
+    /// An op holding its project's turn while waiting for a permit pins no
+    /// process: another op's budget sweep still evicts the project's idle
+    /// worker, so resident + running never exceeds the concurrency (#1836).
+    #[tokio::test]
+    async fn turn_holder_awaiting_permit_does_not_pin_its_worker() {
+        let dir = project("pin");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = Arc::new(DataGatewayLimiter::with_timeout(
+            1,
+            8,
+            std::time::Duration::from_secs(30),
+        ));
+        run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        let slot = lim.workers.slot_for(&dir);
+        assert!(slot.idle().is_some(), "worker warm");
+        // Another op holds the only permit; this project's next op takes its
+        // turn and parks waiting for admission.
+        let held = lim.acquire().await.unwrap();
+        let (l, s, d) = (lim.clone(), stub.clone(), dir.clone());
+        let parked = tokio::spawn(async move {
+            run_serve_op(&l, &s, &d, &serde_json::json!({"op":"schema"})).await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while slot.turn.try_lock().is_ok() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(slot.turn.try_lock().is_err(), "op holds the turn");
+        // The permit holder's sweep: 1 running, so 0 idle allowed.
+        enforce_resident_budget(&lim);
+        assert!(
+            slot.idle().is_none(),
+            "idle worker of a turn-holder awaiting a permit escaped eviction"
+        );
+        drop(held);
+        parked.await.unwrap().unwrap();
+    }
+
+    /// Ops waiting for a busy project's turn consume the console-wide queue,
+    /// so blocked projects cannot multiply the #1329 queue bound, and the
+    /// refusal carries the Busy prefix.
+    #[tokio::test]
+    async fn project_turn_waiters_count_against_the_global_queue() {
+        let slow_dir = project("gq-slow");
+        let spawns = slow_dir.join("spawns.txt");
+        let stub = gated_stub(&slow_dir, &spawns, false);
+        let lim = Arc::new(DataGatewayLimiter::with_timeout(
+            1,
+            1,
+            std::time::Duration::from_secs(60),
+        ));
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (l, s, d) = (lim.clone(), stub.clone(), slow_dir.clone());
+            held.push(tokio::spawn(async move {
+                run_serve_op(&l, &s, &d, &serde_json::json!({"op":"slow"})).await
+            }));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while lim.waiting.load(Ordering::Acquire) < 1 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            lim.waiting.load(Ordering::Acquire),
+            1,
+            "turn waiter queued once"
+        );
+        // The global queue (1) is full: an op for another project is refused
+        // at once instead of queueing beyond the bound.
+        let other = project("gq-other");
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_serve_op(&lim, &stub, &other, &serde_json::json!({"op":"schema"})),
+        )
+        .await
+        .expect("refused promptly, not queued");
+        assert!(
+            matches!(refused, Err(DataError::Busy(ref m)) if m.starts_with(super::super::DATA_GATEWAY_BUSY_PREFIX)),
+            "{refused:?}"
+        );
+        std::fs::write(slow_dir.join("gate"), "").unwrap();
+        for h in held {
+            h.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            lim.waiting.load(Ordering::Acquire),
+            0,
+            "queue place released"
+        );
     }
 
     /// An implementation update that leaves the launcher untouched (path,
