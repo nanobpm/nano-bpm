@@ -74,6 +74,10 @@ const RETIRE_DRAIN: Duration = Duration::from_secs(15);
 
 struct Worker {
     child: Child,
+    /// The launcher's pid, recorded at spawn — on Unix also its process-group
+    /// id. Teardown kills by this, never by `child.id()`, which is `None` once
+    /// the leader has been reaped while forked descendants may live on.
+    pid: Option<u32>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     fingerprint: u64,
@@ -234,23 +238,25 @@ fn kill_and_reap_blocking(limiter: &DataGatewayLimiter, slot: &Slot, w: Worker) 
     let hold = ReapHold::new(slot);
     let budget = limiter.reaping.clone();
     let mut child = w.child;
-    let pid = child.id();
+    let pid = w.pid;
     budget.kill(pid, &mut child);
     let give_up = Instant::now() + budget.grace();
     loop {
-        if child_exited(&mut child) {
+        if worker_gone(&mut child, pid) {
             return true;
         }
         if Instant::now() >= give_up {
             break;
         }
+        // Re-kill: a descendant may outlive the reaped leader.
+        budget.kill(pid, &mut child);
         std::thread::sleep(Duration::from_millis(10));
     }
     warn_unreaped(pid);
     std::thread::spawn(move || {
         let _ticket = ticket;
         let _hold = hold;
-        while !child_exited(&mut child) {
+        while !worker_gone(&mut child, pid) {
             budget.kill(pid, &mut child);
             std::thread::sleep(REAP_RETRY);
         }
@@ -264,6 +270,32 @@ const REAP_RETRY: Duration = Duration::from_millis(50);
 
 fn child_exited(child: &mut Child) -> bool {
     matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+}
+
+/// A worker counts as exited only when its leader is reaped **and** its
+/// process group is empty: a launcher (pnpm/yarn shim, wrapper) may exit and
+/// be reaped while forked descendants keep running (#1836).
+fn worker_gone(child: &mut Child, pid: Option<u32>) -> bool {
+    child_exited(child) && !group_alive(pid)
+}
+
+/// Whether any process remains in the group led by `pid` (Unix). Windows has
+/// no group probe here (see the Job Object follow-up), so it reports none.
+fn group_alive(pid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    if let Some(pid) = pid.filter(|p| *p != 0) {
+        let Ok(pgid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 to a negative pid only probes the group.
+        if unsafe { libc::kill(-pgid, 0) } == 0 {
+            return true;
+        }
+        // EPERM: members exist that we may not signal — still alive.
+        return std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    }
+    let _ = pid;
+    false
 }
 
 fn warn_unreaped(pid: Option<u32>) {
@@ -409,15 +441,18 @@ impl ReapBudget {
     }
 }
 
-/// Kill a child's whole tree and wait (bounded by the reap grace) for it to
-/// exit. Returns whether it exited.
-async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child) -> bool {
-    let pid = child.id();
-    if let Some(pid) = pid {
-        // Blocking on Windows (`taskkill` status); cheap signal on Unix.
-        let b = budget.clone();
-        let _ = tokio::task::spawn_blocking(move || b.kill_group(pid)).await;
+/// Kill a worker's whole tree — by the pid recorded at spawn, whether or not
+/// the leader has already been reaped — and wait (bounded by the reap grace)
+/// for the leader to be reaped and the group to empty. Returns whether it did.
+async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>) -> bool {
+    async fn kill_group(budget: &Arc<ReapBudget>, pid: Option<u32>) {
+        if let Some(pid) = pid {
+            // Blocking on Windows (`taskkill` status); cheap signal on Unix.
+            let b = budget.clone();
+            let _ = tokio::task::spawn_blocking(move || b.kill_group(pid)).await;
+        }
     }
+    kill_group(budget, pid).await;
     #[cfg(test)]
     let skip = budget.ignore_kill.load(Ordering::Acquire);
     #[cfg(not(test))]
@@ -425,16 +460,31 @@ async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child) -> bool {
     if !skip {
         let _ = child.start_kill();
     }
-    tokio::time::timeout(budget.grace(), child.wait())
+    let give_up = tokio::time::Instant::now() + budget.grace();
+    if tokio::time::timeout_at(give_up, child.wait())
         .await
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    // Leader reaped: kill again for descendants that outlived it.
+    loop {
+        kill_group(budget, pid).await;
+        if !group_alive(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= give_up {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
-/// Keep killing and reaping a child that outlived its grace until it exits.
-async fn reap_until_exit(budget: &Arc<ReapBudget>, child: &mut Child) {
-    let pid = child.id();
+/// Keep killing and reaping a worker that outlived its grace until it (and
+/// its whole group) exits.
+async fn reap_until_exit(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>) {
     warn_unreaped(pid);
-    while !kill_tree(budget, child).await {
+    while !kill_tree(budget, child, pid).await {
         tokio::time::sleep(REAP_RETRY).await;
     }
     tracing::info!(?pid, "data worker: unreaped process finally exited");
@@ -465,7 +515,7 @@ impl Drop for Reaping {
 /// and holds a [`Waiting`] place on its project's `slot`, so a retirement drain
 /// (waiters==0) cannot finish while the worker may still hold the dir (#1836).
 fn kill_detached(limiter: &DataGatewayLimiter, slot: &Slot, mut w: Worker) {
-    let pid = w.child.id();
+    let pid = w.pid;
     let ticket = Reaping::new(limiter);
     let hold = ReapHold::new(slot);
     // The Unix group signal is a cheap syscall: send it now so the worker
@@ -491,8 +541,8 @@ fn kill_detached(limiter: &DataGatewayLimiter, slot: &Slot, mut w: Worker) {
         let _hold = hold;
         // Not reaped in time: still a live process — keep the ticket and the
         // slot place until it really exits.
-        if !kill_tree(&budget, &mut w.child).await {
-            reap_until_exit(&budget, &mut w.child).await;
+        if !kill_tree(&budget, &mut w.child, pid).await {
+            reap_until_exit(&budget, &mut w.child, pid).await;
         }
     });
 }
@@ -533,7 +583,7 @@ pub(super) fn enforce_resident_budget(limiter: &DataGatewayLimiter) {
             // slot empty with no waiters while the process is still alive.
             let mut guard = slot.idle();
             if let Some(w) = guard.take() {
-                tracing::debug!(pid = ?w.child.id(), "data worker evicted (resident budget)");
+                tracing::debug!(pid = ?w.pid, "data worker evicted (resident budget)");
                 kill_detached(limiter, &slot, w);
             }
             drop(guard);
@@ -621,6 +671,7 @@ fn spawn_worker(urban: &Path, dir: &Path, fingerprint: u64) -> Result<Worker, Da
     });
     tracing::debug!(dir = %dir.display(), pid = ?child.id(), "data worker started");
     Ok(Worker {
+        pid: child.id(),
         child,
         stdin,
         stdout: BufReader::new(stdout),
@@ -658,17 +709,20 @@ async fn teardown_owned(
         let _ticket = ticket;
         let _hold = hold;
         let Worker {
-            mut child, stdin, ..
+            mut child,
+            stdin,
+            pid,
+            ..
         } = w;
         let exited = if graceful {
-            retire_child(&budget, &mut child, stdin).await
+            retire_child(&budget, &mut child, stdin, pid).await
         } else {
             drop(stdin);
-            kill_tree(&budget, &mut child).await
+            kill_tree(&budget, &mut child, pid).await
         };
         let _ = tx.send(exited);
         if !exited {
-            reap_until_exit(&budget, &mut child).await;
+            reap_until_exit(&budget, &mut child, pid).await;
         }
     });
     rx.await.unwrap_or(false)
@@ -677,15 +731,22 @@ async fn teardown_owned(
 /// Retire a healthy worker gracefully: close stdin (serve mode exits 0 on EOF)
 /// and kill it only if it doesn't go within [`RETIRE_GRACE`]. Returns whether
 /// it exited.
-async fn retire_child(budget: &Arc<ReapBudget>, child: &mut Child, stdin: ChildStdin) -> bool {
+async fn retire_child(
+    budget: &Arc<ReapBudget>,
+    child: &mut Child,
+    stdin: ChildStdin,
+    pid: Option<u32>,
+) -> bool {
     drop(stdin);
     if tokio::time::timeout(RETIRE_GRACE, child.wait())
         .await
         .is_ok()
+        && !group_alive(pid)
     {
         return true;
     }
-    kill_tree(budget, child).await
+    // Hung, or a clean leader exit that left descendants: kill the group.
+    kill_tree(budget, child, pid).await
 }
 
 fn with_stderr(w: &Worker, msg: String) -> DataError {
@@ -924,7 +985,7 @@ pub(super) async fn run_serve_op(
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             if let Some(h) = hook {
-                h(use_.worker.as_ref().and_then(|w| w.child.id()));
+                h(use_.worker.as_ref().and_then(|w| w.pid));
             }
         }
     }
@@ -936,7 +997,7 @@ pub(super) async fn run_serve_op(
         let retired_now = {
             let mut a = slot.active();
             if !a.retired {
-                a.pid = use_.worker.as_ref().and_then(|w| w.child.id());
+                a.pid = use_.worker.as_ref().and_then(|w| w.pid);
             }
             a.retired
         };
@@ -1320,6 +1381,98 @@ mod tests {
         assert_eq!(slot.waiters.load(Ordering::Acquire), 1);
         lim.reaping.ignore_kill.store(false, Ordering::Release);
         wait_released(&lim, &slot, pid).await;
+    }
+
+    /// #1836: a launcher that forks a descendant into its group and exits
+    /// leaves the leader reaped (`Child::id()` is then `None`) while the
+    /// descendant lives on. Teardown must still kill the whole group by the
+    /// pid recorded at spawn, and hold the budget ticket and slot place until
+    /// the group is empty — not just until the leader is reaped.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exited_launcher_descendants_are_killed_and_hold_budget() {
+        let dir = project("orphan-descendant");
+        let pidfile = dir.join("sleeper.pid");
+        let stub = dir.join("urban-forking-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\nsleep 1000 </dev/null >/dev/null 2>&1 &\necho $! > '{}'\nexit 0\n",
+                pidfile.display()
+            ),
+        );
+        let lim = limiter();
+        lim.reaping.short_waits.store(true, Ordering::Release);
+        let mut w = spawn_worker(&stub, &dir, 0).unwrap();
+        // The restart path: the leader is found dead (and reaped) first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(w.child.try_wait(), Ok(Some(_))) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(w.child.id().is_none(), "leader should be reaped");
+        let sleeper: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes for existence.
+        assert_eq!(unsafe { libc::kill(sleeper, 0) }, 0, "sleeper not running");
+        let slot = lim.workers.slot_for(&dir);
+        // Kills not delivered: the surviving descendant keeps the ticket held.
+        lim.reaping.ignore_kill.store(true, Ordering::Release);
+        let exited = teardown_owned(&lim, &slot, w, false).await;
+        assert!(!exited, "a group with a live descendant reported as reaped");
+        assert_eq!(lim.reaping.count.load(Ordering::Acquire), 1);
+        assert_eq!(slot.unreaped.load(Ordering::Acquire), 1);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(sleeper, 0) }, 0);
+        lim.reaping.ignore_kill.store(false, Ordering::Release);
+        // The sleeper is reparented to init (or a subreaper), which reaps it
+        // once killed; wait_released probes it with kill(pid, 0).
+        wait_released(&lim, &slot, sleeper).await;
+    }
+
+    /// Same class on the blocking retirement path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exited_launcher_descendants_are_killed_on_blocking_reap() {
+        let dir = project("orphan-descendant-blocking");
+        let pidfile = dir.join("sleeper.pid");
+        let stub = dir.join("urban-forking-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\nsleep 1000 </dev/null >/dev/null 2>&1 &\necho $! > '{}'\nexit 0\n",
+                pidfile.display()
+            ),
+        );
+        let lim = limiter();
+        lim.reaping.short_waits.store(true, Ordering::Release);
+        let mut w = spawn_worker(&stub, &dir, 0).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(w.child.try_wait(), Ok(Some(_))) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let sleeper: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let slot = lim.workers.slot_for(&dir);
+        let l = &lim;
+        let s = slot.clone();
+        let exited = tokio::task::block_in_place(|| kill_and_reap_blocking(l, &s, w));
+        assert!(exited, "group should be killed within the grace");
+        assert_eq!(lim.reaping.count.load(Ordering::Acquire), 0);
+        wait_released(&lim, &slot, sleeper).await;
     }
 
     async fn wait_released(lim: &DataGatewayLimiter, slot: &Slot, pid: i32) {
