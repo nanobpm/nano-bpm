@@ -3870,11 +3870,6 @@ pub struct ServerImpl {
     /// (#1604): publishes for a pending `(name, correlation key)` wait (bounded)
     /// until the create's routing owner has opened the subscription.
     publication_gate: publication_gate::PublicationGate,
-    /// Peers this node has seen advertise `FEATURE_CLUSTER_PUBLICATION_GATE`
-    /// (#1845). Such a peer may hold early-answered pending opens, so once it
-    /// becomes unreachable the cluster gate fails CLOSED for it rather than
-    /// skipping it (see [`ServerImpl::cluster_publication_gate_wait`]).
-    gate_capable_peers: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     /// Test-only override for [`publication_gate_deadline`], so tests can
     /// exercise gate expiry deterministically in milliseconds rather than
     /// waiting out the full production re-drive budget.
@@ -4140,11 +4135,8 @@ impl ServerImpl {
         // therefore gates early answers on `!raft_enabled()` as well, so the
         // non-Raft journals here are always authoritative at construction time.
         let publication_gate = publication_gate::PublicationGate::default();
-        let recovered_pending_opens = if topology.is_single_node() && !raft_enabled() {
-            pending_subscription_opens_from_journals(&journals, topology.num_partitions)
-        } else {
-            Vec::new()
-        };
+        let recovered_pending_opens =
+            boot_pending_subscription_opens(&journals, topology.num_partitions, raft_enabled());
         let recovered_gate_guard = publication_gate.register(&recovered_pending_opens);
         let reconciled = store.reconcile_orphaned_active(&live_keys);
         if reconciled > 0 {
@@ -4538,7 +4530,6 @@ impl ServerImpl {
             publication_gate,
             #[cfg(test)]
             publication_gate_deadline_override: Arc::new(std::sync::Mutex::new(None)),
-            gate_capable_peers: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             failed_opens: publication_gate::FailedOpens::default(),
             #[cfg(test)]
             fail_routing_pump_for_test: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4601,6 +4592,33 @@ impl ServerImpl {
 /// `*_versions` map, so re-installing an already-known version is a no-op.
 fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
     deployment_replication_events_from_state(deploy_journal.engine().state())
+}
+
+/// Whether [`ServerImpl::cluster_publication_gate_wait`] asks peers (#1845):
+/// only a non-Raft node with peers. Under Raft creates route before answering,
+/// so no peer holds an early-answered open and the wait stays local.
+fn cluster_gate_probes_peers(raft: bool, has_peers: bool) -> bool {
+    !raft && has_peers
+}
+
+/// The pending opens a non-Raft boot pre-registers on the publication gate
+/// (#1604, #1845). Every non-Raft topology — single node OR peers — may have
+/// answered a create before routing its opens
+/// ([`ServerImpl::create_answers_before_routing`]), so a crash after the
+/// answer must be recovered on any node count, not just a single node. A
+/// target partition hosted on a peer is absent from `journals`, so its open
+/// is conservatively re-driven (idempotent on the target). Under Raft
+/// partition state is restored asynchronously in `raft_bootstrap` and creates
+/// always route before answering, so nothing is recovered here.
+fn boot_pending_subscription_opens(
+    journals: &[Journal],
+    num_partitions: u64,
+    raft: bool,
+) -> Vec<Event> {
+    if raft {
+        return Vec::new();
+    }
+    pending_subscription_opens_from_journals(journals, num_partitions)
 }
 
 /// Synthesises `MessageSubscriptionOpening` follow-ups for every cross-partition
@@ -11573,44 +11591,33 @@ impl ServerImpl {
         if raft_enabled() {
             return false;
         }
-        let topology = self.engine.topology();
-        let mut all = true;
-        for node in (0..topology.num_nodes()).filter(|&n| n != topology.node_id) {
-            match self.peers.link(node).await {
-                Ok(link)
-                    if link.supports(
-                        nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE,
-                    ) =>
-                {
-                    self.gate_capable_peers
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(node);
-                }
-                _ => all = false,
-            }
-        }
-        all
+        self.peers
+            .all_peers_support(nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE)
+            .await
     }
 
     /// The cluster-wide publication gate (#1845): waits — bounded by the gate
     /// deadline — until no subscription open for `(name, correlation_key)` is
     /// pending on THIS node's gate or on any peer's, and returns the
     /// [`combine`](publication_gate::GateWait::combine)d outcome. Peers are
-    /// asked in parallel with the local wait, so the whole wait is bounded by
-    /// one deadline (plus transport margin). Only peers advertising
-    /// `FEATURE_CLUSTER_PUBLICATION_GATE` are asked — a peer that does not
-    /// never answers a create early (see
-    /// [`Self::create_answers_before_routing`]), so it has nothing pending.
-    /// A probe failure on a peer known to serve the gate FAILS CLOSED
-    /// (`TimedOut`, a retryable rejection): a refused or malformed reply, a
-    /// transport error/timeout, or the peer becoming unreachable after this
-    /// node saw it advertise the feature. The pending open lives on the create
-    /// node while the subscription's target partition may sit on a third node
-    /// this publish CAN reach, so skipping the probe would let the publish
-    /// overtake the open and silently drop the message. Only a peer never seen
-    /// to serve the gate (e.g. down since this node started) is skipped, so a
-    /// dead node does not make every publish in the cluster unavailable.
+    /// asked in parallel with the local wait.
+    ///
+    /// Under Raft only the local gate is consulted: Raft creates always route
+    /// before answering ([`Self::create_answers_before_routing`]), so no peer
+    /// can hold an early-answered open, and probing peers would turn the loss
+    /// of any single member into a cluster-wide publish outage even though
+    /// the surviving quorum serves every partition.
+    ///
+    /// Without Raft every peer probe FAILS CLOSED (`TimedOut`, a retryable
+    /// rejection) on any error — an unreachable peer (whether or not this
+    /// node ever saw it advertise the gate: the create node only checks ITS
+    /// link to us, so we may never have learned its capability), a refused or
+    /// malformed reply, or a transport error. Only a reachable peer that does
+    /// not advertise `FEATURE_CLUSTER_PUBLICATION_GATE` is skipped: it never
+    /// answers a create early, so it has nothing pending. Each peer probe —
+    /// link acquisition included — is bounded by one budget (the gate deadline
+    /// plus transport margin), so a slow connect cannot stretch the publish
+    /// past it.
     async fn cluster_publication_gate_wait(
         &self,
         name: &str,
@@ -11618,83 +11625,89 @@ impl ServerImpl {
     ) -> publication_gate::GateWait {
         let deadline = self.effective_publication_gate_deadline();
         let local = self.publication_gate.wait(name, correlation_key, deadline);
-        if !self.peers.has_peers() {
+        if !cluster_gate_probes_peers(raft_enabled(), self.peers.has_peers()) {
             return local.await;
         }
+        let budget = nano_server_raft::peer::await_pending_opens_budget(deadline);
         let topology = self.engine.topology();
         let peer_waits = (0..topology.num_nodes())
             .filter(|&node| node != topology.node_id)
             .map(|node| async move {
-                let link = match self.peers.link(node).await {
-                    Ok(link) => link,
-                    Err(e) => {
-                        let seen = self
-                            .gate_capable_peers
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .contains(&node);
-                        if seen {
-                            tracing::warn!(
-                                node,
-                                "publication gate: gate-serving peer unreachable, failing closed: {e}"
-                            );
-                            return publication_gate::GateWait::TimedOut;
-                        }
-                        tracing::debug!(
-                            node,
-                            "publication gate: peer never seen serving the gate is unreachable, skipped: {e}"
-                        );
-                        return publication_gate::GateWait::Clear;
-                    }
-                };
-                if !link
-                    .supports(nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE)
-                {
-                    return publication_gate::GateWait::Clear;
-                }
-                self.gate_capable_peers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(node);
-                match link
-                    .await_pending_opens(name.to_string(), correlation_key.to_string(), deadline)
-                    .await
-                {
-                    Ok(res) if res.status == 200 => res
-                        .body
-                        .as_ref()
-                        .and_then(|b| b.get("outcome"))
-                        .and_then(|o| o.as_str())
-                        .and_then(publication_gate::GateWait::from_wire)
-                        .unwrap_or_else(|| {
-                            tracing::warn!(
-                                node,
-                                "publication gate: malformed peer reply {:?}, failing closed",
-                                res.body
-                            );
-                            publication_gate::GateWait::TimedOut
-                        }),
-                    Ok(res) => {
-                        tracing::warn!(
-                            node,
-                            status = res.status,
-                            "publication gate: peer refused the probe, failing closed"
-                        );
-                        publication_gate::GateWait::TimedOut
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            node,
-                            "publication gate: peer probe failed, failing closed: {e}"
-                        );
-                        publication_gate::GateWait::TimedOut
-                    }
-                }
+                tokio::time::timeout(
+                    budget,
+                    self.probe_peer_gate(node, name, correlation_key, deadline),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::warn!(
+                        node,
+                        "publication gate: peer probe exceeded its budget, failing closed"
+                    );
+                    publication_gate::GateWait::TimedOut
+                })
             });
         let (local, peers) = tokio::join!(local, futures_util::future::join_all(peer_waits));
         peers
             .into_iter()
             .fold(local, publication_gate::GateWait::combine)
+    }
+
+    /// One peer's leg of [`Self::cluster_publication_gate_wait`]; every
+    /// failure fails closed.
+    async fn probe_peer_gate(
+        &self,
+        node: u32,
+        name: &str,
+        correlation_key: &str,
+        deadline: std::time::Duration,
+    ) -> publication_gate::GateWait {
+        let link = match self.peers.link(node).await {
+            Ok(link) => link,
+            Err(e) => {
+                tracing::warn!(
+                    node,
+                    "publication gate: peer unreachable, failing closed: {e}"
+                );
+                return publication_gate::GateWait::TimedOut;
+            }
+        };
+        if !link.supports(nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE) {
+            return publication_gate::GateWait::Clear;
+        }
+        match link
+            .await_pending_opens(name.to_string(), correlation_key.to_string(), deadline)
+            .await
+        {
+            Ok(res) if res.status == 200 => res
+                .body
+                .as_ref()
+                .and_then(|b| b.get("outcome"))
+                .and_then(|o| o.as_str())
+                .and_then(publication_gate::GateWait::from_wire)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        node,
+                        "publication gate: malformed peer reply {:?}, failing closed",
+                        res.body
+                    );
+                    publication_gate::GateWait::TimedOut
+                }),
+            Ok(res) => {
+                tracing::warn!(
+                    node,
+                    status = res.status,
+                    "publication gate: peer refused the probe, failing closed"
+                );
+                publication_gate::GateWait::TimedOut
+            }
+            Err(e) => {
+                tracing::warn!(
+                    node,
+                    "publication gate: peer probe failed, failing closed: {e}"
+                );
+                publication_gate::GateWait::TimedOut
+            }
+        }
     }
 
     fn effective_publication_gate_deadline(&self) -> std::time::Duration {
@@ -56041,7 +56054,7 @@ mod subscription_placement_tests {
             }
             Ok(())
         }
-        let (created_instance_key, order, target_partition) = {
+        let (created_instance_key, order, target_partition, create_partition) = {
             let (shared, recovery) =
                 SharedWriter::open_segmented(&dir, &owned, 4, None).expect("open segmented boot 1");
             let fresh = recovery.fresh;
@@ -56131,8 +56144,42 @@ mod subscription_placement_tests {
             // ever write into the log Boot 2 reopens.
             copy_dir_recursive(&dir, &crash_image).expect("copy crash image");
             drop(release_tx);
-            (created.instance_key, order, target)
+            (created.instance_key, order, target, create_partition)
         };
+
+        // #1845 review: a CLUSTERED non-Raft node answers creates early too,
+        // so its boot must recover the pending open even when the target
+        // partition lives on a peer (absent from this node's journals). Model
+        // the create node of a two-node cluster hosting only the source.
+        {
+            let clustered_image = dir.with_extension("clustered-image");
+            let _ = std::fs::remove_dir_all(&clustered_image);
+            let _clustered_guard = DirGuard(clustered_image.clone());
+            copy_dir_recursive(&crash_image, &clustered_image).expect("copy clustered image");
+            let (shared, recovery) =
+                SharedWriter::open_segmented(&clustered_image, &[create_partition], 4, None)
+                    .expect("open clustered boot");
+            let fresh = recovery.fresh;
+            let journals: Vec<Journal> = recovery
+                .engines
+                .into_iter()
+                .filter(|(p, _)| *p == create_partition)
+                .map(|(p, engine)| Journal::from_engine_shared(p, engine, fresh, &shared))
+                .collect();
+            assert_eq!(journals.len(), 1, "only the source partition is hosted");
+            let pending = boot_pending_subscription_opens(&journals, 4, false);
+            assert!(
+                pending.iter().any(|e| matches!(
+                    e,
+                    Event::MessageSubscriptionOpening { correlation_key, .. } if *correlation_key == order
+                )),
+                "a clustered non-Raft boot must recover the remote-target pending open, got {pending:?}"
+            );
+            assert!(
+                boot_pending_subscription_opens(&journals, 4, true).is_empty(),
+                "Raft recovers partition state asynchronously in raft_bootstrap"
+            );
+        }
 
         // Boot 2: recover from the crash image, never Boot 1's live directory.
         let (shared, recovery) = SharedWriter::open_segmented(&crash_image, &owned, 4, None)
@@ -57067,12 +57114,14 @@ mod subscription_placement_tests {
     #[tokio::test]
     async fn unreachable_peer_fails_the_cluster_gate_closed() {
         let (n0, n1) = two_node_cluster().await;
+        // Node 1 has never connected to node 0 (no prewarmed link), yet node
+        // 0 may already have answered a create early after dialing node 1:
+        // an unknown peer must fail closed too.
         n1.peers.fail_node(0).await;
         assert_eq!(
             n1.cluster_publication_gate_wait("msg-a", "k").await,
-            crate::publication_gate::GateWait::Clear,
-            "a peer never seen serving the gate cannot hold early-answered opens \
-             known to this node; skipping it keeps publishes available"
+            crate::publication_gate::GateWait::TimedOut,
+            "a peer whose gate capability is unknown must fail the gate closed"
         );
         n1.peers.heal_node(0).await;
         assert!(
@@ -57098,6 +57147,17 @@ mod subscription_placement_tests {
             "the publish must be rejected retryably, got {refused:?}"
         );
         drop(n0);
+    }
+
+    /// #1845 review: under Raft the gate never probes peers (creates route
+    /// before answering), so losing a member cannot become a cluster-wide
+    /// publish outage; without Raft, peers are probed only when present.
+    #[test]
+    fn cluster_gate_probes_peers_only_without_raft() {
+        assert!(!super::cluster_gate_probes_peers(true, true));
+        assert!(!super::cluster_gate_probes_peers(true, false));
+        assert!(super::cluster_gate_probes_peers(false, true));
+        assert!(!super::cluster_gate_probes_peers(false, false));
     }
 }
 

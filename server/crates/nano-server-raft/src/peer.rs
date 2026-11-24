@@ -1174,7 +1174,7 @@ impl PeerLink {
         deadline: Duration,
     ) -> Result<PeerResult, PeerError> {
         let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
-        self.request_within(deadline.saturating_add(fast_forward_timeout()), |corr| {
+        self.request_within(await_pending_opens_budget(deadline), |corr| {
             ClientFrame::AwaitPendingOpens {
                 corr,
                 name,
@@ -1876,6 +1876,13 @@ fn breaker_cooldown() -> Duration {
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_BREAKER_COOLDOWN_MS);
     Duration::from_millis(ms)
+}
+
+/// The whole budget of one `AwaitPendingOpens` probe (#1845): the remote gate
+/// deadline plus the fast-forward transport margin. The single source for both
+/// the request timeout and a caller bounding link acquisition + request.
+pub fn await_pending_opens_budget(deadline: Duration) -> Duration {
+    deadline.saturating_add(fast_forward_timeout())
 }
 
 /// Per-call deadline for *fast*, non-await peer forwards (job complete/fail/throw,
