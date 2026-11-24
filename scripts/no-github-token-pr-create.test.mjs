@@ -29,9 +29,10 @@ export function prCreateOffenders(text) {
   const out = [];
   lines.forEach((line, i) => {
     if (!/\bgh\s+pr\s+create\b/.test(line.replace(/#.*$/, ''))) return;
-    // Enclosing step: nearest preceding `- ` list item less indented than this line.
-    let start = -1;
-    for (let j = i; j >= 0; j--) {
+    // Enclosing step: this line itself when it is a list item (`- run: gh pr
+    // create`), else the nearest preceding `- ` item less indented than it.
+    let start = /^ *- /.test(line) ? i : -1;
+    for (let j = i - 1; start < 0 && j >= 0; j--) {
       const m = lines[j].match(/^( *)- /);
       if (m && m[1].length < indentOf(line)) { start = j; break; }
     }
@@ -83,6 +84,11 @@ test('prCreateOffenders flags GITHUB_TOKEN and missing tokens', () => {
     assert.deepEqual(prCreateOffenders(step(`${ind}\n            ${fb}`)).length, 1);
   }
   assert.deepEqual(prCreateOffenders(step(null, '# gh pr create in a comment')), []);
+  // Inline list-item run step: the `- run:` line is itself the enclosing step.
+  const inline = (tok) =>
+    `jobs:\n  j:\n    steps:\n      - run: gh pr create --base main\n        env:\n          GH_TOKEN: ${tok}\n      - name: next\n        env:\n          GH_TOKEN: \${{ steps.app-token.outputs.token }}\n        run: echo`;
+  assert.deepEqual(prCreateOffenders(inline('${{ steps.app-token.outputs.token }}')), []);
+  assert.deepEqual(prCreateOffenders(inline('${{ github.token }}')).length, 1);
 });
 
 test('no workflow or action runs `gh pr create` with GITHUB_TOKEN', () => {
