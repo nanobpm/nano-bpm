@@ -5532,9 +5532,20 @@ impl Drop for Journal {
 mod tests {
     // --- #1855: drop bomb on an unwaited pending Commit ---------------------
 
+    // The bomb is `cfg!(debug_assertions)`-only, so the panic tests are gated
+    // on it; `make server-test-release` (debug-assertions off) runs the
+    // silent-drop counterpart instead.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "pending storage Commit was dropped")]
     fn dropping_a_pending_commit_panics_in_debug() {
+        let (_tx, rx) = oneshot::channel::<()>();
+        drop(Commit::from_ack(rx));
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn dropping_a_pending_commit_is_silent_in_release() {
         let (_tx, rx) = oneshot::channel::<()>();
         drop(Commit::from_ack(rx));
     }
@@ -5550,9 +5561,10 @@ mod tests {
         drop(Commit::failed());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn journal_apply_command_discarded_commit_panics() {
-        // The #1477 shape: `let _ = journal.apply_synced(..)` on a real
+        // The #1477 shape: `let _ = journal.apply_command(..)` on a real
         // file-backed journal must now fail deterministically.
         let dir = std::env::temp_dir().join(format!("nanobpmn-drop-bomb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
