@@ -6764,7 +6764,7 @@ impl Engine {
                 Ok(next) => Some(next),
                 // Collapse missed fires exactly as the evaluated path does.
                 Err(_) if interval_millis > 0 => {
-                    Some(due_at.saturating_add(interval_millis).max(self.now))
+                    Some(timer_cycle::rearm_fixed(due_at, self.now, interval_millis))
                 }
                 Err(_) => None,
             }

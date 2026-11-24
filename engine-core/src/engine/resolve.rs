@@ -1180,12 +1180,9 @@ impl Engine {
                 Ok(resolved(due_at, cycle.interval_millis(), repetitions))
             }
             crate::model::TimerDefKind::Date => {
-                let dt = expression::evaluate_timer(
-                    &def.expr,
-                    vars,
-                    "date-time",
-                    crate::feel::temporal::DateTime::parse,
-                )?;
+                let dt = expression::evaluate_timer(&def.expr, vars, "date-time", |s| {
+                    crate::feel::temporal::DateTime::parse(s.trim())
+                })?;
                 Ok(resolved(
                     (dt.epoch_nanos() / 1_000_000).max(0) as u64,
                     0,
@@ -1200,10 +1197,11 @@ impl Engine {
     /// Resolves the next due date of a fired **cycle** timer (Zeebe
     /// `TimerTriggerProcessor.rescheduleTimer`): the cycle definition is
     /// re-evaluated against `vars` (a FEEL cycle sees current variables), then
-    /// an interval cycle re-arms at `previous_due_at + interval` (never before
-    /// now) and a cron cycle at its next match after `max(previous_due_at,
+    /// an interval cycle re-arms at `previous_due_at + interval`, or at
+    /// `now + interval` when that is not after now
+    /// ([`crate::engine::timer_cycle::rearm_after`]), and a cron cycle at its next match after `max(previous_due_at,
     /// now)` — see [`crate::engine::timer_cycle`]. Without a declared definition the
-    /// static `fallback_millis` period is used (also never before now).
+    /// static `fallback_millis` period is used with the same re-arm rule.
     pub(crate) fn resolve_cycle_rearm(
         &self,
         vars: &BTreeMap<String, Value>,
@@ -1225,9 +1223,11 @@ impl Engine {
                 .resolve_timer(vars, Some(def), previous_due_at, fallback_millis)?
                 .due_at),
             // Same missed-fire collapse as a declared interval cycle.
-            None => Ok(previous_due_at
-                .saturating_add(fallback_millis)
-                .max(self.now)),
+            None => Ok(crate::engine::timer_cycle::rearm_fixed(
+                previous_due_at,
+                self.now,
+                fallback_millis,
+            )),
         }
     }
 

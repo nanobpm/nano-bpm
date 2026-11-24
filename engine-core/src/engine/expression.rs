@@ -416,7 +416,9 @@ pub(crate) fn evaluate_timer<T>(
     } else {
         raw.to_string()
     };
-    parse(text.trim()).ok_or_else(|| {
+    // The parser decides on whitespace: Zeebe trims neither a cycle nor a
+    // date (callers that tolerate it trim themselves).
+    parse(&text).ok_or_else(|| {
         Failure::extract_value(format!(
             "Expected result of the expression '{}' to be a valid {}, but was '{}'.",
             raw.trim(),

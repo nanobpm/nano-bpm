@@ -12,8 +12,14 @@
 //!   start already in the past fires immediately (`Interval.toEpochMilli`).
 //!   Zeebe splits the interval on its **last** `/` and parses the prefix as a
 //!   `ZonedDateTime`, so the end-date form `R[n]/<duration>/<end>` is
-//!   **rejected** by Zeebe and therefore here too. `R0` stays rejected (a
-//!   cycle that never fires, #1596).
+//!   **rejected** by Zeebe and therefore here too. The count follows Zeebe's
+//!   `Integer.parseInt`: `R0` is accepted and fires once (the first fire is
+//!   always armed), and `R-1` is `INFINITE` (unbounded). The duration is a
+//!   `java.time` `Duration` **or** `Period`: calendar units (`P1Y`, `P1M`,
+//!   combined `P1MT1H`) are added with calendar arithmetic in **UTC** (a
+//!   month-end day clamps, `Jan 31 + P1M = Feb 28/29`), as `ZonedDateTime.plus`.
+//!   Like Zeebe, the cycle string is **not** trimmed: surrounding whitespace
+//!   is rejected (only the XML element text around a literal is trimmed).
 //! - **Cron** (`CronTimer`, cron-utils `CronType.SPRING53`): six fields
 //!   `second minute hour day-of-month month day-of-week`, with `*`, `?`,
 //!   lists, ranges, steps, month / weekday names, `L`, `L-n`, `nW`, `LW`,
@@ -25,9 +31,12 @@
 //!   compatibility — Zeebe would try it as cron and reject it. It behaves as
 //!   `R/PT1H`.
 //!
-//! Re-arming (`TimerTriggerProcessor.refreshTimer`): an interval cycle re-arms
-//! at `previous due + duration` (never earlier than now, so fires missed while
-//! the engine was not driven collapse into one), a cron cycle at its next
+//! Re-arming (`TimerTriggerProcessor.refreshTimer` /
+//! `RepeatingInterval.nextOccurrenceAfter`): an interval cycle re-arms at
+//! `previous due + period` when that is after now, otherwise it re-anchors at
+//! `now + period` (`interval.withStart(now)`) — never at or before now, so
+//! fires missed while the engine was not driven collapse into one
+//! ([`rearm_after`]), a cron cycle at its next
 //! match strictly after `max(previous due, now)` — missed cron fires are
 //! skipped, as in Zeebe.
 //!
@@ -56,7 +65,7 @@ pub(crate) enum Schedule {
     /// A fixed period, optionally anchored at an explicit start instant.
     Interval {
         start_millis: Option<u64>,
-        interval_millis: u64,
+        period: Period,
     },
     /// A Spring-style six-field cron expression.
     Cron(Box<Cron>),
@@ -65,9 +74,20 @@ pub(crate) enum Schedule {
 impl TimerCycle {
     /// Parses a `timeCycle` string (see the module docs for the forms).
     pub(crate) fn parse(raw: &str) -> Option<TimerCycle> {
-        let s = raw.trim();
+        // Zeebe does not trim the cycle string: surrounding whitespace fails
+        // `RepeatingInterval.parse` / the cron parser.
+        let s = raw;
+        if s.is_empty() || s.trim() != s {
+            return None;
+        }
         if s.starts_with('R') {
-            let (repetitions, interval) = crate::temporal::split_repetitions(s)?;
+            let (prefix, interval) = s.split_once('/')?;
+            let repetitions = match &prefix[1..] {
+                // `Integer.parseInt("-1") == RepeatingInterval.INFINITE`.
+                "" | "-1" => None,
+                n if n.bytes().all(|b| b.is_ascii_digit()) => Some(n.parse::<u32>().ok()?),
+                _ => return None,
+            };
             let (start_millis, duration) = match interval.rfind('/') {
                 Some(idx) => (Some(parse_start(&interval[..idx])?), &interval[idx + 1..]),
                 None => (None, interval),
@@ -76,16 +96,17 @@ impl TimerCycle {
                 repetitions,
                 schedule: Schedule::Interval {
                     start_millis,
-                    interval_millis: crate::temporal::parse_duration_millis(duration)?,
+                    period: Period::parse(duration)?,
                 },
             });
         }
-        if let Some(interval_millis) = crate::temporal::parse_duration_millis(s) {
+        // Bare duration: a nano extension (fixed durations only).
+        if let Some(millis) = crate::temporal::parse_duration_millis(s) {
             return Some(TimerCycle {
                 repetitions: None,
                 schedule: Schedule::Interval {
                     start_millis: None,
-                    interval_millis,
+                    period: Period { months: 0, millis },
                 },
             });
         }
@@ -95,13 +116,13 @@ impl TimerCycle {
         })
     }
 
-    /// The fixed period between fires, or 0 for a cron cycle.
+    /// The fixed period between fires, or 0 for a cron cycle or a calendar
+    /// (`Y`/`M`) period, which has no fixed length (its re-arm needs the
+    /// definition, so it stops rather than drift if that can't be evaluated).
     pub(crate) fn interval_millis(&self) -> u64 {
         match &self.schedule {
-            Schedule::Interval {
-                interval_millis, ..
-            } => *interval_millis,
-            Schedule::Cron(_) => 0,
+            Schedule::Interval { period, .. } if period.months == 0 => period.millis,
+            Schedule::Interval { .. } | Schedule::Cron(_) => 0,
         }
     }
 
@@ -117,8 +138,8 @@ impl TimerCycle {
             } => ((*start).max(from), self.repetitions),
             Schedule::Interval {
                 start_millis: None,
-                interval_millis,
-            } => (from.saturating_add(*interval_millis), self.repetitions),
+                period,
+            } => (period.add_to(from), self.repetitions),
             Schedule::Cron(cron) => match cron.next_after(from) {
                 Some(due) => (due, None),
                 None => (from, Some(1)),
@@ -130,13 +151,123 @@ impl TimerCycle {
     /// date and the current time (Zeebe `TimerTriggerProcessor.refreshTimer`).
     pub(crate) fn next_due(&self, previous_due: u64, now: u64) -> u64 {
         match &self.schedule {
-            Schedule::Interval {
-                interval_millis, ..
-            } => previous_due.saturating_add(*interval_millis).max(now),
+            Schedule::Interval { period, .. } => {
+                rearm_after(previous_due, now, |t| period.add_to(t))
+            }
             // A cron with no further match is parked at `u64::MAX` (never
             // due) rather than re-fired at `now`, which would loop forever.
             Schedule::Cron(cron) => cron.next_after(previous_due.max(now)).unwrap_or(u64::MAX),
         }
+    }
+}
+
+/// The canonical interval re-arm rule (Zeebe
+/// `RepeatingInterval.nextOccurrenceAfter`): `previous due + period` when that
+/// is strictly after `now`, otherwise `now + period` (`withStart(now)` adds the
+/// interval). The result is never at or before `now` for a non-zero period, so
+/// an overdue cycle does not re-fire on the next tick. Every interval re-arm
+/// site (declared cycle, fixed-period fallback) goes through this.
+pub(crate) fn rearm_after(previous_due: u64, now: u64, add: impl Fn(u64) -> u64) -> u64 {
+    let next = add(previous_due);
+    if next > now {
+        next
+    } else {
+        add(now)
+    }
+}
+
+/// [`rearm_after`] for a fixed period in milliseconds.
+pub(crate) fn rearm_fixed(previous_due: u64, now: u64, interval_millis: u64) -> u64 {
+    rearm_after(previous_due, now, |t| t.saturating_add(interval_millis))
+}
+
+const MILLIS_PER_DAY: u64 = SECS_PER_DAY * MILLIS_PER_SEC;
+
+/// A cycle period (`java.time` `Period` + `Duration`): whole calendar months
+/// (`Y` = 12, `M` = 1) added with calendar arithmetic, then a fixed part
+/// (weeks, days, time) in milliseconds. Evaluated in UTC, so a day is 24 h.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Period {
+    pub(crate) months: u32,
+    pub(crate) millis: u64,
+}
+
+impl Period {
+    /// Parses `P[nY][nM][nW][nD][T…]`. Without `Y`/`M` this is exactly the
+    /// fixed BPMN duration grammar.
+    fn parse(raw: &str) -> Option<Period> {
+        let rest = raw.strip_prefix('P')?;
+        let (date, time) = match rest.split_once('T') {
+            Some((d, t)) => (d, Some(t)),
+            None => (rest, None),
+        };
+        if !date.contains(['Y', 'M']) {
+            let millis = crate::temporal::parse_duration_millis(raw)?;
+            return Some(Period { months: 0, millis });
+        }
+        let (mut months, mut days) = (0u64, 0u64);
+        let mut order = 0;
+        let mut num = String::new();
+        for c in date.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+                continue;
+            }
+            let rank = match c {
+                'Y' => 1,
+                'M' => 2,
+                'W' => 3,
+                'D' => 4,
+                _ => return None,
+            };
+            if num.is_empty() || rank <= order {
+                return None;
+            }
+            order = rank;
+            let v: u64 = std::mem::take(&mut num).parse().ok()?;
+            match c {
+                'Y' => months = months.checked_add(v.checked_mul(12)?)?,
+                'M' => months = months.checked_add(v)?,
+                'W' => days = days.checked_add(v.checked_mul(7)?)?,
+                _ => days = days.checked_add(v)?,
+            }
+        }
+        if !num.is_empty() {
+            return None;
+        }
+        let mut millis = days.checked_mul(MILLIS_PER_DAY)?;
+        if let Some(t) = time {
+            millis =
+                millis.checked_add(crate::temporal::parse_duration_millis(&format!("PT{t}"))?)?;
+        }
+        Some(Period {
+            months: u32::try_from(months).ok()?,
+            millis,
+        })
+    }
+
+    /// `t + self` (months first, clamping the day to the target month's
+    /// length, then the fixed part), saturating at `u64::MAX`.
+    pub(crate) fn add_to(&self, t: u64) -> u64 {
+        self.add_months(t)
+            .and_then(|m| m.checked_add(self.millis))
+            .unwrap_or(u64::MAX)
+    }
+
+    fn add_months(&self, t: u64) -> Option<u64> {
+        if self.months == 0 {
+            return Some(t);
+        }
+        let day = t / MILLIS_PER_DAY;
+        let (y, m, d) = civil_from_days(i64::try_from(day).ok()?);
+        let total = i64::from(y) * 12 + i64::from(m - 1) + i64::from(self.months);
+        let ny = i32::try_from(total.div_euclid(12)).ok()?;
+        let nm = u32::try_from(total.rem_euclid(12)).ok()? + 1;
+        let nd = d.min(days_in_month(ny, nm));
+        let new_day = u64::try_from(days_from_civil(ny, nm, nd)).ok()?;
+        new_day
+            .checked_mul(MILLIS_PER_DAY)?
+            .checked_add(t % MILLIS_PER_DAY)
     }
 }
 
@@ -839,18 +970,27 @@ mod tests {
             c.schedule,
             Schedule::Interval {
                 start_millis: Some(start),
-                interval_millis: 12 * 3_600_000
+                period: Period {
+                    months: 0,
+                    millis: 12 * 3_600_000
+                }
             }
         );
         assert_eq!(c.repetitions, None);
         // A future start is the first due date; a past start fires now.
         assert_eq!(c.first_due(start - 5_000), (start, None));
         assert_eq!(c.first_due(start + 5_000), (start + 5_000, None));
-        // Re-arm from the previous due date, never earlier than now.
+        // Re-arm from the previous due date; when overdue, re-anchor at
+        // now + interval (RepeatingInterval.nextOccurrenceAfter), never at now.
         assert_eq!(c.next_due(start, start), start + 12 * 3_600_000);
         assert_eq!(
             c.next_due(start, start + 30 * 3_600_000),
-            start + 30 * 3_600_000
+            start + 42 * 3_600_000
+        );
+        // Exactly one interval late: prev + I == now is not after now.
+        assert_eq!(
+            c.next_due(start, start + 12 * 3_600_000),
+            start + 24 * 3_600_000
         );
 
         let c = TimerCycle::parse("R3/2026-01-01T07:00:00+01:00/PT1H").unwrap();
@@ -861,7 +1001,6 @@ mod tests {
         // Zeebe rejects the end-date form and a zone-less start.
         assert_eq!(TimerCycle::parse("R/PT1H/2026-01-01T06:00:00Z"), None);
         assert_eq!(TimerCycle::parse("R/2026-01-01T06:00:00/PT1H"), None);
-        assert_eq!(TimerCycle::parse("R0/PT1H"), None);
         assert_eq!(TimerCycle::parse("Rx/PT1H"), None);
 
         // Plain and bare forms.
@@ -890,5 +1029,68 @@ mod tests {
             TimerCycle::parse("0 0 0 30 2 ?").unwrap().first_due(7),
             (7, Some(1))
         );
+    }
+
+    #[test]
+    fn repetition_count_follows_zeebe_parse_int() {
+        // R0 is accepted (fires once: the first fire is always armed).
+        assert_eq!(TimerCycle::parse("R0/PT1H").unwrap().repetitions, Some(0));
+        // R-1 == RepeatingInterval.INFINITE: unbounded.
+        assert_eq!(TimerCycle::parse("R-1/PT1S").unwrap().repetitions, None);
+        for bad in ["R-2/PT1S", "R/", "R", "R5/PT1S/extra", "", "R+/PT1S"] {
+            assert_eq!(TimerCycle::parse(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_rejected_not_trimmed() {
+        for bad in [
+            " R/PT1H",
+            "R/PT1H ",
+            "\tPT1H",
+            "0 0 * * * * ",
+            " @daily",
+            " ",
+        ] {
+            assert_eq!(TimerCycle::parse(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn calendar_periods_use_utc_calendar_arithmetic() {
+        let jan31 = at(2026, 1, 31, 9, 0, 0);
+        let c = TimerCycle::parse("R/P1M").unwrap();
+        assert_eq!(c.interval_millis(), 0);
+        // Month-end clamps: Jan 31 + P1M = Feb 28 (2026), leap year Feb 29.
+        assert_eq!(c.first_due(jan31).0, at(2026, 2, 28, 9, 0, 0));
+        assert_eq!(
+            c.first_due(at(2024, 1, 31, 9, 0, 0)).0,
+            at(2024, 2, 29, 9, 0, 0)
+        );
+        // P1Y from a leap day clamps to Feb 28.
+        let y = TimerCycle::parse("R/P1Y").unwrap();
+        assert_eq!(
+            y.first_due(at(2024, 2, 29, 0, 0, 0)).0,
+            at(2025, 2, 28, 0, 0, 0)
+        );
+        assert_eq!(y.first_due(jan31).0, at(2027, 1, 31, 9, 0, 0));
+        // Combined calendar + time: months first, then the time part.
+        let mt = TimerCycle::parse("R2/P1MT1H").unwrap();
+        assert_eq!(mt.first_due(jan31), (at(2026, 2, 28, 10, 0, 0), Some(2)));
+        let ymwd = TimerCycle::parse("R/P1Y2M1W1DT1H30M").unwrap();
+        assert_eq!(ymwd.first_due(jan31).0, at(2027, 4, 8, 10, 30, 0));
+        // P1D has a fixed length in UTC.
+        assert_eq!(
+            TimerCycle::parse("R/P1D").unwrap().interval_millis(),
+            86_400_000
+        );
+        // Overdue calendar re-arm re-anchors at now + P1M.
+        assert_eq!(
+            c.next_due(at(2026, 1, 1, 0, 0, 0), at(2026, 3, 15, 0, 0, 0)),
+            at(2026, 4, 15, 0, 0, 0)
+        );
+        for bad in ["R/P1M1Y", "R/PM", "R/P1MT", "R/P1X", "R/P1M2", "R/P-1M"] {
+            assert_eq!(TimerCycle::parse(bad), None, "{bad:?} must be rejected");
+        }
     }
 }

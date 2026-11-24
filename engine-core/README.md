@@ -280,8 +280,13 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   `R[n]/<duration>/<end>` is rejected, as Zeebe rejects it. The FEEL `cycle()`
   built-in (`cycle(duration("PT1H"))` → `"R/PT1H"`, `cycle(3, …)` → `"R3/…"`)
   is supported, and a timer start expression can read cluster variables. A
-  fired cycle re-arms at `max(previous due + interval, now)` (cron: its next
-  match after that), so missed fires collapse as in Zeebe.
+  fired cycle re-arms at `previous due + interval`, or at `now + interval` when
+  that is not after now (Zeebe `RepeatingInterval.nextOccurrenceAfter`; cron:
+  its next match after `max(previous due, now)`), so missed fires collapse as
+  in Zeebe and an overdue cycle never re-fires on the next tick. The count
+  follows Zeebe (`R0` fires once, `R-1` is unbounded); calendar periods
+  (`P1M`, `P1Y`, `P1MT1H`) use UTC calendar arithmetic (month-end clamps); a
+  cycle string with surrounding whitespace is rejected (Zeebe does not trim).
 - **Conditional start events** (a process-level `startEvent` with a
   `conditionalEventDefinition`) create instances on demand from a **conditional
   evaluation**. They open no subscription: an `EvaluateConditionalStartEvents {

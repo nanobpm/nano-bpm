@@ -411,9 +411,10 @@ fn feel_cycle_builtin_boundary_timer() {
 
 #[test]
 fn overdue_interval_cycle_reschedules_from_now() {
-    // TimerTriggerProcessor.refreshTimer + Interval.toEpochMilli: the next due
-    // date is max(previous due + interval, now), so an engine that was not
-    // driven for many periods does not replay every missed fire.
+    // RepeatingInterval.nextOccurrenceAfter: the next due date is previous
+    // due + interval when after now, else now + interval (withStart(now) adds
+    // the interval), so an engine that was not driven for many periods does
+    // not replay every missed fire and never re-fires on the next tick.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(boundary_process("R/PT5S")))
@@ -430,9 +431,12 @@ fn overdue_interval_cycle_reschedules_from_now() {
     assert!(fires <= 2, "missed fires collapse (Zeebe parity): {fires}");
     let next = armed(&engine);
     assert_eq!(next.len(), 1);
-    // Re-armed at max(5s + 5s, now) = now: due again on the next tick.
-    assert_eq!(next, vec![1_000_000]);
-    engine.trigger_timers(1_000_000);
+    // Re-anchored at now + 5s: NOT due again on the next tick.
+    assert_eq!(next, vec![1_005_000]);
+    let again = engine.trigger_timers(1_000_000);
+    assert!(!again
+        .iter()
+        .any(|e| matches!(e, Event::TimerTriggered { .. })));
     assert_eq!(armed(&engine), vec![1_005_000]);
 }
 
@@ -450,8 +454,14 @@ fn builder_cycle_without_timer_def_collapses_missed_fires() {
     deploy_at(&mut engine, def, 0);
     assert_eq!(start_due(&engine), Some(5_000));
     engine.trigger_timers(1_000_000);
-    assert_eq!(start_due(&engine), Some(1_000_000));
+    assert_eq!(start_due(&engine), Some(1_005_000));
+    let instances = engine.state().instances.len();
     engine.trigger_timers(1_000_000);
+    assert_eq!(
+        engine.state().instances.len(),
+        instances,
+        "no re-fire on the next tick"
+    );
     assert_eq!(start_due(&engine), Some(1_005_000));
 }
 
@@ -480,5 +490,57 @@ fn invalid_start_expression_fallback_collapses_missed_fires() {
         })
         .unwrap();
     engine.trigger_timers(1_000_000);
-    assert_eq!(start_due(&engine), Some(1_000_000));
+    assert_eq!(start_due(&engine), Some(1_005_000));
+}
+
+#[test]
+fn zeebe_parse_parity_at_deploy() {
+    // R0 (fires once) and R-1 (unbounded) deploy, as Zeebe parseInt accepts them.
+    let mut engine = Engine::new();
+    deploy_at(&mut engine, start_process("p", "R0/PT1S"), 0);
+    assert_eq!(start_due(&engine), Some(1_000));
+    engine.trigger_timers(1_000);
+    assert_eq!(engine.state().instances.len(), 1);
+    // R0: the single fire was the last; the timer does not re-arm.
+    assert!(engine
+        .state()
+        .start_timers
+        .values()
+        .all(|t| t.due_at.is_none()));
+    let mut engine = Engine::new();
+    deploy_at(&mut engine, start_process("p", "R-1/PT1S"), 0);
+    for due in [1_000, 2_000, 3_000] {
+        assert_eq!(start_due(&engine), Some(due));
+        engine.trigger_timers(due);
+    }
+    // Whitespace inside a FEEL string result is not trimmed (Zeebe parity).
+    let reason = deploy_rejected(r#"=" R/PT1H""#);
+    assert!(reason.contains("to be a valid cycle"), "{reason}");
+}
+
+#[test]
+fn calendar_period_start_timer_month_end() {
+    let mut engine = Engine::new();
+    deploy_at(
+        &mut engine,
+        start_process("p", "R/P1M"),
+        at(2026, 1, 31, 9, 0),
+    );
+    assert_eq!(start_due(&engine), Some(at(2026, 2, 28, 9, 0)));
+    engine.trigger_timers(at(2026, 2, 28, 9, 0));
+    assert_eq!(start_due(&engine), Some(at(2026, 3, 28, 9, 0)));
+    let mut engine = Engine::new();
+    deploy_at(
+        &mut engine,
+        start_process("p", "R/P1Y"),
+        at(2024, 2, 29, 0, 0),
+    );
+    assert_eq!(start_due(&engine), Some(at(2025, 2, 28, 0, 0)));
+    let mut engine = Engine::new();
+    deploy_at(
+        &mut engine,
+        start_process("p", "R/P1MT1H"),
+        at(2026, 1, 31, 9, 0),
+    );
+    assert_eq!(start_due(&engine), Some(at(2026, 2, 28, 10, 0)));
 }
