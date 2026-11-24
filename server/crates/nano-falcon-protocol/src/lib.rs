@@ -119,6 +119,28 @@ mod lease_contract_tests {
         );
     }
 
+    /// #1845: the cluster publication-gate probe round-trips on the wire in
+    /// its camelCase spelling.
+    #[test]
+    fn await_pending_opens_round_trips_on_the_wire() {
+        let wire = serde_json::json!({
+            "type": "awaitPendingOpens", "corr": 9, "name": "m",
+            "correlationKey": "k", "deadlineMs": 250
+        });
+        let frame: ClientFrame = serde_json::from_value(wire.clone()).unwrap();
+        let ClientFrame::AwaitPendingOpens {
+            corr,
+            name,
+            correlation_key,
+            deadline_ms,
+        } = &frame
+        else {
+            panic!("decodes as an await-pending-opens probe");
+        };
+        assert_eq!((*corr, name.as_str(), correlation_key.as_str(), *deadline_ms), (9, "m", "k", 250));
+        assert_eq!(serde_json::to_value(&frame).unwrap(), wire);
+    }
+
     /// #1600 (#1556 step 4): `PublishMessage`, `RouteSubscription` and
     /// `InstallDeployment` gained an additive `operationReference`. A frame
     /// from an older node (no `operationReference`) still decodes — as `None`,
@@ -622,6 +644,24 @@ pub enum ClientFrame {
         /// `None` (the legacy unreferenced behaviour).
         #[serde(default)]
         operation_reference: Option<i64>,
+    },
+    /// **Intra-cluster only.** Cluster-wide publication gate (#1845): before a
+    /// gateway applies a publish for `(name, correlationKey)`, it asks every
+    /// peer to wait — bounded by `deadlineMs` — until no subscription open for
+    /// that key is pending in the peer's node-local publication gate (a create
+    /// the peer answered early, whose detached owner is still routing the
+    /// open). Local-only: the peer consults its own gate and never re-forwards.
+    /// Answered by a `CommandResult` (200) whose body is
+    /// `{"outcome": "clear" | "released" | "failed" | "timedOut"}`. Sent only
+    /// to peers advertising
+    /// [`cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE`].
+    #[serde(rename_all = "camelCase")]
+    AwaitPendingOpens {
+        corr: u64,
+        name: String,
+        #[serde(default)]
+        correlation_key: String,
+        deadline_ms: u64,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key job-retries update to
     /// the peer that owns the job's partition. Answered by a `CommandResult`.

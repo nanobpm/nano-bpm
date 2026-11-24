@@ -1161,6 +1161,30 @@ impl PeerLink {
         .await
     }
 
+    /// Cluster-wide publication gate (#1845): asks this peer to wait, bounded
+    /// by `deadline`, until no subscription open for `(name, correlation_key)`
+    /// is pending in its node-local publication gate. The request itself is
+    /// bounded by `deadline` plus the fast write-forward margin, so a stalled
+    /// peer cannot hold the publish past its gate budget by more than that.
+    /// Answered by `{"outcome": "clear" | "released" | "failed" | "timedOut"}`.
+    pub async fn await_pending_opens(
+        &self,
+        name: String,
+        correlation_key: String,
+        deadline: Duration,
+    ) -> Result<PeerResult, PeerError> {
+        let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+        self.request_within(deadline.saturating_add(fast_forward_timeout()), |corr| {
+            ClientFrame::AwaitPendingOpens {
+                corr,
+                name,
+                correlation_key,
+                deadline_ms,
+            }
+        })
+        .await
+    }
+
     /// Forwards a job-retries update to the peer that owns the job's partition.
     pub async fn update_job_retries(
         &self,

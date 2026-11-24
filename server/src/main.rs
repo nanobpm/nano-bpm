@@ -11287,12 +11287,7 @@ impl ServerImpl {
         // today — unmatched it is dropped, a correlate returns not-found —
         // while the open is re-driven in the background (`failed_opens`).
         match self
-            .publication_gate
-            .wait(
-                &name,
-                &correlation_key,
-                self.effective_publication_gate_deadline(),
-            )
+            .cluster_publication_gate_wait(&name, &correlation_key)
             .await
         {
             publication_gate::GateWait::TimedOut => {
@@ -11558,17 +11553,107 @@ impl ServerImpl {
     }
 
     /// Whether a committed create may answer BEFORE its cross-partition
-    /// subscription opens are routed (#1604). The publication gate is
-    /// node-local, so it only orders publishes that apply on this node. That
-    /// holds on a single non-Raft node. In a multi-node cluster a publish can
-    /// enter, or fan out to, a node whose gate never saw the open, so creates
-    /// there keep the route-before-answer ordering. Likewise, when Raft is
-    /// active, partition recovery happens asynchronously in `raft_bootstrap`
-    /// after the HTTP listener starts, so creates under Raft retain
-    /// route-before-answer until Raft boot recovery pre-registers pending opens
-    /// before serving.
-    fn create_answers_before_routing(&self) -> bool {
-        !self.peers.has_peers() && !raft_enabled()
+    /// subscription opens are routed (#1604). Never under Raft: partition
+    /// recovery happens asynchronously in `raft_bootstrap` after the HTTP
+    /// listener starts, so creates under Raft retain route-before-answer until
+    /// Raft boot recovery pre-registers pending opens before serving. With
+    /// peers (#1845) only while EVERY peer is reachable and advertises
+    /// [`FEATURE_CLUSTER_PUBLICATION_GATE`](nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE):
+    /// a publish entering through a peer then asks this node's gate
+    /// ([`Self::cluster_publication_gate_wait`]) before applying, so it is
+    /// ordered behind the pending open. An unreachable or older peer could not
+    /// be asked, so the create falls back to route-before-answer.
+    async fn create_answers_before_routing(&self) -> bool {
+        if raft_enabled() {
+            return false;
+        }
+        !self.peers.has_peers()
+            || self
+                .peers
+                .all_peers_support(
+                    nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE,
+                )
+                .await
+    }
+
+    /// The cluster-wide publication gate (#1845): waits — bounded by the gate
+    /// deadline — until no subscription open for `(name, correlation_key)` is
+    /// pending on THIS node's gate or on any peer's, and returns the
+    /// [`combine`](publication_gate::GateWait::combine)d outcome. Peers are
+    /// asked in parallel with the local wait, so the whole wait is bounded by
+    /// one deadline (plus transport margin). Only peers advertising
+    /// `FEATURE_CLUSTER_PUBLICATION_GATE` are asked — a peer that does not
+    /// never answers a create early (see
+    /// [`Self::create_answers_before_routing`]), so it has nothing pending. An
+    /// unreachable or erroring peer is skipped best-effort, exactly like the
+    /// publish fan-out that would have to reach it: a node a publish cannot
+    /// reach is a node it cannot correlate on either.
+    async fn cluster_publication_gate_wait(
+        &self,
+        name: &str,
+        correlation_key: &str,
+    ) -> publication_gate::GateWait {
+        let deadline = self.effective_publication_gate_deadline();
+        let local = self.publication_gate.wait(name, correlation_key, deadline);
+        if !self.peers.has_peers() {
+            return local.await;
+        }
+        let topology = self.engine.topology();
+        let peer_waits = (0..topology.num_nodes())
+            .filter(|&node| node != topology.node_id)
+            .map(|node| async move {
+                let link = match self.peers.link(node).await {
+                    Ok(link) => link,
+                    Err(e) => {
+                        tracing::debug!(
+                            node,
+                            "publication gate: peer unreachable, skipped: {e}"
+                        );
+                        return publication_gate::GateWait::Clear;
+                    }
+                };
+                if !link.supports(
+                    nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE,
+                ) {
+                    return publication_gate::GateWait::Clear;
+                }
+                match link
+                    .await_pending_opens(name.to_string(), correlation_key.to_string(), deadline)
+                    .await
+                {
+                    Ok(res) if res.status == 200 => res
+                        .body
+                        .as_ref()
+                        .and_then(|b| b.get("outcome"))
+                        .and_then(|o| o.as_str())
+                        .and_then(publication_gate::GateWait::from_wire)
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                node,
+                                "publication gate: malformed peer reply {:?}, skipped",
+                                res.body
+                            );
+                            publication_gate::GateWait::Clear
+                        }),
+                    Ok(res) => {
+                        tracing::warn!(
+                            node,
+                            status = res.status,
+                            "publication gate: peer refused the probe, skipped"
+                        );
+                        publication_gate::GateWait::Clear
+                    }
+                    Err(e) => {
+                        tracing::warn!(node, "publication gate: peer probe failed, skipped: {e}");
+                        publication_gate::GateWait::Clear
+                    }
+                }
+            });
+        let (local, peers) =
+            tokio::join!(local, futures_util::future::join_all(peer_waits));
+        peers
+            .into_iter()
+            .fold(local, publication_gate::GateWait::combine)
     }
 
     fn effective_publication_gate_deadline(&self) -> std::time::Duration {
@@ -11585,9 +11670,11 @@ impl ServerImpl {
 
     /// The one canonical answer/route ordering for a committed create (#1582,
     /// #1604), shared by the non-Raft detached owner and `raft_create_core`.
-    /// On a single non-Raft node: register the pending opens on the publication
-    /// gate, answer, route, then release the gate (also on drop if this task
-    /// dies). With peers or under Raft: route first, then answer. A publish
+    /// When [`Self::create_answers_before_routing`] (a single non-Raft node, or
+    /// non-Raft peers that all serve the cluster-wide gate, #1845): register
+    /// the pending opens on the publication gate, answer, route, then release
+    /// the gate (also on drop if this task dies). Otherwise (under Raft, or a
+    /// peer that cannot be asked): route first, then answer. A publish
     /// issued once the create returns then finds the subscription open on
     /// whatever node applies it. The create's own `operationReference` (#1602)
     /// rides the routed follow-ups.
@@ -11597,7 +11684,7 @@ impl ServerImpl {
         operation_reference: Option<i64>,
         answer: impl FnOnce(),
     ) {
-        if self.create_answers_before_routing() {
+        if self.create_answers_before_routing().await {
             let pending = self.publication_gate.register(&routable);
             self.signal_jobs_available();
             answer();
@@ -12424,10 +12511,10 @@ impl ServerImpl {
     /// stalled subscription target never delays the create response; the
     /// pending opens are registered with the publication gate
     /// ([`publication_gate`]) first, and a publish for the same
-    /// `(name, correlation key)` waits — bounded by
-    /// [`publication_gate_deadline`] — until the open is routed. With peers
-    /// the node-local gate cannot order a publish applied elsewhere, so the
-    /// opens are routed before answering ([`Self::answer_and_route_create`]).
+    /// `(name, correlation key)` — entering through any node (#1845) — waits,
+    /// bounded by [`publication_gate_deadline`], until the open is routed.
+    /// With a peer that cannot be asked, the opens are routed before
+    /// answering ([`Self::answer_and_route_create`]).
     /// Routing
     /// still completes when the caller has gone away: a dropped receiver
     /// (caller cancelled) leaves this task running to completion, exactly as
@@ -12501,9 +12588,9 @@ impl ServerImpl {
                     )));
                     return;
                 }
-                // Single node: answer at commit, then route, with the opens
-                // gated (#1604). With peers: route, then answer (the gate is
-                // node-local). See `answer_and_route_create`.
+                // Answer at commit, then route, with the opens gated (#1604,
+                // cluster-wide #1845) — or route, then answer, when a peer
+                // cannot be asked. See `answer_and_route_create`.
                 server
                     .answer_and_route_create(routable, operation_reference, move || {
                         let _ = tx.send(outcome);
@@ -55031,7 +55118,7 @@ mod subscription_placement_tests {
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
         let server = build_server_in_memory(journals, topology);
-        assert!(!server.create_answers_before_routing());
+        assert!(!server.create_answers_before_routing().await);
         let create_partition = local[0];
         let create_engine = server
             .engine_handle_for(create_partition)
@@ -55272,7 +55359,7 @@ mod subscription_placement_tests {
     #[tokio::test]
     async fn failed_routing_pump_releases_the_gated_publish_and_queues_the_open() {
         let server = single_node_multi_partition();
-        assert!(server.create_answers_before_routing());
+        assert!(server.create_answers_before_routing().await);
         server
             .deploy_centralized(
                 vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
@@ -56731,6 +56818,192 @@ mod subscription_placement_tests {
             .await_completion_for_stream(instance_key, None, Some(2000))
             .await;
         assert!(completed, "single-partition correlation completes inline");
+    }
+
+    /// Serves `server`'s intra-cluster falcon endpoint on `listener`.
+    fn serve_cluster_node(server: ServerImpl, listener: tokio::net::TcpListener) {
+        let registry = falcon::Registry::new();
+        falcon::spawn_dispatcher(server.clone(), registry.clone());
+        let app = falcon::cluster_router(server, registry, None);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+    }
+
+    /// Two real in-process nodes (4 partitions, RF1) serving each other's
+    /// intra-cluster falcon endpoint.
+    async fn two_node_cluster() -> (ServerImpl, ServerImpl) {
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 0");
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 1");
+        let urls: Vec<String> = [&l0, &l1]
+            .iter()
+            .map(|l| format!("http://127.0.0.1:{}", l.local_addr().expect("addr").port()))
+            .collect();
+        let node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: urls.clone(),
+                num_partitions: 4,
+                replication_factor: 1,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            build_server_in_memory(journals, topology)
+        };
+        let (n0, n1) = (node(0), node(1));
+        serve_cluster_node(n0.clone(), l0);
+        serve_cluster_node(n1.clone(), l1);
+        (n0, n1)
+    }
+
+    /// #1845: the publication gate is cluster-wide. A create answered EARLY by
+    /// node 0 (its routing pump stalled on a first, local target) still has
+    /// its second open — to a partition owned by node 1 — pending in node 0's
+    /// gate. A publish for that second key entering through node 1 must NOT
+    /// apply unmatched on node 1 (silently losing the message): it asks node 0
+    /// and fails retryably (503) past the deadline, and — with a longer
+    /// deadline — waits until the open is routed, then correlates.
+    #[tokio::test]
+    async fn publish_via_other_node_waits_for_a_pending_open_on_the_create_node() {
+        let (n0, n1) = two_node_cluster().await;
+        let local0 = n0.engine.topology().local_partitions();
+        let local1 = n1.engine.topology().local_partitions();
+        assert!(local0.len() >= 2, "node 0 owns several partitions: {local0:?}");
+        n0.deploy_centralized(
+            vec![("await-two.bpmn".into(), PARALLEL_TWO_CATCH_BPMN.into())],
+            "<default>".into(),
+        )
+        .await
+        .expect("deploy");
+        assert!(
+            n0.create_answers_before_routing().await,
+            "every peer serves the cluster gate, so creates answer early"
+        );
+
+        let create_partition = local0[0];
+        let create_engine = n0
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local to node 0");
+        // keyB -> another node-0 partition (stalled, routed FIRST: the pump
+        // pops from the back); keyA -> a node-1 partition (healthy, queued
+        // behind the stall in node 0's serial pump).
+        let key_on = |prefix: &str, ok: &dyn Fn(u64) -> bool| {
+            (0..1024u32)
+                .map(|i| format!("{prefix}-{i}"))
+                .find(|k| ok(nanobpmn_engine_core::subscription_partition(k, 4)))
+                .expect("a correlation key for the wanted partition")
+        };
+        let key_b = key_on("stall", &|t| t != create_partition && local0.contains(&t));
+        let key_a = key_on("remote", &|t| local1.contains(&t));
+        let stalled = n0
+            .engine_handle_for(nanobpmn_engine_core::subscription_partition(&key_b, 4))
+            .expect("the stalled target is local to node 0");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = tokio::spawn(async move {
+            stalled
+                .with_low(move |_journal| {
+                    let _ = parked_tx.send(());
+                    release_rx.blocking_recv().ok();
+                })
+                .await;
+        });
+        parked_rx.await.expect("the barrier holds the stalled actor");
+
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("keyA".to_string(), Value::Str(key_a.clone()));
+        variables.insert("keyB".to_string(), Value::Str(key_b.clone()));
+        let accounting = CreateAccounting::enter(&n0, 0);
+        let rx = n0.submit_create_detached_on(
+            accounting,
+            create_engine,
+            move |engine| {
+                let (process_id, sel_key, sel_ver) = resolve_create_selector(
+                    engine.state(),
+                    Some("await-two-messages".into()),
+                    None,
+                    None,
+                )?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the create answers at commit despite the stall")
+            .expect("the detached owner is alive")
+            .expect("the create applied");
+        assert!(n0.publication_gate.is_pending("msg-a", &key_a));
+        assert!(
+            !n1.publication_gate.is_pending("msg-a", &key_a),
+            "node 1's own gate never saw the open"
+        );
+
+        let set_deadline = |server: &ServerImpl, ms: u64| {
+            *server
+                .publication_gate_deadline_override
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
+                Some(std::time::Duration::from_millis(ms));
+        };
+        // Past the deadline: retryable, never an unmatched apply on node 1.
+        set_deadline(&n0, 80);
+        set_deadline(&n1, 80);
+        let timed_out = n1
+            .correlate_message_cluster("msg-a".into(), key_a.clone(), None, None, None)
+            .await;
+        assert!(
+            matches!(timed_out, Err(CorrelateError::SubscriptionOpenPending)),
+            "a publish via node 1 must see node 0's pending open, got {timed_out:?}"
+        );
+
+        // Within the deadline: the publish waits for node 0's open, then
+        // correlates the instance.
+        set_deadline(&n0, 10_000);
+        set_deadline(&n1, 10_000);
+        let publisher = {
+            let n1 = n1.clone();
+            let key_a = key_a.clone();
+            tokio::spawn(async move {
+                n1.correlate_message_cluster("msg-a".into(), key_a, None, None, None)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !publisher.is_finished(),
+            "the publish via node 1 waits for node 0's pending open"
+        );
+        release_tx.send(()).expect("the barrier is parked");
+        barrier.await.expect("the barrier completes");
+        let (_key, correlated) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), publisher)
+                .await
+                .expect("the publish proceeds once the open is routed")
+                .expect("the publisher task")
+                .expect("the publish applies");
+        assert_eq!(correlated, Some(created.instance_key));
+        assert!(!n0.publication_gate.is_pending("msg-a", &key_a));
     }
 }
 
