@@ -156,6 +156,7 @@ impl PublicationGate {
     }
 
     /// Whether an open for `(name, correlation_key)` is pending.
+    #[cfg(test)]
     pub(crate) fn is_pending(&self, name: &str, correlation_key: &str) -> bool {
         self.lock()
             .contains_key(&(name.to_string(), correlation_key.to_string()))
@@ -163,39 +164,50 @@ impl PublicationGate {
 
     /// Waits until no open for `(name, correlation_key)` is pending, at most
     /// `deadline`.
+    ///
+    /// The outcome is sticky over every notifier the waiter observed: if ANY
+    /// registration it waited on ended failed — even one replaced by a fresh
+    /// same-key registration before the waiter resumed — the wait reports
+    /// [`GateWait::Failed`] (#1866).
     pub(crate) async fn wait(
         &self,
         name: &str,
         correlation_key: &str,
         deadline: Duration,
     ) -> GateWait {
-        if !self.is_pending(name, correlation_key) {
-            return GateWait::Clear;
-        }
         let until = tokio::time::Instant::now() + deadline;
         let key = (name.to_string(), correlation_key.to_string());
-        // The outcome of a cleared entry is read from the notifier the waiter
-        // last saw for it: `failed` is settled before the entry is removed.
-        let cleared = |seen: Option<&Arc<Release>>| match seen {
-            Some(r) if r.failed() => GateWait::Failed,
-            _ => GateWait::Released,
+        // Every notifier the waiter has observed. The pending check and the
+        // first capture happen under ONE lock (the first loop lookup), so an
+        // owner failing in between can never make a waiter see "cleared"
+        // without having captured the failed notifier.
+        let mut observed: Vec<Arc<Release>> = Vec::new();
+        let any_failed = |observed: &[Arc<Release>]| observed.iter().any(|r| r.failed());
+        let cleared = |observed: &[Arc<Release>]| {
+            if observed.is_empty() {
+                GateWait::Clear
+            } else if any_failed(observed) {
+                GateWait::Failed
+            } else {
+                GateWait::Released
+            }
         };
-        let mut seen: Option<Arc<Release>> = None;
         loop {
             // Look up this key's notifier AND arm it while holding the lock.
             // Releases (and the re-registration of a cleared key, which
             // installs a fresh notifier) also take the lock, so the armed
             // notifier is always the one the current entry's final release
-            // will notify: no release or same-key re-registration can slip
-            // between the lookup and arming.
+            // will notify.
             let released = {
                 let guard = self.lock();
                 match guard.get(&key) {
                     Some(p) => Arc::clone(&p.released),
-                    None => return cleared(seen.as_ref()),
+                    None => return cleared(&observed),
                 }
             };
-            seen = Some(Arc::clone(&released));
+            if !observed.iter().any(|r| Arc::ptr_eq(r, &released)) {
+                observed.push(Arc::clone(&released));
+            }
             let notified = released.notify.notified();
             tokio::pin!(notified);
             {
@@ -208,17 +220,17 @@ impl PublicationGate {
                         notified.as_mut().enable();
                     }
                     Some(_) => continue,
-                    None => return cleared(seen.as_ref()),
+                    None => return cleared(&observed),
                 }
             }
             if tokio::time::timeout_at(until, notified).await.is_err() {
-                // A key already marked failed (by one of several overlapping
-                // registrations) reports the failure, not just the timeout.
+                // A failure already observed (on this or a replaced notifier)
+                // reports the failure, not just the timeout.
                 let guard = self.lock();
                 return match guard.get(&key) {
-                    Some(p) if p.released.failed() => GateWait::Failed,
+                    Some(p) if p.released.failed() || any_failed(&observed) => GateWait::Failed,
                     Some(_) => GateWait::TimedOut,
-                    None => cleared(seen.as_ref()),
+                    None => cleared(&observed),
                 };
             }
         }
@@ -266,6 +278,40 @@ mod tests {
             kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
             delivery_key: 4,
         }
+    }
+
+    /// A fails and wakes the parked waiter, but B re-registers the same key
+    /// before the waiter resumes; B completing must not mask A's failure.
+    #[tokio::test]
+    async fn failure_survives_a_same_key_reregistration_before_resume() {
+        let gate = PublicationGate::default();
+        let a = gate.register(&[opening("m", "k")]).expect("a");
+        let waiter = {
+            let gate = gate.clone();
+            tokio::spawn(async move { gate.wait("m", "k", Duration::from_secs(30)).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        a.fail();
+        let b = gate.register(&[opening("m", "k")]).expect("b");
+        tokio::task::yield_now().await;
+        b.complete();
+        assert_eq!(waiter.await.expect("join"), GateWait::Failed);
+    }
+
+    /// Same, but the waiter's deadline elapses while B is still pending.
+    #[tokio::test]
+    async fn replaced_failure_is_reported_on_the_deadline_path() {
+        let gate = PublicationGate::default();
+        let a = gate.register(&[opening("m", "k")]).expect("a");
+        let waiter = {
+            let gate = gate.clone();
+            tokio::spawn(async move { gate.wait("m", "k", Duration::from_millis(50)).await })
+        };
+        tokio::task::yield_now().await;
+        a.fail();
+        let _b = gate.register(&[opening("m", "k")]).expect("b");
+        assert_eq!(waiter.await.expect("join"), GateWait::Failed);
     }
 
     #[tokio::test]
