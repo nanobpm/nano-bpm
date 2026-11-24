@@ -74,6 +74,13 @@ pub const FEATURE_REPLICA_DIGEST_CUTOVER: &str = "replica-digest-cutover-v1";
 /// peer that does not.
 pub const FEATURE_TERMINAL_DEADLINES: &str = "terminal-deadlines-v1";
 
+/// Cluster-wide publication gate (#1845): this binary answers the
+/// `AwaitPendingOpens` probe. A node answers a create before routing its
+/// cross-partition subscription opens only while EVERY peer advertises this,
+/// because a publish entering through a peer that cannot be asked would not be
+/// ordered behind the pending open.
+pub const FEATURE_CLUSTER_PUBLICATION_GATE: &str = "cluster-publication-gate-v1";
+
 /// Every replicated-command feature this binary supports — the single source
 /// of truth for what the handshake advertises.
 pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
@@ -82,6 +89,7 @@ pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_REPLICA_DIGEST,
     FEATURE_REPLICA_DIGEST_CUTOVER,
     FEATURE_TERMINAL_DEADLINES,
+    FEATURE_CLUSTER_PUBLICATION_GATE,
 ];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.

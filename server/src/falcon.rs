@@ -879,6 +879,7 @@ async fn handle_client_frame(
         ClientFrame::MigrateInstance { .. } => "migrate_instance",
         ClientFrame::ModifyInstance { .. } => "modify_instance",
         ClientFrame::RouteSubscription { .. } => "route_subscription",
+        ClientFrame::AwaitPendingOpens { .. } => "await_pending_opens",
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
         ClientFrame::UpdateJobTimeout { .. } => "update_job_timeout",
         ClientFrame::UpdateJob { .. } => "update_job",
@@ -1632,6 +1633,33 @@ async fn handle_client_frame(
                 corr,
                 status,
                 body: (status != 200).then_some(serde_json::Value::String(message)),
+            });
+        }
+        ClientFrame::AwaitPendingOpens {
+            corr,
+            name,
+            correlation_key,
+            deadline_ms,
+        } => {
+            // Cluster-wide publication gate (#1845): wait on THIS node's gate
+            // only (never re-forward). Spawned, because the wait can last up to
+            // the deadline and the reader loop must keep serving frames — in
+            // particular the `RouteSubscription` that may be what releases it.
+            // The wait is capped by this node's own gate deadline too.
+            let server = server.clone();
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                let deadline = std::time::Duration::from_millis(deadline_ms)
+                    .min(server.effective_publication_gate_deadline());
+                let outcome = server
+                    .publication_gate
+                    .wait(&name, &correlation_key, deadline)
+                    .await;
+                conn.send(ServerFrame::CommandResult {
+                    corr,
+                    status: 200,
+                    body: Some(serde_json::json!({ "outcome": outcome.as_wire() })),
+                });
             });
         }
         ClientFrame::UpdateJobRetries {

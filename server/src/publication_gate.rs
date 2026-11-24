@@ -32,10 +32,16 @@
 //! [`FAILED_OPEN_REDRIVE_AGE`] is routed again, unbounded, until delivered.
 //! Buffering the message itself (TTL) is the follow-up parity gap.
 //!
-//! The registry is node-local: it orders only publishes that apply on the node
-//! whose create owner routes the opens. Creates answer early only on a single
-//! non-Raft node. With peers or under Raft they keep route-before-answer (see
-//! `ServerImpl::answer_and_route_create`).
+//! **Cluster-wide (#1845).** The registry itself is node-local: the create
+//! owner registers its opens on the node that answered the create. A publish
+//! entering through ANY node therefore consults the whole cluster before it
+//! applies: the gateway waits on its own gate and, in parallel, asks every peer
+//! (`AwaitPendingOpens`) to wait on theirs, all bounded by the same deadline,
+//! and [`GateWait::combine`]s the outcomes. Creates answer early on a non-Raft
+//! node only while every peer advertises
+//! `FEATURE_CLUSTER_PUBLICATION_GATE` (so every peer a publish could enter
+//! through asks this node); otherwise — and always under Raft — they keep
+//! route-before-answer (see `ServerImpl::answer_and_route_create`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -96,6 +102,51 @@ pub(crate) enum GateWait {
     /// publish as retryable rather than applying it against a missing
     /// subscription.
     TimedOut,
+}
+
+impl GateWait {
+    /// The wire spelling of this outcome on an `AwaitPendingOpens` reply
+    /// (#1845) — the single source both the peer handler and the gateway use.
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            GateWait::Clear => "clear",
+            GateWait::Released => "released",
+            GateWait::Failed => "failed",
+            GateWait::TimedOut => "timedOut",
+        }
+    }
+
+    /// Parses [`as_wire`](Self::as_wire); `None` for an unknown spelling.
+    pub(crate) fn from_wire(s: &str) -> Option<Self> {
+        [
+            GateWait::Clear,
+            GateWait::Released,
+            GateWait::Failed,
+            GateWait::TimedOut,
+        ]
+        .into_iter()
+        .find(|w| w.as_wire() == s)
+    }
+
+    /// Folds the outcomes of several gates (this node's and every peer's) into
+    /// the one the publish acts on: any open still pending wins (`TimedOut`,
+    /// fail closed), then any failed open (`Failed`), then any waited-on open
+    /// (`Released`); `Clear` only when every gate was clear.
+    pub(crate) fn combine(self, other: Self) -> Self {
+        fn rank(w: GateWait) -> u8 {
+            match w {
+                GateWait::Clear => 0,
+                GateWait::Released => 1,
+                GateWait::Failed => 2,
+                GateWait::TimedOut => 3,
+            }
+        }
+        if rank(other) > rank(self) {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 /// Registration of a create's in-flight subscription opens. Settle it with
@@ -829,5 +880,34 @@ mod tests {
         a.fail();
         b.complete();
         assert_eq!(waiter.await.expect("join"), GateWait::Failed);
+    }
+
+    /// #1845: every outcome round-trips through its wire spelling, and an
+    /// unknown spelling is rejected rather than guessed.
+    #[test]
+    fn gate_wait_wire_spelling_round_trips() {
+        for w in [
+            GateWait::Clear,
+            GateWait::Released,
+            GateWait::Failed,
+            GateWait::TimedOut,
+        ] {
+            assert_eq!(GateWait::from_wire(w.as_wire()), Some(w));
+        }
+        assert_eq!(GateWait::from_wire("bogus"), None);
+    }
+
+    /// #1845: a cluster-wide wait fails closed — any gate still pending makes
+    /// the whole publish time out, a failed open beats a routed one, and only
+    /// all-clear gates are clear. Order-independent.
+    #[test]
+    fn gate_wait_combine_prefers_the_most_severe_outcome() {
+        use GateWait::*;
+        let all = [Clear, Released, Failed, TimedOut];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(a.combine(*b), all[i.max(j)]);
+            }
+        }
     }
 }
