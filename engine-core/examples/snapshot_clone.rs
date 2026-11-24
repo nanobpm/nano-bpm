@@ -37,12 +37,17 @@ fn payload(kb: usize) -> BTreeMap<String, Value> {
     m
 }
 
-fn time_reps(reps: usize, mut f: impl FnMut()) -> (Duration, Duration) {
+/// Times `f` `reps` times. The closure returns the snapshot so it is dropped
+/// only *after* the elapsed time is sampled: teardown of the cloned maps is
+/// not part of the on-actor clone cost being measured.
+fn time_reps<T>(reps: usize, mut f: impl FnMut() -> T) -> (Duration, Duration) {
     let mut v: Vec<Duration> = (0..reps)
         .map(|_| {
             let s = Instant::now();
-            f();
-            s.elapsed()
+            let out = black_box(f());
+            let d = s.elapsed();
+            drop(out);
+            d
         })
         .collect();
     v.sort();
@@ -87,12 +92,8 @@ fn main() {
         resident = band;
         let per_cmd = s.elapsed().as_secs_f64() * 1e6 / to_add.max(1) as f64;
 
-        let (full_med, full_max) = time_reps(reps, || {
-            black_box(engine.snapshot());
-        });
-        let (ctl_med, ctl_max) = time_reps(reps, || {
-            black_box(engine.snapshot_control_only());
-        });
+        let (full_med, full_max) = time_reps(reps, || engine.snapshot());
+        let (ctl_med, ctl_max) = time_reps(reps, || engine.snapshot_control_only());
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         println!(
             "resident {band:>8}: snapshot {:>8.2} / {:>8.2} ms ({:>5.0} ns/inst, ~{:>6.0} creates stalled)  control_only {:>8.2} / {:>8.2} ms  create {per_cmd:>5.1}us",
