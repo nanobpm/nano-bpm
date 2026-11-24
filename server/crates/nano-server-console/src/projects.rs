@@ -4514,6 +4514,25 @@ async fn run_data_op_inner(
     // embedded fallback; slice c retires that fallback (and deletes `data-cli.ts`)
     // once the pack guarantees the toolkit.
     let is_urban = dir.join("nano.app.json").is_file();
+    // #1881: take the worker-slot lifecycle lease *before* the async
+    // capability probes below. A delete/rename that lands while a probe is
+    // pending revokes it, so this request can never start a worker after its
+    // project was retired. Re-resolve the project after leasing: a
+    // retirement that completed before the lease (directory gone, or the
+    // name no longer resolving here) is caught too.
+    let lease = if is_urban {
+        let lease =
+            urban_data_worker::lease(data_gateway_limiter(), &dir).ok_or(DataError::NoProject)?;
+        let still_here = project_dir(project)
+            .filter(|d| d.is_dir())
+            .map(|d| dunce::canonicalize(&d).unwrap_or(d));
+        if still_here.as_deref() != Some(dir.as_path()) {
+            return Err(DataError::NoProject);
+        }
+        Some(lease)
+    } else {
+        None
+    };
     let urban = if is_urban {
         super::urban::find_urban_for(&dir)
     } else {
@@ -4545,8 +4564,18 @@ async fn run_data_op_inner(
             if !super::urban::urban_supports_data_serve(&urban).await {
                 return Err(DataError::Gateway(UPGRADE_URBAN_FOR_SERVE.to_string()));
             }
-            return urban_data_worker::run_serve_op(data_gateway_limiter(), &urban, &dir, &request)
-                .await;
+            let lease = lease.ok_or_else(|| {
+                DataError::Gateway(
+                    "internal routing error: UrbanData path without a worker lease".to_string(),
+                )
+            })?;
+            return urban_data_worker::run_serve_op(
+                data_gateway_limiter(),
+                &urban,
+                lease,
+                &request,
+            )
+            .await;
         }
         DataGatewayPath::Embedded => {}
     }
@@ -4957,11 +4986,25 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     // so delete it. Also drop a coexisting ref so the name can't silently
     // resurrect as an imported project once its directory is gone.
     let workspace_dir = projects_root().join(name);
+    // Serialise deletes so two aliases of one directory deleted at once can't
+    // each see the other and both skip retirement (#1881).
+    static DELETE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = DELETE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // #1836: no `urban data --serve` worker may outlive (or pin) its project.
     // The guard keeps the path tombstoned (no op runs or spawns there) until
-    // the directory operation below is done.
-    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &dir)?;
-    if workspace_dir.is_dir() {
+    // the directory operation below is done. #1881: deleting a
+    // reference-only alias leaves the directory in place, so its worker is
+    // retired only when no other project still resolves to that directory.
+    let removes_dir = workspace_dir.is_dir();
+    let _retired = if removes_dir || !dir_shared_with_other_project(name, &dir) {
+        Some(urban_data_worker::retire_project_worker_blocking(
+            data_gateway_limiter(),
+            &dir,
+        )?)
+    } else {
+        None
+    };
+    if removes_dir {
         // Drop a coexisting ref before removing the directory; propagate an IO
         // error so a pointer that can't be removed can't silently resurrect the
         // name later (fail closed).
@@ -4974,6 +5017,33 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::remove_dir_all(dir)
+}
+
+/// Whether a project other than `name` resolves to the same (canonical)
+/// directory as `dir` — an alias imported by reference (ADR 0041), or the
+/// workspace project an alias points at. Such a directory's data worker is
+/// shared and must survive the removal of one of its names (#1881).
+fn dir_shared_with_other_project(name: &str, dir: &Path) -> bool {
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canon(dir);
+    let Ok(entries) = std::fs::read_dir(projects_root()) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            return false;
+        };
+        let other = file_name
+            .strip_suffix(".project-ref.json")
+            .unwrap_or(file_name);
+        if other == name || !(other != file_name || entry.path().is_dir()) {
+            return false;
+        }
+        project_dir(other)
+            .filter(|d| d.is_dir())
+            .is_some_and(|d| canon(&d) == target)
+    })
 }
 
 /// Renames a project directory and updates its persisted config name. Fails if
@@ -12415,6 +12485,126 @@ mod tests {
         assert!(
             !dir.join(GEN_DIR).join("data-cli.ts").exists(),
             "embedded data-cli.ts must not be materialised for an Urban app"
+        );
+    }
+
+    /// A serve-mode `urban` stub for the #1881 lifecycle tests: `--help`
+    /// advertises `data [--serve]` (first running `help_prelude`); a worker
+    /// start appends to `<log>` and answers each request with its pid.
+    #[cfg(unix)]
+    fn serve_lifecycle_stub(path: &Path, log: &Path, help_prelude: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh
+case \"$*\" in *--help*) {help_prelude}printf 'urban data [--serve]\\n'; exit 0;; esac\n\
+                 echo \"$*\" >> '{log}'\n\
+                 while IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{{\"id\":%s,\"ok\":true,\"pid\":%s}}\\n' \"$id\" \"$$\"; done\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// #1881: deleting one reference-only alias of a directory must not
+    /// retire the data worker another alias of the same directory still
+    /// uses; deleting the last reference retires it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn deleting_one_alias_keeps_the_shared_data_worker() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = ext_app_dir("alias-share");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1}"#).unwrap();
+        let log = root.join("alias-spawns.txt");
+        let stub = root.join("urban-alias-stub.sh");
+        serve_lifecycle_stub(&stub, &log, "");
+        import_project_ref("alias-a", ext.to_str().unwrap()).unwrap();
+        import_project_ref("alias-b", ext.to_str().unwrap()).unwrap();
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+        let op = |n: &'static str| run_data_op(n, serde_json::json!({ "op": "schema" }));
+        let del = |n: &'static str| async move {
+            tokio::task::spawn_blocking(move || delete_project(n))
+                .await
+                .unwrap()
+        };
+        let a = op("alias-a").await;
+        let deleted_a = del("alias-a").await;
+        let b = op("alias-b").await;
+        let deleted_b = del("alias-b").await;
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+        let (a, b) = (a.expect("op via alias-a"), b.expect("op via alias-b"));
+        deleted_a.expect("delete alias-a");
+        deleted_b.expect("delete alias-b");
+        assert_eq!(
+            a["pid"], b["pid"],
+            "deleting alias-a retired the shared worker"
+        );
+        let spawns = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(spawns.lines().count(), 1, "worker respawned: {spawns:?}");
+        let pid = a["pid"].as_i64().unwrap() as i32;
+        // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "deleting the last reference did not retire the worker"
+        );
+        assert!(ext.join("nano.app.json").is_file(), "external dir touched");
+    }
+
+    /// #1881: a request resolved before its project is deleted must not start
+    /// a worker afterwards — delete the project while its `--help` capability
+    /// probe is held, then release the probe.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn delete_during_capability_probe_spawns_no_worker() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = ext_app_dir("probe-race");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1}"#).unwrap();
+        let log = root.join("probe-spawns.txt");
+        let (probing, release) = (root.join("probing"), root.join("release"));
+        let stub = root.join("urban-probe-race-stub.sh");
+        serve_lifecycle_stub(
+            &stub,
+            &log,
+            &format!(
+                "touch '{}'; while [ ! -f '{}' ]; do sleep 0.02; done; ",
+                probing.display(),
+                release.display()
+            ),
+        );
+        import_project_ref("probe-race", ext.to_str().unwrap()).unwrap();
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+        let op = tokio::spawn(run_data_op(
+            "probe-race",
+            serde_json::json!({ "op": "schema" }),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !probing.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let probed = probing.exists();
+        let deleted = tokio::task::spawn_blocking(|| delete_project("probe-race"))
+            .await
+            .unwrap();
+        std::fs::write(&release, "").unwrap();
+        let res = op.await.unwrap();
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+        assert!(probed, "the capability probe never started");
+        deleted.expect("delete during the probe");
+        assert!(
+            matches!(res, Err(DataError::NoProject)),
+            "op resolved before the delete must fail closed: {res:?}"
+        );
+        let spawns = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            spawns.is_empty(),
+            "a worker started after retirement: {spawns:?}"
         );
     }
 

@@ -201,6 +201,34 @@ impl WorkerRegistry {
     }
 }
 
+/// A lifecycle lease on a project's worker slot, taken **before** an op's
+/// async capability probes (#1881). Retirement removes and marks retired
+/// every registered slot, so a lease taken before a delete/rename is
+/// invalidated by it; [`run_serve_op`] re-validates the lease before it
+/// registers as a waiter or spawns, so a request resolved before retirement
+/// can never start a worker afterwards.
+pub(super) struct Lease {
+    dir: PathBuf,
+    slot: Slot,
+}
+
+impl Lease {
+    /// Whether retirement has invalidated this lease.
+    fn revoked(&self, registry: &WorkerRegistry) -> bool {
+        self.slot.active().retired || !registry.is_registered(&self.dir, &self.slot)
+    }
+}
+
+/// Take a [`Lease`] on `dir`'s slot, or `None` while the path is being
+/// deleted/renamed.
+pub(super) fn lease(limiter: &DataGatewayLimiter, dir: &Path) -> Option<Lease> {
+    let slot = limiter.workers.live_slot_for(dir)?;
+    Some(Lease {
+        dir: dir.to_path_buf(),
+        slot,
+    })
+}
+
 /// Holds a project path tombstoned while its directory is deleted/renamed:
 /// ops on it fail fast and spawn nothing. Dropping it lifts the tombstone.
 #[must_use = "the tombstone lifts when this guard drops"]
@@ -1059,15 +1087,22 @@ fn timed_out(limiter: &DataGatewayLimiter) -> DataError {
 pub(super) async fn run_serve_op(
     limiter: &DataGatewayLimiter,
     urban: &Path,
-    dir: &Path,
+    lease: Lease,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
     let deadline = tokio::time::Instant::now() + limiter.timeout;
     let retired = || DataError::NoProject;
-    let slot = limiter.workers.live_slot_for(dir).ok_or_else(retired)?;
+    let dir = lease.dir.as_path();
+    let slot = lease.slot.clone();
     // Bound the per-project queue: at most one holder + `queue` waiters.
     let prev = slot.waiters.fetch_add(1, Ordering::AcqRel);
     let _waiting = Waiting(slot.clone());
+    // Re-validate the lease only after registering as a waiter: a retirement
+    // that has not yet marked the slot retired will then see (and drain) us;
+    // one that already has is seen here (#1881).
+    if lease.revoked(&limiter.workers) {
+        return Err(retired());
+    }
     if prev > limiter.queue {
         return Err(limiter.busy());
     }
@@ -1199,6 +1234,43 @@ pub(super) async fn run_serve_op(
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "test helpers")]
 mod tests {
     use super::*;
+
+    /// Lease-then-run, as `run_data_op_inner` does (minus the probes).
+    async fn run_serve_op(
+        limiter: &DataGatewayLimiter,
+        urban: &Path,
+        dir: &Path,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, DataError> {
+        let lease = lease(limiter, dir).ok_or(DataError::NoProject)?;
+        super::run_serve_op(limiter, urban, lease, request).await
+    }
+
+    /// #1881: a lease taken before retirement (i.e. before the op's async
+    /// capability probes finished) is revoked by it — the op fails closed and
+    /// never spawns a worker, even after the tombstone has lifted — while a
+    /// fresh lease taken afterwards works.
+    #[tokio::test]
+    async fn lease_taken_before_retirement_never_spawns() {
+        let dir = project("lease");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        let stale = lease(&lim, &dir).unwrap();
+        drop(retire_project_worker_blocking(&lim, &dir).unwrap());
+        let r = super::run_serve_op(&lim, &stub, stale, &serde_json::json!({"op":"schema"})).await;
+        assert!(matches!(r, Err(DataError::NoProject)), "{r:?}");
+        assert_eq!(spawn_count(&spawns), 0, "a revoked lease spawned a worker");
+        assert!(
+            !lim.workers.map().contains_key(&dir),
+            "a revoked lease re-registered a slot"
+        );
+        run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert_eq!(spawn_count(&spawns), 1);
+        drop(retire_project_worker_blocking(&lim, &dir).unwrap());
+    }
 
     fn write_stub(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
