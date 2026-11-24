@@ -4345,7 +4345,7 @@ fn parse_data_gateway_output(out: std::process::Output) -> Result<serde_json::Va
 }
 
 /// Interpret a parsed gateway reply object (`{ ok: true, … }` / `{ ok: false,
-/// error }`): the single place both the single-shot pipe and the long-lived
+/// error }`): the single place both the piped embedded gateway and the long-lived
 /// `urban data --serve` worker ([`urban_data_worker`]) map a reply to a result.
 fn interpret_gateway_reply(mut val: serde_json::Value) -> Result<serde_json::Value, DataError> {
     let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -4404,6 +4404,11 @@ pub async fn run_data_op(
     );
     res
 }
+
+/// The error an Urban app's data op returns when its toolkit has `urban data`
+/// but not `--serve` (#1836): the console has no single-shot fallback.
+const UPGRADE_URBAN_FOR_SERVE: &str =
+    "this console requires @nanobpm/urban >= 0.100.0 (`urban data --serve`); upgrade urban";
 
 async fn run_data_op_inner(
     project: &str,
@@ -4522,26 +4527,17 @@ async fn run_data_op_inner(
                         .to_string(),
                 )
             })?;
-            // #1836: a toolkit with serve mode (@nanobpm/urban >= 0.100.0)
-            // answers every op from the project's one long-lived
-            // `urban data --serve` worker (NDJSON over stdin/stdout, CWD = the
-            // project dir), so a warm worker starts no new Node process. An
-            // older `data`-capable toolkit keeps the single-shot pipe —
-            // additive + non-regressing.
-            if super::urban::urban_supports_data_serve(&urban).await {
-                return urban_data_worker::run_serve_op(
-                    data_gateway_limiter(),
-                    &urban,
-                    &dir,
-                    &request,
-                )
-                .await;
+            // #1836: the console requires @nanobpm/urban >= 0.100.0, whose
+            // `urban data --serve` answers every op from the project's one
+            // long-lived worker (NDJSON over stdin/stdout, CWD = the project
+            // dir), so a warm worker starts no new Node process. There is no
+            // spawn-per-op fallback: a `data`-capable toolkit that predates
+            // `--serve` is rejected with an upgrade instruction.
+            if !super::urban::urban_supports_data_serve(&urban).await {
+                return Err(DataError::Gateway(UPGRADE_URBAN_FOR_SERVE.to_string()));
             }
-            let mut cmd = Command::new(&urban);
-            // `urban data` reads the JSON request on stdin (root "." + manifest
-            // "nano.app.json" default), anchored at the project dir as CWD.
-            cmd.current_dir(&dir).arg("data");
-            return pipe_data_gateway(cmd, &request).await;
+            return urban_data_worker::run_serve_op(data_gateway_limiter(), &urban, &dir, &request)
+                .await;
         }
         DataGatewayPath::Embedded => {}
     }
@@ -12414,12 +12410,12 @@ mod tests {
     }
 
     /// #1836: a toolkit that has `urban data` but predates its `--serve` mode
-    /// (< 0.100.0) keeps the single-shot pipe instead of being run as a serve
-    /// worker it cannot be (which would hang reading stdin until timeout).
+    /// (< 0.100.0) is rejected with an upgrade instruction — there is no
+    /// single-shot fallback — and is never spawned as `urban data`.
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
-    async fn run_data_op_uses_single_shot_urban_data_without_serve_mode() {
+    async fn run_data_op_rejects_urban_data_without_serve_mode() {
         let _g = lock();
         let root = temp_root();
         let name = "urban-data-noserve-app";
@@ -12438,14 +12434,20 @@ mod tests {
         unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
         let res = run_data_op(name, serde_json::json!({ "op": "schema" })).await;
         unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
-        let val = res.expect("single-shot urban data should succeed");
-        assert_eq!(
-            val.get("routed").and_then(|v| v.as_str()),
-            Some("single-shot"),
-            "{val:?}"
+        match res {
+            Err(DataError::Gateway(msg)) => assert_eq!(msg, UPGRADE_URBAN_FOR_SERVE),
+            other => panic!("expected the upgrade-urban error, got {other:?}"),
+        }
+        // The stub records every invocation; only the `--help` probe may run.
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap_or_default();
+        assert!(
+            sentinel.lines().next().is_none_or(|l| l.contains("--help")),
+            "a pre-serve urban must not be spawned as `urban data`: {sentinel:?}"
         );
-        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
-        assert_eq!(sentinel.lines().next(), Some("data"), "{sentinel:?}");
+        assert!(
+            !dir.join(GEN_DIR).join("data-cli.ts").exists(),
+            "must not fall back to the embedded data-cli.ts"
+        );
     }
 
     /// #522 slice (b): an Urban-shaped app whose resolved `urban` *predates* the

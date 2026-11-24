@@ -1,6 +1,6 @@
 //! One long-lived `urban data --serve` worker per Urban project (#1836).
 //!
-//! The single-shot `urban data` gateway spawns a fresh Node process (pair) for
+//! A single-shot gateway spawns a fresh Node process (pair) for
 //! every Data-panel op; #1329 bounded how many run at once, but each op still
 //! paid a cold Node start. `@nanobpm/urban` >= 0.100.0 ships a serve mode
 //! (nanobpm/nano-ide#627): one JSON request per stdin line carrying an `id`,
@@ -12,7 +12,7 @@
 //! Lifecycle:
 //! - **Spawned lazily** on the first op for a project.
 //! - **Bounded**: the registry lives on the [`DataGatewayLimiter`], and every
-//!   admitted op (serve *or* single-shot) evicts least-recently-used idle
+//!   admitted op (serve *or* the embedded piped gateway) evicts least-recently-used idle
 //!   workers so `idle resident workers + running ops <= concurrency` — #1329's
 //!   console-wide live-process bound holds. Workers idle past [`IDLE_TTL`] are
 //!   retired on the next sweep too.
@@ -1864,10 +1864,10 @@ mod tests {
             .expect("capacity not released once the teardown completed");
     }
 
-    /// With a pending teardown the single-shot path refuses (Busy) instead of
+    /// With a pending teardown the piped (embedded `data-cli.ts`) gateway refuses (Busy) instead of
     /// spawning past the bound when the teardown never finishes in time.
     #[tokio::test]
-    async fn single_shot_respects_pending_teardown() {
+    async fn piped_gateway_respects_pending_teardown() {
         let lim = DataGatewayLimiter::with_timeout(1, 8, std::time::Duration::from_millis(150));
         let _ticket = Reaping::new(&lim);
         let mut cmd = Command::new("/bin/sh");

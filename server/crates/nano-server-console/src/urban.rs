@@ -298,7 +298,7 @@ pub(crate) fn toolkit_package_dir(real: &Path) -> Option<std::path::PathBuf> {
 
 /// Whether the resolved toolkit's `urban data` gateway has the long-lived
 /// `--serve` mode (@nanobpm/urban >= 0.100.0, #1836). A `data`-capable toolkit
-/// without it is driven single-shot instead.
+/// without it is rejected with an upgrade instruction (no fallback).
 pub(crate) async fn urban_supports_data_serve(urban: &Path) -> bool {
     urban_help_text(urban)
         .await
@@ -326,8 +326,8 @@ pub(crate) async fn urban_supports_data_serve(urban: &Path) -> bool {
 /// re-stats the toolkit (a few `metadata` calls, no spawn) and re-probes when
 /// the identity changed, so an in-place upgrade or downgrade at the same path
 /// (an `npm install` bumping `node_modules/.bin/urban`, a pack reinstall) is
-/// picked up immediately — the `--serve` gate can neither stay stuck on
-/// single-shot after an upgrade nor keep passing `--serve` to a downgraded
+/// picked up immediately — the `--serve` gate can neither keep rejecting
+/// a toolkit after an upgrade nor keep passing `--serve` to a downgraded
 /// toolkit (#1836). `None`
 /// means the binary could not be run **or** `urban --help` exited non-zero: we
 /// only accept and cache help text on a successful exit, so a binary that errors
