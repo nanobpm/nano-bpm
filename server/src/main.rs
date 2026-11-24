@@ -22,10 +22,13 @@ mod optional_body_guard;
 #[cfg(feature = "console")]
 mod provisioning;
 mod publication_gate;
+#[cfg(test)]
+mod publication_gate_retry_after_tests;
 mod query;
 #[cfg(test)]
 mod request_field_guard;
 mod response_contract;
+mod retry_after;
 mod secrets;
 mod stub_impls;
 
@@ -32906,6 +32909,10 @@ async fn main() {
     // deliberately outside its scope. Off/lenient/strict via
     // NANOBPM_RESPONSE_VALIDATION (default: strict).
     app = app.layer(axum::middleware::from_fn(response_contract::guard));
+    // Retry-After on every 503 lacking one (#1869): the generated 503 variants
+    // carry no headers, so the publication-gate 503s (#1604/#1866) and the
+    // rest of the class would otherwise give clients no retry hint.
+    app = retry_after::layer(app);
 
     // disabled it 404s, removing the endpoint from the attack surface. Computed
     // on scrape, so it costs nothing at steady state.
