@@ -5538,8 +5538,10 @@ mod tests {
     // --- #1855: drop bomb on an unwaited pending Commit ---------------------
 
     // The bomb is `cfg!(debug_assertions)`-only, so the panic tests are gated
-    // on it; `make server-test-release` (debug-assertions off) runs the
-    // silent-drop counterpart instead.
+    // on it; `dropping_a_pending_commit_panics_only_in_debug` covers both
+    // profiles via `cfg!` (compiled — and clippy-linted — in every profile),
+    // so `make server-test-release` (debug-assertions off) checks the silent
+    // drop.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "pending storage Commit was dropped")]
@@ -5548,11 +5550,13 @@ mod tests {
         drop(Commit::from_ack(rx));
     }
 
-    #[cfg(not(debug_assertions))]
     #[test]
-    fn dropping_a_pending_commit_is_silent_in_release() {
-        let (_tx, rx) = oneshot::channel::<()>();
-        drop(Commit::from_ack(rx));
+    fn dropping_a_pending_commit_panics_only_in_debug() {
+        let dropped = std::panic::catch_unwind(|| {
+            let (_tx, rx) = oneshot::channel::<()>();
+            drop(Commit::from_ack(rx));
+        });
+        assert_eq!(dropped.is_err(), cfg!(debug_assertions));
     }
 
     #[test]
