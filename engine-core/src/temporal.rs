@@ -164,64 +164,6 @@ pub fn parse_duration_millis(raw: &str) -> Option<u64> {
     u64::try_from(nanos / NANOS_PER_MILLI).ok()
 }
 
-/// BPMN timer helper: parses an ISO-8601 repeating interval (a BPMN `timeCycle`,
-/// e.g. `R/PT1H` or `R5/PT1H`) into the interval in **milliseconds**. The `Rn`
-/// repetition count is validated but not returned — see [`parse_cycle`] for the
-/// bounded form. A bare duration without the `R[n]/` prefix is also accepted.
-/// Returns `None` if the cycle is not recognisable.
-pub fn parse_cycle_millis(raw: &str) -> Option<u64> {
-    parse_cycle(raw).map(|c| c.interval_millis)
-}
-
-/// A parsed ISO-8601 repeating interval (a BPMN `timeCycle`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cycle {
-    /// The `n` of an `Rn/…` prefix: the total number of times the cycle fires
-    /// (Zeebe fires an `R2/PT1M` cycle exactly twice, #1596). `None` for an
-    /// unbounded `R/…` cycle or a bare duration.
-    pub repetitions: Option<u32>,
-    /// The period between fires (and the initial delay), in milliseconds.
-    pub interval_millis: u64,
-}
-
-/// Parses an ISO-8601 repeating interval (`R/PT1H`, `R5/PT1H`, or a bare
-/// duration) into its repetition count and interval. Returns `None` if the
-/// repetition prefix or the interval is malformed, or the count is `R0`.
-pub fn parse_cycle(raw: &str) -> Option<Cycle> {
-    let s = raw.trim();
-    let (repetitions, interval) = match s.split_once('/') {
-        Some(_) => split_repetitions(s)?,
-        None => (None, s),
-    };
-    Some(Cycle {
-        repetitions,
-        interval_millis: parse_duration_millis(interval)?,
-    })
-}
-
-/// Splits the `R[n]/` repetition prefix off an ISO-8601 repeating interval,
-/// returning the count (`None` for an unbounded `R/`) and the remainder after
-/// the first `/`. Returns `None` if the prefix is malformed or the count is
-/// `R0` — a cycle that never fires is rejected rather than accepted as
-/// `Some(0)`: every arming path would otherwise schedule (and fire) the
-/// initial occurrence (#1596). The single source of the prefix grammar for
-/// both [`parse_cycle`] and the engine's full `timeCycle` parser (#1878).
-pub fn split_repetitions(s: &str) -> Option<(Option<u32>, &str)> {
-    let (repeat, rest) = s.split_once('/')?;
-    let count = repeat.strip_prefix('R')?;
-    let repetitions = if count.is_empty() {
-        None
-    } else if count.bytes().all(|b| b.is_ascii_digit()) {
-        match count.parse::<u32>().ok()? {
-            0 => return None,
-            n => Some(n),
-        }
-    } else {
-        return None;
-    };
-    Some((repetitions, rest))
-}
-
 /// Accumulates an integer-valued unit (`num` × `factor` nanoseconds). Returns
 /// `None` on an empty/invalid number or on `i128` overflow.
 fn add_unit(nanos: i128, num: &str, factor: i128) -> Option<i128> {
@@ -331,28 +273,6 @@ mod tests {
         // BPMN policy: no sign, no fractions.
         assert_eq!(parse_duration_millis("-PT5S"), None);
         assert_eq!(parse_duration_millis("PT1.5S"), None);
-    }
-
-    #[test]
-    fn bpmn_cycle() {
-        assert_eq!(parse_cycle_millis("R/PT1H"), Some(3_600_000));
-        assert_eq!(parse_cycle_millis("R5/PT1H"), Some(3_600_000));
-        assert_eq!(parse_cycle_millis("PT1H"), Some(3_600_000));
-        assert_eq!(parse_cycle_millis("X/PT1H"), None);
-        assert_eq!(parse_cycle_millis("Rx/PT1H"), None);
-        assert_eq!(
-            parse_cycle("R2/PT1M"),
-            Some(Cycle {
-                repetitions: Some(2),
-                interval_millis: 60_000
-            })
-        );
-        assert_eq!(parse_cycle("R/PT1M").and_then(|c| c.repetitions), None);
-        assert_eq!(parse_cycle("PT1M").and_then(|c| c.repetitions), None);
-        // Zero repetitions is rejected, never armed (#1596).
-        assert_eq!(parse_cycle("R0/PT1M"), None);
-        assert_eq!(parse_cycle("R00/PT1M"), None);
-        assert_eq!(parse_cycle_millis("R0/PT1M"), None);
     }
 
     #[test]
@@ -472,8 +392,7 @@ mod tests {
             // Same class in the time part: a trailing unit-less digit.
             assert_eq!(parse_duration_nanos("PT1H2", form), None);
         }
-        // And through the BPMN millis/cycle entry points callers actually use.
+        // And through the BPMN millis entry point callers actually use.
         assert_eq!(parse_duration_millis("P1T2H"), None);
-        assert_eq!(parse_cycle_millis("R/P1T2H"), None);
     }
 }

@@ -30,7 +30,7 @@ mod memory;
 mod migration;
 mod modify;
 mod resolve;
-mod timer_cycle;
+pub(crate) mod timer_cycle;
 pub use debug::{BreakCondition, DebugSession};
 use resolve::{rearm_repetitions, JobProps, ResolvedUserTask};
 
