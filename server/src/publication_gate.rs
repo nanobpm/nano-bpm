@@ -37,7 +37,7 @@
 //! non-Raft node. With peers or under Raft they keep route-before-answer (see
 //! `ServerImpl::answer_and_route_create`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -255,73 +255,165 @@ pub(crate) const FAILED_OPEN_REDRIVE_AGE: Duration = Duration::from_secs(10);
 /// How often the background re-drive scans for due undelivered opens.
 pub(crate) const FAILED_OPEN_REDRIVE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// One undelivered `MessageSubscriptionOpening` awaiting background re-drive.
+/// One undelivered subscription open/close awaiting background re-drive.
 struct FailedOpen {
     since: tokio::time::Instant,
     event: Event,
     operation_reference: Option<i64>,
 }
 
-/// Node-wide queue of cross-partition subscription opens whose routing failed
-/// (#1866). Unbounded in attempts: an entry leaves only when re-driven (a
-/// re-drive that fails again records it afresh). Cheap to clone.
+/// The subscription a keyed (`delivery_key != 0`) open/close addresses, and
+/// whether it is a close. `None` for any other (or an unkeyed) event: an
+/// unkeyed delivery has no recipient dedup, so re-driving it could apply it
+/// twice.
+fn routed_subscription(event: &Event) -> Option<(u64, bool)> {
+    match event {
+        Event::MessageSubscriptionOpening {
+            subscription_key,
+            delivery_key,
+            ..
+        } if *delivery_key != 0 => Some((*subscription_key, false)),
+        Event::MessageSubscriptionClosing {
+            subscription_key,
+            delivery_key,
+            ..
+        } if *delivery_key != 0 => Some((*subscription_key, true)),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct FailedOpensInner {
+    queue: Vec<FailedOpen>,
+    /// Subscriptions whose open a re-drive pass is delivering right now.
+    in_flight: HashSet<u64>,
+    /// In-flight opens a close superseded meanwhile: should that open fail
+    /// again it is dropped, never re-queued (#1866).
+    superseded: HashSet<u64>,
+}
+
+/// Node-wide queue of cross-partition subscription opens (and the closes that
+/// supersede them) whose routing failed (#1866). Unbounded in attempts: an
+/// entry leaves only when re-driven (a re-drive that fails again records it
+/// afresh). It holds the **latest intent** per subscription: a close routed
+/// (or queued) for a subscription drops its queued open, so a cancelled
+/// instance's open is never re-driven into a live subscription — whether the
+/// close was delivered (its recipient tombstone may later be evicted) or
+/// itself exhausted during the same outage (then the close is re-driven
+/// instead). Cheap to clone.
 #[derive(Clone, Default)]
 pub(crate) struct FailedOpens {
-    inner: Arc<Mutex<Vec<FailedOpen>>>,
+    inner: Arc<Mutex<FailedOpensInner>>,
 }
 
 impl FailedOpens {
-    /// Records every keyed `MessageSubscriptionOpening` in `events` as
-    /// undelivered now. Other events are ignored. Returns how many were recorded.
+    /// Records every keyed subscription open/close in `events` as undelivered
+    /// now. Other events are ignored. Returns how many were recorded.
     pub(crate) fn record(&self, events: &[Event], operation_reference: Option<i64>) -> usize {
         let now = tokio::time::Instant::now();
-        let mut q = self.lock();
-        let before = q.len();
-        q.extend(
-            events
-                .iter()
-                // An unkeyed (legacy, `delivery_key == 0`) open has no
-                // recipient dedup, so re-driving it could apply it twice.
-                .filter(|e| {
-                    matches!(e, Event::MessageSubscriptionOpening { delivery_key, .. } if *delivery_key != 0)
+        let mut g = self.lock();
+        let mut recorded = 0;
+        for event in events {
+            let Some((key, is_close)) = routed_subscription(event) else {
+                continue;
+            };
+            if is_close {
+                g.supersede(key);
+                g.queue
+                    .retain(|f| routed_subscription(&f.event) != Some((key, true)));
+            } else if g.superseded.contains(&key)
+                || g.queue.iter().any(|f| {
+                    routed_subscription(&f.event).is_some_and(|(k, close)| k == key && close)
                 })
-                .map(|e| FailedOpen {
-                    since: now,
-                    event: e.clone(),
-                    operation_reference,
-                }),
-        );
-        q.len() - before
+            {
+                // A close already superseded this open.
+                continue;
+            } else {
+                g.queue
+                    .retain(|f| routed_subscription(&f.event).map(|(k, _)| k) != Some(key));
+            }
+            g.queue.push(FailedOpen {
+                since: now,
+                event: event.clone(),
+                operation_reference,
+            });
+            recorded += 1;
+        }
+        recorded
     }
 
-    /// Removes and returns every open pending at least
-    /// [`FAILED_OPEN_REDRIVE_AGE`].
+    /// Notes that a close for `event`'s subscription is being routed: any
+    /// queued open of it is dropped and an in-flight one will not be
+    /// re-queued. A no-op for any event that is not a keyed close.
+    pub(crate) fn note_routing(&self, event: &Event) {
+        if let Some((key, true)) = routed_subscription(event) {
+            self.lock().supersede(key);
+        }
+    }
+
+    /// Removes and returns every entry pending at least
+    /// [`FAILED_OPEN_REDRIVE_AGE`], marking it in flight until
+    /// [`Self::finish`].
     pub(crate) fn take_due(&self) -> Vec<(Event, Option<i64>)> {
         let now = tokio::time::Instant::now();
-        let mut q = self.lock();
-        let (due, keep): (Vec<_>, Vec<_>) = q
+        let mut g = self.lock();
+        let (due, keep): (Vec<_>, Vec<_>) = g
+            .queue
             .drain(..)
             .partition(|f| now.saturating_duration_since(f.since) >= FAILED_OPEN_REDRIVE_AGE);
-        *q = keep;
+        g.queue = keep;
+        for f in &due {
+            if let Some((key, false)) = routed_subscription(&f.event) {
+                g.in_flight.insert(key);
+            }
+        }
         due.into_iter()
             .map(|f| (f.event, f.operation_reference))
             .collect()
     }
 
-    /// Number of opens awaiting re-drive.
+    /// Ends the in-flight window of a re-driven entry taken by
+    /// [`Self::take_due`].
+    pub(crate) fn finish(&self, event: &Event) {
+        if let Some((key, false)) = routed_subscription(event) {
+            let mut g = self.lock();
+            g.in_flight.remove(&key);
+            g.superseded.remove(&key);
+        }
+    }
+
+    /// Number of entries awaiting re-drive.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.lock().len()
+        self.lock().queue.len()
     }
 
-    /// Whether no open awaits re-drive.
+    /// Whether no entry awaits re-drive.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.lock().queue.is_empty()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<FailedOpen>> {
+    /// The queued events, oldest first.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> Vec<Event> {
+        self.lock().queue.iter().map(|f| f.event.clone()).collect()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FailedOpensInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl FailedOpensInner {
+    /// A close for subscription `key` supersedes its open: drop a queued
+    /// open, and keep an in-flight one from being re-queued.
+    fn supersede(&mut self, key: u64) {
+        self.queue
+            .retain(|f| routed_subscription(&f.event) != Some((key, false)));
+        if self.in_flight.contains(&key) {
+            self.superseded.insert(key);
+        }
     }
 }
 
@@ -364,6 +456,60 @@ mod tests {
         }
     }
 
+    fn closing(name: &str, key: &str) -> Event {
+        Event::MessageSubscriptionClosing {
+            subscription_key: 1,
+            instance_key: 2,
+            element_instance_key: 3,
+            element_id: "catch".into(),
+            message_name: name.into(),
+            correlation_key: key.into(),
+            delivery_key: 5,
+        }
+    }
+
+    /// #1866: a close routed for a subscription (delivered, so only its
+    /// bounded recipient tombstone protects) drops the queued open, so the
+    /// re-drive can never reopen it after the tombstone is evicted.
+    #[tokio::test]
+    async fn a_routed_close_drops_the_queued_open() {
+        let q = FailedOpens::default();
+        assert_eq!(q.record(&[opening("m", "k")], None), 1);
+        q.note_routing(&closing("m", "k"));
+        assert!(q.is_empty(), "the open is superseded by the close");
+    }
+
+    /// #1866: a close that also exhausted during the outage replaces the
+    /// queued open (the close is re-driven, never the open), and a later
+    /// re-record of the open cannot resurrect it.
+    #[tokio::test]
+    async fn an_exhausted_close_replaces_the_queued_open() {
+        let q = FailedOpens::default();
+        q.record(&[opening("m", "k")], None);
+        assert_eq!(q.record(&[closing("m", "k")], None), 1);
+        assert_eq!(q.queued(), vec![closing("m", "k")]);
+        assert_eq!(q.record(&[opening("m", "k")], None), 0);
+        assert_eq!(q.queued(), vec![closing("m", "k")]);
+    }
+
+    /// #1866: an open taken for re-drive that a close supersedes while in
+    /// flight is not re-queued when that re-drive fails again.
+    #[tokio::test]
+    async fn an_in_flight_open_superseded_by_a_close_is_not_requeued() {
+        tokio::time::pause();
+        let q = FailedOpens::default();
+        q.record(&[opening("m", "k")], None);
+        tokio::time::advance(FAILED_OPEN_REDRIVE_AGE).await;
+        let due = q.take_due();
+        assert_eq!(due.len(), 1);
+        q.note_routing(&closing("m", "k"));
+        assert_eq!(q.record(&[opening("m", "k")], None), 0, "superseded");
+        q.finish(&opening("m", "k"));
+        assert!(q.is_empty());
+        // After the window closes a fresh open of the key is queued again.
+        assert_eq!(q.record(&[opening("m", "k")], None), 1);
+    }
+
     /// A fails and wakes the parked waiter, but B re-registers the same key
     /// before the waiter resumes; B completing must not mask A's failure.
     #[tokio::test]
@@ -399,7 +545,7 @@ mod tests {
         assert_eq!(waiter.await.expect("join"), GateWait::TimedOut);
     }
 
-    /// #1866: only openings are recorded, and an entry becomes due only once
+    /// #1866: only keyed opens/closes are recorded, and an entry becomes due only once
     /// it has been pending [`FAILED_OPEN_REDRIVE_AGE`] (fake time).
     #[tokio::test(start_paused = true)]
     async fn failed_opens_become_due_after_the_minimum_age() {
@@ -411,7 +557,8 @@ mod tests {
             element_id: "catch".into(),
             message_name: "m".into(),
             correlation_key: "k".into(),
-            delivery_key: 4,
+            // Unkeyed: no recipient dedup, so never re-driven.
+            delivery_key: 0,
         };
         let mut unkeyed = opening("m", "k");
         if let Event::MessageSubscriptionOpening { delivery_key, .. } = &mut unkeyed {
