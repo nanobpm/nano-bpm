@@ -11050,14 +11050,10 @@ mod tests {
             Command::SetLenientCompletion { lenient: true },
         );
         apply_on_both(&mut leader, &mut follower, Command::DeployProcess(demo()));
-        let key = apply_on_both(
-            &mut leader,
-            &mut follower,
-            Command::create_instance("demo"),
-        )
-        .iter()
-        .find_map(|e| e.instance_key())
-        .unwrap();
+        let key = apply_on_both(&mut leader, &mut follower, Command::create_instance("demo"))
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
         let job = leader
             .engine()
             .state()
@@ -11183,9 +11179,9 @@ mod tests {
             follower.force_cold_spill_all();
         };
         let step = |command: Command,
-                        leader: &mut Journal,
-                        follower: &mut Journal,
-                        known: &mut Vec<Key>| {
+                    leader: &mut Journal,
+                    follower: &mut Journal,
+                    known: &mut Vec<Key>| {
             housekeep(follower, known);
             let events = apply_on_both(leader, follower, command);
             for e in &events {
