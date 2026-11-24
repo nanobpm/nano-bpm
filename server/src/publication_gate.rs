@@ -23,7 +23,14 @@
 //! the guard with [`PendingOpens::complete`] only when routing applied every
 //! open; any other end — [`PendingOpens::fail`] or a bare drop — releases the
 //! keys as **failed**, and a publish waiting on a failed key observes
-//! [`GateWait::Failed`] (a retryable refusal) instead of `Released`.
+//! [`GateWait::Failed`] instead of `Released`. The publish then proceeds as
+//! today (a publish with no open subscription is dropped; a correlate returns
+//! not-found) while the owner records the undelivered opens in
+//! [`FailedOpens`], which a background task re-drives Zeebe-style
+//! (`PendingMessageSubscriptionChecker`): every
+//! [`FAILED_OPEN_REDRIVE_INTERVAL`], each open pending longer than
+//! [`FAILED_OPEN_REDRIVE_AGE`] is routed again, unbounded, until delivered.
+//! Buffering the message itself (TTL) is the follow-up parity gap.
 //!
 //! The registry is node-local: it orders only publishes that apply on the node
 //! whose create owner routes the opens. Creates answer early only on a single
@@ -81,8 +88,9 @@ pub(crate) enum GateWait {
     /// The publish waited until every pending open was routed.
     Released,
     /// A pending open was released WITHOUT being routed (#1866): the pump
-    /// failed, so the subscription may not exist. The caller rejects the
-    /// publish as retryable rather than discarding it as unmatched.
+    /// failed, so the subscription may not exist yet. The caller proceeds as
+    /// for an unmatched publication; the open itself is re-driven in the
+    /// background ([`FailedOpens`]).
     Failed,
     /// The deadline elapsed with an open still pending; the caller rejects the
     /// publish as retryable rather than applying it against a missing
@@ -182,11 +190,10 @@ impl PublicationGate {
         // owner failing in between can never make a waiter see "cleared"
         // without having captured the failed notifier.
         let mut observed: Vec<Arc<Release>> = Vec::new();
-        let any_failed = |observed: &[Arc<Release>]| observed.iter().any(|r| r.failed());
         let cleared = |observed: &[Arc<Release>]| {
             if observed.is_empty() {
                 GateWait::Clear
-            } else if any_failed(observed) {
+            } else if observed.iter().any(|r| r.failed()) {
                 GateWait::Failed
             } else {
                 GateWait::Released
@@ -224,11 +231,11 @@ impl PublicationGate {
                 }
             }
             if tokio::time::timeout_at(until, notified).await.is_err() {
-                // A failure already observed (on this or a replaced notifier)
-                // reports the failure, not just the timeout.
+                // An open still pending at the deadline is a timeout even if
+                // an overlapping registration of the key failed: the pending
+                // open may yet apply, so the caller refuses retryably.
                 let guard = self.lock();
                 return match guard.get(&key) {
-                    Some(p) if p.released.failed() || any_failed(&observed) => GateWait::Failed,
                     Some(_) => GateWait::TimedOut,
                     None => cleared(&observed),
                 };
@@ -238,6 +245,83 @@ impl PublicationGate {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<OpenKey, Pending>> {
         self.inner.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// How long an undelivered open must have been pending before the background
+/// re-drive retries it (Zeebe's `PendingMessageSubscriptionChecker` uses a
+/// similar minimum age so an in-flight delivery is not duplicated).
+pub(crate) const FAILED_OPEN_REDRIVE_AGE: Duration = Duration::from_secs(10);
+/// How often the background re-drive scans for due undelivered opens.
+pub(crate) const FAILED_OPEN_REDRIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// One undelivered `MessageSubscriptionOpening` awaiting background re-drive.
+struct FailedOpen {
+    since: tokio::time::Instant,
+    event: Event,
+    operation_reference: Option<i64>,
+}
+
+/// Node-wide queue of cross-partition subscription opens whose routing failed
+/// (#1866). Unbounded in attempts: an entry leaves only when re-driven (a
+/// re-drive that fails again records it afresh). Cheap to clone.
+#[derive(Clone, Default)]
+pub(crate) struct FailedOpens {
+    inner: Arc<Mutex<Vec<FailedOpen>>>,
+}
+
+impl FailedOpens {
+    /// Records every keyed `MessageSubscriptionOpening` in `events` as
+    /// undelivered now. Other events are ignored. Returns how many were recorded.
+    pub(crate) fn record(&self, events: &[Event], operation_reference: Option<i64>) -> usize {
+        let now = tokio::time::Instant::now();
+        let mut q = self.lock();
+        let before = q.len();
+        q.extend(
+            events
+                .iter()
+                // An unkeyed (legacy, `delivery_key == 0`) open has no
+                // recipient dedup, so re-driving it could apply it twice.
+                .filter(|e| {
+                    matches!(e, Event::MessageSubscriptionOpening { delivery_key, .. } if *delivery_key != 0)
+                })
+                .map(|e| FailedOpen {
+                    since: now,
+                    event: e.clone(),
+                    operation_reference,
+                }),
+        );
+        q.len() - before
+    }
+
+    /// Removes and returns every open pending at least
+    /// [`FAILED_OPEN_REDRIVE_AGE`].
+    pub(crate) fn take_due(&self) -> Vec<(Event, Option<i64>)> {
+        let now = tokio::time::Instant::now();
+        let mut q = self.lock();
+        let (due, keep): (Vec<_>, Vec<_>) = q
+            .drain(..)
+            .partition(|f| now.saturating_duration_since(f.since) >= FAILED_OPEN_REDRIVE_AGE);
+        *q = keep;
+        due.into_iter()
+            .map(|f| (f.event, f.operation_reference))
+            .collect()
+    }
+
+    /// Number of opens awaiting re-drive.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether no open awaits re-drive.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<FailedOpen>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -299,9 +383,10 @@ mod tests {
         assert_eq!(waiter.await.expect("join"), GateWait::Failed);
     }
 
-    /// Same, but the waiter's deadline elapses while B is still pending.
+    /// Same, but the waiter's deadline elapses while B is still pending: B may
+    /// yet apply, so the wait is a timeout (the caller refuses retryably).
     #[tokio::test]
-    async fn replaced_failure_is_reported_on_the_deadline_path() {
+    async fn still_pending_after_a_replaced_failure_times_out() {
         let gate = PublicationGate::default();
         let a = gate.register(&[opening("m", "k")]).expect("a");
         let waiter = {
@@ -311,7 +396,36 @@ mod tests {
         tokio::task::yield_now().await;
         a.fail();
         let _b = gate.register(&[opening("m", "k")]).expect("b");
-        assert_eq!(waiter.await.expect("join"), GateWait::Failed);
+        assert_eq!(waiter.await.expect("join"), GateWait::TimedOut);
+    }
+
+    /// #1866: only openings are recorded, and an entry becomes due only once
+    /// it has been pending [`FAILED_OPEN_REDRIVE_AGE`] (fake time).
+    #[tokio::test(start_paused = true)]
+    async fn failed_opens_become_due_after_the_minimum_age() {
+        let q = FailedOpens::default();
+        let other = Event::MessageSubscriptionClosing {
+            subscription_key: 1,
+            instance_key: 2,
+            element_instance_key: 3,
+            element_id: "catch".into(),
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            delivery_key: 4,
+        };
+        let mut unkeyed = opening("m", "k");
+        if let Event::MessageSubscriptionOpening { delivery_key, .. } = &mut unkeyed {
+            *delivery_key = 0;
+        }
+        assert_eq!(q.record(&[opening("m", "k"), other, unkeyed], Some(7)), 1);
+        assert!(q.take_due().is_empty(), "too young to re-drive");
+        tokio::time::advance(FAILED_OPEN_REDRIVE_AGE - Duration::from_millis(1)).await;
+        assert!(q.take_due().is_empty());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let due = q.take_due();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1, Some(7));
+        assert_eq!(q.len(), 0, "a taken entry leaves the queue");
     }
 
     #[tokio::test]
@@ -461,16 +575,16 @@ mod tests {
     }
 
     /// Deadline path: one overlapping registration failed while another is
-    /// still pending at the deadline — the waiter reports the failure.
+    /// still pending at the deadline — the pending open wins: a timeout.
     #[tokio::test]
-    async fn a_deadline_on_a_failed_key_reports_failed() {
+    async fn a_deadline_on_a_still_pending_failed_key_times_out() {
         let gate = PublicationGate::default();
         let failed = gate.register(&[opening("m", "k")]).expect("failed");
         let _stuck = gate.register(&[opening("m", "k")]).expect("stuck");
         failed.fail();
         assert_eq!(
             gate.wait("m", "k", Duration::from_millis(20)).await,
-            GateWait::Failed
+            GateWait::TimedOut
         );
     }
 
