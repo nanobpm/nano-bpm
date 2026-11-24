@@ -1,0 +1,66 @@
+{
+  "name": "timer-cycle-cron",
+  "bpmn": "process.bpmn",
+  "backends": ["nano"],
+  "processId": "parity-timer-cycle-cron",
+  "variables": {},
+  "steps": [
+    {
+      "op": "advanceTime",
+      "ms": 900000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 900000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 36000000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 172800000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 2592000000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 604800000
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "work",
+      "variables": {
+        "done": true
+      }
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": {
+      "done": true
+    },
+    "jobsCreated": {
+      "work": 1
+    },
+    "completedElements": {
+      "StartEvent_1": 1,
+      "Task_Work": 1,
+      "EndEvent_1": 1,
+      "Timer_1": 6,
+      "End_T1": 6,
+      "Timer_2": 4,
+      "End_T2": 4,
+      "Timer_3": 1,
+      "End_T3": 1,
+      "Timer_4": 2,
+      "End_T4": 2,
+      "Timer_5": 3,
+      "End_T5": 3,
+      "Timer_6": 1,
+      "End_T6": 1
+    }
+  }
+}
