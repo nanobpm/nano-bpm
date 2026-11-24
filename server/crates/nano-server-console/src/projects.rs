@@ -3548,6 +3548,9 @@ pub(crate) struct DataGatewayLimiter {
     concurrency: usize,
     queue: usize,
     timeout: std::time::Duration,
+    /// Resident `urban data --serve` workers, bounded by this limiter's
+    /// budget (#1836).
+    workers: urban_data_worker::WorkerRegistry,
 }
 
 impl DataGatewayLimiter {
@@ -3578,6 +3581,7 @@ impl DataGatewayLimiter {
             concurrency,
             queue,
             timeout: timeout.max(std::time::Duration::from_millis(1)),
+            workers: urban_data_worker::WorkerRegistry::default(),
         }
     }
 
@@ -4034,6 +4038,8 @@ async fn pipe_data_gateway_limited(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
     let _permit = limiter.acquire().await?;
+    // Idle resident serve workers count against the same live-process budget.
+    urban_data_worker::enforce_resident_budget(limiter, None);
 
     cmd.env("NO_COLOR", "1")
         .stdin(std::process::Stdio::piped())
@@ -4889,7 +4895,7 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     // resurrect as an imported project once its directory is gone.
     let workspace_dir = projects_root().join(name);
     // #1836: no `urban data --serve` worker may outlive (or pin) its project.
-    urban_data_worker::retire_project_worker(&dir);
+    urban_data_worker::retire_project_worker(data_gateway_limiter(), &dir);
     if workspace_dir.is_dir() {
         // Drop a coexisting ref before removing the directory; propagate an IO
         // error so a pointer that can't be removed can't silently resurrect the
@@ -4927,7 +4933,7 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     // external path and move the workspace project outside the root.
     let from = projects_root().join(old);
     // #1836: the worker is keyed on (and anchored in) the old directory.
-    urban_data_worker::retire_project_worker(&from);
+    urban_data_worker::retire_project_worker(data_gateway_limiter(), &from);
     if !from.is_dir() {
         // A pure imported-by-reference project (no workspace dir) can't be
         // renamed by a directory move; remove and re-import under the new name.

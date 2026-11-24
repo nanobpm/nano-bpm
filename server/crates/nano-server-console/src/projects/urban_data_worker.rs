@@ -5,30 +5,41 @@
 //! paid a cold Node start. `@nanobpm/urban` >= 0.100.0 ships a serve mode
 //! (nanobpm/nano-ide#627): one JSON request per stdin line carrying an `id`,
 //! one JSON reply per stdout line echoing it, errors as replies, a clean exit
-//! on stdin EOF. This module keeps exactly one such worker alive per project
+//! on stdin EOF. This module keeps at most one such worker alive per project
 //! directory and pipes every op through it, so once the worker is warm no data
 //! request starts a new process.
 //!
 //! Lifecycle:
 //! - **Spawned lazily** on the first op for a project.
+//! - **Bounded**: the registry lives on the [`DataGatewayLimiter`], and every
+//!   admitted op (serve *or* single-shot) evicts least-recently-used idle
+//!   workers so `idle resident workers + running ops <= concurrency` — #1329's
+//!   console-wide live-process bound holds. Workers idle past [`IDLE_TTL`] are
+//!   retired on the next sweep too.
 //! - **Restarted on crash**: a worker that has exited (or whose pipe broke /
 //!   reached EOF mid-op) is reaped and a fresh one is spawned for the next op.
 //! - **Restarted on toolkit/manifest change**: each op recomputes
-//!   [`toolkit_fingerprint`] (the resolved `urban` binary + its on-disk stamp +
-//!   the `nano.app.json` bytes); a mismatch retires the old worker first.
-//! - **Desync-safe**: the worker stays in its slot for the whole exchange, so an
-//!   op cancelled mid-exchange leaves it there marked `in_flight`; the next op
-//!   kills its whole process group rather than reading a stale reply.
+//!   [`toolkit_fingerprint`] ([`crate::urban::toolkit_identity`] — the binary,
+//!   its target, and its enclosing package's `package.json` + `dist/cli.js` —
+//!   plus the `nano.app.json` bytes and the directory's identity); a mismatch
+//!   retires the old worker first.
+//! - **Cancellation-safe**: an op cancelled mid-exchange kills its worker's
+//!   process group at once (drop guard) and reaps it in the background, so a
+//!   hung or abandoned write never keeps running or holding locks.
+//! - **One deadline per op**: waiting for the project's worker, for gateway
+//!   admission and for the reply all share the limiter's single timeout; the
+//!   per-project wait queue is bounded (Busy back-pressure) and holds no
+//!   execution permit.
 //! - **Retired with its project**: deleting or renaming a project calls
-//!   [`retire_project_worker`], which drops the slot and kills the worker, and
-//!   the fingerprint includes the directory's identity so a project recreated
-//!   under the same path never reuses a worker anchored in the deleted one.
+//!   [`retire_project_worker`], which drops the slot and kills the worker.
 //! - **Orphan-free**: the console holds the worker's stdin, so if the console
 //!   dies the worker sees EOF and exits; timeouts kill its whole process group.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -38,7 +49,9 @@ use super::{DataError, DataGatewayLimiter};
 /// How much of the worker's most recent stderr we keep to explain a crash.
 const STDERR_TAIL_BYTES: usize = 2048;
 /// Grace for a retired worker to exit on stdin EOF before it is killed.
-const RETIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const RETIRE_GRACE: Duration = Duration::from_secs(2);
+/// An idle worker unused for this long is retired on the next sweep.
+const IDLE_TTL: Duration = Duration::from_secs(300);
 
 struct Worker {
     child: Child,
@@ -47,30 +60,46 @@ struct Worker {
     fingerprint: u64,
     next_id: u64,
     /// Set while a request is written but its reply not yet read; a worker
-    /// found in this state (its op was cancelled) is retired, never reused.
+    /// found in this state is retired, never reused.
     in_flight: bool,
+    last_used: Instant,
     stderr_tail: Arc<Mutex<String>>,
 }
 
-type Slot = Arc<tokio::sync::Mutex<Option<Worker>>>;
-
-fn slots() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Slot>> {
-    static SLOTS: OnceLock<Mutex<HashMap<PathBuf, Slot>>> = OnceLock::new();
-    SLOTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+#[derive(Default)]
+struct SlotInner {
+    /// Ops waiting for (or holding) this project's worker.
+    waiters: AtomicUsize,
+    worker: tokio::sync::Mutex<Option<Worker>>,
 }
+
+type Slot = Arc<SlotInner>;
 
 /// The per-project worker slots, keyed on the canonical project directory.
-fn slot_for(dir: &Path) -> Slot {
-    slots().entry(dir.to_path_buf()).or_default().clone()
-}
+/// Owned by a [`DataGatewayLimiter`], so its budget bounds them.
+#[derive(Default)]
+pub(crate) struct WorkerRegistry(Mutex<HashMap<PathBuf, Slot>>);
 
-/// Whether `slot` is still the registered slot for `dir` (it is not once
-/// [`retire_project_worker`] has dropped it).
-fn slot_is_registered(dir: &Path, slot: &Slot) -> bool {
-    slots().get(dir).is_some_and(|s| Arc::ptr_eq(s, slot))
+impl WorkerRegistry {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Slot>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn slot_for(&self, dir: &Path) -> Slot {
+        self.map().entry(dir.to_path_buf()).or_default().clone()
+    }
+
+    /// Whether `slot` is still the registered slot for `dir`.
+    fn is_registered(&self, dir: &Path, slot: &Slot) -> bool {
+        self.map().get(dir).is_some_and(|s| Arc::ptr_eq(s, slot))
+    }
+
+    fn snapshot(&self) -> Vec<(PathBuf, Slot)> {
+        self.map()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 /// Stop the project's worker (if any) and forget its slot: called when a
@@ -78,11 +107,11 @@ fn slot_is_registered(dir: &Path, slot: &Slot) -> bool {
 /// its directory as CWD, which blocks removal on Windows). An op in flight on
 /// the slot keeps its worker until it finishes, then kills it instead of
 /// parking it, because the slot is no longer registered.
-pub(super) fn retire_project_worker(dir: &Path) {
+pub(super) fn retire_project_worker(limiter: &DataGatewayLimiter, dir: &Path) {
     // Callers key on the canonical dir; accept either spelling here.
     let canon = dunce::canonicalize(dir).ok();
     let removed: Vec<Slot> = {
-        let mut map = slots();
+        let mut map = limiter.workers.map();
         [Some(dir.to_path_buf()), canon]
             .into_iter()
             .flatten()
@@ -90,39 +119,67 @@ pub(super) fn retire_project_worker(dir: &Path) {
             .collect()
     };
     for slot in removed {
-        retire_slot(&slot);
-    }
-}
-
-fn retire_slot(slot: &Slot) {
-    if let Ok(mut g) = slot.try_lock()
-        && let Some(mut w) = g.take()
-    {
-        if let Some(pid) = w.child.id() {
-            super::kill_group_by_pid(pid);
+        if let Ok(mut g) = slot.worker.try_lock()
+            && let Some(w) = g.take()
+        {
+            kill_now(w);
         }
-        // `kill_on_drop` reaps the wrapper; the group kill above got Node.
-        let _ = w.child.start_kill();
     }
 }
 
-/// Identity of the toolkit + manifest a worker was started against. Any change
-/// (a different resolved binary, an in-place reinstall bumping its mtime/size,
-/// or any `nano.app.json` edit) yields a different value and restarts the
-/// worker, so it never serves a stale toolkit or datasource declaration.
+/// Kill a worker's process group synchronously-ish (no await) and leave the
+/// wrapper to `kill_on_drop`.
+fn kill_now(mut w: Worker) {
+    if let Some(pid) = w.child.id() {
+        super::kill_group_by_pid(pid);
+    }
+    let _ = w.child.start_kill();
+}
+
+/// Enforce the console-wide live-process budget (#1329). Called by every op
+/// right after it is admitted (holding a permit): idle workers of *other*
+/// projects are retired, least-recently-used first, until
+/// `idle resident + running ops <= concurrency`; any idle past [`IDLE_TTL`]
+/// goes too. Busy slots (an op holds their lock) are running ops already
+/// counted by the permits.
+pub(super) fn enforce_resident_budget(limiter: &DataGatewayLimiter, keep: Option<&Path>) {
+    let running = limiter
+        .concurrency
+        .saturating_sub(limiter.permits.available_permits());
+    let allowed_idle = limiter.concurrency.saturating_sub(running);
+    let mut guards = Vec::new();
+    for (dir, slot) in limiter.workers.snapshot() {
+        if keep == Some(dir.as_path()) {
+            continue;
+        }
+        let last = match slot.worker.try_lock() {
+            Ok(g) => g.as_ref().map(|w| w.last_used),
+            Err(_) => None,
+        };
+        if let Some(last) = last {
+            guards.push((last, slot));
+        }
+    }
+    // Newest first; retire everything past the allowance or past the TTL.
+    guards.sort_by_key(|g| std::cmp::Reverse(g.0));
+    for (i, (last, slot)) in guards.into_iter().enumerate() {
+        if (i >= allowed_idle || last.elapsed() >= IDLE_TTL)
+            && let Ok(mut g) = slot.worker.try_lock()
+            && let Some(w) = g.take()
+        {
+            tracing::debug!(pid = ?w.child.id(), "data worker evicted (resident budget)");
+            kill_now(w);
+        }
+    }
+}
+
+/// Identity of the toolkit + manifest + project directory a worker was started
+/// against. Any change yields a different value and restarts the worker, so it
+/// never serves a stale toolkit or datasource declaration.
 fn toolkit_fingerprint(urban: &Path, dir: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    urban.hash(&mut h);
-    // `fs::metadata` follows symlinks, so a project-local `.bin/urban` link
-    // reflects its (reinstalled) target.
-    if let Ok(real) = std::fs::canonicalize(urban) {
-        real.hash(&mut h);
-    }
-    if let Ok(md) = std::fs::metadata(urban) {
-        md.len().hash(&mut h);
-        md.modified().ok().hash(&mut h);
-    }
+    crate::urban::toolkit_identity(urban).hash(&mut h);
     std::fs::read(dir.join("nano.app.json")).ok().hash(&mut h);
     // The directory's own identity: a project deleted and recreated at the
     // same path is a different directory, so its worker (whose CWD is the
@@ -186,6 +243,7 @@ fn spawn_worker(urban: &Path, dir: &Path, fingerprint: u64) -> Result<Worker, Da
         fingerprint,
         next_id: 1,
         in_flight: false,
+        last_used: Instant::now(),
         stderr_tail,
     })
 }
@@ -292,19 +350,85 @@ async fn exchange(
     }
 }
 
+/// Decrements a slot's waiter count when the op leaves (even if cancelled).
+struct Waiting(Slot);
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Armed while a request is on the wire: if the op's future is dropped
+/// (caller cancelled) before the reply is read, kill the worker's process
+/// group immediately and reap it in the background — no later request is
+/// needed to stop a hung or abandoned operation.
+struct InFlightGuard {
+    pid: Option<u32>,
+    slot: Slot,
+    armed: bool,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(pid) = self.pid {
+            super::kill_group_by_pid(pid);
+        }
+        let slot = self.slot.clone();
+        let pid = self.pid;
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let mut g = slot.worker.lock().await;
+                if g.as_ref()
+                    .is_some_and(|w| w.in_flight && w.child.id() == pid)
+                    && let Some(w) = g.take()
+                {
+                    kill_worker(w).await;
+                }
+            });
+        }
+    }
+}
+
+fn timed_out(limiter: &DataGatewayLimiter) -> DataError {
+    DataError::Gateway(format!(
+        "data gateway timed out after {:?}",
+        limiter.timeout
+    ))
+}
+
 /// Run one datasource op through the project's long-lived `urban data --serve`
-/// worker, spawning/restarting it as needed. Admission still goes through the
-/// console-wide [`DataGatewayLimiter`] (Busy back-pressure and the per-op
-/// timeout, #1329); ops for one project are serialised on its worker.
+/// worker, spawning/restarting it as needed. Ops for one project queue on its
+/// worker (bounded by the limiter's queue size, without holding an execution
+/// permit); admission then goes through the console-wide
+/// [`DataGatewayLimiter`] (Busy back-pressure, #1329). One deadline (the
+/// limiter's timeout) covers the project wait, admission and the exchange.
 pub(super) async fn run_serve_op(
     limiter: &DataGatewayLimiter,
     urban: &Path,
     dir: &Path,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
-    let _permit = limiter.acquire().await?;
-    let slot = slot_for(dir);
-    let mut guard = slot.lock().await;
+    let deadline = tokio::time::Instant::now() + limiter.timeout;
+    let slot = limiter.workers.slot_for(dir);
+    // Bound the per-project queue: at most one holder + `queue` waiters.
+    let prev = slot.waiters.fetch_add(1, Ordering::AcqRel);
+    let _waiting = Waiting(slot.clone());
+    if prev > limiter.queue {
+        return Err(DataError::Busy(format!(
+            "{} data ops already queued for this project; retry shortly",
+            limiter.queue
+        )));
+    }
+    let mut guard = tokio::time::timeout_at(deadline, slot.worker.lock())
+        .await
+        .map_err(|_| timed_out(limiter))?;
+    let _permit = tokio::time::timeout_at(deadline, limiter.acquire())
+        .await
+        .map_err(|_| timed_out(limiter))??;
+    enforce_resident_budget(limiter, Some(dir));
     let fingerprint = toolkit_fingerprint(urban, dir);
 
     if let Some(mut w) = guard.take() {
@@ -322,20 +446,27 @@ pub(super) async fn run_serve_op(
     if guard.is_none() {
         *guard = Some(spawn_worker(urban, dir, fingerprint)?);
     }
-    // The worker stays in the slot for the whole exchange: if this op is
-    // cancelled, the next op finds it `in_flight` and kills its process group.
     let result = match guard.as_mut() {
         Some(w) => {
             let id = w.next_id;
             w.next_id += 1;
-            tokio::time::timeout(limiter.timeout, exchange(w, id, request)).await
+            w.last_used = Instant::now();
+            let mut armed = InFlightGuard {
+                pid: w.child.id(),
+                slot: slot.clone(),
+                armed: true,
+            };
+            let r = tokio::time::timeout_at(deadline, exchange(w, id, request)).await;
+            armed.armed = false;
+            w.last_used = Instant::now();
+            r
         }
         None => Ok(Err(DataError::Gateway(
             "internal error: data worker slot empty".to_string(),
         ))),
     };
     let ok = matches!(result, Ok(Ok(_)));
-    if !ok || !slot_is_registered(dir, &slot) {
+    if !ok || !limiter.workers.is_registered(dir, &slot) {
         // Failed/timed-out (possibly desynced) worker, or one whose project was
         // retired while this op ran: never park it.
         if let Some(w) = guard.take() {
@@ -350,10 +481,7 @@ pub(super) async fn run_serve_op(
             super::interpret_gateway_reply(reply)
         }
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(DataError::Gateway(format!(
-            "data gateway timed out after {:?}",
-            limiter.timeout
-        ))),
+        Err(_) => Err(timed_out(limiter)),
     }
 }
 
@@ -462,7 +590,7 @@ mod tests {
         // state still answers 0, so also accept the stderr marker it wrote
         // right before exiting as proof it is past its last reply.
         while unsafe { libc::kill(pid, 0) } == 0
-            && !stderr_seen(&slot_for(&dir)).await
+            && !stderr_seen(&lim.workers.slot_for(&dir)).await
             && std::time::Instant::now() < deadline
         {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -475,7 +603,7 @@ mod tests {
     }
 
     async fn stderr_seen(slot: &Slot) -> bool {
-        let mut g = slot.lock().await;
+        let mut g = slot.worker.lock().await;
         let Some(w) = g.as_mut() else { return false };
         let exited = matches!(w.child.try_wait(), Ok(Some(_)));
         exited
@@ -518,8 +646,8 @@ mod tests {
         let a = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
             .await
             .unwrap();
-        retire_project_worker(&dir);
-        assert!(!slots().contains_key(&dir), "slot not forgotten");
+        retire_project_worker(&lim, &dir);
+        assert!(!lim.workers.map().contains_key(&dir), "slot not forgotten");
         let pid = a["pid"].as_i64().unwrap() as i32;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
@@ -559,10 +687,10 @@ mod tests {
         assert_eq!(spawn_count(&spawns), 2);
     }
 
-    /// An op cancelled mid-exchange leaves the worker in its slot marked
-    /// `in_flight`; the next op kills it and spawns a fresh one.
+    /// An op cancelled mid-exchange kills (and reaps) its worker by itself;
+    /// the next op spawns a fresh one.
     #[tokio::test]
-    async fn cancelled_op_retires_worker_on_next_op() {
+    async fn cancelled_op_kills_worker_without_another_request() {
         let dir = project("cancel");
         let spawns = dir.join("spawns.txt");
         let stub = dir.join("urban-slow-stub.sh");
@@ -586,14 +714,18 @@ mod tests {
         )
         .await;
         assert!(cancelled.is_err(), "slow op should have been cancelled");
-        {
-            let slot = slot_for(&dir);
-            let g = slot.lock().await;
-            assert!(
-                g.as_ref().is_some_and(|w| w.in_flight),
-                "worker not kept in_flight"
-            );
+        // Cancellation alone (no further request) terminates the worker.
+        let pid = a["pid"].as_i64().unwrap() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "cancelled op left its worker running"
+        );
         let b = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
             .await
             .unwrap();
@@ -647,5 +779,142 @@ mod tests {
             assert!(matches!(e, DataError::Op(ref m) if m == "bad sql"), "{e:?}");
         }
         assert_eq!(spawn_count(&spawns), 1);
+    }
+
+    /// Sequential ops across more projects than the concurrency never leave
+    /// more than `concurrency` workers resident (#1329 bound).
+    #[tokio::test]
+    async fn resident_workers_are_bounded_by_concurrency() {
+        let tk = project("bound-tk");
+        let spawns = tk.join("spawns.txt");
+        let stub = serve_stub(&tk, &spawns, 0);
+        let lim = limiter(); // concurrency 2
+        for i in 0..5 {
+            let dir = project(&format!("bound-{i}"));
+            run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+                .await
+                .unwrap();
+            let mut live = 0;
+            for (_, slot) in lim.workers.snapshot() {
+                if slot.worker.lock().await.is_some() {
+                    live += 1;
+                }
+            }
+            assert!(live <= 2, "{live} resident workers exceed concurrency 2");
+        }
+    }
+
+    /// A stub whose `*slow*` ops (or every op, with `all`) block until
+    /// `<dir>/gate` exists — deterministic ordering, no sleeps to race.
+    fn gated_stub(dir: &Path, spawns: &Path, all: bool) -> PathBuf {
+        let stub = dir.join("urban-gated-stub.sh");
+        let pat = if all { "*" } else { "*slow*" };
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\necho x >> '{spawns}'\nwhile IFS= read -r line; do\n\
+                 id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n\
+                 case \"$line\" in {pat}) while [ ! -f '{gate}' ]; do sleep 0.05; done;; esac\n\
+                 printf '{{\"id\":%s,\"ok\":true,\"pid\":%s}}\\n' \"$id\" \"$$\"\ndone\n",
+                spawns = spawns.display(),
+                gate = dir.join("gate").display(),
+            ),
+        );
+        stub
+    }
+
+    /// Ops queued on one blocked project hold no execution permit, so another
+    /// project still runs; and the project queue is bounded.
+    #[tokio::test]
+    async fn project_waiters_hold_no_permit_and_are_bounded() {
+        let slow_dir = project("waiters-slow");
+        let spawns = slow_dir.join("spawns.txt");
+        let stub = gated_stub(&slow_dir, &spawns, false);
+        let lim = Arc::new(DataGatewayLimiter::with_timeout(
+            2,
+            1,
+            std::time::Duration::from_secs(60),
+        ));
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (l, s, d) = (lim.clone(), stub.clone(), slow_dir.clone());
+            held.push(tokio::spawn(async move {
+                run_serve_op(&l, &s, &d, &serde_json::json!({"op":"slow"})).await
+            }));
+        }
+        // Wait (bounded) until both ops are registered on the project.
+        let slot = lim.workers.slot_for(&slow_dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while slot.waiters.load(Ordering::Acquire) < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(slot.waiters.load(Ordering::Acquire), 2);
+        // A third op for the same project exceeds holder + queue(1): Busy.
+        let busy = run_serve_op(&lim, &stub, &slow_dir, &serde_json::json!({"op":"slow"})).await;
+        assert!(matches!(busy, Err(DataError::Busy(_))), "{busy:?}");
+        // The queued waiter holds no permit: another project completes while
+        // the blocked project cannot progress (its gate is still closed).
+        let other = project("waiters-other");
+        run_serve_op(&lim, &stub, &other, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert!(held.iter().all(|h| !h.is_finished()));
+        std::fs::write(slow_dir.join("gate"), "").unwrap();
+        for h in held {
+            h.await.unwrap().unwrap();
+        }
+    }
+
+    /// Waiting for the project's worker counts against the op's deadline: a
+    /// queued op times out one timeout after it was issued, not after waiting
+    /// out the holder and then a full exchange timeout of its own.
+    #[tokio::test]
+    async fn project_wait_shares_the_op_deadline() {
+        let dir = project("deadline");
+        let spawns = dir.join("spawns.txt");
+        let stub = gated_stub(&dir, &spawns, true);
+        let timeout = std::time::Duration::from_millis(1500);
+        let lim = Arc::new(DataGatewayLimiter::with_timeout(2, 8, timeout));
+        let (l, s, d) = (lim.clone(), stub.clone(), dir.clone());
+        let first =
+            tokio::spawn(
+                async move { run_serve_op(&l, &s, &d, &serde_json::json!({"op":"a"})).await },
+            );
+        let slot = lim.workers.slot_for(&dir);
+        while slot.waiters.load(Ordering::Acquire) < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let t = std::time::Instant::now();
+        let second = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"b"})).await;
+        let elapsed = t.elapsed();
+        assert!(
+            matches!(second, Err(DataError::Gateway(ref m)) if m.contains("timed out")),
+            "{second:?}"
+        );
+        // Old behaviour: ~timeout waiting + a full timeout exchanging.
+        assert!(elapsed < timeout + timeout / 2, "{elapsed:?}");
+        assert!(first.await.unwrap().is_err(), "gate never opens");
+    }
+
+    /// An implementation update that leaves the launcher untouched (path,
+    /// size, mtime) still changes the toolkit identity.
+    #[test]
+    fn toolkit_identity_tracks_package_implementation() {
+        let pkg = project("ident");
+        std::fs::create_dir_all(pkg.join("bin")).unwrap();
+        std::fs::create_dir_all(pkg.join("dist")).unwrap();
+        let bin = pkg.join("bin").join("urban");
+        write_stub(&bin, "#!/bin/sh\n");
+        std::fs::write(pkg.join("package.json"), r#"{"version":"0.100.0"}"#).unwrap();
+        std::fs::write(pkg.join("dist").join("cli.js"), "a").unwrap();
+        let before = crate::urban::toolkit_identity(&bin);
+        let launcher = std::fs::metadata(&bin).unwrap().modified().unwrap();
+        std::fs::write(pkg.join("package.json"), r#"{"version":"0.99.0"}"#).unwrap();
+        std::fs::write(pkg.join("dist").join("cli.js"), "bb").unwrap();
+        assert_eq!(
+            std::fs::metadata(&bin).unwrap().modified().unwrap(),
+            launcher
+        );
+        assert_ne!(before, crate::urban::toolkit_identity(&bin));
     }
 }
