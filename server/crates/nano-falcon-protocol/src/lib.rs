@@ -905,14 +905,15 @@ pub enum ClientFrame {
     /// **Intra-cluster only.** A best-effort retirement digest broadcast by a
     /// partition leader to its followers under RF>1. Carries the instance keys the
     /// leader has completed and exporter-evicted locally for `partition`. Because
-    /// completion + eviction are leader-local (they never enter the raft log), a
-    /// follower replica applies each `CreateInstance` but never the matching
-    /// retirement, so completed instances accumulate as never-reaped `Active` shells
-    /// (the RF>1 hot-state leak). On receipt the follower drops these keys from its
-    /// replica engine (`nano_server_storage::journal::Journal::retire_instances`). Fire-and-forget
-    /// (no `corr`) and idempotent: a dropped/stale digest only delays retirement
-    /// (memory converges on the next digest), and a lagging learner that has not yet
-    /// applied a create simply ignores the miss (it is re-snapshotted from the leader).
+    /// eviction is leader-local (it never enters the raft log), a follower replica
+    /// would otherwise keep its own terminal copies resident (the RF>1 hot-state
+    /// leak). On receipt the follower reaps **only** those keys that are terminal in
+    /// its own applied state (`nano_server_storage::journal::Journal::retire_instances`,
+    /// #1908); a key that is still live, absent, or cold on the follower is ignored,
+    /// so a digest can never remove state the follower's replica still needs.
+    /// Fire-and-forget (no `corr`) and idempotent: a dropped/stale digest only delays
+    /// retirement, and a lagging follower reaps the key on a later digest/watermark
+    /// once it has applied the completion itself.
     #[serde(rename_all = "camelCase")]
     RetirementDigest {
         partition: u64,
@@ -920,11 +921,12 @@ pub enum ClientFrame {
     },
     /// Loss-tolerant reconciliation backstop for [`ClientFrame::RetirementDigest`]
     /// (RF>1). The partition owner broadcasts `low_water` — the smallest key still
-    /// `Active` on it — every tick; on receipt a follower drops every resident
-    /// replica instance below it (`nano_server_storage::journal::Journal::retire_below`). Unlike
-    /// the per-key digest this is idempotent and self-healing: because the mark is
-    /// re-sent each tick and reaps below it wholesale, a follower converges even
-    /// when best-effort per-key frames are dropped under load. Fire-and-forget (no
+    /// `Active` on it — every tick; on receipt a follower reaps resident replica
+    /// instances below it that are **terminal in its own applied state**
+    /// (`nano_server_storage::journal::Journal::retire_below`, #1908). Live, absent
+    /// and cold keys are ignored, so the mark never removes state the follower still
+    /// needs. Because the mark is re-sent each tick, a follower converges even when
+    /// best-effort per-key frames are dropped under load. Fire-and-forget (no
     /// `corr`); a dropped/stale watermark only delays convergence by a tick.
     #[serde(rename_all = "camelCase")]
     RetirementWatermark {
