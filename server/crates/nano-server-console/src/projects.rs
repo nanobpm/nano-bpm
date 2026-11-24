@@ -4518,13 +4518,20 @@ async fn run_data_op_inner(
     // project was retired. Re-resolve the project after leasing: a
     // retirement that completed before the lease (directory gone, or the
     // name no longer resolving here) is caught too.
+    // The lease tracks the canonical directory, which an alias shares with
+    // other names; the *name* binding is checked separately, here and again
+    // after the probes, because deleting one alias keeps the shared slot alive.
+    let name_still_binds = || {
+        project_dir(project)
+            .filter(|d| d.is_dir())
+            .map(|d| dunce::canonicalize(&d).unwrap_or(d))
+            .as_deref()
+            == Some(dir.as_path())
+    };
     let lease = if is_urban {
         let lease =
             urban_data_worker::lease(data_gateway_limiter(), &dir).ok_or(DataError::NoProject)?;
-        let still_here = project_dir(project)
-            .filter(|d| d.is_dir())
-            .map(|d| dunce::canonicalize(&d).unwrap_or(d));
-        if still_here.as_deref() != Some(dir.as_path()) {
+        if !name_still_binds() {
             return Err(DataError::NoProject);
         }
         Some(lease)
@@ -4545,6 +4552,11 @@ async fn run_data_op_inner(
         Some(u) if super::urban::urban_supports_data(&u).await => Some(u),
         _ => None,
     };
+    // #1881: a delete of this alias may have landed during the probes while a
+    // sibling alias keeps the shared lease valid — revalidate the name.
+    if is_urban && !name_still_binds() {
+        return Err(DataError::NoProject);
+    }
     match data_gateway_path(is_urban, urban.is_some()) {
         DataGatewayPath::UrbanData => {
             let urban = urban.ok_or_else(|| {
@@ -5048,13 +5060,41 @@ fn dir_shared_with_other_project(name: &str, dir: &Path) -> bool {
         } else {
             return false;
         };
-        if other == name {
+        if other == name || is_own_entry(name, &path) {
             return false;
         }
         project_dir(other)
             .filter(|d| d.is_dir())
             .is_some_and(|d| canon(&d) == target)
     })
+}
+
+/// Whether `path` is the very directory-entry `name` itself occupies (its
+/// workspace dir or reference file) under another spelling — e.g. `MyApp`
+/// listed by `read_dir` when deleting `myapp` on a case-insensitive
+/// filesystem. Compared by file identity, so genuinely distinct entries on a
+/// case-sensitive filesystem stay distinct (#1881).
+fn is_own_entry(name: &str, path: &Path) -> bool {
+    let own = [Some(projects_root().join(name)), project_ref_file(name)];
+    own.iter().flatten().any(|o| same_fs_entry(o, path))
+}
+
+fn same_fs_entry(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ma.dev() == mb.dev() && ma.ino() == mb.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows filesystems are case-insensitive: compare the names.
+        let _ = (ma, mb);
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    }
 }
 
 /// Renames a project directory and updates its persisted config name. Fails if
@@ -9045,6 +9085,35 @@ mod tests {
             ext.join("nano.app.json").is_file(),
             "external checkout untouched by a queued delete"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_dir_detection_ignores_the_deleted_names_own_entry_under_another_spelling() {
+        // Simulates a case-insensitive filesystem: `read_dir` lists the deleted
+        // name's own ref file under a different spelling (here a hard link).
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("caseins");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"c","name":"C"}"#,
+        )
+        .unwrap();
+        import_project_ref("myapp", ext.to_str().unwrap()).unwrap();
+        std::fs::hard_link(
+            project_ref_file("myapp").unwrap(),
+            projects_root().join("twin.project-ref.json"),
+        )
+        .unwrap();
+        let dir = project_dir("myapp").unwrap();
+        assert!(
+            !dir_shared_with_other_project("myapp", &dir),
+            "the deleted alias's own entry must not count as another project"
+        );
+        // A genuinely distinct alias still counts.
+        import_project_ref("other", ext.to_str().unwrap()).unwrap();
+        assert!(dir_shared_with_other_project("myapp", &dir));
     }
 
     #[test]
