@@ -61,6 +61,10 @@ crate-type = ["lib", "cdylib"]
 # under `cargo test`, not just when the example is executed against a live
 # corpus.
 [[example]]
+name = "snapshot_clone"
+required-features = ["serde"]
+
+[[example]]
 name = "feel_diff"
 test = true
 
