@@ -3964,7 +3964,12 @@ fn should_reject_a_message_event_referencing_an_unknown_message() {
 fn should_parse_iso8601_cycles() {
     assert_eq!(parse_iso8601_cycle("R/PT10S"), Some(10_000));
     assert_eq!(parse_iso8601_cycle("R5/PT1H"), Some(3_600_000));
-    assert_eq!(parse_iso8601_cycle(" R/PT1M30S "), Some(90_000));
+    assert_eq!(parse_iso8601_cycle("R/PT1M30S"), Some(90_000));
+    // One grammar with the engine (#1878): no trimming, Zeebe R0/R-1 counts.
+    assert_eq!(parse_iso8601_cycle(" R/PT1M30S "), None);
+    assert_eq!(parse_iso8601_cycle("R0/PT1M"), Some(60_000));
+    assert_eq!(parse_iso8601_cycle("R-1/PT1M"), Some(60_000));
+    assert_eq!(parse_iso8601_cycle("Rx/PT1H"), None);
     assert_eq!(parse_iso8601_cycle("PT10S"), Some(10_000));
     assert_eq!(parse_iso8601_cycle("PT10S/R"), None);
     assert_eq!(parse_iso8601_cycle("R/bogus"), None);

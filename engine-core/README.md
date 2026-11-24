@@ -270,6 +270,23 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   (`timeDuration`) is retained with no due time (`next_due_at: None`) so it never
   fires again. Like all timers the engine stays **clock-free** and the schedule is
   durable across restarts.
+- **Timer cycle dialects (Zeebe parity, #1878)** — every `timeCycle` (timer
+  start event, cycle boundary, event sub-process timer start) accepts the same
+  forms Zeebe does, statically or as a FEEL expression: an ISO-8601 repeating
+  interval `R[n]/<duration>`, one **with a start date** `R[n]/<start>/<duration>`
+  (first due at the start, or immediately if it is past), and a Spring-style
+  6-field **cron** expression (`0 0 */12 * * ?`, `L`, `W`, `#`, `MON-FRI`,
+  `@daily` macros; evaluated in UTC; unbounded). Zeebe's end-date form
+  `R[n]/<duration>/<end>` is rejected, as Zeebe rejects it. The FEEL `cycle()`
+  built-in (`cycle(duration("PT1H"))` → `"R/PT1H"`, `cycle(3, …)` → `"R3/…"`)
+  is supported, and a timer start expression can read cluster variables. A
+  fired cycle re-arms at `previous due + interval`, or at `now + interval` when
+  that is not after now (Zeebe `RepeatingInterval.nextOccurrenceAfter`; cron:
+  its next match after `max(previous due, now)`), so missed fires collapse as
+  in Zeebe and an overdue cycle never re-fires on the next tick. The count
+  follows Zeebe (`R0` fires once, `R-1` is unbounded); calendar periods
+  (`P1M`, `P1Y`, `P1MT1H`) use UTC calendar arithmetic (month-end clamps); a
+  cycle string with surrounding whitespace is rejected (Zeebe does not trim).
 - **Conditional start events** (a process-level `startEvent` with a
   `conditionalEventDefinition`) create instances on demand from a **conditional
   evaluation**. They open no subscription: an `EvaluateConditionalStartEvents {
