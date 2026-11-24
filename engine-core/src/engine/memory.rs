@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// [`Engine::retire_below`] examines at most `max_remove * RETIRE_BELOW_SCAN_FACTOR`
+/// resident instances per call (never fewer than [`RETIRE_BELOW_MIN_SCAN`]), so a
+/// live backlog below the owner's mark costs bounded work per tick (#1908).
+const RETIRE_BELOW_SCAN_FACTOR: usize = 4;
+const RETIRE_BELOW_MIN_SCAN: usize = 64;
+
 /// The variable upserts produced by [`Engine::drain_dirty_vars`]: each dirty,
 /// resident (non-spilled) instance's key paired with a cheap `Arc` clone of its
 /// current variable map, for the host to serialize into the durable var store.
@@ -117,9 +123,9 @@ impl Engine {
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
+            retire_cursor: 0,
             dirty_vars: std::collections::BTreeSet::new(),
             forgotten_vars: std::collections::BTreeSet::new(),
-            retired_tombstones: std::collections::BTreeSet::new(),
             torn_down_scopes: std::collections::BTreeSet::new(),
             esp_start_payloads: std::collections::BTreeMap::new(),
             boundary_payloads: std::collections::BTreeMap::new(),
@@ -316,70 +322,53 @@ impl Engine {
         let terminal: BTreeSet<Key> = keys
             .iter()
             .copied()
-            .filter(|k| {
-                matches!(
-                    self.state.instances.get(k).map(|i| i.state),
-                    Some(ProcessInstanceState::Completed | ProcessInstanceState::Terminated)
-                )
-            })
+            .filter(|&k| self.is_terminal_instance(k))
             .collect();
         self.remove_instance_set(&terminal)
     }
 
-    /// Unconditionally removes a batch of instances from hot state regardless of
-    /// their local lifecycle state — the follower-side counterpart to the leader's
-    /// exporter-driven [`Engine::evict_instances`]. Under RF>1 with leader-local
-    /// completion, a follower replica applies each `CreateInstance` (durably
-    /// replicated) but never the retirement (leader-local completion + exporter
-    /// eviction never enter the raft log), so completed instances pile up as
-    /// `Active` shells that [`Engine::evict_instances`] can never reap (they are
-    /// not terminal *here*). The partition leader broadcasts the authoritative set
-    /// of retired keys (the retirement digest) and the follower drops them here.
-    /// Keys absent locally are ignored (already gone, or the create has not yet
-    /// been applied — a benign, self-healing miss for a lagging learner, which is
-    /// re-snapshotted from the leader anyway). Returns the number removed.
-    pub fn retire_instances(&mut self, keys: &[Key]) -> usize {
-        // Cap the tombstone set defensively. It normally holds only keys in the
-        // brief window between a retirement digest and the create it races ahead of
-        // (drained the moment that create applies), so it stays tiny; the cap only
-        // guards a pathological stream of retirements for keys that never arrive.
-        const MAX_TOMBSTONES: usize = 1 << 20;
-        let mut victims: BTreeSet<Key> = BTreeSet::new();
-        for &k in keys {
-            if self.state.instances.contains_key(&k) {
-                victims.insert(k);
-            } else if self.retired_tombstones.len() < MAX_TOMBSTONES {
-                // The create has not been applied here yet (async learner lag).
-                // Remember the retirement so the create is reaped on arrival.
-                self.retired_tombstones.insert(k);
-            }
-        }
-        self.remove_instance_set(&victims)
-    }
-
-    /// Retires any freshly-created instance whose retirement digest already arrived
-    /// (raced ahead of its `CreateInstance` on this follower replica). Called at the
-    /// end of [`Engine::apply_command_at`] with the instance keys the command just
-    /// materialized; a no-op (and near-free) when no retirement is pending. Returns
-    /// the number reaped so the caller can drop them from any spill/cold store too.
-    pub(super) fn reap_tombstoned(&mut self, created: &[Key]) -> usize {
-        if self.retired_tombstones.is_empty() {
-            return 0;
-        }
-        let hit: BTreeSet<Key> = created
+    /// Follower-side reaping driven by the partition leader's out-of-band
+    /// retirement digest (RF>1): drops the named instances that are TERMINAL in
+    /// this replica's own applied state, returning the keys it removed (so the
+    /// host can forget their spilled rows). Live, unknown and not-yet-created
+    /// keys are ignored.
+    ///
+    /// The digest is NOT part of the replicated log, so it reaches a follower
+    /// at an arbitrary point relative to its apply — typically while it still
+    /// lags the leader. The leader names an instance it has already completed;
+    /// a lagging follower has not yet applied that completion, so the instance
+    /// is still live here, and reaping it would make this replica reject the
+    /// completion (`JobNotFound`) the leader applied: a replica divergence that
+    /// fail-stops the follower (#1908). So the digest is a pure garbage
+    /// collector of state no command can address any more — it never changes
+    /// what a later log entry does. An instance still live here is reaped by
+    /// the apply-time terminal eviction once its terminating entry applies.
+    pub fn retire_instances(&mut self, keys: &[Key]) -> Vec<Key> {
+        let terminal: BTreeSet<Key> = keys
             .iter()
             .copied()
-            .filter(|k| self.retired_tombstones.remove(k))
+            .filter(|&k| self.is_terminal_instance(k))
             .collect();
-        self.remove_instance_set(&hit)
+        self.remove_instance_set(&terminal);
+        terminal.into_iter().collect()
+    }
+
+    /// Whether `key` is a resident instance that is terminal (completed or
+    /// terminated) in this engine's own applied state — the only instances an
+    /// out-of-band reap may remove (#1908).
+    fn is_terminal_instance(&self, key: Key) -> bool {
+        matches!(
+            self.state.instances.get(&key).map(|i| i.state),
+            Some(ProcessInstanceState::Completed | ProcessInstanceState::Terminated)
+        )
     }
 
     /// The retirement low-water mark this partition's **owner** broadcasts to its
     /// follower replicas (consumed by [`Engine::retire_below`]): the smallest
-    /// still-`Active` instance key here. Every key below it has terminated — it is
-    /// either already evicted, or a resident `Completed`/`Terminated` shell (a
-    /// reclaimed owner can retain such shells until a later sweep) — so a follower
-    /// may safely reap any resident instance below it. When no instance is active,
+    /// still-`Active` RESIDENT instance key here. It is a hint only: it ignores
+    /// cold-spilled (dormant, live) instances and is not ordered with the log, so
+    /// a follower reaps only instances below it that are terminal in its OWN
+    /// applied state (#1908). When no instance is active,
     /// it is the next key this partition would mint, so a quiescent owner tells its
     /// followers to drop their entire replica backlog. Filtering to `Active`
     /// (rather than the min resident key) is what lets the mark keep advancing even
@@ -398,43 +387,65 @@ impl Engine {
     }
 
     /// Loss-tolerant reconciliation counterpart to the per-key retirement digest:
-    /// on a **follower replica**, drops every resident instance whose key is
-    /// strictly below `low_water` (the owner's [`Engine::retirement_low_water`]).
-    /// Every such instance has terminated on the owner, so reaping its replica
-    /// shell here is safe. Bounded by `max_remove` per call so a large accumulated
-    /// backlog is drained across ticks without stalling the actor. Returns the
-    /// reaped keys (so the host can forget any spilled rows). Idempotent: once the
-    /// backlog below the mark is gone, re-running with the same or a higher mark is
-    /// a cheap no-op. Because the owner re-broadcasts the mark every tick, this
-    /// converges even when best-effort per-key digest frames are dropped under load.
+    /// on a **follower replica**, drops every resident instance below `low_water`
+    /// (the owner's [`Engine::retirement_low_water`]) that is TERMINAL in this
+    /// replica's own applied state. Bounded by `max_remove` reaped instances per
+    /// call so a large backlog drains across ticks without stalling the actor.
+    /// Returns the reaped keys (so the host can forget any spilled rows).
+    /// Idempotent, and re-sent every tick by the owner.
+    ///
+    /// The mark is out-of-band (never in the log), so it can be ahead of this
+    /// replica's apply — and the owner computes it over RESIDENT instances
+    /// only, so it can pass a live cold-spilled backlog instance. Either way
+    /// an instance below the mark may still be live HERE; reaping it would
+    /// change what a later log entry does on this replica alone (#1908), so
+    /// live instances are never touched, exactly like
+    /// [`Engine::retire_instances`].
     pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> Vec<Key> {
-        if self.state.instances.is_empty() || max_remove == 0 {
-            return Vec::new();
-        }
-        let victims: Vec<Key> = self
-            .state
-            .instances
-            .keys()
-            .copied()
-            .filter(|&k| k < low_water)
-            .take(max_remove)
-            .collect();
-        if victims.is_empty() {
-            return victims;
-        }
-        // Any tombstone below the mark is now moot: a create for it, if it ever
-        // arrives, is reaped wholesale by this same sweep, so drop them to keep the
-        // tombstone set bounded to the still-active window.
-        if !self.retired_tombstones.is_empty() {
-            self.retired_tombstones.retain(|&k| k >= low_water);
-        }
-        let set: BTreeSet<Key> = victims.iter().copied().collect();
-        self.remove_instance_set(&set);
-        victims
+        let scan_budget = max_remove
+            .saturating_mul(RETIRE_BELOW_SCAN_FACTOR)
+            .max(RETIRE_BELOW_MIN_SCAN);
+        self.retire_below_bounded(low_water, max_remove, scan_budget)
     }
 
-    /// Shared removal pass for [`Engine::evict_instances`] and
-    /// [`Engine::retire_instances`]: drops every instance in `victims` from hot
+    /// [`Engine::retire_below`] with an explicit bound on the number of
+    /// resident instances EXAMINED per call (not just reaped): a large live
+    /// backlog below the mark must not be rescanned in full every tick on the
+    /// single-writer actor. The scan resumes from a cursor and wraps to the
+    /// start once it reaches `low_water`, so a terminal instance behind a long
+    /// live prefix is still reached within a bounded number of calls.
+    pub(crate) fn retire_below_bounded(
+        &mut self,
+        low_water: Key,
+        max_remove: usize,
+        scan_budget: usize,
+    ) -> Vec<Key> {
+        if self.state.instances.is_empty() || max_remove == 0 || scan_budget == 0 {
+            return Vec::new();
+        }
+        let start = if self.retire_cursor < low_water {
+            self.retire_cursor
+        } else {
+            0
+        };
+        let mut victims: BTreeSet<Key> = BTreeSet::new();
+        let mut next_cursor = 0; // wrap by default: the window reached `low_water`
+        for (examined, (&k, _)) in self.state.instances.range(start..low_water).enumerate() {
+            if examined == scan_budget || victims.len() == max_remove {
+                next_cursor = k;
+                break;
+            }
+            if self.is_terminal_instance(k) {
+                victims.insert(k);
+            }
+        }
+        self.retire_cursor = next_cursor;
+        self.remove_instance_set(&victims);
+        victims.into_iter().collect()
+    }
+
+    /// Shared removal pass for [`Engine::evict_instances`],
+    /// [`Engine::retire_instances`] and [`Engine::retire_below`]: drops every instance in `victims` from hot
     /// state along with its jobs (via the `jobs_by_instance` reverse index, so the
     /// cost is `O(evicted jobs)` not `O(total jobs)`), timers, subscriptions and
     /// incidents. Does **not** shrink the maps — capacity is reused by the next
