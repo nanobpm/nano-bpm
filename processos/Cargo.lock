@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "processos"
-version = "0.0.28"
+version = "0.12.0"
 dependencies = [
  "axum",
  "duckdb",

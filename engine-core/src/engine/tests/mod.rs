@@ -44,6 +44,7 @@ mod scoped_conditions;
 mod secret_provenance;
 mod terminal_timing;
 mod timer_cycle_bounds;
+mod timer_cycle_parity;
 mod timers_catch;
 mod user_task;
 
