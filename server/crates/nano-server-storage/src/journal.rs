@@ -4856,12 +4856,50 @@ impl Journal {
             // snapshot writer: a definitive absence it hits is reported to the
             // leader-propose machinery (#1447) before the build fails closed.
             absences: self.replicated_apply.then(|| self.orphans.inbox.clone()),
+            pins: self.pin_offheap_rows(
+                cold_keys.iter().copied().chain(
+                    resident
+                        .iter()
+                        .filter(|s| s.instance.variables_spilled)
+                        .map(|s| s.instance.key),
+                ),
+            ),
         };
         Some((
             crate::snapstream::StreamingCapture { control, resident },
             cold_keys,
             stores,
         ))
+    }
+
+    /// Pins every distinct classic off-heap store (cold tier and variable
+    /// spill, usually one shared store) for a snapshot capture (#1880), so the
+    /// off-thread writer can read each row the capture references even when a
+    /// later command rehydrates it. See [`crate::varspill::RowPin`].
+    ///
+    /// `scope` is every key the capture references; only those rows are
+    /// preserved on overwrite (bounded memory, #1885).
+    fn pin_offheap_rows(
+        &self,
+        scope: impl IntoIterator<Item = Key>,
+    ) -> Vec<crate::varspill::RowPin> {
+        let scope: BTreeSet<Key> = scope.into_iter().collect();
+        let mut stores: Vec<&Arc<VarSpillStore>> = Vec::new();
+        for store in [
+            self.cold.as_ref().map(|c| &c.store),
+            self.spill.as_ref().map(|s| &s.store),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !stores.iter().any(|seen| Arc::ptr_eq(seen, store)) {
+                stores.push(store);
+            }
+        }
+        stores
+            .into_iter()
+            .map(|store| store.pin_rows(scope.iter().copied()))
+            .collect()
     }
 
     /// Streaming/sidecar counterpart of [`try_engine_snapshot`](Journal::try_engine_snapshot)

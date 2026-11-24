@@ -1062,6 +1062,82 @@ pub fn match_batch_operation_item_state(
     }
 }
 
+// --- Equality pushdown (#1886) ---------------------------------------------
+//
+// The candidate values an equality-style filter admits, derived from the SAME
+// `ops!` normalisation the matchers above use (no second interpretation of the
+// filter shape). `None` = the filter does not pin the field to a finite value
+// set (absent, or only `$neq`/`$like`/`$exists`/… operators); `Some(set)` =
+// every matching value is in `set`. A store may use this to narrow its scan to
+// a superset of the true result; the matcher is still applied afterwards.
+
+impl Ops {
+    /// The finite value set this filter pins the field to, if any: `$eq` (a
+    /// single value) or `$in`. When both are present every match equals `$eq`,
+    /// so `$eq` alone is a valid (tighter) superset.
+    pub fn equality_candidates(&self) -> Option<Vec<String>> {
+        match (&self.eq, &self.in_) {
+            (Some(eq), _) => Some(vec![eq.clone()]),
+            (None, Some(in_)) => Some(in_.clone()),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Equality candidates for a `StringFilterProperty` (see [`Ops::equality_candidates`]).
+pub fn string_candidates(filter: &Option<models::StringFilterProperty>) -> Option<Vec<String>> {
+    match filter.as_ref()? {
+        models::StringFilterProperty::String(s) => Some(vec![s.clone()]),
+        models::StringFilterProperty::AdvancedStringFilter(a) => {
+            ops!(a, |s: &String| s.clone(), like).equality_candidates()
+        }
+    }
+}
+
+/// Equality candidates for a `ProcessInstanceKeyFilterProperty`.
+pub fn process_instance_key_candidates(
+    filter: &Option<models::ProcessInstanceKeyFilterProperty>,
+) -> Option<Vec<String>> {
+    match filter.as_ref()? {
+        models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(k) => Some(vec![k.0.clone()]),
+        models::ProcessInstanceKeyFilterProperty::AdvancedProcessInstanceKeyFilter(a) => {
+            ops!(a, |k: &models::ProcessInstanceKey| k.0.clone()).equality_candidates()
+        }
+    }
+}
+
+/// Equality candidates for a `ScopeKeyFilterProperty`.
+pub fn scope_key_candidates(
+    filter: &Option<models::ScopeKeyFilterProperty>,
+) -> Option<Vec<String>> {
+    match filter.as_ref()? {
+        models::ScopeKeyFilterProperty::ScopeKey(k) => Some(vec![k.0.clone()]),
+        models::ScopeKeyFilterProperty::AdvancedScopeKeyFilter(a) => {
+            ops!(a, |k: &models::ScopeKey| k.0.clone()).equality_candidates()
+        }
+    }
+}
+
+/// Equality candidates for a `VariableKeyFilterProperty`.
+pub fn variable_key_candidates(
+    filter: &Option<models::VariableKeyFilterProperty>,
+) -> Option<Vec<String>> {
+    match filter.as_ref()? {
+        models::VariableKeyFilterProperty::VariableKey(k) => Some(vec![k.0.clone()]),
+        models::VariableKeyFilterProperty::AdvancedVariableKeyFilter(a) => {
+            ops!(a, |k: &models::VariableKey| k.0.clone()).equality_candidates()
+        }
+    }
+}
+
+/// Converts decimal-string key candidates to numeric keys for an indexed
+/// lookup. The matchers compare a key's canonical decimal string, so a
+/// candidate that is not a valid `u64` can match no row and is dropped (an
+/// all-invalid set yields `Some(vec![])`, i.e. no match).
+pub fn key_candidates(candidates: Option<Vec<String>>) -> Option<Vec<u64>> {
+    candidates.map(|c| c.iter().filter_map(|s| s.parse().ok()).collect())
+}
+
 /// One normalised sort instruction: the field name and whether it is descending.
 pub struct SortKey {
     pub field: String,
@@ -1396,6 +1472,63 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1886 defect-class guard: the equality pushdown must never narrow a
+    /// search below its true result. For every filter shape, any value the
+    /// spec-derived matcher accepts must be among the pushdown's candidates.
+    #[test]
+    fn equality_candidates_are_a_superset_of_matcher_results() {
+        let filters = [
+            serde_json::json!("7"),
+            serde_json::json!({"$eq": "7"}),
+            serde_json::json!({"$in": ["7", "8", "x"]}),
+            serde_json::json!({"$eq": "7", "$in": ["7", "8"]}),
+            serde_json::json!({"$neq": "7"}),
+            serde_json::json!({"$exists": true}),
+            serde_json::json!({"$notIn": ["7"]}),
+            serde_json::json!({"$like": "7*"}),
+            serde_json::json!({"$in": []}),
+        ];
+        let values = ["7", "8", "9", "70", "x", ""];
+        for f in &filters {
+            let s: Option<models::StringFilterProperty> =
+                Some(serde_json::from_value(f.clone()).unwrap());
+            let pik: Option<models::ProcessInstanceKeyFilterProperty> =
+                serde_json::from_value(f.clone()).ok();
+            let cs = string_candidates(&s);
+            let cp = pik.as_ref().map(|_| process_instance_key_candidates(&pik));
+            for v in values {
+                if match_string(&s, v) {
+                    assert!(
+                        cs.as_ref().is_none_or(|c| c.iter().any(|x| x == v)),
+                        "{f} {v}"
+                    );
+                }
+                if let Some(cp) = &cp
+                    && match_process_instance_key(&pik, v)
+                {
+                    assert!(
+                        cp.as_ref().is_none_or(|c| c.iter().any(|x| x == v)),
+                        "{f} {v}"
+                    );
+                    // Numeric conversion keeps every matchable (decimal) key.
+                    let keys = key_candidates(cp.clone());
+                    if let Ok(n) = v.parse::<u64>() {
+                        assert!(keys.is_none_or(|k| k.contains(&n)), "{f} {v}");
+                    }
+                }
+            }
+        }
+        // Selective shapes do pin the field.
+        let eq: Option<models::StringFilterProperty> =
+            Some(serde_json::from_value(serde_json::json!("summary")).unwrap());
+        assert_eq!(string_candidates(&eq), Some(vec!["summary".to_string()]));
+        assert_eq!(string_candidates(&None), None);
+        assert_eq!(
+            key_candidates(Some(vec!["664527".into(), "nope".into()])),
+            Some(vec![664_527])
+        );
+    }
 
     #[test]
     fn string_keys_sort_numerically_and_absent_values_first() {
