@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -88,7 +88,7 @@ const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 5885629061888775070;
+const SCHEMA_FINGERPRINT: i64 = 9147392393431493541;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -266,6 +266,12 @@ CREATE TABLE variables (
     process_definition_key TEXT NOT NULL,
     UNIQUE(scope_key, name)
 );
+-- Pushdown indexes for `POST /v2/variables/search` (#1886): the selective
+-- `processInstanceKey` / `name` predicates resolve through these instead of a
+-- full table scan. `scope_key` is served by the UNIQUE(scope_key, name) index
+-- and `key` by the primary key.
+CREATE INDEX idx_variables_instance ON variables(instance_key);
+CREATE INDEX idx_variables_name ON variables(name);
 CREATE TABLE decision_requirements (
     drg_id        TEXT PRIMARY KEY,
     drg_key       INTEGER NOT NULL,
@@ -3485,6 +3491,90 @@ impl ReadStore {
             .query_map(params![instance_key as i64], map_variable)
             .or_corrupt("query instance variables");
         rows.filter_map(Result::ok).collect()
+    }
+
+    /// The variable rows that satisfy the indexed equality / `$in` predicates of
+    /// `pushdown` (#1886). Each constrained column is turned into an
+    /// `IN (...)` predicate resolved through an index (`key` → primary key,
+    /// `instance_key` → `idx_variables_instance`, `scope_key` →
+    /// UNIQUE(scope_key, name), `name` → `idx_variables_name`), so a selective
+    /// search reads only the matching rows rather than the whole table.
+    ///
+    /// The result is a **superset-safe candidate set**: callers still apply the
+    /// full filter semantics in memory. An unconstrained pushdown is exactly
+    /// [`ReadStore::variables`]. Rows are ordered by `key`.
+    pub fn variables_matching(&self, pushdown: &VariablePushdown) -> Vec<VariableRow> {
+        if pushdown.is_empty_result() {
+            return Vec::new();
+        }
+        let (sql, args) = pushdown.select_sql();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(&sql).or_corrupt("prepare variables_matching");
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), map_variable)
+            .or_corrupt("query variables_matching");
+        rows.filter_map(Result::ok).collect()
+    }
+}
+
+/// Above this many `$in` values a pushdown predicate is skipped (left to the
+/// in-memory matcher) so the statement stays well inside SQLite's bound-
+/// parameter limit. Skipping only widens the candidate set, never narrows it.
+const PUSHDOWN_MAX_IN: usize = 500;
+
+/// Indexed equality / `$in` predicates pushed down into a variables search
+/// (#1886). Each field is `None` when unconstrained, or the set of values the
+/// column must take (`Some(vec![])` matches nothing). This is a private
+/// optimisation behind the gateway's spec-derived matcher: it only ever narrows
+/// the candidate rows to a superset of the true result.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VariablePushdown {
+    pub keys: Option<Vec<Key>>,
+    pub instance_keys: Option<Vec<Key>>,
+    pub scope_keys: Option<Vec<Key>>,
+    pub names: Option<Vec<String>>,
+}
+
+impl VariablePushdown {
+    /// Whether some constrained column admits no value at all, so no row can
+    /// match and the query can be skipped.
+    pub fn is_empty_result(&self) -> bool {
+        self.keys.as_ref().is_some_and(Vec::is_empty)
+            || self.instance_keys.as_ref().is_some_and(Vec::is_empty)
+            || self.scope_keys.as_ref().is_some_and(Vec::is_empty)
+            || self.names.as_ref().is_some_and(Vec::is_empty)
+    }
+
+    /// The single canonical SELECT (and its bound arguments) for this pushdown.
+    fn select_sql(&self) -> (String, Vec<rusqlite::types::Value>) {
+        let mut sql = String::from(
+            "SELECT key, instance_key, scope_key, name, value, \
+             process_definition_id, process_definition_key FROM variables",
+        );
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+        let mut push_keys = |col: &str, keys: &Option<Vec<Key>>| {
+            if let Some(keys) = keys.as_ref().filter(|k| k.len() <= PUSHDOWN_MAX_IN) {
+                clauses.push(format!("{col} IN ({})", vec!["?"; keys.len()].join(",")));
+                args.extend(
+                    keys.iter()
+                        .map(|k| rusqlite::types::Value::Integer(*k as i64)),
+                );
+            }
+        };
+        push_keys("key", &self.keys);
+        push_keys("instance_key", &self.instance_keys);
+        push_keys("scope_key", &self.scope_keys);
+        if let Some(names) = self.names.as_ref().filter(|n| n.len() <= PUSHDOWN_MAX_IN) {
+            clauses.push(format!("name IN ({})", vec!["?"; names.len()].join(",")));
+            args.extend(names.iter().cloned().map(rusqlite::types::Value::Text));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY key");
+        (sql, args)
     }
 }
 
@@ -17125,5 +17215,150 @@ mod adhoc_migration_export_tests {
             "no stale source id: {}",
             catalog.value
         );
+    }
+}
+
+#[cfg(test)]
+mod variable_pushdown_tests {
+    //! #1886: a selective variables search must resolve through indexes, not a
+    //! full table scan, and the pushdown must return exactly the rows the
+    //! predicates admit.
+
+    use super::{ReadStore, VariablePushdown};
+
+    const INSTANCES: u64 = 2_000;
+    const VARS_PER_INSTANCE: u64 = 10;
+
+    /// A large fixture: `INSTANCES` instances × `VARS_PER_INSTANCE` root-scope
+    /// variables named `v0`..`v9`.
+    fn fixture() -> ReadStore {
+        let store = ReadStore::open(None).unwrap();
+        {
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            {
+                let mut ins = tx
+                    .prepare(
+                        "INSERT INTO variables (instance_key, scope_key, name, value, \
+                         process_definition_id, process_definition_key) \
+                         VALUES (?1, ?1, ?2, '\"x\"', 'p', '1')",
+                    )
+                    .unwrap();
+                for i in 0..INSTANCES {
+                    for n in 0..VARS_PER_INSTANCE {
+                        ins.execute(rusqlite::params![(i + 1) as i64, format!("v{n}")])
+                            .unwrap();
+                    }
+                }
+            }
+            tx.commit().unwrap();
+        }
+        store
+    }
+
+    /// The query plan SQLite chooses for the pushdown's canonical SELECT — a
+    /// deterministic row-scan guard (not a wall-clock one): a full scan of
+    /// `variables` shows up as `SCAN variables`.
+    fn plan(store: &ReadStore, p: &VariablePushdown) -> String {
+        let (sql, args) = p.select_sql();
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+            .unwrap();
+        rows.map(Result::unwrap).collect::<Vec<_>>().join(" | ")
+    }
+
+    #[test]
+    fn selective_search_resolves_through_an_index() {
+        let store = fixture();
+        assert!(plan(&store, &VariablePushdown::default()).contains("SCAN variables"));
+        for p in [
+            // processInstanceKey + name: the merlin query shape from #1886.
+            VariablePushdown {
+                instance_keys: Some(vec![1_234]),
+                names: Some(vec!["v3".to_string()]),
+                ..Default::default()
+            },
+            VariablePushdown {
+                instance_keys: Some(vec![7, 8]),
+                ..Default::default()
+            },
+            VariablePushdown {
+                names: Some(vec!["v3".to_string()]),
+                ..Default::default()
+            },
+            VariablePushdown {
+                scope_keys: Some(vec![7]),
+                ..Default::default()
+            },
+            VariablePushdown {
+                keys: Some(vec![77]),
+                ..Default::default()
+            },
+        ] {
+            let plan = plan(&store, &p);
+            assert!(
+                plan.contains("SEARCH variables") && !plan.contains("SCAN variables"),
+                "{p:?} must not full-scan variables; plan: {plan}"
+            );
+        }
+        // And the selective merlin shape returns exactly its one row.
+        let rows = store.variables_matching(&VariablePushdown {
+            instance_keys: Some(vec![1_234]),
+            names: Some(vec!["v3".to_string()]),
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn pushdown_returns_exactly_the_admitted_rows() {
+        let store = fixture();
+        let rows = store.variables_matching(&VariablePushdown {
+            instance_keys: Some(vec![5, 6, 999_999]),
+            names: Some(vec!["v1".to_string(), "v2".to_string()]),
+            ..Default::default()
+        });
+        let mut got: Vec<(u64, String)> = rows
+            .iter()
+            .map(|v| (v.instance_key, v.name.clone()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (5, "v1".to_string()),
+                (5, "v2".to_string()),
+                (6, "v1".to_string()),
+                (6, "v2".to_string()),
+            ]
+        );
+        // An empty candidate set matches nothing.
+        assert!(
+            store
+                .variables_matching(&VariablePushdown {
+                    names: Some(Vec::new()),
+                    ..Default::default()
+                })
+                .is_empty()
+        );
+        // An over-long `$in` is skipped (widened), never wrongly narrowed.
+        let many: Vec<u64> = (1..=600).collect();
+        let rows = store.variables_matching(&VariablePushdown {
+            instance_keys: Some(many),
+            names: Some(vec!["v0".to_string()]),
+            ..Default::default()
+        });
+        assert_eq!(rows.len() as u64, INSTANCES);
+        // Unconstrained = every row, ordered by key.
+        let all: Vec<u64> = store
+            .variables_matching(&VariablePushdown::default())
+            .iter()
+            .map(|v| v.key)
+            .collect();
+        let mut expected: Vec<u64> = store.variables().iter().map(|v| v.key).collect();
+        expected.sort_unstable();
+        assert_eq!(all, expected);
     }
 }

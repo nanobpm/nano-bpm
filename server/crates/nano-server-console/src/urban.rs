@@ -228,6 +228,85 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Identity of a resolved toolkit install: the binary path, its resolved
+/// target, its size/mtime, and — because `urban` is a thin bootstrap for
+/// `dist/cli.js` — the enclosing npm package's `package.json` bytes (its
+/// version) plus its `dist/cli.js` size/mtime. An implementation update that
+/// leaves the launcher untouched still changes this value (#1836). It is the
+/// single source of truth for "did the toolkit change": the capability cache
+/// and the serve-worker fingerprint both key on it.
+pub(crate) fn toolkit_identity(urban: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    urban.hash(&mut h);
+    let stamp = |p: &Path, h: &mut std::collections::hash_map::DefaultHasher| {
+        if let Ok(md) = std::fs::metadata(p) {
+            md.len().hash(h);
+            md.modified().ok().hash(h);
+        } else {
+            0u8.hash(h);
+        }
+    };
+    stamp(urban, &mut h);
+    if let Ok(real) = std::fs::canonicalize(urban) {
+        real.hash(&mut h);
+        if let Some(dir) = toolkit_package_dir(&real) {
+            if let Ok(bytes) = std::fs::read(dir.join("package.json")) {
+                bytes.hash(&mut h);
+            }
+            stamp(&dir.join("dist").join("cli.js"), &mut h);
+        }
+    }
+    h.finish()
+}
+
+/// The npm package directory of the `@nanobpm/urban` install a resolved
+/// launcher runs. npm shims (Windows `.cmd`/`.ps1`/extensionless shell shims,
+/// which are regular files rather than symlinks) do not live inside the
+/// package, so their layouts are resolved first: a project-local
+/// `node_modules/.bin/urban*` → `node_modules/@nanobpm/urban`, and a global
+/// `<prefix>/urban*` → `<prefix>/node_modules/@nanobpm/urban` (#1836). Only
+/// otherwise (a symlink resolved into the package) does the nearest enclosing
+/// `package.json` win — never an unrelated app/pack manifest above a shim.
+pub(crate) fn toolkit_package_dir(real: &Path) -> Option<std::path::PathBuf> {
+    let bin_dir = real.parent()?;
+    let mut shim_targets = Vec::new();
+    if bin_dir.file_name().is_some_and(|n| n == ".bin")
+        && let Some(nm) = bin_dir.parent()
+    {
+        shim_targets.push(nm.join("@nanobpm").join("urban"));
+    }
+    shim_targets.push(bin_dir.join("node_modules").join("@nanobpm").join("urban"));
+    if let Some(dir) = shim_targets
+        .into_iter()
+        .find(|d| d.join("package.json").is_file())
+    {
+        return Some(dir);
+    }
+    if bin_dir.file_name().is_some_and(|n| n == ".bin") {
+        // A shim whose package is missing: never attribute an enclosing
+        // project's manifest to the toolkit.
+        return None;
+    }
+    // Nearest enclosing package (bin/ sits at most a few levels deep).
+    real.ancestors()
+        .skip(1)
+        .take(4)
+        .find(|d| d.join("package.json").is_file())
+        .map(Path::to_path_buf)
+}
+
+/// Whether the resolved toolkit's `urban data` gateway has the long-lived
+/// `--serve` mode (@nanobpm/urban >= 0.100.0, #1836). A `data`-capable toolkit
+/// without it is rejected with an upgrade instruction (no fallback).
+pub(crate) async fn urban_supports_data_serve(urban: &Path) -> bool {
+    urban_help_text(urban)
+        .await
+        .as_deref()
+        .map(help_indicates_data_serve)
+        .unwrap_or(false)
+}
+
 /// The `urban --help` text for a resolved binary (stdout + stderr concatenated,
 /// `NO_COLOR`), memoised per binary path. This is the **single** place a toolkit
 /// is spawned to probe its capabilities: every `urban_supports_*` gate derives
@@ -243,16 +322,13 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
 /// without spawning. The help is stored as an `Arc<str>` so a warm hit is a
 /// cheap refcount bump rather than a full copy of the (potentially large) help
 /// output, even when `run_data_op` gates on it per Data-panel op. The entry is
-/// keyed on the binary path and lives for the process lifetime; we deliberately
-/// do **not** stat/mtime-invalidate it, to keep the hot capability-gate path a
-/// single lock-guarded map read. If a binary is replaced *in place* at the same
-/// path (an `npm install` bumping a project-local `node_modules/.bin/urban`, a
-/// pack reinstall) the cached capability set can go stale until the server
-/// restarts — but that staleness is **benign and non-regressing**: a stale
-/// *miss* only routes to the still-working embedded fallback (never to a broken
-/// `urban <op>`), so the worst case is a newly-gained capability going unused
-/// until the next restart, not an outage. A long-lived server outliving an
-/// in-place toolkit upgrade is the rare case, and the price is a restart. `None`
+/// keyed on the binary path and stamped with [`toolkit_identity`]; a warm hit
+/// re-stats the toolkit (a few `metadata` calls, no spawn) and re-probes when
+/// the identity changed, so an in-place upgrade or downgrade at the same path
+/// (an `npm install` bumping `node_modules/.bin/urban`, a pack reinstall) is
+/// picked up immediately — the `--serve` gate can neither keep rejecting
+/// a toolkit after an upgrade nor keep passing `--serve` to a downgraded
+/// toolkit (#1836). `None`
 /// means the binary could not be run **or** `urban --help` exited non-zero: we
 /// only accept and cache help text on a successful exit, so a binary that errors
 /// out (or whose error message happens to contain a capability marker) cannot
@@ -276,7 +352,9 @@ async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
     /// entry with a TTL: it shares one probe's timeout with every concurrent
     /// caller, then expires so a later request retries.
     enum HelpCacheEntry {
-        Ready(Option<Arc<str>>),
+        /// Keyed by [`toolkit_identity`] so an in-place upgrade/downgrade at
+        /// the same path re-probes instead of serving stale capabilities.
+        Ready(u64, Option<Arc<str>>),
         TimedOut(Instant),
     }
 
@@ -295,7 +373,9 @@ async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
         .unwrap_or_else(|e| e.into_inner())
         .get(urban)
     {
-        Some(HelpCacheEntry::Ready(help)) => Some(Ok(help.clone())),
+        Some(HelpCacheEntry::Ready(id, help)) if *id == toolkit_identity(urban) => {
+            Some(Ok(help.clone()))
+        }
         Some(HelpCacheEntry::TimedOut(at)) if at.elapsed() < help_pipe_timeout() => Some(Err(())),
         _ => None,
     };
@@ -326,13 +406,14 @@ async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
         Some(Err(())) => return None,
         None => {}
     }
+    let identity = toolkit_identity(urban);
     let entry = match urban_help_output(urban).await {
         UrbanHelpOutput::Success { stdout, stderr } => {
             let mut help = String::from_utf8_lossy(&stdout).into_owned();
             help.push_str(&String::from_utf8_lossy(&stderr));
-            HelpCacheEntry::Ready(Some(Arc::from(help)))
+            HelpCacheEntry::Ready(identity, Some(Arc::from(help)))
         }
-        UrbanHelpOutput::NoHelp => HelpCacheEntry::Ready(None),
+        UrbanHelpOutput::NoHelp => HelpCacheEntry::Ready(identity, None),
         UrbanHelpOutput::TimedOut => HelpCacheEntry::TimedOut(Instant::now()),
     };
     cache
@@ -523,9 +604,75 @@ fn help_indicates_data(help: &str) -> bool {
     help.contains("urban data")
 }
 
+/// The serve mode is advertised on the `urban data` help line(s).
+fn help_indicates_data_serve(help: &str) -> bool {
+    help.lines()
+        .any(|l| l.contains("urban data") && l.contains("--serve"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1836: npm shims (Windows `urban.cmd`, regular files) sit outside the
+    /// package, so a toolkit-only update must change the identity in both the
+    /// local `.bin` and the global-prefix layouts — the enclosing app/pack
+    /// manifest above the shim must never stand in for the toolkit's.
+    #[test]
+    fn toolkit_identity_resolves_npm_shim_layouts() {
+        let base = std::env::temp_dir().join(format!("nbpm-urban-shim-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        // (shim path, package dir) for local and global npm layouts.
+        let local_nm = base.join("app").join("node_modules");
+        let global = base.join("prefix");
+        let cases = [
+            (
+                local_nm.join(".bin").join("urban.cmd"),
+                local_nm.join("@nanobpm").join("urban"),
+            ),
+            (
+                global.join("urban.cmd"),
+                global.join("node_modules").join("@nanobpm").join("urban"),
+            ),
+        ];
+        // An enclosing app manifest that never changes.
+        std::fs::create_dir_all(base.join("app")).unwrap();
+        std::fs::write(base.join("app").join("package.json"), "{}").unwrap();
+        std::fs::write(base.join("package.json"), "{}").unwrap();
+        for (shim, pkg) in &cases {
+            std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(pkg.join("dist")).unwrap();
+            std::fs::write(shim, "@node urban\r\n").unwrap();
+            std::fs::write(pkg.join("package.json"), r#"{"version":"0.100.0"}"#).unwrap();
+            std::fs::write(pkg.join("dist").join("cli.js"), "a").unwrap();
+            let real = std::fs::canonicalize(shim).unwrap();
+            assert_eq!(
+                toolkit_package_dir(&real),
+                Some(std::fs::canonicalize(pkg).unwrap()),
+                "shim {shim:?} resolved to the wrong package"
+            );
+            let before = toolkit_identity(shim);
+            std::fs::write(pkg.join("package.json"), r#"{"version":"0.101.0"}"#).unwrap();
+            assert_ne!(
+                before,
+                toolkit_identity(shim),
+                "manifest-only update unseen"
+            );
+            let mid = toolkit_identity(shim);
+            std::fs::write(pkg.join("dist").join("cli.js"), "bb").unwrap();
+            assert_ne!(
+                mid,
+                toolkit_identity(shim),
+                "implementation-only update unseen"
+            );
+        }
+        // A `.bin` shim whose package is missing never borrows the app manifest.
+        let orphan = base.join("orphan").join("node_modules").join(".bin");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("urban.cmd"), "x").unwrap();
+        assert_eq!(toolkit_package_dir(&orphan.join("urban.cmd")), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn resolve_urban_prefers_explicit_override() {
@@ -726,6 +873,17 @@ urban — build and run Urban apps (nano.app.json)
   urban gen [--check]               derive artifacts (migrations, worker-io)
   urban data                        run a datasource op through the gateway";
         assert!(help_indicates_data(new_help));
+        assert!(
+            !help_indicates_data_serve(new_help),
+            "a pre-0.100 `data` toolkit has no serve mode"
+        );
+        let serve_help = "\
+  urban gen --serve                 (unrelated flag elsewhere)
+  urban data [--serve]              run datasource ops (--serve: NDJSON loop)";
+        assert!(help_indicates_data_serve(serve_help));
+        assert!(!help_indicates_data_serve(
+            "  urban data   op gateway\n  urban run --serve   serve app"
+        ));
     }
 
     /// Guards the failure mode where a *failed* `urban --help` (non-zero exit)

@@ -3488,6 +3488,8 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+mod urban_data_worker;
+
 /// Errors from the datasource gateway, mapped to HTTP status by the caller.
 #[derive(Debug)]
 pub enum DataError {
@@ -3546,6 +3548,15 @@ pub(crate) struct DataGatewayLimiter {
     concurrency: usize,
     queue: usize,
     timeout: std::time::Duration,
+    /// Resident `urban data --serve` workers, bounded by this limiter's
+    /// budget (#1836).
+    workers: urban_data_worker::WorkerRegistry,
+    /// Killed serve workers whose teardown (Windows `taskkill`, reap) has not
+    /// finished yet: still live processes, so they count against the budget.
+    reaping: std::sync::Arc<urban_data_worker::ReapBudget>,
+    /// Test seam: runs once between a worker spawn and its pid publish.
+    #[cfg(test)]
+    after_spawn: std::sync::Mutex<Option<urban_data_worker::AfterSpawnHook>>,
 }
 
 impl DataGatewayLimiter {
@@ -3576,46 +3587,105 @@ impl DataGatewayLimiter {
             concurrency,
             queue,
             timeout: timeout.max(std::time::Duration::from_millis(1)),
+            workers: urban_data_worker::WorkerRegistry::default(),
+            reaping: std::sync::Arc::default(),
+            #[cfg(test)]
+            after_spawn: std::sync::Mutex::new(None),
         }
     }
 
     /// Take a gateway slot, waiting in the bounded queue if all are busy.
     async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, DataError> {
-        if let Ok(p) = self.permits.try_acquire() {
-            return Ok(p);
-        }
-        // Reserve a queue place atomically; refuse when the queue is full.
+        self.acquire_with(None).await
+    }
+
+    /// Reserve one place in the console-wide wait queue (#1329), or refuse
+    /// with [`DataError::Busy`] when it is full. The place is released when the
+    /// ticket drops, so a cancelled wait never leaks it.
+    pub(super) fn reserve_queue(&self) -> Result<QueueTicket<'_>, DataError> {
         let mut w = self.waiting.load(Ordering::Acquire);
-        let reserved = loop {
+        loop {
             if w >= self.queue {
-                break false;
+                return Err(self.busy());
             }
             match self
                 .waiting
                 .compare_exchange_weak(w, w + 1, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => break true,
+                Ok(_) => return Ok(QueueTicket(&self.waiting)),
                 Err(cur) => w = cur,
             }
+        }
+    }
+
+    /// The canonical back-pressure error: always carries
+    /// [`DATA_GATEWAY_BUSY_PREFIX`] so the REST layer answers `503` +
+    /// `Retry-After` (#1837).
+    pub(super) fn busy(&self) -> DataError {
+        DataError::Busy(format!(
+            "{DATA_GATEWAY_BUSY_PREFIX} {} ops running and {} queued; retry shortly",
+            self.concurrency, self.queue
+        ))
+    }
+
+    /// Like [`Self::acquire`], reusing an already-held queue place (`ticket`)
+    /// so an op that queued earlier (e.g. for its project's worker) is counted
+    /// once against the console-wide queue bound, not twice.
+    pub(super) async fn acquire_with(
+        &self,
+        ticket: Option<QueueTicket<'_>>,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, DataError> {
+        if let Ok(p) = self.permits.try_acquire() {
+            return Ok(p);
+        }
+        let _ticket = match ticket {
+            Some(t) => t,
+            None => self.reserve_queue()?,
         };
-        if !reserved {
-            return Err(DataError::Busy(format!(
-                "{DATA_GATEWAY_BUSY_PREFIX} {} ops running and {} queued; retry shortly",
-                self.concurrency, self.queue
-            )));
-        }
-        // Release the queue place even if this future is dropped mid-wait.
-        struct Leave<'a>(&'a std::sync::atomic::AtomicUsize);
-        impl Drop for Leave<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        let _leave = Leave(&self.waiting);
         self.permits
             .acquire()
             .await
             .map_err(|e| DataError::Gateway(format!("data gateway limiter closed: {e}")))
+    }
+
+    /// Wait (while holding a permit) until the live-process budget has room
+    /// for the caller's process: `running ops + idle resident workers +
+    /// reaping teardowns <= concurrency`. A permit freed by a cancelled op, or an idle worker just
+    /// evicted, may still be a live process mid-teardown (Windows `taskkill`,
+    /// reap); spawning before it is gone would exceed the bound (#1836).
+    /// Callers bound this with their op deadline.
+    pub(super) async fn await_teardown_capacity(&self) {
+        loop {
+            let notified = self.reaping.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // Evict any idle worker past the allowance (moving it into
+            // `reaping`, which notifies on exit), then count every live
+            // process: running, retained idle, and still-reaping.
+            urban_data_worker::enforce_resident_budget(self);
+            let running = self
+                .concurrency
+                .saturating_sub(self.permits.available_permits());
+            let live = running
+                + urban_data_worker::idle_resident_count(self)
+                + self.reaping.count.load(Ordering::Acquire);
+            if live <= self.concurrency {
+                return;
+            }
+            // Idle workers returning/leaving do not notify: re-check on a
+            // short poll as well.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), notified).await;
+        }
+    }
+}
+
+/// One reserved place in a [`DataGatewayLimiter`]'s wait queue; released on
+/// drop (including when the waiting future is cancelled).
+pub(super) struct QueueTicket<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for QueueTicket<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -4032,6 +4102,11 @@ async fn pipe_data_gateway_limited(
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
     let _permit = limiter.acquire().await?;
+    // Idle resident serve workers count against the same live-process budget.
+    urban_data_worker::enforce_resident_budget(limiter);
+    tokio::time::timeout(limiter.timeout, limiter.await_teardown_capacity())
+        .await
+        .map_err(|_| limiter.busy())?;
 
     cmd.env("NO_COLOR", "1")
         .stdin(std::process::Stdio::piped())
@@ -4268,13 +4343,20 @@ fn parse_data_gateway_output(out: std::process::Output) -> Result<serde_json::Va
         }));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut val: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
+    let val: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
         DataError::Gateway(gateway_output_parse_error(
             &e,
             out.stdout.len(),
             text.trim(),
         ))
     })?;
+    interpret_gateway_reply(val)
+}
+
+/// Interpret a parsed gateway reply object (`{ ok: true, … }` / `{ ok: false,
+/// error }`): the single place both the piped embedded gateway and the long-lived
+/// `urban data --serve` worker ([`urban_data_worker`]) map a reply to a result.
+fn interpret_gateway_reply(mut val: serde_json::Value) -> Result<serde_json::Value, DataError> {
     let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     if !ok {
         let msg = val
@@ -4331,6 +4413,11 @@ pub async fn run_data_op(
     );
     res
 }
+
+/// The error an Urban app's data op returns when its toolkit has `urban data`
+/// but not `--serve` (#1836): the console has no single-shot fallback.
+const UPGRADE_URBAN_FOR_SERVE: &str =
+    "this console requires @nanobpm/urban >= 0.100.0 (`urban data --serve`); upgrade urban";
 
 async fn run_data_op_inner(
     project: &str,
@@ -4449,11 +4536,17 @@ async fn run_data_op_inner(
                         .to_string(),
                 )
             })?;
-            let mut cmd = Command::new(&urban);
-            // `urban data` reads the JSON request on stdin (root "." + manifest
-            // "nano.app.json" default), anchored at the project dir as CWD.
-            cmd.current_dir(&dir).arg("data");
-            return pipe_data_gateway(cmd, &request).await;
+            // #1836: the console requires @nanobpm/urban >= 0.100.0, whose
+            // `urban data --serve` answers every op from the project's one
+            // long-lived worker (NDJSON over stdin/stdout, CWD = the project
+            // dir), so a warm worker starts no new Node process. There is no
+            // spawn-per-op fallback: a `data`-capable toolkit that predates
+            // `--serve` is rejected with an upgrade instruction.
+            if !super::urban::urban_supports_data_serve(&urban).await {
+                return Err(DataError::Gateway(UPGRADE_URBAN_FOR_SERVE.to_string()));
+            }
+            return urban_data_worker::run_serve_op(data_gateway_limiter(), &urban, &dir, &request)
+                .await;
         }
         DataGatewayPath::Embedded => {}
     }
@@ -4864,6 +4957,10 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     // so delete it. Also drop a coexisting ref so the name can't silently
     // resurrect as an imported project once its directory is gone.
     let workspace_dir = projects_root().join(name);
+    // #1836: no `urban data --serve` worker may outlive (or pin) its project.
+    // The guard keeps the path tombstoned (no op runs or spawns there) until
+    // the directory operation below is done.
+    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &dir)?;
     if workspace_dir.is_dir() {
         // Drop a coexisting ref before removing the directory; propagate an IO
         // error so a pointer that can't be removed can't silently resurrect the
@@ -4900,6 +4997,10 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     // ref resolution could point `to` (a dangling `new` reference) at an
     // external path and move the workspace project outside the root.
     let from = projects_root().join(old);
+    // #1836: the worker is keyed on (and anchored in) the old directory.
+    // Held across the move: no op runs or spawns in `from` meanwhile.
+    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &from)
+        .map_err(|e| e.to_string())?;
     if !from.is_dir() {
         // A pure imported-by-reference project (no workspace dir) can't be
         // renamed by a directory move; remove and re-import under the new name.
@@ -12284,12 +12385,12 @@ mod tests {
         .unwrap();
 
         // The stub advertises the `urban data` op in `--help` (so the capability
-        // probe routes here), records its subcommand (`data`) + CWD, drains the
-        // request on stdin, and emits the gateway's `{ok:true,…}` reply.
+        // probe routes here), records its subcommand (`data --serve`) + CWD, and
+        // answers each NDJSON request line with the `{id,ok:true,…}` reply.
         let stub = root.join("urban-data-stub.sh");
         write_urban_stub(
             &stub,
-            "case \"$*\" in *--help*) printf 'urban data — datasource op gateway\\n'; exit 0;; esac\ncat >/dev/null\nprintf '{\"ok\":true,\"routed\":\"urban-data\"}\\n'\n",
+            "case \"$*\" in *--help*) printf 'urban data [--serve] — datasource op gateway\\n'; exit 0;; esac\nwhile IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"ok\":true,\"routed\":\"urban-data\"}\\n' \"$id\"; done\n",
         );
         unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
 
@@ -12307,13 +12408,54 @@ mod tests {
         let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
         assert_eq!(
             sentinel.lines().next(),
-            Some("data"),
-            "urban not invoked with `data`: {sentinel:?}"
+            Some("data --serve"),
+            "urban not invoked as the `data --serve` worker: {sentinel:?}"
         );
         // …and the embedded `data-cli.ts` was never materialised for the Urban app.
         assert!(
             !dir.join(GEN_DIR).join("data-cli.ts").exists(),
             "embedded data-cli.ts must not be materialised for an Urban app"
+        );
+    }
+
+    /// #1836: a toolkit that has `urban data` but predates its `--serve` mode
+    /// (< 0.100.0) is rejected with an upgrade instruction — there is no
+    /// single-shot fallback — and is never spawned as `urban data`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn run_data_op_rejects_urban_data_without_serve_mode() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "urban-data-noserve-app";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"urban-data-noserve-app"}"#,
+        )
+        .unwrap();
+        let stub = root.join("urban-data-noserve-stub.sh");
+        write_urban_stub(
+            &stub,
+            "case \"$*\" in *--help*) printf 'urban data — datasource op gateway\\n'; exit 0;; esac\ncat >/dev/null\nprintf '{\"ok\":true,\"routed\":\"single-shot\"}\\n'\n",
+        );
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+        let res = run_data_op(name, serde_json::json!({ "op": "schema" })).await;
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+        match res {
+            Err(DataError::Gateway(msg)) => assert_eq!(msg, UPGRADE_URBAN_FOR_SERVE),
+            other => panic!("expected the upgrade-urban error, got {other:?}"),
+        }
+        // The stub records every invocation; only the `--help` probe may run.
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap_or_default();
+        assert!(
+            sentinel.lines().next().is_none_or(|l| l.contains("--help")),
+            "a pre-serve urban must not be spawned as `urban data`: {sentinel:?}"
+        );
+        assert!(
+            !dir.join(GEN_DIR).join("data-cli.ts").exists(),
+            "must not fall back to the embedded data-cli.ts"
         );
     }
 

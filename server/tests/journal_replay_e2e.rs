@@ -2718,3 +2718,51 @@ fn port_reader_disconnect_is_not_reported_as_budget_exhaustion() {
     let msg = port_failure(std::sync::mpsc::RecvTimeoutError::Timeout, elapsed);
     assert!(msg.contains("budget::PORT"), "{msg}");
 }
+
+/// #1779 guard: an e2e test process must not keep a pipe it merely INHERITED.
+///
+/// On macOS the runner (nextest) creates each test's stdout/stderr pipe with
+/// `pipe()` + a separate `FD_CLOEXEC`, so a sibling test spawned in that window
+/// inherits the write end. A long-lived harness (and the server it spawns)
+/// then holds a *different* test's stdout open after that test exits, and
+/// nextest reports it `LEAK-FAIL`. The harness must drop every inherited pipe
+/// before any test code runs (see `common::close_inherited_pipes`).
+///
+/// Reproduces the condition deterministically: re-exec this test binary with
+/// a non-`CLOEXEC` pipe fd, and require the child to find it closed.
+#[cfg(unix)]
+#[test]
+fn inherited_pipe_fds_are_closed_before_tests_run() {
+    const CHILD_ENV: &str = "NANOBPMN_E2E_INHERITED_PIPE_FD";
+    if let Ok(fd) = std::env::var(CHILD_ENV) {
+        let fd: i32 = fd.parse().expect("fd number");
+        // SAFETY: F_GETFD only queries the descriptor table.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(
+            flags, -1,
+            "inherited pipe fd {fd} is still open in the test process"
+        );
+        return;
+    }
+
+    let mut fds = [0i32; 2];
+    // SAFETY: `fds` is a valid two-element buffer; plain `pipe()` leaves both
+    // ends without FD_CLOEXEC, exactly like the racy runner window.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe()");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "inherited_pipe_fds_are_closed_before_tests_run",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ENV, fds[1].to_string())
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("spawn child test process");
+    // SAFETY: closing the two descriptors this test created.
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+    assert!(status.success(), "child kept the inherited pipe open");
+}
