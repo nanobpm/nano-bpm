@@ -207,6 +207,9 @@ fn valid_start_syntax(clock: &str, offset: &str) -> bool {
     if offset == "Z" {
         return true;
     }
+    if !offset.starts_with(['+', '-']) {
+        return false;
+    }
     let parts: Vec<&str> = offset[1..].split(':').collect();
     match parts.as_slice() {
         [h, m] => two(h, 18) && two(m, 59) && !(h == &"18" && m != &"00"),
@@ -484,13 +487,30 @@ fn parse_dow(field: &str) -> Option<DayOfWeek> {
         } else if let Some(day) = item.strip_suffix('L').filter(|d| !d.is_empty()) {
             dow.last_of_month |= 1 << iso(parse_value(day, 0, 7, &DAY_NAMES, 0)?);
         } else {
-            // cron-utils maps a standalone step anchor of 7 to 0 (`7/2` == `0/2`).
-            let item = match item.strip_prefix("7/") {
-                Some(step) => format!("0/{step}"),
-                None => item.to_string(),
+            // Weekdays form a 7-day cycle: alias the `7` spelling of Sunday to
+            // `0` and expand over 0..=6 (wrapping), so Sunday is never counted
+            // twice in a stepped range (`SAT-SUN/2` == `SAT-7/2`, `7/2` == `0/2`).
+            let (range, step) = match item.split_once('/') {
+                Some((r, s)) => (r, Some(s)),
+                None => (item, None),
             };
-            let spring = parse_calendar_set(&item, 0, 7, &DAY_NAMES)?;
-            for d in 0..=7u32 {
+            let alias = |v: &str| {
+                if v == "7" {
+                    "0".to_string()
+                } else {
+                    v.to_string()
+                }
+            };
+            let range = match range.split_once('-') {
+                Some((a, b)) => format!("{}-{}", alias(a), alias(b)),
+                None => alias(range),
+            };
+            let item = match step {
+                Some(s) => format!("{range}/{s}"),
+                None => range,
+            };
+            let spring = parse_calendar_set(&item, 0, 6, &DAY_NAMES)?;
+            for d in 0..=6u32 {
                 if spring & (1 << d) != 0 {
                     dow.days |= 1 << iso(d);
                 }
@@ -528,6 +548,21 @@ mod tests {
             parse_start("2026-01-01T06:00+02:00"),
             Some(at(2026, 1, 1, 4, 0, 0))
         );
+    }
+
+    #[test]
+    fn start_offset_requires_sign() {
+        assert_eq!(parse_start("2026-01-01T06:00:00Z02:00"), None);
+        assert_eq!(parse_start("2026-01-01T06:00:00Z+02:00"), None);
+    }
+
+    #[test]
+    fn stepped_weekday_ranges_count_sunday_once() {
+        assert_eq!(cron("0 0 0 ? * SAT-SUN/2"), cron("0 0 0 ? * SAT"));
+        assert_eq!(cron("0 0 0 ? * SAT-7/2"), cron("0 0 0 ? * SAT"));
+        assert_eq!(cron("0 0 0 ? * FRI-MON/2"), cron("0 0 0 ? * FRI,SUN"));
+        assert_eq!(cron("0 0 0 ? * 5-1/2"), cron("0 0 0 ? * 5-7/2"));
+        assert_eq!(cron("0 0 0 ? * MON-7"), cron("0 0 0 ? * MON-SUN"));
     }
 
     #[test]

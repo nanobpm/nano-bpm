@@ -191,10 +191,11 @@ fn cycle_builtin(args: &[FeelVal]) -> FeelVal {
     let text = match args {
         [d] => interval(d).map(|d| format!("R/{d}")),
         [FeelVal::Null, d] => interval(d).map(|d| format!("R/{d}")),
-        [n @ (FeelVal::Int(_) | FeelVal::Double(_)), d] => n
-            .as_f64()
-            .filter(|n| n.is_finite())
-            .and_then(|n| interval(d).map(|d| format!("R{}/{d}", n.trunc() as i64))),
+        // Java `intValue()`: truncate, then narrow to signed 32 bits.
+        [FeelVal::Int(n), d] => interval(d).map(|d| format!("R{}/{d}", *n as i32)),
+        [FeelVal::Double(n), d] if n.is_finite() => {
+            interval(d).map(|d| format!("R{}/{d}", (n.trunc() as i128) as i32))
+        }
         _ => None,
     };
     text.map(FeelVal::Str).unwrap_or(FeelVal::Null)
@@ -1666,6 +1667,15 @@ mod cycle_tests {
         let s = |v: &str| Value::Str(v.to_string());
         assert_eq!(eval("cycle(interval)", &[]), Value::Null);
         assert_eq!(eval(r#"cycle(duration("PT1H"))"#, &[]), s("R/PT1H"));
+        // Java `intValue()` narrowing to signed 32 bits.
+        assert_eq!(
+            eval(r#"cycle(4294967297, duration("PT1M"))"#, &[]),
+            s("R1/PT1M")
+        );
+        assert_eq!(
+            eval(r#"cycle(4294967297.5, duration("PT1M"))"#, &[]),
+            s("R1/PT1M")
+        );
         assert_eq!(eval(r#"cycle(duration("PT12H"))"#, &[]), s("R/PT12H"));
         assert_eq!(eval(r#"cycle(duration("P2M"))"#, &[]), s("R/P2M"));
         let three = [("repetitions", Value::Int(3))];
