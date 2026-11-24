@@ -1,6 +1,7 @@
 {
   "name": "timer-cycle-feel",
   "bpmn": "process.bpmn",
+  "backends": ["nano"],
   "processId": "parity-timer-cycle-feel",
   "variables": {
     "reps": 3

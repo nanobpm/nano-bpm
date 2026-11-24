@@ -1,6 +1,7 @@
 {
   "name": "timer-cycle-iso-start",
   "bpmn": "process.bpmn",
+  "backends": ["nano"],
   "processId": "parity-timer-cycle-iso-start",
   "variables": {},
   "steps": [

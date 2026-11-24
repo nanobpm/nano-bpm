@@ -1,6 +1,7 @@
 {
   "name": "timer-cycle-cron",
   "bpmn": "process.bpmn",
+  "backends": ["nano"],
   "processId": "parity-timer-cycle-cron",
   "variables": {},
   "steps": [

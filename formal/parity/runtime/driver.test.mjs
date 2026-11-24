@@ -952,3 +952,18 @@ test("CamundaBackend settled.ack fails loudly on a non-404 correlation error (#1
     await once(server, "close");
   }
 });
+
+// #1918 review: the Camunda backend has no timer-readiness/settlement barrier
+// and does not observe timer firings, so a hand-written corpus scenario that
+// advances the clock must be nano-only (mirrors formal/corpus/enumerate.mjs).
+test("every corpus scenario that advances time is nano-only", async () => {
+  const { readdirSync, readFileSync, existsSync } = await import("node:fs");
+  const dir = new URL("./corpus/", import.meta.url);
+  for (const name of readdirSync(dir)) {
+    const file = new URL(`${name}/scenario.json`, dir);
+    if (!existsSync(file)) continue;
+    const s = JSON.parse(readFileSync(file, "utf8"));
+    if (!(s.steps ?? []).some((st) => st.op === "advanceTime")) continue;
+    assert.deepEqual(s.backends, ["nano"], `${name} advances time but is not nano-only`);
+  }
+});
