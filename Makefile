@@ -444,11 +444,12 @@ print-wasm-pack-version: ## Print the pinned wasm-pack version (used by .github/
 # from a spaced path. Cargo resolves optional path deps even with the feature
 # off, so EVERY engine-wasm cargo invocation runs this first.
 WASM_REST_CODEGEN = m="$(PROJECT_ROOT)/generated/Cargo.toml"; \
-	if [ ! -f "$$m" ] || [ -n "$$(find "$(PROJECT_ROOT)/spec" "$(PROJECT_ROOT)/spec-patches" \
+	stale=$$(find "$(PROJECT_ROOT)/spec" "$(PROJECT_ROOT)/spec-patches" \
 		"$(PROJECT_ROOT)/openapi-generator-config.yaml" "$(PROJECT_ROOT)/scripts/generate.sh" \
 		"$(PROJECT_ROOT)/scripts/preprocess-spec.py" "$(PROJECT_ROOT)/scripts/postprocess-generated.py" \
 		"$(PROJECT_ROOT)/scripts/lib-openapi-generator.sh" \
-		-newer "$$m" -print 2>/dev/null | head -n 1)" ]; then \
+		-newer "$$m" -print 2>/dev/null | head -n 1); \
+	if [ ! -f "$$m" ] || [ -n "$$stale" ]; then \
 		"$(PROJECT_ROOT)/scripts/generate.sh"; \
 	fi
 
