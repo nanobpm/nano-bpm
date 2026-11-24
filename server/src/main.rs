@@ -5101,6 +5101,16 @@ impl Default for ServerImpl {
 impl ServerImpl {
     /// The Raft groups this node hosts. Used to host a partition's group and, by
     /// the falcon handler and write path, to reach it.
+    /// Whether this node's partitions are Raft-replicated: the process-wide
+    /// `NANOBPMN_RAFT` switch OR any Raft partition actually registered on
+    /// this node. The publication-gate decisions (#1845) must follow the
+    /// node's real replication mode, not just the env switch — a node running
+    /// Raft without the env var must still route before answering and must
+    /// not probe peers (else losing one member is a publish outage).
+    pub(crate) fn raft_replicated(&self) -> bool {
+        raft_enabled() || !self.raft.is_empty()
+    }
+
     pub fn raft_registry(&self) -> &Arc<crate::raft::RaftRegistry> {
         &self.raft
     }
@@ -11593,7 +11603,7 @@ impl ServerImpl {
     /// ordered behind the pending open. An unreachable or older peer could not
     /// be asked, so the create falls back to route-before-answer.
     async fn create_answers_before_routing(&self) -> bool {
-        if raft_enabled() {
+        if self.raft_replicated() {
             return false;
         }
         self.peers
@@ -11630,7 +11640,7 @@ impl ServerImpl {
     ) -> publication_gate::GateWait {
         let deadline = self.effective_publication_gate_deadline();
         let local = self.publication_gate.wait(name, correlation_key, deadline);
-        if !cluster_gate_probes_peers(raft_enabled(), self.peers.has_peers()) {
+        if !cluster_gate_probes_peers(self.raft_replicated(), self.peers.has_peers()) {
             return local.await;
         }
         let budget = nano_server_raft::peer::await_pending_opens_budget(deadline);
