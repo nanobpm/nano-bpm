@@ -36757,6 +36757,29 @@ mod clustered_startup_tests {
             "http://unused".to_string(),
         ];
         peers[0] = node0_url;
+        // The hash-partition owner must be reachable too: the cluster
+        // publication gate (#1845) probes every peer and fails closed on an
+        // unreachable one, so an `unused` peer would turn this publish into a
+        // retryable `SubscriptionOpenPending` instead of exercising the
+        // no-local-target key-sourcing path under test.
+        let hp_node = (hp % 3) as u32;
+        if hp_node != 0 {
+            let hp_topology = cluster::Topology {
+                node_id: hp_node,
+                peers: vec!["unused".into(), "unused".into(), "unused".into()],
+                num_partitions: 3,
+                replication_factor: 1,
+            };
+            let hp_server = build_server_in_memory(
+                hp_topology
+                    .local_partitions()
+                    .iter()
+                    .map(|p| Journal::in_memory_partition(*p))
+                    .collect(),
+                hp_topology,
+            );
+            peers[hp_node as usize] = serve_node(&hp_server).await;
+        }
         let topology = cluster::Topology {
             node_id: gateway,
             peers,
