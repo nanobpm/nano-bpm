@@ -242,7 +242,7 @@ fn kill_and_reap_blocking(limiter: &DataGatewayLimiter, slot: &Slot, w: Worker) 
     budget.kill(pid, &mut child);
     let give_up = Instant::now() + budget.grace();
     loop {
-        if worker_gone(&mut child, pid) {
+        if worker_gone(&budget, &mut child, pid) {
             return true;
         }
         if Instant::now() >= give_up {
@@ -257,9 +257,10 @@ fn kill_and_reap_blocking(limiter: &DataGatewayLimiter, slot: &Slot, w: Worker) 
         let _ticket = ticket;
         let _hold = hold;
         let mut zombies = ZombieGrace::default();
-        while !worker_gone(&mut child, pid) {
+        while !worker_gone(&budget, &mut child, pid) {
             budget.kill(pid, &mut child);
-            if zombies.expired(child_exited(&mut child), Instant::now()) {
+            let leader_reaped = child_exited(&mut child);
+            if zombies.expired(&budget, pid, leader_reaped, Instant::now()) {
                 warn_zombies(pid);
                 return;
             }
@@ -279,22 +280,46 @@ const ZOMBIE_GRACE: Duration = Duration::from_secs(5);
 
 /// Bounds the alive-until-ESRCH rule once the leader is reaped: the clock
 /// starts at the first kill after the leader is reaped (the group has had
-/// SIGKILL) and [`ZombieGrace::expired`] reports when [`ZOMBIE_GRACE`] passed.
+/// SIGKILL) and [`ZombieGrace::expired`] reports when the grace passed.
+/// Only a group our SIGKILL can reach ([`Liveness::Signalable`]) is ever
+/// released: an EPERM group has a live member the kill could not touch, so
+/// it is held (and retirement fails closed) for as long as it answers.
 #[derive(Default)]
 struct ZombieGrace {
     since: Option<Instant>,
+    eperm_warned: bool,
 }
 
 impl ZombieGrace {
-    /// Call after each group kill. `leader_reaped` false resets the clock.
-    fn expired(&mut self, leader_reaped: bool, now: Instant) -> bool {
-        if !leader_reaped {
+    /// Call after each group kill. The clock resets unless the leader is
+    /// reaped and the group is signalable.
+    fn expired(
+        &mut self,
+        budget: &ReapBudget,
+        pid: Option<u32>,
+        leader_reaped: bool,
+        now: Instant,
+    ) -> bool {
+        let liveness = budget.liveness(pid);
+        if liveness == Liveness::Eperm && !self.eperm_warned {
+            self.eperm_warned = true;
+            warn_eperm(pid);
+        }
+        if !leader_reaped || liveness != Liveness::Signalable {
             self.since = None;
             return false;
         }
         let since = *self.since.get_or_insert(now);
-        now.saturating_duration_since(since) >= ZOMBIE_GRACE
+        now.saturating_duration_since(since) >= budget.zombie_grace()
     }
+}
+
+fn warn_eperm(pid: Option<u32>) {
+    tracing::warn!(
+        pgid = ?pid,
+        "data worker group has a member SIGKILL cannot reach (EPERM); \
+         holding its slot and budget, and project retirement fails closed"
+    );
 }
 
 fn warn_zombies(pid: Option<u32>) {
@@ -315,8 +340,8 @@ fn child_exited(child: &mut Child) -> bool {
 /// A worker counts as exited only when its leader is reaped **and** its
 /// process group is empty: a launcher (pnpm/yarn shim, wrapper) may exit and
 /// be reaped while forked descendants keep running (#1836).
-fn worker_gone(child: &mut Child, pid: Option<u32>) -> bool {
-    child_exited(child) && !group_alive(pid)
+fn worker_gone(budget: &ReapBudget, child: &mut Child, pid: Option<u32>) -> bool {
+    child_exited(child) && budget.liveness(pid) == Liveness::Gone
 }
 
 /// Whether signalling the group led by `pid` cannot hit an unrelated group.
@@ -328,23 +353,44 @@ fn group_signal_safe(child: &mut Child, pid: Option<u32>) -> bool {
     pid.is_some() && (matches!(child.try_wait(), Ok(None)) || group_alive(pid))
 }
 
-/// Whether any process remains in the group led by `pid` (Unix). Windows has
-/// no group probe here (see the Job Object follow-up), so it reports none.
+/// Result of probing a worker's process group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Liveness {
+    /// No member left (ESRCH).
+    Gone,
+    /// Members exist and our signals reach them: pending SIGKILL or zombies.
+    Signalable,
+    /// Members exist that we may not signal (EPERM): a live process our
+    /// SIGKILL cannot reach. Never treated as gone or as zombies (#1836).
+    Eperm,
+}
+
+/// Whether any process remains in the group led by `pid`.
 fn group_alive(pid: Option<u32>) -> bool {
+    group_liveness(pid) != Liveness::Gone
+}
+
+/// Probe the group led by `pid` (Unix). Windows has no group probe here (see
+/// the Job Object follow-up), so it reports none.
+fn group_liveness(pid: Option<u32>) -> Liveness {
     #[cfg(unix)]
     if let Some(pid) = pid.filter(|p| *p != 0) {
         let Ok(pgid) = i32::try_from(pid) else {
-            return false;
+            return Liveness::Gone;
         };
         // SAFETY: signal 0 to a negative pid only probes the group.
         if unsafe { libc::kill(-pgid, 0) } == 0 {
-            return true;
+            return Liveness::Signalable;
         }
-        // EPERM: members exist that we may not signal — still alive.
-        return std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Liveness::Gone,
+            Some(libc::EPERM) => Liveness::Eperm,
+            // Unknown error: fail closed (never released as zombies).
+            _ => Liveness::Eperm,
+        };
     }
     let _ = pid;
-    false
+    Liveness::Gone
 }
 
 fn warn_unreaped(pid: Option<u32>) {
@@ -403,18 +449,23 @@ pub(super) fn retire_project_worker_blocking<'a>(
         registry: &limiter.workers,
         keys,
     };
+    let mut idle_pids = Vec::new();
     for slot in &removed {
-        let pid = {
+        {
             let mut a = slot.active();
             a.retired = true;
-            a.pid
-        };
-        if let Some(pid) = pid {
-            // The in-flight op sees EOF, fails, and leaves the slot.
-            limiter.reaping.kill_group(pid);
+            if let Some(pid) = a.pid {
+                // The in-flight op sees EOF, fails, and leaves the slot.
+                // Signalled under the `active` lock: the op clears `pid`
+                // under this lock before it can reap the leader, so the
+                // leader is unreaped here and its pid (= pgid) cannot have
+                // been reused by an unrelated group.
+                limiter.reaping.kill_group(pid);
+            }
         }
         let idle = slot.idle().take();
         if let Some(w) = idle {
+            idle_pids.push(w.pid);
             // An unreaped worker keeps its place on `slot`: the drain below
             // then fails closed instead of handing over a live directory.
             kill_and_reap_blocking(limiter, slot, w);
@@ -426,6 +477,11 @@ pub(super) fn retire_project_worker_blocking<'a>(
         .any(|s| s.waiters.load(Ordering::Acquire) > 0)
     {
         if Instant::now() >= give_up {
+            for pid in idle_pids.iter().copied() {
+                if limiter.reaping.liveness(pid) == Liveness::Eperm {
+                    warn_eperm(pid);
+                }
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "project busy: a data operation did not stop in time",
@@ -452,6 +508,9 @@ pub(crate) struct ReapBudget {
     /// Test seam: number of group signals sent.
     #[cfg(test)]
     pub(super) group_signals: AtomicUsize,
+    /// Test seam: faked group probe (0 = real, 1 = Signalable, 2 = Eperm).
+    #[cfg(test)]
+    fake_liveness: std::sync::atomic::AtomicU8,
 }
 
 impl ReapBudget {
@@ -478,6 +537,25 @@ impl ReapBudget {
             self.kill_group(pid);
         }
         let _ = child.start_kill();
+    }
+
+    /// Probe the worker's group (faked in tests).
+    fn liveness(&self, pid: Option<u32>) -> Liveness {
+        #[cfg(test)]
+        match self.fake_liveness.load(Ordering::Acquire) {
+            1 => return Liveness::Signalable,
+            2 => return Liveness::Eperm,
+            _ => {}
+        }
+        group_liveness(pid)
+    }
+
+    fn zombie_grace(&self) -> Duration {
+        #[cfg(test)]
+        if self.short_waits.load(Ordering::Acquire) {
+            return Duration::from_millis(200);
+        }
+        ZOMBIE_GRACE
     }
 
     fn grace(&self) -> Duration {
@@ -529,7 +607,7 @@ async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>
     // Leader reaped: kill again for descendants that outlived it.
     loop {
         kill_group(budget, child, pid).await;
-        if !group_alive(pid) {
+        if budget.liveness(pid) == Liveness::Gone {
             return true;
         }
         if tokio::time::Instant::now() >= give_up {
@@ -545,7 +623,8 @@ async fn reap_until_exit(budget: &Arc<ReapBudget>, child: &mut Child, pid: Optio
     warn_unreaped(pid);
     let mut zombies = ZombieGrace::default();
     while !kill_tree(budget, child, pid).await {
-        if zombies.expired(child_exited(child), Instant::now()) {
+        let leader_reaped = child_exited(child);
+        if zombies.expired(budget, pid, leader_reaped, Instant::now()) {
             warn_zombies(pid);
             return;
         }
@@ -805,7 +884,7 @@ async fn retire_child(
     if tokio::time::timeout(RETIRE_GRACE, child.wait())
         .await
         .is_ok()
-        && !group_alive(pid)
+        && budget.liveness(pid) == Liveness::Gone
     {
         return true;
     }
@@ -2136,30 +2215,92 @@ mod tests {
     }
 
     /// A group that probes alive forever after its leader is reaped (only
-    /// unreaped zombies left) is released after [`ZOMBIE_GRACE`], not held
+    /// unreaped zombies left) is released after the zombie grace, not held
     /// forever; an unreaped leader never releases (#1836).
     #[test]
     fn zombie_only_group_released_after_grace() {
-        let alive = || true; // faked liveness probe: alive forever
+        let budget = ReapBudget::default();
+        budget.fake_liveness.store(1, Ordering::Release); // Signalable forever
         let t0 = Instant::now();
         let mut z = ZombieGrace::default();
         let mut now = t0;
         // Leader unreaped: never expires, however long.
         for _ in 0..1000 {
-            assert!(alive());
-            assert!(!z.expired(false, now));
+            assert!(!z.expired(&budget, Some(1), false, now));
             now += REAP_RETRY;
         }
         let reaped_at = now;
         let released = loop {
-            assert!(alive());
-            if z.expired(true, now) {
+            if z.expired(&budget, Some(1), true, now) {
                 break now;
             }
             now += REAP_RETRY;
         };
         assert!(released - reaped_at >= ZOMBIE_GRACE);
         assert!(released - reaped_at < ZOMBIE_GRACE + REAP_RETRY);
+    }
+
+    /// An EPERM group has a live member our SIGKILL cannot reach: it is never
+    /// released as zombies, however long, even with the leader reaped (#1836).
+    #[test]
+    fn eperm_group_never_released() {
+        let budget = ReapBudget::default();
+        budget.fake_liveness.store(2, Ordering::Release);
+        let mut z = ZombieGrace::default();
+        let mut now = Instant::now();
+        for _ in 0..1000 {
+            assert!(!z.expired(&budget, Some(1), true, now));
+            now += REAP_RETRY;
+        }
+    }
+
+    /// End to end: a reaped worker whose group keeps probing signalable
+    /// (zombies) actually releases its budget ticket and `ReapHold` after the
+    /// zombie grace, while an EPERM group keeps both and retirement fails
+    /// closed with `WouldBlock` (#1836).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zombie_group_releases_but_eperm_group_holds() {
+        for (fake, name) in [(1u8, "zombie-release"), (2u8, "eperm-hold")] {
+            let dir = project(name);
+            let stub = stubborn_stub(&dir);
+            let lim = limiter();
+            lim.reaping.short_waits.store(true, Ordering::Release);
+            lim.reaping.fake_liveness.store(fake, Ordering::Release);
+            let w = spawn_worker(&stub, &dir, 0).unwrap();
+            let pid = w.child.id().unwrap() as i32;
+            let slot = lim.workers.slot_for(&dir);
+            *slot.idle() = Some(w);
+            let r = retire_project_worker_blocking(&lim, &dir);
+            // Let the background reaper run well past the zombie grace.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            // SAFETY: signal 0 only probes for existence (reaped: -1).
+            assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "leader not reaped");
+            if fake == 1 {
+                drop(r);
+                assert_eq!(lim.reaping.count.load(Ordering::Acquire), 0);
+                assert_eq!(slot.waiters.load(Ordering::Acquire), 0);
+                assert_eq!(slot.unreaped.load(Ordering::Acquire), 0);
+            } else {
+                assert!(
+                    matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                    "retire must fail closed over an EPERM group"
+                );
+                drop(r);
+                assert_eq!(lim.reaping.count.load(Ordering::Acquire), 1);
+                assert_eq!(slot.waiters.load(Ordering::Acquire), 1);
+                let retry = retire_project_worker_blocking(&lim, &dir);
+                assert!(
+                    matches!(&retry, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                    "retry must fail closed over an EPERM group"
+                );
+                drop(retry);
+                assert!(dir.join("nano.app.json").exists(), "directory touched");
+                // Once the member is gone the hold releases.
+                lim.reaping.fake_liveness.store(0, Ordering::Release);
+                wait_released(&lim, &slot, pid).await;
+            }
+        }
     }
 
     /// A reaped leader whose group is empty must never be signalled by its
