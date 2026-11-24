@@ -19,7 +19,8 @@
 //!   combined `P1MT1H`) are added with calendar arithmetic in **UTC** (a
 //!   month-end day clamps, `Jan 31 + P1M = Feb 28/29`), as `ZonedDateTime.plus`.
 //!   Like Zeebe, the cycle string is **not** trimmed: surrounding whitespace
-//!   is rejected (only the XML element text around a literal is trimmed).
+//!   is rejected (only the XML element text around a literal is trimmed),
+//!   except around a six-field cron, which cron-utils normalises.
 //! - **Cron** (`CronTimer`, cron-utils `CronType.SPRING53`): six fields
 //!   `second minute hour day-of-month month day-of-week`, with `*`, `?`,
 //!   lists, ranges, steps, month / weekday names, `L`, `L-n`, `nW`, `LW`,
@@ -77,8 +78,21 @@ impl TimerCycle {
         // Zeebe does not trim the cycle string: surrounding whitespace fails
         // `RepeatingInterval.parse` / the cron parser.
         let s = raw;
-        if s.is_empty() || s.trim() != s {
+        if s.is_empty() {
             return None;
+        }
+        if s.trim() != s {
+            // cron-utils normalises whitespace in a six-field expression, so a
+            // padded cron (e.g. a FEEL result `"0 0 * * * * "`) still parses;
+            // ISO forms and `@` macros stay strict.
+            let t = s.trim();
+            if t.starts_with(['R', 'P', '@']) || t.split_whitespace().count() != 6 {
+                return None;
+            }
+            return Some(TimerCycle {
+                repetitions: None,
+                schedule: Schedule::Cron(Box::new(Cron::parse(s)?)),
+            });
         }
         if s.starts_with('R') {
             let (prefix, interval) = s.split_once('/')?;
@@ -202,7 +216,7 @@ impl Period {
             None => (rest, None),
         };
         if !date.contains(['Y', 'M']) {
-            let millis = crate::temporal::parse_duration_millis(raw)?;
+            let millis = crate::temporal::parse_cycle_duration_millis(raw)?;
             return Some(Period { months: 0, millis });
         }
         let (mut months, mut days) = (0u64, 0u64);
@@ -237,8 +251,9 @@ impl Period {
         }
         let mut millis = days.checked_mul(MILLIS_PER_DAY)?;
         if let Some(t) = time {
-            millis =
-                millis.checked_add(crate::temporal::parse_duration_millis(&format!("PT{t}"))?)?;
+            millis = millis.checked_add(crate::temporal::parse_cycle_duration_millis(
+                &format!("PT{t}"),
+            )?)?;
         }
         Some(Period {
             months: u32::try_from(months).ok()?,
@@ -275,7 +290,9 @@ impl Period {
 /// with an explicit offset, optionally followed by a `[Zone/Id]`.
 fn parse_start(raw: &str) -> Option<u64> {
     let body = match raw.find('[') {
-        Some(idx) if raw.ends_with(']') => &raw[..idx],
+        Some(idx) if raw.ends_with(']') && valid_zone_id(&raw[idx + 1..raw.len() - 1]) => {
+            &raw[..idx]
+        }
         Some(_) => return None,
         None => raw,
     };
@@ -298,6 +315,9 @@ fn parse_start(raw: &str) -> Option<u64> {
 /// Returns the body without its offset and the offset in seconds.
 fn split_start_offset(body: &str) -> Option<(&str, i32)> {
     let (date, rest) = body.split_once('T')?;
+    if !valid_start_date(date) {
+        return None;
+    }
     let (clock, offset) = rest.split_at(rest.find(['Z', '+', '-'])?);
     if !valid_start_syntax(clock, offset) {
         return None;
@@ -311,6 +331,60 @@ fn split_start_offset(body: &str) -> Option<(&str, i32)> {
         secs += part.parse::<i32>().ok()? * unit;
     }
     Some((local, if offset.starts_with('-') { -secs } else { secs }))
+}
+
+/// Strict `yyyy-MM-dd` (FEEL's lenient parser would accept `2026-1-1`).
+fn valid_start_date(date: &str) -> bool {
+    let b = date.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let num = |r: std::ops::Range<usize>| {
+        date[r.clone()]
+            .bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| date[r].parse::<u32>().ok())
+            .flatten()
+    };
+    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else {
+        return false;
+    };
+    let Ok(y) = i32::try_from(y) else {
+        return false;
+    };
+    (1..=12).contains(&m) && d >= 1 && d <= days_in_month(y, m)
+}
+
+/// A bracketed zone suffix: a fixed id (`Z`, `UTC`, `GMT`, `UT`, optionally
+/// with a `±hh:mm` offset) or a region id shaped like `Area/Location`. Without
+/// a bundled tz database an unknown-but-well-formed region id cannot be
+/// detected; empty and non-region ids (`[]`, `[Not_A_Zone]`) are rejected.
+fn valid_zone_id(zone: &str) -> bool {
+    let offset = |o: &str| {
+        let o = o.as_bytes();
+        o.len() == 6
+            && matches!(o[0], b'+' | b'-')
+            && o[1..3].iter().all(u8::is_ascii_digit)
+            && o[3] == b':'
+            && o[4..6].iter().all(u8::is_ascii_digit)
+    };
+    for fixed in ["UTC", "GMT", "UT", "Z"] {
+        if let Some(rest) = zone.strip_prefix(fixed) {
+            if rest.is_empty() || (fixed != "Z" && offset(rest)) {
+                return true;
+            }
+        }
+    }
+    if offset(zone) {
+        return true;
+    }
+    let parts: Vec<&str> = zone.split('/').collect();
+    parts.len() >= 2
+        && parts.iter().all(|p| {
+            p.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+        })
 }
 
 fn valid_start_syntax(clock: &str, offset: &str) -> bool {
@@ -467,8 +541,8 @@ impl Cron {
             || dom
                 .nearest_weekday
                 .iter()
-                .any(|n| nearest_weekday(y, m, *n, len) == Some(d))
-            || (dom.last_weekday && nearest_weekday(y, m, len, len) == Some(d));
+                .any(|n| nearest_weekday(y, m, *n, len, false) == Some(d))
+            || (dom.last_weekday && nearest_weekday(y, m, len, len, true) == Some(d));
         let dow = &self.dow;
         let dow_ok = dow.days & (1 << weekday) != 0
             || (dow.last_of_month & (1 << weekday) != 0 && d + 7 > len)
@@ -497,14 +571,18 @@ fn days_in_month(y: i32, m: u32) -> u32 {
 
 /// The weekday (Mon–Fri) nearest to day `n` of the month, never crossing into
 /// an adjacent month (Quartz/Spring `nW`). `None` if `n` exceeds the month.
-fn nearest_weekday(y: i32, m: u32, n: u32, len: u32) -> Option<u32> {
+/// For `nW` (`last == false`) a Sunday on the month's last day is kept as is,
+/// as cron-utils does when the following Monday leaves the month; `LW`
+/// (`last == true`) steps back to the Friday.
+fn nearest_weekday(y: i32, m: u32, n: u32, len: u32, last: bool) -> Option<u32> {
     if n > len {
         return None;
     }
     Some(match iso_weekday(y, m, n) {
         6 if n == 1 => 3,
         6 => n - 1,
-        7 if n == len => n - 2,
+        7 if n == len && last => n - 2,
+        7 if n == len => n,
         7 => n + 1,
         _ => n,
     })
@@ -523,23 +601,32 @@ fn parse_value(token: &str, min: u32, max: u32, names: &[&str], name_base: u32) 
 
 /// Parses a list of `*` / `n` / `a-b` / `x/step` items into a bitmask.
 fn parse_set(field: &str, min: u32, max: u32, names: &[&str]) -> Option<u64> {
-    parse_set_with(field, min, max, names, false)
+    parse_set_with(field, min, max, names, false, max)
 }
 
 /// Like [`parse_set`] for a calendar field (day-of-month, month, weekday),
 /// where cron-utils `SPRING53` leaves ranges non-strict: a descending range
 /// `a-b` wraps (`FRI-MON`, `NOV-FEB`), stepping across the wrap.
 fn parse_calendar_set(field: &str, min: u32, max: u32, names: &[&str]) -> Option<u64> {
-    parse_set_with(field, min, max, names, true)
+    parse_set_with(field, min, max, names, true, max)
 }
 
-fn parse_set_with(field: &str, min: u32, max: u32, names: &[&str], wrap: bool) -> Option<u64> {
+/// `step_max` bounds an `x/step` step as cron-utils' field constraints do
+/// (the field maximum; 7 for the weekday field before Sunday aliasing).
+fn parse_set_with(
+    field: &str,
+    min: u32,
+    max: u32,
+    names: &[&str],
+    wrap: bool,
+    step_max: u32,
+) -> Option<u64> {
     // Month names are 1-based (JAN = 1); weekday names 0-based (SUN = 0).
     let name_base = if names.len() == 12 { 1 } else { 0 };
     let mut mask = 0u64;
     for item in field.split(',') {
         let (range, step) = match item.split_once('/') {
-            Some((r, s)) => (r, Some(parse_value(s, 1, u32::MAX, &[], 0)?)),
+            Some((r, s)) => (r, Some(parse_value(s, 1, step_max, &[], 0)?)),
             None => (item, None),
         };
         let (lo, hi) = if range == "*" {
@@ -643,7 +730,7 @@ fn parse_dow(field: &str) -> Option<DayOfWeek> {
                 Some(s) => format!("{range}/{s}"),
                 None => range,
             };
-            let spring = parse_calendar_set(&item, 0, 6, &DAY_NAMES)?;
+            let spring = parse_set_with(&item, 0, 6, &DAY_NAMES, true, 7)?;
             for d in 0..=6u32 {
                 if spring & (1 << d) != 0 {
                     dow.days |= 1 << iso(d);
@@ -1044,15 +1131,92 @@ mod tests {
 
     #[test]
     fn surrounding_whitespace_is_rejected_not_trimmed() {
+        for bad in [" R/PT1H", "R/PT1H ", "\tPT1H", " @daily", " "] {
+            assert_eq!(TimerCycle::parse(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn padded_six_field_cron_is_normalised() {
+        for good in ["0 0 * * * * ", " 0 0 * * * *", "0  0 * * * *\n"] {
+            assert_eq!(
+                TimerCycle::parse(good),
+                TimerCycle::parse("0 0 * * * *"),
+                "{good:?}"
+            );
+        }
+        for bad in [" PT1H", "R/PT1H\n", " @hourly", "0 0 * * * ", " "] {
+            assert_eq!(TimerCycle::parse(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn fractional_cycle_periods() {
+        let c = TimerCycle::parse("R/PT0.5S").expect("fractional cycle");
+        assert_eq!(c.interval_millis(), 500);
+        let c = TimerCycle::parse("R3/P1MT1.25S").expect("calendar + fraction");
+        assert_eq!(
+            c.next_due(at(2026, 1, 1, 0, 0, 0), 0),
+            at(2026, 2, 1, 0, 0, 1) + 250
+        );
+        assert_eq!(TimerCycle::parse("R/PT0.5.1S"), None);
+    }
+
+    #[test]
+    fn cycle_start_date_and_zone_are_strict() {
         for bad in [
-            " R/PT1H",
-            "R/PT1H ",
-            "\tPT1H",
-            "0 0 * * * * ",
-            " @daily",
-            " ",
+            "R/2026-1-1T06:00:00Z/PT1H",
+            "R/2026-01-1T06:00:00Z/PT1H",
+            "R/2026-02-30T06:00:00Z/PT1H",
+            "R/2026-13-01T06:00:00Z/PT1H",
+            "R/2026-01-01T06:00:00Z[]/PT1H",
+            "R/2026-01-01T06:00:00Z[Not_A_Zone]/PT1H",
+            "R/2026-01-01T06:00:00Z[Europe/]/PT1H",
         ] {
             assert_eq!(TimerCycle::parse(bad), None, "{bad:?} must be rejected");
+        }
+        for good in [
+            "R/2026-01-01T06:00:00Z[UTC]/PT1H",
+            "R/2026-01-01T06:00:00Z[Z]/PT1H",
+            "R/2026-01-01T06:00:00+01:00[GMT+01:00]/PT1H",
+            "R/2024-02-29T06:00:00Z/PT1H",
+        ] {
+            assert!(TimerCycle::parse(good).is_some(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn nearest_weekday_keeps_month_end_sunday_but_lw_steps_back() {
+        // May 31 2026 is a Sunday; June 1 leaves the month.
+        assert_eq!(
+            cron("0 0 0 31W * ?").next_after(at(2026, 5, 1, 0, 0, 0)),
+            Some(at(2026, 5, 31, 0, 0, 0))
+        );
+        assert_eq!(
+            cron("0 0 0 LW * ?").next_after(at(2026, 5, 1, 0, 0, 0)),
+            Some(at(2026, 5, 29, 0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn cron_steps_are_bounded_by_field_maximum() {
+        for bad in [
+            "0 */60 * * * *",
+            "*/60 * * * * *",
+            "0 0 */24 * * *",
+            "0 0 0 */32 * ?",
+            "0 0 0 ? */13 *",
+            "0 0 0 ? * */8",
+        ] {
+            assert!(Cron::parse(bad).is_none(), "{bad:?} must be rejected");
+        }
+        for good in [
+            "0 */59 * * * *",
+            "0 0 */23 * * *",
+            "0 0 0 ? * */7",
+            "0 0 0 ? */12 *",
+        ] {
+            assert!(Cron::parse(good).is_some(), "{good:?}");
         }
     }
 

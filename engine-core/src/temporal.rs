@@ -69,6 +69,15 @@ impl DurationForm {
         allow_fraction: false,
     };
 
+    /// Timer-cycle period policy (`java.time.Duration.parse`, which FEEL
+    /// `cycle(duration("PT0.5S"))` produces): unsigned, weeks allowed,
+    /// fractional seconds.
+    pub const TIMER_CYCLE: DurationForm = DurationForm {
+        allow_sign: false,
+        allow_weeks: true,
+        allow_fraction: true,
+    };
+
     /// FEEL day-time-duration policy: signed, **no** weeks, fractional seconds.
     pub const FEEL_DAYTIME: DurationForm = DurationForm {
         allow_sign: true,
@@ -161,6 +170,13 @@ pub fn parse_duration_nanos(raw: &str, form: DurationForm) -> Option<i128> {
 /// in `u64` milliseconds.
 pub fn parse_duration_millis(raw: &str) -> Option<u64> {
     let nanos = parse_duration_nanos(raw.trim(), DurationForm::BPMN_TIMER)?;
+    u64::try_from(nanos / NANOS_PER_MILLI).ok()
+}
+
+/// Timer-cycle helper: like [`parse_duration_millis`] (no trimming) under
+/// [`DurationForm::TIMER_CYCLE`], truncating sub-millisecond fractions.
+pub fn parse_cycle_duration_millis(raw: &str) -> Option<u64> {
+    let nanos = parse_duration_nanos(raw, DurationForm::TIMER_CYCLE)?;
     u64::try_from(nanos / NANOS_PER_MILLI).ok()
 }
 
