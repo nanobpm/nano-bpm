@@ -4632,10 +4632,15 @@ fn boot_pending_subscription_opens(
 /// [`publication_gate`] BEFORE serving publications and re-drive them to the
 /// target partition.
 ///
-/// Each reconstructed event carries `delivery_key: 0` (the original source
-/// delivery key is not stored on `MessageSubscription`), which is still safe
-/// and idempotent: `Command::OpenMessageSubscription` checks both
-/// `routed_deliveries.is_tombstoned(subscription_key)` and
+/// The original source delivery key is not stored on `MessageSubscription`,
+/// so each reconstructed event uses the subscription key itself as its
+/// `delivery_key` (#1845 review). It is non-zero and unique (minted from the
+/// same allocator, never reused as another delivery's key), so the open keeps
+/// retry ownership: the bounded re-drive budget and, should the target peer
+/// still be offline, a place in [`publication_gate::FailedOpens`] for
+/// background re-drive. A `0` key would get one attempt and be dropped. The
+/// open stays idempotent on the target: `Command::OpenMessageSubscription`
+/// checks `routed_deliveries`, `is_tombstoned(subscription_key)` and
 /// `message_subscriptions.contains_key(&subscription_key)` before emitting
 /// `MessageSubscriptionCreated`.
 fn pending_subscription_opens_from_journals(
@@ -4675,7 +4680,7 @@ fn pending_subscription_opens_from_journals(
                 message_name: sub.message_name.clone(),
                 correlation_key: sub.correlation_key.clone(),
                 kind: sub.kind.clone(),
-                delivery_key: 0,
+                delivery_key: sub.key,
             });
         }
     }
@@ -11738,22 +11743,24 @@ impl ServerImpl {
         operation_reference: Option<i64>,
         answer: impl FnOnce(),
     ) {
-        if self.create_answers_before_routing().await {
+        // Nothing to route → no gate to hold and no peer negotiation: answer
+        // without peer I/O (#1845 review).
+        if routable.is_empty() {
+            self.signal_jobs_available();
+            answer();
+        } else if self.create_answers_before_routing().await {
             let pending = self.publication_gate.register(&routable);
             self.signal_jobs_available();
             answer();
-            let routed = routable.is_empty()
-                || self
-                    .drive_subscription_routing(routable, operation_reference)
-                    .await;
+            let routed = self
+                .drive_subscription_routing(routable, operation_reference)
+                .await;
             if let Some(pending) = pending {
                 pending.settle(routed);
             }
         } else {
-            if !routable.is_empty() {
-                self.drive_subscription_routing(routable, operation_reference)
-                    .await;
-            }
+            self.drive_subscription_routing(routable, operation_reference)
+                .await;
             self.signal_jobs_available();
             answer();
         }
@@ -56174,6 +56181,24 @@ mod subscription_placement_tests {
                     Event::MessageSubscriptionOpening { correlation_key, .. } if *correlation_key == order
                 )),
                 "a clustered non-Raft boot must recover the remote-target pending open, got {pending:?}"
+            );
+            // #1845 review: a recovered open must keep retry ownership — a
+            // keyed delivery gets the bounded re-drive budget AND is retained
+            // by the failed-opens queue when the peer is still offline.
+            for e in &pending {
+                let Some((_, command)) = ServerImpl::route_event(e, 4) else {
+                    panic!("recovered open must be routable: {e:?}");
+                };
+                assert!(
+                    ServerImpl::routed_command_is_idempotent(&command),
+                    "recovered open must carry a delivery key, got {e:?}"
+                );
+            }
+            let retained = publication_gate::FailedOpens::default();
+            assert_eq!(
+                retained.record(&pending, None),
+                pending.len(),
+                "a failed recovered open must be queued for background re-drive"
             );
             assert!(
                 boot_pending_subscription_opens(&journals, 4, true).is_empty(),
