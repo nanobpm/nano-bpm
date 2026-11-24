@@ -38,6 +38,9 @@ export function prCreateOffenders(text) {
     }
     const tok = lines.slice(start, end).map((l) => l.match(/^\s*GH_TOKEN:\s*(.+)$/)).find(Boolean);
     if (!tok) out.push(`line ${i + 1} (step sets no GH_TOKEN)`);
+    // Fail closed on block scalars (`>-`, `|`): the value lives on later lines
+    // this single-line check cannot see, so a fallback could hide there.
+    else if (/^[>|]/.test(tok[1].trim())) out.push(`line ${i + 1} (GH_TOKEN block scalar unsupported)`);
     else if (isDefault(tok[1])) out.push(`line ${i + 1} (GH_TOKEN is GITHUB_TOKEN)`);
   });
   return out;
@@ -61,6 +64,11 @@ test('prCreateOffenders flags GITHUB_TOKEN and missing tokens', () => {
   assert.deepEqual(prCreateOffenders(step(null)).length, 1);
   assert.deepEqual(prCreateOffenders(step('${{ steps.app-token.outputs.token }}')), []);
   assert.deepEqual(prCreateOffenders(step('${{ secrets.C8CTL_PLUGIN_REPO_TOKEN }}')), []);
+  // Folded / literal block scalars hide the value on the next line: fail closed.
+  const fb = '${{ secrets.APP_TOKEN || secrets.GITHUB_TOKEN }}';
+  for (const ind of ['>-', '>', '|', '|-']) {
+    assert.deepEqual(prCreateOffenders(step(`${ind}\n            ${fb}`)).length, 1);
+  }
   assert.deepEqual(prCreateOffenders(step(null, '# gh pr create in a comment')), []);
 });
 
