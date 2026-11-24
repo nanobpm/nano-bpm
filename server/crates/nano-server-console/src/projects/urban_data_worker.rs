@@ -201,6 +201,56 @@ impl WorkerRegistry {
     }
 }
 
+/// A lifecycle lease on a project's worker slot, taken **before** an op's
+/// async capability probes (#1881). Retirement removes and marks retired
+/// every registered slot, so a lease taken before a delete/rename is
+/// invalidated by it; [`run_serve_op`] re-validates the lease before it
+/// registers as a waiter or spawns, so a request resolved before retirement
+/// can never start a worker afterwards.
+///
+/// The slot is keyed by the canonical directory, which several project
+/// aliases may share; deleting one alias keeps the slot alive for the others.
+/// A lease therefore also carries an optional, separately revocable *name
+/// binding* ([`Lease::bound_to`]), re-checked at every point the lease is —
+/// including after the async waits for the project's turn and admission — so
+/// a deleted alias can never run an op through its sibling's slot.
+pub(super) struct Lease {
+    dir: PathBuf,
+    slot: Slot,
+    binding: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl Lease {
+    /// Attach a name binding: the lease counts as revoked once `still_binds`
+    /// returns `false`.
+    pub(super) fn bound_to(
+        mut self,
+        still_binds: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.binding = Some(Box::new(still_binds));
+        self
+    }
+
+    /// Whether retirement (or loss of the name binding) has invalidated this
+    /// lease.
+    fn revoked(&self, registry: &WorkerRegistry) -> bool {
+        self.slot.active().retired
+            || !registry.is_registered(&self.dir, &self.slot)
+            || self.binding.as_ref().is_some_and(|b| !b())
+    }
+}
+
+/// Take a [`Lease`] on `dir`'s slot, or `None` while the path is being
+/// deleted/renamed.
+pub(super) fn lease(limiter: &DataGatewayLimiter, dir: &Path) -> Option<Lease> {
+    let slot = limiter.workers.live_slot_for(dir)?;
+    Some(Lease {
+        dir: dir.to_path_buf(),
+        slot,
+        binding: None,
+    })
+}
+
 /// Holds a project path tombstoned while its directory is deleted/renamed:
 /// ops on it fail fast and spawn nothing. Dropping it lifts the tombstone.
 #[must_use = "the tombstone lifts when this guard drops"]
@@ -1059,15 +1109,22 @@ fn timed_out(limiter: &DataGatewayLimiter) -> DataError {
 pub(super) async fn run_serve_op(
     limiter: &DataGatewayLimiter,
     urban: &Path,
-    dir: &Path,
+    lease: Lease,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
     let deadline = tokio::time::Instant::now() + limiter.timeout;
     let retired = || DataError::NoProject;
-    let slot = limiter.workers.live_slot_for(dir).ok_or_else(retired)?;
+    let dir = lease.dir.as_path();
+    let slot = lease.slot.clone();
     // Bound the per-project queue: at most one holder + `queue` waiters.
     let prev = slot.waiters.fetch_add(1, Ordering::AcqRel);
     let _waiting = Waiting(slot.clone());
+    // Re-validate the lease only after registering as a waiter: a retirement
+    // that has not yet marked the slot retired will then see (and drain) us;
+    // one that already has is seen here (#1881).
+    if lease.revoked(&limiter.workers) {
+        return Err(retired());
+    }
     if prev > limiter.queue {
         return Err(limiter.busy());
     }
@@ -1088,8 +1145,10 @@ pub(super) async fn run_serve_op(
     let _permit = tokio::time::timeout_at(deadline, limiter.acquire_with(ticket))
         .await
         .map_err(|_| timed_out(limiter))??;
-    // Take our worker first: from here it is counted by our permit.
-    if slot.active().retired {
+    // Take our worker first: from here it is counted by our permit. The
+    // turn/admission waits above are async, so re-validate the whole lease
+    // (retirement *and* name binding, #1881) before touching the worker.
+    if lease.revoked(&limiter.workers) {
         return Err(retired());
     }
     let mut use_ = InUse {
@@ -1119,6 +1178,12 @@ pub(super) async fn run_serve_op(
         // A predecessor that outlived its kill grace still owns the project
         // dir: no replacement until it is really gone.
         await_predecessors_reaped(limiter, &slot, deadline).await?;
+        // The teardown-capacity and predecessor-reap waits are async: a
+        // retirement or lost name binding during them must not start a
+        // worker at all (#1881).
+        if lease.revoked(&limiter.workers) {
+            return Err(retired());
+        }
         use_.worker = Some(spawn_worker(urban, dir, fingerprint)?);
         #[cfg(test)]
         {
@@ -1137,12 +1202,26 @@ pub(super) async fn run_serve_op(
         // was retired meanwhile, this worker must not run: reap it before
         // returning (and before `_waiting` drops), so a drain that sees
         // waiters==0 never races a still-live worker holding the project dir.
+        // The teardown/reap waits above are async too: a lost name binding
+        // fails the op here, before any request reaches the worker (#1881).
+        // The worker itself stays: it serves the surviving sibling aliases.
+        let unbound = lease.binding.as_ref().is_some_and(|b| !b());
         let retired_now = {
             let mut a = slot.active();
             if !a.retired {
-                a.pid = use_.worker.as_ref().and_then(|w| w.pid);
+                if unbound {
+                    if let Some(w) = use_.worker.take() {
+                        if limiter.workers.is_registered(dir, &slot) {
+                            *slot.idle() = Some(w);
+                        } else {
+                            use_.worker = Some(w);
+                        }
+                    }
+                } else {
+                    a.pid = use_.worker.as_ref().and_then(|w| w.pid);
+                }
             }
-            a.retired
+            a.retired || unbound
         };
         if retired_now {
             if let Some(w) = use_.worker.take() {
@@ -1199,6 +1278,131 @@ pub(super) async fn run_serve_op(
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "test helpers")]
 mod tests {
     use super::*;
+
+    /// Lease-then-run, as `run_data_op_inner` does (minus the probes).
+    async fn run_serve_op(
+        limiter: &DataGatewayLimiter,
+        urban: &Path,
+        dir: &Path,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, DataError> {
+        let lease = lease(limiter, dir).ok_or(DataError::NoProject)?;
+        super::run_serve_op(limiter, urban, lease, request).await
+    }
+
+    /// #1881: a lease taken before retirement (i.e. before the op's async
+    /// capability probes finished) is revoked by it — the op fails closed and
+    /// never spawns a worker, even after the tombstone has lifted — while a
+    /// fresh lease taken afterwards works.
+    #[tokio::test]
+    async fn lease_taken_before_retirement_never_spawns() {
+        let dir = project("lease");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        let stale = lease(&lim, &dir).unwrap();
+        drop(retire_project_worker_blocking(&lim, &dir).unwrap());
+        let r = super::run_serve_op(&lim, &stub, stale, &serde_json::json!({"op":"schema"})).await;
+        assert!(matches!(r, Err(DataError::NoProject)), "{r:?}");
+        assert_eq!(spawn_count(&spawns), 0, "a revoked lease spawned a worker");
+        assert!(
+            !lim.workers.map().contains_key(&dir),
+            "a revoked lease re-registered a slot"
+        );
+        run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert_eq!(spawn_count(&spawns), 1);
+        drop(retire_project_worker_blocking(&lim, &dir).unwrap());
+    }
+
+    /// #1881: an alias deleted while its op waits for teardown capacity (a
+    /// cold slot, so the op would spawn next) fails closed without ever
+    /// starting a worker: the lease is re-validated right before the spawn.
+    #[tokio::test]
+    async fn name_binding_lost_during_teardown_wait_never_spawns() {
+        use std::sync::atomic::AtomicBool;
+        let dir = project("binding-teardown");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = DataGatewayLimiter::with_timeout(1, 8, std::time::Duration::from_secs(10));
+        let ticket = Reaping::new(&lim);
+        let spawned = Arc::new(AtomicBool::new(false));
+        let sp = spawned.clone();
+        *lim.after_spawn.lock().unwrap() = Some(Box::new(move |_| {
+            sp.store(true, Ordering::SeqCst);
+        }));
+        let bound = Arc::new(AtomicBool::new(true));
+        let b = bound.clone();
+        let l = lease(&lim, &dir)
+            .unwrap()
+            .bound_to(move || b.load(Ordering::SeqCst));
+        let req = serde_json::json!({"op":"schema"});
+        let op = super::run_serve_op(&lim, &stub, l, &req);
+        tokio::pin!(op);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut op)
+                .await
+                .is_err(),
+            "op did not park on teardown capacity"
+        );
+        bound.store(false, Ordering::SeqCst);
+        drop(ticket);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), op)
+            .await
+            .expect("op hung");
+        assert!(matches!(r, Err(DataError::NoProject)), "{r:?}");
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "a deleted alias spawned a worker"
+        );
+        assert_eq!(spawn_count(&spawns), 0, "a deleted alias spawned a worker");
+    }
+
+    /// #1881: an alias deleted while its op waits for the project's turn
+    /// (a sibling alias keeps the shared slot alive) fails closed after the
+    /// wait, sends nothing, and leaves the sibling's warm worker running.
+    #[tokio::test]
+    async fn name_binding_lost_during_admission_fails_closed_and_keeps_worker() {
+        use std::sync::atomic::AtomicBool;
+        let dir = project("binding");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        // A sibling alias warms the shared worker.
+        run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert_eq!(spawn_count(&spawns), 1);
+        let bound = Arc::new(AtomicBool::new(true));
+        let b = bound.clone();
+        let l = lease(&lim, &dir)
+            .unwrap()
+            .bound_to(move || b.load(Ordering::SeqCst));
+        let slot = l.slot.clone();
+        let turn = slot.turn.lock().await;
+        let req = serde_json::json!({"op":"schema"});
+        let r = {
+            let op = super::run_serve_op(&lim, &stub, l, &req);
+            tokio::pin!(op);
+            // Park the op behind the held turn, then delete the alias.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut op)
+                    .await
+                    .is_err()
+            );
+            bound.store(false, Ordering::SeqCst);
+            drop(turn);
+            op.await
+        };
+        assert!(matches!(r, Err(DataError::NoProject)), "{r:?}");
+        assert!(slot.idle().is_some(), "the sibling's worker was torn down");
+        run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert_eq!(spawn_count(&spawns), 1, "the sibling had to respawn");
+        drop(retire_project_worker_blocking(&lim, &dir).unwrap());
+    }
 
     fn write_stub(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
