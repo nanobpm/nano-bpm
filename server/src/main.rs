@@ -18867,29 +18867,42 @@ impl ServerImpl {
         events: Vec<Event>,
         operation_reference: Option<i64>,
     ) {
-        let handles = self.engine.all();
-        let events = Arc::new(events);
-        let durable = {
-            let events = Arc::clone(&events);
-            // Owner's durable commit under its shared guard.
-            let _lifecycle = handles[0].lifecycle_shared().await;
-            handles[0]
-                .with(move |journal| {
-                    journal.install_deployment_durable_ref(&events, operation_reference)
-                })
-                .await
-        };
-        for handle in handles.iter().skip(1) {
-            let events = Arc::clone(&events);
-            // Each sibling install under its own shared guard.
-            let _lifecycle = handle.lifecycle_shared().await;
-            handle
-                .with(move |journal| journal.install_deployment(&events))
-                .await;
+        // ONE detached owner task (#1855): the durable receipt is held across
+        // the sibling lifecycle/actor awaits and the Raft fan-out, so cancelling
+        // the caller mid-install must neither drop a pending `Commit` nor
+        // abandon the fan-out. The owner runs to completion regardless; the
+        // caller merely awaits its handle.
+        let owner = self.clone();
+        let task = tokio::spawn(async move {
+            let handles = owner.engine.all();
+            let events = Arc::new(events);
+            let durable = {
+                let events = Arc::clone(&events);
+                // Owner's durable commit under its shared guard.
+                let _lifecycle = handles[0].lifecycle_shared().await;
+                handles[0]
+                    .with(move |journal| {
+                        journal.install_deployment_durable_ref(&events, operation_reference)
+                    })
+                    .await
+            };
+            for handle in handles.iter().skip(1) {
+                let events = Arc::clone(&events);
+                // Each sibling install under its own shared guard.
+                let _lifecycle = handle.lifecycle_shared().await;
+                handle
+                    .with(move |journal| journal.install_deployment(&events))
+                    .await;
+            }
+            // Under Raft (RF>1) also fan into any follower replica engine actors.
+            owner.install_into_raft_replicas(&events).await;
+            durable.wait().await;
+        });
+        if let Err(e) = task.await
+            && e.is_panic()
+        {
+            std::panic::resume_unwind(e.into_panic());
         }
-        // Under Raft (RF>1) also fan into any follower replica engine actors.
-        self.install_into_raft_replicas(&events).await;
-        durable.wait().await;
     }
 
     /// Forwards a deploy to the partition-0 owner over the Falcon protocol and
@@ -35942,6 +35955,47 @@ mod clustered_startup_tests {
             assert!(
                 n >= 1,
                 "the broadcast definition landed on an owned partition"
+            );
+        }
+    }
+
+    /// #1855 review: cancelling `install_replicated_deployment` after the
+    /// durable owner has applied (its receipt is pending) while a sibling
+    /// install is blocked must neither panic (dropped pending `Commit`) nor
+    /// abandon the sibling fan-out.
+    #[tokio::test]
+    async fn cancelled_replicated_install_still_fans_out_to_siblings() {
+        let node1 = clustered_node(1);
+        let events = demo_deployment_events().await;
+        assert!(!events.is_empty());
+        let handles = node1.engine.all();
+        assert!(handles.len() >= 2, "needs a sibling partition");
+        let exclusive = handles[1].lifecycle_exclusive().await;
+        {
+            let mut install = Box::pin(node1.install_replicated_deployment(events, None));
+            loop {
+                use std::future::Future;
+                let done = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(install.as_mut().poll(cx).is_ready())
+                })
+                .await;
+                assert!(!done, "the blocked sibling install must hold the install");
+                if handles[0].with(|j| !j.state().processes.is_empty()).await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(install);
+        }
+        drop(exclusive);
+        // The lifecycle lock is fair: the owner's queued shared acquisition is
+        // served before this exclusive one, and is held across its install.
+        drop(handles[1].lifecycle_exclusive().await);
+        for handle in handles.iter() {
+            let n = handle.with(|j| j.state().processes.len()).await;
+            assert!(
+                n >= 1,
+                "the cancelled install still reached every partition"
             );
         }
     }
@@ -53273,18 +53327,38 @@ mod subscription_placement_tests {
             "cancel-deploy.bpmn".to_string(),
         );
         let empty = std::collections::HashMap::new();
-        // `timeout(ZERO, ..)` polls the deploy exactly once, then drops it.
-        let _ = tokio::time::timeout(
-            std::time::Duration::ZERO,
-            server.deploy_resources_locally(
+        // Block a sibling partition's install (a rebuild's exclusive hold), so
+        // the fan-out cannot finish before the caller is dropped.
+        let handles = server.engine.all();
+        let exclusive = handles[1].lifecycle_exclusive().await;
+        {
+            let mut deploy = Box::pin(server.deploy_resources_locally(
                 vec![proc.clone()],
                 &names,
                 Vec::new(),
                 &empty,
                 "<default>",
-            ),
-        )
-        .await;
+            ));
+            // Drive the deploy until partition 0 has applied it.
+            loop {
+                use std::future::Future;
+                let done = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(deploy.as_mut().poll(cx).is_ready())
+                })
+                .await;
+                assert!(!done, "the blocked sibling install must hold the deploy");
+                if handles[0]
+                    .with(|j| j.state().processes.contains_key("cancel-deploy"))
+                    .await
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            // Explicitly drop the caller mid-fan-out.
+            drop(deploy);
+        }
+        drop(exclusive);
         // An identical retry must leave every partition able to instantiate it.
         // Deploy owners are serialized (`deploy_pipeline`), so the retry
         // returns only after the cancelled owner's fan-out (if it applied
