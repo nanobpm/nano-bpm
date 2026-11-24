@@ -1178,6 +1178,12 @@ pub(super) async fn run_serve_op(
         // A predecessor that outlived its kill grace still owns the project
         // dir: no replacement until it is really gone.
         await_predecessors_reaped(limiter, &slot, deadline).await?;
+        // The teardown-capacity and predecessor-reap waits are async: a
+        // retirement or lost name binding during them must not start a
+        // worker at all (#1881).
+        if lease.revoked(&limiter.workers) {
+            return Err(retired());
+        }
         use_.worker = Some(spawn_worker(urban, dir, fingerprint)?);
         #[cfg(test)]
         {
@@ -1308,6 +1314,49 @@ mod tests {
             .unwrap();
         assert_eq!(spawn_count(&spawns), 1);
         drop(retire_project_worker_blocking(&lim, &dir).unwrap());
+    }
+
+    /// #1881: an alias deleted while its op waits for teardown capacity (a
+    /// cold slot, so the op would spawn next) fails closed without ever
+    /// starting a worker: the lease is re-validated right before the spawn.
+    #[tokio::test]
+    async fn name_binding_lost_during_teardown_wait_never_spawns() {
+        use std::sync::atomic::AtomicBool;
+        let dir = project("binding-teardown");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = DataGatewayLimiter::with_timeout(1, 8, std::time::Duration::from_secs(10));
+        let ticket = Reaping::new(&lim);
+        let spawned = Arc::new(AtomicBool::new(false));
+        let sp = spawned.clone();
+        *lim.after_spawn.lock().unwrap() = Some(Box::new(move |_| {
+            sp.store(true, Ordering::SeqCst);
+        }));
+        let bound = Arc::new(AtomicBool::new(true));
+        let b = bound.clone();
+        let l = lease(&lim, &dir)
+            .unwrap()
+            .bound_to(move || b.load(Ordering::SeqCst));
+        let req = serde_json::json!({"op":"schema"});
+        let op = super::run_serve_op(&lim, &stub, l, &req);
+        tokio::pin!(op);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut op)
+                .await
+                .is_err(),
+            "op did not park on teardown capacity"
+        );
+        bound.store(false, Ordering::SeqCst);
+        drop(ticket);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), op)
+            .await
+            .expect("op hung");
+        assert!(matches!(r, Err(DataError::NoProject)), "{r:?}");
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "a deleted alias spawned a worker"
+        );
+        assert_eq!(spawn_count(&spawns), 0, "a deleted alias spawned a worker");
     }
 
     /// #1881: an alias deleted while its op waits for the project's turn
