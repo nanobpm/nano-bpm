@@ -31,6 +31,15 @@ serde_json = "1"
 # Both backends expose the identical `open_connection` seam and back `open(None)`
 # with an ephemeral `:memory:` database, so the read channel behaves the same way
 # on both — only how SQLite itself is provided differs.
+# The spec-derived search layer shared with the gateway server (#1883): the
+# migrated `search*` read methods parse the generated `*SearchQuery`, run the
+# server's own filter/sort/paginate pipeline and serialise the generated
+# `*SearchQueryResult`. Default features off: it then brings no SQLite backend
+# of its own (the target-specific `nanobpmn-read-model` deps below pick it) and
+# pulls the MODELS-ONLY build of the generated REST crate, which needs
+# `make generate` (generated/ is git-ignored) before this feature builds.
+nanobpmn-search = { path = "../server/crates/nano-search", default-features = false, optional = true }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 nanobpmn-read-model = { path = "../read-model", default-features = false, features = ["wasm"], optional = true }
 
@@ -43,6 +52,15 @@ nanobpmn-read-model = { path = "../read-model", default-features = false, featur
 # `required` lists (the source the published `readmodel-types` derive from).
 serde_yaml = "0.9"
 
+# Host-only: the server/WASM search parity guard (src/search_parity_tests.rs,
+# #1883) projects the same event log into the server's sharded `ReadModel` and
+# runs the gateway's body handling (serde + generated validation) beside the
+# WASM methods. Host target only: the server storage crate cannot build for
+# wasm32 (the engine-wasm-wasm32 clippy entry compiles dev-deps for wasm32).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+nano-server-storage = { path = "../server/crates/nano-server-storage" }
+validator = "0.20"
+
 [features]
 # Off-by-default. When enabled, `TestEngine` holds an in-memory `ReadStore` fed
 # from the same event log and exposes the REST read methods (`getFormByKey`,
@@ -50,7 +68,7 @@ serde_yaml = "0.9"
 # `searchVariables`). Every field, import and method it adds is gated behind
 # `#[cfg(feature = "read-model")]`, so the feature-OFF build links no new
 # dependency and keeps its lean baseline size.
-read-model = ["dep:nanobpmn-read-model"]
+read-model = ["dep:nanobpmn-read-model", "dep:nanobpmn-search"]
 
 [profile.release]
 opt-level = "z"

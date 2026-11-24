@@ -1459,6 +1459,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1588,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "nanobpm-gateway-rest-server"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1617,6 +1618,7 @@ dependencies = [
  "nanobpm-gateway-rest",
  "nanobpmn-engine-core",
  "nanobpmn-read-model",
+ "nanobpmn-search",
  "openraft",
  "reqwest",
  "serde",
@@ -1653,6 +1655,19 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "nanobpmn-search"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "nanobpm-gateway-rest",
+ "nanobpmn-engine-core",
+ "nanobpmn-read-model",
+ "serde",
+ "serde_json",
+ "validator",
 ]
 
 [[package]]

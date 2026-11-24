@@ -1,6 +1,6 @@
 [package]
 name = "nanobpm-gateway-rest-server"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2024"
 publish = false
 description = "NanoBPM gateway: stub server for the generated Camunda 8 Orchestration Cluster v2 REST layer, wired to the embedded nanobpmn engine."
@@ -34,6 +34,10 @@ nanobpmn-read-model = { path = "../read-model", features = ["native"] }
 # `main.rs` re-exports its modules at the crate root so existing
 # `crate::journal::…` paths keep resolving.
 nano-server-storage = { path = "crates/nano-server-storage" }
+# The spec-derived search layer shared with engine-wasm (#1883): one
+# implementation of each `search*` operation (filter algebra, sort, cursor
+# pagination, generated result models).
+nanobpmn-search = { path = "crates/nano-search" }
 # Falcon protocol wire types (ADR 0064 Phase 2). The falcon handlers/dispatcher
 # stay in this binary (`src/falcon.rs`), which re-exports the frames at that
 # module's root so its handler code is unchanged.

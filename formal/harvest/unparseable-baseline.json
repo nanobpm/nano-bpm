@@ -6,7 +6,6 @@
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementTypeTest": 27,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/BpmnEventTypeTest": 22,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/StartEventFormTest": 1,
-    "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest": 1,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AdHocSubProcessElementsVariableTest": 1,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AdHocSubProcessTest": 2,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AgentDefinitionJobHeaderTest": 5,
@@ -25,7 +24,6 @@
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/NativeUserTaskFormTest": 7,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/OutputMappingTest": 1,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ScriptTaskExpressionTest": 1,
-    "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest": 3,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ServiceTaskTest": 13,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/TerminateEndEventTest": 7,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/UserTaskTransformerTest": 1,
@@ -54,8 +52,7 @@
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/escalation/EscalationCatchEventTest": 4,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/escalation/EscalationEventTest": 22,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest": 5,
-    "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest": 2,
-    "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest": 7,
+    "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest": 1,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/link/LinkEventTest": 3,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceActivityTest": 4,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/multiinstance/MultiInstanceCallActivityTest": 1,
@@ -66,6 +63,6 @@
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/InterruptingEventSubprocessTest": 11,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/MultipleEventSubprocessTest": 3,
     "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/subprocess/NonInterruptingEventSubprocessTest": 4,
-    "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest": 21
+    "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest": 10
   }
 }

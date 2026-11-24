@@ -12,7 +12,7 @@
     </exclusiveGateway>
     <sequenceFlow id="sequenceFlow_1" sourceRef="startEvent_1" targetRef="xor"/>
     <sequenceFlow id="s1" sourceRef="xor" targetRef="end1">
-      <conditionExpression id="conditionExpression_1">= contains(str,a)</conditionExpression>
+      <conditionExpression id="conditionExpression_1">= contains(str,"a")</conditionExpression>
     </sequenceFlow>
     <endEvent id="end1" name="end1">
       <incoming>s1</incoming>

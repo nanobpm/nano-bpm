@@ -49,9 +49,7 @@ struct ColdFacets {
 /// A resident index from routing keys to the cold instance that owns them.
 #[derive(Default)]
 pub struct ColdIndex {
-    /// Ordered by key so [`ColdIndex::retire_below`] can range-scan the instances
-    /// strictly below the low-water mark in O(log n + victims) instead of scanning
-    /// the whole index every retirement tick (see that method's note).
+    /// Ordered by key for deterministic iteration.
     instances: BTreeMap<Key, ColdFacets>,
     by_job: BTreeMap<Key, Key>,
     by_job_type: BTreeMap<String, BTreeSet<Key>>,
@@ -266,41 +264,6 @@ impl ColdIndex {
     /// so they are never mistaken for orphaned read rows.
     pub fn keys(&self) -> impl Iterator<Item = Key> + '_ {
         self.instances.keys().copied()
-    }
-
-    /// Removes up to `max_remove` cold instances whose key is strictly below
-    /// `low_water`, returning them so the host can `forget` their spilled rows.
-    ///
-    /// The cold-tier counterpart of [`Engine::retire_below`](nanobpmn_engine_core::Engine::retire_below):
-    /// a follower's low-water backstop reaps *hot* replica shells below the owner's
-    /// mark, but cold-spilled replica instances are invisible to the engine, so
-    /// without this sweep a cold instance whose best-effort per-key retirement
-    /// digest frame was dropped would leak its `cold` row (and this index entry)
-    /// forever — the unbounded var-spill growth observed after a soak. Bounded per
-    /// call to match the engine sweep's budget so a large backlog drains across
-    /// ticks without stalling the actor.
-    ///
-    /// `instances` is a [`BTreeMap`], so this range-scans the keys strictly below
-    /// the mark in ascending order and stops after `max_remove` victims (or at the
-    /// first key `>= low_water`) — O(log n + victims), and an O(log n) no-op in the
-    /// steady state where nothing is below the mark. It must NOT scan the whole
-    /// index: it runs on the single-writer replica actor every retirement tick, so
-    /// a full O(n) sweep over a multi-million-row cold tier stalls live replication
-    /// and inflates raft-fsync latency (the regression PR #287 originally shipped).
-    pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> Vec<Key> {
-        if self.instances.is_empty() || max_remove == 0 {
-            return Vec::new();
-        }
-        let victims: Vec<Key> = self
-            .instances
-            .range(..low_water)
-            .map(|(&k, _)| k)
-            .take(max_remove)
-            .collect();
-        for &key in &victims {
-            self.remove(key);
-        }
-        victims
     }
 
     /// The cold instance owning `job_key`, if any.
@@ -599,39 +562,5 @@ mod tests {
 
         idx.remove(400);
         assert_eq!(idx.instance_for_scope(450), None);
-    }
-
-    #[test]
-    fn retire_below_reaps_cold_instances_under_the_mark_bounded() {
-        let mut idx = ColdIndex::default();
-        for key in [10u64, 20, 30, 40] {
-            idx.insert(&snapshot_with_job(key, key + 1, "work"));
-        }
-
-        // Bounded: at most `max_remove` victims per call, all strictly below mark.
-        let reaped = idx.retire_below(35, 2);
-        assert_eq!(reaped.len(), 2, "capped to max_remove");
-        assert!(
-            reaped.iter().all(|&k| k < 35),
-            "only keys below the mark are reaped"
-        );
-        // Reaped instances are fully deindexed (routing entries gone too).
-        for &k in &reaped {
-            assert!(!idx.contains(k));
-            assert_eq!(idx.instance_for_job(k + 1), None);
-        }
-
-        // A second pass drains the remaining below-mark instance; 40 (>= 35) stays.
-        let rest = idx.retire_below(35, 100);
-        assert_eq!(rest.len(), 1, "one below-mark instance left");
-        assert!(rest[0] < 35);
-        assert!(idx.contains(40), "instance at/above the mark is retained");
-        assert_eq!(idx.len(), 1);
-
-        // Idempotent no-op once nothing below the mark remains.
-        assert!(idx.retire_below(35, 100).is_empty());
-        // Empty index / zero budget are cheap no-ops.
-        assert!(idx.retire_below(0, 100).is_empty());
-        assert!(idx.retire_below(1_000, 0).is_empty());
     }
 }

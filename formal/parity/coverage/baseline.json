@@ -2,7 +2,7 @@
   "$comment": "Ratchet floors for the dual-engine parity-corpus coverage (#1247). Derived by `node formal/parity/coverage/report.mjs --nano … --zeebe … --update` (floors only rise; lowering needs --allow-lower and review). nano = engine-core LLVM code regions while engine-core/tests/parity_corpus.rs replays the corpus (deterministic; seeded from the CI x86_64-linux measurement — region counts are platform-dependent, so seed/raise it from the CI job, not a local macOS run). zeebe = zeebe/engine JaCoCo branches on a live Camunda 8 over the DETERMINISTIC measured set (#1707): the timing-dependent surface (the io.camunda.zeebe.engine.processing.message / state.message packages — background scheduler sweeps and the correlation race — plus ExpressionProcessor.java:507, the FEEL typeCheck failure branch, #1679) is excluded via zeebe-excludes.json, so identical inputs measure identically. floorPercent 12.0 is the re-baselined value: 951/7872 = 12.08%, byte-identical across a 30-run census (28 archived daily runs + both #1700 same-commit runs, which differed 1037 vs 1033 before the exclusions). The former slackPercent absorption band is gone — the measured set no longer carries broker-scheduling variance, so the floor is hard; a drop is a real coverage loss. Re-measure and raise the floor when scenarios are added; shrink zeebe-excludes.json as #1679 makes those paths deterministic.",
   "nano": {
     "unit": "region",
-    "floorPercent": 15.9
+    "floorPercent": 19.4
   },
   "zeebe": {
     "unit": "branch",

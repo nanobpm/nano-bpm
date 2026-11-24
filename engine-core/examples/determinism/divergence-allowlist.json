@@ -1,32 +1,4 @@
 {
   "observational_variants": [],
-  "divergences": [
-    {
-      "scenario": "scalar-list-routing",
-      "expected": {
-        "only_in_prev": [
-          { "variant": "IncidentRaised", "element_id": "join" }
-        ],
-        "only_in_head": [
-          { "variant": "ElementCompleting", "element_id": "join" },
-          { "variant": "ElementCompleted", "element_id": "join" },
-          { "variant": "SequenceFlowTaken", "from": "join" },
-          { "variant": "ElementActivating", "element_id": "e" },
-          { "variant": "ElementActivated", "element_id": "e" },
-          { "variant": "ElementCompleting", "element_id": "e" },
-          { "variant": "ElementCompleted", "element_id": "e" },
-          { "variant": "ElementCompleting", "element_id": "scalar-route" },
-          { "variant": "ElementCompleted", "element_id": "scalar-route" },
-          { "variant": "ProcessInstanceCompleted" }
-        ],
-        "unbalanced": {
-          "reason": "DMN scalar-as-singleton coercion (#1755): `list contains` on a scalar route head lets the fired inclusive join COMPLETE and route (the join's completing/completed, SequenceFlowTaken join→e, the end event's lifecycle, and instance completion) where the previous release raised an ExpressionEvaluation incident and stranded the instance — head adds routing events outright; prev's IncidentRaised has no head counterpart."
-        }
-      },
-      "introduced_in": "v0.12.0",
-      "issue": "#1755",
-      "upgrade": "upgrade-boundary",
-      "rationale": "upgrade-boundary: Raft members re-execute committed commands (ADR 0066, Rolling upgrade, option C), and a mixed-version cluster would journal different events for the same gateway evaluation — the new build routes `list contains` on a scalar (DMN singleton coercion) where the old build raised an incident — so the release requires an all-nodes-same-version (quiesced) upgrade with no rolling upgrade across it."
-    }
-  ]
+  "divergences": []
 }

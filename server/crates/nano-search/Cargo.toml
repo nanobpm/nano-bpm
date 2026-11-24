@@ -1,0 +1,34 @@
+[package]
+name = "nanobpmn-search"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The spec-derived search layer shared by the gateway server and the in-browser engine-wasm (#1883): generated *SearchQuery in, filter algebra / sort / cursor pagination, generated *SearchQueryResult out. One implementation per operation, so the two read surfaces cannot drift."
+
+# Leaf crate shared by the gateway `server` (native read model) and `engine-wasm`
+# (wasm32 read model). It depends on the MODELS-ONLY build of the generated
+# REST crate (`default-features = false` drops the axum `server` surface, which
+# cannot target wasm32) and on the read model WITHOUT choosing a SQLite backend:
+# each consumer selects `native` / `wasm` and cargo unifies the features.
+[dependencies]
+nanobpm-gateway-rest = { path = "../../../generated", default-features = false }
+nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
+nanobpmn-read-model = { path = "../../../read-model", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
+serde = "1"
+serde_json = "1"
+validator = "0.20"
+
+[features]
+default = ["native"]
+# Host builds (the server and this crate's own tests) back the read model with
+# the bundled C SQLite; engine-wasm turns default features off and supplies the
+# `wasm` backend itself.
+native = ["nanobpmn-read-model/native"]
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

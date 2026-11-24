@@ -36,6 +36,8 @@ runs:
       with:
         llvm: 'true'
         mold: 'true'
+    - name: Generate the REST models the read-model variant needs (#1883)
+      uses: ./.github/actions/rest-codegen
     - name: Install wasm-pack + restore its cached tool downloads (#1461)
       uses: ./.github/actions/wasm-pack-cache
     - name: Build engine-wasm/pkg (make console-wasm)

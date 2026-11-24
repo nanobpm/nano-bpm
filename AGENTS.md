@@ -497,7 +497,7 @@ Don't hunt for them or block on them. Verify v2 REST endpoints with the Rust
 Parallel slices that append to the same hunks produce a textual conflict for
 every PR after the first. The usual shared surfaces are `ServerImpl` fields and
 their init (`server/src/main.rs`), the `OVERRIDES` table in
-`scripts/gen-stub-server.py`, helpers in `server/src/query.rs`, and the manifest
+`scripts/gen-stub-server.py`, helpers in `server/crates/nano-search/src/query.rs`, and the manifest
 and publish of a shared npm package.
 
 - **Land the shared surface first, in a dedicated wave-0 scaffold task** (no
@@ -509,7 +509,7 @@ and publish of a shared npm package.
   slice. Reference: epic #903.
 - **Placeholder state must compile under `warnings = "deny"`.** Annotate
   scaffolded fields that no slice reads yet with `#[allow(dead_code)]`.
-- **`server/src/query.rs`: append, don't interleave.** Add new matchers after
+- **`server/crates/nano-search/src/query.rs`: append, don't interleave.** Add new matchers after
   the existing ones (before `pub struct SortKey`).
 - **A shared published package has one owner per wave.** One slice bumps the
   version, extends the `exports` map and publishes; siblings `dependsOn` it and

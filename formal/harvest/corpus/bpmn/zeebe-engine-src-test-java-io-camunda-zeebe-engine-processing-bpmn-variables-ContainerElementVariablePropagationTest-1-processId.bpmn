@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<definitions xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:ns0="http://camunda.org/schema/zeebe/1.0" exporter="Zeebe BPMN Model" exporterVersion="8.10.8" id="definitions_1" xmlns:modeler="http://camunda.org/schema/modeler/1.0" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.10.8" targetNamespace="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <!-- zeebe-cells: element:EndEvent element:IntermediateThrowEvent element:StartEvent element:SubProcess -->
+  <process id="processId" isExecutable="true">
+    <startEvent id="startEvent_1">
+      <outgoing>sequenceFlow_1</outgoing>
+    </startEvent>
+    <subProcess id="sp" name="sp">
+      <extensionElements>
+        <ns0:ioMapping>
+          <ns0:input source="= &quot;foo&quot;" target="localVar"/>
+        </ns0:ioMapping>
+      </extensionElements>
+      <incoming>sequenceFlow_1</incoming>
+      <outgoing>sequenceFlow_2</outgoing>
+      <multiInstanceLoopCharacteristics id="multiInstanceLoopCharacteristics_1">
+        <extensionElements>
+          <ns0:loopCharacteristics inputCollection="= [1]" inputElement="inputElement" outputCollection="output" outputElement="=outputElement"/>
+        </extensionElements>
+      </multiInstanceLoopCharacteristics>
+      <startEvent id="startEvent_2">
+        <outgoing>sequenceFlow_3</outgoing>
+      </startEvent>
+      <intermediateThrowEvent id="nestedElement" name="nestedElement">
+        <extensionElements>
+          <ns0:ioMapping>
+            <ns0:output source="= &quot;foo&quot;" target="localVar"/>
+          </ns0:ioMapping>
+        </extensionElements>
+        <incoming>sequenceFlow_3</incoming>
+        <outgoing>sequenceFlow_4</outgoing>
+      </intermediateThrowEvent>
+      <sequenceFlow id="sequenceFlow_3" sourceRef="startEvent_2" targetRef="nestedElement"/>
+      <endEvent id="endEvent_1">
+        <incoming>sequenceFlow_4</incoming>
+      </endEvent>
+      <sequenceFlow id="sequenceFlow_4" sourceRef="nestedElement" targetRef="endEvent_1"/>
+    </subProcess>
+    <sequenceFlow id="sequenceFlow_1" sourceRef="startEvent_1" targetRef="sp"/>
+    <endEvent id="endEvent_2">
+      <incoming>sequenceFlow_2</incoming>
+    </endEvent>
+    <sequenceFlow id="sequenceFlow_2" sourceRef="sp" targetRef="endEvent_2"/>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane bpmnElement="processId" id="BPMNPlane_1">
+      <bpmndi:BPMNShape bpmnElement="startEvent_1" id="BPMNShape_1">
+        <dc:Bounds height="36.0" width="36.0" x="100.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="sp" id="BPMNShape_2" isExpanded="true">
+        <dc:Bounds height="200.0" width="350.0" x="186.0" y="18.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_1" id="BPMNEdge_1">
+        <di:waypoint x="136.0" y="118.0"/>
+        <di:waypoint x="186.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="startEvent_2" id="BPMNShape_3">
+        <dc:Bounds height="36.0" width="36.0" x="236.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="nestedElement" id="BPMNShape_4">
+        <dc:Bounds height="36.0" width="36.0" x="322.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_3" id="BPMNEdge_2">
+        <di:waypoint x="272.0" y="118.0"/>
+        <di:waypoint x="322.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="endEvent_1" id="BPMNShape_5">
+        <dc:Bounds height="36.0" width="36.0" x="408.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_4" id="BPMNEdge_3">
+        <di:waypoint x="358.0" y="118.0"/>
+        <di:waypoint x="408.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="endEvent_2" id="BPMNShape_6">
+        <dc:Bounds height="36.0" width="36.0" x="586.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2" id="BPMNEdge_4">
+        <di:waypoint x="536.0" y="118.0"/>
+        <di:waypoint x="586.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>

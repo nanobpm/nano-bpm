@@ -4220,7 +4220,6 @@ impl GatewayTreeGuard {
                 let _ = _child.start_kill();
             }
         }
-        let _ = pid;
     }
 }
 
@@ -4269,7 +4268,6 @@ impl Drop for GatewayTreeGuard {
                 .stderr(std::process::Stdio::null())
                 .spawn();
         }
-        let _ = pid;
     }
 }
 
@@ -4514,6 +4512,38 @@ async fn run_data_op_inner(
     // embedded fallback; slice c retires that fallback (and deletes `data-cli.ts`)
     // once the pack guarantees the toolkit.
     let is_urban = dir.join("nano.app.json").is_file();
+    // #1881: take the worker-slot lifecycle lease *before* the async
+    // capability probes below. A delete/rename that lands while a probe is
+    // pending revokes it, so this request can never start a worker after its
+    // project was retired. Re-resolve the project after leasing: a
+    // retirement that completed before the lease (directory gone, or the
+    // name no longer resolving here) is caught too.
+    // The lease tracks the canonical directory, which an alias shares with
+    // other names; the *name* binding is checked separately, here and again
+    // after the probes, because deleting one alias keeps the shared slot alive.
+    // The name check travels with the lease (`Lease::bound_to`), so
+    // `run_serve_op` re-validates it after its own async waits too.
+    let name_still_binds = {
+        let (project, dir) = (project.to_string(), dir.clone());
+        move || {
+            project_dir(&project)
+                .filter(|d| d.is_dir())
+                .map(|d| dunce::canonicalize(&d).unwrap_or(d))
+                .as_deref()
+                == Some(dir.as_path())
+        }
+    };
+    let lease = if is_urban {
+        let lease = urban_data_worker::lease(data_gateway_limiter(), &dir)
+            .ok_or(DataError::NoProject)?
+            .bound_to(name_still_binds.clone());
+        if !name_still_binds() {
+            return Err(DataError::NoProject);
+        }
+        Some(lease)
+    } else {
+        None
+    };
     let urban = if is_urban {
         super::urban::find_urban_for(&dir)
     } else {
@@ -4528,6 +4558,11 @@ async fn run_data_op_inner(
         Some(u) if super::urban::urban_supports_data(&u).await => Some(u),
         _ => None,
     };
+    // #1881: a delete of this alias may have landed during the probes while a
+    // sibling alias keeps the shared lease valid — revalidate the name.
+    if is_urban && !name_still_binds() {
+        return Err(DataError::NoProject);
+    }
     match data_gateway_path(is_urban, urban.is_some()) {
         DataGatewayPath::UrbanData => {
             let urban = urban.ok_or_else(|| {
@@ -4545,8 +4580,22 @@ async fn run_data_op_inner(
             if !super::urban::urban_supports_data_serve(&urban).await {
                 return Err(DataError::Gateway(UPGRADE_URBAN_FOR_SERVE.to_string()));
             }
-            return urban_data_worker::run_serve_op(data_gateway_limiter(), &urban, &dir, &request)
-                .await;
+            // A second probe is another async gap (#1881): revalidate.
+            if !name_still_binds() {
+                return Err(DataError::NoProject);
+            }
+            let lease = lease.ok_or_else(|| {
+                DataError::Gateway(
+                    "internal routing error: UrbanData path without a worker lease".to_string(),
+                )
+            })?;
+            return urban_data_worker::run_serve_op(
+                data_gateway_limiter(),
+                &urban,
+                lease,
+                &request,
+            )
+            .await;
         }
         DataGatewayPath::Embedded => {}
     }
@@ -4948,8 +4997,17 @@ pub fn create_project_with_options(
     Ok(cfg)
 }
 
+/// Serialises delete/rename so their alias-aware worker retirement decisions
+/// can't race each other (#1881).
+static DIR_LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Deletes a project directory and everything in it.
 pub fn delete_project(name: &str) -> std::io::Result<()> {
+    // Serialise deletes/renames BEFORE resolving the path, so a queued delete
+    // re-resolves `name` inside the serialized region: two concurrent deletes
+    // of one imported alias must not both hold the external checkout path, or
+    // the second would fall through to `remove_dir_all` on it (#1881).
+    let _serial = DIR_LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = project_dir(name).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid project name")
     })?;
@@ -4959,9 +5017,19 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     let workspace_dir = projects_root().join(name);
     // #1836: no `urban data --serve` worker may outlive (or pin) its project.
     // The guard keeps the path tombstoned (no op runs or spawns there) until
-    // the directory operation below is done.
-    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &dir)?;
-    if workspace_dir.is_dir() {
+    // the directory operation below is done. #1881: deleting a
+    // reference-only alias leaves the directory in place, so its worker is
+    // retired only when no other project still resolves to that directory.
+    let removes_dir = workspace_dir.is_dir();
+    let _retired = if removes_dir || !dir_shared_with_other_project(name, &dir) {
+        Some(urban_data_worker::retire_project_worker_blocking(
+            data_gateway_limiter(),
+            &dir,
+        )?)
+    } else {
+        None
+    };
+    if removes_dir {
         // Drop a coexisting ref before removing the directory; propagate an IO
         // error so a pointer that can't be removed can't silently resurrect the
         // name later (fail closed).
@@ -4974,6 +5042,85 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::remove_dir_all(dir)
+}
+
+/// Whether a project other than `name` resolves to the same (canonical)
+/// directory as `dir` — an alias imported by reference (ADR 0041), or the
+/// workspace project an alias points at. Such a directory's data worker is
+/// shared and must survive the removal of one of its names (#1881).
+fn dir_shared_with_other_project(name: &str, dir: &Path) -> bool {
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canon(dir);
+    let Ok(entries) = std::fs::read_dir(projects_root()) else {
+        return false;
+    };
+    let entries: Vec<_> = entries.flatten().collect();
+    let listed: std::collections::HashSet<std::ffi::OsString> =
+        entries.iter().map(|e| e.file_name()).collect();
+    entries.iter().any(|entry| {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            return false;
+        };
+        // Directory names are project names verbatim (a workspace project may
+        // itself be called `app.project-ref.json`); only reference *files*
+        // carry the suffix to strip.
+        let path = entry.path();
+        let other = if path.is_dir() {
+            file_name
+        } else if let Some(stem) = file_name.strip_suffix(".project-ref.json") {
+            stem
+        } else {
+            return false;
+        };
+        if other == name || is_own_entry(name, other, &path, &listed) {
+            return false;
+        }
+        project_dir(other)
+            .filter(|d| d.is_dir())
+            .is_some_and(|d| canon(&d) == target)
+    })
+}
+
+/// Whether `path` is the very directory-entry `name` itself occupies (its
+/// workspace dir or reference file) under another spelling — e.g. `MyApp`
+/// listed by `read_dir` when deleting `myapp` on a case-insensitive
+/// filesystem (#1881). Only a case-variant spelling can be the same entry:
+/// a hard link under a different name (`twin`) is an independently removable
+/// alias, and if `read_dir` also lists the exact spelling `name`, the variant
+/// is a distinct entry on a case-sensitive filesystem.
+fn is_own_entry(
+    name: &str,
+    other: &str,
+    path: &Path,
+    listed: &std::collections::HashSet<std::ffi::OsString>,
+) -> bool {
+    if !other.eq_ignore_ascii_case(name) {
+        return false;
+    }
+    let own = [Some(projects_root().join(name)), project_ref_file(name)];
+    own.iter().flatten().any(|o| {
+        let exact_listed = o.file_name().is_some_and(|f| listed.contains(f));
+        !exact_listed && same_fs_entry(o, path)
+    })
+}
+
+fn same_fs_entry(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ma.dev() == mb.dev() && ma.ino() == mb.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows filesystems are case-insensitive: compare the names.
+        let _ = (ma, mb);
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    }
 }
 
 /// Renames a project directory and updates its persisted config name. Fails if
@@ -4999,8 +5146,7 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     let from = projects_root().join(old);
     // #1836: the worker is keyed on (and anchored in) the old directory.
     // Held across the move: no op runs or spawns in `from` meanwhile.
-    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &from)
-        .map_err(|e| e.to_string())?;
+    let _serial = DIR_LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !from.is_dir() {
         // A pure imported-by-reference project (no workspace dir) can't be
         // renamed by a directory move; remove and re-import under the new name.
@@ -5011,6 +5157,10 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
         }
         return Err("no such project".into());
     }
+    // #1881: only a real directory move retires the worker; a rejected
+    // reference-only rename above must not kill a shared alias's worker.
+    let _retired = urban_data_worker::retire_project_worker_blocking(data_gateway_limiter(), &from)
+        .map_err(|e| e.to_string())?;
     // Same slug (e.g. only the capitalization/spacing of the display name
     // changed, or the display name is being cleared): there is no directory to
     // move, so update the config in place instead of erroring on the
@@ -8479,7 +8629,6 @@ mod tests {
     #[cfg(unix)]
     fn is_zombie(pid: i32) -> bool {
         if !cfg!(target_os = "linux") {
-            let _ = pid;
             return false;
         }
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
@@ -8937,6 +9086,87 @@ mod tests {
         assert!(
             ext.join("nano.app.json").is_file(),
             "external checkout untouched"
+        );
+    }
+
+    #[test]
+    fn concurrent_deletes_of_one_alias_keep_the_external_checkout() {
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("race");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"r","name":"R"}"#,
+        )
+        .unwrap();
+        import_project_ref("racer", ext.to_str().unwrap()).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| delete_project("racer")))
+            .collect();
+        for h in handles {
+            let _ = h.join().unwrap();
+        }
+        assert!(read_project_ref("racer").is_none(), "reference removed");
+        assert!(
+            ext.join("nano.app.json").is_file(),
+            "external checkout untouched by a queued delete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_dir_detection_counts_hard_linked_aliases_as_distinct() {
+        // A hard link is a separate, independently removable directory entry:
+        // deleting `myapp` leaves `twin` resolving to the checkout (#1881).
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("caseins");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"c","name":"C"}"#,
+        )
+        .unwrap();
+        import_project_ref("myapp", ext.to_str().unwrap()).unwrap();
+        std::fs::hard_link(
+            project_ref_file("myapp").unwrap(),
+            projects_root().join("twin.project-ref.json"),
+        )
+        .unwrap();
+        let dir = project_dir("myapp").unwrap();
+        assert!(
+            dir_shared_with_other_project("myapp", &dir),
+            "a hard-linked ref under another name is a surviving alias"
+        );
+        std::fs::remove_file(projects_root().join("twin.project-ref.json")).unwrap();
+        // A case-variant hard link coexisting with the exact spelling is a
+        // distinct entry (case-sensitive filesystem), so it counts too.
+        let variant = projects_root().join("MyApp.project-ref.json");
+        if std::fs::hard_link(project_ref_file("myapp").unwrap(), &variant).is_ok() {
+            assert!(dir_shared_with_other_project("myapp", &dir));
+            std::fs::remove_file(&variant).unwrap();
+        }
+        assert!(!dir_shared_with_other_project("myapp", &dir));
+        // A genuinely distinct alias still counts.
+        import_project_ref("other", ext.to_str().unwrap()).unwrap();
+        assert!(dir_shared_with_other_project("myapp", &dir));
+    }
+
+    #[test]
+    fn shared_dir_detection_keeps_ref_suffixed_directory_names_verbatim() {
+        let _g = lock();
+        let _root = temp_root();
+        let ws = projects_root().join("app.project-ref.json");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"a","name":"A"}"#,
+        )
+        .unwrap();
+        import_project_ref("alias", ws.to_str().unwrap()).unwrap();
+        let dir = project_dir("alias").unwrap();
+        assert!(
+            dir_shared_with_other_project("alias", &dir),
+            "the workspace project `app.project-ref.json` still resolves to the dir"
         );
     }
 
@@ -12415,6 +12645,161 @@ mod tests {
         assert!(
             !dir.join(GEN_DIR).join("data-cli.ts").exists(),
             "embedded data-cli.ts must not be materialised for an Urban app"
+        );
+    }
+
+    /// A serve-mode `urban` stub for the #1881 lifecycle tests: `--help`
+    /// advertises `data [--serve]` (first running `help_prelude`); a worker
+    /// start appends to `<log>` and answers each request with its pid.
+    #[cfg(unix)]
+    fn serve_lifecycle_stub(path: &Path, log: &Path, help_prelude: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh
+case \"$*\" in *--help*) {help_prelude}printf 'urban data [--serve]\\n'; exit 0;; esac\n\
+                 echo \"$*\" >> '{log}'\n\
+                 while IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{{\"id\":%s,\"ok\":true,\"pid\":%s}}\\n' \"$id\" \"$$\"; done\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// #1881: deleting one reference-only alias of a directory must not
+    /// retire the data worker another alias of the same directory still
+    /// uses; deleting the last reference retires it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn deleting_one_alias_keeps_the_shared_data_worker() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = ext_app_dir("alias-share");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1}"#).unwrap();
+        let log = root.join("alias-spawns.txt");
+        let stub = root.join("urban-alias-stub.sh");
+        serve_lifecycle_stub(&stub, &log, "");
+        import_project_ref("alias-a", ext.to_str().unwrap()).unwrap();
+        import_project_ref("alias-b", ext.to_str().unwrap()).unwrap();
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+        let op = |n: &'static str| run_data_op(n, serde_json::json!({ "op": "schema" }));
+        let del = |n: &'static str| async move {
+            tokio::task::spawn_blocking(move || delete_project(n))
+                .await
+                .unwrap()
+        };
+        let a = op("alias-a").await;
+        let deleted_a = del("alias-a").await;
+        let b = op("alias-b").await;
+        let deleted_b = del("alias-b").await;
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+        let (a, b) = (a.expect("op via alias-a"), b.expect("op via alias-b"));
+        deleted_a.expect("delete alias-a");
+        deleted_b.expect("delete alias-b");
+        assert_eq!(
+            a["pid"], b["pid"],
+            "deleting alias-a retired the shared worker"
+        );
+        let spawns = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(spawns.lines().count(), 1, "worker respawned: {spawns:?}");
+        let pid = a["pid"].as_i64().unwrap() as i32;
+        // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "deleting the last reference did not retire the worker"
+        );
+        assert!(ext.join("nano.app.json").is_file(), "external dir touched");
+    }
+
+    /// #1881: a rejected rename of a reference-only alias must not retire the
+    /// worker another alias of the same directory is using.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn renaming_one_alias_keeps_the_shared_data_worker() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = ext_app_dir("alias-rename");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1}"#).unwrap();
+        let log = root.join("alias-rename-spawns.txt");
+        let stub = root.join("urban-alias-rename-stub.sh");
+        serve_lifecycle_stub(&stub, &log, "");
+        import_project_ref("ralias-a", ext.to_str().unwrap()).unwrap();
+        import_project_ref("ralias-b", ext.to_str().unwrap()).unwrap();
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+        let op = |n: &'static str| run_data_op(n, serde_json::json!({ "op": "schema" }));
+        let b1 = op("ralias-b").await;
+        let renamed = tokio::task::spawn_blocking(|| rename_project("ralias-a", "ralias-c"))
+            .await
+            .unwrap();
+        let b2 = op("ralias-b").await;
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+        assert!(renamed.is_err(), "reference rename should be rejected");
+        let (b1, b2) = (b1.expect("op 1"), b2.expect("op 2"));
+        assert_eq!(
+            b1["pid"], b2["pid"],
+            "renaming alias-a retired the shared worker"
+        );
+        let spawns = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(spawns.lines().count(), 1, "worker respawned: {spawns:?}");
+        let _ = tokio::task::spawn_blocking(|| delete_project("ralias-b")).await;
+        let _ = tokio::task::spawn_blocking(|| delete_project("ralias-a")).await;
+    }
+
+    /// #1881: a request resolved before its project is deleted must not start
+    /// a worker afterwards — delete the project while its `--help` capability
+    /// probe is held, then release the probe.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn delete_during_capability_probe_spawns_no_worker() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = ext_app_dir("probe-race");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1}"#).unwrap();
+        let log = root.join("probe-spawns.txt");
+        let (probing, release) = (root.join("probing"), root.join("release"));
+        let stub = root.join("urban-probe-race-stub.sh");
+        serve_lifecycle_stub(
+            &stub,
+            &log,
+            &format!(
+                "touch '{}'; while [ ! -f '{}' ]; do sleep 0.02; done; ",
+                probing.display(),
+                release.display()
+            ),
+        );
+        import_project_ref("probe-race", ext.to_str().unwrap()).unwrap();
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+        let op = tokio::spawn(run_data_op(
+            "probe-race",
+            serde_json::json!({ "op": "schema" }),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !probing.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let probed = probing.exists();
+        let deleted = tokio::task::spawn_blocking(|| delete_project("probe-race"))
+            .await
+            .unwrap();
+        std::fs::write(&release, "").unwrap();
+        let res = op.await.unwrap();
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+        assert!(probed, "the capability probe never started");
+        deleted.expect("delete during the probe");
+        assert!(
+            matches!(res, Err(DataError::NoProject)),
+            "op resolved before the delete must fail closed: {res:?}"
+        );
+        let spawns = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            spawns.is_empty(),
+            "a worker started after retirement: {spawns:?}"
         );
     }
 
