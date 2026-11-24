@@ -228,6 +228,17 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the resolved toolkit's `urban data` gateway has the long-lived
+/// `--serve` mode (@nanobpm/urban >= 0.100.0, #1836). A `data`-capable toolkit
+/// without it is driven single-shot instead.
+pub(crate) async fn urban_supports_data_serve(urban: &Path) -> bool {
+    urban_help_text(urban)
+        .await
+        .as_deref()
+        .map(help_indicates_data_serve)
+        .unwrap_or(false)
+}
+
 /// The `urban --help` text for a resolved binary (stdout + stderr concatenated,
 /// `NO_COLOR`), memoised per binary path. This is the **single** place a toolkit
 /// is spawned to probe its capabilities: every `urban_supports_*` gate derives
@@ -523,6 +534,12 @@ fn help_indicates_data(help: &str) -> bool {
     help.contains("urban data")
 }
 
+/// The serve mode is advertised on the `urban data` help line(s).
+fn help_indicates_data_serve(help: &str) -> bool {
+    help.lines()
+        .any(|l| l.contains("urban data") && l.contains("--serve"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +743,17 @@ urban — build and run Urban apps (nano.app.json)
   urban gen [--check]               derive artifacts (migrations, worker-io)
   urban data                        run a datasource op through the gateway";
         assert!(help_indicates_data(new_help));
+        assert!(
+            !help_indicates_data_serve(new_help),
+            "a pre-0.100 `data` toolkit has no serve mode"
+        );
+        let serve_help = "\
+  urban gen --serve                 (unrelated flag elsewhere)
+  urban data [--serve]              run datasource ops (--serve: NDJSON loop)";
+        assert!(help_indicates_data_serve(serve_help));
+        assert!(!help_indicates_data_serve(
+            "  urban data   op gateway\n  urban run --serve   serve app"
+        ));
     }
 
     /// Guards the failure mode where a *failed* `urban --help` (non-zero exit)

@@ -4458,12 +4458,26 @@ async fn run_data_op_inner(
                         .to_string(),
                 )
             })?;
-            // #1836: every op goes through the project's one long-lived
-            // `urban data --serve` worker (NDJSON over stdin/stdout, anchored at
-            // the project dir as CWD; @nanobpm/urban >= 0.100.0), so a warm
-            // worker answers without starting a new Node process.
-            return urban_data_worker::run_serve_op(data_gateway_limiter(), &urban, &dir, &request)
+            // #1836: a toolkit with serve mode (@nanobpm/urban >= 0.100.0)
+            // answers every op from the project's one long-lived
+            // `urban data --serve` worker (NDJSON over stdin/stdout, CWD = the
+            // project dir), so a warm worker starts no new Node process. An
+            // older `data`-capable toolkit keeps the single-shot pipe —
+            // additive + non-regressing.
+            if super::urban::urban_supports_data_serve(&urban).await {
+                return urban_data_worker::run_serve_op(
+                    data_gateway_limiter(),
+                    &urban,
+                    &dir,
+                    &request,
+                )
                 .await;
+            }
+            let mut cmd = Command::new(&urban);
+            // `urban data` reads the JSON request on stdin (root "." + manifest
+            // "nano.app.json" default), anchored at the project dir as CWD.
+            cmd.current_dir(&dir).arg("data");
+            return pipe_data_gateway(cmd, &request).await;
         }
         DataGatewayPath::Embedded => {}
     }
@@ -4874,6 +4888,8 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     // so delete it. Also drop a coexisting ref so the name can't silently
     // resurrect as an imported project once its directory is gone.
     let workspace_dir = projects_root().join(name);
+    // #1836: no `urban data --serve` worker may outlive (or pin) its project.
+    urban_data_worker::retire_project_worker(&dir);
     if workspace_dir.is_dir() {
         // Drop a coexisting ref before removing the directory; propagate an IO
         // error so a pointer that can't be removed can't silently resurrect the
@@ -4910,6 +4926,8 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     // ref resolution could point `to` (a dangling `new` reference) at an
     // external path and move the workspace project outside the root.
     let from = projects_root().join(old);
+    // #1836: the worker is keyed on (and anchored in) the old directory.
+    urban_data_worker::retire_project_worker(&from);
     if !from.is_dir() {
         // A pure imported-by-reference project (no workspace dir) can't be
         // renamed by a directory move; remove and re-import under the new name.
@@ -12299,7 +12317,7 @@ mod tests {
         let stub = root.join("urban-data-stub.sh");
         write_urban_stub(
             &stub,
-            "case \"$*\" in *--help*) printf 'urban data — datasource op gateway\\n'; exit 0;; esac\nwhile IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"ok\":true,\"routed\":\"urban-data\"}\\n' \"$id\"; done\n",
+            "case \"$*\" in *--help*) printf 'urban data [--serve] — datasource op gateway\\n'; exit 0;; esac\nwhile IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"ok\":true,\"routed\":\"urban-data\"}\\n' \"$id\"; done\n",
         );
         unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
 
@@ -12325,6 +12343,41 @@ mod tests {
             !dir.join(GEN_DIR).join("data-cli.ts").exists(),
             "embedded data-cli.ts must not be materialised for an Urban app"
         );
+    }
+
+    /// #1836: a toolkit that has `urban data` but predates its `--serve` mode
+    /// (< 0.100.0) keeps the single-shot pipe instead of being run as a serve
+    /// worker it cannot be (which would hang reading stdin until timeout).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn run_data_op_uses_single_shot_urban_data_without_serve_mode() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "urban-data-noserve-app";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"urban-data-noserve-app"}"#,
+        )
+        .unwrap();
+        let stub = root.join("urban-data-noserve-stub.sh");
+        write_urban_stub(
+            &stub,
+            "case \"$*\" in *--help*) printf 'urban data — datasource op gateway\\n'; exit 0;; esac\ncat >/dev/null\nprintf '{\"ok\":true,\"routed\":\"single-shot\"}\\n'\n",
+        );
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+        let res = run_data_op(name, serde_json::json!({ "op": "schema" })).await;
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+        let val = res.expect("single-shot urban data should succeed");
+        assert_eq!(
+            val.get("routed").and_then(|v| v.as_str()),
+            Some("single-shot"),
+            "{val:?}"
+        );
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
+        assert_eq!(sentinel.lines().next(), Some("data"), "{sentinel:?}");
     }
 
     /// #522 slice (b): an Urban-shaped app whose resolved `urban` *predates* the

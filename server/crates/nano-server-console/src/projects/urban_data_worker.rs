@@ -16,8 +16,13 @@
 //! - **Restarted on toolkit/manifest change**: each op recomputes
 //!   [`toolkit_fingerprint`] (the resolved `urban` binary + its on-disk stamp +
 //!   the `nano.app.json` bytes); a mismatch retires the old worker first.
-//! - **Desync-safe**: an op cancelled mid-exchange leaves the worker marked
-//!   `in_flight`, and the next op retires it rather than reading a stale reply.
+//! - **Desync-safe**: the worker stays in its slot for the whole exchange, so an
+//!   op cancelled mid-exchange leaves it there marked `in_flight`; the next op
+//!   kills its whole process group rather than reading a stale reply.
+//! - **Retired with its project**: deleting or renaming a project calls
+//!   [`retire_project_worker`], which drops the slot and kills the worker, and
+//!   the fingerprint includes the directory's identity so a project recreated
+//!   under the same path never reuses a worker anchored in the deleted one.
 //! - **Orphan-free**: the console holds the worker's stdin, so if the console
 //!   dies the worker sees EOF and exits; timeouts kill its whole process group.
 
@@ -49,16 +54,56 @@ struct Worker {
 
 type Slot = Arc<tokio::sync::Mutex<Option<Worker>>>;
 
-/// The per-project worker slots, keyed on the canonical project directory.
-fn slot_for(dir: &Path) -> Slot {
+fn slots() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Slot>> {
     static SLOTS: OnceLock<Mutex<HashMap<PathBuf, Slot>>> = OnceLock::new();
     SLOTS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(dir.to_path_buf())
-        .or_default()
-        .clone()
+}
+
+/// The per-project worker slots, keyed on the canonical project directory.
+fn slot_for(dir: &Path) -> Slot {
+    slots().entry(dir.to_path_buf()).or_default().clone()
+}
+
+/// Whether `slot` is still the registered slot for `dir` (it is not once
+/// [`retire_project_worker`] has dropped it).
+fn slot_is_registered(dir: &Path, slot: &Slot) -> bool {
+    slots().get(dir).is_some_and(|s| Arc::ptr_eq(s, slot))
+}
+
+/// Stop the project's worker (if any) and forget its slot: called when a
+/// project is deleted or renamed so no idle Node worker outlives it (nor holds
+/// its directory as CWD, which blocks removal on Windows). An op in flight on
+/// the slot keeps its worker until it finishes, then kills it instead of
+/// parking it, because the slot is no longer registered.
+pub(super) fn retire_project_worker(dir: &Path) {
+    // Callers key on the canonical dir; accept either spelling here.
+    let canon = dunce::canonicalize(dir).ok();
+    let removed: Vec<Slot> = {
+        let mut map = slots();
+        [Some(dir.to_path_buf()), canon]
+            .into_iter()
+            .flatten()
+            .filter_map(|k| map.remove(&k))
+            .collect()
+    };
+    for slot in removed {
+        retire_slot(&slot);
+    }
+}
+
+fn retire_slot(slot: &Slot) {
+    if let Ok(mut g) = slot.try_lock()
+        && let Some(mut w) = g.take()
+    {
+        if let Some(pid) = w.child.id() {
+            super::kill_group_by_pid(pid);
+        }
+        // `kill_on_drop` reaps the wrapper; the group kill above got Node.
+        let _ = w.child.start_kill();
+    }
 }
 
 /// Identity of the toolkit + manifest a worker was started against. Any change
@@ -79,6 +124,17 @@ fn toolkit_fingerprint(urban: &Path, dir: &Path) -> u64 {
         md.modified().ok().hash(&mut h);
     }
     std::fs::read(dir.join("nano.app.json")).ok().hash(&mut h);
+    // The directory's own identity: a project deleted and recreated at the
+    // same path is a different directory, so its worker (whose CWD is the
+    // deleted one) must not be reused.
+    if let Ok(md) = std::fs::metadata(dir) {
+        md.created().ok().hash(&mut h);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            (md.dev(), md.ino()).hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -263,31 +319,41 @@ pub(super) async fn run_serve_op(
             *guard = Some(w);
         }
     }
-    let mut w = match guard.take() {
-        Some(w) => w,
-        None => spawn_worker(urban, dir, fingerprint)?,
+    if guard.is_none() {
+        *guard = Some(spawn_worker(urban, dir, fingerprint)?);
+    }
+    // The worker stays in the slot for the whole exchange: if this op is
+    // cancelled, the next op finds it `in_flight` and kills its process group.
+    let result = match guard.as_mut() {
+        Some(w) => {
+            let id = w.next_id;
+            w.next_id += 1;
+            tokio::time::timeout(limiter.timeout, exchange(w, id, request)).await
+        }
+        None => Ok(Err(DataError::Gateway(
+            "internal error: data worker slot empty".to_string(),
+        ))),
     };
-    let id = w.next_id;
-    w.next_id += 1;
-    match tokio::time::timeout(limiter.timeout, exchange(&mut w, id, request)).await {
+    let ok = matches!(result, Ok(Ok(_)));
+    if !ok || !slot_is_registered(dir, &slot) {
+        // Failed/timed-out (possibly desynced) worker, or one whose project was
+        // retired while this op ran: never park it.
+        if let Some(w) = guard.take() {
+            kill_worker(w).await;
+        }
+    }
+    match result {
         Ok(Ok(mut reply)) => {
-            *guard = Some(w);
             if let Some(obj) = reply.as_object_mut() {
                 obj.remove("id");
             }
             super::interpret_gateway_reply(reply)
         }
-        Ok(Err(e)) => {
-            kill_worker(w).await;
-            Err(e)
-        }
-        Err(_) => {
-            kill_worker(w).await;
-            Err(DataError::Gateway(format!(
-                "data gateway timed out after {:?}",
-                limiter.timeout
-            )))
-        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(DataError::Gateway(format!(
+            "data gateway timed out after {:?}",
+            limiter.timeout
+        ))),
     }
 }
 
@@ -438,6 +504,100 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         let _ = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"})).await;
+        assert_eq!(spawn_count(&spawns), 2);
+    }
+
+    /// Deleting/renaming a project retires its worker: the process is killed
+    /// and the slot forgotten, so the next op spawns fresh.
+    #[tokio::test]
+    async fn retire_project_worker_kills_and_forgets() {
+        let dir = project("retire");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        let a = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        retire_project_worker(&dir);
+        assert!(!slots().contains_key(&dir), "slot not forgotten");
+        let pid = a["pid"].as_i64().unwrap() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "retired worker still alive"
+        );
+        let b = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert_ne!(a["pid"], b["pid"]);
+    }
+
+    /// A project recreated at the same path gets a fresh worker even when the
+    /// manifest and toolkit are byte-identical.
+    #[tokio::test]
+    async fn recreated_project_dir_restarts_worker() {
+        let dir = project("recreate");
+        let tk = project("recreate-tk");
+        let spawns = tk.join("spawns.txt");
+        let stub = serve_stub(&tk, &spawns, 0);
+        let lim = limiter();
+        let a = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nano.app.json"), r#"{"schemaVersion":1}"#).unwrap();
+        let b = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert_ne!(a["pid"], b["pid"]);
+        assert_eq!(spawn_count(&spawns), 2);
+    }
+
+    /// An op cancelled mid-exchange leaves the worker in its slot marked
+    /// `in_flight`; the next op kills it and spawns a fresh one.
+    #[tokio::test]
+    async fn cancelled_op_retires_worker_on_next_op() {
+        let dir = project("cancel");
+        let spawns = dir.join("spawns.txt");
+        let stub = dir.join("urban-slow-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\necho x >> '{}'\nwhile IFS= read -r line; do\n\
+                 id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n\
+                 case \"$line\" in *slow*) sleep 30;; esac\n\
+                 printf '{{\"id\":%s,\"ok\":true,\"pid\":%s}}\\n' \"$id\" \"$$\"\ndone\n",
+                spawns.display()
+            ),
+        );
+        let lim = limiter();
+        let a = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"slow"})),
+        )
+        .await;
+        assert!(cancelled.is_err(), "slow op should have been cancelled");
+        {
+            let slot = slot_for(&dir);
+            let g = slot.lock().await;
+            assert!(
+                g.as_ref().is_some_and(|w| w.in_flight),
+                "worker not kept in_flight"
+            );
+        }
+        let b = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"}))
+            .await
+            .unwrap();
+        assert_ne!(a["pid"], b["pid"]);
         assert_eq!(spawn_count(&spawns), 2);
     }
 
