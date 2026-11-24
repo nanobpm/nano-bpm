@@ -186,16 +186,55 @@ impl Drop for Retired<'_> {
     }
 }
 
-fn kill_and_reap_blocking(limiter: &DataGatewayLimiter, mut w: Worker) {
-    let _ticket = Reaping::new(limiter);
-    if let Some(pid) = w.child.id() {
-        super::kill_group_by_pid(pid);
-    }
-    let _ = w.child.start_kill();
-    let give_up = Instant::now() + super::GATEWAY_REAP_GRACE;
-    while !matches!(w.child.try_wait(), Ok(Some(_)) | Err(_)) && Instant::now() < give_up {
+/// Kill a worker's process group and reap it from a blocking context,
+/// holding a [`Reaping`] ticket and a [`Waiting`] place on `slot` meanwhile.
+/// If it has not exited within the reap grace it is **not** treated as gone:
+/// a background thread keeps both held and keeps killing/reaping until the
+/// process exits, so a retirement drain on `slot` fails closed (#1836).
+/// Returns whether the process exited within the grace.
+fn kill_and_reap_blocking(limiter: &DataGatewayLimiter, slot: &Slot, w: Worker) -> bool {
+    let ticket = Reaping::new(limiter);
+    slot.waiters.fetch_add(1, Ordering::AcqRel);
+    let hold = Waiting(slot.clone());
+    let budget = limiter.reaping.clone();
+    let mut child = w.child;
+    let pid = child.id();
+    budget.kill(pid, &mut child);
+    let give_up = Instant::now() + budget.grace();
+    loop {
+        if child_exited(&mut child) {
+            return true;
+        }
+        if Instant::now() >= give_up {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
+    warn_unreaped(pid);
+    std::thread::spawn(move || {
+        let _ticket = ticket;
+        let _hold = hold;
+        while !child_exited(&mut child) {
+            budget.kill(pid, &mut child);
+            std::thread::sleep(REAP_RETRY);
+        }
+        tracing::info!(?pid, "data worker: unreaped process finally exited");
+    });
+    false
+}
+
+/// Interval between kill/reap attempts on a worker that outlived the grace.
+const REAP_RETRY: Duration = Duration::from_millis(50);
+
+fn child_exited(child: &mut Child) -> bool {
+    matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+}
+
+fn warn_unreaped(pid: Option<u32>) {
+    tracing::warn!(
+        ?pid,
+        "data worker did not exit after kill; holding its slot and budget until it does"
+    );
 }
 
 /// Retire the project's worker(s) before its directory is deleted/renamed
@@ -241,14 +280,16 @@ pub(super) fn retire_project_worker_blocking<'a>(
         };
         if let Some(pid) = pid {
             // The in-flight op sees EOF, fails, and leaves the slot.
-            super::kill_group_by_pid(pid);
+            limiter.reaping.kill_group(pid);
         }
         let idle = slot.idle().take();
         if let Some(w) = idle {
-            kill_and_reap_blocking(limiter, w);
+            // An unreaped worker keeps its place on `slot`: the drain below
+            // then fails closed instead of handing over a live directory.
+            kill_and_reap_blocking(limiter, slot, w);
         }
     }
-    let give_up = Instant::now() + RETIRE_DRAIN;
+    let give_up = Instant::now() + limiter.reaping.drain();
     while removed
         .iter()
         .any(|s| s.waiters.load(Ordering::Acquire) > 0)
@@ -271,6 +312,82 @@ pub(super) fn retire_project_worker_blocking<'a>(
 pub(crate) struct ReapBudget {
     pub(super) count: AtomicUsize,
     pub(super) notify: tokio::sync::Notify,
+    /// Test seam: kills are not delivered (a worker that ignores the kill).
+    #[cfg(test)]
+    ignore_kill: std::sync::atomic::AtomicBool,
+    /// Test seam: short reap grace and retirement drain.
+    #[cfg(test)]
+    short_waits: std::sync::atomic::AtomicBool,
+}
+
+impl ReapBudget {
+    /// Kill a process group (blocking `taskkill` on Windows).
+    fn kill_group(&self, pid: u32) {
+        #[cfg(test)]
+        if self.ignore_kill.load(Ordering::Acquire) {
+            return;
+        }
+        super::kill_group_by_pid(pid);
+    }
+
+    /// Kill the worker's group and the child itself (blocking on Windows).
+    fn kill(&self, pid: Option<u32>, child: &mut Child) {
+        #[cfg(test)]
+        if self.ignore_kill.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(pid) = pid {
+            super::kill_group_by_pid(pid);
+        }
+        let _ = child.start_kill();
+    }
+
+    fn grace(&self) -> Duration {
+        #[cfg(test)]
+        if self.short_waits.load(Ordering::Acquire) {
+            return Duration::from_millis(100);
+        }
+        super::GATEWAY_REAP_GRACE
+    }
+
+    fn drain(&self) -> Duration {
+        #[cfg(test)]
+        if self.short_waits.load(Ordering::Acquire) {
+            return Duration::from_millis(300);
+        }
+        RETIRE_DRAIN
+    }
+}
+
+/// Kill a child's whole tree and wait (bounded by the reap grace) for it to
+/// exit. Returns whether it exited.
+async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child) -> bool {
+    let pid = child.id();
+    if let Some(pid) = pid {
+        // Blocking on Windows (`taskkill` status); cheap signal on Unix.
+        let b = budget.clone();
+        let _ = tokio::task::spawn_blocking(move || b.kill_group(pid)).await;
+    }
+    #[cfg(test)]
+    let skip = budget.ignore_kill.load(Ordering::Acquire);
+    #[cfg(not(test))]
+    let skip = false;
+    if !skip {
+        let _ = child.start_kill();
+    }
+    tokio::time::timeout(budget.grace(), child.wait())
+        .await
+        .is_ok()
+}
+
+/// Keep killing and reaping a child that outlived its grace until it exits.
+async fn reap_until_exit(budget: &Arc<ReapBudget>, child: &mut Child) {
+    let pid = child.id();
+    warn_unreaped(pid);
+    while !kill_tree(budget, child).await {
+        tokio::time::sleep(REAP_RETRY).await;
+    }
+    tracing::info!(?pid, "data worker: unreaped process finally exited");
 }
 
 /// Counts one worker teardown against the live-process budget until dropped.
@@ -306,7 +423,7 @@ fn kill_detached(limiter: &DataGatewayLimiter, slot: &Slot, mut w: Worker) {
     // stops at once, whatever happens to the background task.
     #[cfg(unix)]
     if let Some(pid) = pid {
-        super::kill_group_by_pid(pid);
+        limiter.reaping.kill_group(pid);
     }
     let Ok(rt) = tokio::runtime::Handle::try_current() else {
         // No runtime (shutdown): best effort, inline. `kill_on_drop` backs it.
@@ -319,15 +436,15 @@ fn kill_detached(limiter: &DataGatewayLimiter, slot: &Slot, mut w: Worker) {
         drop(hold);
         return;
     };
+    let budget = limiter.reaping.clone();
     rt.spawn(async move {
         let _ticket = ticket;
         let _hold = hold;
-        #[cfg(not(unix))]
-        if let Some(pid) = pid {
-            let _ = tokio::task::spawn_blocking(move || super::kill_group_by_pid(pid)).await;
+        // Not reaped in time: still a live process — keep the ticket and the
+        // slot place until it really exits.
+        if !kill_tree(&budget, &mut w.child).await {
+            reap_until_exit(&budget, &mut w.child).await;
         }
-        let _ = w.child.start_kill();
-        super::reap_gateway_bounded(&mut w.child, super::GATEWAY_REAP_GRACE).await;
     });
 }
 
@@ -452,15 +569,6 @@ fn spawn_worker(urban: &Path, dir: &Path, fingerprint: u64) -> Result<Worker, Da
     })
 }
 
-/// Kill a child's whole process tree and reap it (bounded).
-async fn kill_tree(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        // Blocking on Windows (`taskkill` status); cheap signal on Unix.
-        let _ = tokio::task::spawn_blocking(move || super::kill_group_by_pid(pid)).await;
-    }
-    super::reap_gateway_bounded(child, super::GATEWAY_REAP_GRACE).await;
-}
-
 /// Test seam type: see `DataGatewayLimiter::after_spawn`.
 #[cfg(test)]
 pub(super) type AfterSpawnHook = Box<dyn FnOnce(Option<u32>) + Send>;
@@ -470,39 +578,52 @@ pub(super) type AfterSpawnHook = Box<dyn FnOnce(Option<u32>) + Send>;
 /// retirement drain waits for it), then await it. If the caller is cancelled
 /// mid-teardown the task still finishes the kill/reap: ownership never falls
 /// back to a bare `Child` drop that skips the process-group cleanup (#1836).
-async fn teardown_owned(limiter: &DataGatewayLimiter, slot: &Slot, w: Worker, graceful: bool) {
+/// The caller waits only for the bounded kill/reap; a process that outlives
+/// it stays owned by the task, which keeps the ticket and the slot place
+/// until it exits. Returns whether the process exited within the grace.
+async fn teardown_owned(
+    limiter: &DataGatewayLimiter,
+    slot: &Slot,
+    w: Worker,
+    graceful: bool,
+) -> bool {
     let ticket = Reaping::new(limiter);
     slot.waiters.fetch_add(1, Ordering::AcqRel);
     let hold = Waiting(slot.clone());
-    let task = tokio::spawn(async move {
+    let budget = limiter.reaping.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
         let _ticket = ticket;
         let _hold = hold;
-        if graceful {
-            retire_worker(w).await;
+        let Worker {
+            mut child, stdin, ..
+        } = w;
+        let exited = if graceful {
+            retire_child(&budget, &mut child, stdin).await
         } else {
-            kill_worker(w).await;
+            drop(stdin);
+            kill_tree(&budget, &mut child).await
+        };
+        let _ = tx.send(exited);
+        if !exited {
+            reap_until_exit(&budget, &mut child).await;
         }
     });
-    let _ = task.await;
-}
-
-async fn kill_worker(mut w: Worker) {
-    kill_tree(&mut w.child).await;
+    rx.await.unwrap_or(false)
 }
 
 /// Retire a healthy worker gracefully: close stdin (serve mode exits 0 on EOF)
-/// and kill it only if it doesn't go within [`RETIRE_GRACE`].
-async fn retire_worker(w: Worker) {
-    let Worker {
-        mut child, stdin, ..
-    } = w;
+/// and kill it only if it doesn't go within [`RETIRE_GRACE`]. Returns whether
+/// it exited.
+async fn retire_child(budget: &Arc<ReapBudget>, child: &mut Child, stdin: ChildStdin) -> bool {
     drop(stdin);
     if tokio::time::timeout(RETIRE_GRACE, child.wait())
         .await
-        .is_err()
+        .is_ok()
     {
-        kill_tree(&mut child).await;
+        return true;
     }
+    kill_tree(budget, child).await
 }
 
 fn with_stderr(w: &Worker, msg: String) -> DataError {
@@ -968,6 +1089,74 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "cancelled teardown orphaned the worker"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #1836: a worker that does not die within the reap grace is not treated
+    /// as gone. Retirement fails closed (WouldBlock, directory untouched) and
+    /// the live-process budget and slot place stay held until it exits.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreaped_idle_worker_blocks_retirement_and_holds_budget() {
+        let dir = project("unreaped-idle");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        lim.reaping.ignore_kill.store(true, Ordering::Release);
+        lim.reaping.short_waits.store(true, Ordering::Release);
+        let w = spawn_worker(&stub, &dir, 0).unwrap();
+        let pid = w.child.id().unwrap() as i32;
+        let slot = lim.workers.slot_for(&dir);
+        *slot.idle() = Some(w);
+        let r = retire_project_worker_blocking(&lim, &dir);
+        assert!(
+            matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "retire must fail closed over a live worker"
+        );
+        drop(r);
+        assert!(dir.join("nano.app.json").exists(), "directory touched");
+        // SAFETY: signal 0 only probes for existence.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "worker should be alive");
+        assert_eq!(lim.reaping.count.load(Ordering::Acquire), 1);
+        assert_eq!(slot.waiters.load(Ordering::Acquire), 1);
+        lim.reaping.ignore_kill.store(false, Ordering::Release);
+        wait_released(&lim, &slot, pid).await;
+    }
+
+    /// #1836: the async teardown path keeps an unreaped worker's budget
+    /// ticket and slot place until it exits, while its caller moves on.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreaped_teardown_holds_budget_until_exit() {
+        let dir = project("unreaped-teardown");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        lim.reaping.ignore_kill.store(true, Ordering::Release);
+        lim.reaping.short_waits.store(true, Ordering::Release);
+        let w = spawn_worker(&stub, &dir, 0).unwrap();
+        let pid = w.child.id().unwrap() as i32;
+        let slot = lim.workers.slot_for(&dir);
+        let exited = teardown_owned(&lim, &slot, w, false).await;
+        assert!(!exited, "a surviving worker reported as reaped");
+        assert_eq!(lim.reaping.count.load(Ordering::Acquire), 1);
+        assert_eq!(slot.waiters.load(Ordering::Acquire), 1);
+        lim.reaping.ignore_kill.store(false, Ordering::Release);
+        wait_released(&lim, &slot, pid).await;
+    }
+
+    async fn wait_released(lim: &DataGatewayLimiter, slot: &Slot, pid: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
+        while unsafe { libc::kill(pid, 0) } == 0
+            || lim.reaping.count.load(Ordering::Acquire) != 0
+            || slot.waiters.load(Ordering::Acquire) != 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "budget/slot not released after the worker exited"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
