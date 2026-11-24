@@ -3554,6 +3554,9 @@ pub(crate) struct DataGatewayLimiter {
     /// Killed serve workers whose teardown (Windows `taskkill`, reap) has not
     /// finished yet: still live processes, so they count against the budget.
     reaping: std::sync::Arc<urban_data_worker::ReapBudget>,
+    /// Test seam: runs once between a worker spawn and its pid publish.
+    #[cfg(test)]
+    after_spawn: std::sync::Mutex<Option<urban_data_worker::AfterSpawnHook>>,
 }
 
 impl DataGatewayLimiter {
@@ -3586,6 +3589,8 @@ impl DataGatewayLimiter {
             timeout: timeout.max(std::time::Duration::from_millis(1)),
             workers: urban_data_worker::WorkerRegistry::default(),
             reaping: std::sync::Arc::default(),
+            #[cfg(test)]
+            after_spawn: std::sync::Mutex::new(None),
         }
     }
 

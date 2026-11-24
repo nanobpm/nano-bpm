@@ -447,6 +447,10 @@ async fn kill_tree(child: &mut Child) {
     super::reap_gateway_bounded(child, super::GATEWAY_REAP_GRACE).await;
 }
 
+/// Test seam type: see `DataGatewayLimiter::after_spawn`.
+#[cfg(test)]
+pub(super) type AfterSpawnHook = Box<dyn FnOnce(Option<u32>) + Send>;
+
 async fn kill_worker(mut w: Worker) {
     kill_tree(&mut w.child).await;
 }
@@ -655,16 +659,36 @@ pub(super) async fn run_serve_op(
     }
     if use_.worker.is_none() {
         use_.worker = Some(spawn_worker(urban, dir, fingerprint)?);
+        #[cfg(test)]
+        {
+            let hook = limiter
+                .after_spawn
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(h) = hook {
+                h(use_.worker.as_ref().and_then(|w| w.child.id()));
+            }
+        }
     }
     {
         // Publish the in-use pid so retirement can kill it; if the project
-        // was retired meanwhile, this worker must not run (InUse kills it).
-        let mut a = slot.active();
-        if a.retired {
-            drop(a);
+        // was retired meanwhile, this worker must not run: reap it before
+        // returning (and before `_waiting` drops), so a drain that sees
+        // waiters==0 never races a still-live worker holding the project dir.
+        let retired_now = {
+            let mut a = slot.active();
+            if !a.retired {
+                a.pid = use_.worker.as_ref().and_then(|w| w.child.id());
+            }
+            a.retired
+        };
+        if retired_now {
+            if let Some(w) = use_.worker.take() {
+                kill_worker(w).await;
+            }
             return Err(retired());
         }
-        a.pid = use_.worker.as_ref().and_then(|w| w.child.id());
     }
     let result = match use_.worker.as_mut() {
         Some(w) => {
@@ -951,6 +975,37 @@ mod tests {
         run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"x"}))
             .await
             .unwrap();
+    }
+
+    /// #1836: a retirement landing between spawn and pid publish must reap
+    /// the freshly spawned worker before the op leaves the slot, so the
+    /// retire drain (waiters==0) never races a live worker in the dir.
+    #[tokio::test]
+    async fn retire_between_spawn_and_publish_reaps_fresh_worker() {
+        let dir = project("retire-spawn");
+        let spawns = dir.join("spawns.txt");
+        let stub = serve_stub(&dir, &spawns, 0);
+        let lim = limiter();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let s2 = seen.clone();
+        let slot = lim.workers.slot_for(&dir);
+        *lim.after_spawn.lock().unwrap() = Some(Box::new(move |pid| {
+            slot.active().retired = true;
+            *s2.lock().unwrap() = pid;
+        }));
+        let r = run_serve_op(&lim, &stub, &dir, &serde_json::json!({"op":"schema"})).await;
+        assert!(matches!(r, Err(DataError::NoProject)), "{r:?}");
+        let pid = seen.lock().unwrap().expect("worker spawned") as i32;
+        assert_eq!(
+            lim.workers.slot_for(&dir).waiters.load(Ordering::Acquire),
+            0
+        );
+        // SAFETY: signal 0 only probes for existence (a reaped pid answers -1).
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "fresh worker alive (or unreaped) after the retired op returned"
+        );
     }
 
     /// An over-long stdout line is a protocol error that kills the worker.
