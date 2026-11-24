@@ -236,14 +236,13 @@ test("the pruning job is wired into the tag-triggered gateway release workflow",
   const wf = readFileSync(join(root, ".github/workflows/publish-c8ctl-binaries.yml"), "utf8");
   assert.match(wf, /prune-divergence-allowlist\.mjs/);
   assert.match(wf, /chore\/prune-determinism-allowlist-\$\{TAG\}/);
-  // The job pushes its branch and opens the PR: it needs contents: write and
-  // pull-requests: write at JOB level (the workflow default is read-only, and
-  // least privilege keeps the PR-write token off every other job).
   const job = wf.slice(wf.indexOf("  prune-allowlist:"), wf.indexOf("\n  publish:"));
-  assert.match(job, /permissions:[\s\S]*contents:\s*write/);
-  assert.match(job, /permissions:[\s\S]*pull-requests:\s*write/);
-  // A bot-token PR does not trigger required CI; a PAT/App token must be preferred.
-  assert.match(job, /secrets\.ALLOWLIST_PRUNE_TOKEN \|\| secrets\.GITHUB_TOKEN/);
+  // GITHUB_TOKEN may not create PRs (#1907) and its pushes do not trigger the
+  // required CI: the push and the PR use a GitHub App installation token.
+  assert.match(job, /uses: actions\/create-github-app-token@/);
+  assert.match(job, /token: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
+  assert.match(job, /GH_TOKEN: \$\{\{ steps\.app-token\.outputs\.token \}\}/);
+  assert.doesNotMatch(job, /GITHUB_TOKEN \}\}|github\.token/);
   // Re-run recovery: an already-pushed branch is reused, not recreated.
   assert.match(job, /git ls-remote --exit-code --heads origin "\$branch"/);
 });

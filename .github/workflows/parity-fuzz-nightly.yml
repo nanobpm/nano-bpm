@@ -78,10 +78,18 @@ jobs:
             args+=(--cases "$CASES" --max-gateways "$MAX_GATEWAYS" --record --file-issues)
           fi
           node formal/corpus/fuzz.mjs "${args[@]}"
+      # GITHUB_TOKEN may not create PRs (#1907): use the GitHub App token.
+      - name: Mint the release-automation GitHub App token
+        id: app-token
+        if: failure() && github.event_name != 'pull_request'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
       - name: Commit the minimal reproducers (PR)
         if: failure() && github.event_name != 'pull_request'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SEED: ${{ steps.fuzz.outputs.seed }}
         run: |
           if git diff --quiet -- formal/corpus/fuzz-corpus.json; then
