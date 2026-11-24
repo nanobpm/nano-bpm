@@ -29,8 +29,7 @@ use nanobpmn_engine_core::{
 /// everything it touches is `#[cfg(feature = "read-model")]`.
 #[cfg(feature = "read-model")]
 use nanobpmn_read_model::{
-    AgentHistoryFilter, AgentHistoryRow, AgentInstanceFilter, AgentInstanceRow, FormRow,
-    ProcessInstanceRow, ReadStore, ResourceRow, RootResolver, UserTaskRow, VariableRow,
+    FormRow, ProcessInstanceRow, ReadStore, ResourceRow, RootResolver, UserTaskRow, VariableRow,
     VARIABLE_VALUE_PREVIEW_LEN,
 };
 use serde::Serialize;
@@ -68,6 +67,14 @@ fn console_error(msg: &str) {
 /// read surface — that fails the build when a newly served read is recorded
 /// without a conscious `TestEngine` decision.
 mod surface_parity;
+
+#[cfg(all(test, feature = "read-model", not(target_arch = "wasm32")))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only module (feature-gated, so the clippy.toml test exemptions do not apply)"
+)]
+mod search_parity_tests;
 
 /// A simulated engine instance bound to one modeler session.
 #[wasm_bindgen]
@@ -1332,54 +1339,77 @@ impl TestEngine {
         to_json(&search_result(items))
     }
 
-    /// The AgentInstances matching an optional filter, as an
-    /// `AgentInstanceSearchQueryResult` JSON object (`{ items, page }`). The
-    /// filter is `{ agentInstanceKey?, agentDefinitionKey?, processInstanceKey?,
-    /// rootProcessInstanceKey?, processDefinitionKey?, status?, elementId?,
-    /// tenantId? }` (`status` a REST spelling, e.g. `"INITIALIZING"`); an
-    /// empty/absent filter returns every instance. Accepts the canonical REST
-    /// envelope `{ "filter": { … } }` as well as the top-level shorthand.
-    /// Mirrors `POST /agent-instances/search`.
+    /// `searchAgentInstances` — mirrors `POST /agent-instances/search`.
+    /// `query_json` is the spec's `AgentInstanceSearchQuery` (`{ filter?, sort?,
+    /// page? }`; empty ⇒ no query), parsed into the generated model and run
+    /// through the SAME `nanobpmn_search` pipeline the gateway serves (every
+    /// filter operator, sort, limit/cursor paging). Returns the generated
+    /// `AgentInstanceSearchQueryResult` as JSON. A property the spec does not
+    /// define is rejected, never silently ignored.
     #[wasm_bindgen(js_name = searchAgentInstances)]
-    pub fn search_agent_instances(&self, filter_json: &str) -> Result<String, JsValue> {
-        let filter = parse_agent_instance_filter(filter_json)?;
-        let items: Vec<serde_json::Value> = self
-            .read_model
-            .try_agent_instances(&filter, None)
-            .map_err(|e| js_err(&e.to_string()))?
-            .iter()
-            .map(agent_instance_result)
-            .collect::<Result<_, _>>()
-            .map_err(|e| js_err(&e))?;
-        to_json(&search_result(items))
+    pub fn search_agent_instances(&self, query_json: &str) -> Result<String, JsValue> {
+        self.search_agent_instances_json(query_json)
+            .map_err(|e| js_err(&e))
     }
 
-    /// The AgentHistory turns for `agent_instance_key`, as an
-    /// `AgentInstanceHistorySearchQueryResult` JSON object (`{ items, page }`),
-    /// in the engine's canonical `(loopIteration, producedAt, historyItemKey)`
-    /// order. `filter_json` is `{ commitStatus? }` where `commitStatus` is a REST
-    /// spelling or array of them; **omitting it defaults to COMMITTED only**
-    /// (PENDING/DISCARDED surface only when asked for explicitly). Accepts the
-    /// canonical REST envelope `{ "filter": { commitStatus? } }` as well as the
-    /// top-level shorthand. Mirrors
-    /// `POST /agent-instances/{agentInstanceKey}/history/search`.
+    /// `searchAgentInstanceHistory` — mirrors
+    /// `POST /agent-instances/{agentInstanceKey}/history/search`. `query_json`
+    /// is the spec's `AgentInstanceHistorySearchQuery`, run through the shared
+    /// `nanobpmn_search` pipeline (COMMITTED-only unless `commitStatus` asks
+    /// otherwise; every filter operator, sort, limit/cursor paging). Returns the
+    /// generated `AgentInstanceHistorySearchQueryResult` as JSON.
     #[wasm_bindgen(js_name = searchAgentInstanceHistory)]
     pub fn search_agent_instance_history(
         &self,
         agent_instance_key: &str,
-        filter_json: &str,
+        query_json: &str,
     ) -> Result<String, JsValue> {
-        let key = parse_key(agent_instance_key)?;
-        let filter = parse_agent_history_filter(key, filter_json)?;
-        let items: Vec<serde_json::Value> = self
-            .read_model
-            .try_agent_history(&filter, None)
-            .map_err(|e| js_err(&e.to_string()))?
-            .iter()
-            .map(agent_history_result)
-            .collect::<Result<_, _>>()
-            .map_err(|e| js_err(&e))?;
-        to_json(&search_result(items))
+        self.search_agent_instance_history_json(agent_instance_key, query_json)
+            .map_err(|e| js_err(&e))
+    }
+}
+
+/// The JS-free bodies of the migrated search methods (host-testable: a
+/// `JsValue` error cannot be constructed off wasm32).
+#[cfg(feature = "read-model")]
+impl TestEngine {
+    fn search_agent_instances_json(&self, query_json: &str) -> Result<String, String> {
+        let query = nanobpmn_search::parse_search_query::<
+            nanobpmn_search::models::AgentInstanceSearchQuery,
+        >(query_json)
+        .map_err(|e| format!("searchAgentInstances: {e}"))?;
+        let result = nanobpmn_search::agent::search_agent_instances(query.as_ref(), || {
+            self.read_model
+                .try_agent_instances(&nanobpmn_read_model::AgentInstanceFilter::default(), None)
+        })
+        .map_err(|e| format!("searchAgentInstances: {e}"))?;
+        serde_json::to_string(&result).map_err(|e| format!("searchAgentInstances: {e}"))
+    }
+
+    fn search_agent_instance_history_json(
+        &self,
+        agent_instance_key: &str,
+        query_json: &str,
+    ) -> Result<String, String> {
+        let key = agent_instance_key
+            .parse::<u64>()
+            .ok()
+            .filter(|k| *k > 0)
+            .ok_or_else(|| {
+                format!(
+                    "searchAgentInstanceHistory: agent instance key {agent_instance_key:?} is not a valid key"
+                )
+            })?;
+        let query = nanobpmn_search::parse_search_query::<
+            nanobpmn_search::models::AgentInstanceHistorySearchQuery,
+        >(query_json)
+        .map_err(|e| format!("searchAgentInstanceHistory: {e}"))?;
+        let result =
+            nanobpmn_search::agent::search_agent_instance_history(key, query.as_ref(), |filter| {
+                self.read_model.try_agent_history(filter, None)
+            })
+            .map_err(|e| format!("searchAgentInstanceHistory: {e}"))?;
+        serde_json::to_string(&result).map_err(|e| format!("searchAgentInstanceHistory: {e}"))
     }
 }
 
@@ -1689,441 +1719,6 @@ fn variable_search_result(v: &VariableRow) -> serde_json::Value {
         "rootProcessInstanceKey": serde_json::Value::Null,
         "value": value,
         "isTruncated": is_truncated,
-    })
-}
-
-/// Parse the `searchAgentInstances` filter body:
-/// `{ agentInstanceKey?, agentDefinitionKey?, processInstanceKey?,
-/// rootProcessInstanceKey?, processDefinitionKey?, status?, elementId?,
-/// tenantId? }`. Accepts the canonical REST envelope `{ "filter": { … } }`
-/// (matching `AgentInstanceSearchQuery`) as well as this top-level shorthand.
-/// Empty/whitespace ⇒ an unfiltered search. Keys are decimal strings; `status`
-/// is a REST spelling.
-#[cfg(feature = "read-model")]
-fn parse_agent_instance_filter(filter_json: &str) -> Result<AgentInstanceFilter, JsValue> {
-    let t = filter_json.trim();
-    let mut filter = AgentInstanceFilter::default();
-    if t.is_empty() {
-        return Ok(filter);
-    }
-    let json: serde_json::Value = serde_json::from_str(t)
-        .map_err(|e| js_err(&format!("searchAgentInstances: invalid filter JSON: {e}")))?;
-    let map = match &json {
-        serde_json::Value::Object(m) => m,
-        serde_json::Value::Null => return Ok(filter),
-        _ => return Err(js_err("searchAgentInstances filter must be a JSON object")),
-    };
-    let map = rest_filter_target(map).map_err(|e| js_err(&e))?;
-    filter.agent_instance_key = agent_filter_key(map, "agentInstanceKey")?;
-    filter.agent_definition_key = agent_filter_key(map, "agentDefinitionKey")?;
-    filter.process_instance_key = agent_filter_key(map, "processInstanceKey")?;
-    filter.root_process_instance_key = agent_filter_key(map, "rootProcessInstanceKey")?;
-    filter.process_definition_key = agent_filter_key(map, "processDefinitionKey")?;
-    if let Some(v) = agent_filter_scalar(map.get("status"))? {
-        if !v.is_null() {
-            let s = v
-                .as_str()
-                .ok_or_else(|| js_err("searchAgentInstances filter `status` must be a string"))?;
-            filter.status = Some(parse_agent_status(s)?);
-        }
-    }
-    filter.element_id = agent_filter_string(map, "elementId")?;
-    filter.tenant_id = agent_filter_string(map, "tenantId")?;
-    filter.process_definition_id = agent_filter_string(map, "processDefinitionId")?;
-    filter.process_definition_version_tag =
-        agent_filter_string(map, "processDefinitionVersionTag")?;
-    filter.process_definition_version = agent_filter_integer(map, "processDefinitionVersion")?;
-    filter.creation_date_ms = agent_filter_date(map, "creationDate")?;
-    filter.last_updated_date_ms = agent_filter_date(map, "lastUpdatedDate")?;
-    filter.completion_date_ms = agent_filter_date(map, "completionDate")?;
-    if let Some(value) = map.get("elementInstanceKeys").filter(|v| !v.is_null()) {
-        let values = value
-            .as_array()
-            .ok_or_else(|| js_err("elementInstanceKeys must be an array"))?;
-        filter.element_instance_keys = values
-            .iter()
-            .map(|value| {
-                let value = agent_filter_scalar(Some(value))?
-                    .ok_or_else(|| js_err("elementInstanceKeys cannot contain null"))?;
-                parse_key(value.as_str().ok_or_else(|| {
-                    js_err("elementInstanceKeys must contain decimal string keys")
-                })?)
-            })
-            .collect::<Result<_, _>>()?;
-    }
-    Ok(filter)
-}
-
-/// Parse the `searchAgentInstanceHistory` filter body: `{ commitStatus? }` where
-/// `commitStatus` is a REST spelling or an array of them. Accepts the canonical
-/// REST envelope `{ "filter": { commitStatus? } }` as well as this top-level
-/// shorthand. Omitted/empty ⇒ the COMMITTED default (enforced by the read
-/// model). The `agent_instance_key` is bound from the method argument, not the
-/// body.
-#[cfg(feature = "read-model")]
-fn parse_agent_history_filter(
-    agent_instance_key: u64,
-    filter_json: &str,
-) -> Result<AgentHistoryFilter, JsValue> {
-    let mut filter = AgentHistoryFilter {
-        agent_instance_key: Some(agent_instance_key),
-        ..Default::default()
-    };
-    let t = filter_json.trim();
-    if t.is_empty() {
-        return Ok(filter);
-    }
-    let json: serde_json::Value = serde_json::from_str(t).map_err(|e| {
-        js_err(&format!(
-            "searchAgentInstanceHistory: invalid filter JSON: {e}"
-        ))
-    })?;
-    let map = match &json {
-        serde_json::Value::Object(m) => m,
-        serde_json::Value::Null => return Ok(filter),
-        _ => {
-            return Err(js_err(
-                "searchAgentInstanceHistory filter must be a JSON object",
-            ));
-        }
-    };
-    let map = rest_filter_target(map).map_err(|e| js_err(&e))?;
-    filter.history_item_key = agent_filter_key(map, "historyItemKey")?;
-    filter.element_instance_key = agent_filter_key(map, "elementInstanceKey")?;
-    filter.job_key = agent_filter_key(map, "jobKey")?;
-    filter.loop_iteration = agent_filter_integer(map, "loopIteration")?;
-    filter.produced_at_ms = agent_filter_date(map, "producedAt")?;
-    if let Some(role) = agent_filter_string(map, "role")? {
-        filter.role = Some(parse_agent_role(&role)?);
-    }
-    if let Some(v) = map.get("commitStatus") {
-        let v = match v {
-            serde_json::Value::Object(map) if map.len() == 1 => map
-                .get("$eq")
-                .or_else(|| map.get("$in"))
-                .ok_or_else(|| js_err("unsupported commitStatus filter operator"))?,
-            _ => v,
-        };
-        let spellings: Vec<&str> = match v {
-            serde_json::Value::Null => Vec::new(),
-            serde_json::Value::String(s) => vec![s.as_str()],
-            serde_json::Value::Array(items) => items
-                .iter()
-                .map(|it| {
-                    it.as_str()
-                        .ok_or_else(|| js_err("`commitStatus` array entries must be strings"))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => {
-                return Err(js_err(
-                    "`commitStatus` must be a string or an array of strings",
-                ));
-            }
-        };
-        if !spellings.is_empty() {
-            let statuses = spellings
-                .into_iter()
-                .map(parse_agent_commit_status)
-                .collect::<Result<Vec<_>, _>>()?;
-            filter.commit_status = Some(statuses);
-        }
-    }
-    Ok(filter)
-}
-
-/// Parse a REST `AgentHistoryItemStateEnum` spelling into the commit status.
-#[cfg(feature = "read-model")]
-fn parse_agent_commit_status(
-    s: &str,
-) -> Result<nanobpmn_engine_core::AgentHistoryCommitStatus, JsValue> {
-    use nanobpmn_engine_core::AgentHistoryCommitStatus as Cs;
-    match s {
-        "COMMITTED" => Ok(Cs::Committed),
-        "PENDING" => Ok(Cs::Pending),
-        "DISCARDED" => Ok(Cs::Discarded),
-        other => Err(js_err(&format!(
-            "invalid agent commit status {other:?}; expected one of COMMITTED, PENDING, DISCARDED"
-        ))),
-    }
-}
-
-/// Read an optional decimal-string key from an agent-search filter object.
-#[cfg(feature = "read-model")]
-fn agent_filter_key(
-    map: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<Option<u64>, JsValue> {
-    match agent_filter_scalar(map.get(field))? {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(s)) => Ok(Some(parse_key(s)?)),
-        Some(_) => Err(js_err(&format!(
-            "agent-search filter `{field}` must be a decimal string key"
-        ))),
-    }
-}
-
-/// Read an optional string field from an agent-search filter object.
-#[cfg(feature = "read-model")]
-fn agent_filter_string(
-    map: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<Option<String>, JsValue> {
-    agent_filter_scalar(map.get(field))?
-        .map(|v| {
-            v.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| js_err(&format!("{field} must be a string")))
-        })
-        .transpose()
-}
-
-#[cfg(feature = "read-model")]
-fn agent_filter_scalar(
-    value: Option<&serde_json::Value>,
-) -> Result<Option<&serde_json::Value>, JsValue> {
-    match value {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::Object(map)) if map.len() == 1 && map.contains_key("$eq") => {
-            Ok(map.get("$eq").filter(|v| !v.is_null()))
-        }
-        Some(serde_json::Value::Object(_)) => Err(js_err("unsupported agent filter operator")),
-        value => Ok(value),
-    }
-}
-
-#[cfg(feature = "read-model")]
-fn agent_filter_integer(
-    map: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<Option<i32>, JsValue> {
-    agent_filter_scalar(map.get(field))?
-        .map(|v| {
-            v.as_i64()
-                .and_then(|v| i32::try_from(v).ok())
-                .ok_or_else(|| js_err(&format!("{field} must be an integer")))
-        })
-        .transpose()
-}
-
-#[cfg(feature = "read-model")]
-fn agent_filter_date(
-    map: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<Option<u64>, JsValue> {
-    agent_filter_string(map, field)?
-        .map(|v| ms_from_rfc3339(&v).map_err(|e| js_err(&e)))
-        .transpose()
-}
-
-/// Serialise an [`AgentInstanceRow`] as the gateway's `AgentInstanceResult` JSON
-/// shape (Camunda v2 `/agent-instances`). Keys are decimal strings; dates are
-/// RFC-3339; `tools` is decoded from the row's projected JSON.
-#[cfg(feature = "read-model")]
-fn agent_instance_result(row: &AgentInstanceRow) -> Result<serde_json::Value, String> {
-    let tools: Vec<AgentTool> = projected_agent_json(&row.tools_json)?;
-    let completion_date = match row.completion_date_ms {
-        Some(ms) => serde_json::Value::String(iso8601_from_ms(ms)),
-        None => serde_json::Value::Null,
-    };
-    let version_tag = match &row.process_definition_version_tag {
-        Some(tag) => serde_json::Value::String(tag.clone()),
-        None => serde_json::Value::Null,
-    };
-    Ok(serde_json::json!({
-        "agentInstanceKey": row.agent_instance_key.to_string(),
-        "agentDefinitionKey": row.agent_definition_key.to_string(),
-        "status": row.status.as_str(),
-        "definition": {
-            "model": row.model.as_deref().ok_or("agent definition is missing its required model")?,
-            "provider": row.provider.as_deref().ok_or("agent definition is missing its required provider")?,
-            "systemPrompt": agent_prompt_result(row.system_prompt.as_deref())?,
-        },
-        "metrics": {
-            "inputTokens": row.input_tokens,
-            "outputTokens": row.output_tokens,
-            "modelCalls": row.model_calls,
-            "toolCalls": row.tool_calls,
-            "reasoningTokenCount": row.reasoning_token_count,
-            "cacheCreationTokenCount": row.cache_creation_token_count,
-            "cacheReadTokenCount": row.cache_read_token_count,
-        },
-        "limits": {
-            "maxTokens": row.max_tokens,
-            "maxModelCalls": row.max_model_calls,
-            "maxToolCalls": row.max_tool_calls,
-        },
-        "tools": tools.iter().map(agent_tool_result).collect::<Vec<_>>(),
-        "elementId": row.element_id,
-        "processInstanceKey": row.process_instance_key.to_string(),
-        "rootProcessInstanceKey": row.root_process_instance_key.to_string(),
-        "processDefinitionKey": row.process_definition_key.to_string(),
-        "processDefinitionId": row.process_definition_id,
-        "processDefinitionVersion": row.process_definition_version,
-        "processDefinitionVersionTag": version_tag,
-        "tenantId": row.tenant_id,
-        "creationDate": iso8601_from_ms(row.creation_date_ms),
-        "lastUpdatedDate": iso8601_from_ms(row.last_updated_date_ms),
-        "completionDate": completion_date,
-        "elementInstanceKeys": row.element_instance_keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
-    }))
-}
-
-#[cfg(feature = "read-model")]
-use nanobpmn_engine_core::AgentHistoryToolCall;
-
-#[cfg(feature = "read-model")]
-fn projected_agent_json<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
-    serde_json::from_str(json).map_err(|e| format!("invalid projected agent JSON: {e}"))
-}
-
-/// Serialise an [`AgentHistoryRow`] as the gateway's `AgentInstanceHistoryItemResult`
-/// JSON shape. Per-call `metrics` retain their recorded presence and null values;
-/// `content`, `toolCalls` and `tools`
-/// are decoded from the row's projected JSON columns and re-serialised into the
-/// REST wire shape (camelCase keys, REST enum spellings, and the opaque
-/// `object`/`arguments` JSON strings re-parsed to structured JSON) exactly as the
-/// gateway does — never dumped in the engine's internal snake_case layout.
-#[cfg(feature = "read-model")]
-fn agent_history_result(row: &AgentHistoryRow) -> Result<serde_json::Value, String> {
-    let content = projected_agent_json::<Vec<AgentHistoryContent>>(&row.content_json)?
-        .iter()
-        .map(agent_content_result)
-        .collect::<Result<Vec<_>, _>>()?;
-    let tool_calls = projected_agent_json::<Vec<AgentHistoryToolCall>>(&row.tool_calls_json)?
-        .iter()
-        .map(agent_tool_call_result)
-        .collect::<Result<Vec<_>, _>>()?;
-    let tools = projected_agent_json::<Vec<AgentTool>>(&row.tools_json)?
-        .iter()
-        .map(agent_tool_result)
-        .collect::<Vec<_>>();
-    let metrics = row
-        .metrics_json
-        .as_deref()
-        .map(projected_agent_json::<Option<nanobpmn_engine_core::AgentHistoryMetrics>>)
-        .transpose()?
-        .flatten();
-    let limits = row
-        .limits_json
-        .as_deref()
-        .map(projected_agent_json::<AgentInstanceLimits>)
-        .transpose()?
-        .unwrap_or_default();
-    Ok(serde_json::json!({
-        "historyItemKey": row.agent_history_key.to_string(),
-        "historyItemId": row.history_item_id.clone().unwrap_or_default(),
-        "agentInstanceKey": row.agent_instance_key.to_string(),
-        "elementInstanceKey": row.element_instance_key.to_string(),
-        "jobKey": row.job_key.to_string(),
-        "jobLeaseToken": row.job_lease,
-        "loopIteration": row.loop_iteration,
-        "role": row.role.as_str(),
-        "content": content,
-        "toolCalls": tool_calls,
-        "metrics": agent_metrics_result(&metrics),
-        "commitStatus": row.commit_status.as_str(),
-        "producedAt": iso8601_from_ms(row.produced_at_ms),
-        "tools": tools,
-        "model": row.model,
-        "provider": row.provider,
-        "limits": {
-            "maxTokens": limits.max_tokens, "maxModelCalls": limits.max_model_calls,
-            "maxToolCalls": limits.max_tool_calls,
-        },
-        "systemPrompt": agent_prompt_result(row.system_prompt.as_deref())?,
-    }))
-}
-
-#[cfg(any(feature = "read-model", test))]
-fn agent_metrics_result(
-    metrics: &Option<nanobpmn_engine_core::AgentHistoryMetrics>,
-) -> serde_json::Value {
-    metrics
-        .as_ref()
-        .map(|metrics| {
-            // Exhaustive destructure: a new engine counter must be surfaced.
-            let nanobpmn_engine_core::AgentHistoryMetrics {
-                input_tokens,
-                output_tokens,
-                reasoning_token_count,
-                cache_creation_token_count,
-                cache_read_token_count,
-                duration_ms,
-            } = metrics;
-            serde_json::json!({
-                "inputTokens": input_tokens,
-                "outputTokens": output_tokens,
-                "reasoningTokenCount": reasoning_token_count,
-                "cacheCreationTokenCount": cache_creation_token_count,
-                "cacheReadTokenCount": cache_read_token_count,
-                "durationMs": duration_ms,
-            })
-        })
-        .unwrap_or(serde_json::Value::Null)
-}
-
-#[cfg(feature = "read-model")]
-fn agent_prompt_result(
-    prompt: Option<&[AgentHistoryContent]>,
-) -> Result<Vec<serde_json::Value>, String> {
-    prompt
-        .unwrap_or_default()
-        .iter()
-        .map(agent_content_result)
-        .collect()
-}
-
-/// Map an engine [`AgentHistoryContent`] block to the gateway's
-/// `AgentInstanceMessageContent` JSON shape (camelCase keys, REST `contentType`
-/// enum spelling). The engine stores `object` as an opaque JSON string; it is
-/// re-parsed into structured JSON so the wire carries JSON, not a JSON-in-a-string
-/// — mirroring the server's `agent_message_content`.
-#[cfg(feature = "read-model")]
-fn agent_content_result(c: &AgentHistoryContent) -> Result<serde_json::Value, String> {
-    Ok(match c.content_type {
-        AgentHistoryContentType::Text => serde_json::json!({
-            "contentType": "TEXT", "text": c.text.as_deref().ok_or("TEXT content is missing text")?,
-        }),
-        AgentHistoryContentType::Document => serde_json::json!({
-            "contentType": "DOCUMENT",
-            "documentReference": projected_agent_json::<serde_json::Map<String, serde_json::Value>>(
-                c.document_reference.as_deref().ok_or("DOCUMENT content is missing documentReference")?)?,
-        }),
-        AgentHistoryContentType::Object => serde_json::json!({
-            "contentType": "OBJECT",
-            "object": projected_agent_json::<serde_json::Value>(
-                c.object.as_deref().ok_or("OBJECT content is missing object")?)?,
-        }),
-    })
-}
-
-/// Map an engine [`AgentHistoryToolCall`] to the gateway's
-/// `AgentInstanceToolCall` JSON shape (camelCase keys). `arguments` is stored as
-/// an opaque JSON string and re-parsed into structured JSON (mirroring the
-/// server's `agent_tool_call_result`); an absent one becomes `null`.
-#[cfg(feature = "read-model")]
-fn agent_tool_call_result(c: &AgentHistoryToolCall) -> Result<serde_json::Value, String> {
-    let arguments = c
-        .arguments
-        .as_deref()
-        .map(projected_agent_json::<serde_json::Map<String, serde_json::Value>>)
-        .transpose()?;
-    Ok(serde_json::json!({
-        "toolCallId": c.tool_call_id,
-        "toolName": c.tool_name,
-        "elementId": c.element_id,
-        "arguments": arguments,
-    }))
-}
-
-/// Map an engine [`AgentTool`] to the gateway's `AgentTool` JSON shape (camelCase
-/// keys), mirroring the server's `agent_tool_result`.
-#[cfg(feature = "read-model")]
-fn agent_tool_result(t: &AgentTool) -> serde_json::Value {
-    serde_json::json!({
-        "name": t.name,
-        "description": t.description,
-        "elementId": t.element_id,
     })
 }
 
@@ -4844,7 +4439,7 @@ mod tests {
                 document_reference: Some("broken JSON".into()),
                 object: Some("broken JSON".into()),
             };
-            assert!(agent_content_result(&content).is_err());
+            assert!(nanobpmn_search::agent::agent_message_content(&content).is_err());
         }
     }
 
@@ -4853,7 +4448,16 @@ mod tests {
     /// counter is optional — an omitted counter surfaces as `null`, the
     /// response schema requiring all six keys.
     #[test]
+    #[cfg(feature = "read-model")]
     fn agent_history_metrics_preserve_nullable_values() {
+        // The REST projection is the shared `nanobpmn_search` one (#1883).
+        let agent_metrics_result = |m: &Option<nanobpmn_engine_core::AgentHistoryMetrics>| {
+            serde_json::to_value(
+                m.as_ref()
+                    .map(nanobpmn_search::agent::agent_history_metrics_result),
+            )
+            .unwrap()
+        };
         const COUNTERS: [&str; 6] = [
             "inputTokens",
             "outputTokens",
@@ -6166,7 +5770,7 @@ mod read_channel_tests {
     }
 
     #[test]
-    fn agent_definition_projection_rejects_missing_required_values() {
+    fn agent_instance_projection_rejects_corrupt_projected_json() {
         let mut eng = TestEngine::new();
         let minted = mint_agent_instance(&mut eng);
         let key = minted["agentInstanceKey"]
@@ -6175,12 +5779,10 @@ mod read_channel_tests {
             .parse()
             .unwrap();
         let mut row = eng.read_model.agent_instance(key).unwrap();
-        assert!(agent_instance_result(&row).is_ok());
-        let model = row.model.take();
-        assert!(agent_instance_result(&row).is_err());
-        row.model = model;
-        row.provider = None;
-        assert!(agent_instance_result(&row).is_err());
+        assert!(nanobpmn_search::agent::agent_instance_result(&row).is_ok());
+        // Corrupt projected JSON is rejected, never silently defaulted.
+        row.tools_json = "not JSON".into();
+        assert!(nanobpmn_search::agent::agent_instance_result(&row).is_err());
     }
 
     // The read-model history output must mirror the gateway's
@@ -6219,7 +5821,7 @@ mod read_channel_tests {
         let history = parse(
             &eng.search_agent_instance_history(
                 minted["agentInstanceKey"].as_str().unwrap(),
-                r#"{"commitStatus":"PENDING"}"#,
+                r#"{"filter":{"commitStatus":"PENDING"}}"#,
             )
             .unwrap(),
         );
@@ -6303,7 +5905,7 @@ mod read_channel_tests {
     /// The instance's current `tools` array via the read channel.
     fn instance_tools(eng: &TestEngine, key: &str) -> Vec<J> {
         let inst = parse(
-            &eng.search_agent_instances(&format!(r#"{{"agentInstanceKey":"{key}"}}"#))
+            &eng.search_agent_instances(&format!(r#"{{"filter":{{"agentInstanceKey":"{key}"}}}}"#))
                 .unwrap(),
         )["items"][0]
             .clone();
@@ -6374,7 +5976,7 @@ mod read_channel_tests {
         eng.update_agent_instance(&key, &req.to_string()).unwrap();
 
         let history = parse(
-            &eng.search_agent_instance_history(&key, r#"{"commitStatus":"PENDING"}"#)
+            &eng.search_agent_instance_history(&key, r#"{"filter":{"commitStatus":"PENDING"}}"#)
                 .unwrap(),
         );
         let assistant: Vec<&J> = history["items"]
@@ -6512,9 +6114,11 @@ mod read_channel_tests {
             1
         );
         assert_eq!(count(r#"{"filter":{"agentInstanceKey":"999999999"}}"#), 0);
-        // The top-level shorthand keeps working.
-        assert_eq!(count(&format!(r#"{{"agentInstanceKey":"{key}"}}"#)), 1);
-        assert_eq!(count(r#"{"agentInstanceKey":"999999999"}"#), 0);
+        // The legacy top-level shorthand is not in the spec: it is rejected,
+        // never silently run as an unfiltered search (#1883).
+        assert!(eng
+            .search_agent_instances_json(&format!(r#"{{"agentInstanceKey":"{key}"}}"#))
+            .is_err());
     }
 
     #[test]
@@ -6547,7 +6151,9 @@ mod read_channel_tests {
 
         assert!(!has_assistant("{}"), "default excludes pending history");
         assert!(has_assistant(r#"{"filter":{"commitStatus":"PENDING"}}"#));
-        assert!(has_assistant(r#"{"commitStatus":"PENDING"}"#));
+        assert!(eng
+            .search_agent_instance_history_json(&key, r#"{"commitStatus":"PENDING"}"#)
+            .is_err());
     }
 
     #[test]

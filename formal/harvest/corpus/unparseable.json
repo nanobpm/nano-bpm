@@ -355,18 +355,6 @@
     "reason": "unsupported-method:zeebeFormId"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-2-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:serviceTask(b ->\n                  b.zeebeJobType(\"t)"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AdHocSubProcessElementsVariableTest-0-process",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AdHocSubProcessElementsVariableTest.java",
     "processId": "process",
@@ -2434,7 +2422,7 @@
       {
         "m": "zeebeOutput",
         "args": [
-          "=aValueundefined",
+          "=\"aValue\"",
           "startEventVar"
         ]
       }
@@ -4867,90 +4855,6 @@
     "reason": "chain-ended-without-done"
   },
   {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-0-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.multiInstan)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-1-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.multiInstan)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-2-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.multiInstan)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-3-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.multiInstan)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-5-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.zeebeInputE)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-6-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.zeebeInputE)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-7-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      }
-    ],
-    "reason": "unresolved-arg:subProcess(sp ->\n                    sp.zeebeInputE)"
-  },
-  {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-11-processId",
     "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
     "processId": "processId",
@@ -5181,7 +5085,7 @@
         "args": []
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: BoundaryEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-18-level2",
@@ -5233,7 +5137,7 @@
         "args": []
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: BoundaryEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ScriptTaskExpressionTest-0-process",
@@ -5257,132 +5161,6 @@
       }
     ],
     "reason": "serialise:NoSuchMethodException: StartEventBuilder.scriptTask(2 args)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "sendTask",
-        "args": [
-          "task"
-        ]
-      },
-      {
-        "m": "message",
-        "args": []
-      },
-      {
-        "m": "name",
-        "args": [
-          "msg"
-        ]
-      },
-      {
-        "m": "zeebeCorrelationKeyExpression",
-        "args": [
-          "123"
-        ]
-      },
-      {
-        "m": "pop",
-        "args": []
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-1-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "sendTask",
-        "args": [
-          "task"
-        ]
-      },
-      {
-        "m": "message",
-        "args": []
-      },
-      {
-        "m": "name",
-        "args": [
-          "msg"
-        ]
-      },
-      {
-        "m": "zeebeCorrelationKeyExpression",
-        "args": [
-          "123"
-        ]
-      },
-      {
-        "m": "pop",
-        "args": []
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-3-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "sendTask",
-        "args": [
-          "task"
-        ]
-      },
-      {
-        "m": "message",
-        "args": []
-      },
-      {
-        "m": "name",
-        "args": [
-          "msg"
-        ]
-      },
-      {
-        "m": "zeebeCorrelationKeyExpression",
-        "args": [
-          "123"
-        ]
-      },
-      {
-        "m": "pop",
-        "args": []
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventLegacyCorrelationKeyScopeTest-0-boundaryCorrelationScopeLegacyIncident",
@@ -5453,7 +5231,7 @@
         "args": []
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: BoundaryEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventLegacyCorrelationKeyScopeTest-1-boundaryCorrelationScopeLegacyIncident",
@@ -5517,7 +5295,7 @@
         "args": []
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: BoundaryEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-2-process",
@@ -5590,7 +5368,7 @@
         "args": []
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: BoundaryEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-7-boundarySubProcessCorrelationScope",
@@ -5661,7 +5439,7 @@
         "args": []
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: BoundaryEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-8-boundarySubProcessCorrelationScope",
@@ -5725,7 +5503,7 @@
         "args": []
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: BoundaryEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventTest-9-boundarySubProcessCorrelationScope",
@@ -5818,7 +5596,7 @@
         "args": []
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: BoundaryEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-2-PROCESS_WITH_MESSAGES",
@@ -5922,7 +5700,7 @@
         ]
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: IntermediateCatchEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-3-PROCESS_WITH_TIMER_AND_MESSAGE",
@@ -6012,7 +5790,7 @@
         ]
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: IntermediateCatchEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-6-PROCESS_WITH_CONDITIONAL_AND_MESSAGE",
@@ -6100,7 +5878,7 @@
         ]
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: IntermediateCatchEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-7-PROCESS_WITH_CONDITIONAL_AND_MESSAGE_FALSE",
@@ -6188,7 +5966,7 @@
         ]
       }
     ],
-    "reason": "serialise:IllegalArgumentException: argument type mismatch"
+    "reason": "serialise:NoSuchMethodException: IntermediateCatchEventBuilder.message(1 args)"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-8-PROCESS_WITH_MULTIPLE_CONDITIONALS",
@@ -6271,745 +6049,5 @@
       }
     ],
     "reason": "serialise:NoSuchMethodException: IntermediateCatchEventBuilder.condition(0 args)"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-8-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "exclusiveGateway",
-        "args": [
-          "xor"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s1"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,a)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToLastExclusiveGateway",
-        "args": []
-      },
-      {
-        "m": "defaultFlow",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s2"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,\b)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end2"
-        ]
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ExclusiveGatewayTest-9-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "exclusiveGateway",
-        "args": [
-          "xor"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s1"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,a)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToLastGateway",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s2"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,\b)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end2"
-        ]
-      },
-      {
-        "m": "moveToLastExclusiveGateway",
-        "args": []
-      },
-      {
-        "m": "defaultFlow",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s3"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= nonexisting_variable"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end3"
-        ]
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-0-process",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": "process",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": [
-          "start"
-        ]
-      },
-      {
-        "m": "inclusiveGateway",
-        "args": [
-          "inclusive"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s1"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,a)"
-        ]
-      },
-      {
-        "m": "manualTask",
-        "args": [
-          "task1"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToNode",
-        "args": [
-          "inclusive"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s2"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,\b)"
-        ]
-      },
-      {
-        "m": "manualTask",
-        "args": [
-          "task2"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end2"
-        ]
-      },
-      {
-        "m": "moveToLastInclusiveGateway",
-        "args": []
-      },
-      {
-        "m": "defaultFlow",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s3"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,c)"
-        ]
-      },
-      {
-        "m": "manualTask",
-        "args": [
-          "task3"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end3"
-        ]
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-1-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "inclusiveGateway",
-        "args": [
-          "inclusive"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s1"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,a)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToLastGateway",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s2"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,\b)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end2"
-        ]
-      },
-      {
-        "m": "moveToLastInclusiveGateway",
-        "args": []
-      },
-      {
-        "m": "defaultFlow",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s3"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= true"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end3"
-        ]
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-2-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "inclusiveGateway",
-        "args": [
-          "inclusive"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s1"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,a)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "a"
-        ]
-      },
-      {
-        "m": "moveToLastInclusiveGateway",
-        "args": []
-      },
-      {
-        "m": "defaultFlow",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s2"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,\b)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "b"
-        ]
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-7-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "inclusiveGateway",
-        "args": [
-          "inclusive"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s1"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,a)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToLastInclusiveGateway",
-        "args": []
-      },
-      {
-        "m": "defaultFlow",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s2"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,\b)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end2"
-        ]
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-8-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "inclusiveGateway",
-        "args": [
-          "inclusive"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s1"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,a)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToLastGateway",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s2"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,\b)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end2"
-        ]
-      },
-      {
-        "m": "moveToLastInclusiveGateway",
-        "args": []
-      },
-      {
-        "m": "defaultFlow",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s3"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= true"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end3"
-        ]
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-9-processId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
-    "processId": "processId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "inclusiveGateway",
-        "args": [
-          "inclusive"
-        ]
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s1"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,a)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end1"
-        ]
-      },
-      {
-        "m": "moveToLastGateway",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s2"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= contains(str,\b)"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end2"
-        ]
-      },
-      {
-        "m": "moveToLastInclusiveGateway",
-        "args": []
-      },
-      {
-        "m": "sequenceFlowId",
-        "args": [
-          "s3"
-        ]
-      },
-      {
-        "m": "conditionExpression",
-        "args": [
-          "= true"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": [
-          "end3"
-        ]
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-18-childProcessId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "childProcessId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "intermediateThrowEvent",
-        "args": [
-          "nestedElement"
-        ]
-      },
-      {
-        "m": "zeebeOutputExpression",
-        "args": [
-          "= \barundefined",
-          "localVar"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-20-childProcessId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "childProcessId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "intermediateThrowEvent",
-        "args": [
-          "nestedElement"
-        ]
-      },
-      {
-        "m": "zeebeOutputExpression",
-        "args": [
-          "= \fooundefined",
-          "localVar"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-22-childProcessId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "childProcessId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "intermediateThrowEvent",
-        "args": [
-          "nestedElement"
-        ]
-      },
-      {
-        "m": "zeebeOutputExpression",
-        "args": [
-          "= \barundefined",
-          "localVar"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
-  },
-  {
-    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-24-childProcessId",
-    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest.java",
-    "processId": "childProcessId",
-    "calls": [
-      {
-        "m": "startEvent",
-        "args": []
-      },
-      {
-        "m": "intermediateThrowEvent",
-        "args": [
-          "nestedElement"
-        ]
-      },
-      {
-        "m": "zeebeOutputExpression",
-        "args": [
-          "= \barundefined",
-          "localVar"
-        ]
-      },
-      {
-        "m": "endEvent",
-        "args": []
-      }
-    ],
-    "reason": "serialise:ModelIoException: Unable to transform model to xml"
   }
 ]

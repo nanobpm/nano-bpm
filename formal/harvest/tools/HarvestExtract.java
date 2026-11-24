@@ -198,7 +198,15 @@ public final class HarvestExtract {
     }
     Class<?> c = target.getClass();
     while (c != null) {
-      for (Method m : c.getDeclaredMethods()) {
+      // getDeclaredMethods() order is unspecified and differs between JVM runs,
+      // so overloads (e.g. foo(String) vs foo(int)) must be resolved by exact
+      // argument compatibility, never by "first one found" — that made the
+      // harvested corpus nondeterministic across hosts. Sort for a stable order
+      // and skip compiler bridges.
+      Method[] declared = c.getDeclaredMethods();
+      java.util.Arrays.sort(declared, java.util.Comparator.comparing(Method::toGenericString));
+      for (Method m : declared) {
+        if (m.isBridge() || m.isSynthetic()) continue;
         if (!m.getName().equals(name) || m.getParameterCount() != args.size()) continue;
         // Only replay no-arg and String-arg builder methods — the harvester only
         // ever emits those. A Consumer/lambda overload is never statically
@@ -210,7 +218,13 @@ public final class HarvestExtract {
         for (int k = 0; k < pts.length; k++) {
           Class<?> pt = pts[k];
           Object a = args.get(k);
-          if (pt == String.class || pt.isPrimitive()) continue;
+          if (pt == String.class && (a == null || a instanceof String)) continue;
+          if (pt == boolean.class && a instanceof Boolean) continue;
+          if ((pt == int.class || pt == long.class || pt == double.class || pt == float.class
+              || pt == short.class) && a instanceof Number) {
+            argv[k] = coerceNumber((Number) a, pt);
+            continue;
+          }
           if (a != null && pt.isInstance(a)) continue; // model-object arg
           if (args.size() > 0) { ok = false; break; }
         }
@@ -222,6 +236,14 @@ public final class HarvestExtract {
     }
     throw new NoSuchMethodException(
         target.getClass().getSimpleName() + "." + name + "(" + args.size() + " args)");
+  }
+
+  static Object coerceNumber(Number n, Class<?> pt) {
+    if (pt == int.class) return n.intValue();
+    if (pt == long.class) return n.longValue();
+    if (pt == double.class) return n.doubleValue();
+    if (pt == float.class) return n.floatValue();
+    return n.shortValue();
   }
 
   // A no-arg `message()` / `signal()` emitted for a Consumer-form call

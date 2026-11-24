@@ -156,22 +156,89 @@ async fn optional_body_operations_accept_a_bodyless_request() {
     );
 }
 
+/// The other half of the class: a PRESENT optional body must still carry a
+/// JSON `Content-Type`. Derived over every optional-body operation, so an
+/// extractor variant (e.g. the strict decoder of #1883) that buffers the body
+/// and forgets the media-type check is caught on every route it serves.
 #[tokio::test]
 async fn present_optional_body_still_requires_json_content_type() {
+    let ops = optional_body_operations();
+    assert!(ops.len() >= 50, "derived only {} operations", ops.len());
     let app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server());
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
+    let mut failures = Vec::new();
+    for (method, path, op_id) in &ops {
+        for content_type in [Some("text/plain"), None] {
+            let mut req = Request::builder()
+                .method(method.clone())
                 .header("host", "localhost")
-                .uri("/v2/jobs/2251799813685249/completion")
-                .header("content-type", "text/plain")
-                .body(Body::from("{}"))
-                .expect("request"),
-        )
-        .await
-        .expect("router responds");
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+                .uri(path);
+            if let Some(ct) = content_type {
+                req = req.header("content-type", ct);
+            }
+            let response = app
+                .clone()
+                .oneshot(req.body(Body::from("{}")).expect("request"))
+                .await
+                .expect("router responds");
+            if response.status() != StatusCode::UNSUPPORTED_MEDIA_TYPE {
+                failures.push(format!(
+                    "{op_id} {method} {path} (content-type {content_type:?}) -> {}",
+                    response.status()
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} non-JSON body(ies) were not rejected with 415:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// Strict-decoded bodies (#1883): an unknown property is a 400 carrying the
+/// spec's error contract (`application/problem+json` `ProblemDetail`), not a
+/// plain-text rejection. Covers every migrated route through the real router.
+#[tokio::test]
+async fn strict_body_unknown_property_is_a_problem_detail() {
+    let app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server());
+    for path in [
+        "/v2/agent-instances/search",
+        "/v2/agent-instances/2251799813685249/history/search",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .header("host", "localhost")
+                    .header("content-type", "application/json")
+                    .uri(path)
+                    .body(Body::from(r#"{"bogus": 1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(ct, "application/problem+json", "{path}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let problem: nanobpm_gateway_rest::models::ProblemDetail =
+            serde_json::from_slice(&bytes).expect("ProblemDetail body");
+        assert_eq!(problem.status, 400, "{path}");
+        assert!(
+            problem.detail.contains("bogus"),
+            "{path}: {}",
+            problem.detail
+        );
+    }
 }
 
 #[tokio::test]

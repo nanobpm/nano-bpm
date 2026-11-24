@@ -1,0 +1,24 @@
+name: REST codegen (generated/ models)
+description: >-
+  Generate the git-ignored generated/ crate (nanobpm-gateway-rest) from spec/
+  with scripts/generate.sh (Java + uv, cached openapi-generator JAR). The
+  engine-wasm `read-model` feature depends on its MODELS-ONLY build through the
+  shared nanobpmn-search crate (#1883), so every job that compiles engine-wasm
+  with `read-model` (the pkg build, the read-model type-check/tests, clippy)
+  runs this first.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: '17'
+    - uses: astral-sh/setup-uv@v7
+    - name: Restore the cached openapi-generator JAR (#1684)
+      uses: ./.github/actions/openapi-generator-cache
+    - name: Generate the REST models (scripts/generate.sh)
+      shell: bash
+      run: |
+        set -euo pipefail
+        uv sync
+        ./scripts/generate.sh
