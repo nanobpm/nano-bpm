@@ -256,13 +256,53 @@ fn kill_and_reap_blocking(limiter: &DataGatewayLimiter, slot: &Slot, w: Worker) 
     std::thread::spawn(move || {
         let _ticket = ticket;
         let _hold = hold;
+        let mut zombies = ZombieGrace::default();
         while !worker_gone(&mut child, pid) {
             budget.kill(pid, &mut child);
+            if zombies.expired(child_exited(&mut child), Instant::now()) {
+                warn_zombies(pid);
+                return;
+            }
             std::thread::sleep(REAP_RETRY);
         }
         tracing::info!(?pid, "data worker: unreaped process finally exited");
     });
     false
+}
+
+/// How long a group whose leader is reaped may keep answering the liveness
+/// probe while it is re-sent SIGKILL. Past it, every member has had SIGKILL,
+/// so what remains can only be unreaped zombies (a PID 1 that does not reap):
+/// they hold no directory or budget, so the ticket and hold are released
+/// rather than kept forever (#1836).
+const ZOMBIE_GRACE: Duration = Duration::from_secs(5);
+
+/// Bounds the alive-until-ESRCH rule once the leader is reaped: the clock
+/// starts at the first kill after the leader is reaped (the group has had
+/// SIGKILL) and [`ZombieGrace::expired`] reports when [`ZOMBIE_GRACE`] passed.
+#[derive(Default)]
+struct ZombieGrace {
+    since: Option<Instant>,
+}
+
+impl ZombieGrace {
+    /// Call after each group kill. `leader_reaped` false resets the clock.
+    fn expired(&mut self, leader_reaped: bool, now: Instant) -> bool {
+        if !leader_reaped {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.saturating_duration_since(since) >= ZOMBIE_GRACE
+    }
+}
+
+fn warn_zombies(pid: Option<u32>) {
+    tracing::warn!(
+        pgid = ?pid,
+        "data worker group still probes alive after SIGKILL and the zombie grace; \
+         assuming unreaped zombies and releasing its slot and budget"
+    );
 }
 
 /// Interval between kill/reap attempts on a worker that outlived the grace.
@@ -503,7 +543,12 @@ async fn kill_tree(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>
 /// its whole group) exits.
 async fn reap_until_exit(budget: &Arc<ReapBudget>, child: &mut Child, pid: Option<u32>) {
     warn_unreaped(pid);
+    let mut zombies = ZombieGrace::default();
     while !kill_tree(budget, child, pid).await {
+        if zombies.expired(child_exited(child), Instant::now()) {
+            warn_zombies(pid);
+            return;
+        }
         tokio::time::sleep(REAP_RETRY).await;
     }
     tracing::info!(?pid, "data worker: unreaped process finally exited");
@@ -2088,6 +2133,33 @@ mod tests {
             // SAFETY: best-effort cleanup of the test's own children.
             unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         }
+    }
+
+    /// A group that probes alive forever after its leader is reaped (only
+    /// unreaped zombies left) is released after [`ZOMBIE_GRACE`], not held
+    /// forever; an unreaped leader never releases (#1836).
+    #[test]
+    fn zombie_only_group_released_after_grace() {
+        let alive = || true; // faked liveness probe: alive forever
+        let t0 = Instant::now();
+        let mut z = ZombieGrace::default();
+        let mut now = t0;
+        // Leader unreaped: never expires, however long.
+        for _ in 0..1000 {
+            assert!(alive());
+            assert!(!z.expired(false, now));
+            now += REAP_RETRY;
+        }
+        let reaped_at = now;
+        let released = loop {
+            assert!(alive());
+            if z.expired(true, now) {
+                break now;
+            }
+            now += REAP_RETRY;
+        };
+        assert!(released - reaped_at >= ZOMBIE_GRACE);
+        assert!(released - reaped_at < ZOMBIE_GRACE + REAP_RETRY);
     }
 
     /// A reaped leader whose group is empty must never be signalled by its
