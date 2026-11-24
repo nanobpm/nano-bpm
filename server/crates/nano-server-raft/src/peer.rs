@@ -1161,6 +1161,30 @@ impl PeerLink {
         .await
     }
 
+    /// Cluster-wide publication gate (#1845): asks this peer to wait, bounded
+    /// by `deadline`, until no subscription open for `(name, correlation_key)`
+    /// is pending in its node-local publication gate. The request itself is
+    /// bounded by `deadline` plus the fast write-forward margin, so a stalled
+    /// peer cannot hold the publish past its gate budget by more than that.
+    /// Answered by `{"outcome": "clear" | "released" | "failed" | "timedOut"}`.
+    pub async fn await_pending_opens(
+        &self,
+        name: String,
+        correlation_key: String,
+        deadline: Duration,
+    ) -> Result<PeerResult, PeerError> {
+        let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+        self.request_within(await_pending_opens_budget(deadline), |corr| {
+            ClientFrame::AwaitPendingOpens {
+                corr,
+                name,
+                correlation_key,
+                deadline_ms,
+            }
+        })
+        .await
+    }
+
     /// Forwards a job-retries update to the peer that owns the job's partition.
     pub async fn update_job_retries(
         &self,
@@ -1852,6 +1876,13 @@ fn breaker_cooldown() -> Duration {
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_BREAKER_COOLDOWN_MS);
     Duration::from_millis(ms)
+}
+
+/// The whole budget of one `AwaitPendingOpens` probe (#1845): the remote gate
+/// deadline plus the fast-forward transport margin. The single source for both
+/// the request timeout and a caller bounding link acquisition + request.
+pub fn await_pending_opens_budget(deadline: Duration) -> Duration {
+    deadline.saturating_add(fast_forward_timeout())
 }
 
 /// Per-call deadline for *fast*, non-await peer forwards (job complete/fail/throw,
