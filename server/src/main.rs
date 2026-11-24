@@ -35988,15 +35988,16 @@ mod clustered_startup_tests {
             drop(install);
         }
         drop(exclusive);
-        // The lifecycle lock is fair: the owner's queued shared acquisition is
-        // served before this exclusive one, and is held across its install.
-        drop(handles[1].lifecycle_exclusive().await);
+        // No reliance on scheduling or lock fairness: poll every partition
+        // (bounded) until the detached owner's install has landed there.
         for handle in handles.iter() {
-            let n = handle.with(|j| j.state().processes.len()).await;
-            assert!(
-                n >= 1,
-                "the cancelled install still reached every partition"
-            );
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while handle.with(|j| j.state().processes.is_empty()).await {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the cancelled install still reached every partition");
         }
     }
 
@@ -53367,14 +53368,18 @@ mod subscription_placement_tests {
             .deploy_resources_locally(vec![proc], &names, Vec::new(), &empty, "<default>")
             .await
             .expect("retry deploy");
+        // Bounded poll per partition: no dependence on owner scheduling.
         for handle in server.engine.all().iter() {
-            let known = handle
-                .with(|j| j.state().processes.contains_key("cancel-deploy"))
-                .await;
-            assert!(
-                known,
-                "definition missing on a partition after cancel + retry"
-            );
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !handle
+                    .with(|j| j.state().processes.contains_key("cancel-deploy"))
+                    .await
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("definition missing on a partition after cancel + retry");
         }
     }
 
