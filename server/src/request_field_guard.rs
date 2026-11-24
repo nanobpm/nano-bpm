@@ -421,8 +421,16 @@ fn sort_dispatcher_sources(main_rs: &str, schema: &str) -> Vec<String> {
 /// an implementation) fail CI instead.
 #[test]
 fn honoured_sort_field_values_have_an_explicit_dispatcher_arm() {
-    let main_rs = std::fs::read_to_string(repo_root().join("server/src/main.rs"))
-        .expect("read server/src/main.rs");
+    // Sort dispatchers live in `main.rs` and, for operations shared with the
+    // WASM read surface (#1883), in the `nano-search` crate - scan both.
+    let main_rs = [
+        "server/src/main.rs",
+        "server/crates/nano-search/src/agent.rs",
+    ]
+    .iter()
+    .map(|p| std::fs::read_to_string(repo_root().join(p)).expect("read sort dispatcher source"))
+    .collect::<Vec<_>>()
+    .join("\n");
     let mut unhandled = Vec::new();
     for (entry, note) in read_manifest() {
         if note.is_some() {

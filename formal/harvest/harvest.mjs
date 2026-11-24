@@ -174,7 +174,13 @@ export function splitArgs(argText) {
       const q = c;
       cur += c;
       i++;
-      while (i < argText.length && argText[i] !== q) { cur += argText[i]; i += argText[i] === '\\' ? 2 : 1; }
+      // Copy an escape sequence WHOLE (`\\"` keeps both chars): skipping the
+      // escaped char here corrupted literals like `"= contains(s,\\"b\\")"`
+      // into a backspace control char that the XML writer rejects.
+      while (i < argText.length && argText[i] !== q) {
+        if (argText[i] === '\\' && i + 1 < argText.length) { cur += argText[i] + argText[i + 1]; i += 2; }
+        else { cur += argText[i]; i++; }
+      }
       cur += argText[i] ?? '';
     } else if (c === '(' || c === '[' || c === '{') { depth++; cur += c; }
     else if (c === ')' || c === ']' || c === '}') { depth--; cur += c; }
