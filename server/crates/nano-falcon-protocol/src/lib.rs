@@ -137,7 +137,10 @@ mod lease_contract_tests {
         else {
             panic!("decodes as an await-pending-opens probe");
         };
-        assert_eq!((*corr, name.as_str(), correlation_key.as_str(), *deadline_ms), (9, "m", "k", 250));
+        assert_eq!(
+            (*corr, name.as_str(), correlation_key.as_str(), *deadline_ms),
+            (9, "m", "k", 250)
+        );
         assert_eq!(serde_json::to_value(&frame).unwrap(), wire);
     }
 

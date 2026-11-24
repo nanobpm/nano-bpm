@@ -141,7 +141,11 @@ impl GateWait {
                 GateWait::TimedOut => 3,
             }
         }
-        if rank(other) > rank(self) { other } else { self }
+        if rank(other) > rank(self) {
+            other
+        } else {
+            self
+        }
     }
 }
 

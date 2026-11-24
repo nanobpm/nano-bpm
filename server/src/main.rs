@@ -11605,16 +11605,13 @@ impl ServerImpl {
                 let link = match self.peers.link(node).await {
                     Ok(link) => link,
                     Err(e) => {
-                        tracing::debug!(
-                            node,
-                            "publication gate: peer unreachable, skipped: {e}"
-                        );
+                        tracing::debug!(node, "publication gate: peer unreachable, skipped: {e}");
                         return publication_gate::GateWait::Clear;
                     }
                 };
-                if !link.supports(
-                    nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE,
-                ) {
+                if !link
+                    .supports(nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_PUBLICATION_GATE)
+                {
                     return publication_gate::GateWait::Clear;
                 }
                 match link
@@ -11649,8 +11646,7 @@ impl ServerImpl {
                     }
                 }
             });
-        let (local, peers) =
-            tokio::join!(local, futures_util::future::join_all(peer_waits));
+        let (local, peers) = tokio::join!(local, futures_util::future::join_all(peer_waits));
         peers
             .into_iter()
             .fold(local, publication_gate::GateWait::combine)
@@ -56875,7 +56871,10 @@ mod subscription_placement_tests {
         let (n0, n1) = two_node_cluster().await;
         let local0 = n0.engine.topology().local_partitions();
         let local1 = n1.engine.topology().local_partitions();
-        assert!(local0.len() >= 2, "node 0 owns several partitions: {local0:?}");
+        assert!(
+            local0.len() >= 2,
+            "node 0 owns several partitions: {local0:?}"
+        );
         n0.deploy_centralized(
             vec![("await-two.bpmn".into(), PARALLEL_TWO_CATCH_BPMN.into())],
             "<default>".into(),
@@ -56885,6 +56884,13 @@ mod subscription_placement_tests {
         assert!(
             n0.create_answers_before_routing().await,
             "every peer serves the cluster gate, so creates answer early"
+        );
+        // Establish node 1's uplink to node 0 before the stall below: the
+        // handshake is served by node 0's engine actors, one of which the
+        // test parks. Links persist, so the probe later reuses it.
+        assert!(
+            n1.create_answers_before_routing().await,
+            "node 1 sees node 0 serve the cluster gate"
         );
 
         let create_partition = local0[0];
@@ -56915,7 +56921,9 @@ mod subscription_placement_tests {
                 })
                 .await;
         });
-        parked_rx.await.expect("the barrier holds the stalled actor");
+        parked_rx
+            .await
+            .expect("the barrier holds the stalled actor");
 
         let mut variables = std::collections::BTreeMap::new();
         variables.insert("keyA".to_string(), Value::Str(key_a.clone()));
@@ -56963,8 +56971,7 @@ mod subscription_placement_tests {
             *server
                 .publication_gate_deadline_override
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()) =
-                Some(std::time::Duration::from_millis(ms));
+                .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Duration::from_millis(ms));
         };
         // Past the deadline: retryable, never an unmatched apply on node 1.
         set_deadline(&n0, 80);
