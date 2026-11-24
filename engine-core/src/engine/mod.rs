@@ -30,6 +30,7 @@ mod memory;
 mod migration;
 mod modify;
 mod resolve;
+pub(crate) mod timer_cycle;
 pub use debug::{BreakCondition, DebugSession};
 use resolve::{rearm_repetitions, JobProps, ResolvedUserTask};
 
@@ -2172,7 +2173,10 @@ impl Engine {
             // `TimerStartEventSubscription` validation, #1398) — never a
             // subscription named after the expression text or a static
             // fallback timer. Resolve all before anything is emitted.
-            let empty = BTreeMap::new();
+            // Cluster variables DO resolve here: Zeebe's timer factory
+            // evaluates with the deployment's tenant, whose evaluation
+            // context layers the cluster-variable scopes (#1878).
+            let empty = self.start_event_variables();
             let mut resolved_starts = Vec::with_capacity(typed_starts.len());
             for start in typed_starts {
                 let (start_element_id, start_kind, start_timer_def, start_properties) = (
@@ -6744,7 +6748,26 @@ impl Engine {
         // A bounded `Rn/…` start cycle stops re-arming after its
         // n-th fire (#1596).
         let next_due_at = if timer.repeating && rearm_repetitions(timer.repetitions).is_some() {
-            Some(due_at.saturating_add(timer.interval_millis))
+            // Re-evaluate the start event's cycle (Zeebe re-runs the timer
+            // factory on reschedule): an interval cycle re-arms one period
+            // after the fired due date, a cron cycle at its next match
+            // (#1878). If the definition is gone or no longer evaluates, a
+            // fixed period keeps its schedule and a cron cycle stops.
+            let interval_millis = timer.interval_millis;
+            let def = self
+                .state
+                .process_by_key(timer.process_definition_key)
+                .and_then(|p| p.definition.element(&start_element_id))
+                .and_then(|e| e.timer.clone());
+            let vars = self.start_event_variables();
+            match self.resolve_cycle_rearm(&vars, def.as_ref(), due_at, interval_millis) {
+                Ok(next) => Some(next),
+                // Collapse missed fires exactly as the evaluated path does.
+                Err(_) if interval_millis > 0 => {
+                    Some(timer_cycle::rearm_fixed(due_at, self.now, interval_millis))
+                }
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -9178,14 +9201,14 @@ impl Engine {
         };
         let timer_def = self.timer_def_of(instance_key, boundary_element_id);
         let vars = self.variables_for_element(instance_key, element_instance_key);
-        let next =
-            self.resolve_timer(&vars, timer_def.as_ref(), previous_due_at, duration_millis)?;
+        let next_due_at =
+            self.resolve_cycle_rearm(&vars, timer_def.as_ref(), previous_due_at, duration_millis)?;
         Ok(Some(Event::TimerCreated {
             timer_key: self.mint_key(),
             instance_key,
             element_instance_key,
             element_id: element_id.to_string(),
-            due_at: next.due_at,
+            due_at: next_due_at,
             kind: state::TimerKind::NonInterruptingBoundary {
                 boundary_element_id: boundary_element_id.to_string(),
             },
