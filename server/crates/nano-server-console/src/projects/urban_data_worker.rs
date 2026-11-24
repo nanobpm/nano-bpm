@@ -109,18 +109,29 @@ impl std::fmt::Debug for Tree {
 
 impl Tree {
     /// Record a freshly spawned launcher's tree. On Windows the launcher is
-    /// put in a Job Object at once, before it can start its Node descendant
-    /// (#1879); if that fails, teardown falls back to `taskkill /T`.
+    /// spawned `CREATE_SUSPENDED` (see `spawn_worker`), put in a Job Object,
+    /// and only then resumed, so it cannot start its Node descendant outside
+    /// the job (#1879). If containment fails it is still resumed, and teardown
+    /// falls back to `taskkill /T`. Resuming a launcher that was not spawned
+    /// suspended is a no-op.
     fn contain(child: &Child) -> Self {
+        #[cfg(windows)]
+        let job = child.raw_handle().and_then(|h| {
+            win_job::Job::contain(h.cast())
+                .map_err(|e| tracing::warn!(error = %e, "data worker: no Job Object"))
+                .ok()
+                .map(Arc::new)
+        });
+        #[cfg(windows)]
+        if let Some(pid) = child.id()
+            && let Err(e) = win_job::resume_process(pid)
+        {
+            tracing::warn!(error = %e, "data worker: resume launcher failed");
+        }
         Self {
             pid: child.id(),
             #[cfg(windows)]
-            job: child.raw_handle().and_then(|h| {
-                win_job::Job::contain(h.cast())
-                    .map_err(|e| tracing::warn!(error = %e, "data worker: no Job Object"))
-                    .ok()
-                    .map(Arc::new)
-            }),
+            job,
         }
     }
 }
@@ -147,14 +158,68 @@ mod win_job {
     use std::ffi::c_void;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
         QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
     use super::Liveness;
+
+    /// Resume every thread of `pid` (a `CREATE_SUSPENDED` process has only
+    /// its main thread). A thread that is not suspended is left untouched.
+    pub(super) fn resume_process(pid: u32) -> std::io::Result<()> {
+        // SAFETY: a thread snapshot of the whole system; checked below.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snap.is_null() || snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        struct Snapshot(HANDLE);
+        impl Drop for Snapshot {
+            fn drop(&mut self) {
+                // SAFETY: the snapshot handle is owned and closed exactly once.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+        let snap = Snapshot(snap);
+        // SAFETY: an all-zero struct with `dwSize` set is a valid in/out buffer.
+        let mut te: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        te.dwSize = size_of_u32::<THREADENTRY32>();
+        let mut resumed = 0usize;
+        let mut err = None;
+        // SAFETY: valid snapshot handle and correctly sized entry.
+        let mut more = unsafe { Thread32First(snap.0, &mut te) } != 0;
+        while more {
+            if te.th32OwnerProcessID == pid {
+                // SAFETY: plain open of a thread id; checked below.
+                let t = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, te.th32ThreadID) };
+                if t.is_null() {
+                    err = Some(std::io::Error::last_os_error());
+                } else {
+                    // SAFETY: `t` is a valid thread handle, closed right after.
+                    unsafe {
+                        if ResumeThread(t) == u32::MAX {
+                            err = Some(std::io::Error::last_os_error());
+                        } else {
+                            resumed += 1;
+                        }
+                        CloseHandle(t);
+                    }
+                }
+            }
+            // SAFETY: as for `Thread32First`.
+            more = unsafe { Thread32Next(snap.0, &mut te) } != 0;
+        }
+        match err {
+            Some(e) if resumed == 0 => Err(e),
+            _ => Ok(()),
+        }
+    }
 
     pub(super) struct Job(HANDLE);
 
@@ -1001,6 +1066,11 @@ fn spawn_worker(urban: &Path, dir: &Path, fingerprint: u64) -> Result<Worker, Da
     // worker (#1329).
     #[cfg(unix)]
     cmd.process_group(0);
+    // Start suspended so `Tree::contain` can put the launcher in its Job
+    // Object before it runs a single instruction, and so before any Node
+    // descendant exists outside the job (#1879); `contain` resumes it.
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
     let mut child = cmd
         .spawn()
         .map_err(|e| DataError::Gateway(format!("spawn data worker: {e}")))?;
@@ -2768,6 +2838,25 @@ mod windows_tests {
         assert!(kill_tree(&budget, &mut child, &tree).await);
         assert_eq!(budget.liveness(&tree), Liveness::Gone);
         assert!(worker_gone(&budget, &mut child, &tree));
+    }
+
+    /// A launcher spawned suspended (as `spawn_worker` does) is assigned to
+    /// the job before it runs and is then resumed: it runs to completion and
+    /// its descendant is inside the job from its first instruction.
+    #[tokio::test]
+    async fn suspended_launcher_is_contained_then_resumed() {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "exit", "0"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED)
+            .stdout(std::process::Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let tree = Tree::contain(&child);
+        assert!(tree.job.is_some(), "launcher not assigned to a job");
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("suspended launcher was never resumed")
+            .unwrap();
+        assert!(status.success());
     }
 
     /// An empty job is gone; a job whose last handle drops kills its members.
