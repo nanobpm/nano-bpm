@@ -22232,7 +22232,11 @@ impl ServerImpl {
     }
 
     /// Applies a retirement digest received from partition `p`'s leader: drops the
-    /// named completed instances from this node's replica engine for `p`. A no-op if
+    /// named instances from this node's replica engine for `p` — only those that are
+    /// already terminal in the replica's own applied state. The digest is not
+    /// ordered with the raft log, so a lagging replica still holds them live; reaping
+    /// a live instance makes the replica reject the completion the leader applied, a
+    /// replica divergence that fail-stops the follower (#1908). A no-op if
     /// this node OWNS `p` (its own exporter already evicted them) or does not
     /// replicate it. Fire-and-forget on the engine actor (no reply to await).
     pub fn apply_retirement_digest(&self, p: u64, keys: Vec<Key>) {
@@ -22257,7 +22261,8 @@ impl ServerImpl {
     }
 
     /// Applies a retirement low-water mark received from partition `p`'s owner: on
-    /// the follower replica, drops every resident instance below `low_water`, the
+    /// the follower replica, drops every resident instance below `low_water` that is
+    /// terminal in the replica's own applied state (never a live one — #1908), the
     /// convergence backstop for the best-effort per-key retirement digest (see
     /// [`ClientFrame::RetirementWatermark`]). A no-op if this node OWNS `p` (its own
     /// working set is authoritative) or does not replicate it. Bounded per call so a
@@ -49656,13 +49661,15 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_retirement_digest_reaps_completed_instances_from_follower_replicas() {
-        // The RF>1 leader-local-completion leak: completion + exporter eviction are
-        // leader-local (they never enter the raft log), so a learner applies each
-        // CreateInstance but no retirement — a completed instance would linger in its
-        // replica engine as a never-reaped `Active` shell. The leader broadcasts a
-        // retirement digest naming the instances it completed + evicted, and the
-        // learner drops them here. This proves that round-trip.
+    async fn the_retirement_digest_never_reaps_a_live_instance_from_a_lagging_follower() {
+        // #1908: the leader broadcasts a retirement digest naming instances it
+        // completed + evicted, but the digest is NOT ordered with the raft log, so it
+        // reaches a follower that has not yet applied the completion — the instance
+        // is still live there. Reaping it made the follower reject the completion
+        // when it applied (`JobNotFound` vs the leader's `JobCompleted`): a chain
+        // digest divergence and a fail-stop. A live replica instance must survive
+        // the digest; it is reaped by apply-time eviction once its completion
+        // applies.
         let (node0, node1, node2) = boot_rf3_leader_durable_cluster().await;
 
         // Create on partition 0 (led by node 0). It ships to the learners.
@@ -49708,10 +49715,11 @@ mod clustered_startup_tests {
             .push(instance_key);
         node0.run_retirement_digest().await;
 
-        // The learner drops the instance from its replica engine (no more leak).
-        let mut retired = false;
-        for _ in 0..400 {
-            if !learner_handle
+        // Give the fire-and-forget frame ample time to land, then prove the live
+        // instance (Active on the learner) is still resident.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            learner_handle
                 .with(move |journal| {
                     journal
                         .engine()
@@ -49719,16 +49727,8 @@ mod clustered_startup_tests {
                         .instances
                         .contains_key(&instance_key)
                 })
-                .await
-            {
-                retired = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(
-            retired,
-            "the retirement digest reaps the completed instance from the follower replica"
+                .await,
+            "the retirement digest must never reap an instance live on the follower"
         );
 
         for node in [&node0, &node1, &node2] {
@@ -49741,14 +49741,12 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_retirement_watermark_converges_a_follower_when_per_key_frames_are_lost() {
-        // The convergence backstop: the per-key retirement digest is best-effort, so
-        // under load its fire-and-forget frames are dropped and a follower only reaps
-        // a fraction — the rest leak as never-reaped `Active` shells. The owner also
-        // broadcasts a low-water mark every tick; a follower drops every resident
-        // replica instance below it, converging to the owner's live set REGARDLESS of
-        // any lost per-key frames. This proves that round-trip with an EMPTY per-key
-        // buffer (i.e. every per-key frame was lost).
+    async fn the_retirement_watermark_never_reaps_a_live_instance_from_a_lagging_follower() {
+        // #1908: the owner's low-water mark is out of band, so it advances past an
+        // instance the follower still holds live (it has not applied the owner's
+        // completion yet). The watermark must reap only instances terminal on the
+        // follower — never a live one, or the follower diverges when the completion
+        // applies.
         let (node0, node1, node2) = boot_rf3_leader_durable_cluster().await;
 
         // A create on partition 0 (led by node 0); it ships to the learners.
@@ -49774,14 +49772,17 @@ mod clustered_startup_tests {
         }
         assert!(replicated, "the create ships to the learner replica engine");
 
-        // Simulate the leader completing + exporter-evicting the instance locally
-        // (leader-local, never logged) but WITHOUT buffering its key — i.e. its
-        // per-key digest frame was lost. The owner's low-water mark now advances past
-        // it, so the watermark phase alone must converge the follower.
+        // The owner runs ahead of the follower: it terminates + evicts `k1`
+        // locally (an entry the follower has not applied), so its mark passes `k1`
+        // while `k1` is still live on the follower.
         let owner = node0.engine_handle_for(0).expect("node 0 owns partition 0");
         owner
             .with(move |journal| {
-                journal.retire_instances(&[k1]);
+                let _ = journal
+                    .apply_command(nanobpmn_engine_core::Command::cancel_instance(k1))
+                    .expect("the owner terminates k1");
+                journal.evict_instances(&[k1]);
+                assert!(journal.retirement_low_water() > k1);
             })
             .await;
 
@@ -49793,20 +49794,12 @@ mod clustered_startup_tests {
         // broadcasts the advanced low-water mark to the followers.
         node0.run_retirement_digest().await;
 
-        let mut converged = false;
-        for _ in 0..400 {
-            if !learner_handle
-                .with(move |journal| journal.engine().state().instances.contains_key(&k1))
-                .await
-            {
-                converged = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(
-            converged,
-            "the retirement watermark reaps the follower backlog with zero per-key frames"
+            learner_handle
+                .with(move |journal| journal.engine().state().instances.contains_key(&k1))
+                .await,
+            "the retirement watermark must never reap an instance live on the follower"
         );
 
         for node in [&node0, &node1, &node2] {

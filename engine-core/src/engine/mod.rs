@@ -251,18 +251,6 @@ pub struct Engine {
     /// variable rows must be deleted from the store. Only populated when
     /// [`track_dirty_vars`] is set.
     forgotten_vars: BTreeSet<Key>,
-    /// Follower-only safety net for the retirement digest (RF>1). A leader completes
-    /// and exporter-evicts an instance and broadcasts its key, but under leader-durable
-    /// the ack happens on the leader before the async learner has applied the
-    /// instance's `CreateInstance`, so [`Engine::retire_instances`] finds the key
-    /// absent. Rather than drop the retirement (and leak the instance once its create
-    /// lands), the absent key is remembered here; the next `apply_command_at` that
-    /// materializes it retires it immediately. Populated only on a follower replica
-    /// (a leader never receives a retirement digest, so this stays empty and the
-    /// per-command check is free). Bounded — it only ever holds keys in the brief
-    /// window between a retirement and its create, so it drains continuously. NOT
-    /// part of the snapshot; pure host-side bookkeeping, never affects determinism.
-    retired_tombstones: BTreeSet<Key>,
     /// Sub-process scopes torn down (by a scoped terminate end or an interrupting
     /// boundary) during the command currently draining. A scoped teardown removes
     /// every descendant token but deliberately leaves the enclosing sub-process
@@ -759,7 +747,6 @@ impl Engine {
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
-            retired_tombstones: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
@@ -940,7 +927,6 @@ impl Engine {
             track_dirty_vars: false,
             dirty_vars: BTreeSet::new(),
             forgotten_vars: BTreeSet::new(),
-            retired_tombstones: BTreeSet::new(),
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
@@ -2523,9 +2509,8 @@ impl Engine {
     ///
     /// Structure: [`plan_command_at`](Self::plan_command_at) translates the
     /// command into an initial `(log, queue)`, the RTC [`run`](Self::run) drives
-    /// the queue to quiescence, and [`finish_command`](Self::finish_command)
-    /// performs the post-drain tail. The debug entrypoints reuse the same
-    /// planner + tail with a *stepping* driver in place of `run`.
+    /// the queue to quiescence. The debug entrypoints reuse the same planner
+    /// with a *stepping* driver in place of `run`.
     pub fn apply_command_at(
         &mut self,
         command: Command,
@@ -2593,7 +2578,6 @@ impl Engine {
                 .map(|(mut log, queue)| {
                     self.run(&mut log, queue);
                     self.cascade_cancel_children(&mut log, 0);
-                    self.finish_command(&log);
                     // Every engine test exercises the parent -> children index the
                     // cascade reads (#1827): a write path that bypassed it fails here.
                     #[cfg(test)]
@@ -2603,32 +2587,6 @@ impl Engine {
         self.operation_reference = None;
         self.terminal_deadline_stamps.clear();
         result
-    }
-
-    /// Post-drain tail shared by [`apply_command_at`](Self::apply_command_at) and
-    /// the debug entrypoints. Instance completion now happens at the fixpoint
-    /// drain point inside [`run_with`](Self::run_with) (so a debug
-    /// `ProcessCompleted` breakpoint can observe it through the driver); the only
-    /// work left here is the follower-only tombstone reap, which is orthogonal to
-    /// completion. Runs after the queue has drained to quiescence.
-    fn finish_command(&mut self, log: &[Event]) {
-        // Follower-only safety net: if a retirement digest raced ahead of an
-        // instance's create on this replica (leader-durable async-learner lag), the
-        // key was tombstoned; now that the create has materialized the instance,
-        // reap it immediately so it cannot linger as a never-retired `Active` shell.
-        // Near-free when nothing is pending (a leader never tombstones).
-        if !self.retired_tombstones.is_empty() {
-            let created: Vec<Key> = log
-                .iter()
-                .filter_map(|e| match e {
-                    Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
-                    _ => None,
-                })
-                .collect();
-            if !created.is_empty() {
-                self.reap_tombstoned(&created);
-            }
-        }
     }
 
     /// Translates `command` into the initial `(log, queue)` the fixpoint loop
@@ -6972,11 +6930,11 @@ impl Engine {
             }
             // Token quiescence. Complete any instance whose tokens have all
             // retired — the terminal tail shared with `apply_command_at`, folded
-            // into the loop (rather than run post-return in `finish_command`) so a
+            // into the loop (rather than run post-return) so a
             // `ProcessCompleted` breakpoint can observe the completion through the
             // driver, exactly like every other event. Idempotent: a completed
             // instance is no longer `Active`, so a resume pass and
-            // `finish_command`'s tombstone tail find nothing left to complete, and
+            // later pass finds nothing left to complete, and
             // the production (`RunToCompletion`) log is byte-identical — completion
             // is still emitted once, at the same quiescence point.
             let completed_from = log.len();

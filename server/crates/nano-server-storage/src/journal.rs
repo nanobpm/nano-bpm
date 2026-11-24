@@ -2944,45 +2944,37 @@ impl Journal {
         self.engine.evict_instances(keys)
     }
 
-    /// Unconditionally retires a batch of instances from hot state (and their
-    /// spilled/cold rows) regardless of local lifecycle state. The follower-side
-    /// counterpart to [`Journal::evict_instances`]: a partition leader broadcasts
-    /// the authoritative retirement digest (the keys it completed + exporter-evicted
-    /// locally, which never enter the raft log) and each follower replica drops them
-    /// here, so its replica engine cannot pile up completed instances as never-reaped
-    /// `Active` shells (the RF>1 leader-local-completion hot-state leak). Mirrors
-    /// [`Engine::retire_instances`]; keys absent locally are ignored.
+    /// Follower-side reaping for the partition leader's out-of-band retirement
+    /// digest: drops the named instances that are TERMINAL in this replica's own
+    /// applied state (and forgets their spilled rows). Mirrors
+    /// [`Engine::retire_instances`]; live, unknown and cold keys are ignored.
+    ///
+    /// The digest is not ordered with the raft log, so it routinely names an
+    /// instance this (lagging) replica still holds live — reaping that would
+    /// make the follower reject the completion the leader already applied and
+    /// fail-stop on a replica divergence (#1908). A cold-spilled instance is
+    /// dormant, i.e. live, by construction, so the cold tier is never touched:
+    /// it is rehydrated and evicted through the log like any live instance.
     pub fn retire_instances(&mut self, keys: &[Key]) -> usize {
-        if let Some(store) = self.spill_store() {
-            store.forget_async(keys);
-        }
-        // Drop any cold-index entries for these keys too: the digest path forgets
-        // the disk rows above, but a cold-spilled replica instance named in the
-        // digest would otherwise leave its in-RAM ColdIndex entry behind (a slow
-        // leak, and a stale routing entry for a row that no longer exists).
-        if let Some(cold) = self.cold.as_mut() {
-            for &key in keys {
-                cold.index.remove(key);
-            }
-        }
-        self.engine.retire_instances(keys)
+        let reaped = self.engine.retire_instances(keys);
+        self.forget_reaped(reaped)
     }
 
     /// Owned-`Vec` variant of [`Journal::retire_instances`] for the digest apply
-    /// path, whose caller ([`apply_retirement_digest`](crate::AppState::apply_retirement_digest))
-    /// already owns the key vec. Moves the vec into the forget worker instead of
-    /// cloning it (this runs on the single-writer replica actor and the set can be
-    /// large), mirroring the [`Journal::retire_below`] copy-free change.
+    /// path, whose caller already owns the key vec.
     pub fn retire_instances_owned(&mut self, keys: Vec<Key>) -> usize {
-        // Consume the borrowed work first, then move `keys` into the worker queue.
-        if let Some(cold) = self.cold.as_mut() {
-            for &key in &keys {
-                cold.index.remove(key);
-            }
-        }
-        let n = self.engine.retire_instances(&keys);
-        if let Some(store) = self.spill_store() {
-            store.forget_async_owned(keys);
+        self.retire_instances(&keys)
+    }
+
+    /// Forgets the spilled rows of instances an out-of-band reap removed,
+    /// moving the set into the forget worker (this runs on the single-writer
+    /// replica actor). Returns how many were reaped.
+    fn forget_reaped(&self, reaped: Vec<Key>) -> usize {
+        let n = reaped.len();
+        if n > 0
+            && let Some(store) = self.spill_store()
+        {
+            store.forget_async_owned(reaped);
         }
         n
     }
@@ -3009,31 +3001,19 @@ impl Journal {
         self.engine.retirement_low_water()
     }
 
-    /// Follower-side reconciliation sweep: drops every resident replica instance
-    /// below the owner's `low_water` (and forgets their spilled rows), bounded to
-    /// `max_remove` per call. Mirrors [`Engine::retire_below`]; the loss-tolerant
-    /// convergence backstop for the best-effort per-key retirement digest.
+    /// Follower-side reconciliation sweep: drops every resident instance below
+    /// the owner's `low_water` that is TERMINAL in this replica's own applied
+    /// state (and forgets their spilled rows), bounded to `max_remove` per
+    /// call. Mirrors [`Engine::retire_below`]; the loss-tolerant backstop for
+    /// the best-effort per-key retirement digest.
     ///
-    /// Sweeps **both tiers**: [`Engine::retire_below`] reaps hot replica shells,
-    /// and [`ColdIndex::retire_below`] reaps cold-spilled replica instances the
-    /// engine can no longer see. Without the cold sweep, a cold instance whose
-    /// per-key digest frame was dropped is never reaped by either path and leaks
-    /// its `cold` row forever (the observed unbounded var-spill file growth).
+    /// The cold tier is deliberately NOT swept: the owner's mark is computed
+    /// over resident instances only, so it passes live cold-spilled backlog
+    /// instances, and reaping them here would make this replica answer later
+    /// activations and completions differently from the leader (#1908).
     pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> usize {
-        let mut reaped = self.engine.retire_below(low_water, max_remove);
-        if let Some(cold) = self.cold.as_mut() {
-            reaped.extend(cold.index.retire_below(low_water, max_remove));
-        }
-        if !reaped.is_empty()
-            && let Some(store) = self.spill_store()
-        {
-            // Move the reaped set into the worker queue rather than cloning it —
-            // this runs on the single-writer replica actor and the set can be large.
-            let n = reaped.len();
-            store.forget_async_owned(reaped);
-            return n;
-        }
-        reaped.len()
+        let reaped = self.engine.retire_below(low_water, max_remove);
+        self.forget_reaped(reaped)
     }
 
     /// Shrinks the hot-state map capacities to fit their live contents, returning
@@ -6429,54 +6409,6 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ProcessInstanceTerminated { instance_key } if *instance_key == key)));
-    }
-
-    #[test]
-    fn retire_below_forgets_cold_rows_of_instances_under_the_mark() {
-        // Regression for unbounded var-spill growth: a follower cold-spills a
-        // dormant replica instance, then the leader's per-key retirement digest for
-        // it is DROPPED (best-effort). The low-water backstop must still reclaim it
-        // — from BOTH the cold index and the disk store — or its `cold` row leaks
-        // forever (the file plateaus at the high-water mark, never reclaims).
-        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
-        let mut journal = Journal::in_memory();
-        journal.set_cold_spill(Arc::clone(&store), 1, 0);
-        let key = deploy_and_create(&mut journal);
-
-        // The instance is dormant on its job: spill it to the cold tier.
-        assert_eq!(journal.force_cold_spill_all(), 1);
-        assert_eq!(journal.cold_count(), 1);
-        assert!(journal.instance(key).is_none());
-
-        // The digest never arrives; only the low-water mark (above `key`) does.
-        // The backstop reaps it: index cleared AND the disk row forgotten.
-        let reaped = journal.retire_below(key + 1, 100);
-        assert_eq!(reaped, 1, "the cold instance below the mark is reaped");
-        assert_eq!(journal.cold_count(), 0, "cold index entry dropped");
-        assert!(
-            store.try_get_cold(key).unwrap().is_none(),
-            "cold disk row forgotten (no leak)"
-        );
-    }
-
-    #[test]
-    fn retire_instances_forgets_cold_index_entry_on_the_digest_path() {
-        // The digest path forgets the disk row; it must also drop the in-RAM cold
-        // index entry, or a cold-spilled replica instance named in a digest leaves
-        // a stale routing entry (a slow RAM leak) behind.
-        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
-        let mut journal = Journal::in_memory();
-        journal.set_cold_spill(Arc::clone(&store), 1, 0);
-        let key = deploy_and_create(&mut journal);
-        assert_eq!(journal.force_cold_spill_all(), 1);
-        assert_eq!(journal.cold_count(), 1);
-
-        journal.retire_instances(&[key]);
-        assert_eq!(journal.cold_count(), 0, "cold index entry dropped");
-        assert!(
-            store.try_get_cold(key).unwrap().is_none(),
-            "cold disk row forgotten"
-        );
     }
 
     #[test]
@@ -11083,5 +11015,253 @@ mod tests {
             "reopen must recover the same engine state"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Applies `command` to both replicas, asserting they journal identical
+    /// events (the per-entry input of the Raft chain digest, ADR 0066 #1664).
+    fn apply_on_both(leader: &mut Journal, follower: &mut Journal, command: Command) -> Vec<Event> {
+        let on_leader = leader
+            .apply_command(command.clone())
+            .map(|(events, _)| events.to_vec());
+        let on_follower = follower
+            .apply_command(command.clone())
+            .map(|(events, _)| events.to_vec());
+        assert_eq!(
+            on_leader.as_ref().map_err(|e| e.to_string()),
+            on_follower.as_ref().map_err(|e| e.to_string()),
+            "replicas diverged applying {command:?}"
+        );
+        on_leader.unwrap_or_default()
+    }
+
+    /// #1908 red/green: the leader's out-of-band retirement broadcast (the
+    /// per-key digest and the low-water watermark) reaches a follower that is
+    /// still BEHIND it in the log. The leader already applied the completion;
+    /// the follower has not. Reaping the instance there made the follower
+    /// reject the completion (`JobNotFound`, no events) the leader had applied
+    /// (`JobCompleted`, …) — a chain-digest divergence and a fail-stop.
+    #[test]
+    fn retirement_reaching_a_lagging_follower_never_reaps_a_live_instance() {
+        let mut leader = Journal::in_memory();
+        let mut follower = Journal::in_memory();
+        apply_on_both(
+            &mut leader,
+            &mut follower,
+            Command::SetLenientCompletion { lenient: true },
+        );
+        apply_on_both(&mut leader, &mut follower, Command::DeployProcess(demo()));
+        let key = apply_on_both(
+            &mut leader,
+            &mut follower,
+            Command::create_instance("demo"),
+        )
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+        let job = leader
+            .engine()
+            .state()
+            .jobs
+            .values()
+            .find(|j| j.instance_key == key)
+            .unwrap()
+            .key;
+        // The leader applies the completion; the follower lags one entry.
+        let _ = leader
+            .apply_command(Command::complete_job(job))
+            .expect("leader completes");
+        // The leader's broadcast lands on the lagging follower.
+        follower.retire_instances(&[key]);
+        follower.retire_instances_owned(vec![key]);
+        follower.retire_below(leader.retirement_low_water(), 100);
+        assert!(
+            follower.instance(key).is_some(),
+            "a follower must never reap an instance that is live in its applied state"
+        );
+        // The follower then applies the same entry: same events as the leader.
+        let mut reference = Journal::in_memory();
+        let _ = reference
+            .apply_command(Command::SetLenientCompletion { lenient: true })
+            .unwrap();
+        let _ = deploy_and_create(&mut reference);
+        let expected = reference
+            .apply_command(Command::complete_job(job))
+            .map(|(e, _)| e.to_vec())
+            .expect("reference completes");
+        let got = follower
+            .apply_command(Command::complete_job(job))
+            .map(|(e, _)| e.to_vec())
+            .expect("the lagging follower applies the completion the leader applied");
+        assert_eq!(got, expected);
+    }
+
+    /// #1908: a digest that races AHEAD of the instance's create on a lagging
+    /// follower must not tombstone the key and reap the instance the moment
+    /// the create applies (it is live there until the completion applies).
+    #[test]
+    fn retirement_racing_ahead_of_the_create_never_reaps_it_on_arrival() {
+        let mut leader = Journal::in_memory();
+        let mut follower = Journal::in_memory();
+        apply_on_both(
+            &mut leader,
+            &mut follower,
+            Command::SetLenientCompletion { lenient: true },
+        );
+        apply_on_both(&mut leader, &mut follower, Command::DeployProcess(demo()));
+        let key = leader
+            .apply_command(Command::create_instance("demo"))
+            .unwrap()
+            .0
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        let job = leader
+            .engine()
+            .state()
+            .jobs
+            .values()
+            .find(|j| j.instance_key == key)
+            .unwrap()
+            .key;
+        let completed = leader
+            .apply_command(Command::complete_job(job))
+            .unwrap()
+            .0
+            .to_vec();
+        // Digest + watermark arrive before the follower applied the create.
+        follower.retire_instances(&[key]);
+        follower.retire_below(leader.retirement_low_water(), 100);
+        let _ = follower
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        assert!(follower.instance(key).is_some(), "the create is not reaped");
+        let got = follower
+            .apply_command(Command::complete_job(job))
+            .map(|(e, _)| e.to_vec())
+            .expect("the follower applies the completion");
+        assert_eq!(got, completed);
+    }
+
+    /// #1908: a cold-spilled instance is dormant, not terminal — the owner's
+    /// low-water mark (computed over RESIDENT instances only) can pass it. A
+    /// follower must never reap it: the backlog's jobs are still to activate.
+    #[test]
+    fn the_watermark_never_reaps_a_cold_live_instance() {
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        let mut journal = Journal::in_memory();
+        journal.set_cold_spill(Arc::clone(&store), 1, 0);
+        let key = deploy_and_create(&mut journal);
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert_eq!(journal.retire_below(key + 1, 100), 0);
+        journal.retire_instances(&[key]);
+        assert_eq!(journal.cold_count(), 1, "the live cold instance is kept");
+        assert!(store.try_get_cold(key).unwrap().is_some());
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 0);
+        assert_eq!(jobs.len(), 1, "its job is still activatable");
+    }
+
+    /// #1908 DEFECT-CLASS GUARD: follower housekeeping that runs OUTSIDE the
+    /// replicated log (retirement digest, watermark, cold spill) is invisible
+    /// to the log's applied output. A follower that runs every such operation,
+    /// with every key it could ever be told about, between every pair of
+    /// entries journals exactly the events a replica that never ran them does.
+    #[test]
+    fn out_of_band_follower_housekeeping_never_changes_applied_events() {
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        let mut leader = Journal::in_memory();
+        let mut follower = Journal::in_memory();
+        follower.set_cold_spill(Arc::clone(&store), 1, 0);
+        let mut known: Vec<Key> = Vec::new();
+        let housekeep = |follower: &mut Journal, known: &[Key]| {
+            let mut every = known.to_vec();
+            // Keys not yet minted here (a digest racing ahead of creates).
+            let next = known.iter().copied().max().unwrap_or(0);
+            every.extend((1..=64).map(|d| next + d));
+            follower.retire_instances(&every);
+            follower.retire_instances_owned(every.clone());
+            follower.retire_below(Key::MAX, usize::MAX);
+            follower.force_cold_spill_all();
+        };
+        let step = |command: Command,
+                        leader: &mut Journal,
+                        follower: &mut Journal,
+                        known: &mut Vec<Key>| {
+            housekeep(follower, known);
+            let events = apply_on_both(leader, follower, command);
+            for e in &events {
+                if let Some(k) = e.instance_key() {
+                    known.push(k);
+                }
+                if let Event::JobCreated { job_key, .. } = e {
+                    known.push(*job_key);
+                }
+            }
+            events
+        };
+        step(
+            Command::SetLenientCompletion { lenient: true },
+            &mut leader,
+            &mut follower,
+            &mut known,
+        );
+        step(
+            Command::DeployProcess(demo()),
+            &mut leader,
+            &mut follower,
+            &mut known,
+        );
+        // A pre-created backlog, then activation (durable, by key) and
+        // completion load interleaved with more creates.
+        for _ in 0..6 {
+            step(
+                Command::create_instance("demo"),
+                &mut leader,
+                &mut follower,
+                &mut known,
+            );
+        }
+        for round in 0..6u64 {
+            let keys = leader.select_activatable_job_keys("demo-work", 2, round, false);
+            step(
+                Command::ActivateJobsByKey {
+                    job_keys: keys.clone(),
+                    worker: "w".into(),
+                    timeout: 1,
+                    now: round,
+                    fetch_variables: Vec::new(),
+                    with_lease: false,
+                },
+                &mut leader,
+                &mut follower,
+                &mut known,
+            );
+            if let Some(&first) = keys.first() {
+                step(
+                    Command::complete_job(first),
+                    &mut leader,
+                    &mut follower,
+                    &mut known,
+                );
+                // A duplicate completion (a worker retry) after the reap.
+                step(
+                    Command::complete_job(first),
+                    &mut leader,
+                    &mut follower,
+                    &mut known,
+                );
+            }
+            step(
+                Command::ExpireJobs { now: round + 5 },
+                &mut leader,
+                &mut follower,
+                &mut known,
+            );
+            step(
+                Command::create_instance("demo"),
+                &mut leader,
+                &mut follower,
+                &mut known,
+            );
+        }
     }
 }

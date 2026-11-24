@@ -3357,171 +3357,120 @@ fn evict_instances_batches_in_one_pass() {
     assert!(engine.state().jobs.values().any(|j| j.instance_key == live));
 }
 
-/// `retire_instances` is the follower-side counterpart to `evict_instances`: it
-/// drops the named instances from hot state regardless of their local lifecycle
-/// state (a follower replica never sees the leader-local completion, so the
-/// instance is still `Active` here), while ignoring keys that are absent.
-#[test]
-fn retire_instances_drops_active_shells_and_ignores_absent() {
-    let mut engine = Engine::new();
+/// Creates one `order` instance, returning its key.
+fn create_order(engine: &mut Engine) -> Key {
     engine
-        .apply_command(Command::DeployProcess(linear_with_task()))
-        .unwrap();
-
-    // Two in-flight (Active, with a Created job) instances — this models a
-    // follower replica that applied the CreateInstance but never the completion.
-    let a = engine
         .apply_command(Command::create_instance("order"))
         .unwrap()
         .iter()
         .find_map(|e| e.instance_key())
-        .unwrap();
-    let b = engine
-        .apply_command(Command::create_instance("order"))
         .unwrap()
-        .iter()
-        .find_map(|e| e.instance_key())
-        .unwrap();
-    let keep = engine
-        .apply_command(Command::create_instance("order"))
-        .unwrap()
-        .iter()
-        .find_map(|e| e.instance_key())
-        .unwrap();
+}
 
-    // Both `a` and `b` are Active, not terminal — `evict_instances` must NOT
-    // touch them, proving the leak they cause.
-    assert_eq!(engine.evict_instances(&[a, b]), 0);
-    assert!(engine.instance(a).is_some());
-
-    // `retire_instances` drops the two named Active shells (and their jobs),
-    // ignores the unknown key, and leaves the untouched instance intact.
-    let retired = engine.retire_instances(&[a, b, 9_999_999]);
-    assert_eq!(retired, 2);
-    assert!(engine.instance(a).is_none());
-    assert!(engine.instance(b).is_none());
-    assert!(engine.instance(keep).is_some());
-    assert!(!engine
+/// Activates and completes `instance`'s only job, driving it to `Completed`.
+fn complete_order(engine: &mut Engine, instance: Key) {
+    let job = engine
         .state()
         .jobs
         .values()
-        .any(|j| j.instance_key == a || j.instance_key == b));
-    assert!(engine.state().jobs.values().any(|j| j.instance_key == keep));
+        .find(|j| j.instance_key == instance)
+        .unwrap()
+        .key;
+    engine
+        .apply_command(Command::ActivateJobsByKey {
+            job_keys: vec![job],
+            worker: "W".into(),
+            timeout: 1_000,
+            now: 0,
+            fetch_variables: Vec::new(),
+            with_lease: false,
+        })
+        .unwrap();
+    engine.apply_command(Command::complete_job(job)).unwrap();
+    assert!(engine.is_completed(instance));
 }
 
-/// The retire-before-create race: under leader-durable the leader completes and
-/// broadcasts a retirement digest before the async learner has applied the
-/// instance's `CreateInstance`. `retire_instances` then finds the key absent and
-/// must tombstone it so the instance is reaped the moment its create materializes
-/// — otherwise it leaks as a never-retired `Active` shell.
+/// #1908: `retire_instances` (the leader's out-of-band retirement digest on a
+/// follower) reaps only instances TERMINAL in this replica's own applied
+/// state. A follower lagging the leader still holds the instance live (it has
+/// not applied the completion the leader broadcasts) — reaping it would make
+/// the follower reject that completion when it applies, diverging.
 #[test]
-fn retire_before_create_tombstones_and_reaps_on_arrival() {
+fn retire_instances_reaps_only_locally_terminal_instances() {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
+    let done = create_order(&mut engine);
+    let live = create_order(&mut engine);
+    complete_order(&mut engine, done);
 
-    // Minting is deterministic for an identical command sequence, but a create
-    // consumes several local keys (instance + job + tokens), so the instance key
-    // is not simply `prev + 1`. Learn the key the create WILL mint from a twin
-    // engine driven with the identical sequence.
+    let retired = engine.retire_instances(&[done, live, 9_999_999]);
+    assert_eq!(retired, vec![done], "only the locally-terminal instance");
+    assert!(engine.instance(done).is_none());
+    assert!(
+        engine.instance(live).is_some(),
+        "a live instance is never reaped out of band"
+    );
+    assert!(engine.state().jobs.values().any(|j| j.instance_key == live));
+}
+
+/// #1908: a digest that races ahead of the instance's create leaves no
+/// tombstone — the create, once applied, is live and must stay resident.
+#[test]
+fn retire_before_create_never_reaps_the_instance_on_arrival() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
     let future_key = {
         let mut twin = Engine::new();
         twin.apply_command(Command::DeployProcess(linear_with_task()))
             .unwrap();
-        twin.apply_command(Command::create_instance("order"))
-            .unwrap()
-            .iter()
-            .find_map(|e| e.instance_key())
-            .unwrap()
+        create_order(&mut twin)
     };
-
-    // Retire `future_key` BEFORE it exists on this engine, exactly as a digest
-    // that raced ahead of the replicated create.
-    assert_eq!(
-        engine.retire_instances(&[future_key]),
-        0,
-        "nothing present yet"
-    );
-    assert!(engine.instance(future_key).is_none());
-
-    // Now the create arrives and mints exactly that key. It must be reaped
-    // immediately, not left Active.
-    let created = engine
-        .apply_command(Command::create_instance("order"))
-        .unwrap()
-        .iter()
-        .find_map(|e| e.instance_key())
-        .unwrap();
-    assert_eq!(created, future_key, "the create mints the tombstoned key");
+    assert!(engine.retire_instances(&[future_key]).is_empty());
+    let created = create_order(&mut engine);
+    assert_eq!(created, future_key);
     assert!(
-        engine.instance(created).is_none(),
-        "the tombstoned instance is reaped on arrival (no leak)"
+        engine.instance(created).is_some(),
+        "the instance is live on this replica"
     );
-    assert!(!engine
-        .state()
-        .jobs
-        .values()
-        .any(|j| j.instance_key == created));
-
-    // A subsequent, untombstoned create is unaffected.
-    let live = engine
-        .apply_command(Command::create_instance("order"))
-        .unwrap()
-        .iter()
-        .find_map(|e| e.instance_key())
-        .unwrap();
-    assert!(engine.instance(live).is_some());
 }
 
-/// The loss-tolerant reconciliation backstop: `retire_below` drops every resident
-/// replica instance below the owner's low-water mark, and `retirement_low_water`
-/// ignores the owner's own resident terminal shells so the mark keeps advancing.
+/// #1908: `retire_below` reaps only locally-terminal instances below the
+/// owner's mark — the mark is out of band, so live instances below it (a
+/// lagging replica, or a cold backlog the owner's resident-only mark passed)
+/// are kept. Bounded and idempotent.
 #[test]
-fn retire_below_reconciles_follower_to_owner_low_water() {
+fn retire_below_reaps_only_locally_terminal_instances_under_the_mark() {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-
-    // Model a follower replica that applied five creates but no retirements.
-    let mut keys = Vec::new();
-    for _ in 0..5 {
-        keys.push(
-            engine
-                .apply_command(Command::create_instance("order"))
-                .unwrap()
-                .iter()
-                .find_map(|e| e.instance_key())
-                .unwrap(),
-        );
-    }
+    let mut keys: Vec<Key> = (0..5).map(|_| create_order(&mut engine)).collect();
     keys.sort_unstable();
-    assert!(keys.iter().all(|k| engine.instance(*k).is_some()));
-
-    // The owner's low-water mark sits just above the 3rd instance: everything below
-    // it has terminated on the owner. The sweep reaps exactly those (bounded).
+    for &k in &keys[..2] {
+        complete_order(&mut engine, k);
+    }
+    // keys[2] is live below the mark; keys[4] is terminal above it.
+    complete_order(&mut engine, keys[4]);
     let low_water = keys[3];
+
+    let capped = engine.retire_below(low_water, 1);
+    assert_eq!(capped, vec![keys[0]], "the bound caps one sweep");
     let reaped = engine.retire_below(low_water, 100);
-    assert_eq!(
-        reaped.len(),
-        3,
-        "reaps every resident instance below the mark"
-    );
-    assert!(engine.instance(keys[0]).is_none());
-    assert!(engine.instance(keys[2]).is_none());
+    assert_eq!(reaped, vec![keys[1]]);
     assert!(
-        engine.instance(keys[3]).is_some(),
-        "the mark itself is kept"
+        engine.instance(keys[2]).is_some(),
+        "a live instance below the mark is kept"
     );
-    assert!(engine.instance(keys[4]).is_some());
-
-    // Idempotent: re-running with the same mark reaps nothing more.
-    assert_eq!(engine.retire_below(low_water, 100).len(), 0);
-
-    // The bound caps a single sweep so a huge backlog drains across ticks.
-    let capped = engine.retire_below(keys[4] + 1, 1);
-    assert_eq!(capped.len(), 1);
+    assert!(engine.instance(keys[3]).is_some());
+    assert!(
+        engine.instance(keys[4]).is_some(),
+        "a terminal instance at/above the mark is kept"
+    );
+    assert!(engine.retire_below(low_water, 100).is_empty(), "idempotent");
 }
 
 /// `retirement_low_water` is the smallest still-`Active` key (so a follower can
