@@ -23,6 +23,14 @@ test('stripComments blanks line and block comments, keeps strings', () => {
 
 // --- splitArgs ---------------------------------------------------------------
 
+test('splitArgs keeps escaped quotes inside a string literal intact', () => {
+  // Regression: the escaped char after a backslash was dropped, turning
+  // "= contains(str,\"b\")" into a literal with a \b (backspace) control char.
+  const [arg] = splitArgs('"= contains(str,\\"b\\")"');
+  assert.equal(arg, '"= contains(str,\\"b\\")"');
+  assert.equal(resolveArg(arg), '= contains(str,"b")');
+});
+
 test('splitArgs splits top-level commas, respecting nesting and quotes', () => {
   assert.deepEqual(splitArgs('"a", "b"'), ['"a"', '"b"']);
   assert.deepEqual(splitArgs('"a,b", f(x, y)'), ['"a,b"', 'f(x, y)']);

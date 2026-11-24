@@ -9,10 +9,10 @@
   },
   "counts": {
     "scannedFiles": 81,
-    "harvested": 86,
-    "runnable": 42,
+    "harvested": 109,
+    "runnable": 50,
     "unverified": 6,
-    "outOfScope": 475
+    "outOfScope": 467
   },
   "unverified": [
     {
@@ -47,9 +47,9 @@
     }
   ],
   "outOfScopeBreakdown": {
-    "unparseable": 437,
+    "unparseable": 414,
     "normalise": 2,
-    "run": 36
+    "run": 51
   },
   "unparseableByClass": [
     {
@@ -69,12 +69,6 @@
       "unparseable": 1,
       "harvested": 0,
       "fullyUnparseable": true
-    },
-    {
-      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest",
-      "unparseable": 1,
-      "harvested": 3,
-      "fullyUnparseable": false
     },
     {
       "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/AdHocSubProcessElementsVariableTest",
@@ -183,12 +177,6 @@
       "unparseable": 1,
       "harvested": 0,
       "fullyUnparseable": true
-    },
-    {
-      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest",
-      "unparseable": 3,
-      "harvested": 1,
-      "fullyUnparseable": false
     },
     {
       "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ServiceTaskTest",
@@ -359,15 +347,9 @@
       "fullyUnparseable": false
     },
     {
-      "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayTest",
-      "unparseable": 2,
-      "harvested": 8,
-      "fullyUnparseable": false
-    },
-    {
       "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest",
-      "unparseable": 7,
-      "harvested": 18,
+      "unparseable": 1,
+      "harvested": 24,
       "fullyUnparseable": false
     },
     {
@@ -432,13 +414,14 @@
     },
     {
       "testClass": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/variables/ContainerElementVariablePropagationTest",
-      "unparseable": 21,
-      "harvested": 4,
+      "unparseable": 10,
+      "harvested": 15,
       "fullyUnparseable": false
     }
   ],
   "runnableIds": [
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-0-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-2-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-3-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-AgentDefinitionJobHeaderTest-1-processId",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityBusinessIdTest-1-child-process",
@@ -458,7 +441,10 @@
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-0-processId",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-1-processId",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-OutputMappingTest-2-processId",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-0-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-1-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-2-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-3-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-behavior-BpmnProcessDeletionBehaviorTest-0-processId",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventElementTest-1-process2",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventCompatibilityTest-0-child-process",
@@ -479,6 +465,10 @@
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-4-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-6-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-7-process",
-    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceCallActivityTest-1-wf-child"
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-multiinstance-MultiInstanceCallActivityTest-1-wf-child",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-18-childProcessId",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-20-childProcessId",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-22-childProcessId",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-variables-ContainerElementVariablePropagationTest-24-childProcessId"
   ]
 }

@@ -1,0 +1,119 @@
+{
+  "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-2-process",
+  "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest.java",
+  "processId": "process",
+  "calls": [
+    {
+      "m": "startEvent",
+      "args": []
+    },
+    {
+      "m": "serviceTask",
+      "args": [
+        "task"
+      ]
+    },
+    {
+      "m": "zeebeJobType",
+      "args": [
+        "type"
+      ]
+    },
+    {
+      "m": "zeebeInput",
+      "args": [
+        "text",
+        "textStatic"
+      ]
+    },
+    {
+      "m": "zeebeInputExpression",
+      "args": [
+        "\"text\"",
+        "textExpression"
+      ]
+    },
+    {
+      "m": "zeebeInput",
+      "args": [
+        "123",
+        "numberStatic"
+      ]
+    },
+    {
+      "m": "zeebeInputExpression",
+      "args": [
+        "\"123\"",
+        "numberExpression"
+      ]
+    },
+    {
+      "m": "zeebeInput",
+      "args": [
+        "true",
+        "booleanStatic"
+      ]
+    },
+    {
+      "m": "zeebeInputExpression",
+      "args": [
+        "\"true\"",
+        "booleanExpression"
+      ]
+    },
+    {
+      "m": "zeebeInput",
+      "args": [
+        "null",
+        "nullStatic"
+      ]
+    },
+    {
+      "m": "zeebeInputExpression",
+      "args": [
+        "\"null\"",
+        "nullExpression"
+      ]
+    },
+    {
+      "m": "zeebeInput",
+      "args": [
+        "https://github.com/{{orgId}}/{{repoId}}",
+        "urlStatic"
+      ]
+    },
+    {
+      "m": "zeebeInputExpression",
+      "args": [
+        "\"https://github.com/{{orgId}}/{{repoId}}\"",
+        "urlExpression"
+      ]
+    },
+    {
+      "m": "zeebeInput",
+      "args": [
+        "My Name is &#34;Zeebe&#34;, nice to meet you",
+        "quotesStaticModeler"
+      ]
+    },
+    {
+      "m": "zeebeInput",
+      "args": [
+        "My Name is \"Zeebe\", nice to meet you",
+        "quotesStatic"
+      ]
+    },
+    {
+      "m": "zeebeInputExpression",
+      "args": [
+        "\"My Name is \\\"Zeebe\\\", nice to meet you\"",
+        "quotesExpression"
+      ]
+    },
+    {
+      "m": "endEvent",
+      "args": []
+    }
+  ],
+  "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<definitions xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" xmlns:ns0=\"http://camunda.org/schema/zeebe/1.0\" exporter=\"Zeebe BPMN Model\" exporterVersion=\"8.10.8\" id=\"definitions_1\" xmlns:modeler=\"http://camunda.org/schema/modeler/1.0\" modeler:executionPlatform=\"Camunda Cloud\" modeler:executionPlatformVersion=\"8.10.8\" targetNamespace=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" xmlns=\"http://www.omg.org/spec/BPMN/20100524/MODEL\">\n  <process id=\"process\" isExecutable=\"true\">\n    <startEvent id=\"startEvent_1\">\n      <outgoing>sequenceFlow_1</outgoing>\n    </startEvent>\n    <serviceTask id=\"task\" name=\"task\">\n      <extensionElements>\n        <ns0:taskDefinition type=\"type\"/>\n        <ns0:ioMapping>\n          <ns0:input source=\"text\" target=\"textStatic\"/>\n          <ns0:input source=\"=&quot;text&quot;\" target=\"textExpression\"/>\n          <ns0:input source=\"123\" target=\"numberStatic\"/>\n          <ns0:input source=\"=&quot;123&quot;\" target=\"numberExpression\"/>\n          <ns0:input source=\"true\" target=\"booleanStatic\"/>\n          <ns0:input source=\"=&quot;true&quot;\" target=\"booleanExpression\"/>\n          <ns0:input source=\"null\" target=\"nullStatic\"/>\n          <ns0:input source=\"=&quot;null&quot;\" target=\"nullExpression\"/>\n          <ns0:input source=\"https://github.com/{{orgId}}/{{repoId}}\" target=\"urlStatic\"/>\n          <ns0:input source=\"=&quot;https://github.com/{{orgId}}/{{repoId}}&quot;\" target=\"urlExpression\"/>\n          <ns0:input source=\"My Name is &amp;#34;Zeebe&amp;#34;, nice to meet you\" target=\"quotesStaticModeler\"/>\n          <ns0:input source=\"My Name is &quot;Zeebe&quot;, nice to meet you\" target=\"quotesStatic\"/>\n          <ns0:input source=\"=&quot;My Name is \\&quot;Zeebe\\&quot;, nice to meet you&quot;\" target=\"quotesExpression\"/>\n        </ns0:ioMapping>\n      </extensionElements>\n      <incoming>sequenceFlow_1</incoming>\n      <outgoing>sequenceFlow_2</outgoing>\n    </serviceTask>\n    <sequenceFlow id=\"sequenceFlow_1\" sourceRef=\"startEvent_1\" targetRef=\"task\"/>\n    <endEvent id=\"endEvent_1\">\n      <incoming>sequenceFlow_2</incoming>\n    </endEvent>\n    <sequenceFlow id=\"sequenceFlow_2\" sourceRef=\"task\" targetRef=\"endEvent_1\"/>\n  </process>\n  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">\n    <bpmndi:BPMNPlane bpmnElement=\"process\" id=\"BPMNPlane_1\">\n      <bpmndi:BPMNShape bpmnElement=\"startEvent_1\" id=\"BPMNShape_1\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"100.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNShape bpmnElement=\"task\" id=\"BPMNShape_2\">\n        <dc:Bounds height=\"80.0\" width=\"100.0\" x=\"186.0\" y=\"78.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_1\" id=\"BPMNEdge_1\">\n        <di:waypoint x=\"136.0\" y=\"118.0\"/>\n        <di:waypoint x=\"186.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"endEvent_1\" id=\"BPMNShape_3\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"336.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_2\" id=\"BPMNEdge_2\">\n        <di:waypoint x=\"286.0\" y=\"118.0\"/>\n        <di:waypoint x=\"336.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n    </bpmndi:BPMNPlane>\n  </bpmndi:BPMNDiagram>\n</definitions>\n"
+}
