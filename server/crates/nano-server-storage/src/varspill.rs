@@ -424,6 +424,17 @@ struct RowPins {
     cold: BTreeSet<Key>,
 }
 
+impl RowPins {
+    /// Drops a deferred delete of `key` after a fresh write of its row, so the
+    /// pin's release never deletes a row newer than the one it deferred.
+    fn undefer(&mut self, table: GcTable, key: Key) {
+        match table {
+            GcTable::Spill => self.spill.remove(&key),
+            GcTable::Cold => self.cold.remove(&key),
+        };
+    }
+}
+
 /// Holds a [`VarSpillStore`]'s rows stable for a snapshot capture (#1880).
 ///
 /// A streaming snapshot captures the cold routing keys and the spilled flags on
@@ -453,29 +464,32 @@ impl Clone for RowPin {
 
 impl Drop for RowPin {
     fn drop(&mut self) {
-        let (spill, cold) = {
-            let mut pins = self.store.pins.lock().unwrap_or_else(|e| e.into_inner());
-            pins.count = pins.count.saturating_sub(1);
-            if pins.count > 0 {
-                return;
-            }
-            (
-                std::mem::take(&mut pins.spill),
-                std::mem::take(&mut pins.cold),
-            )
-        };
+        // The pins lock is held across the deferred deletes (lock order:
+        // `pins` then `conn`), so a concurrent `put`/`put_cold` — which holds
+        // the same lock across its INSERT and undefer — is serialized with the
+        // release: it either undefers before the deletes are taken, or writes
+        // after they ran. Never in between, where the release would delete the
+        // fresh row (#1880).
+        let mut pins = self.store.pins.lock().unwrap_or_else(|e| e.into_inner());
+        pins.count = pins.count.saturating_sub(1);
+        if pins.count > 0 {
+            return;
+        }
+        let spill = std::mem::take(&mut pins.spill);
+        let cold = std::mem::take(&mut pins.cold);
         // A key still deferred in both tables is an ordinary forget; one a
         // rewrite took back out of a table is deleted from the other only.
         let both: Vec<Key> = spill.intersection(&cold).copied().collect();
         // A failure is latched (with its keys) in `forget_faults`, exactly as
         // for an undeferred delete.
-        let _ = self.store.forget(&both);
+        let _ = self.store.forget_now(&both);
         for (table, keys) in [
             (GcTable::Spill, spill.difference(&cold).copied().collect()),
             (GcTable::Cold, cold.difference(&spill).copied().collect()),
         ] {
             self.store.delete_single_table(table, keys);
         }
+        drop(pins);
     }
 }
 
@@ -935,16 +949,6 @@ impl VarSpillStore {
         true
     }
 
-    /// Drops a deferred delete of `key` after a fresh write of its row, so the
-    /// pin's release never deletes a row newer than the one it deferred.
-    fn undefer(&self, table: GcTable, key: Key) {
-        let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
-        match table {
-            GcTable::Spill => pins.spill.remove(&key),
-            GcTable::Cold => pins.cold.remove(&key),
-        };
-    }
-
     /// Deletes `keys` from one table only (a pin release whose other table
     /// was rewritten meanwhile). A failure is latched in `forget_faults`.
     fn delete_single_table(&self, table: GcTable, keys: Vec<Key>) {
@@ -968,13 +972,18 @@ impl VarSpillStore {
     pub fn put(&self, key: Key, vars: &BTreeMap<String, Value>) -> rusqlite::Result<()> {
         let json = serde_json::to_string(vars)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        // Hold the pins lock across the INSERT and the undefer (lock order:
+        // `pins` then `conn`) so a concurrent pin release cannot take this
+        // key's deferred delete and run it against the fresh row (#1880).
+        let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO spill (key, vars) VALUES (?1, ?2)",
             params![key as i64, json],
         )?;
         drop(conn);
-        self.undefer(GcTable::Spill, key);
+        pins.undefer(GcTable::Spill, key);
+        drop(pins);
         self.note_activity();
         Ok(())
     }
@@ -1009,13 +1018,18 @@ impl VarSpillStore {
     pub fn put_cold(&self, key: Key, snapshot: &InstanceSnapshot) -> rusqlite::Result<()> {
         let json = serde_json::to_string(snapshot)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        // Hold the pins lock across the INSERT and the undefer (lock order:
+        // `pins` then `conn`) so a concurrent pin release cannot take this
+        // key's deferred delete and run it against the fresh row (#1880).
+        let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO cold (key, snapshot) VALUES (?1, ?2)",
             params![key as i64, json],
         )?;
         drop(conn);
-        self.undefer(GcTable::Cold, key);
+        pins.undefer(GcTable::Cold, key);
+        drop(pins);
         self.note_activity();
         Ok(())
     }
@@ -1076,6 +1090,15 @@ impl VarSpillStore {
     /// whole actor down.
     pub fn forget(&self, keys: &[Key]) -> rusqlite::Result<()> {
         if keys.is_empty() || self.defer_if_pinned(keys) {
+            return Ok(());
+        }
+        self.forget_now(keys)
+    }
+
+    /// The immediate (never-deferred) delete behind [`forget`](Self::forget);
+    /// also run by a [`RowPin`] release while it holds the pins lock.
+    fn forget_now(&self, keys: &[Key]) -> rusqlite::Result<()> {
+        if keys.is_empty() {
             return Ok(());
         }
         // delete_keys bumps activity per chunk, so no separate note_activity is needed.
@@ -2023,6 +2046,41 @@ mod tests {
         // Unpinned, a forget applies at once.
         store.forget(&[2]).unwrap();
         assert!(store.try_get_cold(2).unwrap().is_none());
+    }
+
+    // #1880 race: a pin's last release and a concurrent rewrite of a key it
+    // deferred must be serialized — whichever runs first, the fresh row
+    // survives (the release never deletes a row written after the forget).
+    #[test]
+    fn row_pin_release_racing_rewrite_never_deletes_fresh_row() {
+        for i in 0..300u64 {
+            let store = Arc::new(VarSpillStore::open(None).unwrap());
+            let key = i + 1;
+            store.put_cold(key, &cold_snapshot(key, "old")).unwrap();
+            store.put(key, &vars("old")).unwrap();
+            let pin = store.pin_rows();
+            store.forget(&[key]).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (s2, b2) = (Arc::clone(&store), Arc::clone(&barrier));
+            let writer = std::thread::spawn(move || {
+                b2.wait();
+                s2.put_cold(key, &cold_snapshot(key, "new")).unwrap();
+                s2.put(key, &vars("new")).unwrap();
+            });
+            barrier.wait();
+            drop(pin);
+            writer.join().unwrap();
+            assert_eq!(
+                store.try_get_cold(key).unwrap(),
+                Some(cold_snapshot(key, "new")),
+                "iteration {i}: fresh cold row deleted by pin release"
+            );
+            assert_eq!(
+                store.try_get(key).unwrap(),
+                Some(vars("new")),
+                "iteration {i}: fresh spill row deleted by pin release"
+            );
+        }
     }
 
     #[test]
