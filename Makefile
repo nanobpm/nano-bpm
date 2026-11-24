@@ -462,6 +462,11 @@ engine-build: ## Build the embeddable BPMN engine-core crate (no Docker, no code
 engine-test: ## Test the engine-core crate (unit + integration + doctests)
 	cd "$(ENGINE_DIR)" && cargo test
 
+.PHONY: parity-coverage-nano
+parity-coverage-nano: ## Measure engine-core parity-corpus region coverage and enforce the ratchet floor (formal/parity/coverage/baseline.json), exactly as the `parity-coverage (nano llvm-cov)` CI job does. Needs cargo-llvm-cov + llvm-tools-preview. Run it on any engine-core change: new engine code without a parity scenario drops the ratio.
+	formal/parity/coverage/nano-coverage.sh "$(CURDIR)/target/parity-coverage/nano-llvm-cov.json" ci
+	node formal/parity/coverage/report.mjs --nano "$(CURDIR)/target/parity-coverage/nano-llvm-cov.json" --out "$(CURDIR)/target/parity-coverage/nano-coverage-report.json" --check
+
 .PHONY: engine-wasm
 engine-wasm: ## Build engine-core for wasm32 (portability check; needs the wasm32 target)
 	cd "$(ENGINE_DIR)" && cargo build --target wasm32-unknown-unknown

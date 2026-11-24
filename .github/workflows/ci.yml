@@ -1171,11 +1171,17 @@ jobs:
   # formal/parity/coverage/baseline.json (a drop fails). The Camunda/JaCoCo
   # half needs a live broker and runs in parity-camunda-daily.yml. Not a
   # required check (not in the merge protocol). No retries.
+  #
+  # Runs on EVERY push to main, not only path-filtered ones (#1916): a drop
+  # that slipped past a PR (this job is not required) must keep main red
+  # until it is fixed, instead of being hidden by later unrelated pushes that
+  # skip the job and blocking whichever PR next trips the path filter.
+  # Locally: `make parity-coverage-nano`.
   parity-coverage-nano:
     name: parity-coverage (nano llvm-cov)
     runs-on: ubuntu-24.04
     needs: changes
-    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.paritycoverage == 'true' }}
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' || needs.changes.outputs.paritycoverage == 'true' }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5

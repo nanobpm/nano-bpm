@@ -1,0 +1,61 @@
+{
+  "name": "timer-cycle-iso-start",
+  "bpmn": "process.bpmn",
+  "processId": "parity-timer-cycle-iso-start",
+  "variables": {},
+  "steps": [
+    {
+      "op": "advanceTime",
+      "ms": 600000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 600000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 2400000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 7200000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 2678400000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 2592000000
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "work",
+      "variables": {
+        "done": true
+      }
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": {
+      "done": true
+    },
+    "jobsCreated": {
+      "work": 1
+    },
+    "completedElements": {
+      "StartEvent_1": 1,
+      "Task_Work": 1,
+      "EndEvent_1": 1,
+      "Timer_1": 3,
+      "End_T1": 3,
+      "Timer_2": 2,
+      "End_T2": 2,
+      "Timer_3": 2,
+      "End_T3": 2,
+      "Timer_4": 4,
+      "End_T4": 4
+    }
+  }
+}
