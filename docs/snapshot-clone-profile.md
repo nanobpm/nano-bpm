@@ -23,7 +23,13 @@ times `Engine::snapshot()` and `snapshot_control_only()` 5 times, then reports t
 median and the maximum. "Creates stalled" is the median clone time divided by the
 measured per-create cost.
 
-Results on an Apple M4 Pro (release build, 10 KB payload):
+Results on an Apple M4 Pro (release build, 10 KB payload). **These numbers were
+produced by the original version of the example (commit fa180fb), whose timed
+region also dropped the cloned snapshot.** They are therefore an upper bound on the
+clone cost: they include teardown of the copy, which does not run on the actor in
+production (the snapshot is dropped off the actor after serialization). The current
+example (c78b155 onward) excludes the drop from the timed region; its results have
+not yet been re-captured on this machine and should replace this table when they are.
 
 | resident instances | snapshot median / max | ns per instance | creates stalled | control_only median |
 |---:|---:|---:|---:|---:|
@@ -37,14 +43,21 @@ Results on an Apple M4 Pro (release build, 10 KB payload):
 
 Findings:
 
-- The clone is linear: about 0.3 µs per resident instance, including its job and
-  indexes. The payload size does not matter, because `variables` is an `Arc` and
-  cloning it only bumps a refcount. `control_only` costs the same as a full snapshot.
-- At realistic per-partition working sets (≤ 10k–50k resident instances), the stall
-  is roughly 3–25 ms per snapshot. Jitter from #49 already staggers these across
+- The clone (plus drop, see above) is linear: about 0.3 µs per resident instance,
+  including its job and indexes. In this benchmark the payload size does not matter,
+  because the payload lives in the instance's top-level `variables`, which is an `Arc`
+  whose clone only bumps a refcount. This does **not** hold for all state: nested
+  `scope_variables` and `esp_held_payloads` are deep-cloned, so workloads with large
+  sub-process/scope variables or held event-subprocess payloads will cost more than
+  measured here. `control_only` costs about the same as a full snapshot.
+- The figures below cover only the in-memory clone component of the on-actor
+  `Engine::snapshot()` call. Any other on-actor work in the server snapshot path
+  (e.g. `streaming_snapshot_parts`) is not decomposed or measured here.
+- At realistic per-partition working sets (≤ 10k–50k resident instances), the clone
+  stall is at most roughly 3–25 ms per snapshot. Jitter from #49 already staggers these across
   partitions.
-- At large working sets (≥ 200k resident instances on one partition), the stall
-  reaches 60–300 ms median, with tail spikes up to about 1 s. Those spikes come from
+- At large working sets (≥ 200k resident instances on one partition), the clone
+  stall reaches up to 60–300 ms median, with tail spikes up to about 1 s. Those spikes come from
   allocator and page-fault pressure on the first touch of the new nodes. A 1 s
   actor pause would be visible as p99 latency.
 
