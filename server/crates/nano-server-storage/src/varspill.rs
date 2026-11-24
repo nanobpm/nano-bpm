@@ -430,7 +430,7 @@ struct RowPins {
     cold: BTreeSet<Key>,
     /// The capture-bound row views of every live [`RowPin`] (#1885), by pin id.
     /// Copies of a pin share its view.
-    views: Vec<(u64, Arc<Mutex<CapturedRows>>)>,
+    views: Vec<(u64, Arc<Mutex<CapturedView>>)>,
     /// Next [`RowPin`] id.
     next_id: u64,
 }
@@ -440,6 +440,20 @@ struct RowPins {
 /// `put`/`put_cold` overwrites it while the pin is alive. A key with no entry
 /// is unchanged since capture, so the live row is still the captured one.
 type CapturedRows = BTreeMap<(GcTable, Key), Option<String>>;
+
+/// A capture's scope plus its copy-on-write side table (#1885).
+///
+/// **Memory bound.** A pre-image is recorded only for a key in `scope` — the
+/// keys the capture actually references (its cold routing keys and its
+/// variable-spilled instances) — and at most once per `(table, key)`. So a
+/// view retains at most two rows (spill + cold) per captured key, never a row
+/// the capture does not read, whatever else is rewritten on the shared store.
+/// The view is freed when the last [`RowPin`] copy on it drops.
+#[derive(Default)]
+struct CapturedView {
+    scope: BTreeSet<Key>,
+    rows: CapturedRows,
+}
 
 impl RowPins {
     /// Drops a deferred delete of `key` after a fresh write of its row, so the
@@ -452,7 +466,7 @@ impl RowPins {
     }
 
     /// Registers a pin on `view` and returns its id.
-    fn register(&mut self, view: Arc<Mutex<CapturedRows>>) -> u64 {
+    fn register(&mut self, view: Arc<Mutex<CapturedView>>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.count += 1;
@@ -461,8 +475,9 @@ impl RowPins {
     }
 
     /// Copy-on-write (#1885): before `table`'s row for `key` is overwritten,
-    /// records its current value in every live pin's view that has not yet
-    /// recorded it, so each capture keeps reading the row as it was when the
+    /// records its current value in every live pin's view whose capture
+    /// references `key` and that has not yet recorded it (see
+    /// [`CapturedView`] for the resulting memory bound), so each capture keeps reading the row as it was when the
     /// capture was taken. Must run under the pins lock with `conn` locked, so
     /// the read and the overwrite are atomic with respect to pins and readers.
     fn preserve_before_overwrite(
@@ -477,7 +492,7 @@ impl RowPins {
         let mut current: Option<Option<String>> = None;
         for (_, view) in &self.views {
             let mut view = view.lock().unwrap_or_else(|e| e.into_inner());
-            if view.contains_key(&(table, key)) {
+            if !view.scope.contains(&key) || view.rows.contains_key(&(table, key)) {
                 continue;
             }
             let row = match &current {
@@ -488,7 +503,7 @@ impl RowPins {
                     row
                 }
             };
-            view.insert((table, key), row);
+            view.rows.insert((table, key), row);
         }
         Ok(())
     }
@@ -530,7 +545,7 @@ impl GcTable {
 pub struct RowPin {
     store: Arc<VarSpillStore>,
     id: u64,
-    view: Arc<Mutex<CapturedRows>>,
+    view: Arc<Mutex<CapturedView>>,
 }
 
 impl Clone for RowPin {
@@ -573,6 +588,7 @@ impl RowPin {
             .view
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .rows
             .get(&(table, key))
             .cloned();
         let row = match preserved {
@@ -1082,8 +1098,16 @@ impl VarSpillStore {
     /// Pins this store's rows for a snapshot capture (#1880): until the
     /// returned [`RowPin`] drops, deletes are deferred, so every row the
     /// capture references stays readable. See [`RowPin`].
-    pub fn pin_rows(self: &Arc<Self>) -> RowPin {
-        let view = Arc::new(Mutex::new(CapturedRows::new()));
+    ///
+    /// `scope` is every key the capture references (cold routing keys and
+    /// variable-spilled instance keys): only those rows get a pre-image when
+    /// overwritten, which bounds the pin's memory (see [`CapturedView`]). A
+    /// read through the pin of a key outside `scope` sees the live row.
+    pub fn pin_rows(self: &Arc<Self>, scope: impl IntoIterator<Item = Key>) -> RowPin {
+        let view = Arc::new(Mutex::new(CapturedView {
+            scope: scope.into_iter().collect(),
+            rows: CapturedRows::new(),
+        }));
         let id = self
             .pins
             .lock()
@@ -2286,12 +2310,12 @@ mod tests {
         let store = Arc::new(VarSpillStore::open(None).unwrap());
         store.put(1, &vars("v1")).unwrap();
         store.put_cold(2, &cold_snapshot(2, "c1")).unwrap();
-        let first = store.pin_rows();
+        let first = store.pin_rows([1, 2, 3]);
         let first_copy = first.clone();
         store.put(1, &vars("v2")).unwrap();
         store.put_cold(2, &cold_snapshot(2, "c2")).unwrap();
         store.put(3, &vars("born-after")).unwrap();
-        let second = store.pin_rows();
+        let second = store.pin_rows([1, 2, 3]);
         store.put(1, &vars("v3")).unwrap();
 
         assert_eq!(data(first.try_get(1).unwrap()), s("v1"));
@@ -2313,13 +2337,49 @@ mod tests {
         assert!(store.pins.lock().unwrap().views.is_empty());
     }
 
+    // #1885 review: the side table is bounded by the capture. Overwriting a
+    // row the capture does not reference records no pre-image (the pin reads
+    // the live row for it), and releasing the last pin frees the view.
+    #[test]
+    fn row_pin_preserves_only_captured_rows_and_frees_view_on_release() {
+        let data = |v: Option<BTreeMap<String, Value>>| v.and_then(|m| m.get("data").cloned());
+        let s = |x: &str| Some(Value::Str(x.to_string()));
+        let store = Arc::new(VarSpillStore::open(None).unwrap());
+        store.put(1, &vars("captured")).unwrap();
+        store.put(9, &vars("outside")).unwrap();
+        store.put_cold(9, &cold_snapshot(9, "outside")).unwrap();
+        let pin = store.pin_rows([1]);
+        store.put(9, &vars("outside-2")).unwrap();
+        store.put_cold(9, &cold_snapshot(9, "outside-2")).unwrap();
+        store.put(10, &vars("born-after")).unwrap();
+        {
+            let view = pin.view.lock().unwrap();
+            assert!(view.rows.is_empty(), "no pre-image outside the capture");
+        }
+        store.put(1, &vars("newer")).unwrap();
+        store.put(1, &vars("newest")).unwrap();
+        {
+            let view = pin.view.lock().unwrap();
+            assert_eq!(view.rows.len(), 1, "one pre-image per captured row");
+        }
+        assert_eq!(data(pin.try_get(1).unwrap()), s("captured"));
+
+        let copy = pin.clone();
+        let weak = Arc::downgrade(&pin.view);
+        drop(pin);
+        assert!(weak.upgrade().is_some(), "a live copy keeps the view");
+        drop(copy);
+        assert!(weak.upgrade().is_none(), "last release frees the view");
+        assert!(store.pins.lock().unwrap().views.is_empty());
+    }
+
     #[test]
     fn row_pin_defers_forgets_until_released() {
         let store = Arc::new(VarSpillStore::open(None).unwrap());
         store.put_cold(1, &cold_snapshot(1, "a")).unwrap();
         store.put_cold(2, &cold_snapshot(2, "b")).unwrap();
         store.put(3, &vars("c")).unwrap();
-        let pin = store.pin_rows();
+        let pin = store.pin_rows([1, 2, 3]);
         let second = pin.clone();
         store.forget(&[1]).unwrap();
         store.forget_async(&[2, 3]);
@@ -2368,7 +2428,7 @@ mod tests {
             let key = i + 1;
             store.put_cold(key, &cold_snapshot(key, "old")).unwrap();
             store.put(key, &vars("old")).unwrap();
-            let pin = store.pin_rows();
+            let pin = store.pin_rows([key]);
             store.forget(&[key]).unwrap();
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let (s2, b2) = (Arc::clone(&store), Arc::clone(&barrier));
@@ -2402,7 +2462,7 @@ mod tests {
         store.put_cold(1, &cold_snapshot(1, "a")).unwrap();
         store.put(2, &vars("b")).unwrap();
         let none = BTreeSet::new();
-        let pin = store.pin_rows();
+        let pin = store.pin_rows([1, 2, 3]);
         assert_eq!(store.gc_orphans(&none, &none, 0).unwrap(), 2);
         assert!(
             store.try_get_cold(1).unwrap().is_some(),
@@ -2429,7 +2489,7 @@ mod tests {
         // Key 1 is spill-referenced (its spill row protected) but not live:
         // only its cold row is an orphan.
         let referenced = BTreeSet::from([1]);
-        let pin = store.pin_rows();
+        let pin = store.pin_rows([1, 2, 3]);
         store.gc_orphans(&none, &referenced, 0).unwrap();
         store.put(2, &vars("b2")).unwrap();
         drop(pin);
@@ -2458,7 +2518,7 @@ mod tests {
         for key in 1..=n {
             store.put(key, &vars("v")).unwrap();
         }
-        let pin = store.pin_rows();
+        let pin = store.pin_rows(1..=n);
         store.forget(&(1..=n).collect::<Vec<_>>()).unwrap();
         let mut batches = 0;
         {
@@ -2504,7 +2564,7 @@ mod tests {
         for key in 1..=16u64 {
             store.put(key, &vars("v")).unwrap();
         }
-        let pin = store.pin_rows();
+        let pin = store.pin_rows([1, 2, 3]);
         store.forget_async_owned((1..=16).collect());
         store.flush_forgets();
         drop(pin);

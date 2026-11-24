@@ -1659,7 +1659,7 @@ mod tests {
         spilled_snap.instance.variables_spilled = true;
 
         // Capture: the pin is taken with the routing keys / spilled flags.
-        let pins = vec![store.pin_rows()];
+        let pins = vec![store.pin_rows([cold_key, spilled_key])];
 
         // Mutate + re-spill both rows after the capture, before the write.
         let mut newer_cold = cold_snap.clone();
