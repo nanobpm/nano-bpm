@@ -18534,69 +18534,89 @@ impl ServerImpl {
             ),
             String,
         > =
-            self.engine
-                .deploy_partition()
-                .with(move |engine| {
-                    // One mixed deployment = ONE command = ONE deployment key
-                    // shared by every co-deployed resource, so
-                    // `bindingType: deployment` forms / linked resources resolve
-                    // (#1193). Never split it into per-kind commands.
-                    let (events, commit) = engine
-                        .apply_command(Command::DeployBundle(
-                            nanobpmn_engine_core::DeploymentBundle {
-                                processes,
-                                decisions,
-                                forms,
-                                resources: generic_resources,
-                            },
-                        ))
-                        .map_err(|e| e.to_string())?;
-                    let all_events = (*events).clone();
-                    let events = Arc::new(all_events);
-                    let resolved: Resolved = requested_ids
-                        .iter()
-                        .filter_map(|id| {
-                            engine
-                                .state()
-                                .processes
-                                .get(id)
-                                .map(|d| (id.clone(), d.key, d.version))
-                        })
-                        .collect();
-                    let resolved_drgs: ResolvedDrgs = requested_drg_ids
-                        .iter()
-                        .filter_map(|id| {
-                            engine
-                                .state()
-                                .decision_requirements
-                                .get(id)
-                                .map(|d| (id.clone(), d.drg.name.clone(), d.key, d.version))
-                        })
-                        .collect();
-                    let resolved_decisions: ResolvedDecisions = requested_drg_ids
-                        .iter()
-                        .filter_map(|id| engine.state().decision_requirements.get(id))
-                        .flat_map(|drg| {
-                            drg.drg
-                                .decisions
-                                .iter()
-                                .filter_map(|d| {
-                                    engine.state().decisions.get(&d.id).map(|dep| {
-                                        (
-                                            dep.decision_id.clone(),
-                                            dep.decision_name.clone(),
-                                            dep.key,
-                                            dep.version,
-                                            drg.drg.id.clone(),
-                                            drg.key,
-                                        )
+            {
+                // The actor round-trip, commit wait, and deployment fan-out run in
+                // ONE detached owner task (#1855, mirroring the create path's #1582
+                // owner): the deploy actor applies a queued command even after its
+                // reply receiver is dropped, so awaiting any of these inline let a
+                // cancelled caller persist a definition on partition 0 that was
+                // never replicated — and an identical retry emits no definition
+                // events, so it could not repair that. Awaiting the JoinHandle here
+                // only OBSERVES the outcome; dropping it leaves the task running.
+                let owner = self.clone();
+                #[allow(clippy::type_complexity)]
+                let deploy =
+                    move |engine: &mut Journal| -> Result<
+                        (
+                            Arc<Vec<Event>>,
+                            Commit,
+                            Resolved,
+                            ResolvedDrgs,
+                            ResolvedDecisions,
+                            ResolvedForms,
+                            ResolvedResources,
+                        ),
+                        String,
+                    > {
+                        // One mixed deployment = ONE command = ONE deployment key
+                        // shared by every co-deployed resource, so
+                        // `bindingType: deployment` forms / linked resources resolve
+                        // (#1193). Never split it into per-kind commands.
+                        let (events, commit) = engine
+                            .apply_command(Command::DeployBundle(
+                                nanobpmn_engine_core::DeploymentBundle {
+                                    processes,
+                                    decisions,
+                                    forms,
+                                    resources: generic_resources,
+                                },
+                            ))
+                            .map_err(|e| e.to_string())?;
+                        let all_events = (*events).clone();
+                        let events = Arc::new(all_events);
+                        let resolved: Resolved = requested_ids
+                            .iter()
+                            .filter_map(|id| {
+                                engine
+                                    .state()
+                                    .processes
+                                    .get(id)
+                                    .map(|d| (id.clone(), d.key, d.version))
+                            })
+                            .collect();
+                        let resolved_drgs: ResolvedDrgs = requested_drg_ids
+                            .iter()
+                            .filter_map(|id| {
+                                engine
+                                    .state()
+                                    .decision_requirements
+                                    .get(id)
+                                    .map(|d| (id.clone(), d.drg.name.clone(), d.key, d.version))
+                            })
+                            .collect();
+                        let resolved_decisions: ResolvedDecisions = requested_drg_ids
+                            .iter()
+                            .filter_map(|id| engine.state().decision_requirements.get(id))
+                            .flat_map(|drg| {
+                                drg.drg
+                                    .decisions
+                                    .iter()
+                                    .filter_map(|d| {
+                                        engine.state().decisions.get(&d.id).map(|dep| {
+                                            (
+                                                dep.decision_id.clone(),
+                                                dep.decision_name.clone(),
+                                                dep.key,
+                                                dep.version,
+                                                drg.drg.id.clone(),
+                                                drg.key,
+                                            )
+                                        })
                                     })
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .collect();
-                    let resolved_forms: ResolvedForms =
-                        requested_form_ids
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+                        let resolved_forms: ResolvedForms = requested_form_ids
                             .iter()
                             .filter_map(|id| {
                                 engine.state().forms.get(id).map(|f| {
@@ -18604,8 +18624,7 @@ impl ServerImpl {
                                 })
                             })
                             .collect();
-                    let resolved_resources: ResolvedResources =
-                        requested_resource_ids
+                        let resolved_resources: ResolvedResources = requested_resource_ids
                             .iter()
                             .filter_map(|id| {
                                 engine.state().resources.get(id).map(|r| {
@@ -18613,7 +18632,18 @@ impl ServerImpl {
                                 })
                             })
                             .collect();
-                    Ok((
+                        Ok((
+                            events,
+                            commit,
+                            resolved,
+                            resolved_drgs,
+                            resolved_decisions,
+                            resolved_forms,
+                            resolved_resources,
+                        ))
+                    };
+                let task = tokio::spawn(async move {
+                    let (
                         events,
                         commit,
                         resolved,
@@ -18621,12 +18651,34 @@ impl ServerImpl {
                         resolved_decisions,
                         resolved_forms,
                         resolved_resources,
+                    ) = owner.engine.deploy_partition().with(deploy).await?;
+                    // Durability first, then replicate the new definition(s) to the
+                    // other local partitions so any of them can instantiate the
+                    // process (the deployment itself is journaled only on partition
+                    // 0; replication is in-memory and re-derived on restart), and
+                    // under Raft (RF>1) into any follower replica engine actors. An
+                    // idempotent redeploy emits no events, so these are no-ops.
+                    commit.wait().await;
+                    owner.replicate_deployment(&events).await;
+                    owner.install_into_raft_replicas(&events).await;
+                    Ok((
+                        events,
+                        Commit::ready(),
+                        resolved,
+                        resolved_drgs,
+                        resolved_decisions,
+                        resolved_forms,
+                        resolved_resources,
                     ))
-                })
-                .await;
+                });
+                match task.await {
+                    Ok(r) => r,
+                    Err(e) => Err(format!("deployment owner task failed: {e}")),
+                }
+            };
         let (
             events,
-            commit,
+            _durable,
             resolved,
             resolved_drgs,
             resolved_decisions,
@@ -18636,18 +18688,6 @@ impl ServerImpl {
             Ok(t) => t,
             Err(e) => return Err(("Invalid deployment", e)),
         };
-        // Wait for durability BEFORE the replication awaits below (#1855): a
-        // caller cancelled at one of those suspension points would otherwise
-        // drop this still-`Pending` commit unwaited (the debug drop bomb).
-        commit.wait().await;
-        // Replicate the new definition(s) to the other local partitions so any of
-        // them can instantiate the process (the deployment itself is journaled
-        // only on partition 0; replication is in-memory and re-derived on restart).
-        // An idempotent redeploy emits no events, so these are no-ops.
-        self.replicate_deployment(&events).await;
-        // Under Raft (RF>1) also fan into any follower replica engine actors so a
-        // replicated create of this definition applies on every replica.
-        self.install_into_raft_replicas(&events).await;
 
         // Every deploy emits a DeploymentCreated first (issue #47, Option B):
         // the engine mints the shared deployment key unconditionally so the
@@ -53202,6 +53242,54 @@ mod subscription_placement_tests {
           </bpmn:extensionElements>
         </bpmn:message>
       </bpmn:definitions>"#;
+
+    /// #1855 review: a deploy caller cancelled after its first poll (the
+    /// command is already queued on the deploy actor) must still fan the
+    /// definition out to every local partition. Before the detached owner, the
+    /// actor applied the deploy on partition 0 but nobody ran the replication,
+    /// and an identical retry emits no definition events, so it never repaired.
+    #[tokio::test]
+    async fn cancelled_deploy_still_replicates_to_every_partition() {
+        let server = single_node_multi_partition();
+        let proc = ProcessBuilder::new("cancel-deploy")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert(
+            "cancel-deploy".to_string(),
+            "cancel-deploy.bpmn".to_string(),
+        );
+        let empty = std::collections::HashMap::new();
+        // `timeout(ZERO, ..)` polls the deploy exactly once, then drops it.
+        let _ = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            server.deploy_resources_locally(
+                vec![proc.clone()],
+                &names,
+                Vec::new(),
+                &empty,
+                "<default>",
+            ),
+        )
+        .await;
+        // An identical retry must leave every partition able to instantiate it.
+        server
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &empty, "<default>")
+            .await
+            .expect("retry deploy");
+        for handle in server.engine.all().iter() {
+            let known = handle
+                .with(|j| j.state().processes.contains_key("cancel-deploy"))
+                .await;
+            assert!(
+                known,
+                "definition missing on a partition after cancel + retry"
+            );
+        }
+    }
 
     /// Signed timeout updates use canonical job lookup and validation; zero is
     /// a valid duration, not a transport-specific error masking an unknown job.
