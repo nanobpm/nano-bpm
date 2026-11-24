@@ -9,14 +9,25 @@ const source = readFileSync(new URL(
 const contract = readFileSync(new URL("../../../spec/agent-instances.yaml", import.meta.url), "utf8");
 
 // Read field names directly from the vendored schema, not a second DTO checklist.
+// Deprecated compatibility aliases (#1283) the shared nano-search mapper emits
+// next to the canonical field; the spec does not list them, so check them
+// explicitly (alias must mirror its canonical field) instead of dropping them.
+const COMPAT_ALIASES = { AgentInstanceHistoryItemResult: { jobLease: "jobLeaseToken" } };
+
 function assertFields(value, schema) {
+  const aliases = COMPAT_ALIASES[schema] ?? {};
+  for (const [alias, canonical] of Object.entries(aliases)) {
+    assert.ok(Object.hasOwn(value, alias), `${schema} carries compat alias ${alias}`);
+    assert.equal(value[alias], value[canonical], `${schema}.${alias} mirrors ${canonical}`);
+  }
   const start = contract.indexOf(`    ${schema}:\n`);
   assert.ok(start >= 0, `canonical schema ${schema} exists`);
   const block = contract.slice(start).split(/\n    (?=[A-Za-z]\w*:)/)[0];
   const properties = block.slice(block.indexOf("\n      properties:\n"));
   const fields = [...properties.matchAll(/^        ([\w.]+):/gm)].map((m) => m[1]).sort();
   assert.ok(fields.length > 0);
-  assert.deepEqual(Object.keys(value).sort(), fields, schema);
+  const keys = Object.keys(value).filter((k) => !Object.hasOwn(aliases, k)).sort();
+  assert.deepEqual(keys, fields, schema);
 }
 
 const text = (value) => ({ contentType: "TEXT", text: value });

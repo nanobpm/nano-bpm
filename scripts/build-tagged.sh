@@ -77,7 +77,7 @@ make -s generate
 
 # --- 2. Console SPA (cached by content hash of every SPA source tree) ----------
 if [ "$CONSOLE" = 1 ]; then
-  KEY=$( { git rev-parse "$FULL:console" "$FULL:process-explorer" "$FULL:engine-wasm" "$FULL:spec"; } 2>/dev/null | sha256sum | cut -c1-16 )
+  KEY=$( { git rev-parse "$FULL:console" "$FULL:process-explorer" "$FULL:engine-wasm" "$FULL:spec" "$FULL:server/crates/nano-search" "$FULL:read-model" "$FULL:engine-core" "$FULL:scripts" "$FULL:Makefile"; } 2>/dev/null | sha256sum | cut -c1-16 )
   CACHED_DIST="$DIST_CACHE/$KEY"
   if [ -d "$CACHED_DIST" ]; then
     echo "--- console/dist cache HIT ($KEY) ---"
