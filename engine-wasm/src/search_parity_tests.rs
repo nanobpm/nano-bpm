@@ -133,6 +133,9 @@ struct Op<'a> {
     server: Surface<'a, J>,
     /// A fixture item whose values seed the filter operands.
     sample: J,
+    /// A filter every paging request carries so the walk covers several rows
+    /// (history turns are PENDING; the default `commitStatus` hides them).
+    page_filter: J,
 }
 
 /// The gateway router's body handling: the generated `StrictOptionalJson`
@@ -208,11 +211,15 @@ fn check_paging(op: &Op) {
     for field in spec_sort_fields(op.sort_schema) {
         for order in ["ASC", "DESC"] {
             let sort = json!([{ "field": field, "order": order }]);
-            let all = compare(op, &json!({ "sort": sort }).to_string())
+            let f = &op.page_filter;
+            let all = compare(op, &json!({ "filter": f, "sort": sort }).to_string())
                 .unwrap_or_else(|| panic!("{}: sort {field} {order} accepted", op.name));
             let total = all["items"].as_array().expect("items").len();
+            // A walk over fewer than two rows never follows a cursor.
+            assert!(total >= 2, "{}: paging fixture has {total} rows", op.name);
             // Forward walk with limit 1 + `after` cursors.
-            let mut body = json!({ "sort": sort, "page": { "limit": 1 } });
+            let mut body = json!({ "filter": f, "sort": sort, "page": { "limit": 1 } });
+            let mut followed = 0;
             let mut seen = 0;
             loop {
                 let page = compare(op, &body.to_string()).expect("page accepted");
@@ -223,15 +230,22 @@ fn check_paging(op: &Op) {
                 };
                 // One backward step from every page's start, too.
                 if let Some(start) = page["page"]["startCursor"].as_str() {
-                    let back = json!({ "sort": sort, "page": { "limit": 1, "before": start } });
+                    let back = json!({ "filter": f, "sort": sort, "page": { "limit": 1, "before": start } });
                     compare(op, &back.to_string()).expect("before page accepted");
                 }
-                body = json!({ "sort": sort, "page": { "limit": 1, "after": cursor } });
+                body =
+                    json!({ "filter": f, "sort": sort, "page": { "limit": 1, "after": cursor } });
+                followed += 1;
                 assert!(seen <= total, "{}: cursor walk overran", op.name);
             }
             assert_eq!(seen, total, "{}: cursor walk {field} {order}", op.name);
+            assert!(
+                followed >= total,
+                "{}: cursor walk followed no cursors",
+                op.name
+            );
             for from in [0, 1, total] {
-                let b = json!({ "sort": sort, "page": { "from": from, "limit": 1 } });
+                let b = json!({ "filter": f, "sort": sort, "page": { "from": from, "limit": 1 } });
                 compare(op, &b.to_string()).expect("offset page accepted");
             }
         }
@@ -240,13 +254,16 @@ fn check_paging(op: &Op) {
 
 /// Three agent instances created at different instants, one with committed and
 /// pending history across loop iterations and roles.
-fn fixture() -> (TestEngine, String) {
+fn fixture() -> (TestEngine, String, Vec<std::ops::Range<usize>>) {
     let mut eng = TestEngine::new();
     let xml = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn")
         .replace("agentType=\"external\"", "agentType=\"aiAgentTask\"");
     eng.deploy(&xml).unwrap();
     let mut first_key = None;
+    let mut spans = Vec::new();
+    spans.push(0..eng.log.len());
     for i in 0..3 {
+        let start = eng.log.len();
         eng.advance_time(60_000.0).unwrap();
         eng.create_instance(
             "external-agent-routing",
@@ -308,24 +325,34 @@ fn fixture() -> (TestEngine, String) {
         if i == 1 {
             first_key = Some(key);
         }
+        spans.push(start..eng.log.len());
     }
-    (eng, first_key.expect("history fixture key"))
+    (eng, first_key.expect("history fixture key"), spans)
 }
 
-/// A server `ReadModel` (two partitions, so the server's shard concatenation
-/// is exercised) fed the engine's event log.
-fn server_read_model(eng: &TestEngine) -> ReadModel {
-    let events: Vec<&Event> = eng.log.iter().map(|e| &e.event).collect();
-    let primary = Arc::new(ReadStore::open(None).unwrap());
-    primary.export(&events).unwrap();
-    let empty = Arc::new(ReadStore::open(None).unwrap());
-    ReadModel::from_shards(vec![(0, primary), (1, empty)])
+/// A server `ReadModel` of two partitions fed the engine's event log, with the
+/// three agent instances split across them (0 and 2 on shard 0, 1 on shard 1)
+/// so their creation times — and every other sort key — interleave across the
+/// shard boundary. A server that sorted or paged each shard before
+/// concatenating would then diverge from the single-store WASM result.
+fn server_read_model(eng: &TestEngine, spans: &[std::ops::Range<usize>]) -> ReadModel {
+    let shard = |parts: &[usize]| {
+        let events: Vec<&Event> = parts
+            .iter()
+            .flat_map(|&p| eng.log[spans[p].clone()].iter().map(|e| &e.event))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).unwrap());
+        store.export(&events).unwrap();
+        store
+    };
+    // spans[0] is the deployment; each instance span follows it.
+    ReadModel::from_shards(vec![(0, shard(&[0, 1, 3])), (1, shard(&[0, 2]))])
 }
 
 #[test]
 fn agent_searches_match_the_server_for_every_spec_operator_sort_and_page() {
-    let (eng, history_key) = fixture();
-    let rm = server_read_model(&eng);
+    let (eng, history_key, spans) = fixture();
+    let rm = server_read_model(&eng, &spans);
     let key: u64 = history_key.parse().unwrap();
 
     let instances = Op {
@@ -344,6 +371,7 @@ fn agent_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         sample: serde_json::from_str::<J>(&eng.search_agent_instances_json("{}").unwrap()).unwrap()
             ["items"][1]
             .clone(),
+        page_filter: json!({}),
     };
     let history_sample = serde_json::from_str::<J>(
         &eng.search_agent_instance_history_json(
@@ -369,6 +397,7 @@ fn agent_searches_match_the_server_for_every_spec_operator_sort_and_page() {
             Ok(serde_json::to_value(r).unwrap())
         }),
         sample: history_sample,
+        page_filter: json!({ "commitStatus": "PENDING" }),
     };
 
     for op in [&instances, &history] {
