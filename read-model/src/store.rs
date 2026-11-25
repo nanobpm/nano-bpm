@@ -5589,9 +5589,6 @@ fn project(
     project_event(tx, event, position, now_ms)
 }
 
-/// Records a message correlation's history row and settles its open wait
-/// row (kept for a non-interrupting boundary, which can correlate again).
-/// `host_key` is the wait's [`wait_host_key`].
 /// One instance-scoped `correlated_message_subscriptions` history row.
 struct CorrelationHistory<'a> {
     subscription_key: Key,
@@ -5632,6 +5629,9 @@ fn insert_correlation_history(
     Ok(())
 }
 
+/// Records a message correlation's history row and settles its open wait
+/// row (kept for a non-interrupting boundary, which can correlate again).
+/// `host_key` is the wait's [`wait_host_key`].
 fn project_message_correlation(
     tx: &rusqlite::Transaction,
     now_ms: u64,
