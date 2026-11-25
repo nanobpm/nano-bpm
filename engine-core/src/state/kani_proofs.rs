@@ -7,8 +7,13 @@
 use super::*;
 use crate::model::IncomingFlow;
 
-/// Bound on the number of nondeterministic operations per harness.
+/// Bound on the number of nondeterministic operations per harness (the
+/// parallel-join harness uses its own [`JOIN_STEPS`]).
 const STEPS: usize = 2;
+
+/// Arrivals in the parallel-join harness: three, so a firing can leave a
+/// surplus token behind (`A, A, B` fires once and keeps one `A`).
+const JOIN_STEPS: usize = 3;
 
 /// Parallel flows from the same source (`ParallelDuplicateFlows`-style), told
 /// apart only by their ordinal — the case the flow ordering must not collapse.
@@ -48,7 +53,16 @@ fn flow_arrivals_preserve_join_invariant() {
     // runner's memory. A ghost count per identity is the oracle instead.
     let (f0, f1) = (flow(0), flow(1));
     let (mut g0, mut g1) = (0usize, 0usize);
+    // Seed both flows with 1..=2 tokens so a firing is reachable on the very
+    // first step, with or without surplus; with an empty start, STEPS = 2
+    // operations could never populate both flows *and* fire.
+    let s0 = 1 + usize::from(kani::any::<u8>() % 2);
+    let s1 = 1 + usize::from(kani::any::<u8>() % 2);
     let mut arrivals = FlowArrivals::default();
+    arrivals.add(&f0, s0);
+    arrivals.add(&f1, s1);
+    g0 += s0;
+    g1 += s1;
     for _ in 0..STEPS {
         // Branch to a concrete flow and ghost: a symbolically indexed flow
         // reference made the solver alias every allocation (runner OOM).
@@ -82,6 +96,8 @@ fn flow_arrivals_preserve_join_invariant() {
                 arrivals.consume_one_each();
                 g0 -= 1;
                 g1 -= 1;
+                kani::cover!(g0 + g1 > 0, "a firing keeps surplus tokens");
+                kani::cover!(g0 + g1 == 0, "a firing drains both flows");
             }
         }
         assert!(arrivals.count(&f0) == g0);
@@ -196,7 +212,7 @@ fn assert_job_indexes(state: &State, order: (i64, Key)) {
 /// join never fires more often than the scarcer flow delivered, and never
 /// before both flows delivered once.
 #[kani::proof]
-#[kani::unwind(3)]
+#[kani::unwind(4)]
 #[kani::solver(cadical)]
 fn parallel_join_fires_only_when_every_flow_taken() {
     const INCOMING: usize = 2;
@@ -210,7 +226,7 @@ fn parallel_join_fires_only_when_every_flow_taken() {
     };
     let mut arrivals = FlowArrivals::default();
     let (mut from_a, mut from_b, mut fired) = (0usize, 0usize, 0usize);
-    for _ in 0..STEPS {
+    for _ in 0..JOIN_STEPS {
         if kani::any() {
             arrivals.record(&a);
             from_a += 1;
@@ -221,6 +237,10 @@ fn parallel_join_fires_only_when_every_flow_taken() {
         if arrivals.distinct_flows() >= INCOMING {
             arrivals.consume_one_each();
             fired += 1;
+            kani::cover!(
+                !arrivals.is_empty(),
+                "the join fires with a surplus token left behind"
+            );
         }
         assert!(fired == from_a.min(from_b), "fires once per full round");
         assert!(arrivals.count(&a) == from_a - fired);
