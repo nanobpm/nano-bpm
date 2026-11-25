@@ -12,11 +12,7 @@ import {
   type TraceSummary,
 } from "../gen";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
-import {
-  TraceTimeline,
-  fmtClock,
-  fmtDuration,
-} from "@nanobpm/process-explorer";
+import { InstanceTimes, TraceTimeline } from "@nanobpm/process-explorer";
 import { Badge, ErrorText } from "@nanobpm/process-explorer/ui";
 
 function outcomeTone(outcome: TraceOutcome): "info" | "ok" | "neutral" {
@@ -76,10 +72,17 @@ export default function Traces() {
                     <span className="font-medium text-fg">{t.processId}</span>
                     <Badge tone={outcomeTone(t.outcome)}>{t.outcome}</Badge>
                   </div>
+                  <div className="font-mono text-xs text-fg-faint">
+                    <InstanceTimes
+                      startedAt={t.startedAt}
+                      endedAt={t.endedAt}
+                      durationMs={t.durationMs}
+                    />
+                  </div>
                   <div className="flex items-center justify-between font-mono text-xs text-fg-faint">
                     <span>{t.instanceKey}</span>
                     <span>
-                      {t.elementCount} el · {fmtDuration(t.durationMs)}
+                      {t.elementCount} el
                       {t.incidentCount > 0 && (
                         <span className="ml-1 text-danger">
                           · {t.incidentCount}⚠
@@ -231,8 +234,12 @@ function TraceDetail({ traceKey }: { traceKey: string }) {
         <div className="mt-1 font-mono text-xs text-fg-faint">
           instance {data.instanceKey}
           {data.version != null && ` · v${data.version}`}
-          {data.businessId && ` · ${data.businessId}`} · started{" "}
-          {fmtClock(data.startedAt)} · {fmtDuration(data.durationMs)}
+          {data.businessId && ` · ${data.businessId}`} ·{" "}
+          <InstanceTimes
+            startedAt={data.startedAt}
+            endedAt={data.endedAt}
+            durationMs={data.durationMs}
+          />
         </div>
         {data.path.length > 0 && (
           <div className="mt-2 flex flex-wrap items-center gap-1 text-xs text-fg-muted">

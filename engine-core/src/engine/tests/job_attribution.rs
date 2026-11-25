@@ -444,7 +444,7 @@ fn a_rejected_stamped_command_does_not_leak_its_deadline() {
     assert!(engine.apply_command(bad).is_err());
     let instance_key = engine.state().jobs[&job_key].instance_key;
     let events = engine
-        .apply_command(Command::CancelInstance { instance_key })
+        .apply_command(Command::cancel_instance(instance_key))
         .unwrap();
     assert_eq!(terminal_deadline(&events, job_key), Some(None));
 }
@@ -456,7 +456,7 @@ fn a_rejected_stamped_command_does_not_leak_its_deadline() {
 fn a_cancel_cascade_of_a_soft_job_is_replica_identical() {
     let (mut leader, mut follower, job_key) = leader_and_follower("W");
     let instance_key = leader.state().jobs[&job_key].instance_key;
-    let cancel = Command::CancelInstance { instance_key };
+    let cancel = Command::cancel_instance(instance_key);
     let on_leader = leader.apply_command(cancel.clone()).unwrap();
     let on_follower = follower.apply_command(cancel).unwrap();
     assert_eq!(on_leader, on_follower);
@@ -522,7 +522,7 @@ fn cancel_instance_stamps_soft_job_deadline_on_every_replica() {
     let (on_leader, on_follower) = replicate_stamped(
         &mut leader,
         &mut follower,
-        Command::CancelInstance { instance_key },
+        Command::cancel_instance(instance_key),
         200,
     );
     assert_eq!(terminal_deadline(&on_leader, job_key), Some(Some(1_000)));
@@ -796,9 +796,7 @@ fn cancel_parent_stamps_call_activity_child_soft_job_deadline() {
     let (on_leader, on_follower) = replicate_stamped(
         &mut leader,
         &mut follower,
-        Command::CancelInstance {
-            instance_key: parent_key,
-        },
+        Command::cancel_instance(parent_key),
         500,
     );
     assert_eq!(terminal_deadline(&on_leader, child_job), Some(Some(15_400)));
@@ -879,9 +877,7 @@ fn a_rejected_envelope_stamped_command_does_not_leak_its_deadlines() {
     // Cancelling a non-existent instance rejects, leaving the real instance alive.
     assert!(leader
         .apply_command_records_stamped_at(
-            Command::CancelInstance {
-                instance_key: 999_999,
-            },
+            Command::cancel_instance(999_999),
             100,
             None,
             &bogus_stamps,
@@ -889,10 +885,10 @@ fn a_rejected_envelope_stamped_command_does_not_leak_its_deadlines() {
         .is_err());
     // An unstamped cancel of the real instance must NOT pick up the leaked 99_999.
     let on_leader = leader
-        .apply_command_at(Command::CancelInstance { instance_key }, 200)
+        .apply_command_at(Command::cancel_instance(instance_key), 200)
         .unwrap();
     let on_follower = follower
-        .apply_command_at(Command::CancelInstance { instance_key }, 200)
+        .apply_command_at(Command::cancel_instance(instance_key), 200)
         .unwrap();
     assert_eq!(on_leader, on_follower);
     assert_eq!(terminal_deadline(&on_leader, job_key), Some(None));
@@ -923,7 +919,7 @@ fn a_rejected_stamped_debug_command_does_not_leak_its_deadline() {
     assert!(engine.debug_command_at(bad, 0, Vec::new()).is_err());
     let instance_key = engine.state().jobs[&job_key].instance_key;
     let session = engine
-        .debug_command_at(Command::CancelInstance { instance_key }, 0, Vec::new())
+        .debug_command_at(Command::cancel_instance(instance_key), 0, Vec::new())
         .unwrap();
     assert_eq!(terminal_deadline(session.log(), job_key), Some(None));
 }
@@ -1028,12 +1024,7 @@ fn cascade_deadlines_walk_through_a_cold_intermediate() {
         child: mid_key,
     };
     // Descent: cancelling `top` reaches `leaf` only through cold `mid`.
-    let down = e.resolve_cascade_terminal_deadlines_with(
-        &Command::CancelInstance {
-            instance_key: top_key,
-        },
-        &cold,
-    );
+    let down = e.resolve_cascade_terminal_deadlines_with(&Command::cancel_instance(top_key), &cold);
     assert_eq!(down.get(&leaf_job), Some(&3_100));
     assert_eq!(down.get(&top_job), Some(&7_100));
     // Ascent: completing `leaf`'s job reaches `top` only through cold `mid`.
@@ -1041,9 +1032,7 @@ fn cascade_deadlines_walk_through_a_cold_intermediate() {
     assert_eq!(up.get(&top_job), Some(&7_100));
     // Without the cold topology the resident-only walk misses them — the gap
     // the `_with` variant closes for hosts with a cold tier.
-    let resident_only = e.resolve_cascade_terminal_deadlines(&Command::CancelInstance {
-        instance_key: top_key,
-    });
+    let resident_only = e.resolve_cascade_terminal_deadlines(&Command::cancel_instance(top_key));
     assert_eq!(resident_only.get(&leaf_job), None);
 }
 
@@ -1066,7 +1055,7 @@ fn cascade_deadlines_ignore_unrelated_activated_jobs_on_both_iteration_sides() {
     let target = activated[0].key;
     let instance_key = e.state().jobs[&target].instance_key;
     // Few reached jobs vs many activations: per-instance side.
-    let deadlines = e.resolve_cascade_terminal_deadlines(&Command::CancelInstance { instance_key });
+    let deadlines = e.resolve_cascade_terminal_deadlines(&Command::cancel_instance(instance_key));
     assert_eq!(
         deadlines.into_iter().collect::<Vec<_>>(),
         vec![(target, 1_000)]
@@ -1108,7 +1097,7 @@ fn cascade_deadlines_ignore_unrelated_activated_jobs_on_both_iteration_sides() {
         "precondition: activation-set branch ({reached_jobs} reached jobs)"
     );
     assert!(e.state().activated_jobs.contains(&other));
-    let deadlines = e.resolve_cascade_terminal_deadlines(&Command::CancelInstance { instance_key });
+    let deadlines = e.resolve_cascade_terminal_deadlines(&Command::cancel_instance(instance_key));
     assert_eq!(
         deadlines.into_iter().collect::<Vec<_>>(),
         vec![(target, 3_000)]
@@ -1162,7 +1151,7 @@ fn a_soft_job_migrated_to_an_agent_marked_target_keeps_its_cascade_deadline() {
     let (on_leader, on_follower) = replicate_stamped(
         &mut leader,
         &mut follower,
-        Command::CancelInstance { instance_key },
+        Command::cancel_instance(instance_key),
         200,
     );
     assert_eq!(terminal_deadline(&on_leader, job_key), Some(Some(1_000)));

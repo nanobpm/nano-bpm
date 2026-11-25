@@ -2708,7 +2708,7 @@ impl Journal {
         // resumes orphaned work (Copilot on #1418).
         if let Command::ModifyInstance { instance_key, .. }
         | Command::MigrateInstance { instance_key, .. }
-        | Command::CancelInstance { instance_key } = command
+        | Command::CancelInstance { instance_key, .. } = command
             && let Some(key) = self.rehydrate_cold_descendants(*instance_key)
         {
             unavailable.get_or_insert(key);
@@ -6147,9 +6147,7 @@ mod tests {
         assert_eq!(journal.force_cold_spill_all(), 1);
         assert!(journal.instance(mid_key).is_none(), "mid is cold");
 
-        let cancel_top = Command::CancelInstance {
-            instance_key: top_key,
-        };
+        let cancel_top = Command::cancel_instance(top_key);
         let down = journal.resolve_cascade_terminal_deadlines(&cancel_top);
         assert_eq!(down.get(&leaf_job), Some(&3_100));
         assert_eq!(down.get(&top_job), Some(&7_100));

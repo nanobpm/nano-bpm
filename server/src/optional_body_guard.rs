@@ -205,6 +205,11 @@ async fn strict_body_unknown_property_is_a_problem_detail() {
     for path in [
         "/v2/agent-instances/search",
         "/v2/agent-instances/2251799813685249/history/search",
+        // The WASM `search*` reads decode these strictly (#1898); the
+        // gateway must reject the same unknown fields.
+        "/v2/user-tasks/search",
+        "/v2/process-instances/search",
+        "/v2/variables/search",
     ] {
         let response = app
             .clone()

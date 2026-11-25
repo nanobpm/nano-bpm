@@ -147,6 +147,33 @@ impl ReplicatedCommand {
     fn strip_terminal_deadlines(&mut self) {
         self.terminal_deadlines.clear();
     }
+
+    /// Whether this item needs
+    /// [`FEATURE_CANCEL_SUSPENDED_INSTANCE`](nano_falcon_protocol::cluster_join::FEATURE_CANCEL_SUSPENDED_INSTANCE)
+    /// on every member (#1863).
+    fn terminates_suspended(&self) -> bool {
+        matches!(
+            self.command,
+            Command::CancelInstance {
+                terminate_suspended: true,
+                ..
+            }
+        )
+    }
+
+    /// Downgrades a SUSPENDED-terminating cancel to the legacy cancel (#1863):
+    /// while any member lacks the capability, the leader keeps the pre-#1863
+    /// behaviour (a SUSPENDED root is rejected and left SUSPENDED) on EVERY
+    /// replica, decided before proposing and carried in the entry.
+    fn strip_terminate_suspended(&mut self) {
+        if let Command::CancelInstance {
+            terminate_suspended,
+            ..
+        } = &mut self.command
+        {
+            *terminate_suspended = false;
+        }
+    }
 }
 
 /// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
@@ -3676,6 +3703,21 @@ impl Batcher {
                         .iter_mut()
                         .for_each(ReplicatedCommand::strip_terminal_deadlines);
                 }
+                // Rolling-upgrade gate for cancelling a SUSPENDED root (#1863):
+                // an older member rejects it, so keep the old behaviour on
+                // every replica until every member advertises the capability.
+                if items.iter().any(ReplicatedCommand::terminates_suspended)
+                    && !all_members_support(
+                        &raft,
+                        transport.as_ref(),
+                        nano_falcon_protocol::cluster_join::FEATURE_CANCEL_SUSPENDED_INSTANCE,
+                    )
+                    .await
+                {
+                    items
+                        .iter_mut()
+                        .for_each(ReplicatedCommand::strip_terminate_suspended);
+                }
                 // Carry this (leader) replica's latest chain digest so
                 // followers can compare at that index (#1664).
                 // Rolling-upgrade gate (#1664 / #1661): stamp only while
@@ -5237,7 +5279,7 @@ mod tests {
     /// `NANOBPMN_RAFT_MAX_ENTRY_BYTES` unnoticed.
     #[test]
     fn replicated_command_size_estimate_counts_terminal_deadlines() {
-        let plain = ReplicatedCommand::new(Command::CancelInstance { instance_key: 42 }, 10);
+        let plain = ReplicatedCommand::new(Command::cancel_instance(42), 10);
         assert_eq!(plain.approx_bytes(), plain.command.approx_bytes());
         let mut stamped = plain.clone();
         for k in 0..1_000u64 {
@@ -5256,7 +5298,7 @@ mod tests {
     /// when populated, and decodes as empty on legacy entries without the field.
     #[test]
     fn replicated_command_terminal_deadlines_is_additive_on_the_wire() {
-        let plain = ReplicatedCommand::new(Command::CancelInstance { instance_key: 42 }, 10);
+        let plain = ReplicatedCommand::new(Command::cancel_instance(42), 10);
         let plain_json = serde_json::to_string(&plain).unwrap();
         assert!(
             !plain_json.contains("terminal_deadlines"),
@@ -5318,7 +5360,7 @@ mod tests {
             .await;
 
         let canceled = part
-            .propose(Command::CancelInstance { instance_key }, 400)
+            .propose(Command::cancel_instance(instance_key), 400)
             .await
             .expect("cancel");
         let recorded_deadline = canceled.iter().find_map(|e| match e {
@@ -7248,9 +7290,7 @@ mod tests {
         assert!(!is_creation_intake(&Command::fail_job(1, 0, "e")));
         assert!(!is_creation_intake(&Command::ExpireJobs { now: 0 }));
         assert!(!is_creation_intake(&Command::TriggerTimers { now: 0 }));
-        assert!(!is_creation_intake(&Command::CancelInstance {
-            instance_key: 1
-        }));
+        assert!(!is_creation_intake(&Command::cancel_instance(1)));
         assert!(!is_creation_intake(&deploy_command()));
     }
 
@@ -9545,6 +9585,141 @@ mod tests {
             perturbed_follower_fail_stops(cluster, all_new).await,
             "an all-new group detects the divergence"
         );
+    }
+
+    /// Boots a 3-voter p0 group (node 0 leader) over `transport`, suspends an
+    /// instance, proposes a SUSPENDED-terminating cancel (#1863) and returns
+    /// whether the cancel was applied plus every replica's resulting instance
+    /// state (after the applied-index barrier).
+    async fn cancel_suspended_on_group(
+        cluster: crate::raft_net::LocalCluster,
+        transport: Arc<dyn RaftTransport>,
+    ) -> (bool, Vec<nanobpmn_engine_core::ProcessInstanceState>) {
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                transport.clone(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        let proc = ProcessBuilder::new("suspend_cancel")
+            .start_event("s")
+            .service_task("t", "work")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid process");
+        parts[0]
+            .propose(Command::DeployProcess(proc), 1_000)
+            .await
+            .expect("deploy");
+        let created = parts[0]
+            .propose(Command::create_instance("suspend_cancel"), 2_000)
+            .await
+            .expect("create");
+        let key = created
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .expect("instance created");
+        parts[0]
+            .propose(Command::suspend_instance(key), 3_000)
+            .await
+            .expect("suspend");
+        let applied = parts[0]
+            .propose_result(Command::cancel_instance_including_suspended(key), 4_000)
+            .await
+            .expect("replicated")
+            .error
+            .is_none();
+        // A later entry so every replica has applied past the cancel.
+        parts[0]
+            .propose(deploy_command(), 5_000)
+            .await
+            .expect("deploy");
+        wait_all_applied(&parts).await;
+        let mut states = Vec::new();
+        for p in &parts {
+            states.push(
+                p.sm_engine()
+                    .with(move |j| j.engine().instance(key).expect("instance").state)
+                    .await,
+            );
+        }
+        for p in parts {
+            p.raft.shutdown().await.ok();
+        }
+        (applied, states)
+    }
+
+    /// #1863 rolling-upgrade gate: while one member does not advertise
+    /// `cancel-suspended-instance-v1`, the leader downgrades the cancel to
+    /// the old behaviour (a SUSPENDED root is rejected and stays SUSPENDED)
+    /// on EVERY replica; once all advertise it the root terminates on every
+    /// replica. Every replica applies the same replicated entry, so the
+    /// verdict is replay-deterministic in both phases.
+    #[tokio::test]
+    async fn cancel_of_a_suspended_root_is_gated_on_every_member_advertising() {
+        use nanobpmn_engine_core::ProcessInstanceState as S;
+
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let mixed: Arc<dyn RaftTransport> = Arc::new(MixedVersion {
+            inner: cluster.clone(),
+            legacy: 1,
+        });
+        let (applied, states) = cancel_suspended_on_group(cluster, mixed).await;
+        assert!(
+            !applied,
+            "a mixed group keeps the old (rejecting) behaviour"
+        );
+        assert_eq!(states, vec![S::Suspended; 3]);
+
+        let cluster = LocalCluster::default();
+        let all_new: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+        let (applied, states) = cancel_suspended_on_group(cluster, all_new).await;
+        assert!(applied, "an all-new group terminates the SUSPENDED root");
+        assert_eq!(states, vec![S::Terminated; 3]);
+    }
+
+    /// #1863: the `terminate_suspended` flag is additive on the wire — an
+    /// unset flag serializes exactly as a pre-#1863 cancel, and a legacy
+    /// entry (no field) decodes as the old behaviour.
+    #[test]
+    fn cancel_instance_terminate_suspended_is_additive_on_the_wire() {
+        let legacy = serde_json::to_string(&Command::cancel_instance(7)).unwrap();
+        assert!(!legacy.contains("terminate_suspended"));
+        let decoded: Command = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(decoded, Command::cancel_instance(7));
+        let flagged =
+            serde_json::to_string(&Command::cancel_instance_including_suspended(7)).unwrap();
+        let decoded: Command = serde_json::from_str(&flagged).unwrap();
+        assert_eq!(decoded, Command::cancel_instance_including_suspended(7));
+        let mut item = ReplicatedCommand::new(Command::cancel_instance_including_suspended(7), 1);
+        assert!(item.terminates_suspended());
+        item.strip_terminate_suspended();
+        assert_eq!(item.command, Command::cancel_instance(7));
     }
 
     /// A transport whose member `legacy` runs an OLD binary until `upgraded`

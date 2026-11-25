@@ -81,12 +81,22 @@ pub const FEATURE_TERMINAL_DEADLINES: &str = "terminal-deadlines-v1";
 /// ordered behind the pending open.
 pub const FEATURE_CLUSTER_PUBLICATION_GATE: &str = "cluster-publication-gate-v1";
 
+<<<<<<< HEAD
 /// Message buffering (#1874): this binary honours `CorrelateMessage`'s
 /// `time_to_live` / `message_id`. A pre-#1874 binary decodes but IGNORES them
 /// (never buffering, and seeding the command differently when a `message_id`
 /// is present), so an entry carrying either never ships to a peer that does
 /// not advertise this.
 pub const FEATURE_MESSAGE_BUFFERING: &str = "message-buffering-v1";
+=======
+/// Cancel of a SUSPENDED root instance (#1863): this binary applies
+/// `Command::CancelInstance { terminate_suspended: true }` by terminating a
+/// SUSPENDED instance. An older binary ignores the flag and REJECTS the
+/// cancel (leaving the instance SUSPENDED), so a leader clears the flag — the
+/// old behaviour everywhere — unless every voter and learner advertises this,
+/// and never ships a flagged entry to a peer that does not.
+pub const FEATURE_CANCEL_SUSPENDED_INSTANCE: &str = "cancel-suspended-instance-v1";
+>>>>>>> origin/main
 
 /// Every replicated-command feature this binary supports — the single source
 /// of truth for what the handshake advertises.
@@ -97,7 +107,11 @@ pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_REPLICA_DIGEST_CUTOVER,
     FEATURE_TERMINAL_DEADLINES,
     FEATURE_CLUSTER_PUBLICATION_GATE,
+<<<<<<< HEAD
     FEATURE_MESSAGE_BUFFERING,
+=======
+    FEATURE_CANCEL_SUSPENDED_INSTANCE,
+>>>>>>> origin/main
 ];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.

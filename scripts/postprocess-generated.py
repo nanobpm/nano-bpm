@@ -183,9 +183,34 @@ def fix_default_tenant_xss_false_positive(models: str) -> tuple[str, int]:
         "        return std::result::Result::Ok(());\n"
         "    }\n"
     )
-    if needle not in models or guard in models:
-        return models, 0
-    return models.replace(needle, needle + guard, 1), 1
+    count = 0
+    if needle in models and guard not in models:
+        models = models.replace(needle, needle + guard, 1)
+        count += 1
+    # The list/map validators (`$in` / `$notIn` operands, string maps and
+    # their keys) call `ammonia::is_html` directly, bypassing the sentinel
+    # exemption above, so `tenantId: {"$in": ["<default>"]}` was rejected with
+    # a 400 (#1946). Route every call outside `check_xss_string` through it,
+    # so the one exemption is the single source of truth for every validator.
+    own = "    if ammonia::is_html(v) {\n        std::result::Result::Err"
+    head, sep, rest = models.partition(own)
+    if sep:
+        rest, n = re.subn(
+            r"ammonia::is_html\((\w+)\)", r"check_xss_string(\1).is_err()", rest
+        )
+        head, m = re.subn(
+            r"ammonia::is_html\((\w+)\)", r"check_xss_string(\1).is_err()", head
+        )
+        models = head + sep + rest
+        count += n + m
+    # Fail closed: a validator still calling `is_html` directly (e.g. a new
+    # generator shape the regex misses) would reintroduce the false positive.
+    if needle in models and models.count("ammonia::is_html(") != 1:
+        raise SystemExit(
+            "postprocess: an XSS validator calls ammonia::is_html directly, "
+            "bypassing the <default> tenant exemption in check_xss_string"
+        )
+    return models, count
 
 
 def fix_discriminator_mapping_values(models: str) -> tuple[str, list[str]]:
@@ -347,7 +372,15 @@ def make_models_only_buildable(cargo: str, lib: str) -> tuple[str, str]:
 # decodes through the same `strict::decode_strict`; the server/WASM parity guard
 # (engine-wasm/src/search_parity_tests.rs) fails if the two ever differ. Extend
 # this list as operations migrate (#1898).
-STRICT_BODY_MODELS = ("AgentInstanceSearchQuery", "AgentInstanceHistorySearchQuery")
+STRICT_BODY_MODELS = (
+    "AgentInstanceSearchQuery",
+    "AgentInstanceHistorySearchQuery",
+    # The WASM `search*` reads decode these strictly too (#1898); the gateway
+    # must reject the same unknown fields or the two surfaces diverge.
+    "UserTaskSearchQuery",
+    "ProcessInstanceSearchQuery",
+    "VariableSearchQuery",
+)
 
 STRICT_MODULE = """//! Strict request-body decoding (injected by
 //! `scripts/postprocess-generated.py`, #1883).

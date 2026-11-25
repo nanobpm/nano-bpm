@@ -8748,3 +8748,50 @@ fn remote_message_correlation_routes_to_message_partition() {
     let legacy = remote(compose_key(1, 5), 0);
     assert_eq!(legacy.owning_partition(), 1);
 }
+
+/// `CancelInstance` with `terminate_suspended` accepts a SUSPENDED instance
+/// (Camunda parity, `spec/process-instances.yaml` cancellation: "only ACTIVE
+/// and SUSPENDED root instances can be cancelled"): its tokens are discarded
+/// and it terminates. Without the flag (the pre-#1863 behaviour, kept while a
+/// cluster is mid rolling-upgrade) the SUSPENDED instance is rejected and left
+/// untouched. Replaying the same command on a second engine yields the same
+/// events and state in both cases (replay determinism).
+#[test]
+fn cancel_of_a_suspended_instance_honours_the_terminate_suspended_flag() {
+    use crate::state::ProcessInstanceState;
+    type Run = (Engine, Key, Result<Vec<Event>, EngineError>);
+    fn run(cancel: fn(Key) -> Command) -> Run {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        engine
+            .apply_command(Command::suspend_instance(key))
+            .unwrap();
+        let out = engine.apply_command(cancel(key));
+        (engine, key, out)
+    }
+    let (new_a, key, out_a) = run(Command::cancel_instance_including_suspended);
+    let (new_b, _, out_b) = run(Command::cancel_instance_including_suspended);
+    assert_eq!(out_a.as_ref().unwrap(), out_b.as_ref().unwrap());
+    for e in [&new_a, &new_b] {
+        assert_eq!(
+            e.instance(key).unwrap().state,
+            ProcessInstanceState::Terminated
+        );
+    }
+    let (old_a, key, out_a) = run(Command::cancel_instance);
+    let (old_b, _, out_b) = run(Command::cancel_instance);
+    assert!(matches!(out_a, Err(EngineError::InstanceNotFound { .. })));
+    assert!(matches!(out_b, Err(EngineError::InstanceNotFound { .. })));
+    for e in [&old_a, &old_b] {
+        assert_eq!(
+            e.instance(key).unwrap().state,
+            ProcessInstanceState::Suspended
+        );
+    }
+}

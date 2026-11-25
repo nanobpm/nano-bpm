@@ -599,9 +599,24 @@ pub enum Command {
     /// Cancel a running process instance. Every token is discarded: pending jobs
     /// are cancelled, armed timers and open message subscriptions are cancelled,
     /// and any active incident is closed. The instance transitions to
-    /// `Terminated` (it does *not* complete). Only an active instance can be
-    /// cancelled; an unknown or already-finished instance is rejected.
-    CancelInstance { instance_key: Key },
+    /// `Terminated` (it does *not* complete). An ACTIVE instance can always be
+    /// cancelled; a SUSPENDED one only when `terminate_suspended` is set. An
+    /// unknown or already-finished instance is rejected.
+    CancelInstance {
+        instance_key: Key,
+        /// Also terminate a SUSPENDED instance (Camunda parity: "only ACTIVE and
+        /// SUSPENDED root instances can be cancelled", #1863). Rolling-upgrade
+        /// gated (ADR 0066): a replicated leader clears it unless every member
+        /// advertises `cancel-suspended-instance-v1`, so an older replica —
+        /// which rejects a SUSPENDED cancel — never applies an entry it would
+        /// diverge on. Carried in the command so replay is deterministic.
+        /// Additive on the wire: omitted when `false`, defaulted when absent.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "core::ops::Not::not")
+        )]
+        terminate_suspended: bool,
+    },
     /// Suspend a running process instance (Camunda parity). The instance stops
     /// making progress — its jobs become non-activatable and its timers/other
     /// triggers do not fire — while retaining all runtime state, and its state
@@ -1250,8 +1265,17 @@ impl Command {
                 h.key(*message_key);
                 h.key(*element_instance_key);
             }
-            Command::CancelInstance { instance_key }
-            | Command::SuspendInstance { instance_key }
+            Command::CancelInstance {
+                instance_key,
+                terminate_suspended,
+            } => {
+                h.key(*instance_key);
+                // Only hashed when set, so a legacy (unset) entry hashes as before.
+                if *terminate_suspended {
+                    h.str("terminate_suspended");
+                }
+            }
+            Command::SuspendInstance { instance_key }
             | Command::ResumeInstance { instance_key }
             | Command::ModifyInstance { instance_key, .. }
             | Command::QuarantineOffheapOrphan { instance_key, .. }
@@ -1906,9 +1930,22 @@ impl Command {
         }
     }
 
-    /// Convenience constructor for a `CancelInstance`.
+    /// Convenience constructor for a legacy `CancelInstance` (rejects a
+    /// SUSPENDED instance).
     pub fn cancel_instance(instance_key: Key) -> Self {
-        Command::CancelInstance { instance_key }
+        Command::CancelInstance {
+            instance_key,
+            terminate_suspended: false,
+        }
+    }
+
+    /// Convenience constructor for a `CancelInstance` that also terminates a
+    /// SUSPENDED instance (#1863; rolling-upgrade gated in a cluster).
+    pub fn cancel_instance_including_suspended(instance_key: Key) -> Self {
+        Command::CancelInstance {
+            instance_key,
+            terminate_suspended: true,
+        }
     }
 
     /// Convenience constructor for a `SuspendInstance`.
