@@ -172,7 +172,7 @@ type them without hand-mirroring the shapes:
 import type { UserTaskSearchQueryResult } from "@nanobpm/engine-wasm/readmodel-types";
 
 const open = JSON.parse(
-  engine.searchUserTasks(JSON.stringify({ state: "CREATED" })),
+  engine.searchUserTasks(JSON.stringify({ filter: { state: "CREATED" } })),
 ) as UserTaskSearchQueryResult;
 ```
 
