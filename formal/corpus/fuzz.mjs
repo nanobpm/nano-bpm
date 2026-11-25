@@ -26,7 +26,8 @@
 // divergence signature on some command order, then keep the fewest-step
 // reproducing scenario. `--record` appends the minimal reproducer to
 // fuzz-corpus.json — the PERMANENT corpus — and `--file-issues` files a parity
-// issue for each (gh CLI) and stamps it into the case.
+// issue for each NEW signature (gh CLI; a signature with an open issue gets a
+// comment there instead, #1975) and stamps the issue into the case.
 //
 // Every run first REPLAYS the committed corpus: an open case (`fixed: false`)
 // must still reproduce its own signature (else it fails as stale — flip it to
@@ -434,7 +435,7 @@ export function issueBody (c) {
   return [
     'Found by the differential fuzzer (`formal/corpus/fuzz.mjs`, #1250) and shrunk to a minimal reproducer.',
     '',
-    `- signature: \`${c.signature}\``,
+    signatureLine(c.signature),
     `- run seed: \`${c.seed}\``,
     `- graph: \`${c.graph.id}\` (\`${c.graph.key}\`)`,
     `- corpus identity: \`${corpusIdentity(c)}\``,
@@ -463,9 +464,49 @@ export function uncommittedIssues (issues, cases, aliases = {}) {
   return issues.filter((i) => !named.has(aliases[i] ?? i))
 }
 
-function fileIssue (c) {
-  const body = issueBody(c)
-  const url = execFileSync('gh', ['issue', 'create', '--title', `parity(fuzz): ${c.signature.slice(0, 180)}`, '--body', body], { encoding: 'utf8' }).trim()
+/** The issue-body line that carries a filed finding's divergence signature. */
+export const signatureLine = (signature) => `- signature: \`${signature}\``
+
+/**
+ * The open fuzz issue (`#N`) already filed for `signature`, or null. `open` is
+ * the open issues as `{ number, body }`. The match is on the exact signature
+ * line of `issueBody`, never a substring: field signatures nest
+ * (`spec-oracle:completed,sequenceFlows` is a prefix of
+ * `spec-oracle:completed,sequenceFlows,…`), and GitHub search is fuzzy. The
+ * OLDEST match wins, so a signature with duplicates already filed converges
+ * on the canonical issue.
+ */
+export function existingIssueFor (signature, open) {
+  const line = signatureLine(signature)
+  const hits = open.filter((i) => String(i.body ?? '').split('\n').some((l) => l.trim() === line)).map((i) => i.number)
+  return hits.length ? `#${Math.min(...hits)}` : null
+}
+
+/** The comment that reports a re-found signature on its existing open issue. */
+export function recurrenceComment (c) {
+  return [
+    `The differential fuzzer found this signature again (run seed \`${c.seed}\`, graph \`${c.graph.id}\` / \`${c.graph.key}\`) — commented here instead of filing a duplicate.`,
+    '',
+    '```json',
+    JSON.stringify({ skeleton: c.skeleton, scenario: c.scenario, detail: c.detail }, null, 2),
+    '```'
+  ].join('\n')
+}
+
+/**
+ * File the finding `c`, deduplicated by signature: an OPEN issue already
+ * carrying the signature gets a comment and is returned; only an unseen
+ * signature creates an issue (nightly runs used to re-file one signature per
+ * graph — #1792/#1895/#1966, #1793/#1896/#1967 — #1975). `gh` runs the CLI.
+ */
+export function fileIssue (c, gh = (args) => execFileSync('gh', args, { encoding: 'utf8' })) {
+  const open = JSON.parse(gh(['issue', 'list', '--state', 'open', '--search', 'parity(fuzz) in:title', '--limit', '1000', '--json', 'number,body']))
+  const existing = existingIssueFor(c.signature, open)
+  if (existing) {
+    gh(['issue', 'comment', existing.slice(1), '--body', recurrenceComment(c)])
+    return existing
+  }
+  const url = gh(['issue', 'create', '--title', `parity(fuzz): ${c.signature.slice(0, 180)}`, '--body', issueBody(c)]).trim()
   return `#${url.split('/').pop()}`
 }
 
