@@ -172,6 +172,20 @@ test('TLC accepts a real Zeebe trace and rejects a reordered or truncated one', 
   assert.equal((await validateTrace(c, 'trunc', g, trace.slice(0, -1))).ok, false)
 })
 
+test('a prefix probe may stop WITHIN one step\'s emitted set, blaming the first bogus entry (#1964)', async () => {
+  const c = ctx()
+  const g = graph('ParallelDiamond')
+  // S emits {f1}; the fork P1 emits {f2, f3}, so f1, f3 is a valid prefix.
+  const r = await validateTrace(c, 'pd-bogus', g, ['flow:f1', 'flow:f3', 'flow:bogus', 'act:A'])
+  assert.equal(r.ok, false)
+  assert.equal(r.matched, 2)
+  assert.equal(r.unmatched, 'flow:bogus')
+  // A wrong entry mid-set is still blamed on itself, not on a valid sibling.
+  const r2 = await validateTrace(c, 'pd-bogus2', g, ['flow:f1', 'flow:bogus', 'flow:f3'])
+  assert.equal(r2.matched, 1)
+  assert.equal(r2.unmatched, 'flow:bogus')
+})
+
 test('an event-based gateway takes NO flow to the triggered catch (Zeebe, #1962)', async () => {
   const c = ctx()
   // The exact milestones the pinned Zeebe exported correlating M1: the catch

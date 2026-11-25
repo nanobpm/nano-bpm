@@ -75,13 +75,25 @@ DrainDecision(f) ==
       THEN IF fired'[n] > fired[n] THEN {"fire:" \o n} ELSE {"defer:" \o n}
       ELSE {}
 
-\* Consume the next |E| trace entries, which must be exactly E.
+\* Consume the next |E| trace entries, which must be exactly E. A PREFIX
+\* probe (`MatchLimit < Len(Trace)`) may instead stop WITHIN E: the entries
+\* up to `MatchLimit` need only be distinct members of E (entries beyond the
+\* limit are ignored), so the longest accepted prefix is found per entry and
+\* the first wrong entry — not a valid sibling of its step — is blamed. Full
+\* validation (`MatchLimit = Len(Trace)`) keeps the exact match.
 Match(E) ==
     IF Unconstrained THEN pos' = pos
     ELSE LET k == Cardinality(E) IN
-         /\ pos + k <= Len(Trace)
-         /\ {Trace[i] : i \in (pos + 1)..(pos + k)} = E
-         /\ pos' = pos + k
+         \/ /\ pos + k <= Len(Trace)
+            /\ {Trace[i] : i \in (pos + 1)..(pos + k)} = E
+            /\ pos' = pos + k
+         \/ /\ MatchLimit < Len(Trace)
+            /\ pos < MatchLimit
+            /\ pos + k > MatchLimit
+            /\ LET W == {Trace[i] : i \in (pos + 1)..MatchLimit} IN
+                 /\ W \subseteq E
+                 /\ Cardinality(W) = MatchLimit - pos
+            /\ pos' = MatchLimit
 
 Decide(D) == IF PrintDecisions THEN \A d \in D : PrintT(<<"DECISION", d>>) ELSE TRUE
 
