@@ -335,12 +335,13 @@ test('issueBody states the commit obligation and carries the corpus identity', (
 // #1975: nightly runs filed one issue per graph for the SAME signature
 // (#1792/#1895/#1966, #1793/#1896/#1967). A signature with an open issue must
 // get a comment there instead of a new issue.
-const fakeGh = (open) => {
+const fakeGh = (open, closed = []) => {
   const calls = []
   const gh = (args) => {
     calls.push(args)
     if (args[1] === 'list') return JSON.stringify(open)
     if (args[1] === 'create') return 'https://github.com/nanobpm/nano-bpm/issues/9001\n'
+    if (args[1] === 'view') return JSON.stringify({ state: closed.includes(Number(args[2])) ? 'CLOSED' : 'OPEN' })
     return ''
   }
   return { gh, calls }
@@ -381,5 +382,25 @@ test('fileIssue comments on a committed open case issue even when no open issue 
   ]
   const { gh, calls } = fakeGh([]) // the auto-filed issues were closed as duplicates
   assert.equal(fileIssue(c, gh, committed), '#1990')
-  assert.deepEqual(calls.map((a) => a.slice(0, 3)), [['issue', 'comment', '1990']])
+  assert.deepEqual(calls.map((a) => a.slice(0, 3)), [['issue', 'list', '--state'], ['issue', 'view', '1990'], ['issue', 'comment', '1990']])
+})
+
+test('fileIssue prefers the oldest open signature-line match over a committed case issue', () => {
+  const c = loadCorpus()[0]
+  const committed = [{ signature: c.signature, issue: '#1990', fixed: false, graph: { key: 'other' } }]
+  const { gh, calls } = fakeGh([{ number: 1988, body: issueBody(c) }])
+  assert.equal(fileIssue(c, gh, committed), '#1988')
+  assert.deepEqual(calls.map((a) => a.slice(0, 3)), [['issue', 'list', '--state'], ['issue', 'comment', '1988']])
+})
+
+test('fileIssue skips a committed case issue GitHub reports closed', () => {
+  const c = loadCorpus()[0]
+  const committed = [
+    { signature: c.signature, issue: '#1700', fixed: false, graph: { key: 'a' } },
+    { signature: c.signature, issue: '#1990', fixed: false, graph: { key: 'b' } }
+  ]
+  const { gh } = fakeGh([], [1700])
+  assert.equal(fileIssue(c, gh, committed), '#1990')
+  const { gh: gh2 } = fakeGh([], [1700, 1990])
+  assert.equal(fileIssue(c, gh2, committed), '#9001')
 })

@@ -483,12 +483,15 @@ export function existingIssueFor (signature, open) {
 }
 
 /**
- * The issue (`#N`) of a committed, still-open corpus case with exactly
- * `signature` (any graph), or null; the oldest issue wins.
+ * The oldest committed open-case issue for `signature` that GitHub reports
+ * OPEN, or null.
  */
-export function committedIssueFor (signature, cases) {
-  const hits = cases.filter((x) => !x.fixed && x.signature === signature && /^#\d+$/.test(x.issue ?? '')).map((x) => Number(x.issue.slice(1)))
-  return hits.length ? `#${Math.min(...hits)}` : null
+export function committedOpenIssue (signature, cases, gh) {
+  const nums = [...new Set(cases.filter((x) => !x.fixed && x.signature === signature && /^#\d+$/.test(x.issue ?? '')).map((x) => Number(x.issue.slice(1))))].sort((a, b) => a - b)
+  for (const n of nums) {
+    if (JSON.parse(gh(['issue', 'view', String(n), '--json', 'state'])).state === 'OPEN') return `#${n}`
+  }
+  return null
 }
 
 /** The comment that reports a re-found signature on its existing open issue. */
@@ -509,20 +512,16 @@ export function recurrenceComment (c) {
  * graph — #1792/#1895/#1966, #1793/#1896/#1967 — #1975). `gh` runs the CLI.
  */
 export function fileIssue (c, gh = (args) => execFileSync('gh', args, { encoding: 'utf8' }), cases = []) {
-  // A committed OPEN case already tracks the signature: its `issue` is the
-  // canonical (triaged) issue, which need not carry the signature line — the
-  // auto-filed ones are closed as duplicates of hand-written fix issues — so
-  // the committed corpus is consulted first, on any graph.
-  const committed = committedIssueFor(c.signature, cases)
-  if (committed) {
-    gh(['issue', 'comment', committed.slice(1), '--body', recurrenceComment(c)])
-    return committed
-  }
+  // The OLDEST open issue carrying the exact signature line wins (the
+  // oldest-open-match rule); a committed open corpus case's `issue` is only a
+  // fallback — the auto-filed issues are closed as duplicates of hand-written
+  // fix issues that need not carry the signature line. `fixed: false` does not
+  // establish GitHub state, so each candidate is verified OPEN first.
   const open = JSON.parse(gh(['issue', 'list', '--state', 'open', '--search', 'parity(fuzz) in:title', '--limit', '1000', '--json', 'number,body']))
-  const existing = existingIssueFor(c.signature, open)
-  if (existing) {
-    gh(['issue', 'comment', existing.slice(1), '--body', recurrenceComment(c)])
-    return existing
+  const target = existingIssueFor(c.signature, open) ?? committedOpenIssue(c.signature, cases, gh)
+  if (target) {
+    gh(['issue', 'comment', target.slice(1), '--body', recurrenceComment(c)])
+    return target
   }
   const url = gh(['issue', 'create', '--title', `parity(fuzz): ${c.signature.slice(0, 180)}`, '--body', issueBody(c)]).trim()
   return `#${url.split('/').pop()}`
