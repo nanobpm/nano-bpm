@@ -1169,7 +1169,6 @@ fn routed_protocol_entries() -> Vec<Command> {
                 kind,
                 variables,
                 delivery_key,
-                ack_partition,
             } => Some(Command::CorrelateMessageSubscription {
                 subscription_key: *subscription_key,
                 message_key: *message_key,
@@ -1179,7 +1178,6 @@ fn routed_protocol_entries() -> Vec<Command> {
                 kind: kind.clone(),
                 variables: variables.clone(),
                 delivery_key: *delivery_key,
-                ack_partition: *ack_partition,
             }),
             _ => None,
         })
@@ -1201,7 +1199,6 @@ fn routed_protocol_entries() -> Vec<Command> {
     // (5): the routed close lands on the message partition.
     let Command::CorrelateMessageSubscription {
         subscription_key,
-        message_key,
         instance_key,
         element_instance_key,
         element_id,
@@ -1221,19 +1218,7 @@ fn routed_protocol_entries() -> Vec<Command> {
         .apply_command_at(close.clone(), T0 + 5)
         .expect("the routed close applies on the message partition");
 
-    // (6): a stale ack (#1874) — the one-shot catch was never ack-paced, so the
-    // message partition ignores it (the idempotent no-op path).
-    let ack = Command::AcknowledgeMessageCorrelation {
-        subscription_key,
-        message_key,
-        accepted: true,
-    };
-    let acked = message_partition
-        .apply_command_at(ack.clone(), T0 + 6)
-        .expect("a stale ack applies on the message partition");
-    assert!(acked.is_empty(), "a stale ack is a no-op: {acked:?}");
-
-    vec![opening, continuation, close, ack]
+    vec![opening, continuation, close]
 }
 
 /// The [`Command::kind`] of every corpus entry (coverage evidence).

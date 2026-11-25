@@ -70,7 +70,6 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     state: MessageSubscriptionState::Open,
                     kind: kind.clone(),
                     correlated_message_keys: Default::default(),
-                    awaiting_ack: None,
                 },
             );
         }
@@ -100,7 +99,6 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     state: MessageSubscriptionState::Opening,
                     kind: kind.clone(),
                     correlated_message_keys: Default::default(),
-                    awaiting_ack: None,
                 },
             );
         }
@@ -269,37 +267,11 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
         // token advance happens on the instance partition, driven by the
         // `CorrelateMessageSubscription` continuation the host routes there.
         Event::RemoteMessageCorrelation {
-            subscription_key,
-            message_key,
-            ack_partition,
-            ..
+            subscription_key, ..
         } => {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
                 if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
-                } else if ack_partition.is_some() {
-                    // Ack-paced buffered drain (#1874): nothing more is sent
-                    // until the instance partition answers.
-                    subscription.awaiting_ack = Some(*message_key);
-                }
-            }
-        }
-
-        // The instance partition answered an ack-paced delivery (#1874). A
-        // rejection closes the subscription (its scope ended or the element no
-        // longer waits), leaving the untaken buffered messages buffered.
-        Event::MessageCorrelationAcknowledged {
-            subscription_key,
-            message_key,
-            accepted,
-            ..
-        } => {
-            if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
-                if subscription.awaiting_ack == Some(*message_key) {
-                    subscription.awaiting_ack = None;
-                    if !*accepted {
-                        subscription.state = MessageSubscriptionState::Correlated;
-                    }
                 }
             }
         }

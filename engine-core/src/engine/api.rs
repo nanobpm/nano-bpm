@@ -167,7 +167,6 @@ impl Engine {
             | Command::EvaluateConditionalStartEvents { .. }
             | Command::OpenMessageSubscription { .. }
             | Command::CloseMessageSubscription { .. }
-            | Command::AcknowledgeMessageCorrelation { .. }
             | Command::SuspendInstance { .. }
             | Command::ResumeInstance { .. }
             | Command::DispatchStartInstance { .. }

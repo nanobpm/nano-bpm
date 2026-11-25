@@ -575,27 +575,6 @@ pub enum Command {
         /// (whose `Opening` record stays open) from spawning a second token.
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
-        /// Ack-paced buffered drain (#1874): when `Some`, answer with an
-        /// [`crate::Event::MessageCorrelationAcknowledging`] routed to this
-        /// (message) partition, accepted or rejected. Carried from the routing
-        /// [`crate::Event::RemoteMessageCorrelation`]. `None` = no ack (legacy).
-        #[cfg_attr(
-            feature = "serde",
-            serde(default, skip_serializing_if = "Option::is_none")
-        )]
-        ack_partition: Option<u64>,
-    },
-    /// The instance partition's acknowledgement (#1874) of an ack-paced
-    /// buffered delivery, applied on the **message** partition (routed from
-    /// [`crate::Event::MessageCorrelationAcknowledging`]). Accepted, with the
-    /// subscription still open: the next buffered message is sent. Rejected:
-    /// the subscription closes and the remaining messages stay buffered.
-    /// **Idempotent** — ignored unless the subscription is awaiting exactly
-    /// this `message_key`.
-    AcknowledgeMessageCorrelation {
-        subscription_key: Key,
-        message_key: Key,
-        accepted: bool,
     },
     /// Close a canonical subscription on the message partition because the
     /// instance disarmed it (the guarded activity left the flow, the instance was
@@ -1271,15 +1250,6 @@ impl Command {
                 h.key(*message_key);
                 h.key(*element_instance_key);
             }
-            Command::AcknowledgeMessageCorrelation {
-                subscription_key,
-                message_key,
-                accepted,
-            } => {
-                h.key(*subscription_key);
-                h.key(*message_key);
-                h.str(if *accepted { "1" } else { "0" });
-            }
             Command::CancelInstance { instance_key }
             | Command::SuspendInstance { instance_key }
             | Command::ResumeInstance { instance_key }
@@ -1373,7 +1343,6 @@ impl Command {
             Command::OpenMessageSubscription { .. } => "open_message_subscription",
             Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
-            Command::AcknowledgeMessageCorrelation { .. } => "acknowledge_message_correlation",
             Command::CancelInstance { .. } => "cancel_instance",
             Command::SuspendInstance { .. } => "suspend_instance",
             Command::ResumeInstance { .. } => "resume_instance",

@@ -8227,7 +8227,19 @@ fn apply_create_instance_direct(
         .unwrap_or_else(|| (fallback_process_id.to_string(), 1));
     let sync_completed = journal.engine().is_completed(instance_key);
     let routable: Vec<Event> = if journal.engine().num_partitions() > 1 {
-        events.iter().filter(|e| e.is_routable()).cloned().collect()
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::MessageSubscriptionOpening { .. }
+                        | Event::RemoteMessageCorrelation { .. }
+                        | Event::MessageSubscriptionClosing { .. }
+                        | Event::StartInstanceDispatched { .. }
+                )
+            })
+            .cloned()
+            .collect()
     } else {
         Vec::new()
     };
@@ -11666,7 +11678,13 @@ impl ServerImpl {
     /// another partition: a subscription open/correlate/close, or a
     /// start-instance dispatch.
     fn is_routable_event(e: &Event) -> bool {
-        e.is_routable()
+        matches!(
+            e,
+            Event::MessageSubscriptionOpening { .. }
+                | Event::RemoteMessageCorrelation { .. }
+                | Event::MessageSubscriptionClosing { .. }
+                | Event::StartInstanceDispatched { .. }
+        )
     }
 
     /// The cross-partition follow-ups carried in `events`, cloned for routing.
@@ -12229,7 +12247,6 @@ impl ServerImpl {
                 kind,
                 variables,
                 delivery_key,
-                ack_partition,
             } => {
                 let target = nanobpmn_engine_core::partition_of(*instance_key);
                 let command = Command::CorrelateMessageSubscription {
@@ -12241,26 +12258,9 @@ impl ServerImpl {
                     kind: kind.clone(),
                     variables: variables.clone(),
                     delivery_key: *delivery_key,
-                    ack_partition: *ack_partition,
                 };
                 Some((target, command))
             }
-            // The instance partition's ack of an ack-paced buffered delivery
-            // (#1874) goes back to the message partition that awaits it.
-            Event::MessageCorrelationAcknowledging {
-                subscription_key,
-                message_key,
-                accepted,
-                target_partition,
-                ..
-            } => Some((
-                *target_partition,
-                Command::AcknowledgeMessageCorrelation {
-                    subscription_key: *subscription_key,
-                    message_key: *message_key,
-                    accepted: *accepted,
-                },
-            )),
             Event::MessageSubscriptionClosing {
                 subscription_key,
                 instance_key,
@@ -12353,10 +12353,7 @@ impl ServerImpl {
     /// is NOT idempotent — the single source of truth is
     /// [`Command::routed_delivery_key`].
     fn routed_command_is_idempotent(command: &Command) -> bool {
-        // An ack (#1874) is idempotent by content: the message partition
-        // applies it only while that subscription awaits that exact message.
         command.routed_delivery_key().is_some()
-            || matches!(command, Command::AcknowledgeMessageCorrelation { .. })
     }
 
     /// Removes the routable follow-ups from a proposal result whose detached
@@ -23229,7 +23226,20 @@ impl ServerImpl {
         {
             produced = true;
             if multi_partition {
-                routable.extend(resp.events.iter().filter(|e| e.is_routable()).cloned());
+                routable.extend(
+                    resp.events
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e,
+                                Event::MessageSubscriptionOpening { .. }
+                                    | Event::RemoteMessageCorrelation { .. }
+                                    | Event::MessageSubscriptionClosing { .. }
+                                    | Event::StartInstanceDispatched { .. }
+                            )
+                        })
+                        .cloned(),
+                );
             }
         }
         if jobs_due {
@@ -23975,7 +23985,13 @@ impl ServerImpl {
                     let routable: Vec<Event> = events
                         .iter()
                         .filter(|e| {
-                            e.is_routable()
+                            matches!(
+                                e,
+                                Event::MessageSubscriptionOpening { .. }
+                                    | Event::RemoteMessageCorrelation { .. }
+                                    | Event::MessageSubscriptionClosing { .. }
+                                    | Event::StartInstanceDispatched { .. }
+                            )
                         })
                         .cloned()
                         .collect();
@@ -33286,7 +33302,13 @@ async fn main() {
                                 fired
                                     .iter()
                                     .filter(|e| {
-                                        e.is_routable()
+                                        matches!(
+                                            e,
+                                            Event::MessageSubscriptionOpening { .. }
+                                                | Event::RemoteMessageCorrelation { .. }
+                                                | Event::MessageSubscriptionClosing { .. }
+                                                | Event::StartInstanceDispatched { .. }
+                                        )
                                     })
                                     .cloned()
                                     .collect()

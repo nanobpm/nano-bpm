@@ -1594,7 +1594,6 @@ fn redriven_non_interrupting_boundary_correlation_fires_exactly_once() {
         kind: r_kind,
         variables: BTreeMap::new(),
         delivery_key: r_delivery,
-        ack_partition: None,
     };
 
     // First delivery fires the boundary once (a token runs to `notified`).
@@ -8448,7 +8447,6 @@ fn allocator_fold_is_not_masked_by_a_foreign_max_key() {
         kind: state::MessageSubscriptionKind::IntermediateCatch,
         variables: BTreeMap::new(),
         delivery_key: local,
-        ack_partition: None,
     };
     let mut next_local = 0;
     event.advance_allocator(0, &mut next_local);
@@ -8730,7 +8728,6 @@ fn remote_message_correlation_routes_to_message_partition() {
     use crate::state::compose_key;
     let inst = |l| compose_key(0, l);
     let remote = |message_key, delivery_key| Event::RemoteMessageCorrelation {
-        ack_partition: None,
         subscription_key: inst(3),
         message_key,
         instance_key: inst(2),

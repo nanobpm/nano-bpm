@@ -2053,18 +2053,6 @@ pub struct MessageSubscription {
         serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub correlated_message_keys: std::collections::BTreeSet<Key>,
-    /// The buffered `message_key` this (message-partition, canonical)
-    /// subscription delivered to a REMOTE instance and is awaiting the
-    /// instance partition's acknowledgement for (#1874, Zeebe `CORRELATING`).
-    /// While set, the buffered-message drain sends it nothing more; an
-    /// accepted [`crate::Event::MessageCorrelationAcknowledged`] clears it and
-    /// lets the next buffered message go, a rejected one closes the
-    /// subscription. Additive (`serde(default)`, omitted when `None`).
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
-    pub awaiting_ack: Option<Key>,
 }
 
 /// An open **signal** subscription holding a token on a signal catch element (or

@@ -459,7 +459,6 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
                 kind,
                 variables,
                 delivery_key,
-                ack_partition: None,
             } => Some((
                 *subscription_key,
                 *message_key,
@@ -497,7 +496,6 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
             kind: r_kind,
             variables: r_vars,
             delivery_key: r_delivery,
-            ack_partition: None,
         })
         .unwrap();
     assert!(advanced
@@ -520,7 +518,6 @@ fn cross_partition_catch_opens_remote_then_correlates_back() {
             kind: state::MessageSubscriptionKind::IntermediateCatch,
             variables: BTreeMap::new(),
             delivery_key: 0,
-            ack_partition: None,
         })
         .unwrap();
     assert!(!again
