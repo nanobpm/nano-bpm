@@ -8807,14 +8807,15 @@ fn cancel_of_a_suspended_instance_honours_the_terminate_suspended_flag() {
 #[test]
 fn delete_process_instance_history_rejects_live_and_accepts_ended() {
     type Outcomes = Vec<Result<Vec<Event>, EngineError>>;
-    fn run() -> (Engine, Key, Outcomes) {
+    fn run() -> (Engine, Key, Outcomes, Vec<Event>) {
         let mut engine = Engine::new();
-        engine
+        let mut log = engine
             .apply_command(Command::DeployProcess(linear_with_task()))
             .unwrap();
         let events = engine
             .apply_command(Command::create_instance("order"))
             .unwrap();
+        log.extend(events.iter().cloned());
         let key = events
             .iter()
             .find_map(|e| match e {
@@ -8824,21 +8825,28 @@ fn delete_process_instance_history_rejects_live_and_accepts_ended() {
             .unwrap();
         let del = || Command::DeleteProcessInstanceHistory { instance_key: key };
         let mut out = vec![engine.apply_command(del())];
-        engine
-            .apply_command(Command::suspend_instance(key))
-            .unwrap();
+        log.extend(
+            engine
+                .apply_command(Command::suspend_instance(key))
+                .unwrap(),
+        );
         out.push(engine.apply_command(del()));
-        engine
-            .apply_command(Command::cancel_instance_including_suspended(key))
-            .unwrap();
+        log.extend(
+            engine
+                .apply_command(Command::cancel_instance_including_suspended(key))
+                .unwrap(),
+        );
         out.push(engine.apply_command(del()));
         out.push(engine.apply_command(Command::DeleteProcessInstanceHistory {
             instance_key: 987_654_321,
         }));
-        (engine, key, out)
+        for ev in out.iter().flatten() {
+            log.extend(ev.iter().cloned());
+        }
+        (engine, key, out, log)
     }
-    let (a, key, out_a) = run();
-    let (_b, _, out_b) = run();
+    let (a, key, out_a, log) = run();
+    let (_b, _, out_b, _) = run();
     assert_eq!(out_a, out_b, "replay must be deterministic");
     for (i, from) in [(0, "ACTIVE"), (1, "SUSPENDED")] {
         match &out_a[i] {
@@ -8869,4 +8877,19 @@ fn delete_process_instance_history_rejects_live_and_accepts_ended() {
         a.instance(key).is_none(),
         "deleted instance must leave state"
     );
+    // Replay of the journal must not advance the key allocator past the
+    // never-minted absent key: the next instance key matches the live engine.
+    let mut live = a;
+    let mut replayed = Engine::replay(log);
+    let next = |e: &mut Engine| {
+        e.apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|ev| match ev {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(next(&mut live), next(&mut replayed));
 }

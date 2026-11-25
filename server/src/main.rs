@@ -25411,10 +25411,26 @@ impl ServerImpl {
         // The same matcher `search_process_instances_impl` uses (one algebra,
         // including `$or` — #1293: an ignored `$or` here would silently broaden
         // a mutating batch), with the batch-specific state/hierarchy overrides.
+        self.batch_matched_process_instances_from(
+            self.store.process_instances(),
+            filter,
+            state_policy,
+            honour_hierarchy,
+        )
+    }
+
+    /// [`Self::batch_matched_process_instances_in`] over an explicit candidate
+    /// set — the one matching implementation every batch selection shares.
+    /// Deletion passes the live + terminal-archive set (#1948).
+    fn batch_matched_process_instances_from(
+        &self,
+        candidates: Vec<readstore::ProcessInstanceRow>,
+        filter: &models::ProcessInstanceFilter,
+        state_policy: ProcessInstanceStatePolicy,
+        honour_hierarchy: BatchHierarchyPolicy,
+    ) -> Vec<u64> {
         let matcher = ProcessInstanceMatcher::new(filter, &self.read_source());
-        let mut keys: Vec<u64> = self
-            .store
-            .process_instances()
+        let mut keys: Vec<u64> = candidates
             .into_iter()
             .filter(|inst| matcher.matches(inst, state_policy, honour_hierarchy))
             .map(|inst| inst.key)
@@ -25494,7 +25510,27 @@ impl ServerImpl {
                 "Provide only one of batchOperationId and batchOperationKey; batchOperationId is deprecated.".to_string(),
             )));
         }
-        let selected = self.batch_matched_process_instances_in(
+        // Deletion's candidate set spans the live store AND the terminal
+        // archive (#1948): retention prunes ended instances into the archive,
+        // and the single-instance endpoint can still delete them via
+        // `try_process_instance_any`, so a batch must select them too. The
+        // filter is evaluated by the same matcher; filter facets backed only by
+        // live secondary tables (e.g. root variables) never match an archived
+        // row, which NARROWS the batch — never broadens it.
+        let candidates = match self.store.try_process_instances_any() {
+            Ok(rows) => rows,
+            Err(e) => {
+                return Ok(
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        500,
+                        format!("Failed to enumerate process instances for deletion: {e}"),
+                    )),
+                );
+            }
+        };
+        let selected = self.batch_matched_process_instances_from(
+            candidates,
             &body.filter,
             ProcessInstanceStatePolicy::EndedOnly,
             BatchHierarchyPolicy::HonourFilters,
@@ -63966,6 +64002,102 @@ mod process_instance_deletion_tests {
     /// completed and none failed; search totals drop by exactly that many and
     /// the read model shrinks, while a live instance is neither enqueued nor
     /// deleted.
+    /// #1948 review: an ended instance that retention pruned into the
+    /// file-backed terminal archive must still be selected — and deleted — by
+    /// the batch deletion endpoint, exactly as the single-instance endpoint
+    /// reaches it via `try_process_instance_any`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_deletion_selects_instances_pruned_into_the_archive() {
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as CreateResp;
+        let dir = std::env::temp_dir().join(format!(
+            "nano-1948-batch-archive-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = Journal::in_memory();
+        let pid = journal.partition_id();
+        let shard = Arc::new(
+            nano_server_storage::readstore::ReadStore::open(Some(&dir.join("read-model.sqlite")))
+                .unwrap(),
+        );
+        let store = Arc::new(ReadModel::from_shards(vec![(pid, Arc::clone(&shard))]));
+        let server = build_server(vec![journal], store, cluster::Topology::single(1));
+        deploy(&server, straight()).await;
+        let pruned = create(&server, "straight").await;
+        let kept = create(&server, "straight").await;
+        eventually("both instances project as ended", || {
+            [pruned, kept].iter().all(|k| {
+                server
+                    .store
+                    .process_instance(*k)
+                    .is_some_and(|r| r.state == ProcessInstanceState::Completed)
+            })
+        })
+        .await;
+        shard.prune_terminal_instances(1, 0).unwrap();
+        assert!(
+            server.store.process_instance(pruned).is_none(),
+            "not pruned"
+        );
+        assert!(
+            server
+                .store
+                .try_process_instance_any(pruned)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut filter = models::ProcessInstanceFilter::new();
+        filter.process_instance_key = Some(
+            models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                models::ProcessInstanceKey(pruned.to_string()),
+            ),
+        );
+        let created = match server
+            .delete_process_instances_batch_operation_impl(
+                &models::ProcessInstanceDeletionBatchOperationRequest::new(filter),
+            )
+            .await
+            .unwrap()
+        {
+            CreateResp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected 200, got {other:?}"),
+        };
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: created.batch_operation_key,
+        };
+        let mut batch = None;
+        for _ in 0..2_000 {
+            let GetResp::Status200_TheBatchOperationWasFound(r) =
+                server.get_batch_operation_impl(&path).await.unwrap()
+            else {
+                panic!("batch must be found");
+            };
+            if r.state != models::BatchOperationStateEnum::Active {
+                batch = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let batch = batch.expect("batch settles");
+        assert_eq!(batch.state, models::BatchOperationStateEnum::Completed);
+        assert_eq!(batch.operations_total_count, 1);
+        assert_eq!(batch.operations_completed_count, 1);
+        eventually("archived deletion projects", || {
+            server
+                .store
+                .try_process_instance_any(pruned)
+                .is_ok_and(|r| r.is_none())
+        })
+        .await;
+        assert!(server.store.process_instance(kept).is_some());
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn batch_deletion_of_10k_ended_instances_shrinks_the_read_model() {
         use apis::batch_operation::GetBatchOperationResponse as GetResp;

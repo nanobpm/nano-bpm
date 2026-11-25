@@ -2450,7 +2450,16 @@ impl Event {
     /// a `RemoteMessageCorrelation` naming an instance on a higher partition),
     /// which would otherwise mask the local delivery key behind the
     /// `partition_of(max) == partition_id` guard.
+    ///
+    /// A non-minting deletion record ([`Event::ProcessInstanceHistoryDeleted`],
+    /// [`Event::DecisionInstanceDeleted`]) only NAMES a key the caller supplied
+    /// — possibly one this engine never minted (an evicted or absent key) — so
+    /// it proves nothing about the allocator and must not advance it: the live
+    /// apply leaves `next_local` unchanged, and replay must agree (#1948).
     pub fn advance_allocator(&self, partition_id: u64, next_local: &mut u64) {
+        if self.is_non_minting_deletion() {
+            return;
+        }
         for k in [Some(self.max_key()), self.source_delivery_key()]
             .into_iter()
             .flatten()
@@ -2459,6 +2468,15 @@ impl Event {
                 *next_local = (*next_local).max(crate::state::local_of(k));
             }
         }
+    }
+
+    /// Whether this record deletes caller-named history without minting any key
+    /// (see [`Event::advance_allocator`]).
+    pub fn is_non_minting_deletion(&self) -> bool {
+        matches!(
+            self,
+            Event::ProcessInstanceHistoryDeleted { .. } | Event::DecisionInstanceDeleted { .. }
+        )
     }
 
     /// Whether this is a partition-agnostic deployment event (a process, DRG,

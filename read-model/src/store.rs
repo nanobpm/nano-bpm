@@ -3346,6 +3346,32 @@ impl ReadStore {
         .optional()
     }
 
+    /// Every process instance across the live store AND the durable terminal
+    /// archive (#1948), deduplicated by key (the live row wins). This is the
+    /// candidate set for history DELETION, which must reach instances that
+    /// retention already pruned into the archive — the same existence domain
+    /// [`Self::try_process_instance_any`] resolves for a single key.
+    pub fn try_process_instances_any(&self) -> rusqlite::Result<Vec<ProcessInstanceRow>> {
+        let mut rows = self.process_instances();
+        let Some(archive) = self.archive_path.as_deref().filter(|a| a.exists()) else {
+            return Ok(rows);
+        };
+        let live: std::collections::HashSet<Key> = rows.iter().map(|r| r.key).collect();
+        let conn =
+            Connection::open_with_flags(archive, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut stmt = conn.prepare(
+            "SELECT key, process_id, process_definition_id, process_definition_key, \
+             version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key, suspended_date_ms FROM process_instances",
+        )?;
+        for row in stmt.query_map([], map_instance)? {
+            let row = row?;
+            if !live.contains(&row.key) {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
     pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
         self.try_process_instance(key)
             .or_corrupt("query process_instance")
@@ -18144,6 +18170,45 @@ mod history_deletion_tests {
             assert!(store.process_instance(10).is_none(), "10 resurrected");
             assert!(store.try_process_instance_any(10).unwrap().is_none());
             assert!(store.process_instance(30).is_some());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948 review: batch deletion's candidate set must include instances
+    /// retention pruned into the archive, once each (live row wins).
+    #[test]
+    fn process_instances_any_lists_live_and_pruned_instances() {
+        let dir = history_del_dir("list-any");
+        let path = dir.join("read-model.sqlite");
+        {
+            let store = ReadStore::open(Some(&path)).unwrap();
+            let events = [
+                created(10, None),
+                created(30, None),
+                Event::ProcessInstanceCompleted { instance_key: 10 },
+                Event::ProcessInstanceCompleted { instance_key: 30 },
+            ];
+            store.export(&events.iter().collect::<Vec<_>>()).unwrap();
+            store.prune_terminal_instances(1, 0).unwrap();
+            assert!(store.process_instance(10).is_none(), "10 not pruned");
+            let mut keys: Vec<u64> = store
+                .try_process_instances_any()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, vec![10, 30]);
+            store
+                .export(&[&Event::ProcessInstanceHistoryDeleted { instance_key: 10 }])
+                .unwrap();
+            let keys: Vec<u64> = store
+                .try_process_instances_any()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+            assert_eq!(keys, vec![30]);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

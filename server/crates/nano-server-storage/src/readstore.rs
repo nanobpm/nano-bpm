@@ -455,6 +455,16 @@ impl ReadModel {
             .collect()
     }
 
+    /// Routes [`ReadStore::try_process_instances_any`] (live + terminal
+    /// archive, #1948) over every shard.
+    pub fn try_process_instances_any(&self) -> rusqlite::Result<Vec<ProcessInstanceRow>> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.try_process_instances_any()?);
+        }
+        Ok(out)
+    }
+
     pub fn jobs(&self) -> Vec<JobRow> {
         self.shards.iter().flat_map(|s| s.jobs()).collect()
     }
