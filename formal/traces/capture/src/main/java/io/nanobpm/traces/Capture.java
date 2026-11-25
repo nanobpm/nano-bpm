@@ -150,7 +150,7 @@ public final class Capture {
     private final TreeSet<String> cells = new TreeSet<>();
     private final TreeMap<String, String> sites = new TreeMap<>();
     private final Map<Long, String> elementIds = new HashMap<>();
-    private final Map<String, Long> jobs = new HashMap<>();
+    private final JobKeys jobs = new JobKeys();
     private final Map<String, Long> userTasks = new HashMap<>();
     private final Map<String, Long> incidents = new HashMap<>();
     /** Canonical-key map for the WHOLE scenario (spec doc step 5) — never reset between steps. */
@@ -243,7 +243,10 @@ public final class Capture {
       }
       if (r.getRecordType() == RecordType.EVENT) {
         if (r.getValueType() == ValueType.JOB && intent.equals("CREATED")) {
-          jobs.put(value.get("type").asText(), r.getKey());
+          jobs.created(value.get("type").asText(), r.getKey());
+        }
+        if (r.getValueType() == ValueType.JOB && JobKeys.isTerminal(intent)) {
+          jobs.ended(value.get("type").asText(), r.getKey());
         }
         if (r.getValueType() == ValueType.USER_TASK && intent.equals("CREATED")) {
           userTasks.put(value.get("elementId").asText(), r.getKey());
@@ -364,7 +367,7 @@ public final class Capture {
     }
 
     private long jobKey(final String type) {
-      return require(jobs, type, "job of type");
+      return jobs.target(type);
     }
 
     private static long require(final Map<String, Long> keys, final String id, final String what) {

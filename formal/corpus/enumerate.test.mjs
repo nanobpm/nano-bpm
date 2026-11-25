@@ -603,3 +603,8 @@ test('Reference takes a fork\'s flows in reverse document order, as Zeebe (#1693
   // The order is per element: the reversed fork still takes BOTH flows.
   assert.deepEqual({ ...ref.takenFlows }, { f1: 1, f2: 1, f3: 1, f5: 1 })
 })
+
+test('exploreOrders rejects follow combined with maxSteps', async () => {
+  const { exploreOrders } = await import('./enumerate.mjs')
+  assert.throws(() => exploreOrders({}, {}, { follow: [], maxSteps: 3 }), /mutually exclusive/)
+})

@@ -485,7 +485,7 @@ struct NanoRun<'a> {
     /// Instances whose root TERMINATING was already rendered (a deferred
     /// cancel with `canceling` listeners emits `ProcessInstanceTerminating`).
     terminating: BTreeSet<Key>,
-    jobs_by_type: BTreeMap<String, Key>,
+    jobs_by_type: JobKeys,
     jobs: BTreeMap<Key, (String, String, i64)>,
     /// job key -> (process-instance key, element-instance key).
     job_scopes: BTreeMap<Key, (Key, Key)>,
@@ -545,7 +545,7 @@ impl<'a> NanoRun<'a> {
             scope_by_element_id: BTreeMap::new(),
             active_elements: Vec::new(),
             terminating: BTreeSet::new(),
-            jobs_by_type: BTreeMap::new(),
+            jobs_by_type: JobKeys::default(),
             jobs: BTreeMap::new(),
             job_scopes: BTreeMap::new(),
             user_tasks: BTreeMap::new(),
@@ -573,8 +573,9 @@ impl<'a> NanoRun<'a> {
         self.engine.apply_command_at(cmd, self.now)
     }
 
-    /// Activate exactly the job the script step selected. `jobs_by_type` tracks
-    /// the NEWEST job of a type, but a type-based `ActivateJobs` hands out the
+    /// Activate exactly the job the script step selected. `jobs_by_type` selects
+    /// the OLDEST outstanding job of a type (mirroring the Java capture's
+    /// `JobKeys`), but a type-based `ActivateJobs` hands out the
     /// OLDEST activatable one — with two live jobs of one type the completion
     /// then targets a job that was never activated (`JobNotActivated`).
     fn activate_selected(&mut self, key: Key) -> Vec<Event> {
@@ -600,7 +601,7 @@ impl<'a> NanoRun<'a> {
             }
             "completeJob" => {
                 let ty = step["jobType"].as_str().expect("jobType").to_string();
-                let key = Self::key(&self.jobs_by_type, &ty, "job of type");
+                let key = self.jobs_by_type.target(&ty);
                 let mut events = Vec::new();
                 if !reject {
                     events.extend(self.activate_selected(key));
@@ -612,7 +613,7 @@ impl<'a> NanoRun<'a> {
             }
             "failJob" => {
                 let ty = step["jobType"].as_str().expect("jobType").to_string();
-                let key = Self::key(&self.jobs_by_type, &ty, "job of type");
+                let key = self.jobs_by_type.target(&ty);
                 let mut events = self.activate_selected(key);
                 let retries = step["retries"].as_i64().expect("retries") as i32;
                 let msg = step["errorMessage"].as_str().unwrap_or_default();
@@ -873,6 +874,12 @@ impl<'a> NanoRun<'a> {
 
     /// Render one nano event as zero or more RAW Zeebe-shaped records.
     fn render(&mut self, e: &Event) -> Vec<J> {
+        match e {
+            Event::JobCompleted { job_key, .. }
+            | Event::JobCanceled { job_key, .. }
+            | Event::JobErrorThrown { job_key, .. } => self.jobs_by_type.ended(*job_key),
+            _ => {}
+        }
         match e {
             Event::ProcessInstanceCreated {
                 instance_key,
@@ -1201,7 +1208,7 @@ impl<'a> NanoRun<'a> {
                 retries,
                 ..
             } => {
-                self.jobs_by_type.insert(job_type.clone(), *job_key);
+                self.jobs_by_type.created(job_type, *job_key);
                 self.jobs.insert(
                     *job_key,
                     (
@@ -3217,6 +3224,125 @@ const MESSAGE_CATCH_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   </bpmndi:BPMNDiagram>
 </bpmn:definitions>
 "#;
+
+/// The jobs of a scenario per type, for addressing `completeJob`/`failJob`.
+/// The single canonical selection policy shared with the Java capture runner
+/// (`formal/traces/capture/.../JobKeys.java`, #1964): a step targets the OLDEST
+/// still-outstanding job of its type, so N completions retire N distinct jobs;
+/// only when none is outstanding does it fall back to the newest created job
+/// (so an expected rejection on an already-completed job addresses that job).
+#[derive(Default)]
+struct JobKeys {
+    outstanding: BTreeMap<String, Vec<Key>>,
+    newest: BTreeMap<String, Key>,
+    /// job key -> type, so `ended` touches only that type's queue.
+    types: BTreeMap<Key, String>,
+}
+
+impl JobKeys {
+    fn created(&mut self, ty: &str, key: Key) {
+        self.outstanding
+            .entry(ty.to_string())
+            .or_default()
+            .push(key);
+        self.newest.insert(ty.to_string(), key);
+        self.types.insert(key, ty.to_string());
+    }
+
+    /// A JOB event that ends the job (COMPLETED, CANCELED, ERROR_THROWN).
+    fn ended(&mut self, key: Key) {
+        if let Some(open) = self
+            .types
+            .remove(&key)
+            .and_then(|ty| self.outstanding.get_mut(&ty))
+        {
+            open.retain(|k| *k != key);
+        }
+    }
+
+    fn target(&self, ty: &str) -> Key {
+        self.outstanding
+            .get(ty)
+            .and_then(|open| open.first().copied())
+            .or_else(|| self.newest.get(ty).copied())
+            .unwrap_or_else(|| panic!("no job of type '{ty}' has been created yet"))
+    }
+}
+
+#[test]
+fn job_keys_select_oldest_outstanding_then_newest() {
+    let mut jobs = JobKeys::default();
+    jobs.created("work", 1);
+    jobs.created("work", 2);
+    assert_eq!(jobs.target("work"), 1, "oldest outstanding first");
+    jobs.ended(1);
+    assert_eq!(jobs.target("work"), 2, "next distinct job");
+    jobs.ended(2);
+    assert_eq!(
+        jobs.target("work"),
+        2,
+        "falls back to newest when none open"
+    );
+    jobs.created("other", 3);
+    jobs.created("work", 4);
+    jobs.ended(3);
+    assert_eq!(jobs.target("work"), 4, "ending one type leaves others");
+    assert_eq!(jobs.target("other"), 3, "ended type falls back to newest");
+    jobs.ended(99);
+    assert_eq!(jobs.target("work"), 4, "unknown key is a no-op");
+}
+
+/// Two concurrent same-type jobs: two `completeJob` steps complete two
+/// DISTINCT jobs (the capture runner's policy), oldest first.
+#[test]
+fn concurrent_same_type_jobs_complete_distinct_oldest_first() {
+    let trace = run_scratch(
+        "jobseq",
+        TWO_TASKS_XML,
+        r#"{"description": "two live jobs, two completions", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "two-tasks"},
+            {"op": "createInstance", "bpmnProcessId": "two-tasks"},
+            {"op": "completeJob", "jobType": "work"},
+            {"op": "completeJob", "jobType": "work"}
+        ]}"#,
+    );
+    let created: Vec<J> = [&trace[0], &trace[1]]
+        .iter()
+        .flat_map(|s| records_of(s, "JOB", "CREATED").into_iter().cloned())
+        .collect();
+    let done: Vec<J> = [&trace[2], &trace[3]]
+        .iter()
+        .flat_map(|s| records_of(s, "JOB", "COMPLETED").into_iter().cloned())
+        .collect();
+    assert_eq!(created.len(), 2, "{trace:?}");
+    assert_eq!(done.len(), 2, "{trace:?}");
+    for s in &trace[2..] {
+        assert!(
+            s["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["recordType"] != "COMMAND_REJECTION"),
+            "no rejection expected: {s}"
+        );
+    }
+    let id = |r: &J| {
+        let (e, p) = (&r["elementInstanceKey"], &r["processInstanceKey"]);
+        assert!(e.is_number() && p.is_number(), "job identity missing: {r}");
+        (e.clone(), p.clone())
+    };
+    assert_ne!(id(&created[0]), id(&created[1]), "two distinct jobs");
+    assert_eq!(
+        id(&done[0]),
+        id(&created[0]),
+        "first completion targets the oldest job"
+    );
+    assert_eq!(
+        id(&done[1]),
+        id(&created[1]),
+        "second completion targets the other job"
+    );
+}
 
 /// With two live jobs of one type, completing the NEWEST must not fail with
 /// `JobNotActivated`: the adapter activates exactly the selected key (a
