@@ -92,7 +92,7 @@ use nanobpmn_search::process_instance::{
 };
 use nanobpmn_search::user_task::user_task_result;
 use nanobpmn_search::variable::{truncate_value, variable_result};
-use nanobpmn_search::{convert::epoch, query};
+use nanobpmn_search::{convert::epoch, incident::incident_result, query};
 
 use crate::backpressure::{
     AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, GlobalGuard,
@@ -14853,53 +14853,8 @@ impl ServerImpl {
     ) -> Result<apis::incident::SearchIncidentsResponse, ()> {
         use apis::incident::SearchIncidentsResponse as Resp;
 
-        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let incidents = self.store.incidents();
-
-        // Apply the filter algebra over each incident's string projections. The
-        // process-definition identity is denormalized onto the row at projection
-        // time, so no cross-entity lookup is needed here.
-        let mut matched: Vec<&readstore::IncidentRow> = incidents
-            .iter()
-            .filter(|inc| match filter {
-                None => true,
-                Some(f) => match_incident_filter(inc, f),
-            })
-            .collect();
-
-        // Sort: known fields, defaulting to incidentKey; entity key tiebreaks.
-        let sort = query::sort_keys(
-            body.as_ref().and_then(|q| q.sort.as_ref()),
-            |r: &models::IncidentSearchQuerySortRequest| (r.field.clone(), r.order),
-        );
-        query::sort_items(
-            &mut matched,
-            &sort,
-            |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
-                "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
-                "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
-                "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
-                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
-                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
-                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
-                "incidentKey" => query::SortVal::Num(inc.key as i128),
-                "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(inc.key as i128),
-            },
-            |inc| inc.key,
-        );
-
-        let sorted: Vec<(u64, &readstore::IncidentRow)> =
-            matched.into_iter().map(|inc| (inc.key, inc)).collect();
-        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::IncidentResult> =
-            page.items.into_iter().map(incident_result).collect();
-
         Ok(Resp::Status200_TheIncidentSearchResult(
-            models::IncidentSearchQueryResult::new(page.response, items),
+            nanobpmn_search::incident::search_incidents(&self.read_source(), body.as_ref()),
         ))
     }
 
@@ -14978,49 +14933,12 @@ impl ServerImpl {
             }
         }
 
-        let filter = body.filter.as_ref();
-        let incidents = self.store.incidents();
-        let mut matched: Vec<&readstore::IncidentRow> = incidents
-            .iter()
-            .filter(|inc| contained.contains(&inc.element_instance_key))
-            .filter(|inc| match filter {
-                None => true,
-                Some(f) => match_incident_filter(inc, f),
-            })
-            .collect();
-
-        let sort = query::sort_keys(
-            body.sort.as_ref(),
-            |r: &models::IncidentSearchQuerySortRequest| (r.field.clone(), r.order),
-        );
-        query::sort_items(
-            &mut matched,
-            &sort,
-            |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
-                "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
-                "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
-                "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
-                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
-                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
-                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
-                "incidentKey" => query::SortVal::Num(inc.key as i128),
-                "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(inc.key as i128),
-            },
-            |inc| inc.key,
-        );
-
-        let sorted: Vec<(u64, &readstore::IncidentRow)> =
-            matched.into_iter().map(|inc| (inc.key, inc)).collect();
-        let page = query::paginate(sorted, body.page.as_ref());
-        let items: Vec<models::IncidentResult> =
-            page.items.into_iter().map(incident_result).collect();
-
         Ok(Resp::Status200_TheElementInstanceIncidentSearchResult(
-            models::IncidentSearchQueryResult::new(page.response, items),
+            nanobpmn_search::incident::search_incident_rows(
+                &self.store.incidents(),
+                Some(body),
+                |inc| contained.contains(&inc.element_instance_key),
+            ),
         ))
     }
 
@@ -26550,66 +26468,6 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Maps an engine [`IncidentKind`] to the REST `errorType` taxonomy.
-fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum {
-    match kind {
-        IncidentKind::JobNoRetries => models::IncidentErrorTypeEnum::JobNoRetries,
-        IncidentKind::NoMatchingSequenceFlow => models::IncidentErrorTypeEnum::ConditionError,
-        IncidentKind::ExpressionEvaluation => models::IncidentErrorTypeEnum::ExtractValueError,
-        IncidentKind::UnhandledError => models::IncidentErrorTypeEnum::UnhandledErrorEvent,
-        IncidentKind::DecisionEvaluation => models::IncidentErrorTypeEnum::DecisionEvaluationError,
-        IncidentKind::CalledElementError => models::IncidentErrorTypeEnum::CalledElementError,
-        IncidentKind::IoMapping => models::IncidentErrorTypeEnum::IoMappingError,
-        IncidentKind::ExtractValueError => models::IncidentErrorTypeEnum::ExtractValueError,
-        // A nano-internal durability incident (#1384): an off-heap orphan's spilled
-        // variables were definitively lost. The Camunda taxonomy has no analogue,
-        // so it surfaces as `UNKNOWN` (the honest catch-all), not a BPMN error.
-        IncidentKind::VariablesLost => models::IncidentErrorTypeEnum::Unknown,
-    }
-}
-
-/// Maps an engine [`IncidentState`] to the REST incident `state` enum.
-fn incident_state_enum(state: IncidentState) -> models::IncidentStateEnum {
-    match state {
-        IncidentState::Active => models::IncidentStateEnum::Active,
-        IncidentState::Resolved => models::IncidentStateEnum::Resolved,
-    }
-}
-
-/// Projects an [`IncidentRow`] into the generated `IncidentResult`. The
-/// process-definition identity is denormalized onto the row at projection time.
-fn incident_result(incident: &readstore::IncidentRow) -> models::IncidentResult {
-    let process_definition_id = incident.process_definition_id.clone();
-    let process_definition_key = incident.process_definition_key.clone();
-
-    let error_type = incident_error_type_enum(incident.kind);
-    let job_key = match incident.job_key {
-        Some(k) => types::Nullable::Present(models::JobKey(k.to_string())),
-        None => types::Nullable::Null,
-    };
-    let creation_time =
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(incident.created_at_ms as i64)
-            .unwrap_or_else(epoch);
-
-    let incident_state = incident_state_enum(incident.state);
-
-    models::IncidentResult::new(
-        process_definition_id,
-        error_type,
-        incident.reason.clone(),
-        incident.element_id.clone(),
-        creation_time,
-        incident_state,
-        "<default>".to_string(),
-        models::IncidentKey(incident.key.to_string()),
-        models::ProcessDefinitionKey(process_definition_key),
-        models::ProcessInstanceKey(incident.instance_key.to_string()),
-        types::Nullable::Null,
-        models::ElementInstanceKey(incident.element_instance_key.to_string()),
-        job_key,
-    )
-}
-
 /// Parses a stored `inputs_json` array into the generated input items.
 fn decision_instance_inputs(inputs_json: &str) -> Vec<models::EvaluatedDecisionInputItem> {
     let parsed: Vec<serde_json::Value> = serde_json::from_str(inputs_json).unwrap_or_default();
@@ -26938,37 +26796,6 @@ fn match_element_instance_fields(
             };
             v == t
         })
-}
-
-/// The incident filter predicate, shared by `searchIncidents` and the
-/// element-instance-scoped incident search so the two cannot drift. Every
-/// declared `IncidentFilter` field is matched: the process-definition identity
-/// is denormalized onto the row at projection time (no cross-entity lookup),
-/// and single-tenant Nano stores no tenant on incidents, so `tenantId` matches
-/// against an absent value — value operators exclude the row (honest, never
-/// silently widening the search) while `$exists: false` still matches.
-fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilter) -> bool {
-    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-        && query::match_process_instance_key(&f.process_instance_key, &inc.instance_key.to_string())
-        && query::match_element_instance_key(
-            &f.element_instance_key,
-            &inc.element_instance_key.to_string(),
-        )
-        && query::match_process_definition_key(
-            &f.process_definition_key,
-            &inc.process_definition_key,
-        )
-        && query::match_string(&f.process_definition_id, &inc.process_definition_id)
-        && query::match_job_key_opt(&f.job_key, inc.job_key.map(|k| k.to_string()).as_deref())
-        && query::match_incident_state(&f.state, &incident_state_enum(inc.state).to_string())
-        && query::match_incident_error_type(
-            &f.error_type,
-            &incident_error_type_enum(inc.kind).to_string(),
-        )
-        && query::match_string(&f.element_id, &inc.element_id)
-        && query::match_string(&f.error_message, &inc.reason)
-        && query::match_date_time_ms(&f.creation_time, Some(inc.created_at_ms as i64))
-        && query::match_string_opt(&f.tenant_id, None)
 }
 
 /// Copies the shared filter fields out of a top-level `ElementInstanceFilter`
