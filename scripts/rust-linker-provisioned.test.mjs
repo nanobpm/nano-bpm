@@ -24,21 +24,30 @@ export function jobs(yaml) {
   const start = lines.findIndex((l) => /^jobs:\s*(#.*)?$/.test(l));
   if (start < 0) return [];
   const out = [];
+  let indent;
   for (let i = start + 1; i < lines.length; i++) {
     const l = lines[i];
     if (/^\S/.test(l)) break;
-    const m = l.match(/^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/);
-    if (m) out.push({ id: m[1], line: i + 1, body: [] });
+    // A job key is any (optionally quoted) key at the first indentation level
+    // under `jobs:` — whatever width that file uses.
+    const m = l.match(/^( +)(?:"([^"]+)"|'([^']+)'|([^\s#'"][^:#]*?)):\s*(#.*)?$/);
+    if (m && indent === undefined) indent = m[1].length;
+    if (m && m[1].length === indent) out.push({ id: m[2] ?? m[3] ?? m[4], line: i + 1, body: [] });
     else if (out.length) out[out.length - 1].body.push(l);
   }
   return out.map((j) => ({ id: j.id, line: j.line, text: j.body.join('\n') }));
+}
+
+/** A literal ubuntu `runs-on`, or an expression one that mentions ubuntu. */
+export function isUbuntuRunner(text) {
+  return /runs-on:[^\n]*ubuntu/.test(text) || (/runs-on:\s*\$\{\{/.test(text) && /ubuntu/.test(text));
 }
 
 /** Jobs that install Rust on a Linux runner without provisioning mold. */
 export function unprovisioned(yaml) {
   return jobs(yaml)
     .filter((j) => /dtolnay\/rust-toolchain@/.test(j.text))
-    .filter((j) => /runs-on:[^\n]*ubuntu/.test(j.text) || /runs-on:\s*\$\{\{/.test(j.text) && /ubuntu/.test(j.text))
+    .filter((j) => isUbuntuRunner(j.text))
     .filter((j) => !/^\s*mold:\s*['"]?true['"]?/m.test(j.text))
     .filter((j) => !/#\s*linker:\s*\S/.test(j.text))
     .map((j) => `job ${j.id} (line ${j.line})`);
@@ -53,6 +62,8 @@ test('detects a Linux Rust job without mold, and accepts provisioned or opted-ou
   // A mold step in a SIBLING job does not cover this one.
   const two = job('') + "  b:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ./.github/actions/build-tools\n        with:\n          mold: 'true'\n";
   assert.deepEqual(unprovisioned(two), ['job a (line 3)']);
+  assert.deepEqual(jobs("jobs:\n    'a.b':\n      x: 1\n    \"c\":\n      y: 2\n    d.e: # c\n      z: 3\n").map((j) => j.id), ['a.b', 'c', 'd.e']);
+  assert.deepEqual(unprovisioned(job('').replace(/\n  /g, '\n    ').replace('  a:', "  'a.x':")).length, 1);
 });
 
 test('every Linux job that installs Rust provisions the mold linker', () => {

@@ -3235,6 +3235,8 @@ const MESSAGE_CATCH_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 struct JobKeys {
     outstanding: BTreeMap<String, Vec<Key>>,
     newest: BTreeMap<String, Key>,
+    /// job key -> type, so `ended` touches only that type's queue.
+    types: BTreeMap<Key, String>,
 }
 
 impl JobKeys {
@@ -3244,11 +3246,16 @@ impl JobKeys {
             .or_default()
             .push(key);
         self.newest.insert(ty.to_string(), key);
+        self.types.insert(key, ty.to_string());
     }
 
     /// A JOB event that ends the job (COMPLETED, CANCELED, ERROR_THROWN).
     fn ended(&mut self, key: Key) {
-        for open in self.outstanding.values_mut() {
+        if let Some(open) = self
+            .types
+            .remove(&key)
+            .and_then(|ty| self.outstanding.get_mut(&ty))
+        {
             open.retain(|k| *k != key);
         }
     }
@@ -3276,6 +3283,13 @@ fn job_keys_select_oldest_outstanding_then_newest() {
         2,
         "falls back to newest when none open"
     );
+    jobs.created("other", 3);
+    jobs.created("work", 4);
+    jobs.ended(3);
+    assert_eq!(jobs.target("work"), 4, "ending one type leaves others");
+    assert_eq!(jobs.target("other"), 3, "ended type falls back to newest");
+    jobs.ended(99);
+    assert_eq!(jobs.target("work"), 4, "unknown key is a no-op");
 }
 
 /// Two concurrent same-type jobs: two `completeJob` steps complete two
