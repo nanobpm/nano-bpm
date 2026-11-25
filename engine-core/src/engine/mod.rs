@@ -7452,8 +7452,7 @@ impl Engine {
         let instance_key = subscription.instance_key;
         if !self.buffer_candidates.contains_key(&subscription_key) {
             #[cfg(test)]
-            self.buffer_scan_count
-                .set(self.buffer_scan_count.get() + 1);
+            self.buffer_scan_count.set(self.buffer_scan_count.get() + 1);
             let mut candidates: Vec<(u64, Key)> = self
                 .state
                 .buffered_messages
