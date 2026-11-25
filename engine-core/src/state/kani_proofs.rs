@@ -5,7 +5,6 @@
 //! for what is proven, the bounds and how to run them.
 
 use super::*;
-use crate::event::Event;
 use crate::model::IncomingFlow;
 
 /// Bound on the number of nondeterministic operations per harness.
@@ -75,9 +74,14 @@ fn flow_arrivals_preserve_join_invariant() {
                 }
             }
             _ => {
+                // The engine fires a join only once every incoming flow holds a
+                // token (`Engine::activate_join`), so a firing always sees both
+                // flows. (Firing over a symbolic-length entry list made the
+                // solver exhaust the CI runner's memory.)
+                kani::assume(arrivals.distinct_flows() == 2);
                 arrivals.consume_one_each();
-                g0 = g0.saturating_sub(1);
-                g1 = g1.saturating_sub(1);
+                g0 -= 1;
+                g1 -= 1;
             }
         }
         assert!(arrivals.count(&f0) == g0);
@@ -119,35 +123,44 @@ fn any_job_transition(state: &mut State) {
 /// six job states, with or without a retry backoff, at any priority): only a
 /// `Created`, non-deferred job is activatable, exactly a deferred one sits in
 /// both deferred indexes at its backoff deadline, and exactly an `Activated`
-/// one is in `activated_jobs`. Driving the full `state::apply` symbolically
-/// did not fit the CI box, so the harness proves the transition every applier
-/// arm funnels through.
+/// one is in `activated_jobs`. Driving `state::apply` (even one concrete
+/// `JobCreated`) did not fit the CI box, so the harness builds the job directly
+/// and proves the transition every applier arm funnels through.
 #[kani::proof]
 #[kani::unwind(3)]
 #[kani::solver(cadical)]
 fn job_index_resync_keeps_lockstep() {
     let mut state = State::default();
-    // Concrete creation through the real applier, then symbolic transitions.
-    apply(
-        &mut state,
-        &Event::JobCreated {
-            job_key: KEY,
+    let priority: i32 = kani::any();
+    state.jobs.insert(
+        KEY,
+        Job {
+            key: KEY,
             instance_key: 1,
             element_instance_key: 2,
             element_id: "A".to_string(),
             job_type: "t".to_string(),
-            created_at: 0,
-            priority: 0,
+            state: JobState::Created,
+            worker: None,
+            deadline: None,
+            activated_at: None,
+            activation_timeout: None,
+            lease_token: None,
+            durable_activation: false,
+            activated: false,
             retries: 3,
+            priority,
+            created_at: 0,
+            kind: JobKind::BpmnElement,
+            error_message: None,
+            error_code: None,
+            has_failed_with_retries_left: false,
+            retry_backoff_until: None,
+            settled_tokens: Vec::new(),
+            terminal_end: None,
             secret_provenance: Vec::new(),
         },
     );
-    // Re-key the job at a symbolic priority (the order the index sorts by).
-    let priority: i32 = kani::any();
-    if let Some(job) = state.jobs.get_mut(&KEY) {
-        job.priority = priority;
-    }
-    state.activatable_jobs.clear();
     let order = types::activation_order(priority, KEY);
     for _ in 0..STEPS {
         any_job_transition(&mut state);
