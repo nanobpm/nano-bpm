@@ -232,6 +232,18 @@ impl ReadModel {
         }
     }
 
+    /// Routes [`ReadStore::try_process_instance_any`] (live + terminal
+    /// archive, #1948) to the key's owning shard.
+    pub fn try_process_instance_any(
+        &self,
+        key: Key,
+    ) -> rusqlite::Result<Option<ProcessInstanceRow>> {
+        match self.shard_for(key) {
+            Some(shard) => shard.try_process_instance_any(key),
+            None => Ok(None),
+        }
+    }
+
     pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
         self.shard_for(key)?.process_instance(key)
     }

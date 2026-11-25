@@ -1170,6 +1170,13 @@ pub enum ReadKind {
     UserTask,
     Variable,
     ElementInstance,
+    /// Existence + state of a process instance's history across the owning
+    /// shard's live store AND terminal archive (#1948), answered as
+    /// `{"state": "<STATE>"}`. Only sent by history deletion, which first
+    /// requires every peer to advertise
+    /// `FEATURE_PROCESS_INSTANCE_HISTORY_DELETION`, so an older peer never
+    /// receives a variant it cannot decode.
+    ProcessInstanceHistory,
 }
 
 /// The user-task mutation a [`ClientFrame::ForwardUserTask`] carries.

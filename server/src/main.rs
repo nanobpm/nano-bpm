@@ -8955,22 +8955,18 @@ impl ServerImpl {
         instance_key: u64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        let Some(row) = self.store.process_instance(instance_key) else {
+        let Some((state, ended)) = self.history_state(instance_key).await? else {
             return Err((
                 404,
                 format!("No process instance with key '{instance_key}'."),
             ));
         };
-        if !matches!(
-            row.state,
-            ProcessInstanceState::Completed | ProcessInstanceState::Terminated
-        ) {
+        if !ended {
             return Err((
                 409,
                 format!(
-                    "Process instance {instance_key} is {} and cannot be deleted; only \
+                    "Process instance {instance_key} is {state} and cannot be deleted; only \
                      COMPLETED or TERMINATED instances can be deleted.",
-                    row.state.as_str()
                 ),
             ));
         }
@@ -8983,6 +8979,57 @@ impl ServerImpl {
             .await?;
         commit.wait().await;
         Ok(())
+    }
+
+    /// Resolves whether `instance_key`'s history exists and has ended (#1948),
+    /// as `Some((state label, ended))` or `None` when unknown. The answer comes
+    /// from the key's OWNING read-model shard, over its live store AND its
+    /// terminal archive — so an ended instance retention pruned into the
+    /// archive is still deletable, and a leader that does not own the shard
+    /// (leadership moved to a replica after a failover) asks the static owner
+    /// instead of 404-ing from its own shard-less read model.
+    async fn history_state(
+        &self,
+        instance_key: u64,
+    ) -> Result<Option<(String, bool)>, (u16, String)> {
+        let Some(owner) = self.remote_owner_of(instance_key) else {
+            return self
+                .store
+                .try_process_instance_any(instance_key)
+                .map(|row| {
+                    row.map(|r| (r.state.as_str().to_string(), history_state_ended(r.state)))
+                })
+                .map_err(|e| (500, format!("read-model lookup failed: {e}")));
+        };
+        let (status, body) = self
+            .forward_get(
+                owner,
+                crate::falcon::ReadKind::ProcessInstanceHistory,
+                instance_key,
+            )
+            .await;
+        match (status, body) {
+            (200, Some(b)) => {
+                let state = b.get("state").and_then(|v| v.as_str());
+                let ended = b.get("ended").and_then(|v| v.as_bool());
+                match (state, ended) {
+                    (Some(state), Some(ended)) => Ok(Some((state.to_string(), ended))),
+                    _ => Err((
+                        500,
+                        format!("owner node {owner} returned a malformed history state"),
+                    )),
+                }
+            }
+            (404, _) => Ok(None),
+            (503, _) => Err((
+                503,
+                format!("owner node {owner} unavailable to resolve instance {instance_key}"),
+            )),
+            (s, _) => Err((
+                500,
+                format!("owner node {owner} returned status {s} resolving instance {instance_key}"),
+            )),
+        }
     }
 
     async fn suspend_process_instance_impl(
@@ -13264,6 +13311,10 @@ impl ServerImpl {
                     &readstore::RootResolver::new(|k| self.store.process_instance(k)),
                 ))
             }),
+            ReadKind::ProcessInstanceHistory => match self.store.try_process_instance_any(key) {
+                Ok(row) => row.map(|x| Ok(history_state_body(x.state))),
+                Err(_) => return (500, None),
+            },
             ReadKind::Incident => self
                 .store
                 .incident(key)
@@ -47445,6 +47496,81 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn history_deletion_follows_leadership_to_a_non_owning_replica() {
+        // #1948 review: after the static owner's Raft groups go down, the new
+        // partition leader is a replica that owns no read-model shard for the
+        // partition. Deleting an ended instance there must resolve the
+        // instance's history through the OWNING shard (the static owner's
+        // read model), not 404 from the leader's own shard-less store.
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits via quorum");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+        assert!(matches!(
+            node0.cancel_instance_core(instance_key, None).await,
+            CancelInstanceOutcome::Canceled
+        ));
+        let mut terminated = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if node0
+                .store
+                .process_instance(instance_key)
+                .is_some_and(|r| r.state == ProcessInstanceState::Terminated)
+            {
+                terminated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            terminated,
+            "the owner's read model projects the termination"
+        );
+
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        let new_leader = wait_new_leader(&node1, &node2, 0).await;
+        assert_eq!(
+            new_leader.remote_owner_of(instance_key),
+            Some(0),
+            "the new leader is a non-owning replica"
+        );
+        assert!(
+            new_leader.store.process_instance(instance_key).is_none(),
+            "the non-owning leader has no read-model row for the instance"
+        );
+
+        let outcome = new_leader
+            .delete_process_instance_history_core(instance_key, None)
+            .await;
+        let detail = match outcome {
+            TransitionInstanceOutcome::Ok => None,
+            TransitionInstanceOutcome::Conflict(d) => Some(format!("409 {d}")),
+            TransitionInstanceOutcome::NotFound(d) => Some(format!("404 {d}")),
+            TransitionInstanceOutcome::Unavailable(d) => Some(format!("503 {d}")),
+            TransitionInstanceOutcome::Internal(d) => Some(format!("500 {d}")),
+        };
+        assert_eq!(
+            detail, None,
+            "deletion on a non-owning leader must resolve via the owning shard"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_create_on_a_node_that_leads_nothing_forwards_to_a_peer_leader() {
         // s3-create-forward: when a node leads NO partition (here because its Raft
         // groups were shut down while its gateway/peer links stay up), a stream
@@ -63590,6 +63716,21 @@ pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
     "versionTag",
     "tenantId",
 ];
+
+/// Whether a process-instance state has ended, i.e. its history may be
+/// deleted (#1948): the single predicate both the local and the owner-side
+/// existence resolution use.
+fn history_state_ended(state: ProcessInstanceState) -> bool {
+    matches!(
+        state,
+        ProcessInstanceState::Completed | ProcessInstanceState::Terminated
+    )
+}
+
+/// The owner-side `ReadKind::ProcessInstanceHistory` answer (#1948).
+fn history_state_body(state: ProcessInstanceState) -> serde_json::Value {
+    serde_json::json!({ "state": state.as_str(), "ended": history_state_ended(state) })
+}
 
 /// Drops every key in `selected` that has an ancestor (via `parent_of`) also in
 /// `selected` (#1948): deleting an instance's history deletes its call-activity

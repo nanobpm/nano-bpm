@@ -3321,6 +3321,31 @@ impl ReadStore {
         Ok(archived.flatten().map(|p| p as Key))
     }
 
+    /// A process instance across the live store AND the durable terminal
+    /// archive (#1948): retention prunes ended instances from the live store
+    /// into the archive, and such an instance's history must still be
+    /// deletable, so existence for deletion is resolved over both. The archive
+    /// only ever holds terminal instances. `Ok(None)` when unknown to both.
+    pub fn try_process_instance_any(
+        &self,
+        key: Key,
+    ) -> rusqlite::Result<Option<ProcessInstanceRow>> {
+        if let Some(row) = self.try_process_instance(key)? {
+            return Ok(Some(row));
+        }
+        let Some(archive) = self.archive_path.as_deref().filter(|a| a.exists()) else {
+            return Ok(None);
+        };
+        let conn =
+            Connection::open_with_flags(archive, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.query_row(
+            PROCESS_INSTANCE_BY_KEY_SQL,
+            params![key as i64],
+            map_instance,
+        )
+        .optional()
+    }
+
     pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
         self.try_process_instance(key)
             .or_corrupt("query process_instance")
@@ -3335,8 +3360,7 @@ impl ReadStore {
     pub fn try_process_instance(&self, key: Key) -> rusqlite::Result<Option<ProcessInstanceRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
-            "SELECT key, process_id, process_definition_id, process_definition_key, \
-             version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key, suspended_date_ms FROM process_instances WHERE key = ?1",
+            PROCESS_INSTANCE_BY_KEY_SQL,
             params![key as i64],
             map_instance,
         )
@@ -3961,6 +3985,12 @@ impl VariablePushdown {
         (sql, args)
     }
 }
+
+/// Point lookup of one process instance by key, shared by the live-store and
+/// archive lookups so their column lists cannot drift.
+const PROCESS_INSTANCE_BY_KEY_SQL: &str = "SELECT key, process_id, process_definition_id, process_definition_key, \
+     version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, \
+     parent_element_instance_key, suspended_date_ms FROM process_instances WHERE key = ?1";
 
 fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
     let tags_str: String = r.get(8)?;
@@ -18075,6 +18105,45 @@ mod history_deletion_tests {
             for k in [10, 20, 40] {
                 assert!(store.process_instance(k).is_none(), "{k} resurrected");
             }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948 review: an ended instance pruned into the terminal archive is
+    /// still found for deletion (`try_process_instance_any`), and once deleted
+    /// it stays deleted across archive replay (prune -> delete -> replay).
+    #[test]
+    fn pruned_instance_is_deletable_and_stays_deleted_after_archive_replay() {
+        let dir = history_del_dir("pruned-root");
+        let path = dir.join("read-model.sqlite");
+        {
+            let store = ReadStore::open(Some(&path)).unwrap();
+            let events = [
+                created(10, None),
+                created(30, None),
+                Event::ProcessInstanceCompleted { instance_key: 10 },
+                Event::ProcessInstanceCompleted { instance_key: 30 },
+            ];
+            store.export(&events.iter().collect::<Vec<_>>()).unwrap();
+            store.prune_terminal_instances(1, 0).unwrap();
+            assert!(store.process_instance(10).is_none(), "10 not pruned");
+            let found = store.try_process_instance_any(10).unwrap();
+            assert_eq!(
+                found.map(|r| r.state),
+                Some(nanobpmn_engine_core::ProcessInstanceState::Completed),
+                "a pruned instance must still resolve from the archive"
+            );
+            assert!(store.try_process_instance_any(99).unwrap().is_none());
+
+            store
+                .export(&[&Event::ProcessInstanceHistoryDeleted { instance_key: 10 }])
+                .unwrap();
+            assert!(store.try_process_instance_any(10).unwrap().is_none());
+            store.reset().unwrap();
+            store.replay_terminal_archive().unwrap();
+            assert!(store.process_instance(10).is_none(), "10 resurrected");
+            assert!(store.try_process_instance_any(10).unwrap().is_none());
+            assert!(store.process_instance(30).is_some());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
