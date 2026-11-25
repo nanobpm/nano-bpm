@@ -8798,12 +8798,12 @@ fn cancel_of_a_suspended_instance_honours_the_terminate_suspended_flag() {
 /// {key}/deletion`): a live (ACTIVE / SUSPENDED) instance is rejected with
 /// `InstanceTransitionInvalid { to: "DELETED" }` and no event; an ENDED
 /// (terminated) instance — and a key absent from engine state, i.e. evicted
-/// after ending — yields exactly one `ProcessInstanceHistoryDeleted`. Running the
+/// after ending — yields exactly one `ProcessInstanceHistoryDeleted`, whose
+/// apply removes the instance from engine state. Running the
 /// same command sequence on a second engine gives identical outcomes (replay
-/// determinism), and the event touches no engine state.
+/// determinism).
 #[test]
 fn delete_process_instance_history_rejects_live_and_accepts_ended() {
-    use crate::state::ProcessInstanceState;
     type Outcomes = Vec<Result<Vec<Event>, EngineError>>;
     fn run() -> (Engine, Key, Outcomes) {
         let mut engine = Engine::new();
@@ -8854,16 +8854,21 @@ fn delete_process_instance_history_rejects_live_and_accepts_ended() {
     }
     assert_eq!(
         out_a[2].as_ref().unwrap(),
-        &vec![Event::ProcessInstanceHistoryDeleted { instance_key: key }]
+        &vec![Event::ProcessInstanceHistoryDeleted {
+            instance_key: key,
+            descendant_keys: vec![]
+        }]
     );
     assert_eq!(
         out_a[3].as_ref().unwrap(),
         &vec![Event::ProcessInstanceHistoryDeleted {
-            instance_key: 987_654_321
+            instance_key: 987_654_321,
+            descendant_keys: vec![]
         }]
     );
-    assert_eq!(
-        a.instance(key).unwrap().state,
-        ProcessInstanceState::Terminated
+    // Event-sourced deletion: apply removed the ended instance from state.
+    assert!(
+        a.instance(key).is_none(),
+        "deleted instance must leave state"
     );
 }

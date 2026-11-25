@@ -1875,3 +1875,159 @@ fn child_index_is_empty_after_completed_instances_are_evicted() {
         engine.state.children_by_parent
     );
 }
+
+/// Deploys `orch` (one call activity into the parked `callee`), creates an
+/// instance and cancels it, so a terminated parent + terminated child tree
+/// remains resident. Returns (engine, parent key, child key, journal).
+fn ended_call_activity_tree() -> (Engine, Key, Key, Vec<Event>) {
+    let def = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "callee")
+        .end_event("done")
+        .connect("start", "c1")
+        .connect("c1", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let mut journal = engine
+        .apply_command(Command::DeployProcess(parked_callee()))
+        .unwrap();
+    journal.extend(engine.apply_command(Command::DeployProcess(def)).unwrap());
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent = parent_key_of(&created, "orch");
+    let child = parent_key_of(&created, "callee");
+    assert_ne!(parent, child);
+    journal.extend(created);
+    journal.extend(
+        engine
+            .apply_command(Command::cancel_instance(parent))
+            .unwrap(),
+    );
+    assert!(
+        engine.instance(child).is_some(),
+        "ended child stays resident"
+    );
+    (engine, parent, child, journal)
+}
+
+/// #1948 event-sourced deletion: the command resolves the ended tree into the
+/// event, and apply removes the parent, the call-activity child and every
+/// instance-scoped entity (jobs, incidents, timers, subscriptions, user
+/// tasks) from engine state — so a snapshot taken afterwards, and an engine
+/// restored from it, never carry the deleted history (no reseed resurrection),
+/// and a full replay from genesis converges to the same state.
+#[test]
+fn delete_process_instance_history_removes_the_ended_tree_from_engine_state() {
+    let (mut engine, parent, child, mut journal) = ended_call_activity_tree();
+    let events = engine
+        .apply_command(Command::DeleteProcessInstanceHistory {
+            instance_key: parent,
+        })
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![Event::ProcessInstanceHistoryDeleted {
+            instance_key: parent,
+            descendant_keys: vec![child],
+        }]
+    );
+    journal.extend(events);
+    for key in [parent, child] {
+        assert!(engine.instance(key).is_none(), "{key} must leave state");
+        assert!(!engine.state.jobs_by_instance.contains_key(&key));
+        assert!(!engine.state.jobs.values().any(|j| j.instance_key == key));
+        assert!(!engine
+            .state
+            .incidents
+            .values()
+            .any(|i| i.instance_key == key));
+        assert!(!engine.state.timers.values().any(|t| t.instance_key == key));
+        assert!(!engine
+            .state
+            .user_tasks
+            .values()
+            .any(|t| t.instance_key == key));
+        assert!(!engine
+            .state
+            .message_subscriptions
+            .values()
+            .any(|s| s.instance_key == key));
+        assert!(!engine.state.children_by_parent.contains_key(&key));
+    }
+
+    // Re-applying the deletion is an idempotent no-op on state.
+    let again = engine
+        .apply_command(Command::DeleteProcessInstanceHistory {
+            instance_key: parent,
+        })
+        .unwrap();
+    assert_eq!(
+        again,
+        vec![Event::ProcessInstanceHistoryDeleted {
+            instance_key: parent,
+            descendant_keys: vec![],
+        }]
+    );
+
+    // Full replay from genesis converges to the same (deleted) state.
+    let replayed = Engine::replay_partition(0, journal);
+    for key in [parent, child] {
+        assert!(replayed.instance(key).is_none(), "replay resurrected {key}");
+    }
+    assert_eq!(
+        replayed.state.instances.keys().collect::<Vec<_>>(),
+        engine.state.instances.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(replayed.state.jobs.len(), engine.state.jobs.len());
+
+    // Snapshot + restore (the reseed source) never carries the deleted tree.
+    #[cfg(feature = "serde")]
+    {
+        let restored = Engine::from_snapshot(engine.snapshot());
+        for key in [parent, child] {
+            assert!(restored.instance(key).is_none(), "reseed resurrected {key}");
+        }
+    }
+}
+
+/// A snapshot taken BEFORE the deletion plus the journal tail that carries it
+/// (the compacted-prefix recovery path) also converges: the tail's deletion
+/// event removes the tree the snapshot still holds.
+#[cfg(feature = "serde")]
+#[test]
+fn delete_process_instance_history_snapshot_plus_tail_converges() {
+    let (mut engine, parent, child, _) = ended_call_activity_tree();
+    let snap = engine.snapshot();
+    let tail = engine
+        .apply_command(Command::DeleteProcessInstanceHistory {
+            instance_key: parent,
+        })
+        .unwrap();
+    let mut restored = Engine::from_snapshot(snap);
+    assert!(restored.instance(child).is_some());
+    restored.apply_replayed_events(tail);
+    for key in [parent, child] {
+        assert!(restored.instance(key).is_none(), "tail replay kept {key}");
+    }
+}
+
+/// A live descendant rejects the whole deletion, naming the live member.
+#[test]
+fn delete_process_instance_history_rejects_a_tree_with_a_live_child() {
+    let (mut engine, parent, child, _) = ended_call_activity_tree();
+    // Force the child live in state (an ended root with a still-live child is
+    // the shape the tree validation must guard).
+    engine.state.instances.get_mut(&child).unwrap().state = ProcessInstanceState::Active;
+    let err = engine
+        .apply_command(Command::DeleteProcessInstanceHistory {
+            instance_key: parent,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::InstanceTransitionInvalid { instance_key, to: "DELETED", .. } if instance_key == child
+    ));
+    assert!(engine.instance(parent).is_some());
+}

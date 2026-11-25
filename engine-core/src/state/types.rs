@@ -3155,6 +3155,43 @@ impl State {
         }
     }
 
+    /// Removes every instance in `victims` and every instance-scoped entity it
+    /// owns — jobs (via the `jobs_by_instance` reverse index, deindexed),
+    /// user tasks, incidents, timers and message / signal / conditional
+    /// subscriptions — from state. The apply step of
+    /// `Event::ProcessInstanceHistoryDeleted` (#1948). Keys not resident are
+    /// ignored, so re-applying the event is a no-op. The `settled_jobs`
+    /// ledger is deliberately kept: it fences duplicate settlements and is
+    /// not instance history.
+    pub fn purge_instance_tree(&mut self, victims: &BTreeSet<Key>) {
+        if victims.is_empty() {
+            return;
+        }
+        for key in victims {
+            self.remove_instance(*key);
+            self.children_by_parent.remove(key);
+            if let Some(job_keys) = self.jobs_by_instance.remove(key) {
+                for job_key in job_keys {
+                    if let Some(job) = self.jobs.remove(&job_key) {
+                        self.deindex_job(&job.job_type, job_key, job.priority);
+                    }
+                }
+            }
+        }
+        self.user_tasks
+            .retain(|_, t| !victims.contains(&t.instance_key));
+        self.incidents
+            .retain(|_, i| !victims.contains(&i.instance_key));
+        self.timers
+            .retain(|_, t| !victims.contains(&t.instance_key));
+        self.message_subscriptions
+            .retain(|_, s| !victims.contains(&s.instance_key));
+        self.signal_subscriptions
+            .retain(|_, s| !victims.contains(&s.instance_key));
+        self.conditional_subscriptions
+            .retain(|_, s| !victims.contains(&s.instance_key));
+    }
+
     /// Removes a process instance, unlinking it from its parent's entry in
     /// [`State::children_by_parent`]. Its own entry as a parent is kept: its
     /// children may stay resident (e.g. the parent alone was spilled to cold

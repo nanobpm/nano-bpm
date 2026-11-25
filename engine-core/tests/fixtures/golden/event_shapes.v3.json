@@ -496,6 +496,7 @@
   "ProcessInstanceCreated.variables",
   "ProcessInstanceCreated.version",
   "ProcessInstanceHistoryDeleted",
+  "ProcessInstanceHistoryDeleted.descendant_keys",
   "ProcessInstanceHistoryDeleted.instance_key",
   "ProcessInstanceMigrated",
   "ProcessInstanceMigrated.child_instances",

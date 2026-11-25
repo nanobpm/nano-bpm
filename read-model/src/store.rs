@@ -835,26 +835,152 @@ fn shared_column_list(
     Ok(list)
 }
 
-/// The instance keys of every [`Event::ProcessInstanceHistoryDeleted`] in `events`.
-fn history_deletions<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<Key> {
+/// Every [`Event::ProcessInstanceHistoryDeleted`] in `events`, as its root
+/// instance key plus the engine-resolved descendant keys it journals.
+fn history_deletions<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<(Key, &'a [Key])> {
     events
         .into_iter()
         .filter_map(|e| match e {
-            Event::ProcessInstanceHistoryDeleted { instance_key } => Some(*instance_key),
+            Event::ProcessInstanceHistoryDeleted {
+                instance_key,
+                descendant_keys,
+            } => Some((*instance_key, descendant_keys.as_slice())),
             _ => None,
         })
         .collect()
 }
 
-/// Retracts ONE deleted instance's history tree (#1948) on `conn`, inside the
-/// caller's transaction: resolves the instance and every call-activity
-/// descendant across the live store AND (when `archived`, i.e. the archive is
-/// attached as `terminal_archive`) the durable archive, then removes every
-/// dependent row from both. Retention can prune an intermediate child into the
-/// archive while its descendants stay live, so the walk follows both tables'
-/// parent edges; each recursive branch is an indexed parent lookup
-/// (`idx_process_instances_parent`, shared `SCHEMA`), not a table scan.
-fn retract_history_tree(conn: &Connection, archived: bool, key: Key) -> rusqlite::Result<()> {
+/// `meta` key prefix of the durable archive-retraction OUTBOX (#1948). A
+/// history deletion removes the live rows and enqueues every resolved tree key
+/// here in the SAME main-store transaction that advances the projection cursor
+/// (one file, so it is crash-atomic). The archive copy is then retracted in a
+/// separate archive-only transaction and the outbox entries cleared
+/// ([`drain_archive_retractions`]). A crash anywhere between leaves the entries
+/// queued, and every path that could restore archived history (open, reset,
+/// [`ReadStore::replay_terminal_archive`]) drains them first — so a deletion
+/// can never be resurrected from the archive. It is a transient work queue
+/// derived from the journaled event, not a second record of deletions: it is
+/// empty whenever the archive is in sync.
+const ARCHIVE_RETRACTION_PREFIX: &str = "pending_archive_retraction:";
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection: fail the archive half of
+    /// [`drain_archive_retractions`] before it commits, simulating a crash
+    /// after the main store committed the deletion and cursor advance.
+    static FAIL_ARCHIVE_DRAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The outbox's queued archive-retraction keys (see [`ARCHIVE_RETRACTION_PREFIX`]).
+fn pending_archive_retractions(conn: &Connection) -> rusqlite::Result<Vec<Key>> {
+    let mut stmt = conn.prepare_cached("SELECT v FROM main.meta WHERE k LIKE ?1 ORDER BY v")?;
+    let keys = stmt
+        .query_map(params![format!("{ARCHIVE_RETRACTION_PREFIX}%")], |r| {
+            r.get::<_, i64>(0)
+        })?
+        .map(|r| r.map(|k| k as Key))
+        .collect::<rusqlite::Result<Vec<Key>>>()?;
+    Ok(keys)
+}
+
+/// Queues `keys` in the archive-retraction outbox on `conn` (idempotent).
+fn enqueue_archive_retractions(conn: &Connection, keys: &[Key]) -> rusqlite::Result<()> {
+    for &k in keys {
+        conn.execute(
+            "INSERT INTO main.meta (k, v) VALUES (?1, ?2) \
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![format!("{ARCHIVE_RETRACTION_PREFIX}{k}"), k as i64],
+        )?;
+    }
+    Ok(())
+}
+
+/// Drains the archive-retraction outbox: deletes every queued key's rows from
+/// the archive in ONE archive-only transaction, then clears the queued
+/// entries from the main store. Idempotent; a failure (or crash) leaves the
+/// entries queued for the next drain. With no archive file, there is nothing
+/// to retract and the entries are simply cleared.
+fn drain_archive_retractions(conn: &Connection, archive: Option<&Path>) -> rusqlite::Result<()> {
+    let keys = pending_archive_retractions(conn)?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    if let Some(a) = archive.filter(|a| a.exists()) {
+        attach_archive(conn, a)?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let body = (|| -> rusqlite::Result<()> {
+                for &k in &keys {
+                    for table in TERMINAL_ARCHIVE_DEP_TABLES {
+                        conn.execute(
+                            &format!(
+                                "DELETE FROM terminal_archive.{table} WHERE instance_key = ?1"
+                            ),
+                            params![k as i64],
+                        )?;
+                    }
+                    conn.execute(
+                        "DELETE FROM terminal_archive.process_instances WHERE key = ?1",
+                        params![k as i64],
+                    )?;
+                }
+                #[cfg(test)]
+                if FAIL_ARCHIVE_DRAIN.with(|f| f.get()) {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                Ok(())
+            })();
+            match body {
+                Ok(()) => conn.execute_batch("COMMIT"),
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })();
+        let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
+        result?;
+    }
+    for &k in &keys {
+        conn.execute(
+            "DELETE FROM main.meta WHERE k = ?1",
+            params![format!("{ARCHIVE_RETRACTION_PREFIX}{k}")],
+        )?;
+    }
+    Ok(())
+}
+
+/// Destructively rebuilds the schema on `conn` while carrying the
+/// archive-retraction outbox across the rebuild, so a queued retraction is
+/// never lost to a reset or an incompatible-schema rebuild (#1948).
+fn rebuild_schema_preserving_retractions(conn: &Connection) -> rusqlite::Result<()> {
+    // A meta table that cannot be read (legacy/corrupt) has no outbox to keep.
+    let pending = pending_archive_retractions(conn).unwrap_or_default();
+    drop_all_user_tables(conn)?;
+    create_fresh_schema(conn)?;
+    enqueue_archive_retractions(conn, &pending)
+}
+
+/// Retracts ONE deleted instance's history tree (#1948) from the LIVE store on
+/// `conn`, inside the caller's transaction. The tree is the root, the
+/// engine-resolved `descendants` journaled in the event, and every
+/// call-activity descendant reachable through the live store's parent edges
+/// and (when `archived`, i.e. the archive is attached as `terminal_archive`)
+/// the archive's — retention can prune an intermediate child into the archive
+/// while its descendants stay live, and the engine may have evicted ended
+/// children before resolving the event. Each recursive branch is an indexed
+/// parent lookup (`idx_process_instances_parent`, shared `SCHEMA`). The archive
+/// is only READ here, so the caller's transaction writes one file and commits
+/// atomically; when `enqueue`, every resolved key is queued in the
+/// archive-retraction outbox ([`ARCHIVE_RETRACTION_PREFIX`]) in that same
+/// transaction, for [`drain_archive_retractions`] to apply to the archive.
+fn retract_history_tree(
+    conn: &Connection,
+    archived: bool,
+    enqueue: bool,
+    key: Key,
+    descendants: &[Key],
+) -> rusqlite::Result<()> {
     let walk = if archived {
         "WITH RECURSIVE tree(k) AS ( \
            SELECT ?1 \
@@ -870,57 +996,47 @@ fn retract_history_tree(conn: &Connection, archived: bool, key: Key) -> rusqlite
              JOIN tree ON p.parent_process_instance_key = tree.k \
          ) SELECT k FROM tree"
     };
-    let tree: Vec<i64> = {
+    let mut tree: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
+    {
         let mut stmt = conn.prepare_cached(walk)?;
-        stmt.query_map(params![key as i64], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?
-    };
-    for k in tree {
+        for seed in std::iter::once(key).chain(descendants.iter().copied()) {
+            if tree.contains(&seed) {
+                continue;
+            }
+            for k in stmt.query_map(params![seed as i64], |r| r.get::<_, i64>(0))? {
+                tree.insert(k? as Key);
+            }
+        }
+    }
+    for &k in &tree {
         for (table, column) in PROCESS_INSTANCE_HISTORY_TABLES {
             conn.execute(
                 &format!("DELETE FROM main.{table} WHERE {column} = ?1"),
-                params![k],
+                params![k as i64],
             )?;
         }
-        if archived {
-            for table in TERMINAL_ARCHIVE_DEP_TABLES {
-                conn.execute(
-                    &format!("DELETE FROM terminal_archive.{table} WHERE instance_key = ?1"),
-                    params![k],
-                )?;
-            }
-            conn.execute(
-                "DELETE FROM terminal_archive.process_instances WHERE key = ?1",
-                params![k],
-            )?;
-        }
+    }
+    if enqueue {
+        enqueue_archive_retractions(conn, &tree.into_iter().collect::<Vec<_>>())?;
     }
     Ok(())
 }
 
-/// Removes the history of the given deleted instances — each instance and
-/// every call-activity descendant found by walking the union of the live store
-/// and the archive, plus their dependent rows — from both the live projection
-/// (via `conn`) and, when `archive` is `Some`, the durable terminal archive
-/// (#1948). Without this, a snapshot-gap recovery's
-/// [`ReadStore::replay_terminal_archive`] would resurrect deleted history and
-/// then advance the cursor past the deletion event. The caller runs it
-/// **before** committing the projection batch, so a failure fails the batch
-/// (the cursor does not advance and the deletion is re-projected) rather than
-/// leaving a deleted instance restorable.
+/// Removes the history of the given deleted instance trees from the live
+/// projection on `conn` (union walk over the live store and, when present, the
+/// archive) and queues them in the archive-retraction outbox in ONE main-store
+/// transaction, then drains the outbox into the archive (#1948). Without this,
+/// a snapshot-gap recovery's [`ReadStore::replay_terminal_archive`] would
+/// resurrect deleted history and then advance the cursor past the deletion
+/// event.
 fn delete_history_from_archive(
     conn: &Connection,
     archive: Option<&Path>,
-    keys: &[Key],
+    deletions: &[(Key, &[Key])],
 ) -> rusqlite::Result<()> {
-    if keys.is_empty() {
+    if deletions.is_empty() {
         return Ok(());
     }
-    // #1948 review: resolve ONE descendant keyset across the live store AND the
-    // archive before removing either copy. Retention can prune an intermediate
-    // child from the live store (it then lives only in the archive) while its
-    // grandchildren / leftover rows remain live — a walk over either store alone
-    // misses part of the tree. The union walk is then used to clear both.
     let archived = match archive {
         Some(a) if a.exists() => {
             attach_archive(conn, a)?;
@@ -930,9 +1046,9 @@ fn delete_history_from_archive(
     };
     let result = (|| -> rusqlite::Result<()> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        let body = keys
-            .iter()
-            .try_for_each(|&key| retract_history_tree(conn, archived, key));
+        let body = deletions.iter().try_for_each(|&(key, descendants)| {
+            retract_history_tree(conn, archived, archive.is_some(), key, descendants)
+        });
         match body {
             Ok(()) => conn.execute_batch("COMMIT"),
             Err(e) => {
@@ -944,7 +1060,8 @@ fn delete_history_from_archive(
     if archived {
         let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
     }
-    result
+    result?;
+    drain_archive_retractions(conn, archive)
 }
 
 /// Copies the given terminal instances (and their instance-scoped dependent rows)
@@ -2196,6 +2313,15 @@ impl ReadStore {
         // it is durable from the first boot of this fix (issue #831).
         if with_archive && path.is_some() {
             store.backfill_terminal_archive();
+            // #1948: finish any archive retraction a crash left queued.
+            let conn = store.conn.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = drain_archive_retractions(&conn, store.archive_path.as_deref()) {
+                tracing::warn!(
+                    error = %e,
+                    "failed to drain queued terminal-archive retractions at open \
+                     (#1948); archive replay retries before restoring history"
+                );
+            }
         }
         Ok(store)
     }
@@ -2255,8 +2381,7 @@ impl ReadStore {
                  version; rebuilding from scratch (live instances are recovered by the \
                  engine-snapshot reprojection, issue #732/#831)"
             );
-            drop_all_user_tables(conn)?;
-            create_fresh_schema(conn)?;
+            rebuild_schema_preserving_retractions(conn)?;
             return Ok(());
         }
         // Stamp version monotonically (never downgrade a database written by a
@@ -2425,9 +2550,9 @@ impl ReadStore {
         // `database is locked`.
         let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        drop_all_user_tables(&conn)?;
-        create_fresh_schema(&conn)?;
-        Ok(())
+        // #1948: a queued archive retraction survives the reset, so the archive
+        // replay that typically follows still honours the deletion.
+        rebuild_schema_preserving_retractions(&conn)
     }
 
     /// Projects a batch of consecutive journal `events` into the store in one
@@ -2443,25 +2568,39 @@ impl ReadStore {
         // common path (pruner idle) and a short wait when the pruner is active.
         let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        // #1948: a deletion must also retract the instance's history from the
-        // durable terminal archive, in the SAME transaction that advances the
-        // cursor (so a crash can never advance it past a deletion the archive
-        // would later resurrect) and at the deletion's own LOG POSITION (so a
+        // #1948: a deletion removes the live rows at its own LOG POSITION (so a
         // descendant projected earlier in this batch is reached through its
-        // still-present parent, and one projected later is unaffected). The
-        // archive is attached only for batches that carry a deletion.
+        // still-present parent) and queues the resolved tree in the
+        // archive-retraction outbox, all in the SAME main-store transaction
+        // that advances the cursor — one file, so crash-atomic. The archive is
+        // attached (read-only, for the union walk) only for batches that carry
+        // a deletion, and is retracted by the outbox drain after the commit.
+        let has_deletion = !history_deletions(events.iter().copied()).is_empty();
         let archived = match self.archive_path.as_deref() {
-            Some(a) if a.exists() && !history_deletions(events.iter().copied()).is_empty() => {
+            Some(a) if a.exists() && has_deletion => {
                 attach_archive(&conn, a)?;
                 true
             }
             _ => false,
         };
-        let result = Self::export_in(&mut conn, events, archived);
+        let enqueue = self.archive_path.is_some();
+        let result = Self::export_in(&mut conn, events, archived, enqueue);
         if archived {
             let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
         }
         let (terminal_keys, inflight_delta) = result?;
+        if has_deletion
+            && let Err(e) = drain_archive_retractions(&conn, self.archive_path.as_deref())
+        {
+            // The deletion is committed and queued; the outbox is drained again
+            // before anything can restore archived history (open / reset /
+            // archive replay), so this is retried, never lost.
+            tracing::warn!(
+                error = %e,
+                "failed to retract deleted history from the terminal archive \
+                 (#1948); queued for retry"
+            );
+        }
         // Durably archive any newly-terminal instances (issue #831) so their
         // audit history survives a below-floor snapshot reprojection, which can
         // only recover *live* instances from the engine snapshot. Best-effort: a
@@ -2487,14 +2626,15 @@ impl ReadStore {
     }
 
     /// The transactional core of [`Self::export`]: projects `events` in one
-    /// transaction and advances the cursor. When `archived` (the archive is
-    /// attached as `terminal_archive`), each history deletion is ALSO retracted
-    /// from the archive at its own log position, inside the same transaction
-    /// (#1948).
+    /// transaction and advances the cursor. Each history deletion retracts its
+    /// tree from the live store at its own log position (walking the archive
+    /// too when `archived`) and, when `enqueue`, queues it in the
+    /// archive-retraction outbox — inside the same transaction (#1948).
     fn export_in(
         conn: &mut Connection,
         events: &[&Event],
         archived: bool,
+        enqueue: bool,
     ) -> rusqlite::Result<(Vec<Key>, i64)> {
         let tx = conn.transaction()?;
         let mut terminal_keys = Vec::new();
@@ -2513,8 +2653,13 @@ impl ReadStore {
             .unwrap_or(0);
         for (i, &event) in events.iter().enumerate() {
             let position = base.max(0) as u64 + i as u64 + 1;
-            if archived && let Event::ProcessInstanceHistoryDeleted { instance_key } = event {
-                retract_history_tree(&tx, true, *instance_key)?;
+            if (archived || enqueue)
+                && let Event::ProcessInstanceHistoryDeleted {
+                    instance_key,
+                    descendant_keys,
+                } = event
+            {
+                retract_history_tree(&tx, archived, enqueue, *instance_key, descendant_keys)?;
             }
             let d = project(&tx, event, position, now)?;
             inflight_delta += d;
@@ -2639,6 +2784,9 @@ impl ReadStore {
         }
         let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // #1948: never restore history whose deletion is still queued for the
+        // archive — drain first, and fail closed if that is impossible.
+        drain_archive_retractions(&conn, Some(archive))?;
         attach_archive(&conn, archive)?;
         let restored = (|| -> rusqlite::Result<usize> {
             let pi_cols =
@@ -7181,33 +7329,17 @@ fn project_event(
             )?;
         }
 
-        Event::ProcessInstanceHistoryDeleted { instance_key } => {
-            // #1948: remove an ENDED instance's history — the instance row, every
-            // descendant (call-activity child) instance, and all their
-            // instance-scoped rows. The engine already rejected a live instance,
-            // so this only ever retracts finished history. Idempotent: a replay,
-            // or a shard that never held the instance, deletes nothing.
-            // Resolve the instance + its descendants once (indexed walk), then
-            // clear each table by key.
-            let tree: Vec<i64> = {
-                let mut stmt = tx.prepare_cached(
-                    "WITH RECURSIVE tree(k) AS ( \
-                       SELECT ?1 \
-                       UNION SELECT p.key FROM process_instances p \
-                         JOIN tree ON p.parent_process_instance_key = tree.k \
-                     ) SELECT k FROM tree",
-                )?;
-                stmt.query_map(params![*instance_key as i64], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?
-            };
-            for key in tree {
-                for (table, column) in PROCESS_INSTANCE_HISTORY_TABLES {
-                    tx.cexecute(
-                        &format!("DELETE FROM {table} WHERE {column} = ?1"),
-                        params![key],
-                    )?;
-                }
-            }
+        Event::ProcessInstanceHistoryDeleted {
+            instance_key,
+            descendant_keys,
+        } => {
+            // #1948: remove an ENDED instance tree's history — the instance row,
+            // every descendant (call-activity child) instance, and all their
+            // instance-scoped rows. The engine already rejected a live tree, so
+            // this only ever retracts finished history. Idempotent: a replay,
+            // or a shard that never held the instance, deletes nothing. One
+            // canonical implementation, shared with the archive-aware export.
+            retract_history_tree(tx, false, false, *instance_key, descendant_keys)?;
         }
 
         Event::ProcessInstanceMigrated {
@@ -17819,7 +17951,10 @@ mod history_deletion_tests {
             ];
             store.export(&events.iter().collect::<Vec<_>>()).unwrap();
             store
-                .export(&[&Event::ProcessInstanceHistoryDeleted { instance_key: 10 }])
+                .export(&[&Event::ProcessInstanceHistoryDeleted {
+                    instance_key: 10,
+                    descendant_keys: vec![],
+                }])
                 .unwrap();
             assert!(store.process_instance(10).is_none());
             assert!(store.process_instance(20).is_none());
@@ -17881,7 +18016,10 @@ mod history_deletion_tests {
             store
                 .export(&[
                     &Event::ProcessInstanceTerminated { instance_key: 10 },
-                    &Event::ProcessInstanceHistoryDeleted { instance_key: 10 },
+                    &Event::ProcessInstanceHistoryDeleted {
+                        instance_key: 10,
+                        descendant_keys: vec![],
+                    },
                 ])
                 .unwrap();
             assert!(store.process_instance(10).is_none());
@@ -17920,7 +18058,10 @@ mod history_deletion_tests {
             let tail = [
                 created(40, Some(20)),
                 Event::ProcessInstanceCompleted { instance_key: 40 },
-                Event::ProcessInstanceHistoryDeleted { instance_key: 10 },
+                Event::ProcessInstanceHistoryDeleted {
+                    instance_key: 10,
+                    descendant_keys: vec![],
+                },
             ];
             store.export(&tail.iter().collect::<Vec<_>>()).unwrap();
             for k in [10, 20, 40] {
@@ -17986,7 +18127,10 @@ mod history_deletion_tests {
                 Event::ProcessInstanceCompleted { instance_key: 30 },
             ];
             store.export(&events.iter().collect::<Vec<_>>()).unwrap();
-            let tail = [Event::ProcessInstanceHistoryDeleted { instance_key: 10 }];
+            let tail = [Event::ProcessInstanceHistoryDeleted {
+                instance_key: 10,
+                descendant_keys: vec![],
+            }];
             store.reset().unwrap();
             store.replay_terminal_archive().unwrap();
             assert!(store.process_instance(10).is_some());
@@ -18003,5 +18147,147 @@ mod history_deletion_tests {
             assert!(store.process_instance(30).is_some());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pending(store: &ReadStore) -> Vec<u64> {
+        let conn = store.conn.lock().unwrap();
+        super::pending_archive_retractions(&conn).unwrap()
+    }
+
+    /// #1948 crash-consistency: the main store commits the deletion, the
+    /// cursor advance and the archive-retraction outbox atomically; a crash
+    /// BEFORE the archive retraction commits (injected) leaves the outbox
+    /// queued. Archive replay without draining fails closed, and a restart
+    /// drains the outbox, so the deleted tree is never resurrected.
+    #[test]
+    fn crash_between_live_delete_and_archive_retraction_is_consistent_after_restart() {
+        let dir = history_del_dir("crash");
+        let path = dir.join("read-model.sqlite");
+        let prefix = [
+            created(10, None),
+            created(20, Some(10)),
+            Event::ProcessInstanceCompleted { instance_key: 20 },
+            Event::ProcessInstanceTerminated { instance_key: 10 },
+        ];
+        {
+            let store = ReadStore::open(Some(&path)).unwrap();
+            store.export(&prefix.iter().collect::<Vec<_>>()).unwrap();
+            super::FAIL_ARCHIVE_DRAIN.with(|f| f.set(true));
+            store
+                .export(&[&Event::ProcessInstanceHistoryDeleted {
+                    instance_key: 10,
+                    descendant_keys: vec![20],
+                }])
+                .unwrap();
+            assert_eq!(store.exported_position(), prefix.len() + 1);
+            for k in [10, 20] {
+                assert!(store.process_instance(k).is_none(), "{k} left live");
+            }
+            assert_eq!(pending(&store), vec![10, 20], "outbox not queued");
+            // Recovery while the archive is still unwritable: the queued
+            // retraction survives the reset and replay fails closed rather than
+            // restoring deleted history.
+            store.reset().unwrap();
+            assert_eq!(pending(&store), vec![10, 20], "reset lost the outbox");
+            assert!(store.replay_terminal_archive().is_err());
+            for k in [10, 20] {
+                assert!(store.process_instance(k).is_none(), "{k} resurrected");
+            }
+            super::FAIL_ARCHIVE_DRAIN.with(|f| f.set(false));
+        }
+        {
+            // Restart: open drains the outbox into the archive.
+            let store = ReadStore::open(Some(&path)).unwrap();
+            assert!(pending(&store).is_empty(), "open did not drain");
+            store.reset().unwrap();
+            store.replay_terminal_archive().unwrap();
+            for k in [10, 20] {
+                assert!(store.process_instance(k).is_none(), "{k} resurrected");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948 replay contract: re-delivering an overlapping journal range that
+    /// starts BEFORE the deletion (creation, completion, then the deletion
+    /// event itself) transiently re-projects the rows and converges to the
+    /// deleted state once the range's deletion event applies — the deletion is
+    /// just another event in the log.
+    #[test]
+    fn overlapping_replay_from_before_the_deletion_converges() {
+        let store = ReadStore::open(None).unwrap();
+        let journal = [
+            created(10, None),
+            created(20, Some(10)),
+            Event::ProcessInstanceCompleted { instance_key: 20 },
+            Event::ProcessInstanceTerminated { instance_key: 10 },
+            Event::ProcessInstanceHistoryDeleted {
+                instance_key: 10,
+                descendant_keys: vec![20],
+            },
+        ];
+        let refs: Vec<&Event> = journal.iter().collect();
+        store.export(&refs).unwrap();
+        store.export(&refs).unwrap();
+        for k in [10, 20] {
+            assert_eq!(total_rows(&store, k), 0, "{k} resurrected by replay");
+        }
+    }
+
+    /// #1948 reseed resurrection guard: the engine apply of the deletion event
+    /// removes the ended instance from engine state, so the snapshot-gap
+    /// recovery's `seed_from_engine_state` (which reseeds from that state after
+    /// the deletion event is compacted away) cannot bring it back.
+    #[test]
+    fn reseed_from_engine_state_after_deletion_does_not_resurrect() {
+        let def = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("t", "work")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let ev = engine.apply_command(Command::create_instance("p")).unwrap();
+        let key = ev.iter().find_map(|e| e.instance_key()).unwrap();
+        engine.apply_command(Command::cancel_instance(key)).unwrap();
+        // Control: before the deletion, the terminal shell reseeds.
+        let before = ReadStore::open(None).unwrap();
+        before.seed_from_engine_state(engine.state()).unwrap();
+        assert!(before.process_instance(key).is_some(), "shell not reseeded");
+        engine
+            .apply_command(Command::DeleteProcessInstanceHistory { instance_key: key })
+            .unwrap();
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(engine.state()).unwrap();
+        assert_eq!(
+            total_rows(&store, key),
+            0,
+            "reseed resurrected deleted history"
+        );
+    }
+
+    /// The engine-resolved `descendant_keys` journaled in the event are
+    /// deleted even when the read model lacks the parent edge to them (e.g.
+    /// an ancestor row was never projected on this shard).
+    #[test]
+    fn journaled_descendant_keys_are_deleted_without_a_parent_edge() {
+        let store = ReadStore::open(None).unwrap();
+        let events = [
+            created(10, None),
+            created(20, None),
+            Event::ProcessInstanceCompleted { instance_key: 20 },
+            Event::ProcessInstanceTerminated { instance_key: 10 },
+            Event::ProcessInstanceHistoryDeleted {
+                instance_key: 10,
+                descendant_keys: vec![20],
+            },
+        ];
+        store.export(&events.iter().collect::<Vec<_>>()).unwrap();
+        for k in [10, 20] {
+            assert_eq!(total_rows(&store, k), 0, "{k} left behind");
+        }
     }
 }

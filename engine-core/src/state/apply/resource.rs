@@ -149,9 +149,17 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
             // instance rows. No core engine state to mutate.
         }
 
-        Event::ProcessInstanceHistoryDeleted { .. } => {
-            // Audit/projection-only (#1948): the read model deletes the ended
-            // instance's history. No core engine state to mutate.
+        Event::ProcessInstanceHistoryDeleted {
+            instance_key,
+            descendant_keys,
+        } => {
+            // Event-sourced deletion (#1948): remove the ended tree from engine
+            // state so no snapshot carries it and a reseed from engine state
+            // cannot resurrect it. Idempotent for keys already absent.
+            let victims: std::collections::BTreeSet<_> = std::iter::once(*instance_key)
+                .chain(descendant_keys.iter().copied())
+                .collect();
+            state.purge_instance_tree(&victims);
         }
 
         // Cluster variables (#1657): replicated configuration state, folded
