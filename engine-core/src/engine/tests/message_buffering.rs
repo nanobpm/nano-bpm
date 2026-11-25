@@ -2048,3 +2048,88 @@ fn reservation_is_released_when_the_subscription_closes_mid_flight() {
     let second = rig.create("ni", &order, 3_000);
     assert_eq!(correlated(&rig, second), published);
 }
+
+fn two_non_interrupting_esps() -> ProcessDefinition {
+    use crate::model::EventSubProcessTrigger as Trig;
+    let trig = || Trig::Message {
+        message_name: "m".into(),
+        correlation_key: "orderId".into(),
+    };
+    ProcessBuilder::new("two")
+        .start_event("s")
+        .service_task("work", "work")
+        .end_event("e")
+        .connect("s", "work")
+        .connect("work", "e")
+        .event_sub_process("esp1", "s1", trig(), false)
+        .start_event("s1")
+        .end_event("e1")
+        .connect("s1", "e1")
+        .contained_in("s1", "esp1")
+        .contained_in("e1", "esp1")
+        .event_sub_process("esp2", "s2", trig(), false)
+        .start_event("s2")
+        .end_event("e2")
+        .connect("s2", "e2")
+        .contained_in("s2", "esp2")
+        .contained_in("e2", "esp2")
+        .build()
+        .unwrap()
+}
+
+/// Copilot e8o (#1949) reservation release floor: A reserves M1, B (same
+/// instance, name and key) skips it and reserves M2. A's delivery is
+/// answered unconsumed (deferred while suspended), releasing M1 while B
+/// still awaits its ack. When B's consumed ack arrives, its scan must not
+/// resume past M1: B is offered M1 next (oldest first), not M3 — and every
+/// message is still taken exactly once by the instance.
+#[test]
+fn a_release_during_a_sibling_ack_is_not_skipped_by_its_cursor() {
+    let (mut rig, order) = Rig::new(two_non_interrupting_esps());
+    let published = rig.publish_backlog(&order, 3);
+    let (instance_key, held) = rig.create_holding("two", &order, 2_000, &is_delivery);
+    assert_eq!(held.len(), 2, "one delivery per subscription");
+    let b_sub = match &held[1].1 {
+        Command::CorrelateMessageSubscription {
+            subscription_key, ..
+        } => *subscription_key,
+        other => panic!("{other:?}"),
+    };
+    rig.run(false, Command::SuspendInstance { instance_key }, 2_001);
+    let mut held = held.into_iter();
+    let (a_to, a) = held.next().unwrap();
+    let (b_to, b) = held.next().unwrap();
+    // A's delivery is deferred (unconsumed): M1 released while B awaits.
+    let mut later = rig.run_holding(a_to, a, 2_002, &is_delivery);
+    assert!(rig
+        .message
+        .state()
+        .message_subscriptions
+        .values()
+        .any(|s| s.rescan_from.is_some()));
+    // Resume, holding its handshake so A does not retake M1 first.
+    later.extend(rig.run_holding(
+        false,
+        Command::ResumeInstance { instance_key },
+        2_003,
+        &|c| matches!(c, Command::ResumeMessageSubscription { .. }),
+    ));
+    // B consumes M2; its next offer is the released M1.
+    let before = rig.trace.len();
+    rig.run(b_to, b, 2_004);
+    let next_for_b = rig.trace[before..].iter().find_map(|e| match e {
+        Event::RemoteMessageCorrelation {
+            subscription_key,
+            message_key,
+            ..
+        } if *subscription_key == b_sub => Some(*message_key),
+        _ => None,
+    });
+    assert_eq!(next_for_b, Some(published[0]), "{:?}", rig.trace);
+    for (to, command) in later {
+        rig.run(to, command, 2_005);
+    }
+    let mut taken = correlated(&rig, instance_key);
+    taken.sort_unstable();
+    assert_eq!(taken, published, "each message exactly once");
+}
