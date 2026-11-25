@@ -7695,6 +7695,9 @@ fn project_event(
         | Event::MessageSubscriptionResuming { .. }
         | Event::MessageSubscriptionResumed { .. }
         | Event::MessageSubscriptionResumeConfirmed { .. }
+        // Receipt settlement (#1949) is ledger bookkeeping.
+        | Event::MessageCorrelationSettled { .. }
+        | Event::MessageCorrelationReceiptSettled { .. }
         // The activation latch (#1949) is partition bookkeeping.
         | Event::RemoteBufferedDeliveryActivated { .. }
         | Event::MessageSubscriptionClosing { .. }

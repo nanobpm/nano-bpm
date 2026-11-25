@@ -142,6 +142,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::MessageCorrelationAcknowledged { .. }
         | Event::MessageCorrelationAcknowledging { .. }
         | Event::MessageSubscriptionResumeConfirmed { .. }
+        | Event::MessageCorrelationReceiptSettled { .. }
         | Event::RemoteBufferedDeliveryActivated { .. }
         | Event::MessageStartSubscriptionCreated { .. }
         | Event::RoutedDeliveryRecorded { .. } => subscription::apply_subscription(state, event),
@@ -150,7 +151,9 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::MessageStartEventCorrelated { .. } => {}
         // The resume handshake (#1949) is a routing record only: the state it
         // re-offers lives on the message partition.
-        Event::MessageSubscriptionResuming { .. } | Event::MessageSubscriptionResumed { .. } => {}
+        Event::MessageSubscriptionResuming { .. }
+        | Event::MessageSubscriptionResumed { .. }
+        | Event::MessageCorrelationSettled { .. } => {}
         // A Raft applied-entry record (#1405): state-neutral bookkeeping the
         // replay loop folds into the engine's `raft_applied` (see
         // `Engine::replay_partition` / `apply_replayed_events`); it mutates no

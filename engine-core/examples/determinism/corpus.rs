@@ -1279,7 +1279,21 @@ fn routed_protocol_entries() -> Vec<Command> {
         "a stale confirmation is a no-op: {confirmed:?}"
     );
 
-    vec![opening, continuation, close, ack, resume, confirm]
+    // (9): a stale receipt settlement (#1949) on the instance partition —
+    // no receipt is pinned for this delivery, so it is a no-op.
+    let settle = Command::SettleMessageCorrelationReceipt {
+        subscription_key,
+        delivery_key: 0,
+    };
+    let settled = instance_partition
+        .apply_command_at(settle.clone(), T0 + 9)
+        .expect("a receipt settlement applies on the instance partition");
+    assert!(
+        settled.is_empty(),
+        "a stale settlement is a no-op: {settled:?}"
+    );
+
+    vec![opening, continuation, close, ack, resume, confirm, settle]
 }
 
 /// The [`Command::kind`] of every corpus entry (coverage evidence).

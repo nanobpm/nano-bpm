@@ -2286,13 +2286,23 @@ pub const SETTLED_JOB_LEDGER_CAP: usize = 65_536;
 /// dropped token on a still-live job remains fenced by [`Job::settled_tokens`].
 pub const SETTLED_TOKENS_PER_JOB_CAP: usize = 8;
 
-/// Upper bound on [`State::routed_deliveries`] (#1497). Beyond it the entries
-/// this partition **applied earliest** are dropped (FIFO in the recipient's own
-/// applied order — never by key value: keys sort by source partition first, so
-/// key-order eviction would let a fresh delivery from a low partition evict
-/// itself the moment it is recorded). A re-delivery that old degrades to the
-/// pre-#1497 answer (applied again), never to a lost first delivery — the same
+/// Upper bound on the **settled** entries of [`State::routed_deliveries`]
+/// (#1497). Beyond it the settled entries this partition **applied earliest**
+/// are dropped (FIFO in the recipient's own applied order — never by key
+/// value: keys sort by source partition first, so key-order eviction would let
+/// a fresh delivery from a low partition evict itself the moment it is
+/// recorded). A re-delivery that old degrades to the pre-#1497 answer (applied
+/// again), never to a lost first delivery — the same
 /// degrade-to-previous-behaviour rule as [`SETTLED_JOB_LEDGER_CAP`].
+///
+/// An entry carrying an **unsettled receipt** (#1949) is exempt: it is
+/// pinned outside the cap until the message partition confirms it applied the
+/// ack ([`crate::Event::MessageCorrelationReceiptSettled`]). Until then the
+/// sender may still re-drive the delivery, and answering it from current state
+/// instead of the receipt could release a reservation the token already
+/// consumed — a duplicate correlation, not a degraded dedup. The pinned set is
+/// bounded by the deliveries still awaiting their ack on a message partition
+/// (at most one per subscription).
 pub const ROUTED_DELIVERY_LEDGER_CAP: usize = 65_536;
 
 /// One routed-delivery ledger entry (#1497): the source-minted `delivery_key`
@@ -2332,6 +2342,16 @@ pub struct CorrelationReceipt {
     pub accepted: bool,
     pub consumed: bool,
     pub deferred: bool,
+    /// The delivered message (the routing data of the ack, so a pinned
+    /// receipt can re-drive its answer until it is settled). Additive.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub message_key: Key,
+    /// The instance the delivery targeted. Additive.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub instance_key: Key,
+    /// The message partition awaiting the ack. Additive.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub target_partition: u64,
 }
 
 /// The routed-delivery ledger (#1497): dedup set + applied-order FIFO + a
@@ -2339,7 +2359,7 @@ pub struct CorrelationReceipt {
 /// (the only mutator). Derived solely from replicated
 /// [`crate::Event::RoutedDeliveryRecorded`] records applied in log order, so
 /// every replica — and every snapshot/replay — holds the identical ledger.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
@@ -2358,9 +2378,34 @@ pub struct RoutedDeliveries {
     /// from `order`): an O(1) lookup instead of a ledger scan per open.
     tombstones: std::collections::BTreeMap<Key, Key>,
     /// `delivery_key -> receipt` of every retained entry carrying one
-    /// (derived from `order`, #1949).
+    /// (derived from `order`, #1949). Exactly the **unsettled, pinned**
+    /// entries: settling a receipt removes it (see [`Self::settle_receipt`]).
     receipts: std::collections::BTreeMap<Key, CorrelationReceipt>,
+    /// Upper bound on the settled (unpinned) entries. Not serialized: a
+    /// restored ledger uses [`ROUTED_DELIVERY_LEDGER_CAP`].
+    cap: usize,
 }
+
+impl Default for RoutedDeliveries {
+    fn default() -> Self {
+        Self {
+            order: std::collections::VecDeque::new(),
+            keys: std::collections::BTreeSet::new(),
+            tombstones: std::collections::BTreeMap::new(),
+            receipts: std::collections::BTreeMap::new(),
+            cap: ROUTED_DELIVERY_LEDGER_CAP,
+        }
+    }
+}
+
+impl PartialEq for RoutedDeliveries {
+    /// The cap is configuration, not replicated state.
+    fn eq(&self, other: &Self) -> bool {
+        self.order == other.order
+    }
+}
+
+impl Eq for RoutedDeliveries {}
 
 impl RoutedDeliveries {
     /// Whether `delivery_key` was already applied (and is still retained).
@@ -2382,13 +2427,28 @@ impl RoutedDeliveries {
         self.order.iter()
     }
     /// The durable answer recorded for ack-paced delivery `delivery_key`
-    /// (#1949), while its entry is retained.
+    /// (#1949), while it is unsettled (pinned).
     pub fn receipt(&self, delivery_key: Key) -> Option<CorrelationReceipt> {
         self.receipts.get(&delivery_key).copied()
     }
-    /// Attach `receipt` to the retained entry for `delivery_key` (#1949).
-    /// First write wins: a receipt, once recorded, is the delivery's
-    /// immutable outcome. A key not (or no longer) retained is a no-op.
+    /// Every unsettled receipt, `(delivery_key, subscription_key, receipt)`,
+    /// in applied order (#1949).
+    pub fn unsettled_receipts(&self) -> impl Iterator<Item = (Key, Key, CorrelationReceipt)> + '_ {
+        self.order.iter().filter_map(|e| {
+            e.receipt
+                .map(|r| (e.delivery_key, e.subscription_key.unwrap_or(0), r))
+        })
+    }
+    /// Overrides the settled-entry cap (tests exercise eviction with a small
+    /// one; production uses [`ROUTED_DELIVERY_LEDGER_CAP`]).
+    pub fn set_cap(&mut self, cap: usize) {
+        self.cap = cap;
+        self.evict();
+    }
+    /// Attach `receipt` to the retained entry for `delivery_key` (#1949),
+    /// pinning it outside the cap until [`Self::settle_receipt`]. First write
+    /// wins: a receipt, once recorded, is the delivery's immutable outcome. A
+    /// key not (or no longer) retained is a no-op.
     pub fn set_receipt(&mut self, delivery_key: Key, receipt: CorrelationReceipt) {
         if !self.keys.contains(&delivery_key) || self.receipts.contains_key(&delivery_key) {
             return;
@@ -2399,15 +2459,35 @@ impl RoutedDeliveries {
             .order
             .iter_mut()
             .rev()
-            .find(|e| e.delivery_key == delivery_key)
+            .find(|e| e.delivery_key == delivery_key && e.receipt.is_none())
         {
             entry.receipt = Some(receipt);
             self.receipts.insert(delivery_key, receipt);
+            self.evict();
         }
     }
-    /// Record an applied delivery, evicting the earliest-APPLIED entries
-    /// beyond `cap`. A key already present is a no-op (never re-ordered).
-    pub fn record(&mut self, entry: RoutedDelivery, cap: usize) {
+    /// The message partition applied the ack of `delivery_key` (#1949): no
+    /// re-drive of it can change a reservation any more (a late duplicate's
+    /// ack is ignored there), so its receipt is dropped and the entry becomes
+    /// an ordinary, cap-bounded dedup entry. Returns whether it was pinned.
+    pub fn settle_receipt(&mut self, delivery_key: Key) -> bool {
+        if self.receipts.remove(&delivery_key).is_none() {
+            return false;
+        }
+        if let Some(entry) = self
+            .order
+            .iter_mut()
+            .find(|e| e.delivery_key == delivery_key)
+        {
+            entry.receipt = None;
+        }
+        self.evict();
+        true
+    }
+    /// Record an applied delivery, evicting the earliest-APPLIED settled
+    /// entries beyond the cap. A key already present is a no-op (never
+    /// re-ordered).
+    pub fn record(&mut self, entry: RoutedDelivery) {
         if !self.keys.insert(entry.delivery_key) {
             return;
         }
@@ -2420,12 +2500,19 @@ impl RoutedDeliveries {
             self.receipts.insert(entry.delivery_key, receipt);
         }
         self.order.push_back(entry);
-        while self.order.len() > cap {
-            let Some(old) = self.order.pop_front() else {
+        self.evict();
+    }
+    /// Drops the earliest-applied SETTLED entries while more than `cap` are
+    /// retained. A pinned (unsettled-receipt) entry is never evicted.
+    fn evict(&mut self) {
+        while self.order.len() - self.receipts.len() > self.cap {
+            let Some(i) = self.order.iter().position(|e| e.receipt.is_none()) else {
+                break;
+            };
+            let Some(old) = self.order.remove(i) else {
                 break;
             };
             self.keys.remove(&old.delivery_key);
-            self.receipts.remove(&old.delivery_key);
             if let Some(sub) = old.subscription_key {
                 if self.tombstones.get(&sub) == Some(&old.delivery_key) {
                     self.tombstones.remove(&sub);
@@ -2439,10 +2526,14 @@ impl RoutedDeliveries {
 /// load, so a snapshot can never carry an index that drifted from `order`.
 impl From<std::collections::VecDeque<RoutedDelivery>> for RoutedDeliveries {
     fn from(order: std::collections::VecDeque<RoutedDelivery>) -> Self {
-        let mut l = Self::default();
+        let mut l = Self {
+            cap: usize::MAX,
+            ..Self::default()
+        };
         for e in order {
-            l.record(e, usize::MAX);
+            l.record(e);
         }
+        l.cap = ROUTED_DELIVERY_LEDGER_CAP;
         l
     }
 }
@@ -2453,9 +2544,9 @@ impl From<RoutedDeliveries> for std::collections::VecDeque<RoutedDelivery> {
     }
 }
 
-/// Record a routed delivery in `state`'s ledger (bounded by `cap`).
-pub fn record_routed_delivery(state: &mut State, entry: RoutedDelivery, cap: usize) {
-    state.routed_deliveries.record(entry, cap);
+/// Record a routed delivery in `state`'s ledger (bounded by its cap).
+pub fn record_routed_delivery(state: &mut State, entry: RoutedDelivery) {
+    state.routed_deliveries.record(entry);
 }
 
 /// Record a settlement in the ledger, evicting the oldest entries beyond `cap`.

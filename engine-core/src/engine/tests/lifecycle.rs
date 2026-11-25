@@ -8463,6 +8463,7 @@ fn allocator_fold_is_not_masked_by_a_foreign_max_key() {
 fn routed_delivery_ledger_evicts_in_applied_order() {
     let mut ledger = state::RoutedDeliveries::default();
     let cap = 4;
+    ledger.set_cap(cap);
     let entry = |k, close: bool| state::RoutedDelivery {
         delivery_key: k,
         subscription_key: Some(k + 1000),
@@ -8470,10 +8471,10 @@ fn routed_delivery_ledger_evicts_in_applied_order() {
         receipt: None,
     };
     for i in 1..=cap as u64 {
-        ledger.record(entry(state::compose_key(3, i), true), cap);
+        ledger.record(entry(state::compose_key(3, i), true));
     }
     let fresh_low = state::compose_key(0, 1);
-    ledger.record(entry(fresh_low, false), cap);
+    ledger.record(entry(fresh_low, false));
     assert!(ledger.contains(fresh_low), "fresh delivery evicted itself");
     assert_eq!(ledger.len(), cap, "bounded");
     // The earliest-applied entry (and its tombstone index) went instead.
@@ -8485,7 +8486,7 @@ fn routed_delivery_ledger_evicts_in_applied_order() {
     );
     assert!(ledger.is_tombstoned(state::compose_key(3, 2) + 1000));
     // A duplicate record is a no-op (no reorder, no growth).
-    ledger.record(entry(state::compose_key(3, 2), true), cap);
+    ledger.record(entry(state::compose_key(3, 2), true));
     assert_eq!(ledger.len(), cap);
     assert_eq!(
         ledger.iter().next().map(|e| e.delivery_key),
@@ -8502,15 +8503,12 @@ fn routed_delivery_ledger_evicts_in_applied_order() {
 fn routed_delivery_ledger_round_trips_with_indexes() {
     let mut ledger = state::RoutedDeliveries::default();
     for (k, close) in [(9, false), (3, true), (7, false)] {
-        ledger.record(
-            state::RoutedDelivery {
-                delivery_key: k,
-                subscription_key: Some(k * 10),
-                close_tombstone: close,
-                receipt: None,
-            },
-            usize::MAX,
-        );
+        ledger.record(state::RoutedDelivery {
+            delivery_key: k,
+            subscription_key: Some(k * 10),
+            close_tombstone: close,
+            receipt: None,
+        });
     }
     let json = serde_json::to_string(&ledger).unwrap();
     let back: state::RoutedDeliveries = serde_json::from_str(&json).unwrap();

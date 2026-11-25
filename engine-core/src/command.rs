@@ -653,6 +653,17 @@ pub enum Command {
         #[cfg_attr(feature = "serde", serde(default))]
         generation: u64,
     },
+    /// The message partition's confirmation (#1949), applied on the
+    /// **instance** partition (routed from
+    /// [`crate::Event::MessageCorrelationSettled`]), that it applied — or no
+    /// longer awaits — the ack of `delivery_key`: no re-drive of that
+    /// delivery can change its reservation any more, so the instance
+    /// partition unpins the delivery's receipt. Idempotent: a no-op unless
+    /// the receipt is still pinned.
+    SettleMessageCorrelationReceipt {
+        subscription_key: Key,
+        delivery_key: Key,
+    },
     /// Close a canonical subscription on the message partition because the
     /// instance disarmed it (the guarded activity left the flow, the instance was
     /// cancelled, or a sibling boundary fired). Routed by the host after the
@@ -1360,6 +1371,13 @@ impl Command {
                 h.str(if *consumed { "1" } else { "0" });
                 h.str(if *deferred { "1" } else { "0" });
             }
+            Command::SettleMessageCorrelationReceipt {
+                subscription_key,
+                delivery_key,
+            } => {
+                h.key(*subscription_key);
+                h.key(*delivery_key);
+            }
             Command::ResumeMessageSubscription {
                 subscription_key,
                 generation,
@@ -1477,6 +1495,7 @@ impl Command {
             Command::AcknowledgeMessageCorrelation { .. } => "acknowledge_message_correlation",
             Command::ResumeMessageSubscription { .. } => "resume_message_subscription",
             Command::ConfirmMessageSubscriptionResume { .. } => "confirm_subscription_resume",
+            Command::SettleMessageCorrelationReceipt { .. } => "settle_correlation_receipt",
             Command::CancelInstance { .. } => "cancel_instance",
             Command::SuspendInstance { .. } => "suspend_instance",
             Command::ResumeInstance { .. } => "resume_instance",

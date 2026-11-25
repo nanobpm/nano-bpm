@@ -204,6 +204,10 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
             reason: "internal cross-partition resume confirmation; \
                  single-partition test engine never paces",
         },
+        Command::SettleMessageCorrelationReceipt { .. } => Surface::NotSurfaced {
+            reason: "internal cross-partition settlement of a paced delivery's receipt; \
+                 single-partition test engine never paces",
+        },
         Command::AcknowledgeMessageCorrelation { .. } => Surface::NotSurfaced {
             reason: "internal cross-partition ack of a paced buffered delivery; single-partition \
                  test engine never paces",

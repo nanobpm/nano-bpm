@@ -529,7 +529,8 @@ impl StalledDeliveries {
     /// previous pass (by `(subscription_key, delivery_key)`); remembers `now`
     /// for the next pass. A pending resume handshake (#1949,
     /// `Engine::pending_resume_handshakes`) is paced the same way, keyed by
-    /// `(subscription_key, 0)` (a real delivery key is never `0`). Any other
+    /// `(subscription_key, 0)` (a real delivery key is never `0`), and so is
+    /// an unsettled ack (`Engine::pending_unsettled_receipts`). Any other
     /// event is ignored.
     pub(crate) fn due(&self, now: Vec<Event>) -> Vec<Event> {
         let identity = |event: &Event| match event {
@@ -542,6 +543,14 @@ impl StalledDeliveries {
             Event::MessageSubscriptionResuming {
                 subscription_key, ..
             } => Some((*subscription_key, 0)),
+            // An unsettled answer (#1949, `Engine::pending_unsettled_receipts`)
+            // or the release of an orphaned reservation: keyed like the
+            // delivery it answers.
+            Event::MessageCorrelationAcknowledging {
+                subscription_key,
+                delivery_key,
+                ..
+            } => Some((*subscription_key, *delivery_key)),
             _ => None,
         };
         let mut previous = self.previous.lock().unwrap_or_else(|e| e.into_inner());

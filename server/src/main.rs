@@ -12373,8 +12373,9 @@ impl ServerImpl {
 
     /// The ack-paced buffered deliveries (#1949) still awaiting their ack on
     /// every partition this node writes (leads under Raft, owns otherwise),
-    /// plus the resume handshakes still owed after a deferral, rebuilt from
-    /// durable engine state.
+    /// plus the resume handshakes still owed after a deferral and the
+    /// answers whose settlement is still unseen (pinned receipts), rebuilt
+    /// from durable engine state.
     async fn in_flight_buffered_deliveries(&self) -> Vec<Event> {
         let topology = self.engine.topology();
         let mut in_flight = Vec::new();
@@ -12390,6 +12391,7 @@ impl ServerImpl {
                     let engine = journal.engine();
                     let mut events = engine.pending_buffered_deliveries();
                     events.extend(engine.pending_resume_handshakes());
+                    events.extend(engine.pending_unsettled_receipts());
                     events
                 })
                 .await
@@ -12603,6 +12605,20 @@ impl ServerImpl {
                     generation: *generation,
                 },
             )),
+            // The message partition's settlement of an ack (#1949) goes back
+            // to the instance's partition (the subscription key was minted
+            // there), unpinning the delivery's receipt.
+            Event::MessageCorrelationSettled {
+                subscription_key,
+                delivery_key,
+                ..
+            } => Some((
+                nanobpmn_engine_core::partition_of(*subscription_key),
+                Command::SettleMessageCorrelationReceipt {
+                    subscription_key: *subscription_key,
+                    delivery_key: *delivery_key,
+                },
+            )),
             Event::MessageSubscriptionClosing {
                 subscription_key,
                 instance_key,
@@ -12706,6 +12722,7 @@ impl ServerImpl {
                 Command::AcknowledgeMessageCorrelation { .. }
                     | Command::ResumeMessageSubscription { .. }
                     | Command::ConfirmMessageSubscriptionResume { .. }
+                    | Command::SettleMessageCorrelationReceipt { .. }
             )
     }
 

@@ -171,6 +171,7 @@ impl Engine {
             | Command::AcknowledgeMessageCorrelation { .. }
             | Command::ResumeMessageSubscription { .. }
             | Command::ConfirmMessageSubscriptionResume { .. }
+            | Command::SettleMessageCorrelationReceipt { .. }
             | Command::SuspendInstance { .. }
             | Command::ResumeInstance { .. }
             | Command::DispatchStartInstance { .. }

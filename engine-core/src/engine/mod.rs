@@ -5582,6 +5582,21 @@ impl Engine {
                 consumed,
                 deferred,
             } => {
+                // Either way — applied now, or a duplicate / stale ack of a
+                // delivery no longer awaited — no re-drive of this delivery
+                // can change its reservation any more, so the instance
+                // partition may unpin its receipt (#1949). Emitted for a
+                // duplicate too: that is how a lost settlement is re-driven.
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::MessageCorrelationSettled {
+                            subscription_key,
+                            delivery_key,
+                            partition: self.partition_id,
+                        },
+                    );
+                }
                 // Idempotent: only the exact delivery this subscription awaits
                 // (message AND delivery key) is acknowledged; a duplicate or a
                 // delayed ack of an earlier delivery of the same message is a
@@ -5606,6 +5621,11 @@ impl Engine {
                 // A reservation released while this subscription awaited its
                 // own ack (#1949): read before the ack's apply clears it.
                 let rescan_from = subscription.rescan_from;
+                // The reserved message is gone (the self-routed release of an
+                // orphaned reservation, see `pending_buffered_deliveries`):
+                // the subscription is offered its backlog again even though
+                // the release keeps it open like a deferral.
+                let orphaned = !self.state.buffered_messages.contains_key(&message_key);
                 self.emit(
                     &mut log,
                     Event::MessageCorrelationAcknowledged {
@@ -5680,7 +5700,7 @@ impl Engine {
                 // buffered message on this command's quiescent pass. A
                 // deferred (suspended) subscription is not re-offered: it
                 // would bounce off the suspended instance again.
-                if !deferred
+                if (!deferred || orphaned)
                     && self
                         .state
                         .message_subscriptions
@@ -5729,6 +5749,23 @@ impl Engine {
                     generation,
                 };
                 self.emit(&mut log, event);
+            }
+
+            Command::SettleMessageCorrelationReceipt {
+                subscription_key,
+                delivery_key,
+            } => {
+                // Only a still-pinned receipt is settled: a duplicate
+                // settlement is a no-op.
+                if self.state.routed_deliveries.receipt(delivery_key).is_some() {
+                    self.emit(
+                        &mut log,
+                        Event::MessageCorrelationReceiptSettled {
+                            subscription_key,
+                            delivery_key,
+                        },
+                    );
+                }
             }
 
             Command::ConfirmMessageSubscriptionResume {
@@ -7936,9 +7973,29 @@ impl Engine {
             .values()
             .filter_map(|s| {
                 let ack = s.awaiting_ack?;
-                // A reserved message never expires while in flight, so it is
-                // always still buffered here.
-                let message = self.state.buffered_messages.get(&ack.message_key)?;
+                // A reserved message never expires while in flight, but a
+                // reservation must never depend on that for liveness: if the
+                // message is gone by ANY path, the delivery cannot be re-sent,
+                // so the subscription would await an ack forever (#1949). It is
+                // released instead, by an explicit ack this partition routes to
+                // ITSELF: not consumed, subscription kept (a one-shot one is
+                // re-opened) and offered its backlog again. Should the
+                // instance in fact have taken the lost delivery, the next
+                // offer is answered "not consumed, not waiting", which releases
+                // that message and closes the subscription.
+                let Some(message) = self.state.buffered_messages.get(&ack.message_key) else {
+                    return Some(Event::MessageCorrelationAcknowledging {
+                        subscription_key: s.key,
+                        message_key: ack.message_key,
+                        instance_key: s.instance_key,
+                        accepted: true,
+                        consumed: false,
+                        deferred: true,
+                        partition: self.partition_id,
+                        target_partition: self.partition_id,
+                        delivery_key: ack.delivery_key,
+                    });
+                };
                 Some(Event::RemoteMessageCorrelation {
                     subscription_key: s.key,
                     message_key: ack.message_key,
@@ -7951,6 +8008,34 @@ impl Engine {
                     ack_partition: Some(self.partition_id),
                 })
             })
+            .collect()
+    }
+
+    /// The answers this (instance) partition gave to ack-paced deliveries
+    /// whose settlement it has not yet seen (#1949): every pinned receipt,
+    /// rebuilt as the exact [`Event::MessageCorrelationAcknowledging`] that
+    /// answered it. The host re-drives these, so a lost ack — or a lost
+    /// [`Event::MessageCorrelationSettled`] — can never pin a receipt
+    /// forever: the message partition applies the first ack it still awaits
+    /// and answers every ack (duplicate or not) with a settlement. Ordered
+    /// by applied order.
+    pub fn pending_unsettled_receipts(&self) -> Vec<Event> {
+        self.state
+            .routed_deliveries
+            .unsettled_receipts()
+            .map(
+                |(delivery_key, subscription_key, r)| Event::MessageCorrelationAcknowledging {
+                    subscription_key,
+                    message_key: r.message_key,
+                    instance_key: r.instance_key,
+                    accepted: r.accepted,
+                    consumed: r.consumed,
+                    deferred: r.deferred,
+                    partition: self.partition_id,
+                    target_partition: r.target_partition,
+                    delivery_key,
+                },
+            )
             .collect()
     }
 
@@ -8148,6 +8233,9 @@ impl Engine {
             accepted,
             consumed,
             deferred,
+            message_key: ack.message_key,
+            instance_key: ack.instance_key,
+            target_partition: ack.target_partition,
         };
         self.emit_receipt(log, &ack, receipt);
     }

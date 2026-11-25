@@ -2062,6 +2062,26 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default))]
         generation: u64,
     },
+    /// The message partition processed an ack of `delivery_key` (#1949) —
+    /// applied it, or found the delivery no longer awaited (a duplicate or
+    /// stale ack): either way no re-drive of that delivery can change its
+    /// reservation any more. The host routes it as a
+    /// [`crate::Command::SettleMessageCorrelationReceipt`] to the instance's
+    /// partition (`partition_of(subscription_key)`), which unpins the
+    /// delivery's receipt. State-neutral here; `partition` is this (message)
+    /// partition: the subscription key is foreign.
+    MessageCorrelationSettled {
+        subscription_key: Key,
+        delivery_key: Key,
+        partition: u64,
+    },
+    /// The instance partition received [`Event::MessageCorrelationSettled`]
+    /// (#1949): the delivery's receipt is unpinned and its ledger entry
+    /// becomes an ordinary cap-bounded dedup entry.
+    MessageCorrelationReceiptSettled {
+        subscription_key: Key,
+        delivery_key: Key,
+    },
     /// A replicated envelope enabled remote buffered delivery on this
     /// partition for the first time (#1949). Recorded in the journal so event
     /// replay (not only a snapshot) restores the one-way activation latch:
@@ -2461,6 +2481,8 @@ impl Event {
             | Event::BufferedMessageCorrelated { .. }
             | Event::MessageCorrelationAcknowledged { .. }
             | Event::MessageSubscriptionResumed { .. }
+            | Event::MessageCorrelationSettled { .. }
+            | Event::MessageCorrelationReceiptSettled { .. }
             | Event::RemoteBufferedDeliveryActivated { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
@@ -2552,6 +2574,7 @@ impl Event {
                 | Event::MessageCorrelationAcknowledging { .. }
                 | Event::MessageSubscriptionResuming { .. }
                 | Event::MessageSubscriptionResumed { .. }
+                | Event::MessageCorrelationSettled { .. }
                 | Event::MessageSubscriptionClosing { .. }
                 | Event::StartInstanceDispatched { .. }
         )
@@ -2654,6 +2677,7 @@ impl Event {
             | Event::MessageCorrelationAcknowledging { partition, .. }
             | Event::MessageCorrelationAcknowledged { partition, .. }
             | Event::MessageSubscriptionResumed { partition, .. }
+            | Event::MessageCorrelationSettled { partition, .. }
             | Event::RemoteBufferedDeliveryActivated { partition } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another
@@ -2893,6 +2917,12 @@ impl Event {
                 subscription_key, ..
             }
             | Event::MessageSubscriptionResumeConfirmed {
+                subscription_key, ..
+            }
+            | Event::MessageCorrelationSettled {
+                subscription_key, ..
+            }
+            | Event::MessageCorrelationReceiptSettled {
                 subscription_key, ..
             } => m = m.max(*subscription_key),
             Event::MessageSubscriptionResumed {

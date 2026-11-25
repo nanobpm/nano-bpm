@@ -253,7 +253,6 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     close_tombstone: *close_tombstone,
                     receipt: None,
                 },
-                ROUTED_DELIVERY_LEDGER_CAP,
             );
         }
 
@@ -370,6 +369,9 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             deferred,
             delivery_key,
             subscription_key,
+            message_key,
+            instance_key,
+            target_partition,
             ..
         } => {
             if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
@@ -387,6 +389,9 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                         accepted: *accepted,
                         consumed: *consumed,
                         deferred: *deferred,
+                        message_key: *message_key,
+                        instance_key: *instance_key,
+                        target_partition: *target_partition,
                     },
                 );
             }
@@ -405,6 +410,11 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     s.resume_pending = false;
                 }
             }
+        }
+        // The message partition processed this delivery's ack (#1949):
+        // unpin its receipt.
+        Event::MessageCorrelationReceiptSettled { delivery_key, .. } => {
+            state.routed_deliveries.settle_receipt(*delivery_key);
         }
         Event::RemoteBufferedDeliveryActivated { .. } => {
             state.remote_buffered_delivery_latched = true;

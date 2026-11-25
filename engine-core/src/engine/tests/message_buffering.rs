@@ -855,6 +855,17 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
                 generation,
             },
         ),
+        Event::MessageCorrelationSettled {
+            subscription_key,
+            delivery_key,
+            ..
+        } => (
+            false,
+            Command::SettleMessageCorrelationReceipt {
+                subscription_key,
+                delivery_key,
+            },
+        ),
         Event::MessageCorrelationAcknowledging {
             subscription_key,
             message_key,
@@ -1610,6 +1621,18 @@ impl Rig {
     }
 }
 
+/// A duplicate / stale ack changes nothing on the message partition: it only
+/// (re-)confirms the delivery's settlement to the instance partition (#1949).
+fn assert_only_settles(events: &[Event]) {
+    assert!(
+        !events.is_empty()
+            && events
+                .iter()
+                .all(|e| matches!(e, Event::MessageCorrelationSettled { .. })),
+        "{events:?}"
+    );
+}
+
 fn is_delivery(command: &Command) -> bool {
     matches!(command, Command::CorrelateMessageSubscription { .. })
 }
@@ -1791,7 +1814,7 @@ fn lost_delivery_and_lost_ack_are_redriven_across_a_restart() {
     }
     // A duplicate of the (lost, now superseded) ack is a no-op.
     for (_, command) in lost_acks {
-        assert!(rig.on_message(command, 3_200).is_empty());
+        assert_only_settles(&rig.on_message(command, 3_200));
     }
     assert!(redrive(&rig).is_empty());
     assert_eq!(tokens(&rig), 3, "each message spawns exactly one token");
@@ -2018,12 +2041,12 @@ fn duplicate_delivery_is_answered_with_its_stored_receipt_across_a_restart() {
     replayed.set_num_partitions(Rig::N);
     assert_eq!(replayed.state(), rig.instance.state());
     assert_eq!(
-        replayed.state().routed_deliveries.receipt(first[0].0),
-        Some(state::CorrelationReceipt {
-            accepted: false,
-            consumed: false,
-            deferred: true,
-        })
+        replayed
+            .state()
+            .routed_deliveries
+            .receipt(first[0].0)
+            .map(|r| (r.accepted, r.consumed, r.deferred)),
+        Some((false, false, true))
     );
     rig.instance = replayed;
 
@@ -2037,7 +2060,7 @@ fn duplicate_delivery_is_answered_with_its_stored_receipt_across_a_restart() {
     assert_eq!(correlated(&rig, instance_key).len(), 1, "exactly once");
     // The lost original ack, arriving late, changes nothing.
     for (_, command) in lost_acks {
-        assert!(rig.on_message(command, 3_200).is_empty());
+        assert_only_settles(&rig.on_message(command, 3_200));
     }
     assert!(redrive(&rig).is_empty());
 }
@@ -2240,7 +2263,7 @@ fn a_stale_ack_of_an_earlier_delivery_of_the_same_message_is_ignored() {
         .expect("the resumed delivery is in flight");
     assert_eq!(current.message_key, published[0]);
     // The delayed duplicate of the OLD delivery's ack arrives: a no-op.
-    assert!(rig.on_message(stale_ack, 3_100).is_empty());
+    assert_only_settles(&rig.on_message(stale_ack, 3_100));
     assert_eq!(
         rig.message
             .state()
@@ -2580,4 +2603,179 @@ fn an_instance_owing_a_resume_handshake_is_not_cold_spilled() {
     assert_eq!(lost.len(), 1);
     assert!(rig.instance.snapshot_instance(instance_key).is_none());
     assert_eq!(rig.instance.pending_resume_handshakes().len(), 1);
+}
+
+/// Floods `rig`'s instance partition ledger with `n` unrelated routed
+/// deliveries (closes of unknown subscriptions, each recording a tombstone).
+fn flood_instance_ledger(rig: &mut Rig, n: u64) {
+    for i in 0..n {
+        let k = state::compose_key(1, 900_000 + i);
+        rig.on_instance(
+            Command::CloseMessageSubscription {
+                subscription_key: k,
+                instance_key: k,
+                element_instance_key: k,
+                element_id: "x".into(),
+                delivery_key: k,
+            },
+            2_500,
+        );
+    }
+}
+
+/// #1949 D1 (operator review): a receipt whose ack is LOST must survive any
+/// number of other routed deliveries — it is pinned outside the ledger cap
+/// until the message partition settles it. Otherwise the re-driven delivery
+/// of a completed one-shot instance is answered from current state
+/// (`consumed: false`), the reservation is released and the message can
+/// correlate a second time. Also across a snapshot restore.
+#[test]
+fn an_unsettled_receipt_outlives_ledger_eviction_until_settled() {
+    const CAP: usize = 4;
+    let (mut rig, order) = Rig::new(process_with_message_catch());
+    rig.instance.state_mut().routed_deliveries.set_cap(CAP);
+    let published = rig.publish_named_backlog("payment-received", &order, 1);
+    let (instance_key, lost_acks) = rig.create_holding("await-payment", &order, 2_000, &is_ack);
+    assert_eq!(lost_acks.len(), 1, "the ack is lost");
+    assert!(rig.instance.is_completed(instance_key));
+    let delivery_key = receipts(&rig.trace)[0].0;
+
+    flood_instance_ledger(&mut rig, 3 * CAP as u64);
+    let ledger = &rig.instance.state().routed_deliveries;
+    assert!(ledger.contains(delivery_key), "pinned, never evicted");
+    assert_eq!(ledger.len(), CAP + 1, "settled entries stay bounded");
+    assert_eq!(
+        rig.instance.pending_unsettled_receipts().len(),
+        1,
+        "the unsettled answer is re-drivable"
+    );
+
+    #[cfg(feature = "serde")]
+    {
+        let json = serde_json::to_string(&rig.instance.snapshot()).unwrap();
+        let mut restored = Engine::from_snapshot(serde_json::from_str(&json).unwrap());
+        restored.set_num_partitions(Rig::N);
+        assert_eq!(restored.state(), rig.instance.state());
+        restored.state_mut().routed_deliveries.set_cap(CAP);
+        assert!(restored
+            .state()
+            .routed_deliveries
+            .receipt(delivery_key)
+            .is_some());
+        rig.instance = restored;
+    }
+
+    // The message partition re-drives the delivery: answered with the
+    // ORIGINAL receipt, so the reservation is kept.
+    let before = rig.trace.len();
+    for (to_message, command) in redrive(&rig) {
+        rig.run(to_message, command, 3_000);
+    }
+    assert_eq!(
+        receipts(&rig.trace[before..]),
+        receipts(&rig.trace[..before])
+    );
+    assert_eq!(rig.acks(), vec![(false, true)], "{:?}", rig.trace);
+    assert!(rig.message.state().buffered_messages[&published[0]]
+        .correlated_instances
+        .contains(&instance_key));
+    assert!(redrive(&rig).is_empty());
+    // The settlement round-tripped: the receipt is unpinned and bounded again.
+    let ledger = &rig.instance.state().routed_deliveries;
+    assert!(ledger.receipt(delivery_key).is_none());
+    assert!(ledger.len() <= CAP);
+    assert!(rig.instance.pending_unsettled_receipts().is_empty());
+    // The lost original ack, arriving late, only re-confirms the settlement.
+    for (_, command) in lost_acks {
+        assert_only_settles(&rig.on_message(command, 3_100));
+    }
+    assert_eq!(rig.acks().len(), 1);
+}
+
+/// #1949 D1: a lost SETTLEMENT never pins a receipt forever: the instance
+/// partition re-drives its answer, which the message partition (no longer
+/// awaiting it) answers with another settlement.
+#[test]
+fn a_lost_settlement_is_redriven_from_the_pinned_receipt() {
+    let (mut rig, order) = Rig::new(process_with_message_catch());
+    rig.publish_named_backlog("payment-received", &order, 1);
+    let is_settle = |c: &Command| matches!(c, Command::SettleMessageCorrelationReceipt { .. });
+    let (_, lost) = rig.create_holding("await-payment", &order, 2_000, &is_settle);
+    assert_eq!(lost.len(), 1, "the settlement is lost");
+    assert_eq!(rig.acks(), vec![(false, true)]);
+    let pending = rig.instance.pending_unsettled_receipts();
+    assert_eq!(pending.len(), 1);
+    for (to_message, command) in pending.iter().filter_map(routed) {
+        rig.run(to_message, command, 3_000);
+    }
+    assert!(rig.instance.pending_unsettled_receipts().is_empty());
+    assert_eq!(rig.acks().len(), 1, "the re-driven answer applied nothing");
+    // A late duplicate settlement is a no-op.
+    for (to_message, command) in lost {
+        rig.run(to_message, command, 3_100);
+    }
+    assert!(rig.instance.pending_unsettled_receipts().is_empty());
+}
+
+/// #1949 D2 (operator review): a subscription awaiting the ack of a reserved
+/// message that is GONE (removed by any path) must not stall: the re-drive
+/// releases the reservation with an explicit self-routed ack, and the
+/// subscription is offered its remaining backlog.
+#[test]
+fn an_orphaned_reservation_is_released_not_stalled() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 2);
+    let (instance_key, held) = rig.create_holding("ni", &order, 2_000, &is_delivery);
+    assert_eq!(held.len(), 1);
+    // The reserved message disappears (simulates any removal path).
+    rig.message
+        .state_mut()
+        .remove_buffered_message(published[0]);
+    let release = redrive(&rig);
+    assert_eq!(release.len(), 1);
+    assert!(
+        matches!(
+            release[0].1,
+            Command::AcknowledgeMessageCorrelation {
+                consumed: false,
+                ..
+            }
+        ),
+        "{release:?}"
+    );
+    for (to_message, command) in release {
+        rig.run(to_message, command, 3_000);
+    }
+    assert_eq!(
+        correlated(&rig, instance_key),
+        published[1..],
+        "the rest of the backlog flows: {:?}",
+        rig.trace
+    );
+    assert!(redrive(&rig).is_empty(), "nothing left awaiting");
+}
+
+/// #1949 D2: an orphaned ONE-SHOT reservation re-opens the subscription, so
+/// a later message still reaches the waiting catch.
+#[test]
+fn an_orphaned_one_shot_reservation_reopens_the_subscription() {
+    let (mut rig, order) = Rig::new(process_with_message_catch());
+    let published = rig.publish_named_backlog("payment-received", &order, 1);
+    let (instance_key, held) = rig.create_holding("await-payment", &order, 2_000, &is_delivery);
+    assert_eq!(held.len(), 1);
+    rig.message
+        .state_mut()
+        .remove_buffered_message(published[0]);
+    for (to_message, command) in redrive(&rig) {
+        rig.run(to_message, command, 3_000);
+    }
+    assert!(redrive(&rig).is_empty());
+    // A later publication reaches the re-opened subscription.
+    rig.run(
+        true,
+        publish_with("payment-received", &order, BTreeMap::new(), None),
+        3_100,
+    );
+    assert!(rig.instance.is_completed(instance_key), "{:?}", rig.trace);
+    assert!(redrive(&rig).is_empty());
 }
