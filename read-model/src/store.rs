@@ -6210,8 +6210,24 @@ fn project_event(
                 params![*subscription_key as i64, *message_key as i64],
             )?;
         }
-        // The settling answer to an ack-paced reservation. A deferral leaves
-        // everything in flight. Otherwise: a consuming ack records history
+        // A deferral (suspended instance) releases the reservation but keeps
+        // the open wait: the resume re-delivers through a fresh reservation
+        // that re-captures the metadata, so drop this message's captured row
+        // now — otherwise a message that expires before the resume leaves it
+        // behind forever (Copilot r4701976472).
+        Event::MessageCorrelationAcknowledged {
+            subscription_key,
+            message_key,
+            deferred: true,
+            ..
+        } => {
+            tx.cexecute(
+                "DELETE FROM paced_message_correlations \
+                 WHERE subscription_key = ?1 AND message_key = ?2",
+                params![*subscription_key as i64, *message_key as i64],
+            )?;
+        }
+        // The settling answer to an ack-paced reservation. Otherwise: a consuming ack records history
         // from the captured metadata, and `accepted == false` means the
         // engine closed the subscription (a one-shot consumed, or a
         // permanently rejected delivery such as a losing event-gateway catch,
@@ -7839,7 +7855,6 @@ fn project_event(
         // the instance partition closing its own record, which the read model
         // already projects.
         | Event::MessageCorrelationAcknowledging { .. }
-        | Event::MessageCorrelationAcknowledged { .. }
         // The resume handshake (#1949) is a routing record only.
         | Event::MessageSubscriptionResuming { .. }
         | Event::MessageSubscriptionResumed { .. }
@@ -13425,6 +13440,9 @@ mod element_instance_tests {
             .unwrap();
         assert_eq!(store.message_subscriptions().len(), 1, "deferral");
         assert!(store.correlated_message_subscriptions().is_empty());
+        // The deferred message's captured row is released with it, so a
+        // message that expires before the resume leaks nothing.
+        assert_eq!(paced_in_flight(&store), 0, "deferral leaks capture");
         // A later consuming delivery settles the wait and records history.
         store
             .export(&[&paced(13), &ack(13, false, true, false)])
