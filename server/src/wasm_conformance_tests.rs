@@ -30,11 +30,11 @@
 //! a listed gap that starts conforming fails the suite until it is deleted.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 use axum::body::Body;
 use axum::http::{Method, Request};
-use nanobpmn_engine_wasm::TestEngine;
+use nanobpmn_engine_wasm::{HOST_REJECTION_PREFIX, TestEngine};
 use serde_json::{Value as J, json};
 use tower::ServiceExt;
 
@@ -614,11 +614,23 @@ fn wasm_run(eng: &mut TestEngine, step: &Step, vars: &BTreeMap<String, String>) 
     }));
     match result {
         Ok(Ok(text)) => Outcome::Accepted(serde_json::from_str(&text).unwrap_or(J::String(text))),
+        Err(payload) if !is_host_rejection(payload.as_ref()) => resume_unwind(payload),
         Ok(Err(())) | Err(_) => Outcome::Rejected {
             status: None,
             title: None,
         },
     }
+}
+
+/// Only a panic raised by the facade's host-side `js_err` is a rejection.
+/// Any other panic — a missing path param, an unadapted operation, or a
+/// genuine engine crash — must fail the test, never masquerade as drift.
+fn is_host_rejection(payload: &(dyn std::any::Any + Send)) -> bool {
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied());
+    msg.is_some_and(|m| m.starts_with(HOST_REJECTION_PREFIX))
 }
 
 // -------------------------------------------------------------- comparing --
@@ -829,6 +841,53 @@ fn every_scenario_operation_is_a_spec_operation() {
 }
 
 /// The comparator itself must see the drift classes it exists to catch.
+fn bare_step(op: &str) -> Step {
+    Step {
+        id: "t".into(),
+        op: op.into(),
+        params: BTreeMap::new(),
+        body: None,
+        resources: Vec::new(),
+        capture: BTreeMap::new(),
+        compare_body: true,
+    }
+}
+
+#[test]
+#[should_panic(expected = "no TestEngine adapter for operation `noSuchOperation`")]
+fn unadapted_operation_fails_loudly_not_as_rejection() {
+    wasm_run(
+        &mut TestEngine::new(),
+        &bare_step("noSuchOperation"),
+        &BTreeMap::new(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "needs path param jobKey")]
+fn missing_path_param_fails_loudly_not_as_rejection() {
+    wasm_run(
+        &mut TestEngine::new(),
+        &bare_step("completeJob"),
+        &BTreeMap::new(),
+    );
+}
+
+#[test]
+fn facade_rejection_is_a_status_less_rejection() {
+    let mut step = bare_step("completeJob");
+    step.params.insert("jobKey".into(), "not-a-key".into());
+    assert!(matches!(
+        wasm_run(&mut TestEngine::new(), &step, &BTreeMap::new()),
+        Outcome::Rejected {
+            status: None,
+            title: None
+        }
+    ));
+    assert!(is_host_rejection(&format!("{HOST_REJECTION_PREFIX}x")));
+    assert!(!is_host_rejection(&"index out of bounds"));
+}
+
 #[test]
 fn comparator_flags_key_type_and_shape_drift() {
     let step = Step {
