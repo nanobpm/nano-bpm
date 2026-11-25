@@ -965,6 +965,8 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
                 variables: payload,
                 business_id: None,
                 message_key: None,
+                time_to_live: None,
+                message_id: None,
             },
             T0 + 26,
         )
@@ -1124,6 +1126,29 @@ fn build_event_witnesses() -> Vec<Event> {
                 correlation_key: "c".to_string(),
             }),
             delivery_key: 25,
+        },
+        // The #1874 message-buffer frames (additive variants, no version
+        // bump): a buffered publish, its correlation to a later-opened
+        // subscription, and its TTL expiry.
+        Event::MessageBuffered {
+            message_key: 20,
+            partition: 1,
+            message_name: "m".to_string(),
+            correlation_key: "c".to_string(),
+            deadline: 60_000,
+            message_id: Some("id-1".to_string()),
+            variables: vars.clone(),
+            correlated_instances: vec![22],
+        },
+        Event::BufferedMessageCorrelated {
+            message_key: 20,
+            partition: 1,
+            subscription_key: 21,
+            instance_key: 23,
+        },
+        Event::MessageExpired {
+            message_key: 20,
+            partition: 1,
         },
         // The #1497 routed-delivery ledger frame (additive variant, no version
         // bump): the recipient partition's dedup / close-tombstone record.

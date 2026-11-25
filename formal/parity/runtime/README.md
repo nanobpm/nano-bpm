@@ -67,6 +67,15 @@ plus three timer-cycle scenarios (#1916; Zeebe `timeCycle` semantics from #1878)
 `timer-cycle-iso-start` (`R<n>/<start>/<period>` incl. offsets and calendar
 periods) and `timer-cycle-feel` (FEEL `cycle()`), each a service task with
 non-interrupting cycle boundary timers fired by `advanceTime` from the epoch.
+Six message-buffering scenarios (#1969; Zeebe `timeToLive` / `messageId`
+semantics from #1874) use `publishMessage` with an explicit `timeToLive` (ms),
+optional `messageId` and `expectRejected` (the publish must be refused — Zeebe's
+`ALREADY_EXISTS`). Such a publication is sent as given on both backends, with no
+`settled` barrier: `message-buffered-before-subscription`,
+`message-ttl-zero-not-buffered`, `message-buffered-dedup-message-id`,
+`message-buffered-non-interrupting-boundary-drain` (several buffered messages
+drained in publish order), `message-buffered-interrupting-boundary-one` (exactly
+one taken) and `message-buffered-expired` (nano-only: it advances the clock).
 The **single-source corpus generator** ([#1258], `formal/corpus/`) has since
 landed; wiring this runner to its output (pointing `--corpus` at the generated
 directory) is a follow-up, with the scenario schema above as the contract.

@@ -59,6 +59,38 @@
     }
   },
   {
+    "MessageBuffered": {
+      "correlated_instances": [
+        22
+      ],
+      "correlation_key": "c",
+      "deadline": 60000,
+      "message_id": "id-1",
+      "message_key": 20,
+      "message_name": "m",
+      "partition": 1,
+      "variables": {
+        "x": {
+          "Int": 1
+        }
+      }
+    }
+  },
+  {
+    "BufferedMessageCorrelated": {
+      "instance_key": 23,
+      "message_key": 20,
+      "partition": 1,
+      "subscription_key": 21
+    }
+  },
+  {
+    "MessageExpired": {
+      "message_key": 20,
+      "partition": 1
+    }
+  },
+  {
     "RoutedDeliveryRecorded": {
       "close_tombstone": true,
       "delivery_key": 25,

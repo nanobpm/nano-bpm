@@ -7621,6 +7621,11 @@ fn project_event(
         | Event::ElementTerminating { .. }
         | Event::GatewayRouteSelected { .. }
         | Event::MessagePublished { .. }
+        // Engine-internal message buffer (#1874): the correlation records
+        // that follow carry everything the read model projects.
+        | Event::MessageBuffered { .. }
+        | Event::MessageExpired { .. }
+        | Event::BufferedMessageCorrelated { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }

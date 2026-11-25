@@ -23,6 +23,7 @@ export {
 } from "./liveTranscript.ts";
 export { TraceTimeline, msFmt, type TraceTimeFmt } from "./TraceTimeline.tsx";
 export { fmtClock, fmtDuration } from "./traceTime.ts";
+export { InstanceStartedAt, InstanceTimes } from "./InstanceTimes.tsx";
 export { IncidentReason } from "./IncidentReason.tsx";
 export { ResizeHandle } from "./ResizeHandle.tsx";
 export * from "./usePaneResize.ts";

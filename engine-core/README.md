@@ -217,8 +217,15 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   stays **clock-free** and the message flow is durable
   (`MessagePublished`/`MessageSubscriptionCreated`/`MessageCorrelated` are
   journaled), so a parked subscription survives a restart and a settled one is
-  retained so it never re-correlates. Messages are **not buffered** — with no
-  matching open subscription the message is simply dropped (no TTL/dedup).
+  retained so it never re-correlates. A message published with a positive
+  `time_to_live` is **buffered** (#1874, Zeebe parity: `MessageBuffered`) until
+  `now + ttl`; a subscription opened before then correlates the oldest buffered
+  message its instance has not already taken (`BufferedMessageCorrelated`) —
+  delivery is currently partition-local (a subscription on another partition
+  leaves the message buffered until expiry; cross-partition delivery is #1949),
+  `TriggerTimers` expires it (`MessageExpired`), and a `message_id` still
+  buffered for the same name and correlation key is rejected. TTL 0 (the
+  default) correlates at publish time only, otherwise the message is dropped.
 - **Interrupting message boundary events** attach a subscription to a service
   task. When the task activates a subscription is opened; if a matching message is
   correlated before the job is done, the engine **cancels the job**, interrupts

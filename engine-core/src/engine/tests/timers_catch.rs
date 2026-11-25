@@ -827,6 +827,8 @@ fn message_start_stamps_the_message_business_id_on_the_new_instance() {
                 variables: BTreeMap::new(),
                 business_id: Some("order-42".into()),
                 message_key: None,
+                time_to_live: None,
+                message_id: None,
             },
             0,
         )
@@ -863,6 +865,8 @@ fn message_start_stamps_the_message_business_id_on_the_new_instance() {
                 variables: BTreeMap::new(),
                 business_id: Some("ignored".into()),
                 message_key: None,
+                time_to_live: None,
+                message_id: None,
             },
             0,
         )
@@ -1959,6 +1963,8 @@ fn correlate_message_reuses_a_pre_minted_message_key() {
                 variables: BTreeMap::new(),
                 business_id: None,
                 message_key: Some(foreign),
+                time_to_live: None,
+                message_id: None,
             },
             0,
         )

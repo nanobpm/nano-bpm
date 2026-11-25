@@ -235,6 +235,12 @@ pub struct Engine {
     /// children, never walk the resident instance map.
     #[cfg(test)]
     pub(crate) cascade_scan_count: std::cell::Cell<usize>,
+    /// Test-only count of buffered messages visited while building
+    /// subscriptions' candidate queues (#1874): only messages matching the
+    /// subscription's name + correlation key are ever visited (index read),
+    /// once per subscription per command — never the whole buffer.
+    #[cfg(test)]
+    pub(crate) buffer_scan_count: std::cell::Cell<usize>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -309,6 +315,22 @@ pub struct Engine {
     /// before the next, mirroring Zeebe's one-TRIGGER-command-per-timer
     /// processing. Per-command scratch: cleared by every `plan_command_at`.
     pending_timer_fires: VecDeque<PendingTimerFire>,
+    /// Log index from which the fixpoint loop still has to look for freshly
+    /// opened message subscriptions that may correlate a **buffered** message
+    /// (#1874). Per-command scratch: reset by every `plan_command_at`.
+    buffer_scan_from: usize,
+    /// Still-open persistent subscriptions that took a buffered message and
+    /// may take the next one (#1874). Per-command scratch.
+    buffer_requeue: VecDeque<Key>,
+    /// Resume cursor into the `buffered_by_correlation` index, shared by
+    /// every subscription of one instance on one (name, correlation key)
+    /// (#1874): the last index entry proven ineligible for that instance
+    /// (expired, or already correlated to it). Ineligibility is permanent
+    /// within a command, so each candidate is visited at most once per
+    /// (instance, name, key) — k catches over M matching messages cost
+    /// O(k + M), never O(k*M). Per-command scratch; reset whenever a
+    /// message is buffered.
+    pub(crate) buffer_candidates: BTreeMap<(Key, String, String), (u64, Key)>,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -749,6 +771,8 @@ impl Engine {
             resource_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            buffer_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             retire_cursor: 0,
             dirty_vars: BTreeSet::new(),
@@ -757,6 +781,9 @@ impl Engine {
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
+            buffer_scan_from: 0,
+            buffer_requeue: VecDeque::new(),
+            buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
         }
@@ -847,6 +874,14 @@ impl Engine {
         !self.state.cluster_variables.is_unused()
     }
 
+    /// Whether this partition has EVER buffered a message (#1874). One-way:
+    /// the buffer sequence cursor is never reset (an expired message leaves
+    /// its slot behind) and survives snapshot recovery, so the retained
+    /// log/snapshot depends on `message-buffering-v1` once this is `true`.
+    pub fn message_buffering_ever_used(&self) -> bool {
+        self.state.next_buffered_seq > 0
+    }
+
     /// The cluster-wide partition count this engine is configured with.
     pub fn num_partitions(&self) -> u64 {
         self.num_partitions
@@ -930,6 +965,8 @@ impl Engine {
             resource_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            buffer_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             retire_cursor: 0,
             dirty_vars: BTreeSet::new(),
@@ -938,6 +975,9 @@ impl Engine {
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
+            buffer_scan_from: 0,
+            buffer_requeue: VecDeque::new(),
+            buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,
         }
@@ -2589,10 +2629,16 @@ impl Engine {
                     // cascade reads (#1827): a write path that bypassed it fails here.
                     #[cfg(test)]
                     self.state.assert_children_index_covers_instances();
+                    #[cfg(test)]
+                    self.state.assert_buffered_message_id_index_consistent();
                     log
                 });
         self.operation_reference = None;
         self.terminal_deadline_stamps.clear();
+        // Per-command scratch must not outlive the command: an idle engine
+        // retains no candidate queues (#1874).
+        self.buffer_candidates.clear();
+        self.buffer_requeue.clear();
         result
     }
 
@@ -2656,6 +2702,9 @@ impl Engine {
         self.esp_start_payloads.clear();
         self.boundary_payloads.clear();
         self.pending_timer_fires.clear();
+        self.buffer_scan_from = 0;
+        self.buffer_requeue.clear();
+        self.buffer_candidates.clear();
         self.sweep_from = 0;
         // Per-command terminal-deadline stamp (#1494): set from THIS command
         // only, merged with any envelope stamps armed by
@@ -3668,6 +3717,25 @@ impl Engine {
                     .map(|t| t.timer_key)
                     .collect();
                 due_starts.sort_unstable();
+                // Expire buffered messages past their deadline (#1874, Zeebe
+                // `MessageTimeToLiveChecker` → `MessageIntent.EXPIRE`),
+                // deterministic by message key.
+                let expired: Vec<Key> = self
+                    .state
+                    .buffered_messages
+                    .values()
+                    .filter(|m| !m.is_live_at(now))
+                    .map(|m| m.key)
+                    .collect();
+                for message_key in expired {
+                    self.emit(
+                        &mut log,
+                        Event::MessageExpired {
+                            message_key,
+                            partition: self.partition_id,
+                        },
+                    );
+                }
                 self.pending_timer_fires.extend(
                     due.into_iter()
                         .map(PendingTimerFire::Timer)
@@ -4811,8 +4879,36 @@ impl Engine {
                 variables,
                 business_id,
                 message_key,
+                time_to_live,
+                message_id,
             } => {
                 check_business_id(business_id.as_deref())?;
+                // Only the partition owning `hash(correlation_key)` buffers (and
+                // so deduplicates): the partition-0 copy of a multi-partition
+                // publish exists for message starts alone (#1874).
+                let buffers_here =
+                    self.subscription_partition(&correlation_key) == self.partition_id;
+                let time_to_live = time_to_live.unwrap_or(0);
+                if buffers_here {
+                    if let Some(id) = message_id.as_deref() {
+                        // Zeebe `MessagePublishProcessor`: a messageId still
+                        // buffered for the same name + correlation key is
+                        // ALREADY_EXISTS. An expired-but-unswept message no
+                        // longer counts.
+                        // Indexed lookup, not a buffer scan: O(log n) per publish.
+                        if self
+                            .state
+                            .live_buffered_message_by_id(&message_name, &correlation_key, id, now)
+                            .is_some()
+                        {
+                            return Err(EngineError::MessageAlreadyExists {
+                                message_name,
+                                correlation_key,
+                                message_id: id.to_string(),
+                            });
+                        }
+                    }
+                }
                 // Always record a message key (Zeebe records every published
                 // message); it is returned to the host and, carried on the
                 // MessagePublished event, restores the key generator on replay.
@@ -4834,8 +4930,8 @@ impl Engine {
                 );
 
                 // Correlate to every matching open subscription, deterministic by
-                // subscription key. Messages are not buffered: with no match the
-                // message is simply dropped.
+                // subscription key. Without a time-to-live (see `MessageBuffered`
+                // below) a message with no match is simply dropped.
                 let mut matched: Vec<Key> = self
                     .state
                     .message_subscriptions
@@ -4936,6 +5032,7 @@ impl Engine {
                     }
                 }
 
+                let starts_from = log.len();
                 // Message start events: a matching message also creates a new
                 // instance of every process subscribed at the process level —
                 // but only when the message was not already claimed by an open
@@ -4977,6 +5074,48 @@ impl Engine {
                             correlation_key: correlation_key.clone(),
                         }),
                     );
+                }
+                // Buffer the message until its deadline (#1874): a subscription
+                // opened before then correlates it (see
+                // `correlate_buffered_messages`). TTL 0 never buffers. Emitted
+                // AFTER the message starts so the per-instance ledger also
+                // records every instance this publication started inline: a
+                // catch in that instance must wait for ANOTHER message, never
+                // consume the one that created it (Zeebe
+                // `existMessageCorrelation`).
+                if buffers_here && time_to_live > 0 {
+                    for e in &log[starts_from..] {
+                        if let Event::MessageStartEventCorrelated {
+                            message_key: k,
+                            instance_key,
+                            ..
+                        } = e
+                        {
+                            if *k == message_key {
+                                correlated_instances.insert(*instance_key);
+                            }
+                        }
+                    }
+                    // Reset the resume cursors when a message is
+                    // buffered (cheap; they rebuild lazily on next use).
+                    self.buffer_candidates.clear();
+                    self.emit(
+                        &mut log,
+                        Event::MessageBuffered {
+                            message_key,
+                            partition: self.partition_id,
+                            message_name: message_name.clone(),
+                            correlation_key: correlation_key.clone(),
+                            deadline: now.saturating_add(time_to_live),
+                            message_id: message_id.clone(),
+                            variables: variables.clone(),
+                            correlated_instances: correlated_instances.iter().copied().collect(),
+                        },
+                    );
+                    // Subscriptions opened later in THIS command (by the tokens
+                    // the publish advanced or the instances it started) may
+                    // take it too; they are all still queued, so scan from here.
+                    self.buffer_scan_from = log.len();
                 }
             }
 
@@ -6956,6 +7095,23 @@ impl Engine {
             // disarms it. A fire enqueues work, which the loop drains before the
             // sweep reconsiders the scope.
             cursor = self.reevaluate_conditionals(log, &mut queue, cursor);
+            // A subscription opened during this drain may take a buffered
+            // message (#1874). Like the conditional re-evaluation above, this
+            // runs BEFORE the drained-scope / instance-completion sweeps: a
+            // message event sub-process armed with a scope whose main flow has
+            // already drained gets its buffered-correlation opportunity before
+            // the sweep completes the scope and disarms it. A correlation
+            // enqueues work; drain it (the sweeps re-run after).
+            if queue.is_empty() {
+                let buffered_from = log.len();
+                self.correlate_buffered_messages(log, &mut queue);
+                if log.len() > buffered_from {
+                    if let Drive::Pause = driver.after_step(&log[drain_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                    continue;
+                }
+            }
             let mut swept = false;
             if queue.is_empty() {
                 let sweep_from = log.len();
@@ -7272,6 +7428,211 @@ impl Engine {
             }
         }
         scan_end
+    }
+
+    /// Correlates buffered messages (#1874) to the message subscriptions opened
+    /// since `buffer_scan_from` — Zeebe `MessageSubscriptionCreateProcessor` →
+    /// `correlateNextMessage`: each newly opened, still-open subscription takes
+    /// the oldest (first-buffered, by [`state::BufferedMessage::seq`]) live
+    /// buffered message with its name and correlation key that has not already
+    /// correlated to its instance. Only a LOCAL instance (on this partition)
+    /// takes a buffered message, advancing inline; a subscription whose
+    /// instance lives on another partition takes nothing and the message stays
+    /// buffered until TTL expiry (remote delivery is tracked in
+    /// https://github.com/nanobpm/nano-bpm/issues/1949). A suspended or
+    /// no-longer-active instance takes nothing either.
+    ///
+    /// At most ONE local correlation per call: its queued follow-ups (an
+    /// event-based gateway withdrawing its losing alternatives, an interrupting
+    /// boundary cancelling sibling catches) must drain before the remaining
+    /// opened subscriptions are reconsidered, so a withdrawn sibling never
+    /// takes a message too. `buffer_scan_from` is left at the next unprocessed
+    /// opening, so the caller's next quiescent pass resumes there.
+    fn correlate_buffered_messages(&mut self, log: &mut Vec<Event>, queue: &mut VecDeque<Step>) {
+        let from = self.buffer_scan_from.min(log.len());
+        let end = log.len();
+        self.buffer_scan_from = end;
+        if self.state.buffered_messages.is_empty() {
+            self.buffer_requeue.clear();
+            self.buffer_candidates.clear();
+            return;
+        }
+        // Persistent subscriptions (non-interrupting boundary / event
+        // sub-process) that took a buffered message on an earlier pass stay
+        // open and get the next matching buffered message (Zeebe
+        // `correlateNextMessage` after a non-interrupting correlation).
+        while let Some(subscription_key) = self.buffer_requeue.pop_front() {
+            if self.correlate_one_buffered(log, queue, subscription_key) {
+                self.buffer_scan_from = from;
+                return;
+            }
+        }
+        // Incremental scan of the openings (no per-pass rebuild of the
+        // remaining list): stop at the first local correlation and resume
+        // right after it on the next pass.
+        for i in from..end {
+            let Event::MessageSubscriptionCreated {
+                subscription_key, ..
+            } = log[i]
+            else {
+                continue;
+            };
+            if self.correlate_one_buffered(log, queue, subscription_key) {
+                self.buffer_scan_from = i + 1;
+                return;
+            }
+        }
+    }
+
+    /// Whether any resident ancestor (call-activity parent chain) of
+    /// `instance_key` is no longer live — its cancellation cascade is pending.
+    fn has_ended_ancestor(&self, instance_key: Key) -> bool {
+        let mut current = instance_key;
+        while let Some(parent) = self
+            .state
+            .instances
+            .get(&current)
+            .and_then(|i| i.parent_process_instance_key)
+        {
+            match self.state.instances.get(&parent) {
+                Some(p)
+                    if !matches!(
+                        p.state,
+                        ProcessInstanceState::Active | ProcessInstanceState::Suspended
+                    ) =>
+                {
+                    return true;
+                }
+                Some(_) => current = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// The oldest live buffered message the subscription may still take:
+    /// a lazy range over its (name, correlation key) index set, resumed from
+    /// the instance's shared cursor (see `buffer_candidates`).
+    fn next_buffered_candidate(
+        &mut self,
+        subscription_key: Key,
+        now: u64,
+    ) -> Option<&state::BufferedMessage> {
+        use std::ops::Bound;
+        let subscription = self.state.message_subscriptions.get(&subscription_key)?;
+        let instance_key = subscription.instance_key;
+        let index_key = (
+            subscription.message_name.clone(),
+            subscription.correlation_key.clone(),
+        );
+        let set = self.state.buffered_by_correlation.get(&index_key)?;
+        let cursor_key = (instance_key, index_key.0, index_key.1);
+        let lower = match self.buffer_candidates.get(&cursor_key) {
+            Some(&c) => Bound::Excluded(c),
+            None => Bound::Unbounded,
+        };
+        let mut found = None;
+        let mut last_skipped = None;
+        for &entry in set.range((lower, Bound::Unbounded)) {
+            #[cfg(test)]
+            self.buffer_scan_count.set(self.buffer_scan_count.get() + 1);
+            if self.state.buffered_messages.get(&entry.1).is_some_and(|m| {
+                m.is_live_at(now) && !m.correlated_instances.contains(&instance_key)
+            }) {
+                found = Some(entry.1);
+                break;
+            }
+            last_skipped = Some(entry);
+        }
+        if let Some(c) = last_skipped {
+            self.buffer_candidates.insert(cursor_key, c);
+        }
+        self.state.buffered_messages.get(&found?)
+    }
+
+    /// One subscription's turn at the buffer (see
+    /// [`Self::correlate_buffered_messages`]). Returns `true` when a LOCAL
+    /// correlation advanced a token (the caller must drain before going on);
+    /// a still-open local subscription is requeued for the next message. A
+    /// remote subscription never takes a buffered message (#1949).
+    fn correlate_one_buffered(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        subscription_key: Key,
+    ) -> bool {
+        let now = self.now;
+        let Some(subscription) = self
+            .state
+            .message_subscriptions
+            .get(&subscription_key)
+            .filter(|s| s.state == state::MessageSubscriptionState::Open)
+        else {
+            return false;
+        };
+        let instance_key = subscription.instance_key;
+        let element_instance_key = subscription.element_instance_key;
+        let element_id = subscription.element_id.clone();
+        let kind = subscription.kind.clone();
+        // LOCAL-ONLY buffered correlation (#1874): a subscription whose
+        // instance lives on ANOTHER partition never takes a buffered
+        // message — no partial or one-shot remote drain. The message stays
+        // buffered until a local subscription takes it or its TTL expires.
+        // Ack-paced remote delivery is tracked in
+        // https://github.com/nanobpm/nano-bpm/issues/1949.
+        if state::partition_of(instance_key) != self.partition_id {
+            return false;
+        }
+        // A buffered message must never reach a child whose ancestor has
+        // already ended (e.g. a top-level terminate end raced a call
+        // activity): the pending cascade will terminate it, and a
+        // correlation first could complete it instead (#1874).
+        if self.has_ended_ancestor(instance_key) {
+            return false;
+        }
+        let Some(message) = self.next_buffered_candidate(subscription_key, now) else {
+            return false;
+        };
+        let message_key = message.key;
+        let variables = message.variables.clone();
+        if self.instance_is_suspended(instance_key)
+            || self
+                .state
+                .instances
+                .get(&instance_key)
+                .is_none_or(|i| i.state != ProcessInstanceState::Active)
+        {
+            return false;
+        }
+        self.emit(
+            log,
+            Event::BufferedMessageCorrelated {
+                message_key,
+                partition: self.partition_id,
+                subscription_key,
+                instance_key,
+            },
+        );
+        self.advance_correlated_token(
+            log,
+            queue,
+            subscription_key,
+            message_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind,
+            &variables,
+        );
+        if self
+            .state
+            .message_subscriptions
+            .get(&subscription_key)
+            .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
+        {
+            self.buffer_requeue.push_back(subscription_key);
+        }
+        true
     }
 
     /// Records a correlation against a subscription whose **instance lives on this
@@ -19447,6 +19808,13 @@ pub enum EngineError {
     /// `CompleteJob` tried to assign a business id differing from the one the
     /// instance already carries; assignment is single and irreversible (409).
     BusinessIdAlreadyAssigned { instance_key: Key },
+    /// `CorrelateMessage` carried a `message_id` that is still buffered for the
+    /// same message name and correlation key (#1874, Zeebe ALREADY_EXISTS, 409).
+    MessageAlreadyExists {
+        message_name: String,
+        correlation_key: String,
+        message_id: String,
+    },
     /// `ResolveIncident` referenced an incident key that does not exist.
     IncidentNotFound { incident_key: Key },
     /// `ResolveIncident` referenced a job-incident whose job still has no
@@ -20027,6 +20395,14 @@ impl std::fmt::Display for EngineError {
             EngineError::DecisionNotFound { reference } => {
                 write!(f, "no deployed decision with {reference}")
             }
+            EngineError::MessageAlreadyExists {
+                message_name,
+                correlation_key,
+                message_id,
+            } => write!(
+                f,
+                "a message with id '{message_id}' named '{message_name}' and correlation key '{correlation_key}' is already published"
+            ),
             EngineError::ClusterVariableAlreadyExists { tenant_id, name } => match tenant_id {
                 None => write!(f, "a global cluster variable named '{name}' already exists"),
                 Some(t) => write!(
@@ -20452,6 +20828,7 @@ impl EngineError {
             EngineError::ProcessNotFound { .. }
             | EngineError::DecisionNotFound { .. }
             | EngineError::ClusterVariableAlreadyExists { .. }
+            | EngineError::MessageAlreadyExists { .. }
             | EngineError::ClusterVariableNotFound { .. }
             | EngineError::NoStartEvent { .. }
             | EngineError::StartEventExpressionInvalid { .. }
