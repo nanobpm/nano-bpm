@@ -76,6 +76,7 @@ mod engine;
 mod event;
 mod json;
 mod model;
+mod problem;
 mod read_query;
 mod state;
 mod temporal;
@@ -138,6 +139,7 @@ pub use event::{
     SubscriptionMigrationAction,
 };
 pub use feel::FeelError;
+pub use problem::{EngineProblem, ProblemKind};
 #[cfg(feature = "serde")]
 pub use model::value_from_json;
 pub use model::{
