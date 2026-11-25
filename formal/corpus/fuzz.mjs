@@ -482,6 +482,15 @@ export function existingIssueFor (signature, open) {
   return hits.length ? `#${Math.min(...hits)}` : null
 }
 
+/**
+ * The issue (`#N`) of a committed, still-open corpus case with exactly
+ * `signature` (any graph), or null; the oldest issue wins.
+ */
+export function committedIssueFor (signature, cases) {
+  const hits = cases.filter((x) => !x.fixed && x.signature === signature && /^#\d+$/.test(x.issue ?? '')).map((x) => Number(x.issue.slice(1)))
+  return hits.length ? `#${Math.min(...hits)}` : null
+}
+
 /** The comment that reports a re-found signature on its existing open issue. */
 export function recurrenceComment (c) {
   return [
@@ -499,7 +508,16 @@ export function recurrenceComment (c) {
  * signature creates an issue (nightly runs used to re-file one signature per
  * graph — #1792/#1895/#1966, #1793/#1896/#1967 — #1975). `gh` runs the CLI.
  */
-export function fileIssue (c, gh = (args) => execFileSync('gh', args, { encoding: 'utf8' })) {
+export function fileIssue (c, gh = (args) => execFileSync('gh', args, { encoding: 'utf8' }), cases = []) {
+  // A committed OPEN case already tracks the signature: its `issue` is the
+  // canonical (triaged) issue, which need not carry the signature line — the
+  // auto-filed ones are closed as duplicates of hand-written fix issues — so
+  // the committed corpus is consulted first, on any graph.
+  const committed = committedIssueFor(c.signature, cases)
+  if (committed) {
+    gh(['issue', 'comment', committed.slice(1), '--body', recurrenceComment(c)])
+    return committed
+  }
   const open = JSON.parse(gh(['issue', 'list', '--state', 'open', '--search', 'parity(fuzz) in:title', '--limit', '1000', '--json', 'number,body']))
   const existing = existingIssueFor(c.signature, open)
   if (existing) {
@@ -612,7 +630,7 @@ async function main () {
     fs.writeFileSync(CORPUS_PATH, JSON.stringify(file, null, 2) + '\n')
     if (!args.fileIssues) return
     try {
-      rec.issue = fileIssue(rec)
+      rec.issue = fileIssue(rec, undefined, cases)
     } catch (err) {
       failures.push(`could not file an issue for ${rec.signature} (reproducer recorded with "issue": null): ${err.message}`)
       return

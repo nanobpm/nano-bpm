@@ -371,3 +371,15 @@ test('existingIssueFor matches the exact signature line, never a prefix', () => 
   assert.equal(existingIssueFor('spec-oracle:completed,sequenceFlows', [{ number: 1, body }]), null)
   assert.equal(existingIssueFor('spec-oracle:completed,sequenceFlows,jobsCreated', [{ number: 1, body }]), '#1')
 })
+
+test('fileIssue comments on a committed open case issue even when no open issue carries the signature line', () => {
+  const c = { ...loadCorpus()[0], graph: { id: 'Gen_new', key: 'new|graph' } }
+  const committed = [
+    { signature: c.signature, issue: '#1990', fixed: false, graph: { key: 'other' } },
+    { signature: c.signature, issue: '#1500', fixed: true, graph: { key: 'old' } },
+    { signature: `${c.signature},extra`, issue: '#1400', fixed: false, graph: { key: 'x' } }
+  ]
+  const { gh, calls } = fakeGh([]) // the auto-filed issues were closed as duplicates
+  assert.equal(fileIssue(c, gh, committed), '#1990')
+  assert.deepEqual(calls.map((a) => a.slice(0, 3)), [['issue', 'comment', '1990']])
+})
