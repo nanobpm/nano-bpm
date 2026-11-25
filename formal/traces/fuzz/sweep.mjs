@@ -227,9 +227,23 @@ function emit (root, name, seedName) {
   }
 }
 
-function fileIssue (seed, sig, diff, scriptPath) {
+/**
+ * The open sweep issue (number) whose body carries `sig`'s exact marker line,
+ * or null (the oldest wins). Matched on the body, not via `gh --search`: the
+ * marker lives in an HTML comment, which GitHub search does not reliably
+ * index, so a search-only dedupe silently re-files one signature (#1975).
+ */
+export function existingSweepIssue (sig, open) {
+  const line = `<!-- fuzz-signature:${sig} -->`
+  const hits = open.filter((i) => String(i.body ?? '').split('\n').some((l) => l.trim() === line)).map((i) => i.number)
+  return hits.length ? Math.min(...hits) : null
+}
+
+export function fileIssue (seed, sig, diff, scriptPath, sh = run) {
   const marker = `fuzz-signature:${sig}`
-  const found = run('gh', ['issue', 'list', '--state', 'open', '--search', marker, '--json', 'number', '--jq', '.[0].number'])
+  const listed = sh('gh', ['issue', 'list', '--state', 'open', '--search', 'fuzz in:title', '--limit', '1000', '--json', 'number,body'])
+  if (listed.code !== 0) throw new Error(`gh issue list failed: ${listed.out}`)
+  const existing = existingSweepIssue(sig, JSON.parse(listed.out))
   const body = [
     `The generative Zeebe differential sweep (#1521) found a divergence: seed \`${seed}\`.`,
     '',
@@ -247,11 +261,12 @@ function fileIssue (seed, sig, diff, scriptPath) {
     '',
     `<!-- ${marker} -->`
   ].join('\n')
-  if (found.code === 0 && found.out.trim()) {
-    run('gh', ['issue', 'comment', found.out.trim(), '--body', body])
-    return { known: true, ref: `#${found.out.trim()} (commented)` }
+  if (existing) {
+    const c = sh('gh', ['issue', 'comment', String(existing), '--body', body])
+    if (c.code !== 0) throw new Error(`gh issue comment failed: ${c.out}`)
+    return { known: true, ref: `#${existing} (commented)` }
   }
-  const r = run('gh', ['issue', 'create', '--title', `fuzz: Zeebe divergence (signature ${sig}, seed ${seed})`, '--body', body])
+  const r = sh('gh', ['issue', 'create', '--title', `fuzz: Zeebe divergence (signature ${sig}, seed ${seed})`, '--body', body])
   if (r.code !== 0) throw new Error(`gh issue create failed: ${r.out}`)
   return { known: false, ref: r.out.trim() }
 }
