@@ -18275,12 +18275,8 @@ impl ServerImpl {
                 )
                 .await
             {
-                Ok((result, events)) => {
-                    // The synced spec's deployment request has no
-                    // `operationReference` yet (camunda#67491 re-sync) — `None`.
-                    self.broadcast_deployment(&events, None).await;
-                    Ok(Resp::Status200_TheResourcesAreDeployed(result))
-                }
+                // Peer broadcast runs inside the detached deploy owner.
+                Ok((result, _events)) => Ok(Resp::Status200_TheResourcesAreDeployed(result)),
                 Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
                     400, detail,
                 ))),
@@ -18730,6 +18726,13 @@ impl ServerImpl {
                     commit.wait().await;
                     owner.replicate_deployment(&events).await;
                     owner.install_into_raft_replicas(&events).await;
+                    // Peer broadcast belongs to the same detached, serialized
+                    // owner: a cancelled caller must not leave peers without
+                    // the definition (an identical retry emits no definition
+                    // events, so it could never repair them). The synced spec's
+                    // deployment request carries no `operationReference` yet
+                    // (camunda#67491 re-sync) — `None`.
+                    owner.broadcast_deployment(&events, None).await;
                     Ok((
                         events,
                         Commit::ready(),
@@ -18873,7 +18876,7 @@ impl ServerImpl {
     }
 
     /// Runs a forwarded deploy on the partition-0 owner: parses, deploys locally,
-    /// broadcasts to peers, and returns the deployment JSON. Invoked by the
+    /// broadcasts to peers (inside the detached deploy owner), and returns the deployment JSON. Invoked by the
     /// `Deploy` falcon frame handler. `Err` is `(status, detail)`.
     #[allow(
         clippy::expect_used,
@@ -18885,7 +18888,7 @@ impl ServerImpl {
         tenant_id: String,
     ) -> Result<serde_json::Value, (u16, String)> {
         let parsed = parse_deploy_resources(&resources).map_err(|(_, detail)| (400u16, detail))?;
-        let (result, events) = self
+        let (result, _events) = self
             .deploy_resources_locally_with_forms(
                 parsed.processes,
                 &parsed.process_resource_names,
@@ -18897,9 +18900,8 @@ impl ServerImpl {
             )
             .await
             .map_err(|(_, detail)| (400u16, detail))?;
-        // The synced spec's deployment request carries no `operationReference`
-        // yet (it arrives with the camunda#67491 re-sync) — `None` here.
-        self.broadcast_deployment(&events, None).await;
+        // The peer broadcast runs inside the detached deploy owner, so it
+        // survives caller cancellation (#1855 review).
         Ok(serde_json::to_value(result).expect("deployment result serializes"))
     }
 
@@ -35752,6 +35754,85 @@ mod clustered_startup_tests {
             .await
             .expect("peer creates after the wire broadcast");
         assert!(!completed);
+    }
+
+    /// #1855 review: the peer broadcast must survive caller cancellation too.
+    /// A deploy cancelled mid-fan-out on the partition-0 owner, followed by an
+    /// identical retry (which emits no definition events), must still leave
+    /// the peer node able to create the process.
+    #[tokio::test]
+    async fn cancelled_deploy_still_broadcasts_to_peers() {
+        let node1 = clustered_node(1);
+        let registry = falcon::Registry::new();
+        falcon::spawn_dispatcher(node1.clone(), registry.clone());
+        let app = peer_facing_app(node1.clone(), registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://unused".into(), format!("http://127.0.0.1:{port}")],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node0 = build_server_in_memory(journals, topology);
+        let proc = ProcessBuilder::new("cancel-bcast")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("cancel-bcast".to_string(), "cancel-bcast.bpmn".to_string());
+        let empty = std::collections::HashMap::new();
+        let handles = node0.engine.all();
+        assert!(handles.len() >= 2, "node 0 owns a sibling partition");
+        let exclusive = handles[1].lifecycle_exclusive().await;
+        {
+            let mut deploy = Box::pin(node0.deploy_resources_locally(
+                vec![proc.clone()],
+                &names,
+                Vec::new(),
+                &empty,
+                "<default>",
+            ));
+            loop {
+                use std::future::Future;
+                let done = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(deploy.as_mut().poll(cx).is_ready())
+                })
+                .await;
+                assert!(!done, "the blocked sibling install must hold the deploy");
+                if handles[0]
+                    .with(|j| j.state().processes.contains_key("cancel-bcast"))
+                    .await
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(deploy);
+        }
+        drop(exclusive);
+        // Owners are serialized, so the retry returns only after the cancelled
+        // owner's fan-out and broadcast have completed.
+        node0
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &empty, "<default>")
+            .await
+            .expect("retry deploy");
+        node1
+            .create_for_stream(Some("cancel-bcast".into()), None, Default::default())
+            .await
+            .expect("peer creates after cancel + retry");
     }
 
     /// A runtime SLA switch on one node propagates over the Falcon peer link to
