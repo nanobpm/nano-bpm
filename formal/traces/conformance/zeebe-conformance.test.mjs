@@ -196,6 +196,24 @@ test('an event-based gateway takes NO flow to the triggered catch (Zeebe, #1962)
   assert.equal((await validateTrace(c, 'evt-old', EVT, ['flow:f1', 'act:G1', 'flow:f2', 'flow:f3', 'done'])).ok, false)
 })
 
+test('a trace that violates the join rule is REJECTED by TLC (#1964)', async () => {
+  const c = ctx()
+  const g = graph('ParallelDiamond') // P2 joins f4, f5; out f6
+  const head = ['flow:f1', 'flow:f3', 'flow:f2', 'act:B', 'act:A']
+  // Green control: two arrivals, one fire (arrivals - fires = 1 defer).
+  assert.deepEqual(await validateTrace(c, 'join-ok', g, [...head, 'flow:f4', 'flow:f5', 'fire:P2', 'flow:f6', 'done']), { ok: true })
+  // The parallel join fires on ONE arrival (the other never taken).
+  const one = await validateTrace(c, 'join-one', g, [...head, 'flow:f4', 'fire:P2', 'flow:f6', 'done'])
+  assert.equal(one.ok, false)
+  assert.equal(one.unmatched, 'fire:P2')
+  // More fires than arrivals: two arrivals, two fires (zero inferred defers).
+  const twice = await validateTrace(c, 'join-twice', g, [...head, 'flow:f4', 'flow:f5', 'fire:P2', 'flow:f6', 'fire:P2', 'flow:f6', 'done'])
+  assert.equal(twice.ok, false)
+  // The inference counts this as fire-only, which is why it is never used to
+  // ACCEPT a trace: soundness (TLC) rejects it first.
+  assert.deepEqual([...observedDecisions(g, [['flow:f4', 'flow:f5', 'fire:P2', 'fire:P2']])], ['fire:P2'])
+})
+
 test('the unconstrained model enumerates both join decisions of a diamond', async () => {
   const d = await modelDecisions(ctx(), graph('ParallelDiamond'))
   assert.deepEqual([...d].sort(), ['defer:P2', 'fire:P2'])

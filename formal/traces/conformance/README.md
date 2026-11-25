@@ -54,6 +54,65 @@ Any rejected trace or uncovered decision is a **divergence**: the reference mode
 is wrong (or too permissive). Fix the model; `RefinesZeebe` then surfaces any
 matching Nano divergence, which gets filed separately.
 
+## Abstraction and its soundness
+
+This section states exactly what link A checks, so it can be reviewed without reading the code.
+
+**Action labels.** `ZeebeTokenFlowTrace.tla` doesn't restate Zeebe's semantics. It
+`INSTANCE`s `ZeebeTokenFlow` and labels each model action with the exporter
+records that action emits (`stepMilestones` projects the records onto the same labels):
+
+| Model action (`ZeebeTokenFlow`)             | Label (milestones)                       | Exporter records                                                |
+|---------------------------------------------|------------------------------------------|-----------------------------------------------------------------|
+| `DrainVia(f, S)` into a task / event gateway | `act:<n>`                                | `ELEMENT_ACTIVATED` of `n`                                      |
+| `DrainVia(f, S)` into a join that fires      | `fire:<j>` + `flow:<g>` for `g ∈ S`      | `ELEMENT_ACTIVATED` of `j`, `SEQUENCE_FLOW_TAKEN` of its outflows |
+| `DrainVia(f, S)` into a join that defers     | nothing (silent)                         | nothing (the activation command is rejected, no event)          |
+| `DrainVia(f, S)` into a non-join gateway    | `flow:<g>` for `g ∈ S`                   | `SEQUENCE_FLOW_TAKEN` of each chosen outflow                    |
+| `DrainVia(f, S)` into an end event           | nothing (silent)                         | end-event lifecycle (dropped, see below)                        |
+| `CompleteTask(t)`                           | `flow:<g>` for `g ∈ Out(t)`              | `SEQUENCE_FLOW_TAKEN` after the job completes                   |
+| `CorrelateEvent(n, g)`                      | nothing (silent)                         | the catch event is activated directly; no flow is taken         |
+| `CompleteInstance`                          | `done`                                   | `ELEMENT_COMPLETED` of the `PROCESS`                            |
+
+**What is dropped, and why that is sound.** The projection keeps only
+`PROCESS_INSTANCE` records. It drops:
+
+- every non-`ELEMENT_ACTIVATED` lifecycle intent (`ACTIVATING`, `COMPLETING`,
+  `COMPLETED`, …) of an element other than the process;
+- `ELEMENT_ACTIVATED` of splits, non-join gateways, catch and end events;
+- the `JOB`, `VARIABLE`, `MESSAGE_SUBSCRIPTION`, … value types.
+
+None of these is a state change of `ZeebeTokenFlow`: they're wait-state
+bookkeeping or lifecycle steps that follow, in the same command, from a kept
+record. The model has no variables for them. Dropping them only makes the
+check *weaker*, never wrong: link A proves "every observed projected trace is a
+behaviour of the model". It doesn't claim the model predicts the dropped
+records. Those are compared record-for-record by the differential harness
+(`formal/traces`, `engine-core/tests/zeebe_traces.rs`).
+
+Order inside one action's label is not checked (`Match` compares sets), because
+Zeebe writes one command's follow-up records contiguously in an order the model
+abstracts. Order *between* actions is checked. Each label set is consumed whole,
+so a step's records can't interleave with another step's.
+
+**The join-inference rule** (coverage, `observedDecisions`). A deferred join
+arrival is silent, so a trace can't show a `defer:<j>` directly. The runner infers it:
+within one captured step, `k` flows taken into join `j` and `m` `fire:<j>`
+records mean `m` fires and `k − m` defers.
+
+*Assumption:* every flow taken into a join produces exactly one activation
+attempt, and that attempt is decided (fired or rejected) **within the same
+step** (the same client command's processing). This holds for Zeebe because
+`SEQUENCE_FLOW_TAKEN` writes one `ACTIVATE_ELEMENT` command for the target,
+and the engine processes all follow-up commands of a client command before it
+returns. The model makes the same assumption: one queued activation per
+arrival, drained by `DrainVia`. If it doesn't hold, the soundness check
+catches it rather than the inference silently miscounting: TLC only accepts a
+trace where each `fire:<j>` is produced by the drain of an arrival in the same
+label set. So `fire:<j>` with no arrival, more fires than arrivals, or a fire
+before its arrivals are all **rejected** (see the negative tests in
+`zeebe-conformance.test.mjs`). The inference is only used for *coverage*
+(which decisions were observed), never to accept a trace.
+
 ## Running it
 
 ```bash
