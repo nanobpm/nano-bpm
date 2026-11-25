@@ -75,6 +75,55 @@ impl std::fmt::Display for PeerError {
 
 impl std::error::Error for PeerError {}
 
+impl PeerError {
+    /// Whether a client may safely retry the request that failed with this
+    /// error (#1931). Every variant is a **transport** failure: the forwarding
+    /// node could not reach the owner, or did not hear back in time. None of
+    /// them is a semantic rejection by the owner (those arrive as an `Ok`
+    /// [`PeerResult`] carrying the owner's 4xx), so all are transient —
+    /// Zeebe/C8 parity: a gateway→broker timeout surfaces as gRPC
+    /// `DEADLINE_EXCEEDED` / `UNAVAILABLE`, which clients retry. Exhaustive on
+    /// purpose: a new variant must make an explicit retryability decision.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            PeerError::Connect(_) | PeerError::Closed | PeerError::Timeout => true,
+        }
+    }
+
+    /// The HTTP status a gateway surfaces for this peer-forward failure: the
+    /// single canonical mapping every forwarding path derives from (#1931).
+    /// Retryable transport failures map to 503 Service Unavailable (the
+    /// backpressure / leader-race status every SDK retries); never a 5xx that
+    /// clients treat as non-retryable (500/502).
+    pub fn http_status(&self) -> u16 {
+        if self.is_retryable() { 503 } else { 500 }
+    }
+
+    /// Whether the request may already have reached (and been applied by) the
+    /// owner: a link that closed or timed out **after** the send leaves the
+    /// outcome unknown, while a connect failure is definitely pre-send.
+    /// Exhaustive on purpose.
+    pub fn outcome_unknown(&self) -> bool {
+        match self {
+            PeerError::Connect(_) => false,
+            PeerError::Closed | PeerError::Timeout => true,
+        }
+    }
+
+    /// The HTTP status for a failed **non-idempotent write** (e.g. an
+    /// instance create): retrying an unknown-outcome write is only safe when
+    /// the owner deduplicates it (`deduplicated`, e.g. a `businessId`).
+    /// Otherwise an unknown outcome is surfaced as a non-retryable 500 so a
+    /// client retry cannot mint a duplicate (#1931 review).
+    pub fn write_http_status(&self, deduplicated: bool) -> u16 {
+        if self.outcome_unknown() && !deduplicated {
+            500
+        } else {
+            self.http_status()
+        }
+    }
+}
+
 /// Maps a failed WebSocket handshake to [`PeerError::Connect`], keeping the
 /// peer's HTTP rejection **body** in the message. A gateway that enforces the
 /// cluster secret or a determinism upgrade boundary (#1702) refuses the join
@@ -209,6 +258,20 @@ fn link_closed_result() -> PeerResult {
 /// retry such an outcome (#1582).
 pub fn is_link_closed_result(r: &PeerResult) -> bool {
     r.status == 502 && matches!(&r.body, Some(Value::String(s)) if s == LINK_CLOSED_BODY)
+}
+
+/// The single choke point every awaited peer reply passes through (#1931):
+/// the synthetic link-closed reply (lane closed / retired mid-request) is a
+/// TRANSPORT failure, so it surfaces as `Err(PeerError::Closed)` — mapped by
+/// [`PeerError::http_status`] to a retryable 503 — never as an `Ok` 502 that
+/// forwarders would relay as a non-retryable 500/502. Non-idempotent callers
+/// still treat any `Err` after send as an ambiguous outcome (#1582).
+fn classify_reply(r: PeerResult) -> Result<PeerResult, PeerError> {
+    if is_link_closed_result(&r) {
+        Err(PeerError::Closed)
+    } else {
+        Ok(r)
+    }
 }
 
 impl PeerLink {
@@ -599,7 +662,7 @@ impl PeerLink {
         }
 
         match tokio::time::timeout_at(deadline, rx).await {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok(result)) => classify_reply(result),
             Ok(Err(_)) => Err(PeerError::Closed),
             Err(_) => Err(PeerError::Timeout),
         }
@@ -1903,8 +1966,40 @@ fn fast_forward_timeout() -> Duration {
 }
 
 #[cfg(test)]
+mod write_status_tests {
+    use super::PeerError;
+
+    #[test]
+    fn unknown_outcome_unkeyed_write_is_not_retryable() {
+        for e in [PeerError::Closed, PeerError::Timeout] {
+            assert_eq!(e.write_http_status(false), 500, "{e}");
+            assert_eq!(e.write_http_status(true), 503, "{e}");
+        }
+        let c = PeerError::Connect("refused".into());
+        assert_eq!(c.write_http_status(false), 503);
+        assert_eq!(c.write_http_status(true), 503);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1931: every `PeerError` variant is classified as a class — transport
+    /// failures are retryable and surface as 503, never 500/502 (which SDKs
+    /// mark `nonRetryable` and drop, stranding jobs until their timeout).
+    #[test]
+    fn peer_error_mapping_is_retryable_for_transport_failures() {
+        let table: [(PeerError, bool, u16); 3] = [
+            (PeerError::Connect("refused".into()), true, 503),
+            (PeerError::Closed, true, 503),
+            (PeerError::Timeout, true, 503),
+        ];
+        for (err, retryable, status) in table {
+            assert_eq!(err.is_retryable(), retryable, "{err}");
+            assert_eq!(err.http_status(), status, "{err}");
+        }
+    }
 
     /// #1582: dropping an in-flight `request_on` future (a caller-side timeout,
     /// a cancelled task, a `select!` loser) must remove its pending-correlation
@@ -2218,6 +2313,21 @@ mod tests {
             status: 503,
             body: Some(Value::String(LINK_CLOSED_BODY.into())),
         }));
+    }
+
+    /// #1931: a lane closing mid-request reaches callers as a retryable
+    /// transport error (503), not an `Ok` 502 that bypasses the mapping;
+    /// genuine peer replies (including a real 502) pass through untouched.
+    #[test]
+    fn link_closed_reply_surfaces_as_retryable_closed_error() {
+        let e = classify_reply(link_closed_result()).expect_err("link-closed is a transport error");
+        assert!(matches!(e, PeerError::Closed));
+        assert_eq!(e.http_status(), 503);
+        let real = PeerResult {
+            status: 502,
+            body: Some(Value::String("bad gateway".into())),
+        };
+        assert_eq!(classify_reply(real).map(|r| r.status).ok(), Some(502));
     }
 
     /// A partially-built link (first socket dialed, second failed/cancelled)
