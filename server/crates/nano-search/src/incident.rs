@@ -52,6 +52,7 @@ pub fn search_incident_rows(
 /// The incident search sort projection.
 pub fn incident_sort_val(inc: &readstore::IncidentRow, field: &str) -> query::SortVal {
     match field {
+        "incidentKey" => query::SortVal::Num(inc.key as i128),
         "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
         "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
         "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
