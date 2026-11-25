@@ -5,6 +5,8 @@
 
 mod apply;
 pub(crate) mod types;
+#[cfg(kani)]
+mod kani_proofs;
 
 pub use apply::apply;
 #[cfg(test)]
