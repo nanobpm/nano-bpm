@@ -1,10 +1,13 @@
-//! Kani probe.
+//! Kani proof harness for the engine transitions (#1960): deploying and
+//! instantiating a parallel diamond (activate / complete / finalize_completion
+//! through the fork) never panics or overflows. See `formal/kani/README.md`.
+
 use super::*;
 use crate::model::ProcessBuilder;
 
 #[kani::proof]
 #[kani::unwind(4)]
-fn probe_parallel_diamond() {
+fn parallel_diamond_creates_one_instance() {
     let def = ProcessBuilder::new("p")
         .start_event("S")
         .parallel_gateway("P1")

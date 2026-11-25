@@ -4,9 +4,9 @@
 //! existing `crate::state::…` path resolving.
 
 mod apply;
-pub(crate) mod types;
 #[cfg(kani)]
 mod kani_proofs;
+pub(crate) mod types;
 
 pub use apply::apply;
 #[cfg(test)]

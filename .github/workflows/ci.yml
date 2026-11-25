@@ -940,6 +940,19 @@ jobs:
         with:
           path: ~/.cache/nanobpm-formal
           key: tla2tools-${{ steps.tla.outputs.version }}
+      - name: Cache Kani toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-${{ hashFiles('formal/kani/check.sh') }}
+      - name: Kani proofs (engine-core code-level, #1960)
+        # Bounded model checking of engine-core harnesses (formal/kani/README.md).
+        # Time-boxed: a harness that outgrows the box must shrink its bounds.
+        timeout-minutes: 20
+        run: formal/kani/check.sh
       - name: Model-check
         # Keep every model's TLC log (with its -coverage statistics) for the
         # action-coverage gate below (#1248).

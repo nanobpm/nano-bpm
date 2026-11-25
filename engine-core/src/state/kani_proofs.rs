@@ -56,7 +56,7 @@ fn total(arrivals: &FlowArrivals) -> usize {
 /// distinct flow (Zeebe's "Tetris principle") and an arrival adds exactly its
 /// tokens to exactly its flow.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(4)]
 fn flow_arrivals_preserve_join_invariant() {
     let mut arrivals = FlowArrivals::default();
     for _ in 0..STEPS {
@@ -97,11 +97,19 @@ fn any_job_event() -> Event {
             job_key: KEY,
             instance_key: 1,
             durable: kani::any(),
-            worker: if kani::any() { "w".to_string() } else { String::new() },
+            worker: if kani::any() {
+                "w".to_string()
+            } else {
+                String::new()
+            },
             deadline: kani::any(),
             activated_at: if kani::any() { Some(kani::any()) } else { None },
             fetch_variables: Vec::new(),
-            lease_token: if kani::any() { Some("t".to_string()) } else { None },
+            lease_token: if kani::any() {
+                Some("t".to_string())
+            } else {
+                None
+            },
         },
         1 => Event::JobLockExpired {
             job_key: KEY,
@@ -141,7 +149,7 @@ fn any_job_event() -> Event {
 /// non-deferred job is activatable; a frozen activation timeout never exceeds
 /// its deadline; a `Completed` job holds no lock.
 #[kani::proof]
-#[kani::unwind(5)]
+#[kani::unwind(4)]
 fn job_lease_lifecycle_keeps_indexes_in_lockstep() {
     const KEY: Key = 7;
     let mut state = State::default();

@@ -18,8 +18,6 @@ use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
-#[cfg(kani)]
-mod kani_proofs;
 mod agent_behavior;
 mod api;
 mod boundary;
@@ -28,6 +26,8 @@ mod debug;
 mod event_subprocess;
 mod expression;
 mod flow_scope;
+#[cfg(kani)]
+mod kani_proofs;
 mod memory;
 mod migration;
 mod modify;
