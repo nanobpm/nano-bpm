@@ -963,9 +963,19 @@ jobs:
     # model recorded in formal/tla/check.sh. That includes known-defect
     # ratchets, which fail once the defect stops reproducing. Also guards the
     # Zeebe parity coverage matrix in formal/parity (#1245).
-    needs: changes
-    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true' }}
+    #
+    # Also the required-check carrier for the Kani proofs (#1994): it `needs`
+    # the `kani` matrix and runs under `always()` so a failed/cancelled/timed-out
+    # Kani leg FAILS this required check instead of skipping it (a skipped
+    # required check is accepted by the merge protocol).
+    needs: [changes, kani]
+    if: ${{ always() && needs.changes.result == 'success' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true') }}
     steps:
+      - name: Require Kani proofs to pass
+        if: ${{ needs.kani.result != 'success' }}
+        run: |
+          echo "::error::kani (engine-core proofs) concluded '${{ needs.kani.result }}', expected 'success'"
+          exit 1
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
