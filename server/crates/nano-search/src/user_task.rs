@@ -326,9 +326,9 @@ pub fn user_task_result(
 ) -> models::UserTaskResult {
     // The business id snapshotted when the user task was created.
     let business_id = nullable_business_id(task.business_id.clone());
-    let creation_date =
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(task.created_at_ms as i64)
-            .unwrap_or_else(chrono::Utc::now);
+    // Clock-free: an out-of-range virtual-clock timestamp must map to a fixed
+    // instant, never the wall clock, so identical reads stay deterministic.
+    let creation_date = crate::convert::ms_to_datetime(task.created_at_ms);
 
     let parse_date = |d: &Option<String>| -> types::Nullable<chrono::DateTime<chrono::Utc>> {
         match d
@@ -379,6 +379,25 @@ pub fn user_task_result(
             None => types::Nullable::Null,
         },
         tags: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod creation_date_tests {
+    #[test]
+    fn out_of_range_creation_ms_is_deterministic_not_wall_clock() {
+        let a = crate::convert::ms_to_datetime(u64::MAX);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = crate::convert::ms_to_datetime(10_000_000_000_000_000);
+        assert_eq!(a, b);
+        assert_eq!(a.timestamp(), 0);
+    }
+
+    #[test]
+    fn mapper_does_not_read_the_wall_clock() {
+        let src = include_str!("user_task.rs");
+        let needle = ["Utc", "::now"].concat();
+        assert!(!src.contains(&needle), "user_task.rs must stay clock-free");
     }
 }
 
