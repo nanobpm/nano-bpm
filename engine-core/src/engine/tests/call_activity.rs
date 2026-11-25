@@ -2146,3 +2146,22 @@ fn evicting_an_ended_child_drops_its_retained_user_tasks() {
         }
     }
 }
+
+/// #1948 review: `retire_below` must honour `max_remove` across an ended
+/// call-activity tree (no descendant closure past the budget): it reaps
+/// leaf-first, one instance per call, retaining each parent until its
+/// descendants are drained, and the drained tree leaves no state behind.
+#[test]
+fn retire_below_reaps_an_ended_tree_leaf_first_within_budget() {
+    let (mut engine, root, mid, leaf) = ended_three_level_tree();
+    let low_water = engine.retirement_low_water();
+    assert_eq!(engine.retire_below(low_water, 1), vec![leaf]);
+    assert!(engine.instance(mid).is_some() && engine.instance(root).is_some());
+    assert_eq!(engine.retire_below(low_water, 1), vec![mid]);
+    assert!(engine.instance(root).is_some());
+    assert_eq!(engine.retire_below(low_water, 1), vec![root]);
+    assert!(engine.retire_below(low_water, 1).is_empty());
+    for key in [root, mid, leaf] {
+        assert!(!holds_any_state_for(&engine, key), "{key} left behind");
+    }
+}

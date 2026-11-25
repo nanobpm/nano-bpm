@@ -384,6 +384,10 @@ impl Engine {
     /// change what a later log entry does on this replica alone (#1908), so
     /// live instances are never touched, exactly like
     /// [`Engine::retire_instances`].
+    ///
+    /// Reaping is leaf-first: an instance with resident call-activity
+    /// children is kept until they are gone, so each call removes at most
+    /// `max_remove` instances even across a large ended subtree.
     pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> Vec<Key> {
         let scan_budget = max_remove
             .saturating_mul(RETIRE_BELOW_SCAN_FACTOR)
@@ -418,7 +422,12 @@ impl Engine {
                 next_cursor = k;
                 break;
             }
-            if self.is_terminal_instance(k) {
+            // Leaf-first (#1948): an ended parent is retained until its
+            // resident descendants are reaped by earlier calls, so the
+            // descendant closure in `remove_instance_set` never expands a
+            // single pick past `max_remove` (a wide ended subtree drains across
+            // ticks instead of monopolizing the actor in one call).
+            if self.is_terminal_instance(k) && !self.state.children_by_parent.contains_key(&k) {
                 victims.insert(k);
             }
         }
