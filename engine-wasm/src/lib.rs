@@ -1229,7 +1229,14 @@ impl TestEngine {
         let (element_id, process_instance_key) = self
             .engine
             .agent_instance_ownership(agent_instance_key)
-            .ok_or_else(|| js_err("no such agent instance"))?;
+            .ok_or_else(|| {
+                engine_err(
+                    "update agent instance error",
+                    &nanobpmn_engine_core::EngineError::AgentInstanceNotFound {
+                        agent_instance_key,
+                    },
+                )
+            })?;
         reject_non_updatable_status(req.status.as_deref()).map_err(|m| js_err(&m))?;
         let status = match req.status.as_deref() {
             Some(s) => Some(parse_agent_status(s)?),
@@ -1862,14 +1869,20 @@ impl TestEngine {
 
     /// Activate the job's type so a `Created` job can be completed/failed. A job
     /// that has already been activated is left as-is.
+    ///
+    /// A missing job is left for the caller's command to reject, so it surfaces
+    /// as the typed `JobNotFound` (ProblemDetail 404 via [`engine_err`]) with the
+    /// caller's own context — never a bare string (#1937).
     fn ensure_activated(&mut self, job_key: u64) -> Result<(), JsValue> {
-        let (state, leased) = self
+        let Some((state, leased)) = self
             .engine
             .state()
             .jobs
             .get(&job_key)
             .map(|j| (j.state, j.lease_token.is_some()))
-            .ok_or_else(|| js_err(&format!("no such job: {job_key}")))?;
+        else {
+            return Ok(());
+        };
         // Already activated (or terminal) — nothing to do; completion is by key.
         if state != JobState::Created || leased {
             return Ok(());
@@ -4514,6 +4527,64 @@ mod tests {
         assert_eq!(decisions.len(), 1, "{decisions:?}");
         assert_eq!(decisions[0]["state"], "FAILED");
         assert!(decisions[0]["evaluationFailure"].as_str().is_some());
+    }
+
+    /// Missing-resource lookups are typed 404 rejections on every entry point,
+    /// not only on the paths that reach `apply` (#1937): a no-lease job call and
+    /// an unknown-agent update used to throw a bare string.
+    #[test]
+    fn missing_resource_lookups_throw_problem_detail() {
+        fn rejection(f: impl FnOnce(&mut TestEngine)) -> String {
+            let mut eng = TestEngine::new();
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut eng)))
+                .expect_err("call must reject");
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default()
+        }
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "complete error",
+                rejection(|e| {
+                    let _ = e.complete_job("424242", "{}", None);
+                }),
+            ),
+            (
+                "complete agent job error",
+                rejection(|e| {
+                    let _ = e.complete_agent_job("424242", "{}", "{}", None);
+                }),
+            ),
+            (
+                "fail error",
+                rejection(|e| {
+                    let _ = e.fail_job("424242", 0, "x", None);
+                }),
+            ),
+            (
+                "throw error",
+                rejection(|e| {
+                    let _ = e.throw_error("424242", "E", "x", None);
+                }),
+            ),
+            (
+                "update agent instance error",
+                rejection(|e| {
+                    let _ = e.update_agent_instance(
+                        "424242",
+                        r#"{"elementInstanceKey":"1","jobKey":"2"}"#,
+                    );
+                }),
+            ),
+        ];
+        for (context, msg) in cases {
+            assert!(
+                msg.starts_with(&format!("{HOST_REJECTION_PREFIX}{context}: "))
+                    && msg.contains("[status=404 title=NOT_FOUND nonRetryable=true]"),
+                "{context}: {msg}"
+            );
+        }
     }
 
     #[test]

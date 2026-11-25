@@ -67,6 +67,25 @@ async function checkVariant(label, glueSpecifier, wasmSpecifier) {
     rejection(() => engine.evaluateDecision("no-such-decision", "{}")),
     { status: 404, title: "NOT_FOUND", nonRetryable: true, context: "evaluate error" },
   );
+  // Missing-resource lookups that exit before the engine command (#1937).
+  for (const [call, context, fn] of [
+    ["completeJob(no lease)", "complete error", () => engine.completeJob("424242", "{}")],
+    ["completeAgentJob(no lease)", "complete agent job error", () => engine.completeAgentJob("424242", "{}", "{}")],
+    ["failJob(no lease)", "fail error", () => engine.failJob("424242", 0, "x")],
+    ["throwError(no lease)", "throw error", () => engine.throwError("424242", "E", "x")],
+    [
+      "updateAgentInstance(unknown agent)",
+      "update agent instance error",
+      () => engine.updateAgentInstance("424242", JSON.stringify({ elementInstanceKey: "1", jobKey: "2" })),
+    ],
+  ]) {
+    checkProblem(`${label}: ${call}`, rejection(fn), {
+      status: 404,
+      title: "NOT_FOUND",
+      nonRetryable: true,
+      context,
+    });
+  }
   engine.free();
 }
 
