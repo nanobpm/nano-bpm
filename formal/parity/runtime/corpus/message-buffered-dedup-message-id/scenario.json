@@ -1,0 +1,52 @@
+{
+  "name": "message-buffered-dedup-message-id",
+  "bpmn": "process.bpmn",
+  "processId": "parity-msg-dedup",
+  "variables": {
+    "key": "parity-msg-dedup"
+  },
+  "steps": [
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-dedup",
+      "variables": {
+        "first": true
+      },
+      "timeToLive": 600000,
+      "messageId": "dedup-1"
+    },
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-dedup",
+      "variables": {
+        "second": true
+      },
+      "timeToLive": 600000,
+      "messageId": "dedup-1",
+      "expectRejected": true
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "a",
+      "variables": {}
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": {
+      "key": "parity-msg-dedup",
+      "first": true
+    },
+    "jobsCreated": {
+      "a": 1
+    },
+    "completedElements": {
+      "StartEvent_1": 1,
+      "Task_A": 1,
+      "Catch_M": 1,
+      "EndEvent_1": 1
+    }
+  }
+}

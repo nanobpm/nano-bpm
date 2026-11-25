@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_parity-msg-int-one" targetNamespace="http://bpmn.io/schema/bpmn" exporter="nano parity seed" exporterVersion="1.0.0">
+  <bpmn:message id="Message_M" name="M">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=key" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+  <bpmn:process id="parity-msg-int-one" name="Interrupting boundary takes one buffered message" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_1" name="Start">
+      <bpmn:outgoing>Flow_s_a</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="Flow_s_a" sourceRef="StartEvent_1" targetRef="Task_A" />
+    <bpmn:serviceTask id="Task_A" name="A">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="a" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_s_a</bpmn:incoming>
+      <bpmn:outgoing>Flow_a_w</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_a_w" sourceRef="Task_A" targetRef="Task_W" />
+    <bpmn:serviceTask id="Task_W" name="W">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="w" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_a_w</bpmn:incoming>
+      <bpmn:outgoing>Flow_w_e</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_w_e" sourceRef="Task_W" targetRef="EndEvent_1" />
+    <bpmn:endEvent id="EndEvent_1" name="End">
+      <bpmn:incoming>Flow_w_e</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="Boundary_M" name="M" cancelActivity="true" attachedToRef="Task_W">
+      <bpmn:outgoing>Flow_bm_b</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="Boundary_M_def" messageRef="Message_M" />
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_bm_b" sourceRef="Boundary_M" targetRef="Task_B" />
+    <bpmn:serviceTask id="Task_B" name="B">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="b" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_bm_b</bpmn:incoming>
+      <bpmn:outgoing>Flow_b_e</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="Flow_b_e" sourceRef="Task_B" targetRef="End_B" />
+    <bpmn:endEvent id="End_B" name="End B">
+      <bpmn:incoming>Flow_b_e</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="parity-msg-int-one">
+      <bpmndi:BPMNShape id="StartEvent_1_di" bpmnElement="StartEvent_1">
+        <dc:Bounds x="172" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_A_di" bpmnElement="Task_A">
+        <dc:Bounds x="260" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_W_di" bpmnElement="Task_W">
+        <dc:Bounds x="412" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_1_di" bpmnElement="EndEvent_1">
+        <dc:Bounds x="564" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Boundary_M_di" bpmnElement="Boundary_M">
+        <dc:Bounds x="444" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_B_di" bpmnElement="Task_B">
+        <dc:Bounds x="530" y="200" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_B_di" bpmnElement="End_B">
+        <dc:Bounds x="682" y="222" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_s_a_di" bpmnElement="Flow_s_a">
+        <di:waypoint x="208" y="120" />
+        <di:waypoint x="260" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_a_w_di" bpmnElement="Flow_a_w">
+        <di:waypoint x="360" y="120" />
+        <di:waypoint x="412" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_w_e_di" bpmnElement="Flow_w_e">
+        <di:waypoint x="512" y="120" />
+        <di:waypoint x="564" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_bm_b_di" bpmnElement="Flow_bm_b">
+        <di:waypoint x="462" y="178" />
+        <di:waypoint x="462" y="240" />
+        <di:waypoint x="530" y="240" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_b_e_di" bpmnElement="Flow_b_e">
+        <di:waypoint x="630" y="240" />
+        <di:waypoint x="682" y="240" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

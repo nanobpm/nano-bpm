@@ -1,0 +1,51 @@
+{
+  "name": "message-ttl-zero-not-buffered",
+  "bpmn": "process.bpmn",
+  "processId": "parity-msg-ttl-zero",
+  "variables": {
+    "key": "parity-msg-ttl-zero"
+  },
+  "steps": [
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-ttl-zero",
+      "variables": {
+        "buffered": true
+      },
+      "timeToLive": 0
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "a",
+      "variables": {}
+    },
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-ttl-zero",
+      "variables": {
+        "late": true
+      },
+      "settled": {
+        "ack": true
+      }
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": {
+      "key": "parity-msg-ttl-zero",
+      "late": true
+    },
+    "jobsCreated": {
+      "a": 1
+    },
+    "completedElements": {
+      "StartEvent_1": 1,
+      "Task_A": 1,
+      "Catch_M": 1,
+      "EndEvent_1": 1
+    }
+  }
+}
