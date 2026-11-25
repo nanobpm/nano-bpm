@@ -608,3 +608,132 @@ fn oldest_buffered_message_wins_regardless_of_key_origin() {
         assert_eq!(got[0].0, foreign, "the first-published message wins");
     }
 }
+
+/// A main flow that parks on a service task, plus a NON-interrupting message
+/// event sub-process: a persistent subscription that stays open after firing.
+fn non_interrupting_esp_process() -> ProcessDefinition {
+    use crate::model::EventSubProcessTrigger as Trig;
+    ProcessBuilder::new("ni")
+        .start_event("s")
+        .service_task("work", "work")
+        .end_event("e")
+        .connect("s", "work")
+        .connect("work", "e")
+        .event_sub_process(
+            "esp",
+            "esp_start",
+            Trig::Message {
+                message_name: "m".into(),
+                correlation_key: "orderId".into(),
+            },
+            false,
+        )
+        .start_event("esp_start")
+        .end_event("esp_end")
+        .connect("esp_start", "esp_end")
+        .contained_in("esp_start", "esp")
+        .contained_in("esp_end", "esp")
+        .build()
+        .unwrap()
+}
+
+/// r4692383366 (previously missed): a still-armed non-interrupting
+/// subscription takes EVERY matching buffered message, oldest first — not
+/// just the first one.
+#[test]
+fn non_interrupting_subscription_drains_the_whole_backlog_locally() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(non_interrupting_esp_process()))
+        .unwrap();
+    let mut published = Vec::new();
+    for t in [1_000, 1_001, 1_002] {
+        let events = engine
+            .apply_command_at(publish_with("m", "o-1", BTreeMap::new(), None), t)
+            .unwrap();
+        published.push(
+            events
+                .iter()
+                .find_map(|e| match e {
+                    Event::MessageBuffered { message_key, .. } => Some(*message_key),
+                    _ => None,
+                })
+                .expect("buffered"),
+        );
+    }
+    let events = engine
+        .apply_command_at(
+            Command::create_instance_with("ni", vars(&[("orderId", Value::Str("o-1".into()))])),
+            2_000,
+        )
+        .unwrap();
+    let taken: Vec<Key> = buffered_correlations(&events)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    assert_eq!(
+        taken, published,
+        "every buffered message, in order: {events:?}"
+    );
+}
+
+/// The routed twin: the message partition settles every backlog message to a
+/// still-open non-interrupting subscription.
+#[test]
+fn non_interrupting_subscription_drains_the_whole_backlog_routed() {
+    const N: u64 = 2;
+    let order = ('a'..='z')
+        .map(|c| c.to_string())
+        .find(|k| state::subscription_partition(k, N) == 1)
+        .expect("some key hashes to partition 1");
+    let mut instance_engine = Engine::with_partition(0);
+    instance_engine.set_num_partitions(N);
+    instance_engine
+        .apply_command(Command::DeployProcess(non_interrupting_esp_process()))
+        .unwrap();
+    let mut message_engine = Engine::with_partition(1);
+    message_engine.set_num_partitions(N);
+    for t in [1_000, 1_001] {
+        message_engine
+            .apply_command_at(publish_with("m", &order, BTreeMap::new(), None), t)
+            .unwrap();
+    }
+    let created = instance_engine
+        .apply_command_at(
+            Command::create_instance_with("ni", vars(&[("orderId", Value::Str(order.clone()))])),
+            2_000,
+        )
+        .unwrap();
+    let open = created
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                delivery_key,
+            } => Some(Command::OpenMessageSubscription {
+                subscription_key: *subscription_key,
+                instance_key: *instance_key,
+                element_instance_key: *element_instance_key,
+                element_id: element_id.clone(),
+                message_name: message_name.clone(),
+                correlation_key: correlation_key.clone(),
+                kind: kind.clone(),
+                delivery_key: *delivery_key,
+            }),
+            _ => None,
+        })
+        .expect("a cross-partition Opening");
+    let opened = message_engine.apply_command_at(open, 3_000).unwrap();
+    let remote = opened
+        .iter()
+        .filter(|e| matches!(e, Event::RemoteMessageCorrelation { .. }))
+        .count();
+    assert_eq!(buffered_correlations(&opened).len(), 2, "{opened:?}");
+    assert_eq!(remote, 2, "{opened:?}");
+}

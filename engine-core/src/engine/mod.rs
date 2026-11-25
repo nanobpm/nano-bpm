@@ -313,6 +313,9 @@ pub struct Engine {
     /// opened message subscriptions that may correlate a **buffered** message
     /// (#1874). Per-command scratch: reset by every `plan_command_at`.
     buffer_scan_from: usize,
+    /// Still-open persistent subscriptions that took a buffered message and
+    /// may take the next one (#1874). Per-command scratch.
+    buffer_requeue: VecDeque<Key>,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -762,6 +765,7 @@ impl Engine {
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
+            buffer_requeue: VecDeque::new(),
             sweep_from: 0,
             raft_applied: None,
         }
@@ -944,6 +948,7 @@ impl Engine {
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
+            buffer_requeue: VecDeque::new(),
             sweep_from: 0,
             raft_applied,
         }
@@ -2663,6 +2668,7 @@ impl Engine {
         self.boundary_payloads.clear();
         self.pending_timer_fires.clear();
         self.buffer_scan_from = 0;
+        self.buffer_requeue.clear();
         self.sweep_from = 0;
         // Per-command terminal-deadline stamp (#1494): set from THIS command
         // only, merged with any envelope stamps armed by
@@ -7353,29 +7359,59 @@ impl Engine {
     /// opening, so the caller's next quiescent pass resumes there.
     fn correlate_buffered_messages(&mut self, log: &mut Vec<Event>, queue: &mut VecDeque<Step>) {
         let from = self.buffer_scan_from.min(log.len());
-        self.buffer_scan_from = log.len();
+        let end = log.len();
+        self.buffer_scan_from = end;
         if self.state.buffered_messages.is_empty() {
+            self.buffer_requeue.clear();
             return;
         }
-        let opened: Vec<(usize, Key)> = log[from..]
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| match e {
-                Event::MessageSubscriptionCreated {
-                    subscription_key, ..
-                } => Some((from + i, *subscription_key)),
-                _ => None,
-            })
-            .collect();
+        // Persistent subscriptions (non-interrupting boundary / event
+        // sub-process) that took a buffered message on an earlier pass stay
+        // open and get the next matching buffered message (Zeebe
+        // `correlateNextMessage` after a non-interrupting correlation).
+        while let Some(subscription_key) = self.buffer_requeue.pop_front() {
+            if self.correlate_one_buffered(log, queue, subscription_key) {
+                self.buffer_scan_from = from;
+                return;
+            }
+        }
+        // Incremental scan of the openings (no per-pass rebuild of the
+        // remaining list): stop at the first local correlation and resume
+        // right after it on the next pass.
+        for i in from..end {
+            let Event::MessageSubscriptionCreated {
+                subscription_key, ..
+            } = log[i]
+            else {
+                continue;
+            };
+            if self.correlate_one_buffered(log, queue, subscription_key) {
+                self.buffer_scan_from = i + 1;
+                return;
+            }
+        }
+    }
+
+    /// One subscription's turn at the buffer (see
+    /// [`Self::correlate_buffered_messages`]). Returns `true` when a LOCAL
+    /// correlation advanced a token (the caller must drain before going on);
+    /// a still-open local subscription is requeued for the next message. A
+    /// remote subscription is settled here, repeatedly while it stays open.
+    fn correlate_one_buffered(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        subscription_key: Key,
+    ) -> bool {
         let now = self.now;
-        for (idx, &(_, subscription_key)) in opened.iter().enumerate() {
+        loop {
             let Some(subscription) = self
                 .state
                 .message_subscriptions
                 .get(&subscription_key)
                 .filter(|s| s.state == state::MessageSubscriptionState::Open)
             else {
-                continue;
+                return false;
             };
             let instance_key = subscription.instance_key;
             let element_instance_key = subscription.element_instance_key;
@@ -7393,7 +7429,7 @@ impl Engine {
                 })
                 .min_by_key(|m| (m.seq, m.key))
             else {
-                continue;
+                return false;
             };
             let message_key = message.key;
             let variables = message.variables.clone();
@@ -7406,7 +7442,7 @@ impl Engine {
                         .get(&instance_key)
                         .is_none_or(|i| i.state != ProcessInstanceState::Active))
             {
-                continue;
+                return false;
             }
             self.emit(
                 log,
@@ -7429,13 +7465,15 @@ impl Engine {
                     kind,
                     &variables,
                 );
-                // Drain this correlation before reconsidering the rest; resume
-                // at the next unprocessed opening (anything the correlation
-                // itself opens is queued, so it lands after `log.len()`).
-                if let Some(&(next, _)) = opened.get(idx + 1) {
-                    self.buffer_scan_from = next;
+                if self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
+                {
+                    self.buffer_requeue.push_back(subscription_key);
                 }
-                return;
+                return true;
             }
             let delivery_key = self.mint_key();
             self.emit(
