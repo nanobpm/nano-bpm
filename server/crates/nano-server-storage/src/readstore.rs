@@ -223,6 +223,15 @@ impl ReadModel {
 
     // --- point lookups: route to the key's owning partition shard ---
 
+    /// Routes [`ReadStore::try_parent_process_instance_key_any`] (live +
+    /// archive ancestry, #1948) to the key's owning shard.
+    pub fn try_parent_process_instance_key_any(&self, key: Key) -> rusqlite::Result<Option<Key>> {
+        match self.shard_for(key) {
+            Some(shard) => shard.try_parent_process_instance_key_any(key),
+            None => Ok(None),
+        }
+    }
+
     pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
         self.shard_for(key)?.process_instance(key)
     }

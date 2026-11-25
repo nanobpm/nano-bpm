@@ -25444,10 +25444,15 @@ impl ServerImpl {
             ProcessInstanceStatePolicy::EndedOnly,
             BatchHierarchyPolicy::HonourFilters,
         );
+        // Ancestry spans the live store AND the terminal archive — the same
+        // hierarchy deletion walks — so a selected grandchild under a pruned
+        // (archive-only) child is still recognised as covered by its root. A
+        // failed lookup keeps the item (it then fails or succeeds on its own).
         let items = dedupe_selected_descendants(selected, |key| {
             self.store
-                .process_instance(key)
-                .and_then(|row| row.parent_process_instance_key)
+                .try_parent_process_instance_key_any(key)
+                .ok()
+                .flatten()
         })
         .into_iter()
         .map(BatchItem::process_instance)

@@ -846,6 +846,58 @@ fn history_deletions<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<Key
         .collect()
 }
 
+/// Retracts ONE deleted instance's history tree (#1948) on `conn`, inside the
+/// caller's transaction: resolves the instance and every call-activity
+/// descendant across the live store AND (when `archived`, i.e. the archive is
+/// attached as `terminal_archive`) the durable archive, then removes every
+/// dependent row from both. Retention can prune an intermediate child into the
+/// archive while its descendants stay live, so the walk follows both tables'
+/// parent edges; each recursive branch is an indexed parent lookup
+/// (`idx_process_instances_parent`, shared `SCHEMA`), not a table scan.
+fn retract_history_tree(conn: &Connection, archived: bool, key: Key) -> rusqlite::Result<()> {
+    let walk = if archived {
+        "WITH RECURSIVE tree(k) AS ( \
+           SELECT ?1 \
+           UNION SELECT p.key FROM main.process_instances p \
+             JOIN tree ON p.parent_process_instance_key = tree.k \
+           UNION SELECT a.key FROM terminal_archive.process_instances a \
+             JOIN tree ON a.parent_process_instance_key = tree.k \
+         ) SELECT k FROM tree"
+    } else {
+        "WITH RECURSIVE tree(k) AS ( \
+           SELECT ?1 \
+           UNION SELECT p.key FROM main.process_instances p \
+             JOIN tree ON p.parent_process_instance_key = tree.k \
+         ) SELECT k FROM tree"
+    };
+    let tree: Vec<i64> = {
+        let mut stmt = conn.prepare_cached(walk)?;
+        stmt.query_map(params![key as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for k in tree {
+        for (table, column) in PROCESS_INSTANCE_HISTORY_TABLES {
+            conn.execute(
+                &format!("DELETE FROM main.{table} WHERE {column} = ?1"),
+                params![k],
+            )?;
+        }
+        if archived {
+            for table in TERMINAL_ARCHIVE_DEP_TABLES {
+                conn.execute(
+                    &format!("DELETE FROM terminal_archive.{table} WHERE instance_key = ?1"),
+                    params![k],
+                )?;
+            }
+            conn.execute(
+                "DELETE FROM terminal_archive.process_instances WHERE key = ?1",
+                params![k],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Removes the history of the given deleted instances — each instance and
 /// every call-activity descendant found by walking the union of the live store
 /// and the archive, plus their dependent rows — from both the live projection
@@ -878,54 +930,9 @@ fn delete_history_from_archive(
     };
     let result = (|| -> rusqlite::Result<()> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        let body = (|| -> rusqlite::Result<()> {
-            let walk = if archived {
-                "WITH RECURSIVE edges(key, parent) AS ( \
-                   SELECT key, parent_process_instance_key FROM main.process_instances \
-                   UNION SELECT key, parent_process_instance_key \
-                     FROM terminal_archive.process_instances \
-                 ), tree(k) AS ( \
-                   SELECT ?1 \
-                   UNION SELECT e.key FROM edges e JOIN tree ON e.parent = tree.k \
-                 ) SELECT k FROM tree"
-            } else {
-                "WITH RECURSIVE tree(k) AS ( \
-                   SELECT ?1 \
-                   UNION SELECT p.key FROM main.process_instances p \
-                     JOIN tree ON p.parent_process_instance_key = tree.k \
-                 ) SELECT k FROM tree"
-            };
-            for key in keys {
-                let tree: Vec<i64> = {
-                    let mut stmt = conn.prepare_cached(walk)?;
-                    stmt.query_map(params![*key as i64], |r| r.get(0))?
-                        .collect::<rusqlite::Result<_>>()?
-                };
-                for k in tree {
-                    for (table, column) in PROCESS_INSTANCE_HISTORY_TABLES {
-                        conn.execute(
-                            &format!("DELETE FROM main.{table} WHERE {column} = ?1"),
-                            params![k],
-                        )?;
-                    }
-                    if archived {
-                        for table in TERMINAL_ARCHIVE_DEP_TABLES {
-                            conn.execute(
-                                &format!(
-                                    "DELETE FROM terminal_archive.{table} WHERE instance_key = ?1"
-                                ),
-                                params![k],
-                            )?;
-                        }
-                        conn.execute(
-                            "DELETE FROM terminal_archive.process_instances WHERE key = ?1",
-                            params![k],
-                        )?;
-                    }
-                }
-            }
-            Ok(())
-        })();
+        let body = keys
+            .iter()
+            .try_for_each(|&key| retract_history_tree(conn, archived, key));
         match body {
             Ok(()) => conn.execute_batch("COMMIT"),
             Err(e) => {
@@ -2436,47 +2443,25 @@ impl ReadStore {
         // common path (pruner idle) and a short wait when the pruner is active.
         let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        // #1948: retract deleted history from the durable terminal archive
-        // BEFORE this batch commits, so a crash or failure can never advance the
-        // cursor past a deletion the archive would later resurrect on
-        // snapshot-gap recovery. Idempotent, so a re-projected batch is safe.
-        if self.archive_path.is_some() {
-            let deleted = history_deletions(events.iter().copied());
-            delete_history_from_archive(&conn, self.archive_path.as_deref(), &deleted)?;
-        }
-        let tx = conn.transaction()?;
-        let mut terminal_keys = Vec::new();
-        let mut inflight_delta: i64 = 0;
-        let now = now_ms();
-        // #1347: each event's durable identity is its absolute, 1-based journal
-        // position — the cursor before this batch plus its offset. Read inside
-        // the same transaction that advances the cursor, so it is exact.
-        let base: i64 = tx
-            .query_row(
-                "SELECT v FROM meta WHERE k = 'exported_position'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        for (i, &event) in events.iter().enumerate() {
-            let position = base.max(0) as u64 + i as u64 + 1;
-            let d = project(&tx, event, position, now)?;
-            inflight_delta += d;
-            // Collect only GENUINE terminal transitions (d < 0) for hot-state
-            // eviction; a re-delivered terminal (d == 0) was already evicted.
-            if d < 0
-                && let Event::ProcessInstanceCompleted { instance_key }
-                | Event::ProcessInstanceTerminated { instance_key } = event
-            {
-                terminal_keys.push(*instance_key);
+        // #1948: a deletion must also retract the instance's history from the
+        // durable terminal archive, in the SAME transaction that advances the
+        // cursor (so a crash can never advance it past a deletion the archive
+        // would later resurrect) and at the deletion's own LOG POSITION (so a
+        // descendant projected earlier in this batch is reached through its
+        // still-present parent, and one projected later is unaffected). The
+        // archive is attached only for batches that carry a deletion.
+        let archived = match self.archive_path.as_deref() {
+            Some(a) if a.exists() && !history_deletions(events.iter().copied()).is_empty() => {
+                attach_archive(&conn, a)?;
+                true
             }
+            _ => false,
+        };
+        let result = Self::export_in(&mut conn, events, archived);
+        if archived {
+            let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
         }
-        tx.cexecute(
-            "UPDATE meta SET v = v + ?1 WHERE k = 'exported_position'",
-            params![events.len() as i64],
-        )?;
-        tx.commit()?;
+        let (terminal_keys, inflight_delta) = result?;
         // Durably archive any newly-terminal instances (issue #831) so their
         // audit history survives a below-floor snapshot reprojection, which can
         // only recover *live* instances from the engine snapshot. Best-effort: a
@@ -2499,6 +2484,55 @@ impl ReadStore {
             terminal_keys,
             inflight_delta,
         })
+    }
+
+    /// The transactional core of [`Self::export`]: projects `events` in one
+    /// transaction and advances the cursor. When `archived` (the archive is
+    /// attached as `terminal_archive`), each history deletion is ALSO retracted
+    /// from the archive at its own log position, inside the same transaction
+    /// (#1948).
+    fn export_in(
+        conn: &mut Connection,
+        events: &[&Event],
+        archived: bool,
+    ) -> rusqlite::Result<(Vec<Key>, i64)> {
+        let tx = conn.transaction()?;
+        let mut terminal_keys = Vec::new();
+        let mut inflight_delta: i64 = 0;
+        let now = now_ms();
+        // #1347: each event's durable identity is its absolute, 1-based journal
+        // position — the cursor before this batch plus its offset. Read inside
+        // the same transaction that advances the cursor, so it is exact.
+        let base: i64 = tx
+            .query_row(
+                "SELECT v FROM meta WHERE k = 'exported_position'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        for (i, &event) in events.iter().enumerate() {
+            let position = base.max(0) as u64 + i as u64 + 1;
+            if archived && let Event::ProcessInstanceHistoryDeleted { instance_key } = event {
+                retract_history_tree(&tx, true, *instance_key)?;
+            }
+            let d = project(&tx, event, position, now)?;
+            inflight_delta += d;
+            // Collect only GENUINE terminal transitions (d < 0) for hot-state
+            // eviction; a re-delivered terminal (d == 0) was already evicted.
+            if d < 0
+                && let Event::ProcessInstanceCompleted { instance_key }
+                | Event::ProcessInstanceTerminated { instance_key } = event
+            {
+                terminal_keys.push(*instance_key);
+            }
+        }
+        tx.cexecute(
+            "UPDATE meta SET v = v + ?1 WHERE k = 'exported_position'",
+            params![events.len() as i64],
+        )?;
+        tx.commit()?;
+        Ok((terminal_keys, inflight_delta))
     }
 
     /// Copies every terminal instance currently in the read model into the
@@ -3099,6 +3133,34 @@ impl ReadStore {
             .query_map(params![limit, offset], map_instance)
             .or_corrupt("query process_instances_page");
         rows.filter_map(Result::ok).collect()
+    }
+
+    /// The parent process instance of `key` across the live store AND the
+    /// durable terminal archive (#1948): retention can prune an intermediate
+    /// call-activity child into the archive while its descendants stay live, so
+    /// ancestry resolved from the live store alone breaks at the pruned link.
+    /// This mirrors the live+archive hierarchy that history deletion walks.
+    /// `Ok(None)` when `key` is a root or unknown to both stores.
+    pub fn try_parent_process_instance_key_any(&self, key: Key) -> rusqlite::Result<Option<Key>> {
+        const SQL: &str =
+            "SELECT parent_process_instance_key FROM process_instances WHERE key = ?1";
+        let live: Option<Option<i64>> = {
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.query_row(SQL, params![key as i64], |r| r.get(0))
+                .optional()?
+        };
+        if let Some(parent) = live {
+            return Ok(parent.map(|p| p as Key));
+        }
+        let Some(archive) = self.archive_path.as_deref().filter(|a| a.exists()) else {
+            return Ok(None);
+        };
+        let conn =
+            Connection::open_with_flags(archive, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let archived: Option<Option<i64>> = conn
+            .query_row(SQL, params![key as i64], |r| r.get(0))
+            .optional()?;
+        Ok(archived.flatten().map(|p| p as Key))
     }
 
     pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
@@ -17832,6 +17894,75 @@ mod history_deletion_tests {
             for k in [10, 20, 40] {
                 assert!(store.process_instance(k).is_none(), "{k} resurrected");
             }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948 review: a file-backed catch-up batch carries a descendant's
+    /// projection AND, later in the same batch, its root's deletion, while the
+    /// root and intermediate child were exported by an earlier batch. The
+    /// archive retraction must run at the deletion's log position (not as a
+    /// pre-pass over the batch), or it removes the intermediate child before the
+    /// grandchild is projected and the deletion no longer reaches it.
+    #[test]
+    fn deletion_in_a_split_prefix_batch_reaches_descendants_projected_earlier() {
+        let dir = history_del_dir("split-prefix");
+        let path = dir.join("read-model.sqlite");
+        {
+            let store = ReadStore::open(Some(&path)).unwrap();
+            let prefix = [
+                created(10, None),
+                created(20, Some(10)),
+                Event::ProcessInstanceCompleted { instance_key: 20 },
+                Event::ProcessInstanceTerminated { instance_key: 10 },
+            ];
+            store.export(&prefix.iter().collect::<Vec<_>>()).unwrap();
+            let tail = [
+                created(40, Some(20)),
+                Event::ProcessInstanceCompleted { instance_key: 40 },
+                Event::ProcessInstanceHistoryDeleted { instance_key: 10 },
+            ];
+            store.export(&tail.iter().collect::<Vec<_>>()).unwrap();
+            for k in [10, 20, 40] {
+                assert!(store.process_instance(k).is_none(), "{k} left searchable");
+            }
+            store.reset().unwrap();
+            store.replay_terminal_archive().unwrap();
+            for k in [10, 20, 40] {
+                assert!(store.process_instance(k).is_none(), "{k} resurrected");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948 review: ancestry for batch dedupe must follow a link whose
+    /// intermediate child survives only in the archive.
+    #[test]
+    fn parent_lookup_follows_a_pruned_intermediate_child() {
+        let dir = history_del_dir("parent-any");
+        let path = dir.join("read-model.sqlite");
+        {
+            let store = ReadStore::open(Some(&path)).unwrap();
+            let events = [
+                created(10, None),
+                created(20, Some(10)),
+                created(40, Some(20)),
+                Event::ProcessInstanceCompleted { instance_key: 40 },
+                Event::ProcessInstanceCompleted { instance_key: 20 },
+            ];
+            store.export(&events.iter().collect::<Vec<_>>()).unwrap();
+            store.prune_terminal_instances(1, 0).unwrap();
+            assert!(store.process_instance(20).is_none(), "child not pruned");
+            assert_eq!(
+                store.try_parent_process_instance_key_any(40).unwrap(),
+                Some(20)
+            );
+            assert_eq!(
+                store.try_parent_process_instance_key_any(20).unwrap(),
+                Some(10)
+            );
+            assert_eq!(store.try_parent_process_instance_key_any(10).unwrap(), None);
+            assert_eq!(store.try_parent_process_instance_key_any(99).unwrap(), None);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
