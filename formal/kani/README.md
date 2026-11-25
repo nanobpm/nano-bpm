@@ -17,7 +17,7 @@ Harnesses are compiled only under `cfg(kani)` (declared in
 | `job_lease_lifecycle_keeps_indexes_in_lockstep` | `engine-core/src/state/kani_proofs.rs` | Any sequence of job events (activate / lock-expire / complete / fail / retries-update) with arbitrary deadlines, timestamps, retries and priority, applied through the real `state::apply`, never panics, and the derived indexes (`activated_jobs`, `activatable_jobs`, `deferred_job_deadlines`) stay in lockstep with the job state. | 3 events after creation |
 | `parallel_diamond_creates_one_instance` | `engine-core/src/engine/kani_proofs.rs` | Deploy + create-instance of a parallel fork/join diamond runs `activate`/`complete`/`finalize_completion` through the fork without panic. | fixed graph |
 
-Harnesses declare their own `#[kani::unwind(N)]` (4 for the state harnesses, 8 for the engine diamond, whose `ProcessBuilder::build` walks 6 elements + 6 flows); `--default-unwind 4` covers anything else. Setting `KANI_UNWIND` passes `--unwind`, overriding every harness.
+Harnesses declare their own `#[kani::unwind(N)]` (4 for the state harnesses, 24 for the engine diamond, whose bound must cover every loop in the deploy + create command execution — `ProcessBuilder::build` over 6 elements + 6 flows and the engine's passes over the emitted event list); `--default-unwind 4` covers anything else. Setting `KANI_UNWIND` passes `--unwind`, overriding every harness.
 
 ## Running
 
