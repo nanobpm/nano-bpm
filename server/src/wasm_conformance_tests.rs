@@ -25,7 +25,7 @@
 //!   a scenario step ([`every_surfaced_wasm_method_has_a_conformance_scenario`]),
 //!   so a newly surfaced command cannot land untested.
 //!
-//! Known drift is recorded in [`KNOWN_GAPS`] / [`UNCOVERED_SURFACED_METHODS`],
+//! Known drift is recorded in `conformance/known-gaps.json` / [`UNCOVERED_SURFACED_METHODS`],
 //! each entry linked to the issue that removes it. Both lists may only shrink:
 //! a listed gap that starts conforming fails the suite until it is deleted.
 
@@ -47,55 +47,26 @@ const SURFACE_PARITY: &str = concat!(
     "/../engine-wasm/src/surface_parity.rs"
 );
 
-/// Drift between the two surfaces that is known and tracked. Keyed
-/// `<scenario>/<step>`; the value is the issue whose fix removes the entry.
-/// This list may only shrink: an entry whose step now conforms fails the suite.
-const KNOWN_GAPS: &[(&str, &str)] = &[
-    (
-        "errors/complete-unknown-job",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "errors/create-unknown-process",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "fail-with-backoff/activate-during-backoff",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "job-lifecycle/activate",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "job-lifecycle/create",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "job-lifecycle/search-completed",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "job-lifecycle/search-created",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "message-signal-variables/search-task",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "message-signal-variables/search-variables",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "message-signal-variables/signal",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-    (
-        "throw-error-and-user-task/search-variables",
-        "https://github.com/nanobpm/nano-bpm/issues/1957",
-    ),
-];
+/// Drift between the two surfaces that is known and tracked, read from
+/// `conformance/known-gaps.json`: keyed `<scenario>/<step>`, each entry carries
+/// the issue whose fix removes it and the step's EXACT expected differences.
+/// The step must reproduce that baseline: a new difference (a regression
+/// hiding behind the gap) and a vanished one (a fix that must shrink the
+/// baseline) both fail the suite. The set of gaps may only shrink; re-record
+/// the baselines of the listed gaps with `UPDATE_CONFORMANCE_GAPS=1`.
+const KNOWN_GAPS_FILE: &str = "known-gaps.json";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct KnownGap {
+    issue: String,
+    diffs: Vec<String>,
+}
+
+fn known_gaps() -> BTreeMap<String, KnownGap> {
+    let src = std::fs::read_to_string(format!("{CONFORMANCE_DIR}/{KNOWN_GAPS_FILE}"))
+        .expect("read conformance/known-gaps.json");
+    serde_json::from_str(&src).expect("parse conformance/known-gaps.json")
+}
 
 /// `Surfaced` `TestEngine` methods with no scenario yet, each linked to the
 /// issue that adds one. May only shrink.
@@ -642,11 +613,19 @@ fn is_host_rejection(payload: &(dyn std::any::Any + Send)) -> bool {
 /// one side and a string on the other remains a difference.
 fn volatile(field: &str) -> bool {
     field.ends_with("Key")
-        || field.ends_with("Date")
+        || (field.ends_with("Date") && !CLIENT_SUPPLIED_DATES.contains(&field))
         || field == "deadline"
         || field == "jobLeaseToken"
         || field.ends_with("Cursor")
 }
+
+/// `*Date` fields whose value the client supplies (user-task attributes), so
+/// both surfaces must echo it verbatim — never volatile.
+const CLIENT_SUPPLIED_DATES: &[&str] = &["dueDate", "followUpDate"];
+
+/// Application-owned payload maps: compared verbatim, never normalised, so a
+/// `variables.customerKey` that differs between the surfaces is a difference.
+const APPLICATION_PAYLOADS: &[&str] = &["variables", "customHeaders"];
 
 fn normalise(v: &J) -> J {
     match v {
@@ -656,6 +635,7 @@ fn normalise(v: &J) -> J {
                     let x = match x {
                         J::String(_) if volatile(k) => J::String("<volatile:string>".into()),
                         J::Number(_) if volatile(k) => J::String("<volatile:number>".into()),
+                        _ if APPLICATION_PAYLOADS.contains(&k.as_str()) => x.clone(),
                         _ => normalise(x),
                     };
                     (k.clone(), x)
@@ -739,19 +719,36 @@ async fn run_all() -> BTreeMap<String, Vec<String>> {
 #[tokio::test]
 async fn server_and_wasm_conform_on_every_scenario() {
     let results = run_all().await;
-    let gaps: BTreeMap<&str, &str> = KNOWN_GAPS.iter().copied().collect();
+    let mut gaps = known_gaps();
+    if std::env::var_os("UPDATE_CONFORMANCE_GAPS").is_some() {
+        for (id, gap) in &mut gaps {
+            if let Some(diffs) = results.get(id) {
+                gap.diffs.clone_from(diffs);
+            }
+        }
+        let text = serde_json::to_string_pretty(&gaps).expect("serialise known gaps");
+        std::fs::write(
+            format!("{CONFORMANCE_DIR}/{KNOWN_GAPS_FILE}"),
+            format!("{text}\n"),
+        )
+        .expect("write conformance/known-gaps.json");
+    }
     let mut failures = Vec::new();
     for gap in gaps.keys() {
-        if !results.contains_key(*gap) {
+        if !results.contains_key(gap) {
             failures.push(format!(
-                "KNOWN_GAPS names `{gap}`, which is not a scenario step"
+                "known-gaps.json names `{gap}`, which is not a scenario step"
             ));
         }
     }
     for (id, diffs) in &results {
-        match (diffs.is_empty(), gaps.get(id.as_str())) {
-            (true, Some(issue)) => failures.push(format!(
-                "`{id}` now conforms — delete it from KNOWN_GAPS ({issue})"
+        match (diffs.is_empty(), gaps.get(id).map(|g| (&g.issue, &g.diffs))) {
+            (true, Some((issue, _))) => failures.push(format!(
+                "`{id}` now conforms — delete it from known-gaps.json ({issue})"
+            )),
+            (false, Some((issue, expected))) if diffs != expected => failures.push(format!(
+                "`{id}` no longer matches its known-gaps.json baseline ({issue}):\n    \
+                     expected: {expected:?}\n    actual:   {diffs:?}"
             )),
             (false, None) => failures.push(format!(
                 "`{id}` diverges between server and wasm:\n    {}",
@@ -932,4 +929,43 @@ fn comparator_flags_key_type_and_shape_drift() {
     };
     assert!(!compare(&step, &problem, &bare).is_empty());
     assert!(!compare(&step, &ok(J::Null), &bare).is_empty());
+}
+
+#[test]
+fn comparator_keeps_client_supplied_dates_and_payloads_verbatim() {
+    let step = bare_step("searchUserTasks");
+    let ok = |v: J| Outcome::Accepted(v);
+    for field in ["dueDate", "followUpDate"] {
+        assert!(
+            !compare(
+                &step,
+                &ok(json!({ field: "2030-01-01T00:00:00Z" })),
+                &ok(json!({ field: "2031-01-01T00:00:00Z" }))
+            )
+            .is_empty(),
+            "{field} must not be normalised"
+        );
+    }
+    // Server-generated dates stay volatile.
+    assert!(
+        compare(
+            &step,
+            &ok(json!({"creationDate": "a"})),
+            &ok(json!({"creationDate": "b"}))
+        )
+        .is_empty()
+    );
+    for payload in ["variables", "customHeaders"] {
+        for inner in ["customerKey", "deliveryDate", "plain"] {
+            assert!(
+                !compare(
+                    &step,
+                    &ok(json!({ "items": [{ payload: { inner: "1" } }] })),
+                    &ok(json!({ "items": [{ payload: { inner: "2" } }] }))
+                )
+                .is_empty(),
+                "{payload}.{inner} must be compared verbatim"
+            );
+        }
+    }
 }

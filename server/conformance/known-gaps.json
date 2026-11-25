@@ -1,0 +1,100 @@
+{
+  "errors/complete-unknown-job": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "outcome: server Rejected { status: Some(404), title: Some(\"Job not found\") }, wasm Rejected { status: None, title: None }"
+    ]
+  },
+  "errors/create-unknown-process": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "outcome: server Rejected { status: Some(400), title: Some(\"Process not found\") }, wasm Rejected { status: None, title: None }"
+    ]
+  },
+  "fail-with-backoff/activate-during-backoff": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "/: server {\"jobs\":[]}, wasm [{\"bpmnProcessId\":\"conformance-service\",\"businessId\":null,\"customHeaders\":{},\"deadline\":\"<volatile:number>\",\"elementId\":\"work\",\"elementInstanceKey\":\"<volatile:string>\",\"instanceKey\":\"<volatile:string>\",\"jobLeaseToken\":null,\"key\":\"6\",\"priority\":50,\"processDefinitionKey\":\"<volatile:string>\",\"processDefinitionVersion\":1,\"retries\":2,\"tags\":[],\"type\":\"conformance-work\",\"variables\":{\"orderId\":\"o-2\"},\"worker\":\"conformance\"}]"
+    ]
+  },
+  "job-lifecycle/activate": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "/: server {\"jobs\":[{\"businessId\":\"biz-1\",\"customHeaders\":{},\"deadline\":\"<volatile:number>\",\"elementId\":\"work\",\"elementInstanceKey\":\"<volatile:string>\",\"jobKey\":\"<volatile:string>\",\"jobLeaseToken\":null,\"kind\":\"BPMN_ELEMENT\",\"leaseToken\":null,\"listenerEventType\":\"UNSPECIFIED\",\"physicalTenantId\":\"default\",\"priority\":50,\"processDefinitionId\":\"conformance-service\",\"processDefinitionKey\":\"<volatile:string>\",\"processDefinitionVersion\":1,\"processInstanceKey\":\"<volatile:string>\",\"retries\":3,\"rootProcessInstanceKey\":null,\"tags\":[\"conformance\"],\"tenantId\":\"<default>\",\"type\":\"conformance-work\",\"userTask\":null,\"variables\":{\"amount\":42,\"orderId\":\"o-1\"},\"worker\":\"conformance\"}]}, wasm [{\"bpmnProcessId\":\"conformance-service\",\"businessId\":null,\"customHeaders\":{},\"deadline\":\"<volatile:number>\",\"elementId\":\"work\",\"elementInstanceKey\":\"<volatile:string>\",\"instanceKey\":\"<volatile:string>\",\"jobLeaseToken\":null,\"key\":\"6\",\"priority\":50,\"processDefinitionKey\":\"<volatile:string>\",\"processDefinitionVersion\":1,\"retries\":3,\"tags\":[],\"type\":\"conformance-work\",\"variables\":{\"amount\":42,\"orderId\":\"o-1\"},\"worker\":\"conformance\"}]"
+    ]
+  },
+  "job-lifecycle/create": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "/activeElementIds: server <absent>, wasm [\"work\"]",
+      "/businessId: server \"biz-1\", wasm <absent>",
+      "/completedInstances: server <absent>, wasm 0",
+      "/created: server <absent>, wasm \"3\"",
+      "/decisionInstances: server <absent>, wasm []",
+      "/elementStats: server <absent>, wasm [{\"active\":0,\"completed\":1,\"elementId\":\"start\",\"incidents\":0},{\"active\":1,\"completed\":0,\"elementId\":\"work\",\"incidents\":0}]",
+      "/eventCount: server <absent>, wasm 11",
+      "/incidentElementIds: server <absent>, wasm []",
+      "/incidents: server <absent>, wasm []",
+      "/instances: server <absent>, wasm [{\"activeElements\":[{\"elementId\":\"work\",\"key\":\"5\"}],\"completed\":false,\"key\":\"3\",\"processId\":\"conformance-service\",\"state\":\"Active\",\"variables\":{\"amount\":42,\"orderId\":\"o-1\"}}]",
+      "/jobs: server <absent>, wasm [{\"elementId\":\"work\",\"instanceKey\":\"<volatile:string>\",\"jobType\":\"conformance-work\",\"key\":\"6\",\"retries\":3,\"state\":\"Created\"}]",
+      "/messageSubscriptions: server <absent>, wasm []",
+      "/now: server <absent>, wasm 0",
+      "/processCompleted: server false, wasm <absent>",
+      "/processDefinitionId: server \"conformance-service\", wasm <absent>",
+      "/processDefinitionKey: server \"<volatile:string>\", wasm <absent>",
+      "/processDefinitionVersion: server 1, wasm <absent>",
+      "/processInstanceKey: server \"<volatile:string>\", wasm <absent>",
+      "/signalSubscriptions: server <absent>, wasm []",
+      "/tags: server [\"conformance\"], wasm <absent>",
+      "/takenSequenceFlows: server <absent>, wasm [{\"from\":\"start\",\"to\":\"work\"}]",
+      "/tenantId: server \"<default>\", wasm <absent>",
+      "/timers: server <absent>, wasm []",
+      "/totalInstances: server <absent>, wasm 1",
+      "/userTasks: server <absent>, wasm []",
+      "/variables: server {}, wasm <absent>"
+    ]
+  },
+  "job-lifecycle/search-completed": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "/items/0/businessId: server \"biz-1\", wasm null",
+      "/items/0/tags: server [\"conformance\"], wasm []"
+    ]
+  },
+  "job-lifecycle/search-created": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "/items/0/businessId: server \"biz-1\", wasm null",
+      "/items/0/tags: server [\"conformance\"], wasm []"
+    ]
+  },
+  "message-signal-variables/search-task": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "/items: server [], wasm [{\"assignee\":null,\"businessId\":null,\"candidateGroups\":[],\"candidateUsers\":[],\"completionDate\":null,\"creationDate\":\"<volatile:string>\",\"customHeaders\":{},\"dueDate\":null,\"elementId\":\"review\",\"elementInstanceKey\":\"<volatile:string>\",\"externalFormReference\":null,\"followUpDate\":null,\"formKey\":null,\"name\":null,\"priority\":50,\"processDefinitionId\":\"conformance-events\",\"processDefinitionKey\":\"<volatile:string>\",\"processDefinitionVersion\":1,\"processInstanceKey\":\"<volatile:string>\",\"processName\":null,\"rootProcessInstanceKey\":\"<volatile:string>\",\"state\":\"CREATED\",\"tags\":[],\"tenantId\":\"<default>\",\"userTaskKey\":\"<volatile:string>\"}]",
+      "/page/endCursor: server null, wasm \"<volatile:string>\"",
+      "/page/startCursor: server null, wasm \"<volatile:string>\"",
+      "/page/totalItems: server 0, wasm 1"
+    ]
+  },
+  "message-signal-variables/search-variables": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "/items: server [{\"isTruncated\":false,\"name\":\"note\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"checked\\\"\",\"variableKey\":\"<volatile:string>\"},{\"isTruncated\":false,\"name\":\"orderId\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"o-7\\\"\",\"variableKey\":\"<volatile:string>\"},{\"isTruncated\":false,\"name\":\"paid\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"true\",\"variableKey\":\"<volatile:string>\"}], wasm [{\"isTruncated\":false,\"name\":\"go\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"1\",\"variableKey\":\"<volatile:string>\"},{\"isTruncated\":false,\"name\":\"note\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"checked\\\"\",\"variableKey\":\"<volatile:string>\"},{\"isTruncated\":false,\"name\":\"orderId\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"o-7\\\"\",\"variableKey\":\"<volatile:string>\"},{\"isTruncated\":false,\"name\":\"paid\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"true\",\"variableKey\":\"<volatile:string>\"}]",
+      "/page/totalItems: server 3, wasm 4"
+    ]
+  },
+  "message-signal-variables/signal": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "outcome: server Rejected { status: Some(501), title: None }, wasm Accepted(Object {\"activeElementIds\": Array [String(\"review\")], \"completedInstances\": Number(0), \"decisionInstances\": Array [], \"elementStats\": Array [Object {\"active\": Number(1), \"completed\": Number(0), \"elementId\": String(\"review\"), \"incidents\": Number(0)}, Object {\"active\": Number(0), \"completed\": Number(1), \"elementId\": String(\"start\"), \"incidents\": Number(0)}, Object {\"active\": Number(0), \"completed\": Number(1), \"elementId\": String(\"wait-message\"), \"incidents\": Number(0)}, Object {\"active\": Number(0), \"completed\": Number(1), \"elementId\": String(\"wait-signal\"), \"incidents\": Number(0)}], \"eventCount\": Number(29), \"incidentElementIds\": Array [], \"incidents\": Array [], \"instances\": Array [Object {\"activeElements\": Array [Object {\"elementId\": String(\"review\"), \"key\": String(\"11\")}], \"completed\": Bool(false), \"key\": String(\"3\"), \"processId\": String(\"conformance-events\"), \"state\": String(\"Active\"), \"variables\": Object {\"go\": Number(1), \"orderId\": String(\"o-7\"), \"paid\": Bool(true)}}], \"jobs\": Array [], \"messageSubscriptions\": Array [], \"now\": Number(0), \"signalSubscriptions\": Array [], \"takenSequenceFlows\": Array [Object {\"from\": String(\"start\"), \"to\": String(\"wait-message\")}, Object {\"from\": String(\"wait-message\"), \"to\": String(\"wait-signal\")}, Object {\"from\": String(\"wait-signal\"), \"to\": String(\"review\")}], \"timers\": Array [], \"totalInstances\": Number(1), \"userTasks\": Array [Object {\"candidateGroups\": Array [], \"candidateUsers\": Array [], \"elementId\": String(\"review\"), \"elementInstanceKey\": String(\"11\"), \"instanceKey\": String(\"3\"), \"key\": String(\"12\"), \"priority\": Number(50), \"state\": String(\"Created\")}]})"
+    ]
+  },
+  "throw-error-and-user-task/search-variables": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "/items: server [{\"isTruncated\":false,\"name\":\"orderId\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"o-3\\\"\",\"variableKey\":\"<volatile:string>\"},{\"isTruncated\":false,\"name\":\"reason\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"card-declined\\\"\",\"variableKey\":\"<volatile:string>\"}], wasm [{\"isTruncated\":false,\"name\":\"orderId\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"o-3\\\"\",\"variableKey\":\"<volatile:string>\"}]",
+      "/page/totalItems: server 2, wasm 1"
+    ]
+  }
+}
