@@ -344,3 +344,107 @@ fn request_rejections_are_problem_details() {
     let p: models::ProblemDetail = serde_json::from_str(&res.body).expect("ProblemDetail");
     assert_eq!(p.instance, "/v2/jobs/abc/completion");
 }
+
+fn deploy_raw(eng: &mut TestEngine, filename: &str, content: &str) -> HttpResponse {
+    let boundary = "nano-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"resources\"; filename=\"{filename}\"\r\n\r\n{content}\r\n--{boundary}--\r\n"
+    );
+    let headers = json!({ "Content-Type": format!("multipart/form-data; boundary={boundary}") });
+    eng.handle_request("POST", "/v2/deployments", &headers.to_string(), &body)
+}
+
+/// Review #1997: BPMN under any `.xml` name registers the process (gateway parity).
+#[test]
+fn bpmn_under_plain_xml_name_is_deployed_as_a_process() {
+    let mut eng = TestEngine::new();
+    let res = deploy_raw(&mut eng, "order.xml", BPMN);
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(
+        json_body(&res)["deployments"][0]["processDefinition"].is_object(),
+        "{}",
+        res.body
+    );
+    create(&mut eng);
+    // Non-BPMN XML stays a generic resource.
+    let res = deploy_raw(&mut eng, "data.xml", "<a/>");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(
+        json_body(&res)["deployments"][0]["resource"].is_object(),
+        "{}",
+        res.body
+    );
+}
+
+/// Review #1997: boundary text inside content is NOT framing; content is kept
+/// verbatim, and a body without its closing delimiter is rejected.
+#[test]
+fn multipart_only_frames_on_complete_delimiter_lines() {
+    let mut eng = TestEngine::new();
+    let content = "prefix--nano-boundary--suffix\n--nano-boundaryX";
+    let res = deploy_raw(&mut eng, "notes.txt", content);
+    assert_eq!(res.status, 200, "{}", res.body);
+    // The framing keeps the content byte-for-byte.
+    let body = format!("--nano-boundary\r\nH: v\r\n\r\n{content}\r\n--nano-boundary--\r\n");
+    let parts = super::gateway::split_multipart(&body, "nano-boundary").expect("framed");
+    assert_eq!(parts, vec![format!("H: v\r\n\r\n{content}")]);
+
+    let headers = json!({ "Content-Type": "multipart/form-data; boundary=nano-boundary" });
+    let body = "--nano-boundary\r\nContent-Disposition: form-data; name=\"resources\"; filename=\"a.txt\"\r\n\r\nx\r\n";
+    let res = eng.handle_request("POST", "/v2/deployments", &headers.to_string(), body);
+    assert_eq!(res.status, 400, "{}", res.body);
+}
+
+/// Review #1997: conflicting lease tokens are rejected before any mutation, on
+/// every job command; failure variables are rejected rather than dropped.
+#[test]
+fn job_commands_reject_conflicting_lease_tokens_and_fail_variables() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    create(&mut eng);
+    let job = activate(&mut eng).jobs[0].job_key.0.clone();
+    let conflict = json!({ "jobLeaseToken": "a", "leaseToken": "b" });
+    for (suffix, extra) in [
+        ("completion", json!({})),
+        ("failure", json!({})),
+        ("error", json!({ "errorCode": "E" })),
+    ] {
+        let mut body = conflict.clone();
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let res = call(&mut eng, "POST", &format!("/v2/jobs/{job}/{suffix}"), &body);
+        assert_eq!(res.status, 400, "{suffix}: {}", res.body);
+    }
+    let res = call(
+        &mut eng,
+        "POST",
+        &format!("/v2/jobs/{job}/failure"),
+        &json!({ "retries": 1, "variables": { "x": 1 } }),
+    );
+    assert_eq!(res.status, 400, "{}", res.body);
+    // The job was never mutated: it still completes.
+    let res = call(
+        &mut eng,
+        "POST",
+        &format!("/v2/jobs/{job}/completion"),
+        &json!({}),
+    );
+    assert_eq!(res.status, 204, "{}", res.body);
+}
+
+/// Review #1997: an explicit empty `fetchVariable` returns all variables.
+#[test]
+fn empty_fetch_variable_returns_all_variables() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    create(&mut eng);
+    let res = call(
+        &mut eng,
+        "POST",
+        "/v2/jobs/activation",
+        &json!({ "type": "charge", "maxJobsToActivate": 5, "timeout": 60000, "fetchVariable": [] }),
+    );
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(json_body(&res)["jobs"][0]["variables"]["amount"], json!(42));
+}

@@ -446,6 +446,23 @@ fn variables(
     .unwrap_or_default()
 }
 
+/// Resolve the canonical `jobLeaseToken` / deprecated `leaseToken` pair the
+/// way the gateway's `resolve_lease_token` does: prefer the canonical name,
+/// fall back to the legacy one, and reject both-present-but-different with a
+/// 400 BEFORE any command runs.
+fn lease_token(
+    canonical: Option<String>,
+    legacy: Option<String>,
+) -> Result<Option<String>, Problem> {
+    match (canonical, legacy) {
+        (Some(c), Some(l)) if c != l => Err(Problem::invalid(
+            "jobLeaseToken and leaseToken were both supplied with different values",
+        )),
+        (Some(c), _) => Ok(Some(c)),
+        (None, l) => Ok(l),
+    }
+}
+
 /// A `Nullable` optional: absent and explicit `null` both read as `None`.
 fn present<T: Clone>(v: Option<&types::Nullable<T>>) -> Option<T> {
     match v {
@@ -585,8 +602,10 @@ impl TestEngine {
                         }
                         (
                             present(r.variables.as_ref()),
-                            present(r.job_lease_token.as_ref())
-                                .or_else(|| present(r.lease_token.as_ref())),
+                            lease_token(
+                                present(r.job_lease_token.as_ref()),
+                                present(r.lease_token.as_ref()),
+                            )?,
                             present(r.business_id.as_ref()),
                         )
                     }
@@ -607,13 +626,22 @@ impl TestEngine {
                 let job_key = path_key("jobKey", param(0))?;
                 let req = body::<models::JobFailRequest>(raw)?;
                 let req = req.as_ref();
+                if req.is_some_and(|r| !variables(r.variables.as_ref()).is_empty()) {
+                    return Err(Problem::invalid(
+                        "failJob: failure `variables` are not supported by the in-browser engine",
+                    ));
+                }
+                let lease = match req {
+                    Some(r) => lease_token(
+                        present(r.job_lease_token.as_ref()),
+                        present(r.lease_token.as_ref()),
+                    )?,
+                    None => None,
+                };
                 self.exec(Command::FailJob {
                     job_key,
                     attribution: None,
-                    lease_token: req.and_then(|r| {
-                        present(r.job_lease_token.as_ref())
-                            .or_else(|| present(r.lease_token.as_ref()))
-                    }),
+                    lease_token: lease,
                     retries: req.and_then(|r| r.retries).unwrap_or(0),
                     error_message: req
                         .and_then(|r| r.error_message.clone())
@@ -634,8 +662,10 @@ impl TestEngine {
                     error_code: req.error_code.clone(),
                     error_message: present(req.error_message.as_ref()).unwrap_or_default(),
                     variables: variables(present(req.variables.as_ref()).as_ref()),
-                    lease_token: present(req.job_lease_token.as_ref())
-                        .or_else(|| present(req.lease_token.as_ref())),
+                    lease_token: lease_token(
+                        present(req.job_lease_token.as_ref()),
+                        present(req.lease_token.as_ref()),
+                    )?,
                 })?;
                 Ok(None)
             }
@@ -931,7 +961,9 @@ impl TestEngine {
             .ok()
             .filter(|t| *t > 0)
             .ok_or_else(|| Problem::invalid("timeout must be positive"))?;
-        let fetch = req.fetch_variable.clone();
+        // An empty `fetchVariable` list means "all visible variables"
+        // (`spec/jobs.yaml`), as the native gateway normalises it.
+        let fetch = req.fetch_variable.clone().filter(|f| !f.is_empty());
         let now = self.now;
         let events = self.exec(Command::activate_jobs_with_options(
             req.r_type.clone(),
@@ -984,24 +1016,13 @@ fn multipart(headers: &BTreeMap<String, String>, raw: &str) -> Result<Vec<Part>,
                 "createDeployment: expected a multipart/form-data body with a boundary",
             )
         })?;
-    let delimiter = format!("--{boundary}");
+    let chunks = split_multipart(raw, boundary)?;
     let mut parts = Vec::new();
-    for chunk in raw.split(delimiter.as_str()).skip(1) {
-        if chunk.starts_with("--") {
-            break;
-        }
-        let chunk = chunk
-            .strip_prefix("\r\n")
-            .or_else(|| chunk.strip_prefix('\n'))
-            .unwrap_or(chunk);
+    for chunk in chunks {
         let (head, content) = chunk
             .split_once("\r\n\r\n")
             .or_else(|| chunk.split_once("\n\n"))
             .ok_or_else(|| Problem::invalid("createDeployment: malformed multipart part"))?;
-        let content = content
-            .strip_suffix("\r\n")
-            .or_else(|| content.strip_suffix('\n'))
-            .unwrap_or(content);
         let disposition = head
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
@@ -1037,6 +1058,58 @@ fn multipart(headers: &BTreeMap<String, String>, raw: &str) -> Result<Vec<Part>,
     Ok(parts)
 }
 
+/// Split a multipart body into its raw parts (headers + content), recognising
+/// a delimiter only as a COMPLETE line (`--boundary` at the body start or right
+/// after a line break, followed by optional whitespace and a line break) and
+/// requiring the closing `--boundary--` delimiter. Boundary text occurring
+/// inside content is therefore never mistaken for framing. The line break that
+/// precedes a delimiter belongs to the delimiter (RFC 2046 §5.1.1).
+pub(crate) fn split_multipart<'a>(raw: &'a str, boundary: &str) -> Result<Vec<&'a str>, Problem> {
+    let malformed = || Problem::invalid("createDeployment: malformed multipart body");
+    let delimiter = format!("--{boundary}");
+    // Find each delimiter line: (start of its preceding line break, end of the delimiter line, is_close).
+    let mut marks: Vec<(usize, usize, bool)> = Vec::new();
+    let mut from = 0;
+    while let Some(off) = raw[from..].find(delimiter.as_str()) {
+        let at = from + off;
+        from = at + delimiter.len();
+        let pre = if at == 0 {
+            Some(0)
+        } else if raw[..at].ends_with("\r\n") {
+            Some(at - 2)
+        } else if raw[..at].ends_with('\n') {
+            Some(at - 1)
+        } else {
+            None
+        };
+        let Some(pre) = pre else { continue };
+        let mut rest = &raw[from..];
+        let close = rest.starts_with("--");
+        if close {
+            rest = &rest[2..];
+        }
+        let trimmed = rest.trim_start_matches([' ', '\t']);
+        let ws = rest.len() - trimmed.len();
+        let eol = if trimmed.starts_with("\r\n") {
+            2
+        } else if trimmed.starts_with('\n') || (close && trimmed.is_empty()) {
+            usize::from(!trimmed.is_empty())
+        } else {
+            continue;
+        };
+        let end = from + usize::from(close) * 2 + ws + eol;
+        marks.push((pre, end, close));
+        if close {
+            break;
+        }
+        from = end;
+    }
+    if !marks.last().is_some_and(|m| m.2) {
+        return Err(malformed());
+    }
+    Ok(marks.windows(2).map(|w| &raw[w[0].1..w[1].0]).collect())
+}
+
 /// A `DeploymentMetadataResult` with exactly one member set.
 fn deployment_meta(kind: &str, value: serde_json::Value) -> serde_json::Value {
     let mut m = serde_json::json!({
@@ -1062,9 +1135,20 @@ impl TestEngine {
         let mut drgs: Vec<(String, String)> = Vec::new();
         for Part { filename, content } in parts {
             let lower = filename.to_ascii_lowercase();
-            if lower.ends_with(".bpmn") || lower.ends_with(".bpmn20.xml") {
-                let defs = parse_bpmn(&content)
-                    .map_err(|e| Problem::invalid(format!("{filename}: {e}")))?;
+            // Dispatch mirrors the gateway's `parse_deploy_resources`: `.bpmn`
+            // is always BPMN; any `.xml` is BPMN iff it parses as BPMN, else
+            // a generic resource.
+            let xml_bpmn = if lower.ends_with(".xml") {
+                parse_bpmn(&content).ok()
+            } else {
+                None
+            };
+            if lower.ends_with(".bpmn") || xml_bpmn.is_some() {
+                let defs = match xml_bpmn {
+                    Some(defs) => defs,
+                    None => parse_bpmn(&content)
+                        .map_err(|e| Problem::invalid(format!("{filename}: {e}")))?,
+                };
                 processes.extend(defs.iter().map(|d| (filename.clone(), d.id.clone())));
                 bundle.processes.extend(defs);
             } else if lower.ends_with(".dmn") {
