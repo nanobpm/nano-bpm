@@ -6,9 +6,11 @@ use super::*;
 use crate::model::ProcessBuilder;
 
 #[kani::proof]
-// ProcessBuilder::build iterates all 6 elements and 6 flows, so the bound
-// must exceed 6 (Kani applies it to callees too).
-#[kani::unwind(8)]
+// Kani applies the bound to every loop in callees, including the engine's
+// passes over the emitted event list: deploy + create (S, P1, A, B activation,
+// completions, two job records) emits well over 8 records, so the bound must
+// cover the whole command execution, not just ProcessBuilder::build.
+#[kani::unwind(24)]
 fn parallel_diamond_creates_one_instance() {
     let def = ProcessBuilder::new("p")
         .start_event("S")
