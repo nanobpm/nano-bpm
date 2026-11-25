@@ -11631,11 +11631,10 @@ impl Engine {
         // child's local scope view, matching Zeebe: an MI inner activity's output
         // mappings are applied on each instance's completion into the instance's
         // OWN scope (`getVariableScopeKey` returns the element-instance key while
-        // the loop counter is set), so `outputElement` can read them. They are NOT
-        // propagated to the parent — only the aggregated `outputCollection` is. We
-        // therefore overlay the mapped values onto the eval context in memory
-        // rather than writing them into the (about-to-be-torn-down, non-propagated)
-        // child scope.
+        // the loop counter is set), so `outputElement` can read them. Each inner
+        // instance's mapped outputs are ALSO propagated to the flow scope as that
+        // instance completes (#1982, `child_output_updates` below), in addition
+        // to the aggregated `outputCollection`.
         // ONE post-output view of the completing child, shared by `outputElement`
         // AND the completion condition (#1335): Zeebe applies the child's output
         // mappings (or receives a call activity's returned variables) before the
