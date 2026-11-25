@@ -2377,11 +2377,18 @@ pub struct CorrelationReceipt {
     )
 )]
 pub struct RoutedDeliveries {
-    /// Entries in the order this partition APPLIED them (oldest first). The
-    /// eviction order and the serialized source of truth.
-    order: std::collections::VecDeque<RoutedDelivery>,
-    /// `delivery_key` membership index (derived from `order`).
-    keys: std::collections::BTreeSet<Key>,
+    /// Entries in the order this partition APPLIED them (oldest first), keyed
+    /// by a ledger-local applied sequence number. The eviction order and the
+    /// serialized source of truth (serialized as the plain applied-order list).
+    order: std::collections::BTreeMap<u64, RoutedDelivery>,
+    /// Next applied sequence number (ledger-local; never serialized).
+    next_seq: u64,
+    /// `delivery_key -> applied seq` membership index (derived from `order`).
+    keys: std::collections::BTreeMap<Key, u64>,
+    /// Applied seqs of every UNPINNED (evictable) entry, oldest first
+    /// (derived from `order`): eviction pops its front in O(log n), so pinned
+    /// receipts never add per-delivery scan work, however many are retained.
+    evictable: std::collections::BTreeSet<u64>,
     /// `subscription_key -> delivery_key` of the live close tombstone (derived
     /// from `order`): an O(1) lookup instead of a ledger scan per open.
     tombstones: std::collections::BTreeMap<Key, Key>,
@@ -2397,8 +2404,10 @@ pub struct RoutedDeliveries {
 impl Default for RoutedDeliveries {
     fn default() -> Self {
         Self {
-            order: std::collections::VecDeque::new(),
-            keys: std::collections::BTreeSet::new(),
+            order: std::collections::BTreeMap::new(),
+            next_seq: 0,
+            keys: std::collections::BTreeMap::new(),
+            evictable: std::collections::BTreeSet::new(),
             tombstones: std::collections::BTreeMap::new(),
             receipts: std::collections::BTreeMap::new(),
             cap: ROUTED_DELIVERY_LEDGER_CAP,
@@ -2407,9 +2416,11 @@ impl Default for RoutedDeliveries {
 }
 
 impl PartialEq for RoutedDeliveries {
-    /// The cap is configuration, not replicated state.
+    /// The cap and the ledger-local seq numbering are not replicated state:
+    /// two ledgers are equal when they retain the same entries in the same
+    /// applied order.
     fn eq(&self, other: &Self) -> bool {
-        self.order == other.order
+        self.order.values().eq(other.order.values())
     }
 }
 
@@ -2418,7 +2429,7 @@ impl Eq for RoutedDeliveries {}
 impl RoutedDeliveries {
     /// Whether `delivery_key` was already applied (and is still retained).
     pub fn contains(&self, delivery_key: Key) -> bool {
-        self.keys.contains(&delivery_key)
+        self.keys.contains_key(&delivery_key)
     }
     /// Whether a retained close tombstone exists for `subscription_key`.
     pub fn is_tombstoned(&self, subscription_key: Key) -> bool {
@@ -2432,7 +2443,7 @@ impl RoutedDeliveries {
     }
     /// Retained entries, oldest-applied first.
     pub fn iter(&self) -> impl Iterator<Item = &RoutedDelivery> {
-        self.order.iter()
+        self.order.values()
     }
     /// The durable answer recorded for ack-paced delivery `delivery_key`
     /// (#1949), while it is unsettled (pinned).
@@ -2442,10 +2453,14 @@ impl RoutedDeliveries {
     /// Every unsettled receipt, `(delivery_key, subscription_key, receipt)`,
     /// in applied order (#1949).
     pub fn unsettled_receipts(&self) -> impl Iterator<Item = (Key, Key, CorrelationReceipt)> + '_ {
-        self.order.iter().filter_map(|e| {
+        self.order.values().filter_map(|e| {
             e.receipt
                 .map(|r| (e.delivery_key, e.subscription_key.unwrap_or(0), r))
         })
+    }
+    /// Number of unpinned (evictable) entries; exposed for invariant tests.
+    pub fn evictable_len(&self) -> usize {
+        self.evictable.len()
     }
     /// Overrides the settled-entry cap (tests exercise eviction with a small
     /// one; production uses [`ROUTED_DELIVERY_LEDGER_CAP`]).
@@ -2460,23 +2475,22 @@ impl RoutedDeliveries {
     /// is a no-op. Returns whether this call recorded the delivery's FIRST
     /// answer (a duplicate ack returns `false`).
     pub fn set_receipt(&mut self, delivery_key: Key, receipt: CorrelationReceipt) -> bool {
-        if !self.keys.contains(&delivery_key) || self.receipts.contains_key(&delivery_key) {
+        if self.receipts.contains_key(&delivery_key) {
             return false;
         }
-        // The ack follows its delivery's record within the same command, so
-        // the entry is (almost always) the newest: search from the back.
-        if let Some(entry) = self
-            .order
-            .iter_mut()
-            .rev()
-            .find(|e| e.delivery_key == delivery_key && e.receipt.is_none() && !e.settled)
-        {
-            entry.receipt = Some(receipt);
-            self.receipts.insert(delivery_key, receipt);
-            self.evict();
-            return true;
+        let Some(&seq) = self.keys.get(&delivery_key) else {
+            return false;
+        };
+        let Some(entry) = self.order.get_mut(&seq) else {
+            return false;
+        };
+        if entry.receipt.is_some() || entry.settled {
+            return false;
         }
-        false
+        entry.receipt = Some(receipt);
+        self.receipts.insert(delivery_key, receipt);
+        self.evictable.remove(&seq);
+        true
     }
     /// The message partition applied the ack of `delivery_key` (#1949): no
     /// re-drive of it can change a reservation any more (a late duplicate's
@@ -2486,15 +2500,12 @@ impl RoutedDeliveries {
         if self.receipts.remove(&delivery_key).is_none() {
             return false;
         }
-        // Ack-paced drains settle the newest delivery: search from the back.
-        if let Some(entry) = self
-            .order
-            .iter_mut()
-            .rev()
-            .find(|e| e.delivery_key == delivery_key)
-        {
-            entry.receipt = None;
-            entry.settled = true;
+        if let Some(&seq) = self.keys.get(&delivery_key) {
+            if let Some(entry) = self.order.get_mut(&seq) {
+                entry.receipt = None;
+                entry.settled = true;
+            }
+            self.evictable.insert(seq);
         }
         self.evict();
         true
@@ -2503,29 +2514,38 @@ impl RoutedDeliveries {
     /// entries beyond the cap. A key already present is a no-op (never
     /// re-ordered).
     pub fn record(&mut self, entry: RoutedDelivery) {
-        if !self.keys.insert(entry.delivery_key) {
+        if self.keys.contains_key(&entry.delivery_key) {
             return;
         }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.keys.insert(entry.delivery_key, seq);
         if entry.close_tombstone {
             if let Some(sub) = entry.subscription_key {
                 self.tombstones.insert(sub, entry.delivery_key);
             }
         }
-        if let Some(receipt) = entry.receipt {
-            self.receipts.insert(entry.delivery_key, receipt);
+        match entry.receipt {
+            Some(receipt) => {
+                self.receipts.insert(entry.delivery_key, receipt);
+            }
+            None => {
+                self.evictable.insert(seq);
+            }
         }
-        self.order.push_back(entry);
+        self.order.insert(seq, entry);
         self.evict();
     }
     /// Drops the earliest-applied SETTLED entries while more than `cap` are
-    /// retained. A pinned (unsettled-receipt) entry is never evicted.
+    /// retained. A pinned (unsettled-receipt) entry is never evicted. Each
+    /// eviction is O(log n) regardless of how many entries are pinned.
     fn evict(&mut self) {
-        while self.order.len() - self.receipts.len() > self.cap {
-            let Some(i) = self.order.iter().position(|e| e.receipt.is_none()) else {
+        while self.evictable.len() > self.cap {
+            let Some(seq) = self.evictable.pop_first() else {
                 break;
             };
-            let Some(old) = self.order.remove(i) else {
-                break;
+            let Some(old) = self.order.remove(&seq) else {
+                continue;
             };
             self.keys.remove(&old.delivery_key);
             if let Some(sub) = old.subscription_key {
@@ -2555,7 +2575,7 @@ impl From<std::collections::VecDeque<RoutedDelivery>> for RoutedDeliveries {
 
 impl From<RoutedDeliveries> for std::collections::VecDeque<RoutedDelivery> {
     fn from(l: RoutedDeliveries) -> Self {
-        l.order
+        l.order.into_values().collect()
     }
 }
 
@@ -4460,5 +4480,65 @@ mod flow_arrivals_tests {
             arrivals.iter().collect::<Vec<_>>(),
             vec![(&flow("a", 0), 1)]
         );
+    }
+}
+
+#[cfg(test)]
+mod routed_ledger_eviction_tests {
+    use super::*;
+
+    fn entry(k: Key, receipt: Option<CorrelationReceipt>) -> RoutedDelivery {
+        RoutedDelivery {
+            delivery_key: k,
+            subscription_key: Some(k),
+            close_tombstone: false,
+            receipt,
+            settled: false,
+        }
+    }
+
+    fn receipt() -> CorrelationReceipt {
+        CorrelationReceipt {
+            accepted: true,
+            consumed: true,
+            deferred: false,
+            message_key: 1,
+            instance_key: 2,
+            target_partition: 0,
+        }
+    }
+
+    /// #1949 review: pinned receipts must not sit in the eviction path. With
+    /// a pinned backlog ahead of them, settled entries still evict FIFO, the
+    /// evictable index tracks exactly the unpinned entries, and settling an
+    /// interior pinned entry makes it evictable in its applied position.
+    #[test]
+    fn pinned_backlog_is_skipped_by_an_indexed_evictable_fifo() {
+        let mut l = RoutedDeliveries::default();
+        l.set_cap(3);
+        for k in 0..100 {
+            l.record(entry(k, Some(receipt())));
+        }
+        for k in 100..110 {
+            l.record(entry(k, None));
+        }
+        assert_eq!(l.len(), 103);
+        assert_eq!(l.evictable_len(), 3);
+        assert!((0..100).all(|k| l.contains(k)));
+        assert!((107..110).all(|k| l.contains(k)));
+        assert!(!l.contains(106));
+        // Settling an old pinned entry: it is the earliest-applied evictable
+        // entry, so it is the one evicted to restore the cap.
+        assert!(l.settle_receipt(5));
+        assert!(!l.contains(5));
+        assert_eq!(l.evictable_len(), 3);
+        // Pinning a retained settled-less entry removes it from the FIFO.
+        assert!(l.set_receipt(108, receipt()));
+        assert_eq!(l.evictable_len(), 2);
+        // Round-trip through the serialized form preserves order and indexes.
+        let order: std::collections::VecDeque<_> = l.clone().into();
+        let back = RoutedDeliveries::from(order);
+        assert_eq!(back, l);
+        assert_eq!(back.evictable_len(), 2);
     }
 }

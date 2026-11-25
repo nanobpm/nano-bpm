@@ -5199,14 +5199,21 @@ fn project_engine_state(
     //     event projector keeps it until the ack settles it), even when a
     //     one-shot reservation already marked it `Correlated`; its captured
     //     paced-correlation metadata is rebuilt below so the ack still
-    //     records history after the reseed.
+    //     records history after the reseed. A CANCELED subscription is never
+    //     a live wait, even with an ack in flight (its close already dropped
+    //     the wait in the event projector, and a later accepted ack would not
+    //     drop a recreated one): only its captured metadata is rebuilt.
     for sub in state.message_subscriptions.values() {
-        let open = matches!(
-            sub.state,
+        if !is_tracked_message_wait(sub.element_instance_key, &sub.kind) {
+            continue;
+        }
+        let live_wait = match sub.state {
             nanobpmn_engine_core::MessageSubscriptionState::Open
-                | nanobpmn_engine_core::MessageSubscriptionState::Opening
-        ) || sub.awaiting_ack.is_some();
-        if open && is_tracked_message_wait(sub.element_instance_key, &sub.kind) {
+            | nanobpmn_engine_core::MessageSubscriptionState::Opening => true,
+            nanobpmn_engine_core::MessageSubscriptionState::Canceled => false,
+            _ => sub.awaiting_ack.is_some(),
+        };
+        if live_wait {
             let non_interrupting = is_non_interrupting(&sub.kind);
             tx.cexecute(
                 "INSERT INTO message_subscriptions (subscription_key, instance_key, \
@@ -5230,22 +5237,22 @@ fn project_engine_state(
                     non_interrupting as i64,
                 ],
             )?;
-            if let Some(awaiting) = &sub.awaiting_ack {
-                tx.cexecute(
-                    "INSERT OR REPLACE INTO paced_message_correlations (subscription_key, \
+        }
+        if let Some(awaiting) = &sub.awaiting_ack {
+            tx.cexecute(
+                "INSERT OR REPLACE INTO paced_message_correlations (subscription_key, \
                      message_key, instance_key, element_instance_key, element_id, \
                      message_name, correlation_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        sub.key as i64,
-                        awaiting.message_key as i64,
-                        sub.instance_key as i64,
-                        wait_host_key(sub.instance_key, sub.element_instance_key) as i64,
-                        sub.element_id,
-                        sub.message_name,
-                        sub.correlation_key,
-                    ],
-                )?;
-            }
+                params![
+                    sub.key as i64,
+                    awaiting.message_key as i64,
+                    sub.instance_key as i64,
+                    wait_host_key(sub.instance_key, sub.element_instance_key) as i64,
+                    sub.element_id,
+                    sub.message_name,
+                    sub.correlation_key,
+                ],
+            )?;
         }
     }
 
@@ -13627,6 +13634,50 @@ mod element_instance_tests {
         assert_eq!(corr[0].message_key, 51);
         assert_eq!(corr[0].element_instance_key, TASK_EI);
         assert_eq!(corr[0].message_name, "OrderPlaced");
+        assert_eq!(paced_in_flight(&store), 0);
+    }
+
+    /// #1949 review r-cancel: a subscription closed while its consuming
+    /// accepted ack is in flight must not be resurrected as a live wait by a
+    /// reseed; the delayed ack still records history from the rebuilt capture.
+    #[test]
+    fn reseed_of_canceled_awaiting_ack_keeps_no_phantom_wait() {
+        use nanobpmn_engine_core::{
+            AwaitingAck, MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState,
+            State,
+        };
+        let mut state = State::default();
+        state.message_subscriptions.insert(
+            3502,
+            MessageSubscription {
+                key: 3502,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".into(),
+                message_name: "OrderPlaced".into(),
+                correlation_key: "P1".into(),
+                state: MessageSubscriptionState::Canceled,
+                kind: MessageSubscriptionKind::IntermediateCatch,
+                correlated_message_keys: Default::default(),
+                awaiting_ack: Some(AwaitingAck {
+                    message_key: 52,
+                    delivery_key: 952,
+                }),
+                rescan_from: None,
+                resume_pending: false,
+                resume_generation: 0,
+            },
+        );
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        assert!(store.message_subscriptions().is_empty(), "no phantom wait");
+        assert_eq!(paced_in_flight(&store), 1, "capture reseeded");
+        store.export(&[&paced_ack(3502, 52, true, true)]).unwrap();
+        assert!(store.message_subscriptions().is_empty(), "still no wait");
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].message_key, 52);
         assert_eq!(paced_in_flight(&store), 0);
     }
 
