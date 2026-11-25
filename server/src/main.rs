@@ -6167,6 +6167,24 @@ impl AsRef<ServerImpl> for ServerImpl {
     }
 }
 
+/// Maps a peer-forward transport failure for a job command (#1931) to a
+/// retryable "Service unavailable" problem via `unavailable`, logging it on the
+/// forwarding node (target node, job key) so the failure is observable. The
+/// status comes from the canonical [`PeerError::http_status`] mapping.
+fn peer_transport_failure<R>(
+    node: u32,
+    job_key: u64,
+    e: &nano_server_raft::peer::PeerError,
+    unavailable: impl FnOnce(models::ProblemDetail) -> R,
+) -> R {
+    tracing::warn!(node, job_key, error = %e, "job command forward to peer failed; returning retryable 503");
+    unavailable(problem(
+        "Service unavailable",
+        e.http_status(),
+        e.to_string(),
+    ))
+}
+
 fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
     models::ProblemDetail::new(title.to_string(), status, detail, String::new())
 }
@@ -10245,7 +10263,7 @@ impl ServerImpl {
                     lease_token,
                 )
                 .await
-                .map_err(|error| (502, error.to_string()))?;
+                .map_err(|error| (error.http_status(), error.to_string()))?;
             return if is_ok_status(response.status) {
                 Ok(())
             } else {
@@ -10296,8 +10314,10 @@ impl ServerImpl {
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
+                Err((503, m)) => Out::Unavailable(m),
                 Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
             };
         }
@@ -10339,8 +10359,10 @@ impl ServerImpl {
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
+                Err((503, m)) => Out::Unavailable(m),
                 Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
             };
         }
@@ -10370,8 +10392,10 @@ impl ServerImpl {
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
+                Err((503, m)) => Out::Unavailable(m),
                 Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
             };
         }
@@ -10461,8 +10485,10 @@ impl ServerImpl {
                     Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
+                Err((503, m)) => Out::Unavailable(m),
                 Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
             };
         }
@@ -10529,8 +10555,10 @@ impl ServerImpl {
                 {
                     Ok(r) if is_ok_status(r.status) => Out::Modified,
                     Ok(r) => Out::from_status(r.status, peer_detail(&r)),
+                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
+                Err((503, m)) => Out::Unavailable(m),
                 Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
             };
         }
@@ -10593,8 +10621,10 @@ impl ServerImpl {
                     Ok(r) if r.status == 409 => Out::NotResolvable(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
+                Err((503, m)) => Out::Unavailable(m),
                 Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
             };
         }
@@ -10728,8 +10758,10 @@ impl ServerImpl {
                     Ok(r) if r.status == 400 => Out::ScopeNotFound(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
+                Err((503, m)) => Out::Unavailable(m),
                 Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
             };
         }
@@ -12930,12 +12962,14 @@ impl ServerImpl {
         self.engine.peer_nodes()
     }
 
-    /// Acquires the uplink to peer `node`, mapping a connect failure to a 502.
+    /// Acquires the uplink to peer `node`, mapping a connect failure to its canonical `PeerError::http_status` (503, #1931).
     async fn peer_link(&self, node: u32) -> Result<crate::peer::PeerLink, (u16, String)> {
-        self.peers
-            .link(node)
-            .await
-            .map_err(|e| (502, format!("peer node {node} unreachable: {e}")))
+        self.peers.link(node).await.map_err(|e| {
+            (
+                e.http_status(),
+                format!("peer node {node} unreachable: {e}"),
+            )
+        })
     }
 
     /// Peer-side of query forwarding: answers a GET-by-key read for a key this
@@ -13000,7 +13034,7 @@ impl ServerImpl {
         match self.peer_link(node).await {
             Ok(link) => match link.get_by_key(kind, key).await {
                 Ok(r) => (r.status, r.body),
-                Err(_) => (502, None),
+                Err(e) => (e.http_status(), None),
             },
             Err((s, _)) => (s, None),
         }
@@ -13139,7 +13173,7 @@ impl ServerImpl {
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_default(),
                 ),
-                Err(e) => (502, e.to_string()),
+                Err(e) => (e.http_status(), e.to_string()),
             },
             Err((s, m)) => (s, m),
         }
@@ -13250,7 +13284,7 @@ impl ServerImpl {
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_default(),
                 ),
-                Err(e) => (502, e.to_string()),
+                Err(e) => (e.http_status(), e.to_string()),
             },
             Err((s, m)) => (s, m),
         }
@@ -13306,25 +13340,34 @@ impl ServerImpl {
             business_id,
         } = completion;
         use apis::job::CompleteJobResponse as Resp;
-        let res =
-            match self.peer_link(node).await {
-                Ok(link) => {
-                    link.complete_job(
-                        job_key.to_string(),
-                        lease_token,
-                        variables,
-                        adhoc_result,
-                        task_result,
-                        business_id,
-                    )
-                    .await
-                }
-                Err((s, m)) => {
-                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", s, m),
-                    );
-                }
-            };
+        let res = match self.peer_link(node).await {
+            Ok(link) => {
+                link.complete_job(
+                    job_key.to_string(),
+                    lease_token,
+                    variables,
+                    adhoc_result,
+                    task_result,
+                    business_id,
+                )
+                .await
+            }
+            Err((s, m)) => {
+                return if s == 503 {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        s,
+                        m,
+                    ))
+                } else {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Peer error",
+                        s,
+                        m,
+                    ))
+                };
+            }
+        };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobWasCompletedSuccessfully,
             Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheGivenKeyWasNotFound(problem(
@@ -13359,11 +13402,9 @@ impl ServerImpl {
                 500,
                 peer_detail(&r),
             )),
-            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                502,
-                e.to_string(),
-            )),
+            Err(e) => peer_transport_failure(node, job_key, &e, |p| {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(p)
+            }),
         }
     }
 
@@ -13378,24 +13419,33 @@ impl ServerImpl {
         retry_back_off: i64,
     ) -> apis::job::FailJobResponse {
         use apis::job::FailJobResponse as Resp;
-        let res =
-            match self.peer_link(node).await {
-                Ok(link) => {
-                    link.fail_job(
-                        job_key.to_string(),
-                        lease_token,
-                        retries,
-                        error_message,
-                        retry_back_off,
-                    )
-                    .await
-                }
-                Err((s, m)) => {
-                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", s, m),
-                    );
-                }
-            };
+        let res = match self.peer_link(node).await {
+            Ok(link) => {
+                link.fail_job(
+                    job_key.to_string(),
+                    lease_token,
+                    retries,
+                    error_message,
+                    retry_back_off,
+                )
+                .await
+            }
+            Err((s, m)) => {
+                return if s == 503 {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        s,
+                        m,
+                    ))
+                } else {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Peer error",
+                        s,
+                        m,
+                    ))
+                };
+            }
+        };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobIsFailed,
             Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(
@@ -13416,11 +13466,9 @@ impl ServerImpl {
                 500,
                 peer_detail(&r),
             )),
-            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                502,
-                e.to_string(),
-            )),
+            Err(e) => peer_transport_failure(node, job_key, &e, |p| {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(p)
+            }),
         }
     }
 
@@ -13436,24 +13484,33 @@ impl ServerImpl {
         variables: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> apis::job::ThrowJobErrorResponse {
         use apis::job::ThrowJobErrorResponse as Resp;
-        let res =
-            match self.peer_link(node).await {
-                Ok(link) => {
-                    link.throw_error(
-                        job_key.to_string(),
-                        lease_token,
-                        error_code,
-                        error_message,
-                        variables,
-                    )
-                    .await
-                }
-                Err((s, m)) => {
-                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", s, m),
-                    );
-                }
-            };
+        let res = match self.peer_link(node).await {
+            Ok(link) => {
+                link.throw_error(
+                    job_key.to_string(),
+                    lease_token,
+                    error_code,
+                    error_message,
+                    variables,
+                )
+                .await
+            }
+            Err((s, m)) => {
+                return if s == 503 {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        s,
+                        m,
+                    ))
+                } else {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Peer error",
+                        s,
+                        m,
+                    ))
+                };
+            }
+        };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_AnErrorIsThrownForTheJob,
             Ok(r) if r.status == 404 => {
@@ -13482,11 +13539,9 @@ impl ServerImpl {
                 500,
                 peer_detail(&r),
             )),
-            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                502,
-                e.to_string(),
-            )),
+            Err(e) => peer_transport_failure(node, job_key, &e, |p| {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(p)
+            }),
         }
     }
 
@@ -13521,7 +13576,10 @@ impl ServerImpl {
                 .await
             {
                 Ok(r) => (r.status, r.body),
-                Err(e) => (502, Some(serde_json::Value::String(e.to_string()))),
+                Err(e) => (
+                    e.http_status(),
+                    Some(serde_json::Value::String(e.to_string())),
+                ),
             },
             Err((s, m)) => (s, Some(serde_json::Value::String(m))),
         }
@@ -13550,7 +13608,10 @@ impl ServerImpl {
                 .await
             {
                 Ok(r) => (r.status, r.body),
-                Err(e) => (502, Some(serde_json::Value::String(e.to_string()))),
+                Err(e) => (
+                    e.http_status(),
+                    Some(serde_json::Value::String(e.to_string())),
+                ),
             },
             Err((s, m)) => (s, Some(serde_json::Value::String(m))),
         }
@@ -13579,7 +13640,10 @@ impl ServerImpl {
                 .await
             {
                 Ok(r) => (r.status, r.body),
-                Err(e) => (502, Some(serde_json::Value::String(e.to_string()))),
+                Err(e) => (
+                    e.http_status(),
+                    Some(serde_json::Value::String(e.to_string())),
+                ),
             },
             Err((s, m)) => (s, Some(serde_json::Value::String(m))),
         }
@@ -13665,7 +13729,7 @@ impl ServerImpl {
             // non-retryable 500 during the incident-resolution retry phase.
             Ok(r) if r.status == 503 => Err((503, peer_detail(&r))),
             Ok(r) => Err((500, peer_detail(&r))),
-            Err(e) => Err((502, e.to_string())),
+            Err(e) => Err((e.http_status(), e.to_string())),
         }
     }
 
@@ -13865,17 +13929,19 @@ impl ServerImpl {
             }
             // Without placement protection a peer never placement-sheds, so this
             // is only reached defensively; surface it as a retryable error.
-            ForwardCreateOutcome::Shed(detail) => {
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Peer error",
+            ForwardCreateOutcome::Shed(detail) | ForwardCreateOutcome::Unreachable(detail) => {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
                     503,
                     detail,
                 ))
             }
-            ForwardCreateOutcome::Unreachable(detail) => {
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Peer error",
-                    502,
+            // A retryable peer status (incl. a transport failure classified by
+            // `PeerError::http_status`, #1931) stays retryable end to end.
+            ForwardCreateOutcome::Error(503, detail) => {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
                     detail,
                 ))
             }
@@ -13955,7 +14021,7 @@ impl ServerImpl {
             // A transport error AFTER the request was sent is ambiguous — the peer
             // may have applied the create — so it is NOT rerouted (that would risk
             // a duplicate instance); it surfaces as a retryable error instead.
-            Err(e) => ForwardCreateOutcome::Error(502, e.to_string()),
+            Err(e) => ForwardCreateOutcome::Error(e.http_status(), e.to_string()),
         }
     }
 
@@ -17098,7 +17164,7 @@ impl ServerImpl {
             .await?
             .forward_agent_instance(agent_instance_key, body)
             .await
-            .map_err(|error| (502, error.to_string()))?;
+            .map_err(|error| (error.http_status(), error.to_string()))?;
         if !is_ok_status(response.status) {
             return Err((response.status, peer_detail(&response)));
         }
@@ -18904,15 +18970,16 @@ impl ServerImpl {
         tenant_id: String,
     ) -> Result<models::DeploymentResult, (u16, String)> {
         let owner = self.engine.topology().owner_of(0);
-        let link = self
-            .peers
-            .link(owner)
-            .await
-            .map_err(|e| (502u16, format!("deploy-partition owner unreachable: {e}")))?;
+        let link = self.peers.link(owner).await.map_err(|e| {
+            (
+                e.http_status(),
+                format!("deploy-partition owner unreachable: {e}"),
+            )
+        })?;
         let res = link
             .deploy(resources, Some(tenant_id))
             .await
-            .map_err(|e| (502u16, format!("deploy forward failed: {e}")))?;
+            .map_err(|e| (e.http_status(), format!("deploy forward failed: {e}")))?;
         if res.status != 200 {
             let detail = res
                 .body
@@ -23286,7 +23353,7 @@ impl ServerImpl {
                 None,
             )
             .await
-            .map_err(|e| (502u16, e.to_string()))?;
+            .map_err(|e| (e.http_status(), e.to_string()))?;
         if !is_ok_status(res.status) {
             return Err((res.status, peer_detail(&res)));
         }
@@ -43371,6 +43438,64 @@ mod clustered_startup_tests {
             !matches!(again, R::Status204_TheJobWasCompletedSuccessfully),
             "re-completing an already-completed job must not return 204, got a success"
         );
+    }
+
+    /// #1931: a job command forwarded to an unreachable/timed-out owner is a
+    /// transient transport failure — it must surface as a retryable 503, never
+    /// a 500 (which SDKs mark `nonRetryable` and drop, stranding the job until
+    /// its timeout).
+    #[tokio::test]
+    async fn job_command_forward_transport_failure_is_retryable_503() {
+        let node0 = clustered_node(0);
+        node0
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("owner creates the demo instance");
+        let jobs = node0
+            .activate_for_stream("demo-work", "w", 10, 60_000, None)
+            .await;
+        let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
+
+        // node 1 points at a dead owner: every forward fails in transport.
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec!["http://127.0.0.1:1".into(), "http://unused".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node1 = build_server_in_memory(journals, topology);
+        let owner = node1.remote_owner_of(job_key).expect("peer-owned job");
+
+        let complete = node1
+            .forward_complete_job(owner, job_key, JobCompletion::default())
+            .await;
+        assert!(
+            matches!(&complete, apis::job::CompleteJobResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503),
+            "complete: transport failure must be a retryable 503"
+        );
+        let fail = node1
+            .forward_fail_job(owner, job_key, None, 0, String::new(), 0)
+            .await;
+        assert!(
+            matches!(&fail, apis::job::FailJobResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503),
+            "fail: transport failure must be a retryable 503"
+        );
+        let throw = node1
+            .forward_throw_error(owner, job_key, None, "E".into(), String::new(), None)
+            .await;
+        assert!(
+            matches!(&throw, apis::job::ThrowJobErrorResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503),
+            "throwError: transport failure must be a retryable 503"
+        );
+        let (status, _) = node1
+            .forward_complete_job_stream(owner, job_key, JobCompletion::default())
+            .await;
+        assert_eq!(status, 503, "stream complete: transport failure is 503");
     }
 
     #[tokio::test]

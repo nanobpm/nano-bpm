@@ -75,6 +75,31 @@ impl std::fmt::Display for PeerError {
 
 impl std::error::Error for PeerError {}
 
+impl PeerError {
+    /// Whether a client may safely retry the request that failed with this
+    /// error (#1931). Every variant is a **transport** failure: the forwarding
+    /// node could not reach the owner, or did not hear back in time. None of
+    /// them is a semantic rejection by the owner (those arrive as an `Ok`
+    /// [`PeerResult`] carrying the owner's 4xx), so all are transient —
+    /// Zeebe/C8 parity: a gateway→broker timeout surfaces as gRPC
+    /// `DEADLINE_EXCEEDED` / `UNAVAILABLE`, which clients retry. Exhaustive on
+    /// purpose: a new variant must make an explicit retryability decision.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            PeerError::Connect(_) | PeerError::Closed | PeerError::Timeout => true,
+        }
+    }
+
+    /// The HTTP status a gateway surfaces for this peer-forward failure: the
+    /// single canonical mapping every forwarding path derives from (#1931).
+    /// Retryable transport failures map to 503 Service Unavailable (the
+    /// backpressure / leader-race status every SDK retries); never a 5xx that
+    /// clients treat as non-retryable (500/502).
+    pub fn http_status(&self) -> u16 {
+        if self.is_retryable() { 503 } else { 500 }
+    }
+}
+
 /// Maps a failed WebSocket handshake to [`PeerError::Connect`], keeping the
 /// peer's HTTP rejection **body** in the message. A gateway that enforces the
 /// cluster secret or a determinism upgrade boundary (#1702) refuses the join
@@ -1905,6 +1930,22 @@ fn fast_forward_timeout() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1931: every `PeerError` variant is classified as a class — transport
+    /// failures are retryable and surface as 503, never 500/502 (which SDKs
+    /// mark `nonRetryable` and drop, stranding jobs until their timeout).
+    #[test]
+    fn peer_error_mapping_is_retryable_for_transport_failures() {
+        let table: [(PeerError, bool, u16); 3] = [
+            (PeerError::Connect("refused".into()), true, 503),
+            (PeerError::Closed, true, 503),
+            (PeerError::Timeout, true, 503),
+        ];
+        for (err, retryable, status) in table {
+            assert_eq!(err.is_retryable(), retryable, "{err}");
+            assert_eq!(err.http_status(), status, "{err}");
+        }
+    }
 
     /// #1582: dropping an in-flight `request_on` future (a caller-side timeout,
     /// a cancelled task, a `select!` loser) must remove its pending-correlation
