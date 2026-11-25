@@ -245,7 +245,10 @@ fn parallel_join_fires_only_when_every_flow_taken() {
         assert!(fired == from_a.min(from_b), "fires once per full round");
         assert!(arrivals.count(&a) == from_a - fired);
         assert!(arrivals.count(&b) == from_b - fired);
-        assert!(arrivals.distinct_flows() < INCOMING, "a ready join never waits");
+        assert!(
+            arrivals.distinct_flows() < INCOMING,
+            "a ready join never waits"
+        );
         assert_join_invariant(&arrivals);
     }
 }
