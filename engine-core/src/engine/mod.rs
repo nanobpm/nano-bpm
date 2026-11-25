@@ -235,9 +235,10 @@ pub struct Engine {
     /// children, never walk the resident instance map.
     #[cfg(test)]
     pub(crate) cascade_scan_count: std::cell::Cell<usize>,
-    /// Test-only count of full buffered-message scans (#1874): a persistent
-    /// subscription draining a backlog must scan the buffer once, not per
-    /// message.
+    /// Test-only count of buffered messages visited while building
+    /// subscriptions' candidate queues (#1874): only messages matching the
+    /// subscription's name + correlation key are ever visited (index read),
+    /// once per subscription per command — never the whole buffer.
     #[cfg(test)]
     pub(crate) buffer_scan_count: std::cell::Cell<usize>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
@@ -7477,23 +7478,21 @@ impl Engine {
         let subscription = self.state.message_subscriptions.get(&subscription_key)?;
         let instance_key = subscription.instance_key;
         if !self.buffer_candidates.contains_key(&subscription_key) {
-            #[cfg(test)]
-            self.buffer_scan_count.set(self.buffer_scan_count.get() + 1);
-            let mut candidates: Vec<(u64, Key)> = self
+            // Read only the (name, correlation key) set, already in seq
+            // order — never a scan of the whole buffer.
+            let candidates: VecDeque<Key> = self
                 .state
-                .buffered_messages
-                .values()
-                .filter(|m| {
-                    m.message_name == subscription.message_name
-                        && m.correlation_key == subscription.correlation_key
-                })
-                .map(|m| (m.seq, m.key))
-                .collect();
-            candidates.sort_unstable();
-            self.buffer_candidates.insert(
-                subscription_key,
-                candidates.into_iter().map(|(_, k)| k).collect(),
-            );
+                .buffered_by_correlation
+                .get(&(
+                    subscription.message_name.clone(),
+                    subscription.correlation_key.clone(),
+                ))
+                .map(|set| set.iter().map(|&(_, k)| k).collect())
+                .unwrap_or_default();
+            #[cfg(test)]
+            self.buffer_scan_count
+                .set(self.buffer_scan_count.get() + candidates.len());
+            self.buffer_candidates.insert(subscription_key, candidates);
         }
         let queue = self.buffer_candidates.get_mut(&subscription_key)?;
         while let Some(&key) = queue.front() {

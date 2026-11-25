@@ -33975,7 +33975,10 @@ mod clustered_startup_tests {
             .expect("buffer")
             .1
             .blocking_wait();
-        assert!(journal.engine().message_buffering_ever_used(), "precondition");
+        assert!(
+            journal.engine().message_buffering_ever_used(),
+            "precondition"
+        );
         let topology = cluster::Topology {
             node_id: 0,
             peers: vec![

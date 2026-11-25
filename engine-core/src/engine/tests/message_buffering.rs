@@ -677,9 +677,9 @@ fn non_interrupting_subscription_drains_the_whole_backlog_locally() {
         taken, published,
         "every buffered message, in order: {events:?}"
     );
-    // r4692584915: the backlog is drained from one ordered scan of the
-    // buffer, not one full scan per message.
-    assert_eq!(engine.buffer_scan_count.get(), 1);
+    // r4692584915: the backlog is drained from one ordered read of the
+    // matching index set — each message visited once, not once per message.
+    assert_eq!(engine.buffer_scan_count.get(), published.len());
     // r4693206193: the per-command candidate cache does not outlive the
     // command (no idle retention).
     assert!(engine.buffer_candidates.is_empty());
@@ -894,4 +894,111 @@ fn message_id_dedup_uses_an_index_that_survives_replay_and_restore() {
     assert_eq!(engine.state().buffered_messages.len(), 1);
     assert_eq!(engine.state().buffered_message_ids.len(), 1);
     assert!(is_dup(&mut engine, "m-1", 5_000));
+}
+
+fn fan_out_catches(n: usize) -> ProcessDefinition {
+    let mut b = ProcessBuilder::new("fan")
+        .start_event("start")
+        .parallel_gateway("fork");
+    b = b.connect("start", "fork");
+    for i in 0..n {
+        let (c, e) = (format!("c{i}"), format!("e{i}"));
+        b = b
+            .message_intermediate_catch_event(&c, "m", "orderId")
+            .end_event(&e)
+            .connect("fork", &c)
+            .connect(&c, &e);
+    }
+    b.build().unwrap()
+}
+
+/// Copilot (PR 1944): k subscriptions opening in one command must not each
+/// filter the whole buffer (O(k*N)). Candidates come from the
+/// (name, correlation key) index, so a backlog under OTHER keys is never
+/// visited, and the index stays consistent across expiry and replay.
+#[test]
+fn opening_subscriptions_never_scan_unrelated_buffered_messages() {
+    let mut engine = Engine::new();
+    let mut journal: Vec<Event> = Vec::new();
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(fan_out_catches(50)), 0)
+            .unwrap(),
+    );
+    for i in 0..1_000u64 {
+        let ttl = if i % 2 == 0 { 1_000 } else { 100_000 };
+        journal.extend(
+            engine
+                .apply_command_at(publish("m", &format!("other-{i}"), Some(ttl), None), 1_000)
+                .unwrap(),
+        );
+    }
+    journal.extend(
+        engine
+            .apply_command_at(publish("m", "o-1", Some(100_000), None), 1_000)
+            .unwrap(),
+    );
+    engine.buffer_scan_count.set(0);
+    let events = engine
+        .apply_command_at(
+            Command::create_instance_with("fan", vars(&[("orderId", Value::Str("none".into()))])),
+            1_500,
+        )
+        .unwrap();
+    journal.extend(events.iter().cloned());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::MessageSubscriptionCreated { .. }))
+            .count(),
+        50
+    );
+    assert_eq!(
+        engine.buffer_scan_count.get(),
+        0,
+        "no buffered message matches, so none may be visited"
+    );
+
+    // With one match, each of the 50 catches visits only that message.
+    engine.buffer_scan_count.set(0);
+    let events = engine
+        .apply_command_at(
+            Command::create_instance_with("fan", vars(&[("orderId", Value::Str("o-1".into()))])),
+            1_600,
+        )
+        .unwrap();
+    journal.extend(events.iter().cloned());
+    assert!(engine.buffer_scan_count.get() <= 50);
+    assert_eq!(buffered_correlations(&events).len(), 1);
+
+    // Expiry sweep drops entries from the index too.
+    journal.extend(
+        engine
+            .apply_command_at(Command::TriggerTimers { now: 5_000 }, 5_000)
+            .unwrap(),
+    );
+    assert_eq!(engine.state().buffered_messages.len(), 501);
+    let indexed: usize = engine
+        .state()
+        .buffered_by_correlation
+        .values()
+        .map(BTreeSet::len)
+        .sum();
+    assert_eq!(indexed, 501);
+    engine.state().assert_buffered_message_id_index_consistent();
+
+    let replayed = Engine::replay_partition(0, journal);
+    assert_eq!(
+        replayed.state().buffered_by_correlation,
+        engine.state().buffered_by_correlation
+    );
+    #[cfg(feature = "serde")]
+    {
+        let json = serde_json::to_string(&engine.snapshot()).unwrap();
+        let restored = Engine::from_snapshot(serde_json::from_str(&json).unwrap());
+        assert_eq!(
+            restored.state().buffered_by_correlation,
+            engine.state().buffered_by_correlation
+        );
+    }
 }

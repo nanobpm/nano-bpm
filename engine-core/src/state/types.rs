@@ -2522,6 +2522,16 @@ pub struct State {
     /// [`State::rebuild_buffered_message_id_index`] on snapshot restore.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub buffered_message_ids: BTreeMap<(String, String, String), Key>,
+    /// Index of buffered messages by `(message_name, correlation_key)` →
+    /// ordered `(seq, message key)` set (#1874, Zeebe's name + correlation
+    /// key message index). A subscription's buffered candidates are read from
+    /// its matching set — `O(log n + matches)` — instead of a scan of the
+    /// whole buffer. Derived from `buffered_messages` and maintained only by
+    /// [`State::insert_buffered_message`] / [`State::remove_buffered_message`].
+    /// In-memory only: rebuilt by [`State::rebuild_buffered_message_id_index`]
+    /// on snapshot restore.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub buffered_by_correlation: BTreeMap<(String, String), BTreeSet<(u64, Key)>>,
     /// Next [`BufferedMessage::seq`] to assign (#1874): bumped by every
     /// applied `MessageBuffered`, never reused (an expired or removed message
     /// leaves its slot behind), so enqueue order is total and replayable.
@@ -3260,6 +3270,13 @@ impl State {
                 message.key,
             );
         }
+        self.buffered_by_correlation
+            .entry((
+                message.message_name.clone(),
+                message.correlation_key.clone(),
+            ))
+            .or_default()
+            .insert((message.seq, message.key));
         self.buffered_messages.insert(message.key, message);
     }
 
@@ -3273,6 +3290,16 @@ impl State {
     /// Drops `message`'s index entry only if it still points at `message`
     /// (a newer message may have reused the id after this one expired).
     fn unindex_buffered_message(&mut self, message: &BufferedMessage) {
+        let ck = (
+            message.message_name.clone(),
+            message.correlation_key.clone(),
+        );
+        if let Some(set) = self.buffered_by_correlation.get_mut(&ck) {
+            set.remove(&(message.seq, message.key));
+            if set.is_empty() {
+                self.buffered_by_correlation.remove(&ck);
+            }
+        }
         if let Some(id) = &message.message_id {
             let k = (
                 message.message_name.clone(),
@@ -3311,6 +3338,13 @@ impl State {
     /// the only one that can still be live.
     pub fn rebuild_buffered_message_id_index(&mut self) {
         self.buffered_message_ids.clear();
+        self.buffered_by_correlation.clear();
+        for m in self.buffered_messages.values() {
+            self.buffered_by_correlation
+                .entry((m.message_name.clone(), m.correlation_key.clone()))
+                .or_default()
+                .insert((m.seq, m.key));
+        }
         let mut by_seq: Vec<&BufferedMessage> = self.buffered_messages.values().collect();
         by_seq.sort_by_key(|m| m.seq);
         for m in by_seq {
@@ -3362,6 +3396,17 @@ impl State {
                 "index entry {triple:?} is not the newest"
             );
         }
+        let mut by_correlation: BTreeMap<(String, String), BTreeSet<(u64, Key)>> = BTreeMap::new();
+        for m in self.buffered_messages.values() {
+            by_correlation
+                .entry((m.message_name.clone(), m.correlation_key.clone()))
+                .or_default()
+                .insert((m.seq, m.key));
+        }
+        assert_eq!(
+            self.buffered_by_correlation, by_correlation,
+            "buffered (name, correlation key) index drifted from the buffer"
+        );
         for (triple, group) in &by_triple {
             if group.len() == 1 {
                 assert!(
