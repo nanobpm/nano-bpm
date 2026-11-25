@@ -10314,6 +10314,9 @@ impl ServerImpl {
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    // Unknown outcome is safe to retry here: this keyed command is
+                    // idempotent on the owner (a re-apply is a no-op or a
+                    // deterministic 404/409), so it cannot duplicate (#1931).
                     Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -10359,6 +10362,9 @@ impl ServerImpl {
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    // Unknown outcome is safe to retry here: this keyed command is
+                    // idempotent on the owner (a re-apply is a no-op or a
+                    // deterministic 404/409), so it cannot duplicate (#1931).
                     Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -10392,6 +10398,9 @@ impl ServerImpl {
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    // Unknown outcome is safe to retry here: this keyed command is
+                    // idempotent on the owner (a re-apply is a no-op or a
+                    // deterministic 404/409), so it cannot duplicate (#1931).
                     Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -10628,6 +10637,9 @@ impl ServerImpl {
                     Ok(r) if r.status == 409 => Out::NotResolvable(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    // Unknown outcome is safe to retry here: this keyed command is
+                    // idempotent on the owner (a re-apply is a no-op or a
+                    // deterministic 404/409), so it cannot duplicate (#1931).
                     Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -10765,6 +10777,9 @@ impl ServerImpl {
                     Ok(r) if r.status == 400 => Out::ScopeNotFound(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
+                    // Unknown outcome is safe to retry here: this keyed command is
+                    // idempotent on the owner (a re-apply is a no-op or a
+                    // deterministic 404/409), so it cannot duplicate (#1931).
                     Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -13983,7 +13998,6 @@ impl ServerImpl {
         request_timeout: Option<i64>,
         operation_reference: Option<i64>,
     ) -> ForwardCreateOutcome {
-        let business_id_keyed = business_id.is_some();
         let res = match self.peer_link(node).await {
             Ok(link) => {
                 link.forward_create(
@@ -14028,12 +14042,15 @@ impl ServerImpl {
             Ok(r) => ForwardCreateOutcome::Error(500, peer_detail(&r)),
             // A transport error AFTER the request was sent is ambiguous — the peer
             // may have applied the create — so it is NOT rerouted (that would risk
-            // a duplicate instance). It is retryable only when the owner
-            // deduplicates the create (a `businessId`); an unkeyed create with an
-            // unknown outcome stays a non-retryable 500 (#1931 review).
-            Err(e) => {
-                ForwardCreateOutcome::Error(e.write_http_status(business_id_keyed), e.to_string())
-            }
+            // a duplicate instance), and it is NEVER retryable: an unknown-outcome
+            // create is a non-retryable 500 (#1931 review). A `businessId` is NOT
+            // a dedup key: uniqueness enforcement is optional (only then is a
+            // repeat rejected with 409 BusinessIdAlreadyAssigned), and even when
+            // enabled it covers only ACTIVE root instances — if the first create
+            // applied and its instance already completed, a retry after the lost
+            // reply would mint a duplicate. A connect failure (definitely
+            // pre-send) never reaches here: `peer_link` maps it to `Unreachable`.
+            Err(e) => ForwardCreateOutcome::Error(e.write_http_status(false), e.to_string()),
         }
     }
 
@@ -43519,28 +43536,14 @@ mod clustered_startup_tests {
         assert_eq!(status, 503, "stream complete: transport failure is 503");
     }
 
-    /// #1931 review: a peer that ACCEPTS the link but closes it before replying
-    /// (an established connection failing post-send) must surface the job
-    /// forwards as a retryable 503 — exercising the post-connection `Err` arms,
-    /// not the connect-failure branch.
-    #[tokio::test]
-    async fn job_command_forward_post_connect_failure_is_retryable_503() {
+    /// A mute owner (#1931 review): completes the cluster handshake, then drops
+    /// the socket as soon as a request frame arrives, without replying — an
+    /// established link failing post-send (outcome unknown).
+    async fn spawn_mute_owner() -> std::net::SocketAddr {
         use nano_falcon_protocol::cluster_join as cj;
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-        let node0 = clustered_node(0);
-        node0
-            .create_for_stream(Some("demo".into()), None, Default::default())
-            .await
-            .expect("owner creates the demo instance");
-        let jobs = node0
-            .activate_for_stream("demo-work", "w", 10, 60_000, None)
-            .await;
-        let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
-
-        // A mute owner: completes the cluster handshake, then drops the socket
-        // as soon as a request frame arrives, without replying.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -43578,6 +43581,79 @@ mod clustered_startup_tests {
                 });
             }
         });
+        addr
+    }
+
+    /// #1931 review: a create forwarded WITH a `businessId` whose link drops
+    /// after the send has an unknown outcome. A businessId does not dedupe
+    /// (optional enforcement; active-only uniqueness), so it must be the
+    /// non-retryable 500, never 503. A connect failure (pre-send) stays
+    /// rerouteable/retryable (`Unreachable`).
+    #[tokio::test]
+    async fn keyed_create_forward_unknown_outcome_is_500_connect_failure_is_unreachable() {
+        let addr = spawn_mute_owner().await;
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![
+                format!("http://{addr}"),
+                "http://unused".into(),
+                "http://127.0.0.1:1".into(),
+            ],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node1 = build_server_in_memory(journals, topology);
+        let create = |node: u32| {
+            node1.forward_create_once(
+                node,
+                Some("demo".into()),
+                None,
+                None,
+                Vec::new(),
+                Some("order-42".into()),
+                false,
+                None,
+                None,
+                None,
+            )
+        };
+        match create(0).await {
+            ForwardCreateOutcome::Error(status, detail) => {
+                assert_eq!(
+                    status, 500,
+                    "keyed unknown-outcome create must be 500: {detail}"
+                )
+            }
+            _ => panic!("expected a post-send transport Error for the mute owner"),
+        }
+        assert!(
+            matches!(create(2).await, ForwardCreateOutcome::Unreachable(_)),
+            "a connect failure must stay rerouteable (Unreachable)"
+        );
+    }
+
+    /// #1931 review: a peer that ACCEPTS the link but closes it before replying
+    /// (an established connection failing post-send) must surface the job
+    /// forwards as a retryable 503 — exercising the post-connection `Err` arms,
+    /// not the connect-failure branch.
+    #[tokio::test]
+    async fn job_command_forward_post_connect_failure_is_retryable_503() {
+        let node0 = clustered_node(0);
+        node0
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("owner creates the demo instance");
+        let jobs = node0
+            .activate_for_stream("demo-work", "w", 10, 60_000, None)
+            .await;
+        let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
+
+        let addr = spawn_mute_owner().await;
 
         let topology = cluster::Topology {
             node_id: 1,
