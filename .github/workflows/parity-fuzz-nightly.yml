@@ -50,7 +50,6 @@ jobs:
     permissions:
       contents: write
       issues: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -78,10 +77,18 @@ jobs:
             args+=(--cases "$CASES" --max-gateways "$MAX_GATEWAYS" --record --file-issues)
           fi
           node formal/corpus/fuzz.mjs "${args[@]}"
+      # GITHUB_TOKEN may not create PRs (#1907): use the GitHub App token.
+      - name: Mint the release-automation GitHub App token
+        id: app-token
+        if: failure() && github.event_name != 'pull_request'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
       - name: Commit the minimal reproducers (PR)
         if: failure() && github.event_name != 'pull_request'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SEED: ${{ steps.fuzz.outputs.seed }}
         run: |
           if git diff --quiet -- formal/corpus/fuzz-corpus.json; then
@@ -93,6 +100,10 @@ jobs:
           git switch -c "$branch"
           git add formal/corpus/fuzz-corpus.json
           git commit -s -m "parity(fuzz): minimal reproducers from seed $SEED"
+          # Push with the App token, not checkout's persisted GITHUB_TOKEN: a
+          # GITHUB_TOKEN push does not trigger the PR's required CI (#1907).
+          git config --unset-all http.https://github.com/.extraheader || true
+          gh auth setup-git
           git push origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "parity(fuzz): minimal reproducers from seed $SEED" \
