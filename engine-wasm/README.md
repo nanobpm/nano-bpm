@@ -124,7 +124,7 @@ engine.createInstance("my-process", "{}");
 
 // Same lean surface as above, PLUS the gateway's REST read channel:
 const form  = JSON.parse(engine.getFormByKey("2251799813685250"));
-const open  = JSON.parse(engine.searchUserTasks(JSON.stringify({ state: "CREATED" })));
+const open  = JSON.parse(engine.searchUserTasks(JSON.stringify({ filter: { state: "CREATED" } })));
 const insts = JSON.parse(engine.searchProcessInstances("{}"));
 const res   = JSON.parse(engine.getResourceByKey("2251799813685251"));
 const vars  = JSON.parse(engine.searchVariables("{}"));
@@ -132,24 +132,35 @@ const vars  = JSON.parse(engine.searchVariables("{}"));
 
 ### Read methods (read-model subpath only)
 
-Each returns the same JSON shapes the Camunda v2 REST surface returns; each
-delegates to the in-memory read model, kept current after every command and
-cleared by `reset()`.
+Every read method runs the SAME spec-derived pipeline the gateway serves (the
+shared `nanobpmn-search` crate): the request body is the spec's `*SearchQuery`
+(`{ filter?, sort?, page? }` — every filter field and operator, `$or`,
+variable filters, sort fields and limit/offset/cursor paging; an empty string
+means "no query"), parsed strictly — a property or enum value the spec does not
+define throws, it is never silently ignored — and the result is the generated
+`*SearchQueryResult` / `*Result`, byte-for-byte what the gateway returns. A
+server/WASM parity guard (`src/search_parity_tests.rs`) enforces this for every
+operation. Each reads the in-memory read model, kept current after every
+command and cleared by `reset()`.
 
-- **`getFormByKey(formKey)`** → the latest deployed form for `formKey`
-  (`{ tenantId, formId, schema, version, formKey }`), or `null`.
-  Mirrors `GET /forms/{formKey}`.
-- **`searchUserTasks(filterJson)`** → `{ items, page }`. Honours an optional
-  `{ state? }` filter (e.g. `"CREATED"`) through the read model.
+- **`searchUserTasks(queryJson)`** → `UserTaskSearchQueryResult`.
   Mirrors `POST /user-tasks/search`.
-- **`searchProcessInstances(filterJson)`** → `{ items, page }`. Body is
-  shape-validated; filter/sort/page fields are not yet honoured (returns every
-  instance). Mirrors `POST /process-instances/search`.
-- **`getResourceByKey(resourceKey)`** → the generic resource, or `null`.
-  Mirrors `GET /resources/{resourceKey}`.
-- **`searchVariables(filterJson)`** → `{ items, page }`. Body is shape-validated;
-  long values are truncated with `isTruncated: true`.
+- **`searchProcessInstances(queryJson)`** → `ProcessInstanceSearchQueryResult`.
+  Mirrors `POST /process-instances/search`.
+- **`searchVariables(queryJson, truncateValues?)`** → `VariableSearchQueryResult`.
+  `truncateValues` (default `true`) is the endpoint's query parameter: long
+  values are cut to the preview length and flagged `isTruncated: true`.
   Mirrors `POST /variables/search`.
+- **`searchAgentInstances(queryJson)`** / **`searchAgentInstanceHistory(key,
+  queryJson)`** → the agent search results. Mirror `POST /agent-instances/search`
+  and `POST /agent-instances/{key}/history/search`.
+- **`getFormByKey(formKey)`** → `FormResult`, or `null` where the gateway
+  answers 404. Mirrors `GET /forms/{formKey}`.
+- **`getResourceByKey(resourceKey)`** → `ResourceResult`, or `null` where the
+  gateway answers 404. Mirrors `GET /resources/{resourceKey}`.
+- **`getAgentInstance(agentInstanceKey)`** → `AgentInstanceResult`, `null` where
+  the gateway answers 404, and throws where it answers 400 (a malformed key).
+  Mirrors `GET /agent-instances/{agentInstanceKey}`.
 
 ### Typing the results — `@nanobpm/engine-wasm/readmodel-types`
 
@@ -163,7 +174,7 @@ type them without hand-mirroring the shapes:
 import type { UserTaskSearchQueryResult } from "@nanobpm/engine-wasm/readmodel-types";
 
 const open = JSON.parse(
-  engine.searchUserTasks(JSON.stringify({ state: "CREATED" })),
+  engine.searchUserTasks(JSON.stringify({ filter: { state: "CREATED" } })),
 ) as UserTaskSearchQueryResult;
 ```
 
@@ -237,11 +248,12 @@ embedded-only method.
 
 | Method | Returns | REST operation | REST request schema | REST response schema | Description |
 | --- | --- | --- | --- | --- | --- |
-| `getFormByKey(formKey: string)` | string (throws) | [`getFormByKey`](../spec/forms.yaml) (`GET /forms/{formKey}`) | — | `FormResult` | The latest deployed form for `form_key`, as a `FormResult` JSON object (`{ tenantId, formId, schema, version, formKey }`), or JSON `null` when no form with that key exists. |
-| `searchUserTasks(filterJson: string)` | string (throws) | [`searchUserTasks`](../spec/user-tasks.yaml) (`POST /user-tasks/search`) | `UserTaskSearchQuery` | `UserTaskSearchQueryResult` | The user tasks matching an optional `{ state? }` filter, as a `UserTaskSearchQueryResult` JSON object (`{ items: [...], page: {...} }`). |
-| `searchProcessInstances(filterJson: string)` | string (throws) | [`searchProcessInstances`](../spec/process-instances.yaml) (`POST /process-instances/search`) | `ProcessInstanceSearchQuery` | `ProcessInstanceSearchQueryResult` | All process instances, as a `ProcessInstanceSearchQueryResult` JSON object (`{ items: [...], page: {...} }`). |
-| `getResourceByKey(resourceKey: string)` | string (throws) | [`getResource`](../spec/deployments.yaml) (`GET /resources/{resourceKey}`) | — | `ResourceResult` | The generic resource for `resource_key`, as a `ResourceResult` JSON object, or JSON `null` when no resource with that key exists. |
-| `searchVariables(filterJson: string)` | string (throws) | [`searchVariables`](../spec/variables.yaml) (`POST /variables/search`) | `VariableSearchQuery` | `VariableSearchQueryResult` | All variables, as a `VariableSearchQueryResult` JSON object (`{ items: [...], page: {...} }`). |
+| `getFormByKey(formKey: string)` | string (throws) | [`getFormByKey`](../spec/forms.yaml) (`GET /forms/{formKey}`) | — | `FormResult` | `getFormByKey` — mirrors `GET /forms/{formKey}`. |
+| `getResourceByKey(resourceKey: string)` | string (throws) | [`getResource`](../spec/deployments.yaml) (`GET /resources/{resourceKey}`) | — | `ResourceResult` | `getResourceByKey` — mirrors `GET /resources/{resourceKey}`. |
+| `getAgentInstance(agentInstanceKey: string)` | string (throws) | [`getAgentInstance`](../spec/agent-instances.yaml) (`GET /agent-instances/{agentInstanceKey}`) | — | `AgentInstanceResult` | `getAgentInstance` — mirrors `GET /agent-instances/{agentInstanceKey}`. |
+| `searchUserTasks(queryJson: string)` | string (throws) | [`searchUserTasks`](../spec/user-tasks.yaml) (`POST /user-tasks/search`) | `UserTaskSearchQuery` | `UserTaskSearchQueryResult` | `searchUserTasks` — mirrors `POST /user-tasks/search`. |
+| `searchProcessInstances(queryJson: string)` | string (throws) | [`searchProcessInstances`](../spec/process-instances.yaml) (`POST /process-instances/search`) | `ProcessInstanceSearchQuery` | `ProcessInstanceSearchQueryResult` | `searchProcessInstances` — mirrors `POST /process-instances/search`: the spec's `ProcessInstanceSearchQuery` through the shared pipeline, returning the generated `ProcessInstanceSearchQueryResult`. |
+| `searchVariables(queryJson: string, truncateValues: boolean?)` | string (throws) | [`searchVariables`](../spec/variables.yaml) (`POST /variables/search`) | `VariableSearchQuery` | `VariableSearchQueryResult` | `searchVariables` — mirrors `POST /variables/search`: the spec's `VariableSearchQuery` through the shared pipeline, returning the generated `VariableSearchQueryResult`. |
 | `searchAgentInstances(queryJson: string)` | string (throws) | [`searchAgentInstances`](../spec/agent-instances.yaml) (`POST /agent-instances/search`) | `AgentInstanceSearchQuery` | `AgentInstanceSearchQueryResult` | `searchAgentInstances` — mirrors `POST /agent-instances/search`. |
 | `searchAgentInstanceHistory(agentInstanceKey: string, queryJson: string)` | string (throws) | [`searchAgentInstanceHistory`](../spec/agent-instances.yaml) (`POST /agent-instances/{agentInstanceKey}/history/search`) | `AgentInstanceHistorySearchQuery` | `AgentInstanceHistorySearchQueryResult` | `searchAgentInstanceHistory` — mirrors `POST /agent-instances/{agentInstanceKey}/history/search`. |
 

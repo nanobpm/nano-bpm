@@ -422,15 +422,22 @@ fn sort_dispatcher_sources(main_rs: &str, schema: &str) -> Vec<String> {
 #[test]
 fn honoured_sort_field_values_have_an_explicit_dispatcher_arm() {
     // Sort dispatchers live in `main.rs` and, for operations shared with the
-    // WASM read surface (#1883), in the `nano-search` crate - scan both.
-    let main_rs = [
-        "server/src/main.rs",
-        "server/crates/nano-search/src/agent.rs",
-    ]
-    .iter()
-    .map(|p| std::fs::read_to_string(repo_root().join(p)).expect("read sort dispatcher source"))
-    .collect::<Vec<_>>()
-    .join("\n");
+    // WASM read surface (#1883, #1898), in the `nano-search` crate - scan both,
+    // every module of the shared crate (listed from disk, so a newly migrated
+    // operation's module is scanned without editing this guard).
+    let search_dir = repo_root().join("server/crates/nano-search/src");
+    let mut sources: Vec<std::path::PathBuf> = std::fs::read_dir(&search_dir)
+        .expect("read nano-search sources")
+        .map(|e| e.expect("nano-search entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    sources.sort();
+    sources.insert(0, repo_root().join("server/src/main.rs"));
+    let main_rs = sources
+        .iter()
+        .map(|p| std::fs::read_to_string(p).expect("read sort dispatcher source"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut unhandled = Vec::new();
     for (entry, note) in read_manifest() {
         if note.is_some() {

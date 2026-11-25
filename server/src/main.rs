@@ -83,7 +83,14 @@ use nanobpmn_engine_core::{
     IncidentState, Key, MAX_PARTITION_ID, ProcessBuilder, ProcessDefinition, ProcessInstanceState,
     TaskListenerJobResult, UserTaskCorrections, Value, partition_of,
 };
-use nanobpmn_search::{agent::agent_instance_result, convert::epoch, query};
+use nanobpmn_search::get::{form_result, resource_result};
+use nanobpmn_search::process_instance::{
+    BatchHierarchyPolicy, ProcessInstanceMatcher, ProcessInstanceStatePolicy,
+    element_instance_state_enum, nullable_business_id, process_instance_result,
+};
+use nanobpmn_search::user_task::user_task_result;
+use nanobpmn_search::variable::{truncate_value, variable_result};
+use nanobpmn_search::{convert::epoch, query};
 
 use crate::backpressure::{
     AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, GlobalGuard,
@@ -524,7 +531,19 @@ fn cluster_variable_target(command: &Command) -> Option<(Option<String>, String)
     }
 }
 
+/// The sharded [`ReadModel`] as the shared search layer's row source
+/// (`nanobpmn_search::source::ReadSource`): the gateway and the in-browser
+/// `engine-wasm` run the SAME search/get pipelines over their respective stores.
+pub(crate) struct ServerReadSource<'a>(pub(crate) &'a ReadModel);
+
+nanobpmn_search::impl_read_source!(ServerReadSource<'_>, |s| s.0);
+
 impl ServerImpl {
+    /// This node's read model as a shared-search row source.
+    pub(crate) fn read_source(&self) -> ServerReadSource<'_> {
+        ServerReadSource(&self.store)
+    }
+
     /// The local engine actor whose replicated state serves cluster-variable
     /// reads: the authoritative partition 0 when hosted here, else any local
     /// partition (each holds the fanned-out copy).
@@ -15450,29 +15469,17 @@ impl ServerImpl {
         path_params: &models::GetFormByKeyPathParams,
     ) -> Result<apis::form::GetFormByKeyResponse, ()> {
         use apis::form::GetFormByKeyResponse as Resp;
+        use nanobpmn_search::get::Lookup;
 
-        let raw = &path_params.form_key;
-        let key: u64 = match raw.parse() {
-            Ok(k) => k,
-            Err(_) => {
-                return Ok(Resp::Status404_TheFormWithTheGivenKeyWasNotFound(problem(
-                    "Form not found",
-                    404,
-                    format!("Form key '{raw}' is not a valid key."),
-                )));
-            }
-        };
-
-        match self.store.form_by_key(key) {
-            Some(row) => Ok(Resp::Status200_TheFormIsSuccessfullyReturned(form_result(
-                &row,
-            ))),
-            None => Ok(Resp::Status404_TheFormWithTheGivenKeyWasNotFound(problem(
-                "Form not found",
-                404,
-                format!("No form with key {key}."),
-            ))),
-        }
+        Ok(
+            match nanobpmn_search::get::get_form_by_key(&self.read_source(), &path_params.form_key)
+            {
+                Lookup::Found(r) => Resp::Status200_TheFormIsSuccessfullyReturned(r),
+                Lookup::NotFound { title, detail } | Lookup::Invalid { title, detail } => {
+                    Resp::Status404_TheFormWithTheGivenKeyWasNotFound(problem(title, 404, detail))
+                }
+            },
+        )
     }
 
     async fn search_decision_definitions_impl(
@@ -15702,33 +15709,17 @@ impl ServerImpl {
         path_params: &models::GetResourcePathParams,
     ) -> Result<apis::resource::GetResourceResponse, ()> {
         use apis::resource::GetResourceResponse as Resp;
+        use nanobpmn_search::get::Lookup;
 
-        let raw = &path_params.resource_key;
-        let key: u64 = match raw.parse() {
-            Ok(k) => k,
-            Err(_) => {
-                return Ok(Resp::Status404_AResourceWithTheGivenKeyWasNotFound(
-                    problem(
-                        "Resource not found",
-                        404,
-                        format!("Resource key '{raw}' is not a valid key."),
-                    ),
-                ));
-            }
-        };
-
-        match self.store.resource_by_key_meta(key) {
-            Some(row) => Ok(Resp::Status200_TheResourceIsSuccessfullyReturned(
-                resource_result(&row),
-            )),
-            None => Ok(Resp::Status404_AResourceWithTheGivenKeyWasNotFound(
-                problem(
-                    "Resource not found",
-                    404,
-                    format!("No resource with key {key}."),
-                ),
-            )),
-        }
+        Ok(
+            match nanobpmn_search::get::get_resource(&self.read_source(), &path_params.resource_key)
+            {
+                Lookup::Found(r) => Resp::Status200_TheResourceIsSuccessfullyReturned(r),
+                Lookup::NotFound { title, detail } | Lookup::Invalid { title, detail } => {
+                    Resp::Status404_AResourceWithTheGivenKeyWasNotFound(problem(title, 404, detail))
+                }
+            },
+        )
     }
 
     async fn get_resource_content_binary_impl(
@@ -15865,77 +15856,11 @@ impl ServerImpl {
         body: &Option<models::ProcessInstanceSearchQuery>,
     ) -> Result<apis::process_instance::SearchProcessInstancesResponse, ()> {
         use apis::process_instance::SearchProcessInstancesResponse as Resp;
-        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let instances = self.store.process_instances();
-
-        // One shared matcher (the same algebra the batch-selection path uses),
-        // honouring every top-level field AND the `$or` clause list (#1293).
-        let matcher = filter.map(|f| ProcessInstanceMatcher::new(f, &self.store));
-        let mut matched: Vec<&readstore::ProcessInstanceRow> = instances
-            .iter()
-            .filter(|inst| {
-                matcher.as_ref().is_none_or(|m| {
-                    m.matches(
-                        inst,
-                        ProcessInstanceStatePolicy::HonourFilter,
-                        BatchHierarchyPolicy::HonourFilters,
-                    )
-                })
-            })
-            .collect();
-
-        let sort = query::sort_keys(
-            body.as_ref().and_then(|q| q.sort.as_ref()),
-            |r: &models::ProcessInstanceSearchQuerySortRequest| (r.field.clone(), r.order),
-        );
-        query::sort_items(
-            &mut matched,
-            &sort,
-            |inst, field| match field {
-                "processDefinitionId" => query::SortVal::Str(inst.process_definition_id.clone()),
-                "processDefinitionKey" => query::key_sort_val(&inst.process_definition_key),
-                "state" => query::SortVal::Str(process_instance_state_enum(inst.state).to_string()),
-                "businessId" => query::opt_str_sort_val(inst.business_id.as_deref()),
-                "startDate" => query::SortVal::Num(inst.start_date_ms as i128),
-                "suspendedDate" => {
-                    query::opt_num_sort_val(inst.suspended_date_ms.map(|ms| ms as i128))
-                }
-                "hasIncident" => query::SortVal::Num(i128::from(inst.has_incident)),
-                "parentProcessInstanceKey" => {
-                    query::opt_num_sort_val(inst.parent_process_instance_key.map(|k| k as i128))
-                }
-                "parentElementInstanceKey" => {
-                    query::opt_num_sort_val(inst.parent_element_instance_key.map(|k| k as i128))
-                }
-                "processDefinitionVersion" => query::SortVal::Num(i128::from(inst.version)),
-                // Constant in Nano: the result always projects these as null
-                // (`process_instance_result`), so every row ties and the
-                // entity-key tiebreak orders them.
-                "endDate" | "processDefinitionName" | "processDefinitionVersionTag" => {
-                    query::SortVal::Num(0)
-                }
-                "processInstanceKey" => query::SortVal::Num(inst.key as i128),
-                "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(inst.key as i128),
-            },
-            |inst| inst.key,
-        );
-
-        let sorted: Vec<(u64, &readstore::ProcessInstanceRow)> =
-            matched.into_iter().map(|inst| (inst.key, inst)).collect();
-        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        // Build result models only for the returned page, never the whole
-        // (potentially very large) matched set. One memoised root resolver spans
-        // the page so instances sharing a parent chain walk it once.
-        let roots = readstore::RootResolver::new(|k| self.store.process_instance(k));
-        let items: Vec<models::ProcessInstanceResult> = page
-            .items
-            .into_iter()
-            .map(|inst| process_instance_result(inst, &roots))
-            .collect();
-
         Ok(Resp::Status200_TheProcessInstanceSearchResult(
-            models::ProcessInstanceSearchQueryResult::new(page.response, items),
+            nanobpmn_search::process_instance::search_process_instances(
+                &self.read_source(),
+                body.as_ref(),
+            ),
         ))
     }
 
@@ -16793,33 +16718,24 @@ impl ServerImpl {
         path_params: &models::GetAgentInstancePathParams,
     ) -> Result<apis::agent_instance::GetAgentInstanceResponse, ()> {
         use apis::agent_instance::GetAgentInstanceResponse as Resp;
+        use nanobpmn_search::get::Lookup;
 
-        let key: Key = match path_params.agent_instance_key.parse() {
-            Ok(k) if k > 0 => k,
-            _ => {
-                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid agent instance key",
-                    400,
-                    format!(
-                        "Agent instance key '{}' is not a valid key.",
-                        path_params.agent_instance_key
-                    ),
-                )));
+        let lookup =
+            nanobpmn_search::get::get_agent_instance(&path_params.agent_instance_key, |k| {
+                self.store.try_agent_instance(k)
+            })
+            .map_err(|_| ())?;
+        Ok(match lookup {
+            Lookup::Found(r) => Resp::Status200_TheAgentInstanceIsSuccessfullyReturned(r),
+            Lookup::NotFound { title, detail } => {
+                Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(problem(
+                    title, 404, detail,
+                ))
             }
-        };
-
-        match self.store.try_agent_instance(key).map_err(|_| ())? {
-            Some(row) => Ok(Resp::Status200_TheAgentInstanceIsSuccessfullyReturned(
-                agent_instance_result(&row).map_err(|_| ())?,
-            )),
-            None => Ok(Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(
-                problem(
-                    "Agent instance not found",
-                    404,
-                    format!("No agent instance with key {key}."),
-                ),
-            )),
-        }
+            Lookup::Invalid { title, detail } => {
+                Resp::Status400_TheProvidedDataIsNotValid(problem(title, 400, detail))
+            }
+        })
     }
 
     /// `PATCH /v2/agent-instances/{agentInstanceKey}` — advance an agent
@@ -17327,65 +17243,8 @@ impl ServerImpl {
         body: &Option<models::UserTaskSearchQuery>,
     ) -> Result<apis::user_task::SearchUserTasksResponse, ()> {
         use apis::user_task::SearchUserTasksResponse as Resp;
-
-        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let tasks = self.store.user_tasks();
-        // Variable-store join for `processInstanceVariables` / `localVariables`
-        // (#1293), built only for the names the filter references.
-        let variables = filter
-            .map(|f| UserTaskVariableIndex::new(f, &self.store))
-            .unwrap_or_default();
-
-        let mut matched: Vec<&readstore::UserTaskRow> = tasks
-            .iter()
-            .filter(|task| filter.is_none_or(|f| match_user_task_filter(task, f, &variables)))
-            .collect();
-
-        let sort = query::sort_keys(
-            body.as_ref().and_then(|q| q.sort.as_ref()),
-            |r: &models::UserTaskSearchQuerySortRequest| (r.field.clone(), r.order),
-        );
-        query::sort_items(
-            &mut matched,
-            &sort,
-            |task, field| match field {
-                "processInstanceKey" => query::SortVal::Num(task.instance_key as i128),
-                "elementId" => query::SortVal::Str(task.element_id.clone()),
-                "state" => query::SortVal::Str(user_task_state_enum(task.state).to_string()),
-                "creationDate" => query::SortVal::Num(task.created_at_ms as i128),
-                "businessId" => query::opt_str_sort_val(task.business_id.as_deref()),
-                // Sort on the value `user_task_result` returns (clamped to
-                // 0..=100) so rows reporting equal priorities tie.
-                "priority" => query::SortVal::Num(i128::from(user_task_priority(task.priority))),
-                // Sort on the instant, not the stored string, so differing
-                // offsets/precision still order chronologically.
-                "dueDate" => query::opt_num_sort_val(rfc3339_ns(task.due_date.as_deref())),
-                "followUpDate" => {
-                    query::opt_num_sort_val(rfc3339_ns(task.follow_up_date.as_deref()))
-                }
-                // Constant in Nano: `user_task_result` always projects `name` and
-                // `completionDate` as null, so every row ties and the task-key
-                // tiebreak orders them.
-                "name" | "completionDate" => query::SortVal::Num(0),
-                _ => query::SortVal::Num(task.key as i128),
-            },
-            |task| task.key,
-        );
-
-        let sorted: Vec<(u64, &readstore::UserTaskRow)> =
-            matched.into_iter().map(|task| (task.key, task)).collect();
-        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        // One resolver spans the whole page so tasks sharing a parent chain walk
-        // it once (mirrors the process-instance search; issue #1095).
-        let roots = readstore::RootResolver::new(|k| self.store.process_instance(k));
-        let items: Vec<models::UserTaskResult> = page
-            .items
-            .into_iter()
-            .map(|task| user_task_result(task, &roots))
-            .collect();
-
         Ok(Resp::Status200_TheUserTaskSearchResult(
-            models::UserTaskSearchQueryResult::new(page.response, items),
+            nanobpmn_search::user_task::search_user_tasks(&self.read_source(), body.as_ref()),
         ))
     }
 
@@ -18044,69 +17903,15 @@ impl ServerImpl {
         body: &Option<models::VariableSearchQuery>,
     ) -> Result<apis::variable::SearchVariablesResponse, ()> {
         use apis::variable::SearchVariablesResponse as Resp;
-
         // `truncateValues` defaults to true: long values are truncated and the
         // result flags `isTruncated`.
         let truncate = query_params.truncate_values.unwrap_or(true);
-        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        // Push the indexed equality / `$in` predicates down into the read store
-        // (#1886) so a selective search reads only candidate rows instead of
-        // full-scanning the table; the matcher below keeps full semantics.
-        let vars = self
-            .store
-            .variables_matching(&variable_search_pushdown(filter));
-
-        let mut matched: Vec<&readstore::VariableRow> = vars
-            .iter()
-            .filter(|v| match filter {
-                None => true,
-                Some(f) => {
-                    let tenant_ok = f.tenant_id.as_ref().is_none_or(|t| t == "<default>");
-                    let truncated = value_is_truncated(&v.value, truncate);
-                    tenant_ok
-                        && query::match_string(&f.name, &v.name)
-                        && query::match_string(&f.value, &v.value)
-                        && query::match_variable_key(&f.variable_key, &v.key.to_string())
-                        && query::match_scope_key(&f.scope_key, &v.scope_key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &v.instance_key.to_string(),
-                        )
-                        && f.is_truncated.is_none_or(|want| want == truncated)
-                }
-            })
-            .collect();
-
-        let sort = query::sort_keys(
-            body.as_ref().and_then(|q| q.sort.as_ref()),
-            |r: &models::VariableSearchQuerySortRequest| (r.field.clone(), r.order),
-        );
-        query::sort_items(
-            &mut matched,
-            &sort,
-            |v, field| match field {
-                "name" => query::SortVal::Str(v.name.clone()),
-                "value" => query::SortVal::Str(v.value.clone()),
-                "tenantId" => query::SortVal::Str("<default>".to_string()),
-                "scopeKey" => query::SortVal::Num(v.scope_key as i128),
-                "processInstanceKey" => query::SortVal::Num(v.instance_key as i128),
-                "variableKey" => query::SortVal::Num(v.key as i128),
-                _ => query::SortVal::Num(v.key as i128),
-            },
-            |v| v.key,
-        );
-
-        let sorted: Vec<(u64, &readstore::VariableRow)> =
-            matched.into_iter().map(|v| (v.key, v)).collect();
-        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::VariableSearchResult> = page
-            .items
-            .into_iter()
-            .map(|v| variable_search_result(v, truncate))
-            .collect();
-
         Ok(Resp::Status200_TheVariableSearchResult(
-            models::VariableSearchQueryResult::new(page.response, items),
+            nanobpmn_search::variable::search_variables(
+                &self.read_source(),
+                truncate,
+                body.as_ref(),
+            ),
         ))
     }
 
@@ -25336,25 +25141,6 @@ fn job_matches_filter(f: &models::JobFilter, job: &readstore::JobRow) -> bool {
             }
 }
 
-/// How a process-instance batch matcher treats the call-activity hierarchy
-/// (issue #977). Batch operations differ by contract, so the policy is passed
-/// explicitly rather than inferred:
-///
-/// * [`HonourFilters`](BatchHierarchyPolicy::HonourFilters) — evaluate the
-///   caller's `parentProcessInstanceKey` / `parentElementInstanceKey` predicates
-///   verbatim (incident-resolution and the `search` surface).
-/// * [`RootOnly`](BatchHierarchyPolicy::RootOnly) — ignore the caller's parent
-///   filters **and** target only root instances
-///   (`parent_process_instance_key.is_none()`). Cancellation: only ACTIVE root
-///   instances are cancellable (`spec/process-instances.yaml:371-375`), so a
-///   child-scoped request must neither scope to the child nor enqueue active
-///   call-activity children.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BatchHierarchyPolicy {
-    HonourFilters,
-    RootOnly,
-}
-
 /// v2 REST batch-operations surface (epic #903, sub-issue #905).
 ///
 /// Kept in its own `impl` block so this slice never touches the shared
@@ -25389,7 +25175,7 @@ impl ServerImpl {
     ///
     /// The `variables` filter is honoured exactly as
     /// `search_process_instances_impl` honours it: matched against the
-    /// instance's process-scoped (root) variables via [`match_instance_variables`],
+    /// instance's process-scoped (root) variables via `nanobpmn_search::process_instance::match_instance_variables`,
     /// over a per-call index built only when a variable filter is present (the
     /// common no-variable-filter path pays nothing for the extra scan). Dropping
     /// it here would silently *broaden* the batch — a migration filtered to
@@ -25419,7 +25205,7 @@ impl ServerImpl {
         // The same matcher `search_process_instances_impl` uses (one algebra,
         // including `$or` — #1293: an ignored `$or` here would silently broaden
         // a mutating batch), with the batch-specific state/hierarchy overrides.
-        let matcher = ProcessInstanceMatcher::new(filter, &self.store);
+        let matcher = ProcessInstanceMatcher::new(filter, &self.read_source());
         let mut keys: Vec<u64> = self
             .store
             .process_instances()
@@ -26596,16 +26382,6 @@ fn decision_definition_result(
     )
 }
 
-fn form_result(row: &readstore::FormRow) -> models::FormResult {
-    models::FormResult::new(
-        row.tenant_id.clone(),
-        row.form_id.clone(),
-        row.schema.clone(),
-        row.version as i64,
-        models::FormKey(row.form_key.to_string()),
-    )
-}
-
 fn decision_requirements_result(
     row: &readstore::DecisionRequirementsRow,
 ) -> models::DecisionRequirementsResult {
@@ -26637,21 +26413,6 @@ fn resource_sort_val(row: &readstore::ResourceMetaRow, field: &str) -> query::So
         "deploymentKey" => query::opt_num_sort_val(row.deployment_key),
         _ => query::SortVal::Num(row.resource_key as i128),
     }
-}
-
-fn resource_result(row: &readstore::ResourceMetaRow) -> models::ResourceResult {
-    let version_tag = match &row.version_tag {
-        Some(t) => types::Nullable::Present(t.clone()),
-        None => types::Nullable::Null,
-    };
-    models::ResourceResult::new(
-        row.resource_name.clone(),
-        row.version,
-        version_tag,
-        row.resource_id.clone(),
-        row.tenant_id.clone(),
-        models::ResourceKey(row.resource_key.to_string()),
-    )
 }
 
 fn decision_instance_result(
@@ -26764,695 +26525,6 @@ fn decision_instance_get_result(
     }
 }
 
-/// Per-instance cross-entity index backing the inherited element / job /
-/// incident filters on a process-instance query (`elementId`,
-/// `elementInstanceState`, `hasElementInstanceIncident`, `errorMessage`,
-/// `hasRetriesLeft`). These are **existential** predicates over an instance's
-/// child rows (element instances, jobs, incidents), not columns on
-/// [`readstore::ProcessInstanceRow`], so they are pre-indexed by
-/// `instance_key` once per query — only when at least one such filter is
-/// actually present, so the common path pays nothing for the extra scans.
-///
-/// Built lazily via [`InstanceCrossEntityIndex::new`]; each child-row source
-/// (element instances, jobs, incidents) is scanned only when a filter that
-/// reads it is supplied — at the top level or in any `$or` clause — mirroring
-/// the `variables_index` construction in `search_process_instances_impl`.
-#[derive(Default)]
-struct InstanceCrossEntityIndex {
-    /// `instance_key → its element instances` (for the element predicates).
-    /// The whole row is kept per element — not a per-field map — so the
-    /// `elementId` / `elementInstanceState` / `hasElementInstanceIncident`
-    /// predicates stay correlated: they must hold of the **same** element
-    /// instance, not of three independent rows (a COMPLETED `review` plus an
-    /// ACTIVE `approve` must not satisfy `elementId: "review",
-    /// elementInstanceState: "ACTIVE"`).
-    elements: std::collections::HashMap<u64, Vec<IndexedElement>>,
-    /// `instance_key → worker/incident error messages` (for `errorMessage`):
-    /// the last `errorMessage` of each failed/errored job plus each incident's
-    /// reason — the two places a process-level error message is projected.
-    error_messages: std::collections::HashMap<u64, Vec<String>>,
-    /// `instance_key → true when any job has failed with retries left` (for
-    /// `hasRetriesLeft`).
-    has_retries_left: std::collections::HashMap<u64, bool>,
-}
-
-/// One element instance as carried by [`InstanceCrossEntityIndex::elements`].
-struct IndexedElement {
-    element_id: String,
-    /// The element-instance state wire spelling (`ACTIVE` / `COMPLETED` /
-    /// `TERMINATED`).
-    state: String,
-    has_incident: bool,
-}
-
-/// The child-row sources an [`InstanceCrossEntityIndex`] is built from. Each
-/// field is loaded by the caller **only when a supplied filter reads it** (see
-/// [`InstanceCrossEntityIndex::needs_elements`] / `needs_jobs` /
-/// `needs_incidents`), so an `elementId`-only query never materializes the job
-/// or incident tables. `None` sources are treated as empty; construction
-/// asserts the filter only reads sources that were loaded.
-#[derive(Default)]
-struct CrossEntitySources {
-    element_instances: Option<Vec<readstore::ElementInstanceRow>>,
-    jobs: Option<Vec<readstore::JobRow>>,
-    incidents: Option<Vec<readstore::IncidentRow>>,
-}
-
-impl InstanceCrossEntityIndex {
-    /// Builds the index, populating only the maps the supplied `filters`
-    /// (the base filter plus every `$or` clause) actually constrain on and
-    /// reading only the sources in `sources`.
-    #[allow(
-        clippy::expect_used,
-        reason = "construction invariant: sources_for loads exactly the sources the supplied filters read, so a missing source here is a wiring bug between the two, not a runtime condition"
-    )]
-    fn new(filters: &[&models::ProcessInstanceFilter], sources: &CrossEntitySources) -> Self {
-        let mut idx = InstanceCrossEntityIndex::default();
-        if Self::needs_elements_any(filters) {
-            let rows = sources
-                .element_instances
-                .as_deref()
-                .expect("element predicates require the element-instance source");
-            for e in rows {
-                idx.elements
-                    .entry(e.instance_key)
-                    .or_default()
-                    .push(IndexedElement {
-                        element_id: e.element_id.clone(),
-                        state: element_instance_state_enum(e.state).to_string(),
-                        has_incident: e.has_incident,
-                    });
-            }
-        }
-        if filters.iter().any(|f| f.error_message.is_some()) {
-            for j in sources
-                .jobs
-                .as_deref()
-                .expect("errorMessage requires the job source")
-            {
-                if let Some(msg) = &j.error_message {
-                    idx.error_messages
-                        .entry(j.instance_key)
-                        .or_default()
-                        .push(msg.clone());
-                }
-            }
-            for i in sources
-                .incidents
-                .as_deref()
-                .expect("errorMessage requires the incident source")
-            {
-                idx.error_messages
-                    .entry(i.instance_key)
-                    .or_default()
-                    .push(i.reason.clone());
-            }
-        }
-        if filters.iter().any(|f| f.has_retries_left.is_some()) {
-            for j in sources
-                .jobs
-                .as_deref()
-                .expect("hasRetriesLeft requires the job source")
-            {
-                if j.has_failed_with_retries_left {
-                    idx.has_retries_left.insert(j.instance_key, true);
-                }
-            }
-        }
-        idx
-    }
-
-    /// Whether any element predicate (`elementId` / `elementInstanceState` /
-    /// `hasElementInstanceIncident`) is present, so the caller loads the
-    /// element-instance source only then.
-    fn needs_elements(filter: &models::ProcessInstanceFilter) -> bool {
-        filter.element_id.is_some()
-            || filter.element_instance_state.is_some()
-            || filter.has_element_instance_incident.is_some()
-    }
-
-    /// [`Self::needs_elements`] over every group of one query (base + `$or`
-    /// clauses).
-    fn needs_elements_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
-        filters.iter().any(|f| Self::needs_elements(f))
-    }
-
-    /// Whether any job-reading predicate (`errorMessage` / `hasRetriesLeft`)
-    /// is present.
-    fn needs_jobs(filter: &models::ProcessInstanceFilter) -> bool {
-        filter.error_message.is_some() || filter.has_retries_left.is_some()
-    }
-
-    /// [`Self::needs_jobs`] over every group of one query.
-    fn needs_jobs_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
-        filters.iter().any(|f| Self::needs_jobs(f))
-    }
-
-    /// Whether any incident-reading predicate (`errorMessage`) is present.
-    fn needs_incidents(filter: &models::ProcessInstanceFilter) -> bool {
-        filter.error_message.is_some()
-    }
-
-    /// [`Self::needs_incidents`] over every group of one query.
-    fn needs_incidents_any(filters: &[&models::ProcessInstanceFilter]) -> bool {
-        filters.iter().any(|f| Self::needs_incidents(f))
-    }
-
-    /// Whether any cross-entity filter is present (so the caller can skip
-    /// building the index entirely when none is).
-    fn is_needed(filter: &models::ProcessInstanceFilter) -> bool {
-        Self::needs_elements(filter) || Self::needs_jobs(filter) || Self::needs_incidents(filter)
-    }
-
-    /// Loads exactly the child-row sources the supplied `filters` (the base
-    /// filter plus every `$or` clause) read: the element-instance table only
-    /// when an element predicate is present, jobs only for `errorMessage` /
-    /// `hasRetriesLeft`, incidents only for `errorMessage` — so an
-    /// `elementId`-only query never scans the job or incident tables. Shared
-    /// by the search and batch-selection paths so both honour the same
-    /// lazy-source contract.
-    fn sources_for(
-        filters: &[&models::ProcessInstanceFilter],
-        store: &readstore::ReadModel,
-    ) -> CrossEntitySources {
-        CrossEntitySources {
-            element_instances: Self::needs_elements_any(filters).then(|| store.element_instances()),
-            jobs: Self::needs_jobs_any(filters).then(|| store.jobs()),
-            incidents: Self::needs_incidents_any(filters).then(|| store.incidents()),
-        }
-    }
-}
-
-/// Evaluates the inherited element / job / incident / batch-operation filters
-/// on a process-instance query against instance `instance_key`, using the
-/// pre-indexed `index`. Each is an **existential** predicate over the
-/// instance's child rows:
-///
-/// - `elementId` / `elementInstanceState` / `hasElementInstanceIncident` — the
-///   instance has **one** element instance satisfying all supplied element
-///   predicates at once (they are correlated: a COMPLETED `review` plus an
-///   ACTIVE `approve` must not satisfy `elementId: "review",
-///   elementInstanceState: "ACTIVE"`). `hasElementInstanceIncident: false`
-///   inverts the whole existential: it selects instances with **no** element
-///   satisfying the supplied id/state predicates that carries an incident.
-/// - `errorMessage` — it has a failed/errored job or incident whose message
-///   matches.
-/// - `hasRetriesLeft` — it has a job that failed with retries left (`false`
-///   selects instances with no such job).
-///
-/// `incidentErrorHashCode` and `batchOperationId` / `batchOperationKey` are
-/// declared on the filter schema but Nano does not project a per-instance value
-/// for them (no incident error-hash column; batch membership lives in the
-/// separate `BatchOperationStore`, not the read model), so they are matched
-/// against an **absent** value: equality / `$in` / `$exists: true` correctly
-/// exclude (fail closed — the field is honoured, not silently broadening a
-/// mutating batch) while `$exists: false` still matches. This mirrors the
-/// `endDate` / `processDefinitionName` convention.
-fn match_instance_cross_entity_filters(
-    filter: &models::ProcessInstanceFilter,
-    instance_key: u64,
-    index: &InstanceCrossEntityIndex,
-) -> bool {
-    // The element predicates are evaluated together, existentially over the
-    // instance's element rows, so an id/state/incident combination must hold of
-    // the SAME element instance. An instance with no element instances matches
-    // an `elementId` filter only against an absent value (so `$exists: false`
-    // still matches) and never matches a state or `hasElementInstanceIncident:
-    // true` predicate.
-    let element_matches = {
-        let has_element_predicates = filter.element_id.is_some()
-            || filter.element_instance_state.is_some()
-            || filter.has_element_instance_incident.is_some();
-        if !has_element_predicates {
-            true
-        } else {
-            let elements = index.elements.get(&instance_key);
-            let row_matches = |e: &IndexedElement| {
-                let id_ok = match &filter.element_id {
-                    None => true,
-                    Some(f) => query::match_string_property(f, Some(e.element_id.as_str())),
-                };
-                let state_ok = match &filter.element_instance_state {
-                    None => true,
-                    Some(f) => {
-                        query::match_element_instance_state(&Some(f.clone()), e.state.as_str())
-                    }
-                };
-                id_ok && state_ok
-            };
-            match filter.has_element_instance_incident {
-                None => match elements {
-                    Some(rows) => rows.iter().any(row_matches),
-                    // No element rows: `elementId` still matches against an
-                    // absent value (the `$exists: false` case); a state
-                    // predicate can never be satisfied.
-                    None => {
-                        let id_ok = match &filter.element_id {
-                            None => true,
-                            Some(f) => query::match_string_property(f, None),
-                        };
-                        id_ok && filter.element_instance_state.is_none()
-                    }
-                },
-                // `true`: some element satisfying the id/state predicates
-                // carries an incident. `false`: none does (the inverted
-                // existential — an instance with no element instances has no
-                // incidented element, so it matches).
-                Some(want) => {
-                    let any_incidented = elements
-                        .map(|rows| rows.iter().any(|e| row_matches(e) && e.has_incident))
-                        .unwrap_or(false);
-                    any_incidented == want
-                }
-            }
-        }
-    };
-    // `errorMessage`: existential over the instance's job/incident messages.
-    let error_message_matches = match &filter.error_message {
-        None => true,
-        Some(f) => match index.error_messages.get(&instance_key) {
-            Some(msgs) => msgs
-                .iter()
-                .any(|m| query::match_string_property(f, Some(m.as_str()))),
-            None => query::match_string_property(f, None),
-        },
-    };
-    // `hasRetriesLeft`: `true` requires a job that failed with retries left.
-    let retries_matches = match filter.has_retries_left {
-        None => true,
-        Some(want) => {
-            index
-                .has_retries_left
-                .get(&instance_key)
-                .copied()
-                .unwrap_or(false)
-                == want
-        }
-    };
-    element_matches
-        && error_message_matches
-        && retries_matches
-        // Not projected per-instance → matched against an absent value (fail
-        // closed; see the doc comment).
-        && query::match_integer(&filter.incident_error_hash_code, None)
-        && query::match_string_opt(&filter.batch_operation_id, None)
-        && query::match_string_opt(&filter.batch_operation_key, None)
-}
-
-/// Evaluates a process-instance `variables` filter against an instance's
-/// process-scoped (root) variables, provided as a `name → serialized-JSON value`
-/// map (absent when the instance has no root variables). Each
-/// [`models::VariableValueFilterProperty`] selects a variable by `name` and
-/// matches its value with the entry's `StringFilterProperty`; multiple entries
-/// are ANDed (Camunda semantics). A variable absent from the instance is matched
-/// against `None`, so an equality/`$like`/`$in` operator honestly excludes it
-/// (rather than the field being silently ignored) while `$exists: false` still
-/// matches — mirroring the `endDate` / `searchClusterVariables` convention.
-fn match_instance_variables(
-    filter: &Option<Vec<models::VariableValueFilterProperty>>,
-    vars: Option<&std::collections::HashMap<String, String>>,
-) -> bool {
-    match filter {
-        None => true,
-        Some(entries) => entries.iter().all(|entry| {
-            let value = vars.and_then(|m| m.get(&entry.name)).map(String::as_str);
-            query::match_string_property(&entry.value, value)
-        }),
-    }
-}
-
-/// How a [`ProcessInstanceMatcher`] treats the filter's `state` field.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ProcessInstanceStatePolicy {
-    /// Search: honour the supplied `state` predicate.
-    HonourFilter,
-    /// Process-instance batch operations: `state` is ignored and overridden to
-    /// ACTIVE (`spec/process-instances.yaml:371-375`, `416-418`).
-    ActiveOnly,
-    /// Process-instance cancellation batch: `state` is ignored and overridden to
-    /// ACTIVE or SUSPENDED (`spec/process-instances.yaml:443-445`).
-    LiveOnly,
-}
-
-/// One AND-group of a process-instance filter (the top-level fields, or one
-/// `$or` clause). Indexes are NOT per-group: they live once on the
-/// [`ProcessInstanceMatcher`] so N `$or` clauses never build N copies.
-struct ProcessInstanceFilterGroup {
-    filter: models::ProcessInstanceFilter,
-}
-
-/// Query-level indexes shared by every group of one [`ProcessInstanceMatcher`].
-struct ProcessInstanceIndexes {
-    /// Root variables for the UNION of variable names referenced by the base
-    /// filter and every `$or` clause — one scan, one map.
-    variables: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
-    /// Cross-entity (element / job / incident) index, built from the UNION of
-    /// the base filter and every `$or` clause: the clause shape
-    /// (`ProcessInstanceFilterFields`) carries the same cross-entity fields the
-    /// top-level filter does, so a clause-only `elementId` / `hasRetriesLeft` /
-    /// `errorMessage` must populate the index too — otherwise it matches
-    /// against an empty index (missed matches, or overbroad `false` matches).
-    cross: InstanceCrossEntityIndex,
-}
-
-/// The single process-instance filter predicate, shared by
-/// `searchProcessInstances` and every process-instance batch creator so the
-/// two can never drift. Honours every top-level field AND, when a non-empty
-/// `$or` list is present, requires at least one clause to match (each clause an
-/// AND of its own fields) — #1293.
-struct ProcessInstanceMatcher {
-    base: ProcessInstanceFilterGroup,
-    or_clauses: Vec<ProcessInstanceFilterGroup>,
-    indexes: ProcessInstanceIndexes,
-}
-
-impl ProcessInstanceMatcher {
-    fn new(filter: &models::ProcessInstanceFilter, store: &readstore::ReadModel) -> Self {
-        let mut base = filter.clone();
-        let clauses: Vec<models::ProcessInstanceFilter> = base
-            .dollar_or
-            .take()
-            .unwrap_or_default()
-            .into_iter()
-            .map(process_instance_or_clause)
-            .collect();
-        let variable_names: std::collections::HashSet<String> = std::iter::once(&base)
-            .chain(clauses.iter())
-            .filter_map(|f| f.variables.as_ref())
-            .flatten()
-            .map(|e| e.name.clone())
-            .collect();
-        // One cross-entity index for the whole query, built from every group
-        // that can carry element / job / incident predicates: the base filter
-        // AND each `$or` clause (the clause schema carries the same fields).
-        // `needs_elements` / `needs_jobs` / `needs_incidents` keep the build
-        // lazy — a source table is loaded only when some group reads it.
-        let index_groups: Vec<&models::ProcessInstanceFilter> =
-            std::iter::once(&base).chain(clauses.iter()).collect();
-        let indexes = ProcessInstanceIndexes {
-            variables: root_variables_index(&variable_names, store),
-            cross: if index_groups
-                .iter()
-                .any(|f| InstanceCrossEntityIndex::is_needed(f))
-            {
-                InstanceCrossEntityIndex::new(
-                    &index_groups,
-                    &InstanceCrossEntityIndex::sources_for(&index_groups, store),
-                )
-            } else {
-                InstanceCrossEntityIndex::default()
-            },
-        };
-        ProcessInstanceMatcher {
-            base: ProcessInstanceFilterGroup { filter: base },
-            or_clauses: clauses
-                .into_iter()
-                .map(|filter| ProcessInstanceFilterGroup { filter })
-                .collect(),
-            indexes,
-        }
-    }
-
-    fn matches(
-        &self,
-        inst: &readstore::ProcessInstanceRow,
-        state_policy: ProcessInstanceStatePolicy,
-        hierarchy: BatchHierarchyPolicy,
-    ) -> bool {
-        let state_ok = match state_policy {
-            ProcessInstanceStatePolicy::HonourFilter => true,
-            ProcessInstanceStatePolicy::ActiveOnly => {
-                matches!(inst.state, ProcessInstanceState::Active)
-            }
-            ProcessInstanceStatePolicy::LiveOnly => matches!(
-                inst.state,
-                ProcessInstanceState::Active | ProcessInstanceState::Suspended
-            ),
-        };
-        let root_ok = match hierarchy {
-            BatchHierarchyPolicy::HonourFilters => true,
-            // Cancellation: only root instances, never active children.
-            BatchHierarchyPolicy::RootOnly => inst.parent_process_instance_key.is_none(),
-        };
-        state_ok
-            && root_ok
-            && match_process_instance_group(
-                inst,
-                &self.base,
-                &self.indexes,
-                state_policy,
-                hierarchy,
-            )
-            && (self.or_clauses.is_empty()
-                || self.or_clauses.iter().any(|g| {
-                    match_process_instance_group(inst, g, &self.indexes, state_policy, hierarchy)
-                }))
-    }
-}
-
-/// Lifts one `$or` clause into a `ProcessInstanceFilter` (no nested `$or`).
-/// Exhaustive destructuring: a field added to the clause schema fails to
-/// compile here instead of being silently dropped.
-fn process_instance_or_clause(
-    c: models::ProcessInstanceFilterFields,
-) -> models::ProcessInstanceFilter {
-    let models::ProcessInstanceFilterFields {
-        start_date,
-        end_date,
-        state,
-        has_incident,
-        suspended_date,
-        tenant_id,
-        variables,
-        process_instance_key,
-        parent_process_instance_key,
-        parent_element_instance_key,
-        batch_operation_id,
-        batch_operation_key,
-        error_message,
-        has_retries_left,
-        element_instance_state,
-        element_id,
-        has_element_instance_incident,
-        incident_error_hash_code,
-        tags,
-        business_id,
-        process_definition_id,
-        process_definition_name,
-        process_definition_version,
-        process_definition_version_tag,
-        process_definition_key,
-    } = c;
-    models::ProcessInstanceFilter {
-        start_date,
-        end_date,
-        state,
-        has_incident,
-        suspended_date,
-        tenant_id,
-        variables,
-        process_instance_key,
-        parent_process_instance_key,
-        parent_element_instance_key,
-        batch_operation_id,
-        batch_operation_key,
-        error_message,
-        has_retries_left,
-        element_instance_state,
-        element_id,
-        has_element_instance_incident,
-        incident_error_hash_code,
-        tags,
-        business_id,
-        process_definition_id,
-        process_definition_name,
-        process_definition_version,
-        process_definition_version_tag,
-        process_definition_key,
-        dollar_or: None,
-    }
-}
-
-/// Indexes process-scoped (root) variables by instance, restricted to the
-/// `requested` variable names; empty (no scan) when none are requested.
-fn root_variables_index(
-    requested: &std::collections::HashSet<String>,
-    store: &readstore::ReadModel,
-) -> std::collections::HashMap<u64, std::collections::HashMap<String, String>> {
-    let mut idx: std::collections::HashMap<u64, std::collections::HashMap<String, String>> =
-        std::collections::HashMap::new();
-    if requested.is_empty() {
-        return idx;
-    }
-    // Only the requested names are read, via the `name` index (#1886).
-    let pushdown = readstore::VariablePushdown {
-        names: Some(requested.iter().cloned().collect()),
-        ..Default::default()
-    };
-    for v in store.variables_matching(&pushdown) {
-        // Root-scope only: a nested-scope variable has `scope_key != instance_key`.
-        if v.scope_key == v.instance_key && requested.contains(&v.name) {
-            idx.entry(v.instance_key)
-                .or_default()
-                .insert(v.name, v.value);
-        }
-    }
-    idx
-}
-
-/// Evaluates one AND-group of process-instance filter fields.
-fn match_process_instance_group(
-    inst: &readstore::ProcessInstanceRow,
-    g: &ProcessInstanceFilterGroup,
-    idx: &ProcessInstanceIndexes,
-    state_policy: ProcessInstanceStatePolicy,
-    hierarchy: BatchHierarchyPolicy,
-) -> bool {
-    let f = &g.filter;
-    let state_ok = match state_policy {
-        ProcessInstanceStatePolicy::HonourFilter => query::match_process_instance_state(
-            &f.state,
-            &process_instance_state_enum(inst.state).to_string(),
-        ),
-        // Overridden to ACTIVE by the caller; the supplied `state` is ignored.
-        ProcessInstanceStatePolicy::ActiveOnly | ProcessInstanceStatePolicy::LiveOnly => true,
-    };
-    // Call-activity hierarchy filters (C8 parity, #977): a bare parent key
-    // enumerates direct children; `$exists:false` selects top-level instances.
-    // Cancellation (`RootOnly`) ignores them (the caller enforces root-only).
-    let hierarchy_ok = match hierarchy {
-        BatchHierarchyPolicy::HonourFilters => {
-            query::match_process_instance_key_opt(
-                &f.parent_process_instance_key,
-                inst.parent_process_instance_key
-                    .map(|k| k.to_string())
-                    .as_deref(),
-            ) && query::match_element_instance_key_opt(
-                &f.parent_element_instance_key,
-                inst.parent_element_instance_key
-                    .map(|k| k.to_string())
-                    .as_deref(),
-            )
-        }
-        BatchHierarchyPolicy::RootOnly => true,
-    };
-    state_ok
-        && hierarchy_ok
-        && query::match_process_instance_key(&f.process_instance_key, &inst.key.to_string())
-        && query::match_process_definition_key(
-            &f.process_definition_key,
-            &inst.process_definition_key,
-        )
-        && query::match_string(&f.process_definition_id, &inst.process_definition_id)
-        && query::match_integer(&f.process_definition_version, Some(i64::from(inst.version)))
-        && f.has_incident.is_none_or(|want| want == inst.has_incident)
-        && query::match_date_time_ms(&f.start_date, Some(inst.start_date_ms as i64))
-        // No projected completion timestamp: `endDate` matches an absent value
-        // (value operators exclude, `$exists: false` matches).
-        && query::match_date_time_ms(&f.end_date, None)
-        && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
-        // `suspended_date_ms` is the single source of truth for suspension.
-        && query::match_date_time_ms(
-            &f.suspended_date,
-            inst.suspended_date_ms.map(|ms| ms as i64),
-        )
-        // Single-tenant: every instance's `tenantId` is `<default>`.
-        && query::match_string(&f.tenant_id, "<default>")
-        // Never projected (always null in `process_instance_result`): matched
-        // against an absent value.
-        && query::match_string_opt(&f.process_definition_name, None)
-        && query::match_string_opt(&f.process_definition_version_tag, None)
-        && match_instance_variables(&f.variables, idx.variables.get(&inst.key))
-        && match_instance_tags(&f.tags, &inst.tags)
-        // Inherited element / job / incident / batch-operation filters.
-        && match_instance_cross_entity_filters(f, inst.key, &idx.cross)
-}
-
-/// Matches the `tags` filter against an instance's carried tags. Every
-/// requested tag must be present on the instance (AND semantics — a tag set
-/// constrains to instances carrying the whole set, Camunda-style). An empty
-/// filter set matches everything; an instance with no tags matches only an
-/// absent/empty filter, never a non-empty one (so the field is honoured, not
-/// silently ignored — the class that let a `tags: ["canary"]` migration select
-/// untagged instances, #1551 review).
-fn match_instance_tags(filter: &Option<Vec<models::Tag>>, instance_tags: &[String]) -> bool {
-    match filter {
-        None => true,
-        Some(tags) => tags
-            .iter()
-            .all(|want| instance_tags.iter().any(|have| have == &want.0)),
-    }
-}
-
-/// Projects a [`ProcessInstanceRow`] into the generated `ProcessInstanceResult`.
-///
-/// Surfaces the call-activity hierarchy (C8 parity): `parentProcessInstanceKey`
-/// / `parentElementInstanceKey` carry the engine-tracked linkage for a child
-/// spawned by a call activity (both null for a top-level instance), and
-/// `rootProcessInstanceKey` is resolved by walking the parent chain to the
-/// top-level ancestor (`roots`, memoised per request) — a top-level instance
-/// reports its own key.
-fn process_instance_result(
-    instance: &readstore::ProcessInstanceRow,
-    roots: &readstore::RootResolver,
-) -> models::ProcessInstanceResult {
-    let process_definition_id = instance.process_definition_id.clone();
-    let version = instance.version;
-    let process_definition_key = instance.process_definition_key.clone();
-
-    let state_enum = process_instance_state_enum(instance.state);
-
-    let start_date =
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(instance.start_date_ms as i64)
-            .unwrap_or_else(epoch);
-
-    let parent_process_instance_key = match instance.parent_process_instance_key {
-        Some(k) => types::Nullable::Present(models::ProcessInstanceKey(k.to_string())),
-        None => types::Nullable::Null,
-    };
-    let parent_element_instance_key = match instance.parent_element_instance_key {
-        Some(k) => types::Nullable::Present(models::ElementInstanceKey(k.to_string())),
-        None => types::Nullable::Null,
-    };
-    let root_process_instance_key = types::Nullable::Present(models::ProcessInstanceKey(
-        roots.root_of_row(instance).to_string(),
-    ));
-
-    // Single source of truth: the read-model's `suspended_date_ms` column (also
-    // what derives the `Suspended` state). Always present — a datetime while
-    // suspended, null otherwise.
-    let suspended_date = match instance.suspended_date_ms {
-        Some(ms) => types::Nullable::Present(
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64).unwrap_or_else(epoch),
-        ),
-        None => types::Nullable::Null,
-    };
-
-    models::ProcessInstanceResult {
-        process_definition_id,
-        process_definition_name: types::Nullable::Null,
-        process_definition_version: version,
-        process_definition_version_tag: types::Nullable::Null,
-        start_date,
-        end_date: types::Nullable::Null,
-        state: state_enum,
-        suspended_date,
-        has_incident: instance.has_incident,
-        tenant_id: "<default>".to_string(),
-        process_instance_key: models::ProcessInstanceKey(instance.key.to_string()),
-        process_definition_key: models::ProcessDefinitionKey(process_definition_key),
-        parent_process_instance_key,
-        parent_element_instance_key,
-        root_process_instance_key,
-        tags: instance.tags.clone().into_iter().map(models::Tag).collect(),
-        business_id: instance
-            .business_id
-            .clone()
-            .map(types::Nullable::Present)
-            .unwrap_or(types::Nullable::Null),
-    }
-}
-
 /// A synthesized resource (file) name for a process id. The engine does not
 /// retain the original deployment resource name, so derive a stable `.bpmn`
 /// name from the id.
@@ -27497,15 +26569,11 @@ fn process_definition_state(_deployed: &readstore::ProcessDefinitionRow) -> &'st
 }
 
 /// The byte length beyond which a variable value is truncated in search results
-/// (when `truncateValues` is on). Moved to the shared `nanobpmn-read-model` crate
-/// and re-exported here so the gateway and the in-browser `engine-wasm`
-/// `TestEngine` share a single source of truth for the preview length (no drift).
+/// (when `truncateValues` is on): the shared `nanobpmn-read-model` constant the
+/// search layer (`nanobpmn_search::variable`) truncates with. Only the tests
+/// here name it.
+#[cfg(test)]
 pub(crate) use nanobpmn_read_model::VARIABLE_VALUE_PREVIEW_LEN;
-
-/// Whether `value` would be truncated given the current `truncate` setting.
-fn value_is_truncated(value: &str, truncate: bool) -> bool {
-    truncate && value.len() > VARIABLE_VALUE_PREVIEW_LEN
-}
 
 /// Storage-level truncation state of a cluster variable's value, as seen by the
 /// `isTruncated` *filter* (spec: "based on the underlying storage
@@ -27514,96 +26582,8 @@ fn value_is_truncated(value: &str, truncate: bool) -> bool {
 /// always `false`, independent of the response-only `truncateValues` param. A
 /// filter of `isTruncated: true` therefore matches nothing. (The response
 /// item's `isTruncated` flag is separate: it reflects response-preview
-/// truncation via [`value_is_truncated`].)
+/// truncation via `nanobpmn_search::variable::value_is_truncated`.)
 const CLUSTER_VARIABLE_STORED_TRUNCATED: bool = false;
-/// Truncates `value` to the preview length on a char boundary when `truncate` is
-/// on, returning the (possibly shortened) value and whether it was truncated.
-fn truncate_value(value: &str, truncate: bool) -> (String, bool) {
-    if value_is_truncated(value, truncate) {
-        let mut end = VARIABLE_VALUE_PREVIEW_LEN;
-        while !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        (value[..end].to_string(), true)
-    } else {
-        (value.to_string(), false)
-    }
-}
-
-/// Derives the read-store pushdown for a variables search (#1886) from the
-/// request filter: the indexed `variableKey` / `processInstanceKey` /
-/// `scopeKey` / `name` equality and `$in` predicates. A tenant filter other
-/// than `<default>` matches nothing (mirroring the in-memory matcher). The
-/// result is a superset of the true match set; the caller re-applies the full
-/// spec-derived matcher on the reduced rows.
-fn variable_search_pushdown(
-    filter: Option<&models::VariableFilter>,
-) -> readstore::VariablePushdown {
-    let Some(f) = filter else {
-        return readstore::VariablePushdown::default();
-    };
-    let mut p = readstore::VariablePushdown {
-        keys: query::key_candidates(query::variable_key_candidates(&f.variable_key)),
-        instance_keys: query::key_candidates(query::process_instance_key_candidates(
-            &f.process_instance_key,
-        )),
-        scope_keys: query::key_candidates(query::scope_key_candidates(&f.scope_key)),
-        names: query::string_candidates(&f.name),
-    };
-    if f.tenant_id.as_ref().is_some_and(|t| t != "<default>") {
-        p.keys = Some(Vec::new());
-    }
-    p
-}
-
-/// Projects a [`VariableRow`] into the generated `VariableSearchResult`, applying
-/// value truncation per the request's `truncateValues` setting.
-fn variable_search_result(
-    v: &readstore::VariableRow,
-    truncate: bool,
-) -> models::VariableSearchResult {
-    let (value, is_truncated) = truncate_value(&v.value, truncate);
-    models::VariableSearchResult::new(
-        v.name.clone(),
-        "<default>".to_string(),
-        models::VariableKey(v.key.to_string()),
-        models::ScopeKey(v.scope_key.to_string()),
-        models::ProcessInstanceKey(v.instance_key.to_string()),
-        types::Nullable::Null,
-        value,
-        is_truncated,
-    )
-}
-
-/// Projects a [`VariableRow`] into the generated `VariableResult` (single-get),
-/// always carrying the full untruncated value.
-fn variable_result(v: &readstore::VariableRow) -> models::VariableResult {
-    models::VariableResult::new(
-        v.name.clone(),
-        "<default>".to_string(),
-        models::VariableKey(v.key.to_string()),
-        models::ScopeKey(v.scope_key.to_string()),
-        models::ProcessInstanceKey(v.instance_key.to_string()),
-        types::Nullable::Null,
-        v.value.clone(),
-    )
-}
-
-/// Maps an engine [`ProcessInstanceState`] to the REST state enum.
-fn process_instance_state_enum(state: ProcessInstanceState) -> models::ProcessInstanceStateEnum {
-    match state {
-        ProcessInstanceState::Active => models::ProcessInstanceStateEnum::Active,
-        ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,
-        // The REST enum has no transient "terminating" state; an instance draining
-        // its `canceling` task-listener chain (ADR 0037 §6) has already had its
-        // tokens discarded and is on its way to `Terminated`, so it projects as
-        // TERMINATED externally.
-        ProcessInstanceState::Terminated | ProcessInstanceState::Terminating => {
-            models::ProcessInstanceStateEnum::Terminated
-        }
-        ProcessInstanceState::Suspended => models::ProcessInstanceStateEnum::Suspended,
-    }
-}
 
 /// Tests one element-instance row against a single set of element-instance
 /// filter fields (the shared field set of `ElementInstanceFilter` and its `$or`
@@ -27679,210 +26659,6 @@ fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilte
         && query::match_string_opt(&f.tenant_id, None)
 }
 
-/// The user-task filter predicate over one AND-group of fields, shared by the
-/// top-level filter and each `$or` clause so the two cannot drift.
-///
-/// Every advertised field is matched against what the row actually projects.
-/// Fields Nano never projects onto a user task — `name` (the result's `name`
-/// is always null), `completionDate` (always null), `tags` (always empty), and
-/// `tenantId` (single-tenant Nano stores no tenant on tasks) — match against an
-/// absent value: value operators exclude the row (honest, never silently
-/// widening the search) while `$exists: false` still matches. The variable
-/// filters match through `vars` (#1293): `processInstanceVariables` against
-/// the owning instance's root-scope variables, `localVariables` against the
-/// variables held at the task's element-instance scope.
-fn match_user_task_fields(
-    task: &readstore::UserTaskRow,
-    f: &models::UserTaskFilterFields,
-    vars: &UserTaskVariableIndex,
-) -> bool {
-    let assignee = task.assignee.clone().unwrap_or_default();
-    // The task's due/follow-up dates are stored as RFC 3339 strings; project
-    // them to epoch millis for the date-time filter algebra. An unparseable or
-    // absent stored date is an absent value (value operators exclude it).
-    let parse_ms = |d: &Option<String>| {
-        d.as_deref()
-            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
-            .map(|dt| dt.timestamp_millis())
-    };
-    f.user_task_key
-        .as_ref()
-        .is_none_or(|k| k.0 == task.key.to_string())
-        && f.element_instance_key
-            .as_ref()
-            .is_none_or(|k| k.0 == task.element_instance_key.to_string())
-        && query::match_process_instance_key(
-            &f.process_instance_key,
-            &task.instance_key.to_string(),
-        )
-        && query::match_process_definition_key(
-            &f.process_definition_key,
-            &task.process_definition_key,
-        )
-        && query::match_process_definition_id(
-            &f.process_definition_id,
-            Some(&task.process_definition_id),
-        )
-        && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
-        && query::match_string(&f.assignee, &assignee)
-        && query::match_user_task_state(&f.state, &user_task_state_enum(task.state).to_string())
-        && query::match_string_opt(&f.business_id, task.business_id.as_deref())
-        && query::match_integer(&f.priority, Some(i64::from(task.priority)))
-        && f.candidate_group.as_ref().is_none_or(|g| match g {
-            models::StringFilterProperty::String(s) => task.candidate_groups.contains(s),
-            models::StringFilterProperty::AdvancedStringFilter(_) => task
-                .candidate_groups
-                .iter()
-                .any(|cg| query::match_string_property(g, Some(cg))),
-        })
-        && f.candidate_user.as_ref().is_none_or(|u| match u {
-            models::StringFilterProperty::String(s) => task.candidate_users.contains(s),
-            models::StringFilterProperty::AdvancedStringFilter(_) => task
-                .candidate_users
-                .iter()
-                .any(|cu| query::match_string_property(u, Some(cu))),
-        })
-        && query::match_date_time_ms(&f.creation_date, Some(task.created_at_ms as i64))
-        && query::match_date_time_ms(&f.due_date, parse_ms(&task.due_date))
-        && query::match_date_time_ms(&f.follow_up_date, parse_ms(&task.follow_up_date))
-        // Never projected: completion date (result is always null).
-        && query::match_date_time_ms(&f.completion_date, None)
-        // Never projected: task name (result is always null).
-        && query::match_string_opt(&f.name, None)
-        // Never projected: task tags (result is always empty), so any listed
-        // tag excludes the row.
-        && f.tags.as_ref().is_none_or(|tags| tags.is_empty())
-        && query::match_string_opt(&f.tenant_id, None)
-        && match_instance_variables(
-            &f.process_instance_variables,
-            vars.process_instance.get(&task.instance_key),
-        )
-        && match_instance_variables(
-            &f.local_variables,
-            vars.local.get(&task.element_instance_key),
-        )
-}
-
-/// `name -> serialized value` maps keyed by instance (root scope) and by
-/// element-instance scope, restricted to the variable names a user-task filter
-/// references (empty — no scan — when it references none).
-#[derive(Default)]
-struct UserTaskVariableIndex {
-    process_instance: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
-    local: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
-}
-
-impl UserTaskVariableIndex {
-    fn new(f: &models::UserTaskFilter, store: &readstore::ReadModel) -> Self {
-        let mut groups = vec![user_task_filter_base(f)];
-        groups.extend(f.dollar_or.iter().flatten().cloned());
-        let names = |pick: fn(
-            &models::UserTaskFilterFields,
-        ) -> &Option<Vec<models::VariableValueFilterProperty>>| {
-            groups
-                .iter()
-                .filter_map(|g| pick(g).as_ref())
-                .flatten()
-                .map(|e| e.name.clone())
-                .collect::<std::collections::HashSet<String>>()
-        };
-        let root_names = names(|g| &g.process_instance_variables);
-        let local_names = names(|g| &g.local_variables);
-        let mut idx = UserTaskVariableIndex::default();
-        if root_names.is_empty() && local_names.is_empty() {
-            return idx;
-        }
-        // Only the referenced names are read, via the `name` index (#1886).
-        let pushdown = readstore::VariablePushdown {
-            names: Some(root_names.union(&local_names).cloned().collect()),
-            ..Default::default()
-        };
-        for v in store.variables_matching(&pushdown) {
-            if v.scope_key == v.instance_key && root_names.contains(&v.name) {
-                idx.process_instance
-                    .entry(v.instance_key)
-                    .or_default()
-                    .insert(v.name.clone(), v.value.clone());
-            }
-            if local_names.contains(&v.name) {
-                idx.local
-                    .entry(v.scope_key)
-                    .or_default()
-                    .insert(v.name, v.value);
-            }
-        }
-        idx
-    }
-}
-
-/// Copies every field of a top-level `UserTaskFilter` except `$or` into a
-/// `UserTaskFilterFields`, so the base match reuses the `$or`-clause predicate.
-fn user_task_filter_base(f: &models::UserTaskFilter) -> models::UserTaskFilterFields {
-    let models::UserTaskFilter {
-        state,
-        assignee,
-        business_id,
-        priority,
-        element_id,
-        name,
-        candidate_group,
-        candidate_user,
-        tenant_id,
-        process_definition_id,
-        creation_date,
-        completion_date,
-        follow_up_date,
-        due_date,
-        process_instance_variables,
-        local_variables,
-        user_task_key,
-        process_definition_key,
-        process_instance_key,
-        element_instance_key,
-        tags,
-        dollar_or: _,
-    } = f.clone();
-    models::UserTaskFilterFields {
-        state,
-        assignee,
-        business_id,
-        priority,
-        element_id,
-        name,
-        candidate_group,
-        candidate_user,
-        tenant_id,
-        process_definition_id,
-        creation_date,
-        completion_date,
-        follow_up_date,
-        due_date,
-        process_instance_variables,
-        local_variables,
-        user_task_key,
-        process_definition_key,
-        process_instance_key,
-        element_instance_key,
-        tags,
-    }
-}
-
-/// Full user-task filter match: every top-level field AND, when a non-empty
-/// `$or` list is present, at least one clause (each an AND of its fields).
-fn match_user_task_filter(
-    task: &readstore::UserTaskRow,
-    f: &models::UserTaskFilter,
-    vars: &UserTaskVariableIndex,
-) -> bool {
-    match_user_task_fields(task, &user_task_filter_base(f), vars)
-        && match &f.dollar_or {
-            Some(clauses) if !clauses.is_empty() => clauses
-                .iter()
-                .any(|c| match_user_task_fields(task, c, vars)),
-            _ => true,
-        }
-}
-
 /// Copies the shared filter fields out of a top-level `ElementInstanceFilter`
 /// into an `ElementInstanceFilterFields` so the top-level base match reuses the
 /// same predicate as each `$or` clause. `startDate`/`endDate` date-time filters
@@ -27923,23 +26699,6 @@ fn match_element_instance_filter(
             clauses.iter().any(|c| match_element_instance_fields(ei, c))
         }
         _ => true,
-    }
-}
-
-/// A read-model business id (`None` when unset) as the REST `Nullable`.
-fn nullable_business_id(id: Option<String>) -> types::Nullable<String> {
-    id.map_or(types::Nullable::Null, types::Nullable::Present)
-}
-
-/// Maps a read-model [`readstore::ElementInstanceState`] to the REST element
-/// instance state enum.
-fn element_instance_state_enum(
-    state: readstore::ElementInstanceState,
-) -> models::ElementInstanceStateEnum {
-    match state {
-        readstore::ElementInstanceState::Active => models::ElementInstanceStateEnum::Active,
-        readstore::ElementInstanceState::Completed => models::ElementInstanceStateEnum::Completed,
-        readstore::ElementInstanceState::Terminated => models::ElementInstanceStateEnum::Terminated,
     }
 }
 
@@ -28452,58 +27211,6 @@ fn job_kind_enums(
     }
 }
 
-/// Epoch nanoseconds of an optional RFC 3339 timestamp string (`None` when
-/// absent or unparseable) — the sort projection for string-stored dates. Full
-/// precision (not millis) so sub-millisecond instants the REST surface
-/// returns verbatim still order correctly; `i128` cannot overflow.
-fn rfc3339_ns(s: Option<&str>) -> Option<i128> {
-    s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| i128::from(d.timestamp()) * 1_000_000_000 + i128::from(d.timestamp_subsec_nanos()))
-}
-
-/// The user-task priority as exposed by REST (clamped to `0..=100`): the single
-/// source for both the response projection and the sort projection.
-fn user_task_priority(stored: i32) -> u8 {
-    stored.clamp(0, 100) as u8
-}
-
-#[cfg(test)]
-mod sort_projection_tests {
-    use super::{rfc3339_ns, user_task_priority};
-
-    #[test]
-    fn priority_sort_projection_matches_the_returned_clamped_value() {
-        // Stored 100 and 101 both return priority 100, so they must tie in
-        // the sort (letting the secondary sort / key tiebreak decide).
-        assert_eq!(user_task_priority(100), user_task_priority(101));
-        assert_eq!(user_task_priority(i32::MAX), 100);
-        assert_eq!(user_task_priority(-5), 0);
-        assert_eq!(user_task_priority(42), 42);
-    }
-
-    #[test]
-    fn rfc3339_ns_orders_by_instant_not_string() {
-        // Lexicographically "…T10:00:00+02:00" > "…T09:00:00Z", but it is the
-        // earlier instant; sorting must follow the instant (#1298).
-        let a = rfc3339_ns(Some("2026-01-01T10:00:00+02:00"));
-        let b = rfc3339_ns(Some("2026-01-01T09:00:00Z"));
-        assert!(a < b);
-        assert_eq!(rfc3339_ns(None), None);
-        assert_eq!(rfc3339_ns(Some("garbage")), None);
-    }
-
-    #[test]
-    fn rfc3339_ns_keeps_sub_millisecond_precision() {
-        let early = rfc3339_ns(Some("2026-01-01T00:00:00.000100Z"));
-        let late = rfc3339_ns(Some("2026-01-01T00:00:00.000900Z"));
-        assert!(early < late, "same-millisecond instants must not tie");
-        // Pre-epoch instants stay ordered too.
-        assert!(
-            rfc3339_ns(Some("1969-12-31T23:59:59.5Z")) < rfc3339_ns(Some("1970-01-01T00:00:00Z"))
-        );
-    }
-}
-
 /// Sort projection for job search: string-encoded definition keys sort
 /// numerically (so `"2"` precedes `"10"`), optional fields sort as
 /// [`query::SortVal::Null`] (before every present value), and unknown fields
@@ -28628,87 +27335,6 @@ fn job_search_result(
         result.fetched_variables = Some(types::Nullable::Present(job.read_set.clone()));
     }
     result
-}
-
-/// Maps an engine [`nanobpmn_engine_core::UserTaskState`] to the REST user-task
-/// state enum.
-fn user_task_state_enum(state: nanobpmn_engine_core::UserTaskState) -> models::UserTaskStateEnum {
-    use nanobpmn_engine_core::UserTaskState;
-    match state {
-        UserTaskState::Created => models::UserTaskStateEnum::Created,
-        UserTaskState::Completed => models::UserTaskStateEnum::Completed,
-        UserTaskState::Canceled => models::UserTaskStateEnum::Canceled,
-    }
-}
-
-/// Projects a [`readstore::UserTaskRow`] into the generated `UserTaskResult`. The
-/// process-definition identity is denormalized onto the row at projection time.
-///
-/// `rootProcessInstanceKey` (issue #1095) is resolved from the task's
-/// `processInstanceKey` by walking the call-activity parent chain via `roots`
-/// (the same [`readstore::RootResolver`] the process-instance projection uses, so
-/// there is one canonical root-walk, no duplicate derivation) — a top-level
-/// (self-rooted) task reports its own `processInstanceKey`.
-fn user_task_result(
-    task: &readstore::UserTaskRow,
-    roots: &readstore::RootResolver,
-) -> models::UserTaskResult {
-    // The business id snapshotted when the user task was created.
-    let business_id = nullable_business_id(task.business_id.clone());
-    let creation_date =
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(task.created_at_ms as i64)
-            .unwrap_or_else(chrono::Utc::now);
-
-    let parse_date = |d: &Option<String>| -> types::Nullable<chrono::DateTime<chrono::Utc>> {
-        match d
-            .as_deref()
-            .map(|s| s.parse::<chrono::DateTime<chrono::Utc>>())
-        {
-            Some(Ok(dt)) => types::Nullable::Present(dt),
-            _ => types::Nullable::Null,
-        }
-    };
-
-    models::UserTaskResult {
-        name: types::Nullable::Null,
-        state: user_task_state_enum(task.state),
-        assignee: match &task.assignee {
-            Some(a) => types::Nullable::Present(a.clone()),
-            None => types::Nullable::Null,
-        },
-        element_id: task.element_id.clone(),
-        candidate_groups: task.candidate_groups.clone(),
-        candidate_users: task.candidate_users.clone(),
-        process_definition_id: task.process_definition_id.clone(),
-        creation_date,
-        completion_date: types::Nullable::Null,
-        follow_up_date: parse_date(&task.follow_up_date),
-        due_date: parse_date(&task.due_date),
-        tenant_id: "<default>".to_string(),
-        external_form_reference: match &task.external_form_reference {
-            Some(r) => types::Nullable::Present(r.clone()),
-            None => types::Nullable::Null,
-        },
-        process_definition_version: task.process_definition_version,
-        custom_headers: std::collections::HashMap::new(),
-        priority: user_task_priority(task.priority),
-        user_task_key: models::UserTaskKey(task.key.to_string()),
-        element_instance_key: models::ElementInstanceKey(task.element_instance_key.to_string()),
-        process_name: types::Nullable::Null,
-        process_definition_key: models::ProcessDefinitionKey(task.process_definition_key.clone()),
-        process_instance_key: models::ProcessInstanceKey(task.instance_key.to_string()),
-        root_process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
-            roots
-                .root_process_instance_key(task.instance_key)
-                .to_string(),
-        )),
-        business_id,
-        form_key: match task.form_key {
-            Some(k) => types::Nullable::Present(models::FormKey(k.to_string())),
-            None => types::Nullable::Null,
-        },
-        tags: Vec::new(),
-    }
 }
 
 /// Maps an engine [`ActivatedJob`] into the generated `ActivatedJobResult`,
@@ -58360,6 +56986,8 @@ mod parse_deploy_resources_tests {
 
 #[cfg(test)]
 mod variable_record_projection_tests {
+    use nanobpmn_search::variable::variable_search_result;
+
     use super::*;
 
     fn row(instance_key: u64, scope_key: u64, name: &str, value: &str) -> readstore::VariableRow {
@@ -60985,8 +59613,8 @@ mod call_activity_hierarchy_read_model_tests {
     //! a real engine run, so the projection cannot silently regress.
     use nanobpmn_search::{
         agent::{
-            agent_history_metrics_result, agent_message_content, agent_system_prompt,
-            match_agent_instance_filter,
+            agent_history_metrics_result, agent_instance_result, agent_message_content,
+            agent_system_prompt, match_agent_instance_filter,
         },
         convert::ms_to_datetime,
     };
