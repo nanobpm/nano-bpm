@@ -11,19 +11,32 @@
 // — via `engine-wasm/readmodel-types` (`npm run gen`). Do not hand-edit; a
 // stale artifact fails CI (`npm run check` = regen + `git diff --exit-code`).
 export type {
-  // `searchUserTasks(filter): UserTaskSearchQueryResult`
+  // `searchUserTasks(query: UserTaskSearchQuery): UserTaskSearchQueryResult`
+  // — like every search below, the request is the spec's own query type and
+  // runs the SAME spec-derived search layer as the gateway (#1898).
+  UserTaskSearchQuery,
+  UserTaskFilter,
+  UserTaskSearchQuerySortRequest,
   UserTaskSearchQueryResult,
   UserTaskResult,
-  // `searchProcessInstances(filter): ProcessInstanceSearchQueryResult`
+  // `searchProcessInstances(query: ProcessInstanceSearchQuery): ProcessInstanceSearchQueryResult`
+  ProcessInstanceSearchQuery,
+  ProcessInstanceFilter,
+  ProcessInstanceSearchQuerySortRequest,
   ProcessInstanceSearchQueryResult,
   ProcessInstanceResult,
-  // `searchVariables(filter): VariableSearchQueryResult`
+  // `searchVariables(query: VariableSearchQuery, truncateValues?): VariableSearchQueryResult`
+  VariableSearchQuery,
+  VariableFilter,
+  VariableSearchQuerySortRequest,
   VariableSearchQueryResult,
+  VariableSearchResult,
   VariableResult,
-  // `getFormByKey(key): FormResult | null`
+  // `getFormByKey(key): FormResult | null` (null where the gateway 404s)
   FormResult,
-  // `getResourceByKey(key): ResourceResult | null`
+  // `getResourceByKey(key): ResourceResult | null` (null where the gateway 404s)
   ResourceResult,
+  // `getAgentInstance(key): AgentInstanceResult | null` (exported below)
   // Shared search envelope (`{ items, page }`) the *SearchQueryResult types extend.
   SearchQueryResponse,
   SearchQueryPageResponse,

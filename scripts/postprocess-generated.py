@@ -347,7 +347,15 @@ def make_models_only_buildable(cargo: str, lib: str) -> tuple[str, str]:
 # decodes through the same `strict::decode_strict`; the server/WASM parity guard
 # (engine-wasm/src/search_parity_tests.rs) fails if the two ever differ. Extend
 # this list as operations migrate (#1898).
-STRICT_BODY_MODELS = ("AgentInstanceSearchQuery", "AgentInstanceHistorySearchQuery")
+STRICT_BODY_MODELS = (
+    "AgentInstanceSearchQuery",
+    "AgentInstanceHistorySearchQuery",
+    # The WASM `search*` reads decode these strictly too (#1898); the gateway
+    # must reject the same unknown fields or the two surfaces diverge.
+    "UserTaskSearchQuery",
+    "ProcessInstanceSearchQuery",
+    "VariableSearchQuery",
+)
 
 STRICT_MODULE = """//! Strict request-body decoding (injected by
 //! `scripts/postprocess-generated.py`, #1883).
