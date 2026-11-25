@@ -1409,7 +1409,21 @@ fn ts_filter_probes(query: &str) -> Vec<String> {
         .find(|(k, _)| k == "filter")
         .unwrap_or_else(|| panic!("{query} has a filter"))
         .1;
-    let fields = ts_fields(&decls, &filter_ty);
+    ts_filter_object_probes(&decls, &filter_ty)
+        .into_iter()
+        .map(|f| json!({ "filter": f }).to_string())
+        .collect()
+}
+
+/// Every TS-advertised probe for the filter type `filter_ty`, as filter
+/// objects. `$or` lists recurse into their element type, so each operator
+/// is also probed nested inside `$or` (`{"$or":[{field:{op:…}}]}`).
+fn ts_filter_object_probes(
+    decls: &std::collections::BTreeMap<String, String>,
+    filter_ty: &str,
+) -> Vec<J> {
+    let filter_ty = filter_ty.to_string();
+    let fields = ts_fields(decls, &filter_ty);
     assert!(!fields.is_empty(), "{filter_ty} advertises fields");
     let mut bodies = Vec::new();
     for (field, ty) in fields {
@@ -1426,26 +1440,31 @@ fn ts_filter_probes(query: &str) -> Vec<String> {
             } else {
                 json!([{ "name": "label", "value": "\"item-1\"" }])
             };
-            bodies.push(json!({ "filter": { field.as_str(): v } }).to_string());
+            bodies.push(json!({ field.as_str(): v }));
+            if field == "$or" {
+                let elem = ts_array_elem(resolved)
+                    .unwrap_or_else(|| panic!("{filter_ty}.$or is an array"));
+                for f in ts_filter_object_probes(decls, elem) {
+                    bodies.push(json!({ "$or": [f] }));
+                }
+                continue;
+            }
             // Variable-value lists: each element's `value` is itself a filter
             // property (`VariableValueFilterProperty.value:
             // StringFilterProperty`), so probe its operators nested.
             if let Some(elem) = ts_array_elem(resolved) {
                 let elem = decls.get(elem).map(String::as_str).unwrap_or(elem);
-                let value_ty = ts_fields(&decls, elem)
+                let value_ty = ts_fields(decls, elem)
                     .into_iter()
                     .find(|(k, _)| k == "value")
                     .map(|(_, t)| t);
                 if let Some(value_ty) = value_ty {
                     let base = json!("\"item-1\"");
-                    for o in ts_operators(&decls, &value_ty) {
+                    for o in ts_operators(decls, &value_ty) {
                         for operand in operands(&o, &base) {
-                            bodies.push(
-                                json!({ "filter": { field.as_str(): [
+                            bodies.push(json!({ field.as_str(): [
                                     { "name": "label", "value": { o.as_str(): operand } }
-                                ] } })
-                                .to_string(),
-                            );
+                                ] }));
                         }
                     }
                 }
@@ -1458,13 +1477,10 @@ fn ts_filter_probes(query: &str) -> Vec<String> {
         let elem_schema = spec_array_items(&prop_schema).unwrap_or(prop_schema);
         let v = spec_scalar_operand(&elem_schema)
             .unwrap_or_else(|| panic!("{filter_ty}.{field}: no scalar operand"));
-        bodies.push(json!({ "filter": { field.as_str(): wrap(v.clone()) } }).to_string());
-        for o in ts_operators(&decls, &ty) {
+        bodies.push(json!({ field.as_str(): wrap(v.clone()) }));
+        for o in ts_operators(decls, &ty) {
             for operand in operands(&o, &v) {
-                bodies.push(
-                    json!({ "filter": { field.as_str(): wrap(json!({ o.as_str(): operand })) } })
-                        .to_string(),
-                );
+                bodies.push(json!({ field.as_str(): wrap(json!({ o.as_str(): operand })) }));
             }
         }
     }
@@ -1561,6 +1577,25 @@ fn ts_probes_include_nested_variable_value_operators() {
         assert!(
             probes.iter().any(|b| b.contains(&needle)),
             "{o}: {probes:?}"
+        );
+    }
+}
+
+#[test]
+fn ts_probes_include_nested_or_operators() {
+    // `$or` elements are full filter-field types: the guard must probe each
+    // advertised operator inside `$or`, not only an empty clause.
+    for (query, needle) in [
+        ("UserTaskSearchQuery", r#"{"$or":[{"assignee":{"$like""#),
+        (
+            "ProcessInstanceSearchQuery",
+            r#"{"$or":[{"processDefinitionId":{"$like""#,
+        ),
+    ] {
+        let probes = ts_filter_probes(query);
+        assert!(
+            probes.iter().any(|b| b.contains(needle)),
+            "{query}: {needle}"
         );
     }
 }
