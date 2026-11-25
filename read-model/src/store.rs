@@ -128,6 +128,27 @@ fn fnv1a_64(bytes: &[u8]) -> i64 {
     hash as i64
 }
 
+/// The `(table, instance-key column)` pairs cleared by
+/// [`Event::ProcessInstanceHistoryDeleted`] (#1948) for the instance and every
+/// descendant (call-activity child) instance. `process_instances` is last: the
+/// descendant walk reads it. `history_deletion_covers_every_instance_scoped_table`
+/// pins this list to [`SCHEMA`] so a new instance-scoped table cannot be left
+/// behind.
+const PROCESS_INSTANCE_HISTORY_TABLES: &[(&str, &str)] = &[
+    ("element_instances", "instance_key"),
+    ("variables", "instance_key"),
+    ("jobs", "instance_key"),
+    ("incidents", "instance_key"),
+    ("user_tasks", "instance_key"),
+    ("decision_instances", "instance_key"),
+    ("message_subscriptions", "instance_key"),
+    ("event_waits", "instance_key"),
+    ("correlated_message_subscriptions", "instance_key"),
+    ("agent_history", "process_instance_key"),
+    ("agent_instances", "process_instance_key"),
+    ("process_instances", "key"),
+];
+
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE process_definitions (
     key        INTEGER PRIMARY KEY,
@@ -6953,6 +6974,27 @@ fn project_event(
                  AND (decision_evaluation_key = ?1 OR root_decision_key = ?1)",
                 params![*decision_evaluation_key as i64, *instance_key as i64],
             )?;
+        }
+
+        Event::ProcessInstanceHistoryDeleted { instance_key } => {
+            // #1948: remove an ENDED instance's history — the instance row, every
+            // descendant (call-activity child) instance, and all their
+            // instance-scoped rows. The engine already rejected a live instance,
+            // so this only ever retracts finished history. Idempotent: a replay,
+            // or a shard that never held the instance, deletes nothing.
+            for table_and_column in PROCESS_INSTANCE_HISTORY_TABLES {
+                let (table, column) = table_and_column;
+                tx.cexecute(
+                    &format!(
+                        "WITH RECURSIVE tree(k) AS ( \
+                           SELECT ?1 \
+                           UNION SELECT p.key FROM process_instances p \
+                             JOIN tree ON p.parent_process_instance_key = tree.k \
+                         ) DELETE FROM {table} WHERE {column} IN (SELECT k FROM tree)"
+                    ),
+                    params![*instance_key as i64],
+                )?;
+            }
         }
 
         Event::ProcessInstanceMigrated {
@@ -17360,5 +17402,150 @@ mod variable_pushdown_tests {
         let mut expected: Vec<u64> = store.variables().iter().map(|v| v.key).collect();
         expected.sort_unstable();
         assert_eq!(all, expected);
+    }
+}
+
+#[cfg(test)]
+mod history_deletion_tests {
+    use std::collections::BTreeMap;
+
+    use nanobpmn_engine_core::{Command, Engine, Event, ProcessBuilder, Value};
+
+    use super::{PROCESS_INSTANCE_HISTORY_TABLES, ReadStore, SCHEMA};
+
+    fn rows(store: &ReadStore, table: &str, column: &str, key: u64) -> i64 {
+        let conn = store.conn.lock().unwrap();
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+            [key as i64],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn total_rows(store: &ReadStore, key: u64) -> i64 {
+        PROCESS_INSTANCE_HISTORY_TABLES
+            .iter()
+            .map(|(t, c)| rows(store, t, c, key))
+            .sum()
+    }
+
+    /// Defect-class guard (#1948): every instance-scoped table in [`SCHEMA`]
+    /// (one carrying an `instance_key` / `process_instance_key` column) must be
+    /// cleared by history deletion, so adding such a table without extending
+    /// [`PROCESS_INSTANCE_HISTORY_TABLES`] fails here instead of leaking rows.
+    #[test]
+    fn history_deletion_covers_every_instance_scoped_table() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for table in tables {
+            let mut cols = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap();
+            let cols: Vec<String> = cols
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for col in ["instance_key", "process_instance_key"] {
+                if cols.iter().any(|c| c == col) {
+                    assert!(
+                        PROCESS_INSTANCE_HISTORY_TABLES
+                            .iter()
+                            .any(|(t, c)| *t == table && *c == col),
+                        "instance-scoped table {table}.{col} is not cleared by history deletion"
+                    );
+                }
+            }
+        }
+        assert!(
+            PROCESS_INSTANCE_HISTORY_TABLES
+                .last()
+                .is_some_and(|(t, _)| *t == "process_instances"),
+            "process_instances must be deleted last (the descendant walk reads it)"
+        );
+    }
+
+    /// A real engine journal: an instance with a variable and a job is
+    /// terminated, then its history deleted. Every instance-scoped row of it —
+    /// and of a call-activity child — disappears; an unrelated instance stays.
+    /// Replaying the deletion is a no-op.
+    #[test]
+    fn deletes_instance_and_descendant_history_only() {
+        let def = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("t", "worker")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        let mut log: Vec<Event> = engine
+            .apply_command(Command::DeployProcess(def))
+            .unwrap();
+        let create = |engine: &mut Engine, log: &mut Vec<Event>| {
+            let mut vars = BTreeMap::new();
+            vars.insert("x".to_string(), Value::Int(1));
+            let ev = engine
+                .apply_command(Command::create_instance_with("p", vars))
+                .unwrap();
+            let key = ev.iter().find_map(|e| e.instance_key()).unwrap();
+            log.extend(ev);
+            key
+        };
+        let doomed = create(&mut engine, &mut log);
+        let kept = create(&mut engine, &mut log);
+        log.extend(
+            engine
+                .apply_command(Command::cancel_instance(doomed))
+                .unwrap(),
+        );
+        let store = ReadStore::open(None).unwrap();
+        store.export(&log.iter().collect::<Vec<_>>()).unwrap();
+        // A synthetic call-activity child of the doomed instance.
+        let child = 9_999_999;
+        let def_key = store.process_instance(doomed).unwrap().process_definition_key;
+        store
+            .export(&[&Event::ProcessInstanceCreated {
+                instance_key: child,
+                process_id: "p".to_string(),
+                variables: BTreeMap::new(),
+                created_at: 2,
+                tags: Vec::new(),
+                business_id: None,
+                process_definition_key: def_key.parse().unwrap(),
+                version: 1,
+                parent_process_instance_key: Some(doomed),
+                parent_element_instance_key: Some(doomed + 1),
+            }])
+            .unwrap();
+        assert!(rows(&store, "variables", "instance_key", doomed) > 0);
+        assert!(rows(&store, "jobs", "instance_key", doomed) > 0);
+        assert!(rows(&store, "element_instances", "instance_key", doomed) > 0);
+        let kept_before = total_rows(&store, kept);
+
+        let del = engine
+            .apply_command(Command::DeleteProcessInstanceHistory {
+                instance_key: doomed,
+            })
+            .unwrap();
+        store.export(&del.iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(total_rows(&store, doomed), 0);
+        assert_eq!(total_rows(&store, child), 0);
+        assert!(store.process_instance(doomed).is_none());
+        assert!(store.process_instance(child).is_none());
+        assert_eq!(total_rows(&store, kept), kept_before);
+        // Idempotent replay.
+        store.export(&del.iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(total_rows(&store, kept), kept_before);
     }
 }
