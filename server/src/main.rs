@@ -63403,7 +63403,10 @@ mod process_instance_deletion_tests {
             .expect("valid process")
     }
 
-    async fn delete(server: &ServerImpl, key: &str) -> apis::process_instance::DeleteProcessInstanceResponse {
+    async fn delete(
+        server: &ServerImpl,
+        key: &str,
+    ) -> apis::process_instance::DeleteProcessInstanceResponse {
         server
             .delete_process_instance_impl(
                 &models::DeleteProcessInstancePathParams {
@@ -63432,7 +63435,10 @@ mod process_instance_deletion_tests {
         let server = ServerImpl::default();
         deploy(&server, waiting()).await;
         let key = create(&server, "waiting").await;
-        eventually("instance projects", || server.store.process_instance(key).is_some()).await;
+        eventually("instance projects", || {
+            server.store.process_instance(key).is_some()
+        })
+        .await;
 
         let live = delete(&server, &key.to_string()).await;
         assert!(
@@ -63475,7 +63481,11 @@ mod process_instance_deletion_tests {
                     .element_instances()
                     .iter()
                     .any(|e| e.instance_key == key)
-                && !server.store.variables().iter().any(|v| v.instance_key == key)
+                && !server
+                    .store
+                    .variables()
+                    .iter()
+                    .any(|v| v.instance_key == key)
         })
         .await;
 

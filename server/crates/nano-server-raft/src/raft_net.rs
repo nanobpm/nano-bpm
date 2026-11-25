@@ -594,9 +594,9 @@ mod codec_tests {
         assert!(required_features_for(&req(vec![entry(Command::cancel_instance(1))])).is_empty());
         // #1948: a history deletion never ships to a peer that cannot decode it.
         assert_eq!(
-            required_features_for(&req(vec![entry(
-                Command::DeleteProcessInstanceHistory { instance_key: 1 }
-            )])),
+            required_features_for(&req(vec![entry(Command::DeleteProcessInstanceHistory {
+                instance_key: 1
+            })])),
             vec![nano_falcon_protocol::cluster_join::FEATURE_PROCESS_INSTANCE_HISTORY_DELETION]
         );
         // #1863: a SUSPENDED-terminating cancel never ships to a peer that

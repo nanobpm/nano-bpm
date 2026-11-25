@@ -666,8 +666,8 @@ pub fn match_process_instance_group(
     let state_ok = match state_policy {
         ProcessInstanceStatePolicy::HonourFilter | ProcessInstanceStatePolicy::EndedOnly => {
             query::match_process_instance_state(
-            &f.state,
-            &process_instance_state_enum(inst.state).to_string(),
+                &f.state,
+                &process_instance_state_enum(inst.state).to_string(),
             )
         }
         // Overridden to ACTIVE by the caller; the supplied `state` is ignored.

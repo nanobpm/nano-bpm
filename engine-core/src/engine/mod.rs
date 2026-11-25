@@ -2784,7 +2784,10 @@ impl Engine {
                         }
                     }
                 }
-                self.emit(&mut log, Event::ProcessInstanceHistoryDeleted { instance_key });
+                self.emit(
+                    &mut log,
+                    Event::ProcessInstanceHistoryDeleted { instance_key },
+                );
             }
 
             Command::CreateClusterVariable {

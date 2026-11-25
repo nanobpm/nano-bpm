@@ -17598,9 +17598,7 @@ mod history_deletion_tests {
             .build()
             .unwrap();
         let mut engine = Engine::new();
-        let mut log: Vec<Event> = engine
-            .apply_command(Command::DeployProcess(def))
-            .unwrap();
+        let mut log: Vec<Event> = engine.apply_command(Command::DeployProcess(def)).unwrap();
         let create = |engine: &mut Engine, log: &mut Vec<Event>| {
             let mut vars = BTreeMap::new();
             vars.insert("x".to_string(), Value::Int(1));
@@ -17622,7 +17620,10 @@ mod history_deletion_tests {
         store.export(&log.iter().collect::<Vec<_>>()).unwrap();
         // A synthetic call-activity child of the doomed instance.
         let child = 9_999_999;
-        let def_key = store.process_instance(doomed).unwrap().process_definition_key;
+        let def_key = store
+            .process_instance(doomed)
+            .unwrap()
+            .process_definition_key;
         store
             .export(&[&Event::ProcessInstanceCreated {
                 instance_key: child,
