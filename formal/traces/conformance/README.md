@@ -105,12 +105,16 @@ step** (the same client command's processing). This holds for Zeebe because
 `SEQUENCE_FLOW_TAKEN` writes one `ACTIVATE_ELEMENT` command for the target,
 and the engine processes all follow-up commands of a client command before it
 returns. The model makes the same assumption: one queued activation per
-arrival, drained by `DrainVia`. If it doesn't hold, the soundness check
-catches it rather than the inference silently miscounting: TLC only accepts a
-trace where each `fire:<j>` is produced by the drain of an arrival in the same
-label set. So `fire:<j>` with no arrival, more fires than arrivals, or a fire
-before its arrivals are all **rejected** (see the negative tests in
-`zeebe-conformance.test.mjs`). The inference is only used for *coverage*
+arrival, drained by `DrainVia`. Same-step settlement is a **precondition
+supplied by the capture harness**, not something TLC verifies:
+`traceMilestones` flattens captured command boundaries before validation, so
+moving a join firing into a later captured step can leave the validated trace
+unchanged while changing the inferred fire/defer coverage. What TLC *does*
+check is the label-level shape: it only accepts a trace where each `fire:<j>`
+is produced by the drain of an arrival, so `fire:<j>` with no arrival, more
+fires than arrivals, or a fire before its arrivals are all **rejected** (see
+the negative tests in `zeebe-conformance.test.mjs`). The inference is only
+used for *coverage*
 (which decisions were observed), never to accept a trace.
 
 ## Running it
