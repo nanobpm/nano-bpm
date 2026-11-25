@@ -1002,22 +1002,48 @@ fn batch_operation_endpoints() -> BTreeSet<String> {
             let Some(responses) = op.get("responses").and_then(Value::as_mapping) else {
                 continue;
             };
-            let mints = responses.iter().any(|(status, resp)| {
-                let status = match status {
+            // Walk every 2xx response schema RECURSIVELY (the same `walk` the
+            // response-field guard uses), so a `BatchOperationCreatedResult`
+            // embedded behind `$ref`s (e.g. `DeleteResourceResponse.batchOperation`)
+            // is found, not just one named in the immediate response text.
+            let mut fields = BTreeSet::new();
+            let mut visited = BTreeSet::new();
+            for (status, resp) in responses.clone() {
+                let status = match &status {
                     Value::String(s) => s.clone(),
                     Value::Number(n) => n.to_string(),
-                    _ => return false,
+                    _ => continue,
                 };
                 if !status.starts_with('2') {
-                    return false;
+                    continue;
                 }
-                let resp = match resp.get("$ref").and_then(Value::as_str) {
-                    Some(r) => spec.resolve(r, &file).0,
-                    None => resp.clone(),
+                let (resp, resp_file) = match resp.get("$ref").and_then(Value::as_str) {
+                    Some(r) => {
+                        let (v, f, _) = spec.resolve(r, &file);
+                        (v, f)
+                    }
+                    None => (resp, file.clone()),
                 };
-                serde_yaml::to_string(&resp)
-                    .is_ok_and(|text| text.contains("BatchOperationCreatedResult"))
-            });
+                let Some(content) = resp.get("content").and_then(Value::as_mapping) else {
+                    continue;
+                };
+                for (_, media) in content.clone() {
+                    if let Some(schema) = media.get("schema") {
+                        let name = format!("{op_id}Response");
+                        walk(
+                            &mut spec,
+                            schema,
+                            &resp_file,
+                            &name,
+                            &mut fields,
+                            &mut visited,
+                        );
+                    }
+                }
+            }
+            let mints = fields
+                .iter()
+                .any(|f| f.starts_with("BatchOperationCreatedResult."));
             if mints {
                 out.insert(snake(op_id));
             }
@@ -1089,6 +1115,8 @@ fn batch_endpoint_derivation_finds_the_known_batches() {
         "update_jobs_batch_operation",
         "migrate_process_instances_batch_operation",
         "modify_process_instances_batch_operation",
+        // Embedded behind `$ref`s: `DeleteResourceResponse.batchOperation`.
+        "delete_resource",
     ] {
         assert!(endpoints.contains(op), "{op} not derived: {endpoints:?}");
     }

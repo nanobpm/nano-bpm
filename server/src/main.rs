@@ -9839,6 +9839,18 @@ impl ServerImpl {
             )));
         }
 
+        // The filter selects which jobs are MUTATED, so it fails closed: an
+        // empty filter (the spec requires at least one dimension) or a
+        // dimension `job_matches_filter` does not evaluate is a 400, never a
+        // silently widened selection that updates jobs the caller excluded.
+        if let Err(detail) = validate_job_batch_filter(&body.filter) {
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
+                "Invalid filter",
+                400,
+                detail,
+            )));
+        }
+
         // Execute the batch (#1863): every job the filter matches (the same
         // algebra as `POST /v2/jobs/search`) gets the changeset applied through
         // the single-job `update_job_core`, via the shared batch seam, with the
@@ -25222,6 +25234,56 @@ impl ServerImpl {
     pub(crate) fn active_worker_cap(&self) -> usize {
         self.active_worker_cap.load(Ordering::Relaxed)
     }
+}
+
+/// The `JobFilter` wire dimensions [`job_matches_filter`] evaluates — the
+/// single list a mutating job batch may select by. Any other supplied
+/// dimension would be silently ignored by the matcher, widening the selection,
+/// so [`validate_job_batch_filter`] rejects it instead.
+const JOB_FILTER_EVALUATED_DIMENSIONS: &[&str] = &[
+    "jobKey",
+    "processInstanceKey",
+    "processDefinitionKey",
+    "elementInstanceKey",
+    "type",
+    "elementId",
+    "state",
+    "errorMessage",
+    "errorCode",
+    "hasFailedWithRetriesLeft",
+    "creationTime",
+    "lastUpdateTime",
+    "endTime",
+    "deadline",
+];
+
+/// Fail-closed gate for a job filter that selects jobs to MUTATE (#1863):
+/// rejects an empty filter (`spec/jobs.yaml`: "At least one dimension must be
+/// set") and any supplied dimension outside [`JOB_FILTER_EVALUATED_DIMENSIONS`].
+/// Derived from the filter's own wire form, so a new spec field is rejected
+/// until the matcher learns it.
+fn validate_job_batch_filter(f: &models::JobFilter) -> Result<(), String> {
+    let wire = serde_json::to_value(f).map_err(|e| format!("Unreadable job filter: {e}."))?;
+    let keys: Vec<&String> = wire
+        .as_object()
+        .map(|o| o.keys().collect())
+        .unwrap_or_default();
+    if keys.is_empty() {
+        return Err("The job filter must set at least one dimension.".to_string());
+    }
+    let mut unsupported: Vec<&str> = keys
+        .into_iter()
+        .map(String::as_str)
+        .filter(|k| !JOB_FILTER_EVALUATED_DIMENSIONS.contains(k))
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    unsupported.sort_unstable();
+    Err(format!(
+        "Job filter dimension(s) not supported for batch updates: {}.",
+        unsupported.join(", ")
+    ))
 }
 
 /// The `JobFilter` algebra over one projected job — the single predicate shared
@@ -52016,8 +52078,7 @@ mod clustered_startup_tests {
     async fn rest_batch_update_jobs_validates_and_mints_a_batch_key() {
         use apis::job::UpdateJobsBatchOperationResponse as Resp;
         let server = ServerImpl::default();
-        let request =
-            |changeset| models::JobBatchUpdateRequest::new(models::JobFilter::new(), changeset);
+        let request = |changeset| models::JobBatchUpdateRequest::new(work_job_filter(), changeset);
         let rejected = |resp| matches!(resp, Resp::Status400_TheJobBatchUpdateOperationFailed(_));
 
         // Each changeset field alone is a valid update and mints a trackable batch key.
@@ -52079,6 +52140,83 @@ mod clustered_startup_tests {
                 "an out-of-range {what} must be rejected"
             );
         }
+    }
+
+    /// A job filter selecting `type = "work"` — an explicit, evaluated dimension.
+    pub(crate) fn work_job_filter() -> models::JobFilter {
+        serde_json::from_value(serde_json::json!({ "type": "work" })).expect("job filter")
+    }
+
+    /// #1863: a job batch MUTATES what its filter selects, so the filter fails
+    /// closed — an empty filter and every dimension the matcher does not
+    /// evaluate are 400s (never a silently widened selection), while every
+    /// evaluated dimension is accepted.
+    #[tokio::test]
+    async fn rest_batch_update_jobs_rejects_empty_and_unevaluated_filters() {
+        use apis::job::UpdateJobsBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let mut changeset = models::JobChangeset::new();
+        changeset.retries = Some(types::Nullable::Present(7));
+        let run = |filter: serde_json::Value| {
+            let server = &server;
+            let changeset = changeset.clone();
+            async move {
+                let filter: models::JobFilter =
+                    serde_json::from_value(filter.clone()).expect("filter decodes");
+                server
+                    .update_jobs_batch_operation_impl(&models::JobBatchUpdateRequest::new(
+                        filter, changeset,
+                    ))
+                    .await
+                    .expect("handler runs")
+            }
+        };
+        assert!(
+            matches!(
+                run(serde_json::json!({})).await,
+                Resp::Status400_TheJobBatchUpdateOperationFailed(_)
+            ),
+            "an empty filter must be rejected"
+        );
+        // Every spec dimension the matcher ignores is rejected, alone or
+        // alongside an evaluated one.
+        for (field, value) in [
+            ("retries", serde_json::json!(0)),
+            ("worker", serde_json::json!("w")),
+            ("processDefinitionId", serde_json::json!("p")),
+            ("tenantId", serde_json::json!("<default>")),
+            ("priority", serde_json::json!(0)),
+            ("deniedReason", serde_json::json!("x")),
+            ("isDenied", serde_json::json!(true)),
+        ] {
+            for filter in [
+                serde_json::json!({ field: value.clone() }),
+                serde_json::json!({ field: value.clone(), "type": "work" }),
+            ] {
+                assert!(
+                    matches!(
+                        run(filter.clone()).await,
+                        Resp::Status400_TheJobBatchUpdateOperationFailed(_)
+                    ),
+                    "unevaluated dimension must be rejected: {filter}"
+                );
+            }
+        }
+        assert!(
+            matches!(
+                run(serde_json::json!({ "type": "work" })).await,
+                Resp::Status200_TheBatchOperationWasCreated(_)
+            ),
+            "an evaluated dimension is accepted"
+        );
+        // An explicit `deadline: null` is a real (evaluated) dimension.
+        assert!(
+            matches!(
+                run(serde_json::json!({ "deadline": null })).await,
+                Resp::Status200_TheBatchOperationWasCreated(_)
+            ),
+            "`deadline: null` is an evaluated dimension"
+        );
     }
 
     /// Wait for a job of `job_type` to project into the read model, returning its
@@ -54467,7 +54605,10 @@ mod subscription_placement_tests {
         const JOB_REF: i64 = 0x0018_6301;
         let mut changeset = models::JobChangeset::new();
         changeset.retries = Some(types::Nullable::Present(7));
-        let mut job_req = models::JobBatchUpdateRequest::new(models::JobFilter::new(), changeset);
+        let mut job_req = models::JobBatchUpdateRequest::new(
+            crate::clustered_startup_tests::work_job_filter(),
+            changeset,
+        );
         job_req.operation_reference = Some(JOB_REF);
         let apis::job::UpdateJobsBatchOperationResponse::Status200_TheBatchOperationWasCreated(
             created,
@@ -54491,6 +54632,49 @@ mod subscription_placement_tests {
                 .all(|j| j.retries == 7)
         })
         .await;
+
+        // --- Non-zero priority batch: every item FAILS, jobs unchanged. ---
+        let mut changeset = models::JobChangeset::new();
+        changeset.priority = Some(types::Nullable::Present(5));
+        let apis::job::UpdateJobsBatchOperationResponse::Status200_TheBatchOperationWasCreated(
+            created,
+        ) = server
+            .update_jobs_batch_operation_impl(&models::JobBatchUpdateRequest::new(
+                crate::clustered_startup_tests::work_job_filter(),
+                changeset,
+            ))
+            .await
+            .expect("priority batch")
+        else {
+            panic!("priority batch must be created");
+        };
+        let priority_key = created.batch_operation_key;
+        assert_ne!(
+            settle(priority_key.clone()).await,
+            models::BatchOperationStateEnum::Completed,
+            "an unsupported priority must not report success"
+        );
+        let GetResp::Status200_TheBatchOperationWasFound(priority_batch) = server
+            .get_batch_operation_impl(&models::GetBatchOperationPathParams {
+                batch_operation_key: priority_key,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("priority batch must be found");
+        };
+        assert_eq!(priority_batch.operations_total_count, 2);
+        assert_eq!(priority_batch.operations_failed_count, 2);
+        assert_eq!(priority_batch.operations_completed_count, 0);
+        assert!(
+            server
+                .store
+                .jobs()
+                .iter()
+                .filter(|j| instances.contains(&j.instance_key))
+                .all(|j| j.retries == 7),
+            "a failed priority batch leaves job properties unchanged"
+        );
 
         // --- Resolve-incident batch: the open incident is resolved. ---
         const RESOLVE_REF: i64 = 0x0018_6302;
@@ -54519,6 +54703,53 @@ mod subscription_placement_tests {
                 .all(|i| i.state == IncidentState::Resolved)
         })
         .await;
+
+        // --- Job timeout batch: every matched job's deadline is moved. ---
+        // A timeout only applies to an ACTIVATED job: the second job is still
+        // activated from above; re-activate the failed one (its incident is
+        // resolved and the batch gave it retries).
+        const TIMEOUT_REF: i64 = 0x0018_6304;
+        let mut activated_count = 0;
+        for _ in 0..200 {
+            activated_count += server
+                .activate_for_stream("work", "w", 10, 60_000, None)
+                .await
+                .len();
+            if activated_count >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(activated_count, 1, "the failed job re-activates");
+        let mut changeset = models::JobChangeset::new();
+        changeset.timeout = Some(types::Nullable::Present(3_600_000));
+        let mut timeout_req = models::JobBatchUpdateRequest::new(
+            crate::clustered_startup_tests::work_job_filter(),
+            changeset,
+        );
+        timeout_req.operation_reference = Some(TIMEOUT_REF);
+        let apis::job::UpdateJobsBatchOperationResponse::Status200_TheBatchOperationWasCreated(
+            created,
+        ) = server
+            .update_jobs_batch_operation_impl(&timeout_req)
+            .await
+            .expect("timeout batch")
+        else {
+            panic!("timeout batch must be created");
+        };
+        let timeout_key = created.batch_operation_key;
+        let timeout_state = settle(timeout_key.clone()).await;
+        let GetResp::Status200_TheBatchOperationWasFound(timeout_batch) = server
+            .get_batch_operation_impl(&models::GetBatchOperationPathParams {
+                batch_operation_key: timeout_key,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("timeout batch must be found");
+        };
+        assert_eq!(timeout_state, models::BatchOperationStateEnum::Completed);
+        assert_eq!(timeout_batch.operations_total_count, 2);
 
         // --- Cancel batch: every ACTIVE root instance is cancelled. ---
         const CANCEL_REF: i64 = 0x0018_6303;
@@ -54568,6 +54799,8 @@ mod subscription_placement_tests {
         };
         let retries = refs_of(&|e| matches!(e, Event::JobRetriesUpdated { .. }));
         assert_eq!(retries, vec![Some(JOB_REF); 2], "job-update records");
+        let timeouts = refs_of(&|e| matches!(e, Event::JobTimeoutUpdated { .. }));
+        assert_eq!(timeouts, vec![Some(TIMEOUT_REF); 2], "job-timeout records");
         let resolved = refs_of(&|e| matches!(e, Event::IncidentResolved { .. }));
         assert_eq!(
             resolved,
