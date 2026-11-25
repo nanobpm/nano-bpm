@@ -9,14 +9,24 @@
 //! cannot drift from each other or from the spec (the server/WASM parity guard
 //! in `engine-wasm` pins that).
 //!
-//! Operations migrated so far: `searchAgentInstances`,
-//! `searchAgentInstanceHistory` ([`agent`]).
+//! Operations: `searchAgentInstances`, `searchAgentInstanceHistory`
+//! ([`agent`]), `searchProcessInstances` ([`process_instance`]),
+//! `searchUserTasks` ([`user_task`]), `searchVariables` ([`variable`]) and the
+//! single-entity reads `getFormByKey`, `getResource`, `getAgentInstance`
+//! ([`get`]). Each pipeline reads rows through [`source::ReadSource`], so the
+//! gateway's sharded read model and the WASM engine's single store share it.
 
 pub mod agent;
 pub mod convert;
+pub mod get;
+pub mod process_instance;
 pub mod query;
+pub mod source;
+pub mod user_task;
+pub mod variable;
 
 pub use nanobpm_gateway_rest::{models, strict, types};
+pub use nanobpmn_read_model as readstore;
 
 /// Why a shared search pipeline failed.
 #[derive(Debug)]
