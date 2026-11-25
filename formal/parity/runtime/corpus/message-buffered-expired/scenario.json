@@ -1,0 +1,58 @@
+{
+  "name": "message-buffered-expired",
+  "bpmn": "process.bpmn",
+  "backends": [
+    "nano"
+  ],
+  "processId": "parity-msg-expired",
+  "variables": {
+    "key": "parity-msg-buffered-expired"
+  },
+  "steps": [
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-buffered-expired",
+      "variables": {
+        "buffered": true
+      },
+      "timeToLive": 1000
+    },
+    {
+      "op": "advanceTime",
+      "ms": 2000
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "a",
+      "variables": {}
+    },
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-buffered-expired",
+      "variables": {
+        "late": true
+      },
+      "settled": {
+        "ack": true
+      }
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": {
+      "key": "parity-msg-buffered-expired",
+      "late": true
+    },
+    "jobsCreated": {
+      "a": 1
+    },
+    "completedElements": {
+      "StartEvent_1": 1,
+      "Task_A": 1,
+      "Catch_M": 1,
+      "EndEvent_1": 1
+    }
+  }
+}

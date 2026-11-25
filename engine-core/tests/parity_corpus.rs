@@ -34,7 +34,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use nanobpmn_engine_core::{bpmn::parse_bpmn, Command, Engine, Event, Key, Value};
+use nanobpmn_engine_core::{bpmn::parse_bpmn, Command, Engine, EngineError, Event, Key, Value};
 use serde_json::Value as Json;
 
 /// The same activation cap as `observation.mjs`'s `MAX_JOBS_TO_ACTIVATE`
@@ -148,15 +148,35 @@ fn run_scenario(path: &Path) -> (Key, Vec<Event>) {
                 variables: v,
                 local: false,
             }),
-            "correlateMessage" | "publishMessage" => run.apply(Command::CorrelateMessage {
-                message_name: s("name"),
-                correlation_key: s("correlationKey"),
-                variables: v,
-                business_id: None,
-                message_key: None,
-                time_to_live: None,
-                message_id: None,
-            }),
+            "correlateMessage" | "publishMessage" => {
+                // `timeToLive` / `messageId` (#1969): the same mapping as the
+                // wasm `TestEngine.publishMessage` the nano backend calls.
+                let cmd = Command::CorrelateMessage {
+                    message_name: s("name"),
+                    correlation_key: s("correlationKey"),
+                    variables: v,
+                    business_id: None,
+                    message_key: None,
+                    time_to_live: step.get("timeToLive").and_then(Json::as_u64),
+                    message_id: step
+                        .get("messageId")
+                        .and_then(Json::as_str)
+                        .map(str::to_string),
+                };
+                if step.get("expectRejected").and_then(Json::as_bool) == Some(true) {
+                    let res = run.engine.apply_command_at(cmd, run.now);
+                    assert!(
+                        step.get("timeToLive").is_some() || step.get("messageId").is_some(),
+                        "expectRejected needs a messageId or timeToLive publication"
+                    );
+                    assert!(
+                        matches!(res, Err(EngineError::MessageAlreadyExists { .. })),
+                        "the publish was expected to be rejected as a duplicate messageId, got {res:?}"
+                    );
+                } else {
+                    run.apply(cmd);
+                }
+            }
             "broadcastSignal" => run.apply(Command::BroadcastSignal {
                 signal_name: s("name"),
                 variables: v,

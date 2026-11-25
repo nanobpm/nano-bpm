@@ -1,0 +1,40 @@
+{
+  "name": "message-buffered-before-subscription",
+  "bpmn": "process.bpmn",
+  "processId": "parity-msg-buffered",
+  "variables": {
+    "key": "parity-msg-buffered-before-subscription"
+  },
+  "steps": [
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-buffered-before-subscription",
+      "variables": {
+        "buffered": true
+      },
+      "timeToLive": 600000
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "a",
+      "variables": {}
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": {
+      "key": "parity-msg-buffered-before-subscription",
+      "buffered": true
+    },
+    "jobsCreated": {
+      "a": 1
+    },
+    "completedElements": {
+      "StartEvent_1": 1,
+      "Task_A": 1,
+      "Catch_M": 1,
+      "EndEvent_1": 1
+    }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "name": "message-buffered-interrupting-boundary-one",
+  "bpmn": "process.bpmn",
+  "processId": "parity-msg-int-one",
+  "variables": {
+    "key": "parity-msg-int-one"
+  },
+  "steps": [
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-int-one",
+      "variables": {
+        "n": 1
+      },
+      "timeToLive": 600000
+    },
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-int-one",
+      "variables": {
+        "n": 2
+      },
+      "timeToLive": 600000
+    },
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-int-one",
+      "variables": {
+        "n": 3
+      },
+      "timeToLive": 600000
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "a",
+      "variables": {}
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "b",
+      "variables": {}
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": {
+      "key": "parity-msg-int-one",
+      "n": 1
+    },
+    "jobsCreated": {
+      "a": 1,
+      "w": 1,
+      "b": 1
+    },
+    "completedElements": {
+      "StartEvent_1": 1,
+      "Task_A": 1,
+      "Boundary_M": 1,
+      "Task_B": 1,
+      "End_B": 1
+    }
+  }
+}

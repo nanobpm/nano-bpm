@@ -967,3 +967,68 @@ test("every corpus scenario that advances time is nano-only", async () => {
     assert.deepEqual(s.backends, ["nano"], `${name} advances time but is not nano-only`);
   }
 });
+
+// #1969: a publication that carries an explicit timeToLive / messageId is sent
+// AS GIVEN (it exercises Zeebe buffering itself), and `expectRejected` asserts
+// the broker's 409 ALREADY_EXISTS for a still-buffered messageId.
+test("publishMessage with timeToLive/messageId publishes as given and asserts a 409 rejection", async () => {
+  const bodies = [];
+  let reject = false;
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      bodies.push(`${req.url.replace(/^.*\/messages/, "/messages")} ${body}`);
+      if (reject) {
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end('{"title":"ALREADY_EXISTS"}');
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const handle = { instanceKeys: new Set() };
+    await backend.publishMessage(handle, "M", "k", { n: 1 }, undefined, {
+      timeToLive: 0,
+      messageId: "m1",
+    });
+    assert.deepEqual(bodies, [
+      '/messages/publication {"name":"M","correlationKey":"k","variables":{"n":1},"timeToLive":0,"messageId":"m1"}',
+    ]);
+    // A rejection that was expected passes …
+    reject = true;
+    await backend.publishMessage(handle, "M", "k", {}, undefined, {
+      timeToLive: 600000,
+      messageId: "m1",
+      expectRejected: true,
+    });
+    // … one that was not fails loudly, and so does an expected one that was accepted.
+    await assert.rejects(
+      backend.publishMessage(handle, "M", "k", {}, undefined, { timeToLive: 600000, messageId: "m1" }),
+    );
+    reject = false;
+    await assert.rejects(
+      backend.publishMessage(handle, "M", "k", {}, undefined, {
+        timeToLive: 600000,
+        messageId: "m1",
+        expectRejected: true,
+      }),
+      /expected to be rejected/,
+    );
+    // A buffering publication takes no `settled` barrier (it would publish twice).
+    await assert.rejects(
+      backend.publishMessage(handle, "M", "k", {}, { ack: true }, { timeToLive: 1 }),
+      /no `settled` barrier/,
+    );
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
