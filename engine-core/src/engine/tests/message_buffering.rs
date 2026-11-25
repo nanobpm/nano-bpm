@@ -2779,3 +2779,68 @@ fn an_orphaned_one_shot_reservation_reopens_the_subscription() {
     assert!(rig.instance.is_completed(instance_key), "{:?}", rig.trace);
     assert!(redrive(&rig).is_empty());
 }
+
+/// #1949 (Copilot r4701729161): only a delivery's FIRST acknowledgement moves
+/// the subscription's resume state. A re-emitted duplicate — the original
+/// receipt replayed, or an answer recomputed after the receipt settled — must
+/// neither clear a pending resume, bump its generation, nor re-pin a receipt.
+#[test]
+fn a_duplicate_acknowledgement_does_not_rewrite_resume_state() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    rig.publish_backlog(&order, 1);
+    let _ = create_suspended(&mut rig, &order, &|_| false);
+    let record = opening_record(&rig);
+    assert!(record.resume_pending);
+    let generation = record.resume_generation;
+    let original = rig
+        .trace
+        .iter()
+        .find(|e| {
+            matches!(e, Event::MessageCorrelationAcknowledging { deferred: true, delivery_key, .. } if *delivery_key != 0)
+        })
+        .cloned()
+        .expect("a deferred receipt");
+    let Event::MessageCorrelationAcknowledging {
+        subscription_key,
+        delivery_key,
+        ..
+    } = original.clone()
+    else {
+        unreachable!()
+    };
+    let resume_state = |s: &state::State| {
+        let r = &s.message_subscriptions[&subscription_key];
+        (r.resume_pending, r.resume_generation)
+    };
+
+    // Variant 1: the original deferred receipt re-emitted while pinned.
+    let mut st = rig.instance.state().clone();
+    state::apply(&mut st, &original);
+    assert_eq!(resume_state(&st), (true, generation), "replayed receipt");
+
+    // Variant 2: a non-deferred answer recomputed for a duplicate (pinned).
+    let mut recomputed = original.clone();
+    if let Event::MessageCorrelationAcknowledging { deferred, .. } = &mut recomputed {
+        *deferred = false;
+    }
+    let mut st = rig.instance.state().clone();
+    state::apply(&mut st, &recomputed);
+    assert_eq!(resume_state(&st), (true, generation), "recomputed, pinned");
+
+    // Variant 3: the same recomputed duplicate AFTER the receipt settled.
+    let mut st = rig.instance.state().clone();
+    state::apply(
+        &mut st,
+        &Event::MessageCorrelationReceiptSettled {
+            subscription_key,
+            delivery_key,
+        },
+    );
+    assert!(st.routed_deliveries.receipt(delivery_key).is_none());
+    state::apply(&mut st, &recomputed);
+    assert_eq!(resume_state(&st), (true, generation), "recomputed, settled");
+    assert!(
+        st.routed_deliveries.receipt(delivery_key).is_none(),
+        "a settled receipt is never re-pinned"
+    );
+}

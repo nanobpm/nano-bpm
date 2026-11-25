@@ -2332,6 +2332,14 @@ pub struct RoutedDelivery {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub receipt: Option<CorrelationReceipt>,
+    /// The receipt was recorded AND settled (#1949): a later duplicate ack
+    /// of this delivery must neither re-pin a receipt nor count as its first
+    /// answer. Additive, omitted when `false`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub settled: bool,
 }
 
 /// The durable answer to one ack-paced buffered delivery (#1949): see
@@ -2448,10 +2456,12 @@ impl RoutedDeliveries {
     /// Attach `receipt` to the retained entry for `delivery_key` (#1949),
     /// pinning it outside the cap until [`Self::settle_receipt`]. First write
     /// wins: a receipt, once recorded, is the delivery's immutable outcome. A
-    /// key not (or no longer) retained is a no-op.
-    pub fn set_receipt(&mut self, delivery_key: Key, receipt: CorrelationReceipt) {
+    /// key not (or no longer) retained, or whose receipt was already settled,
+    /// is a no-op. Returns whether this call recorded the delivery's FIRST
+    /// answer (a duplicate ack returns `false`).
+    pub fn set_receipt(&mut self, delivery_key: Key, receipt: CorrelationReceipt) -> bool {
         if !self.keys.contains(&delivery_key) || self.receipts.contains_key(&delivery_key) {
-            return;
+            return false;
         }
         // The ack follows its delivery's record within the same command, so
         // the entry is (almost always) the newest: search from the back.
@@ -2459,12 +2469,14 @@ impl RoutedDeliveries {
             .order
             .iter_mut()
             .rev()
-            .find(|e| e.delivery_key == delivery_key && e.receipt.is_none())
+            .find(|e| e.delivery_key == delivery_key && e.receipt.is_none() && !e.settled)
         {
             entry.receipt = Some(receipt);
             self.receipts.insert(delivery_key, receipt);
             self.evict();
+            return true;
         }
+        false
     }
     /// The message partition applied the ack of `delivery_key` (#1949): no
     /// re-drive of it can change a reservation any more (a late duplicate's
@@ -2474,12 +2486,15 @@ impl RoutedDeliveries {
         if self.receipts.remove(&delivery_key).is_none() {
             return false;
         }
+        // Ack-paced drains settle the newest delivery: search from the back.
         if let Some(entry) = self
             .order
             .iter_mut()
+            .rev()
             .find(|e| e.delivery_key == delivery_key)
         {
             entry.receipt = None;
+            entry.settled = true;
         }
         self.evict();
         true

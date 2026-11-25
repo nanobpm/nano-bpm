@@ -5574,6 +5574,75 @@ fn project(
     project_event(tx, event, position, now_ms)
 }
 
+/// Records a message correlation's history row and settles its open wait
+/// row (kept for a non-interrupting boundary, which can correlate again).
+/// `host_key` is the wait's [`wait_host_key`].
+fn project_message_correlation(
+    tx: &rusqlite::Transaction,
+    now_ms: u64,
+    subscription_key: Key,
+    message_key: Key,
+    host_key: Key,
+    instance_key: Key,
+    element_id: &str,
+) -> rusqlite::Result<()> {
+    // Only a subscription the open read model tracks (see
+    // `is_tracked_message_wait`) has an open row to recover the message
+    // name / key / flag from; the row lookup below is that check, so a
+    // process-level event sub-process wait (element instance `0`) is
+    // recorded too (#1555).
+    {
+        // Recover the message name / correlation key / interrupting flag
+        // from the open row. If the open row is absent (out-of-order replay
+        // or partial seeding), skip the history insert entirely rather than
+        // record a row with an empty message name / correlation key that
+        // would silently corrupt `searchCorrelatedMessageSubscriptions`.
+        let captured: Option<(String, String, bool)> = tx
+            .query_row(
+                "SELECT message_name, correlation_key, non_interrupting \
+                 FROM message_subscriptions WHERE subscription_key = ?1",
+                params![subscription_key as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+            )
+            .optional()?;
+        if let Some((message_name, correlation_key, non_interrupting)) = captured {
+            tx.cexecute(
+                "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
+                 instance_key, element_instance_key, element_id, message_name, correlation_key, \
+                 correlation_time_ms, partition_id, business_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT business_id FROM process_instances WHERE key = ?3)) \
+                 ON CONFLICT(message_key, subscription_key) DO NOTHING",
+                params![
+                    message_key as i64,
+                    subscription_key as i64,
+                    instance_key as i64,
+                    host_key as i64,
+                    element_id,
+                    message_name,
+                    correlation_key,
+                    now_ms as i64,
+                    // 1-based partition id (Camunda/Zeebe convention), to
+                    // match the topology mapping in main.rs.
+                    (partition_of(subscription_key) + 1) as i64,
+                ],
+            )?;
+            // A non-interrupting boundary subscription stays open in the
+            // engine so it can correlate again (each correlation spawns a
+            // parallel token); keep its open read-model row so subsequent
+            // correlations are still recorded. Interrupting boundaries and
+            // intermediate catches settle, so their open row is dropped.
+            if non_interrupting {
+                return Ok(());
+            }
+        }
+    }
+    tx.cexecute(
+        "DELETE FROM message_subscriptions WHERE subscription_key = ?1",
+        params![subscription_key as i64],
+    )?;
+    Ok(())
+}
+
 fn project_event(
     tx: &rusqlite::Transaction,
     event: &Event,
@@ -6058,62 +6127,52 @@ fn project_event(
             instance_key,
             element_instance_key,
             element_id,
+            ack_partition: None,
             ..
         } => {
-            // Only a subscription the open read model tracks (see
-            // `is_tracked_message_wait`) has an open row to recover the message
-            // name / key / flag from; the row lookup below is that check, so a
-            // process-level event sub-process wait (element instance `0`) is
-            // recorded too (#1555).
-            {
-                // Recover the message name / correlation key / interrupting flag
-                // from the open row. If the open row is absent (out-of-order replay
-                // or partial seeding), skip the history insert entirely rather than
-                // record a row with an empty message name / correlation key that
-                // would silently corrupt `searchCorrelatedMessageSubscriptions`.
-                let captured: Option<(String, String, bool)> = tx
-                    .query_row(
-                        "SELECT message_name, correlation_key, non_interrupting \
-                         FROM message_subscriptions WHERE subscription_key = ?1",
-                        params![*subscription_key as i64],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
-                    )
-                    .optional()?;
-                if let Some((message_name, correlation_key, non_interrupting)) = captured {
-                    tx.cexecute(
-                        "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
-                         instance_key, element_instance_key, element_id, message_name, correlation_key, \
-                         correlation_time_ms, partition_id, business_id) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT business_id FROM process_instances WHERE key = ?3)) \
-                         ON CONFLICT(message_key, subscription_key) DO NOTHING",
-                        params![
-                            *message_key as i64,
-                            *subscription_key as i64,
-                            *instance_key as i64,
-                            wait_host_key(*instance_key, *element_instance_key) as i64,
-                            element_id,
-                            message_name,
-                            correlation_key,
-                            now_ms as i64,
-                            // 1-based partition id (Camunda/Zeebe convention), to
-                            // match the topology mapping in main.rs.
-                            (partition_of(*subscription_key) + 1) as i64,
-                        ],
-                    )?;
-                    // A non-interrupting boundary subscription stays open in the
-                    // engine so it can correlate again (each correlation spawns a
-                    // parallel token); keep its open read-model row so subsequent
-                    // correlations are still recorded. Interrupting boundaries and
-                    // intermediate catches settle, so their open row is dropped.
-                    if non_interrupting {
-                        return Ok(delta);
-                    }
-                }
-            }
-            tx.cexecute(
-                "DELETE FROM message_subscriptions WHERE subscription_key = ?1",
-                params![*subscription_key as i64],
+            project_message_correlation(
+                tx,
+                now_ms,
+                *subscription_key,
+                *message_key,
+                wait_host_key(*instance_key, *element_instance_key),
+                *instance_key,
+                element_id,
             )?;
+        }
+        // An ack-paced (#1949) delivery is only a RESERVATION: the instance
+        // partition may still defer it (suspended) or reject it. The open wait
+        // and its history row are settled only once the message partition
+        // applies a CONSUMING acknowledgement (below).
+        Event::RemoteMessageCorrelation {
+            ack_partition: Some(_),
+            ..
+        } => {}
+        Event::MessageCorrelationAcknowledged {
+            subscription_key,
+            message_key,
+            consumed: true,
+            ..
+        } => {
+            let row: Option<(i64, i64, String)> = tx
+                .query_row(
+                    "SELECT instance_key, element_instance_key, element_id \
+                     FROM message_subscriptions WHERE subscription_key = ?1",
+                    params![*subscription_key as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((instance_key, host_key, element_id)) = row {
+                project_message_correlation(
+                    tx,
+                    now_ms,
+                    *subscription_key,
+                    *message_key,
+                    host_key as Key,
+                    instance_key as Key,
+                    &element_id,
+                )?;
+            }
         }
 
         // A message correlated to a process-level message start event (#1300).
@@ -13229,6 +13288,70 @@ mod element_instance_tests {
             }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
+    }
+
+    /// #1949 (Copilot r4701729249): an ack-paced delivery is only a
+    /// reservation. Deferral or rejection must leave the open wait and record
+    /// no history; only a CONSUMING acknowledgement settles it.
+    #[test]
+    fn ack_paced_correlation_projects_only_on_consuming_ack() {
+        use nanobpmn_engine_core::MessageSubscriptionKind;
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store
+            .export(&[&Event::MessageSubscriptionCreated {
+                subscription_key: 3101,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".to_string(),
+                message_name: "OrderPlaced".to_string(),
+                correlation_key: "P1".to_string(),
+                kind: MessageSubscriptionKind::IntermediateCatch,
+            }])
+            .unwrap();
+        let paced = |message_key| Event::RemoteMessageCorrelation {
+            subscription_key: 3101,
+            message_key,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "await".to_string(),
+            kind: MessageSubscriptionKind::IntermediateCatch,
+            variables: std::collections::BTreeMap::new(),
+            delivery_key: 77 + message_key,
+            ack_partition: Some(0),
+        };
+        let ack =
+            |message_key, accepted, consumed, deferred| Event::MessageCorrelationAcknowledged {
+                subscription_key: 3101,
+                message_key,
+                accepted,
+                consumed,
+                deferred,
+                partition: 0,
+            };
+        // Deferred (suspended instance): still waiting, no history.
+        store
+            .export(&[&paced(11), &ack(11, true, false, true)])
+            .unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1, "deferral");
+        assert!(store.correlated_message_subscriptions().is_empty());
+        // Rejected: still no correlation recorded.
+        store
+            .export(&[&paced(12), &ack(12, false, false, false)])
+            .unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1, "rejection");
+        assert!(store.correlated_message_subscriptions().is_empty());
+        // A later consuming delivery settles the wait and records history.
+        store
+            .export(&[&paced(13), &ack(13, true, true, false)])
+            .unwrap();
+        assert!(store.message_subscriptions().is_empty());
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].message_key, 13);
+        assert_eq!(corr[0].instance_key, INST);
+        assert_eq!(corr[0].element_instance_key, TASK_EI);
+        assert_eq!(corr[0].element_id, "await");
     }
 
     #[test]

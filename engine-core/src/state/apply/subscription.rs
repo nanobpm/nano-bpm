@@ -252,6 +252,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     subscription_key: *subscription_key,
                     close_tombstone: *close_tombstone,
                     receipt: None,
+                    settled: false,
                 },
             );
         }
@@ -374,16 +375,11 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             target_partition,
             ..
         } => {
-            if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
-                if s.state == MessageSubscriptionState::Opening {
-                    s.resume_pending = *deferred;
-                    if *deferred {
-                        s.resume_generation = s.resume_generation.wrapping_add(1);
-                    }
-                }
-            }
-            if *delivery_key != 0 {
-                state.routed_deliveries.set_receipt(
+            // Only the delivery's FIRST answer moves the resume state: a
+            // re-emitted duplicate (original receipt, or one recomputed after
+            // settlement) must not clear a newer deferral or pending resume.
+            let first = *delivery_key == 0
+                || state.routed_deliveries.set_receipt(
                     *delivery_key,
                     CorrelationReceipt {
                         accepted: *accepted,
@@ -394,6 +390,15 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                         target_partition: *target_partition,
                     },
                 );
+            if first {
+                if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
+                    if s.state == MessageSubscriptionState::Opening {
+                        s.resume_pending = *deferred;
+                        if *deferred {
+                            s.resume_generation = s.resume_generation.wrapping_add(1);
+                        }
+                    }
+                }
             }
         }
 

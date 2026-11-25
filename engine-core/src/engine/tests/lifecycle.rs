@@ -8469,6 +8469,7 @@ fn routed_delivery_ledger_evicts_in_applied_order() {
         subscription_key: Some(k + 1000),
         close_tombstone: close,
         receipt: None,
+        settled: false,
     };
     for i in 1..=cap as u64 {
         ledger.record(entry(state::compose_key(3, i), true));
@@ -8508,6 +8509,7 @@ fn routed_delivery_ledger_round_trips_with_indexes() {
             subscription_key: Some(k * 10),
             close_tombstone: close,
             receipt: None,
+            settled: false,
         });
     }
     let json = serde_json::to_string(&ledger).unwrap();
