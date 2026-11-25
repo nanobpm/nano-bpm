@@ -149,6 +149,17 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
             // instance rows. No core engine state to mutate.
         }
 
+        Event::ProcessInstanceHistoryDeleted { instance_key } => {
+            // Event-sourced deletion (#1948): remove the ended tree — the root
+            // plus every call-activity descendant still RESIDENT on this
+            // replica — from engine state, so no snapshot carries it and a
+            // reseed from engine state cannot resurrect it. Residency is
+            // replica-local, so the tree is resolved here at apply (a local
+            // state effect), never journaled. Idempotent for absent keys.
+            let victims = state.resident_instance_tree(*instance_key);
+            state.purge_instance_tree(&victims);
+        }
+
         // Cluster variables (#1657): replicated configuration state, folded
         // from the log so every replica and every replay reads the same set.
         Event::ClusterVariableCreated {

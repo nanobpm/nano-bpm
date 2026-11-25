@@ -100,6 +100,8 @@
   "DeleteDecisionInstance",
   "DeleteDecisionInstance.decision_evaluation_key",
   "DeleteDecisionInstance.instance_key",
+  "DeleteProcessInstanceHistory",
+  "DeleteProcessInstanceHistory.instance_key",
   "DeployBundle",
   "DeployBundle.adhoc",
   "DeployBundle.condition",

@@ -495,6 +495,8 @@
   "ProcessInstanceCreated.tags",
   "ProcessInstanceCreated.variables",
   "ProcessInstanceCreated.version",
+  "ProcessInstanceHistoryDeleted",
+  "ProcessInstanceHistoryDeleted.instance_key",
   "ProcessInstanceMigrated",
   "ProcessInstanceMigrated.child_instances",
   "ProcessInstanceMigrated.compensation_migrated",
