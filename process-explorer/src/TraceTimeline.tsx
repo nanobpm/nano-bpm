@@ -100,7 +100,7 @@ export function TraceTimeline({
   return (
     <div>
       <Legend />
-      <div className="mt-4 space-y-1.5">
+      <div className="mt-4 space-y-1.5 overflow-x-auto">
         {trace.elements.map((el) => (
           <ElementRow
             key={el.elementInstanceKey}
@@ -180,29 +180,32 @@ function ElementRow({
   const headline = headlineDuration(el, now, fmt.duration, traceEndedAt);
   const left = pct(start);
   const width = Math.max(pct(end) - left, 0.6);
+  // Derived once: the bar can be fully covered by job segments, so the
+  // label and entry-time column carry the same lifetime tooltip.
+  const lifetimeTitle = `${el.elementId} · ${fmt.clock(el.enteredAt)} → ${
+    el.exitedAt != null ? fmt.clock(el.exitedAt) : "…"
+  } · ${fmt.duration(el.durationMs)} · ${headline.title}`;
 
   return (
     <div className="flex items-center gap-3">
       <div
         className="w-44 shrink-0 truncate font-mono text-xs text-fg-muted"
-        title={el.elementId}
+        title={lifetimeTitle}
       >
         {el.elementId}
         {el.incidents > 0 && <span className="ml-1 text-danger">⚠</span>}
       </div>
       <div
         className="w-28 shrink-0 font-mono text-[11px] text-fg-faint"
-        title={`entered ${fmt.clock(el.enteredAt)}`}
+        title={lifetimeTitle}
       >
         {fmt.clock(el.enteredAt)}
       </div>
-      <div className="relative h-6 flex-1 rounded bg-inset">
+      <div className="relative h-6 min-w-24 flex-1 rounded bg-inset">
         <div
           className="absolute top-1/2 h-3 -translate-y-1/2 rounded-sm bg-edge-strong"
           style={{ left: `${left}%`, width: `${width}%` }}
-          title={`${el.elementId} · ${fmt.clock(el.enteredAt)} → ${
-            el.exitedAt != null ? fmt.clock(el.exitedAt) : "…"
-          } · ${fmt.duration(el.durationMs)} · ${headline.title}`}
+          title={lifetimeTitle}
         />
         {job && <JobBars job={job} pct={pct} fmt={fmt} />}
       </div>
