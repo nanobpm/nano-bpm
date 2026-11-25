@@ -596,10 +596,6 @@ pub enum Command {
         subscription_key: Key,
         message_key: Key,
         accepted: bool,
-        /// The instance is suspended with its scope alive: keep the
-        /// subscription open and the message buffered (no next send).
-        #[cfg_attr(feature = "serde", serde(default))]
-        deferred: bool,
     },
     /// Close a canonical subscription on the message partition because the
     /// instance disarmed it (the guarded activity left the flow, the instance was
@@ -1279,12 +1275,10 @@ impl Command {
                 subscription_key,
                 message_key,
                 accepted,
-                deferred,
             } => {
                 h.key(*subscription_key);
                 h.key(*message_key);
                 h.str(if *accepted { "1" } else { "0" });
-                h.str(if *deferred { "1" } else { "0" });
             }
             Command::CancelInstance { instance_key }
             | Command::SuspendInstance { instance_key }

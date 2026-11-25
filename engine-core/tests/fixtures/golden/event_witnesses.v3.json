@@ -114,7 +114,6 @@
   {
     "MessageCorrelationAcknowledging": {
       "accepted": true,
-      "deferred": false,
       "instance_key": 23,
       "message_key": 20,
       "partition": 0,
@@ -125,7 +124,6 @@
   {
     "MessageCorrelationAcknowledged": {
       "accepted": false,
-      "deferred": false,
       "message_key": 20,
       "partition": 1,
       "subscription_key": 21

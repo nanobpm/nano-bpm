@@ -1534,8 +1534,7 @@ pub enum Event {
     /// The instance partition's answer (#1874) to an ack-paced
     /// [`Event::RemoteMessageCorrelation`]: `accepted` when the parked token
     /// took the message, `false` when it was rejected (the scope ended, the
-    /// element no longer waits, or the instance is gone). A suspended instance
-    /// whose scope is alive answers `deferred` instead (see the field). The
+    /// element no longer waits, or the instance is suspended or gone). The
     /// host routes it to `target_partition` (the message partition) as a
     /// [`crate::Command::AcknowledgeMessageCorrelation`]. `partition` is the
     /// emitting (instance) partition, recorded explicitly because the message
@@ -1545,11 +1544,6 @@ pub enum Event {
         message_key: Key,
         instance_key: Key,
         accepted: bool,
-        /// The instance is SUSPENDED but its subscription scope is alive
-        /// (#1874): the message partition keeps the subscription open and the
-        /// message buffered for it, instead of closing it. Additive.
-        #[cfg_attr(feature = "serde", serde(default))]
-        deferred: bool,
         partition: u64,
         target_partition: u64,
     },
@@ -1562,9 +1556,6 @@ pub enum Event {
         subscription_key: Key,
         message_key: Key,
         accepted: bool,
-        /// See [`Event::MessageCorrelationAcknowledging`]'s `deferred`.
-        #[cfg_attr(feature = "serde", serde(default))]
-        deferred: bool,
         partition: u64,
     },
     /// A published message correlated to a process-level **message start
@@ -2448,6 +2439,14 @@ impl Event {
         }
     }
 
+    /// The highest [`Key`] this event references in any field.
+    ///
+    /// Replay uses the maximum across the whole log to restore the engine's key
+    /// generator past every key the original run assigned, so newly minted keys
+    /// never collide with replayed ones. (Keys are only ever minted by the
+    /// engine and stamped onto events, so the log is an exact record of them —
+    /// including transient ones like completed element-instance keys that no
+    /// longer appear in final state.)
     /// Whether this is a cross-partition follow-up the host must route to
     /// another partition as a command (the single canonical routable set):
     /// a subscription open / close, a remote correlation, its ack (#1874), or
@@ -2576,14 +2575,6 @@ impl Event {
         }
     }
 
-    /// The highest [`Key`] this event references in any field.
-    ///
-    /// Replay uses the maximum across the whole log to restore the engine's key
-    /// generator past every key the original run assigned, so newly minted keys
-    /// never collide with replayed ones. (Keys are only ever minted by the
-    /// engine and stamped onto events, so the log is an exact record of them —
-    /// including transient ones like completed element-instance keys that no
-    /// longer appear in final state.)
     pub fn max_key(&self) -> Key {
         let mut m = self.instance_key().unwrap_or(0);
         match self {

@@ -12251,7 +12251,6 @@ impl ServerImpl {
                 subscription_key,
                 message_key,
                 accepted,
-                deferred,
                 target_partition,
                 ..
             } => Some((
@@ -12260,7 +12259,6 @@ impl ServerImpl {
                     subscription_key: *subscription_key,
                     message_key: *message_key,
                     accepted: *accepted,
-                    deferred: *deferred,
                 },
             )),
             Event::MessageSubscriptionClosing {

@@ -1227,7 +1227,6 @@ fn routed_protocol_entries() -> Vec<Command> {
         subscription_key,
         message_key,
         accepted: true,
-        deferred: false,
     };
     let acked = message_partition
         .apply_command_at(ack.clone(), T0 + 6)

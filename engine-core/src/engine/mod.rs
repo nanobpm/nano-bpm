@@ -5307,10 +5307,7 @@ impl Engine {
                 // gated jobs and timers): the routed correlation is *dropped*. The
                 // message model is unbuffered, so a dropped correlation does not
                 // re-correlate on resume — drop-on-suspend is the documented
-                // suspension semantics for messages. An ack-paced buffered
-                // delivery is the exception: it is *deferred* (see
-                // `emit_pending_correlation_ack`), so the message stays
-                // buffered and the persistent subscription stays open (#1874).
+                // suspension semantics for messages.
                 //
                 // A persistent subscription (non-interrupting boundary / event
                 // sub-process) never settles, so it instead dedupes on delivery
@@ -5379,7 +5376,6 @@ impl Engine {
                 subscription_key,
                 message_key,
                 accepted,
-                deferred,
             } => {
                 // Idempotent: only the exact delivery this subscription awaits
                 // is acknowledged; a redelivered or stale ack is a no-op.
@@ -5395,20 +5391,16 @@ impl Engine {
                             subscription_key,
                             message_key,
                             accepted,
-                            deferred,
                             partition: self.partition_id,
                         },
                     );
                     // Still open (accepted, scope alive): offer it the next
-                    // buffered message on this command's quiescent pass. A
-                    // deferred (suspended) subscription is not re-offered: it
-                    // would bounce off the suspended instance again.
-                    if !deferred
-                        && self
-                            .state
-                            .message_subscriptions
-                            .get(&subscription_key)
-                            .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
+                    // buffered message on this command's quiescent pass.
+                    if self
+                        .state
+                        .message_subscriptions
+                        .get(&subscription_key)
+                        .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
                     {
                         self.buffer_requeue.push_back(subscription_key);
                     }
@@ -7703,15 +7695,6 @@ impl Engine {
                 .message_subscriptions
                 .get(&ack.subscription_key)
                 .is_some_and(|s| s.state == state::MessageSubscriptionState::Opening);
-        // A suspended instance whose scope still waits takes nothing now but
-        // must keep its persistent subscription (#1874): defer, don't reject.
-        let deferred = !ack.advanced
-            && self.instance_is_suspended(ack.instance_key)
-            && self
-                .state
-                .message_subscriptions
-                .get(&ack.subscription_key)
-                .is_some_and(|s| s.state == state::MessageSubscriptionState::Opening);
         self.emit(
             log,
             Event::MessageCorrelationAcknowledging {
@@ -7719,7 +7702,6 @@ impl Engine {
                 message_key: ack.message_key,
                 instance_key: ack.instance_key,
                 accepted,
-                deferred,
                 partition: self.partition_id,
                 target_partition: ack.target_partition,
             },

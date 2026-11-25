@@ -1,7 +1,6 @@
 [
   "AcknowledgeMessageCorrelation",
   "AcknowledgeMessageCorrelation.accepted",
-  "AcknowledgeMessageCorrelation.deferred",
   "AcknowledgeMessageCorrelation.message_key",
   "AcknowledgeMessageCorrelation.subscription_key",
   "ActivateAdHocActivities",
