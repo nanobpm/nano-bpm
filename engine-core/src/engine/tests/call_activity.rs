@@ -2042,3 +2042,107 @@ fn delete_process_instance_history_events_do_not_depend_on_residency() {
         }
     }
 }
+
+/// Deploys `root` → call `mid` → call `leaf` (the leaf parks on a user task),
+/// creates an instance and cancels it, so a three-level ended tree with a
+/// retained user task on the leaf remains resident. Returns (engine, root,
+/// mid, leaf).
+fn ended_three_level_tree() -> (Engine, Key, Key, Key) {
+    let leaf = ProcessBuilder::new("leaf")
+        .start_event("ls")
+        .user_task("ut")
+        .end_event("le")
+        .connect("ls", "ut")
+        .connect("ut", "le")
+        .build()
+        .unwrap();
+    let mid = ProcessBuilder::new("mid")
+        .start_event("ms")
+        .call_activity("mc", "leaf")
+        .end_event("me")
+        .connect("ms", "mc")
+        .connect("mc", "me")
+        .build()
+        .unwrap();
+    let root = ProcessBuilder::new("root")
+        .start_event("rs")
+        .call_activity("rc", "mid")
+        .end_event("re")
+        .connect("rs", "rc")
+        .connect("rc", "re")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    for def in [leaf, mid, root] {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let created = engine
+        .apply_command(Command::create_instance("root"))
+        .unwrap();
+    let root_key = parent_key_of(&created, "root");
+    let mid_key = parent_key_of(&created, "mid");
+    let leaf_key = parent_key_of(&created, "leaf");
+    engine
+        .apply_command(Command::cancel_instance(root_key))
+        .unwrap();
+    (engine, root_key, mid_key, leaf_key)
+}
+
+fn holds_any_state_for(engine: &Engine, key: Key) -> bool {
+    engine.instance(key).is_some()
+        || engine
+            .state
+            .user_tasks
+            .values()
+            .any(|t| t.instance_key == key)
+        || engine.state.children_by_parent.contains_key(&key)
+}
+
+/// #1948 review: evicting an ended INTERMEDIATE instance must not strand its
+/// ended grandchild (and the grandchild's retained user task) outside the
+/// root's reachable tree — else deleting the root leaves that state behind
+/// for a snapshot to reseed. Eviction closes over terminal descendants.
+#[test]
+fn evicting_an_ended_intermediate_takes_its_ended_descendants_along() {
+    let (mut engine, root, mid, leaf) = ended_three_level_tree();
+    assert!(engine
+        .state
+        .user_tasks
+        .values()
+        .any(|t| t.instance_key == leaf));
+    assert!(engine.evict_instance(mid));
+    for key in [mid, leaf] {
+        assert!(!holds_any_state_for(&engine, key), "{key} stranded");
+    }
+    engine
+        .apply_command(Command::DeleteProcessInstanceHistory { instance_key: root })
+        .unwrap();
+    for key in [root, mid, leaf] {
+        assert!(
+            !holds_any_state_for(&engine, key),
+            "{key} survived deletion"
+        );
+    }
+}
+
+/// #1948 review: evicting an ended LEAF child drops its retained user tasks
+/// with it (they were previously left behind, unreachable from the root).
+/// Covers every eviction entry point, which share one removal pass.
+#[test]
+fn evicting_an_ended_child_drops_its_retained_user_tasks() {
+    for entry in 0..3 {
+        let (mut engine, root, mid, leaf) = ended_three_level_tree();
+        match entry {
+            0 => assert!(engine.evict_instance(leaf)),
+            1 => assert_eq!(engine.evict_instances(&[leaf]), 1),
+            _ => assert_eq!(engine.retire_instances(&[leaf]), vec![leaf]),
+        }
+        assert!(!holds_any_state_for(&engine, leaf), "entry {entry}");
+        engine
+            .apply_command(Command::DeleteProcessInstanceHistory { instance_key: root })
+            .unwrap();
+        for key in [root, mid, leaf] {
+            assert!(!holds_any_state_for(&engine, key), "entry {entry}: {key}");
+        }
+    }
+}

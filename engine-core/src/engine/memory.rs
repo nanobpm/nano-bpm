@@ -288,23 +288,7 @@ impl Engine {
         if !terminal {
             return false;
         }
-        self.state.remove_instance(key);
-        // Drop the instance's jobs via the reverse index (O(this instance's
-        // jobs)), deindexing each from the activatable/activated indices. A
-        // terminal instance's jobs are normally already settled and thus not in
-        // the activatable index, but `deindex_job` is unconditional and safe.
-        if let Some(job_keys) = self.state.jobs_by_instance.remove(&key) {
-            for job_key in job_keys {
-                if let Some(job) = self.state.jobs.remove(&job_key) {
-                    self.state.deindex_job(&job.job_type, job_key, job.priority);
-                }
-            }
-        }
-        self.state.timers.retain(|_, t| t.instance_key != key);
-        self.state
-            .message_subscriptions
-            .retain(|_, s| s.instance_key != key);
-        self.state.incidents.retain(|_, i| i.instance_key != key);
+        self.remove_instance_set(&BTreeSet::from([key]));
         true
     }
 
@@ -324,7 +308,7 @@ impl Engine {
             .copied()
             .filter(|&k| self.is_terminal_instance(k))
             .collect();
-        self.remove_instance_set(&terminal)
+        self.remove_instance_set(&terminal).len()
     }
 
     /// Follower-side reaping driven by the partition leader's out-of-band
@@ -349,8 +333,7 @@ impl Engine {
             .copied()
             .filter(|&k| self.is_terminal_instance(k))
             .collect();
-        self.remove_instance_set(&terminal);
-        terminal.into_iter().collect()
+        self.remove_instance_set(&terminal).into_iter().collect()
     }
 
     /// Whether `key` is a resident instance that is terminal (completed or
@@ -440,8 +423,7 @@ impl Engine {
             }
         }
         self.retire_cursor = next_cursor;
-        self.remove_instance_set(&victims);
-        victims.into_iter().collect()
+        self.remove_instance_set(&victims).into_iter().collect()
     }
 
     /// Shared removal pass for [`Engine::evict_instances`],
@@ -449,40 +431,38 @@ impl Engine {
     /// state along with its jobs (via the `jobs_by_instance` reverse index, so the
     /// cost is `O(evicted jobs)` not `O(total jobs)`), timers, subscriptions and
     /// incidents. Does **not** shrink the maps — capacity is reused by the next
-    /// instances, which is exactly what is wanted under sustained load. Returns the
-    /// number of instances removed.
-    fn remove_instance_set(&mut self, victims: &BTreeSet<Key>) -> usize {
-        if victims.is_empty() {
-            return 0;
+    /// instances, which is exactly what is wanted under sustained load.
+    ///
+    /// The set is first closed over each victim's TERMINAL resident call-activity
+    /// descendants, and removal goes through the same
+    /// [`State::purge_instance_tree`] as history deletion (#1948): evicting an
+    /// ended child unlinks it from its parent, so anything left behind under it
+    /// (an ended grandchild, retained user tasks) would become unreachable from
+    /// the root and survive a later deletion of that root. Returns the keys
+    /// actually removed (a superset of the terminal `victims`).
+    fn remove_instance_set(&mut self, victims: &BTreeSet<Key>) -> BTreeSet<Key> {
+        let mut closed: BTreeSet<Key> = BTreeSet::new();
+        for &victim in victims {
+            if closed.contains(&victim) {
+                continue;
+            }
+            for k in self.state.resident_instance_tree(victim) {
+                if k == victim || self.is_terminal_instance(k) {
+                    closed.insert(k);
+                }
+            }
+        }
+        if closed.is_empty() {
+            return closed;
         }
         if self.track_dirty_vars {
-            for key in victims {
+            for key in &closed {
                 self.dirty_vars.remove(key);
                 self.forgotten_vars.insert(*key);
             }
         }
-        for key in victims {
-            self.state.remove_instance(*key);
-            // Drop this instance's jobs via the reverse index (O(its jobs)),
-            // deindexing each from the activatable/activated indices.
-            if let Some(job_keys) = self.state.jobs_by_instance.remove(key) {
-                for job_key in job_keys {
-                    if let Some(job) = self.state.jobs.remove(&job_key) {
-                        self.state.deindex_job(&job.job_type, job_key, job.priority);
-                    }
-                }
-            }
-        }
-        self.state
-            .timers
-            .retain(|_, t| !victims.contains(&t.instance_key));
-        self.state
-            .message_subscriptions
-            .retain(|_, s| !victims.contains(&s.instance_key));
-        self.state
-            .incidents
-            .retain(|_, i| !victims.contains(&i.instance_key));
-        victims.len()
+        self.state.purge_instance_tree(&closed);
+        closed
     }
 
     /// Evicts every completed instance (see [`Engine::evict_instance`]) and

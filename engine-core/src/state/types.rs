@@ -3168,8 +3168,10 @@ impl State {
             return;
         }
         for key in victims {
+            // `remove_instance` unlinks the victim from its parent, so an entry
+            // empties (and is dropped) with its last child; a non-victim child's
+            // ancestry edge is never discarded here.
             self.remove_instance(*key);
-            self.children_by_parent.remove(key);
             if let Some(job_keys) = self.jobs_by_instance.remove(key) {
                 for job_key in job_keys {
                     if let Some(job) = self.jobs.remove(&job_key) {
