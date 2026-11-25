@@ -1184,11 +1184,11 @@ jobs:
   # seed + bounded-exhaustive corpus natively over engine-core under
   # `cargo llvm-cov` and ratchet the region coverage against
   # formal/parity/coverage/baseline.json (a drop fails). The Camunda/JaCoCo
-  # half needs a live broker and runs in parity-camunda-daily.yml. Not a
-  # required check (not in the merge protocol). No retries.
+  # half needs a live broker and runs in parity-camunda-daily.yml. A required
+  # merge gate since #1977 (in the merge protocol and .mergify.yml). No retries.
   #
   # Runs on EVERY push to main, not only path-filtered ones (#1916): a drop
-  # that slipped past a PR (this job is not required) must keep main red
+  # that slipped past a PR (e.g. one that skipped the job via the path filter) must keep main red
   # until it is fixed, instead of being hidden by later unrelated pushes that
   # skip the job and blocking whichever PR next trips the path filter.
   # Locally: `make parity-coverage-nano`.
