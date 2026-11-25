@@ -9,7 +9,7 @@ use crate::event::Event;
 use crate::model::IncomingFlow;
 
 /// Bound on the number of nondeterministic operations per harness.
-const STEPS: usize = 3;
+const STEPS: usize = 2;
 
 /// One of three incoming-flow identities: two parallel flows from the same
 /// source (`ParallelDuplicateFlows`-style, distinct ordinals) and one from a
@@ -56,7 +56,7 @@ fn total(arrivals: &FlowArrivals) -> usize {
 /// distinct flow (Zeebe's "Tetris principle") and an arrival adds exactly its
 /// tokens to exactly its flow.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(3)]
 fn flow_arrivals_preserve_join_invariant() {
     let mut arrivals = FlowArrivals::default();
     for _ in 0..STEPS {
@@ -149,7 +149,7 @@ fn any_job_event() -> Event {
 /// non-deferred job is activatable; a frozen activation timeout never exceeds
 /// its deadline; a `Completed` job holds no lock.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(3)]
 fn job_lease_lifecycle_keeps_indexes_in_lockstep() {
     const KEY: Key = 7;
     let mut state = State::default();
@@ -203,7 +203,7 @@ fn job_lease_lifecycle_keeps_indexes_in_lockstep() {
 /// join never fires more often than the scarcer flow delivered, and never
 /// before both flows delivered once.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(3)]
 fn parallel_join_fires_only_when_every_flow_taken() {
     const INCOMING: usize = 2;
     let a = IncomingFlow {

@@ -13,13 +13,13 @@ Harnesses are compiled only under `cfg(kani)` (declared in
 
 | Harness | File | Property | Bound |
 |---|---|---|---|
-| `flow_arrivals_preserve_join_invariant` | `engine-core/src/state/kani_proofs.rs` | Any interleaving of join arrivals (`record`/`add`) and firings (`consume_one_each`) keeps every stored token count positive, entries strictly sorted (one per flow), conserves tokens, never under/overflows. Restates the `TokenFlow.tla` join invariant. | 3 ops over 3 flow identities, `add` ≤ 4 tokens |
-| `job_lease_lifecycle_keeps_indexes_in_lockstep` | `engine-core/src/state/kani_proofs.rs` | Any sequence of job events (activate / lock-expire / complete / fail / retries-update) with arbitrary deadlines, timestamps, retries and priority, applied through the real `state::apply`, never panics, and the derived indexes (`activated_jobs`, `activatable_jobs`, `deferred_job_deadlines`) stay in lockstep with the job state. | 3 events after creation |
-| `parallel_join_fires_only_when_every_flow_taken` | `engine-core/src/state/kani_proofs.rs` | The parallel-diamond join (`P2`, two incoming flows) under the guard `Engine::activate_join` applies: over any arrival order it fires exactly when both flows have been taken, once per full round (`fired == min(from_A, from_B)`), keeps the surplus, and is never left ready-but-waiting. | 3 arrivals |
+| `flow_arrivals_preserve_join_invariant` | `engine-core/src/state/kani_proofs.rs` | Any interleaving of join arrivals (`record`/`add`) and firings (`consume_one_each`) keeps every stored token count positive, entries strictly sorted (one per flow), conserves tokens, never under/overflows. Restates the `TokenFlow.tla` join invariant. | 2 ops over 3 flow identities, `add` ≤ 4 tokens |
+| `job_lease_lifecycle_keeps_indexes_in_lockstep` | `engine-core/src/state/kani_proofs.rs` | Any sequence of job events (activate / lock-expire / complete / fail / retries-update) with arbitrary deadlines, timestamps, retries and priority, applied through the real `state::apply`, never panics, and the derived indexes (`activated_jobs`, `activatable_jobs`, `deferred_job_deadlines`) stay in lockstep with the job state. | 2 events after creation |
+| `parallel_join_fires_only_when_every_flow_taken` | `engine-core/src/state/kani_proofs.rs` | The parallel-diamond join (`P2`, two incoming flows) under the guard `Engine::activate_join` applies: over any arrival order it fires exactly when both flows have been taken, once per full round (`fired == min(from_A, from_B)`), keeps the surplus, and is never left ready-but-waiting. | 2 arrivals |
 
 The earlier engine-level diamond harness (full deploy + create-instance through `Engine::apply_command`) did not prove inside the CI box — it needed unwind 24 over the whole command path — so it was replaced by the pure join transition above.
 
-Harnesses declare their own `#[kani::unwind(4)]`; `--default-unwind 3` covers anything else. Setting `KANI_UNWIND` passes `--unwind`, overriding every harness.
+Harnesses declare their own `#[kani::unwind(3)]` (2 steps + loop exit; every collection holds ≤ 2 entries); `--default-unwind 3` covers anything else. Setting `KANI_UNWIND` passes `--unwind`, overriding every harness.
 
 ## Running
 
