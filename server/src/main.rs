@@ -8619,11 +8619,10 @@ impl ServerImpl {
                         &process_id,
                         operation_reference,
                     )
-                    .map_err(|e| match e {
-                        EngineError::ProcessNotFound { process_id } => {
-                            (400, format!("No deployed process with id '{process_id}'."))
-                        }
-                        other => (500, other.to_string()),
+                    .map_err(|e| {
+                        // The shared engine-core mapping (#1937).
+                        let p = e.problem();
+                        (p.status, p.detail)
                     })?;
                     Ok((process_id, created))
                 },
@@ -13955,11 +13954,10 @@ impl ServerImpl {
                         &process_id,
                         operation_reference,
                     )
-                    .map_err(|e| match e {
-                        EngineError::ProcessNotFound { process_id } => {
-                            (400, format!("No deployed process with id '{process_id}'."))
-                        }
-                        other => (500, other.to_string()),
+                    .map_err(|e| {
+                        // The shared engine-core mapping (#1937).
+                        let p = e.problem();
+                        (p.status, p.detail)
                     })?;
                     Ok((process_id, created))
                 },
@@ -23174,11 +23172,10 @@ impl ServerImpl {
                         &process_id,
                         None,
                     )
-                    .map_err(|e| match e {
-                        EngineError::ProcessNotFound { process_id } => {
-                            (400, format!("No deployed process with id '{process_id}'."))
-                        }
-                        other => (500, other.to_string()),
+                    .map_err(|e| {
+                        // The shared engine-core mapping (#1937).
+                        let p = e.problem();
+                        (p.status, p.detail)
                     })
                 },
                 None,
