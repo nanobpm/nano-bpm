@@ -5856,9 +5856,10 @@ mod tests {
         let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         engine
             .with(|j| {
-                let _ = j
-                    .apply_command_at(deploy_command(), 1)
-                    .expect("deploy applies");
+                j.apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies")
+                    .1
+                    .blocking_wait();
             })
             .await;
         let mut sm: Arc<PartitionStateMachine> =
@@ -6017,9 +6018,10 @@ mod tests {
         let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         engine
             .with(|j| {
-                let _ = j
-                    .apply_command_at(deploy_command(), 1)
-                    .expect("deploy applies");
+                j.apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies")
+                    .1
+                    .blocking_wait();
             })
             .await;
         let mut sm: Arc<PartitionStateMachine> =
@@ -6107,9 +6109,10 @@ mod tests {
         let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         engine
             .with(|j| {
-                let _ = j
-                    .apply_command_at(deploy_command(), 1)
-                    .expect("deploy applies");
+                j.apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies")
+                    .1
+                    .blocking_wait();
             })
             .await;
         let mut sm: Arc<PartitionStateMachine> =
@@ -6170,9 +6173,10 @@ mod tests {
         let donor = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         donor
             .with(|j| {
-                let _ = j
-                    .apply_command_at(deploy_command(), 1)
-                    .expect("donor deploy applies");
+                j.apply_command_at(deploy_command(), 1)
+                    .expect("donor deploy applies")
+                    .1
+                    .blocking_wait();
             })
             .await;
         let (capture, cold_keys, stores) = donor
@@ -6207,9 +6211,10 @@ mod tests {
             let engine = durable_engine(&journal_dir);
             engine
                 .with(|j| {
-                    let _ = j
-                        .apply_command_at(deploy_command(), 1)
-                        .expect("deploy applies");
+                    j.apply_command_at(deploy_command(), 1)
+                        .expect("deploy applies")
+                        .1
+                        .blocking_wait();
                 })
                 .await;
             let sm = PartitionStateMachine::new(
@@ -6594,9 +6599,10 @@ mod tests {
         let engine = durable_engine(&journal_dir);
         engine
             .with(|j| {
-                let _ = j
-                    .apply_command_at(deploy_command(), 1)
-                    .expect("local deploy applies");
+                j.apply_command_at(deploy_command(), 1)
+                    .expect("local deploy applies")
+                    .1
+                    .blocking_wait();
             })
             .await;
         let chain = ChainDigest::genesis(1);
@@ -6875,9 +6881,10 @@ mod tests {
         let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         engine
             .with(|j| {
-                let _ = j
-                    .apply_command_at(deploy_command(), 1)
-                    .expect("deploy applies");
+                j.apply_command_at(deploy_command(), 1)
+                    .expect("deploy applies")
+                    .1
+                    .blocking_wait();
             })
             .await;
         let sm: Arc<PartitionStateMachine> =
@@ -7012,9 +7019,10 @@ mod tests {
         // promptly reaps the superseded snapshot files already in its dir.
         let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         src.with(|j| {
-            let _ = j
-                .apply_command_at(deploy_command(), 1)
-                .expect("deploy applies");
+            j.apply_command_at(deploy_command(), 1)
+                .expect("deploy applies")
+                .1
+                .blocking_wait();
         })
         .await;
         let mut src_sm: Arc<PartitionStateMachine> =
@@ -7508,31 +7516,34 @@ mod tests {
             .expect("valid process");
         let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         src.with(|j| {
-            let _ = j
-                .apply_command_at(deploy_command(), 1)
-                .expect("deploy applies");
+            j.apply_command_at(deploy_command(), 1)
+                .expect("deploy applies")
+                .1
+                .blocking_wait();
         })
         .await;
         src.with(move |j| {
-            let _ = j
-                .apply_command_at(Command::DeployProcess(wait_proc), 2)
-                .expect("deploy wait proc applies");
+            j.apply_command_at(Command::DeployProcess(wait_proc), 2)
+                .expect("deploy wait proc applies")
+                .1
+                .blocking_wait();
         })
         .await;
         src.with(|j| {
-            let _ = j
-                .apply_command_at(
-                    Command::CreateInstance {
-                        process_id: "p".into(),
-                        variables: Default::default(),
-                        tags: Vec::new(),
-                        business_id: None,
-                        process_definition_key: None,
-                        version: None,
-                    },
-                    3,
-                )
-                .expect("create applies");
+            j.apply_command_at(
+                Command::CreateInstance {
+                    process_id: "p".into(),
+                    variables: Default::default(),
+                    tags: Vec::new(),
+                    business_id: None,
+                    process_definition_key: None,
+                    version: None,
+                },
+                3,
+            )
+            .expect("create applies")
+            .1
+            .blocking_wait();
         })
         .await;
         let active_key = src
@@ -7653,9 +7664,10 @@ mod tests {
         src_journal.set_cold_spill(Arc::clone(&store), 1, 0);
         let src = DeepthiHandle::spawn(src_journal, 0, None);
         src.with(move |j| {
-            let _ = j
-                .apply_command_at(Command::DeployProcess(wait_proc), 1)
-                .expect("deploy applies");
+            j.apply_command_at(Command::DeployProcess(wait_proc), 1)
+                .expect("deploy applies")
+                .1
+                .blocking_wait();
         })
         .await;
         let mut cold_keys = Vec::new();
@@ -7835,7 +7847,10 @@ mod tests {
         {
             let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
             src.with(|j| {
-                let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
+                j.apply_command_at(deploy_command(), 1)
+                    .expect("deploy")
+                    .1
+                    .blocking_wait();
             })
             .await;
             let mut src_sm: Arc<PartitionStateMachine> = Arc::new(
@@ -10327,7 +10342,10 @@ mod tests {
         let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         engine
             .with(|j| {
-                let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
+                j.apply_command_at(deploy_command(), 1)
+                    .expect("deploy")
+                    .1
+                    .blocking_wait();
             })
             .await;
         let sm: Arc<PartitionStateMachine> =
@@ -10470,7 +10488,10 @@ mod tests {
         let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         engine
             .with(|j| {
-                let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
+                j.apply_command_at(deploy_command(), 1)
+                    .expect("deploy")
+                    .1
+                    .blocking_wait();
             })
             .await;
         let sm: Arc<PartitionStateMachine> =
@@ -10626,7 +10647,10 @@ mod tests {
         // A source with a deployed definition, to produce a real snapshot.
         let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         src.with(|j| {
-            let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
+            j.apply_command_at(deploy_command(), 1)
+                .expect("deploy")
+                .1
+                .blocking_wait();
         })
         .await;
         let src_sm: Arc<PartitionStateMachine> =

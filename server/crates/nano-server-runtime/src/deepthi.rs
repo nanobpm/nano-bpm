@@ -564,13 +564,18 @@ impl DeepthiHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let job: Job = Box::new(move |journal| {
             // A dropped receiver (caller cancelled) is fine; the command still ran.
-            let _ = reply_tx.send(f(journal));
+            // The undeliverable reply may own pending commit receipts; nobody is
+            // left to wait on them, so drop it as detached rather than tripping
+            // the #1855 drop bomb on (and killing) the engine thread.
+            if let Err(undelivered) = reply_tx.send(f(journal)) {
+                crate::journal::Commit::detaching(move || drop(undelivered));
+            }
         });
         self.mb.push(Priority::High, job);
         // `Err` means the sender was dropped without answering: the actor is
         // dead and its `AliveGuard` drained the queue (the panic hook already
         // captured the cause).
-        reply_rx.await.ok()
+        DetachingReply(reply_rx).recv().await.ok()
     }
 
     /// Like [`with`](DeepthiHandle::with) but at [`Priority::Low`] — the engine
@@ -595,7 +600,12 @@ impl DeepthiHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let job: Job = Box::new(move |journal| {
             // A dropped receiver (caller cancelled) is fine; the command still ran.
-            let _ = reply_tx.send(f(journal));
+            // The undeliverable reply may own pending commit receipts; nobody is
+            // left to wait on them, so drop it as detached rather than tripping
+            // the #1855 drop bomb on (and killing) the engine thread.
+            if let Err(undelivered) = reply_tx.send(f(journal)) {
+                crate::journal::Commit::detaching(move || drop(undelivered));
+            }
         });
         self.mb.push(priority, job);
         // A `None` here means the engine thread unwound mid-command (its
@@ -608,7 +618,10 @@ impl DeepthiHandle {
             clippy::expect_used,
             reason = "a dead engine thread can never answer; AliveGuard + the panic hook already surfaced the fatal unwind"
         )]
-        reply_rx.await.expect("engine thread answered")
+        DetachingReply(reply_rx)
+            .recv()
+            .await
+            .expect("engine thread answered")
     }
 
     /// Enqueues `f` to run on the engine thread (at [`Priority::High`]) without
@@ -701,6 +714,30 @@ impl DeepthiHandle {
     }
 }
 
+/// Reply receiver that, if dropped before its value is taken (the awaiting
+/// caller was cancelled *after* the engine already sent the reply), discards
+/// the queued value inside [`Commit::detaching`](crate::journal::Commit::detaching)
+/// so a commit-bearing reply cannot trip the #1855 drop bomb on the caller's
+/// thread. The send-side counterpart is the `Err(undelivered)` arm in the job.
+struct DetachingReply<R>(oneshot::Receiver<R>);
+
+impl<R> DetachingReply<R> {
+    async fn recv(mut self) -> Result<R, oneshot::error::RecvError> {
+        (&mut self.0).await
+    }
+}
+
+impl<R> Drop for DetachingReply<R> {
+    fn drop(&mut self) {
+        // Close first so a racing send fails (and the job detaches it) rather
+        // than landing after we look; then drain anything already queued.
+        self.0.close();
+        if let Ok(queued) = self.0.try_recv() {
+            crate::journal::Commit::detaching(move || drop(queued));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -716,6 +753,75 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("condition not met within 3s");
+    }
+
+    /// #1855: a caller cancelled before its reply is delivered must not let the
+    /// undeliverable reply's pending `Commit` trip the drop bomb on (and kill)
+    /// the engine thread.
+    #[test]
+    fn cancelled_request_with_pending_commit_keeps_actor_alive() {
+        let h = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats = Arc::clone(h.stats());
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        h.spawn_job(move |_journal| {
+            let _ = gate_rx.recv();
+        });
+        let (_ack_tx, ack_rx) = oneshot::channel::<()>();
+        use std::future::Future;
+        let mut fut = Box::pin(h.with_priority(Priority::High, move |_journal| {
+            crate::journal::Commit::from_ack(ack_rx)
+        }));
+        // Poll once so the job is enqueued, then cancel the caller.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        drop(fut);
+        gate_tx.send(()).expect("release gate");
+        wait_until(|| stats.jobs.load(Ordering::Relaxed) >= 2);
+        h.spawn_job(|_journal| {});
+        wait_until(|| stats.jobs.load(Ordering::Relaxed) >= 3);
+        assert!(stats.alive.load(Ordering::Relaxed), "actor survived");
+    }
+
+    /// #1855 (cancel-after-send): the engine already delivered a
+    /// commit-bearing reply, then the caller is cancelled before polling again.
+    /// Dropping the caller's future must discard the queued reply as detached
+    /// instead of tripping the drop bomb on the caller's thread. Covers both
+    /// reply paths (`with_priority` and `try_with`).
+    #[test]
+    fn cancelled_after_send_drops_queued_commit_reply_silently() {
+        use std::future::Future;
+        let h = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let stats = Arc::clone(h.stats());
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+
+        // Each closure blocks on a gate until the caller's first poll has
+        // returned Pending, so the reply is deterministically sent AFTER that
+        // poll (no race where the engine replies before the first poll).
+        let (go_a, gate_a) = std::sync::mpsc::channel::<()>();
+        let (_ack_a, rx_a) = oneshot::channel::<()>();
+        let mut fut = Box::pin(h.with_priority(Priority::High, move |_journal| {
+            let _ = gate_a.recv();
+            crate::journal::Commit::from_ack(rx_a)
+        }));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        go_a.send(()).expect("release closure a");
+        wait_until(|| stats.jobs.load(Ordering::Relaxed) >= 1);
+        drop(fut); // reply is queued, never received
+
+        let (go_b, gate_b) = std::sync::mpsc::channel::<()>();
+        let (_ack_b, rx_b) = oneshot::channel::<()>();
+        let mut fut = Box::pin(h.try_with(move |_journal| {
+            let _ = gate_b.recv();
+            crate::journal::Commit::from_ack(rx_b)
+        }));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        go_b.send(()).expect("release closure b");
+        wait_until(|| stats.jobs.load(Ordering::Relaxed) >= 2);
+        drop(fut);
+
+        assert!(stats.alive.load(Ordering::Relaxed), "actor survived");
     }
 
     #[test]

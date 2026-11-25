@@ -3492,6 +3492,11 @@ pub struct ServerImpl {
     /// and consumed on the next park — the dispatcher never sleeps to the
     /// backstop tick while there is pushable work. See [`signal_jobs_available`].
     dispatch_wake: Arc<tokio::sync::Notify>,
+    /// Serializes deployment owners (#1855): each detached deploy owner holds
+    /// this across the deploy-actor apply, commit wait and partition fan-out, so
+    /// an identical retry (which emits no events) cannot return success while a
+    /// cancelled predecessor's fan-out of the same definition is still running.
+    deploy_pipeline: Arc<tokio::sync::Mutex<()>>,
     /// Notified by the read-model exporter after every projected batch, so an
     /// `awaitCompletion` create request can wake the moment its instance reaches
     /// a terminal state (the exporter is the single point through which all
@@ -4091,10 +4096,13 @@ impl ServerImpl {
                 .build()
                 .expect("valid demo process");
             // Seed durability is non-critical: a fresh journal re-seeds on every
-            // start, so we don't await the commit here.
-            let _ = journals[0]
+            // start, so we don't await the commit here — detached explicitly
+            // (#1855).
+            journals[0]
                 .apply_command(Command::DeployProcess(demo))
-                .expect("deploy demo process");
+                .expect("deploy demo process")
+                .1
+                .detach();
         }
         // Replicate the deployment partition's definitions to every other
         // partition (in-memory, not journaled — re-derived here on each restart
@@ -4468,6 +4476,7 @@ impl ServerImpl {
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
+            deploy_pipeline: Arc::new(tokio::sync::Mutex::new(())),
             instances_changed: Arc::new(tokio::sync::Notify::new()),
             backpressure,
             sla_mode,
@@ -18266,12 +18275,8 @@ impl ServerImpl {
                 )
                 .await
             {
-                Ok((result, events)) => {
-                    // The synced spec's deployment request has no
-                    // `operationReference` yet (camunda#67491 re-sync) — `None`.
-                    self.broadcast_deployment(&events, None).await;
-                    Ok(Resp::Status200_TheResourcesAreDeployed(result))
-                }
+                // Peer broadcast runs inside the detached deploy owner.
+                Ok((result, _events)) => Ok(Resp::Status200_TheResourcesAreDeployed(result)),
                 Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
                     400, detail,
                 ))),
@@ -18590,69 +18595,89 @@ impl ServerImpl {
             ),
             String,
         > =
-            self.engine
-                .deploy_partition()
-                .with(move |engine| {
-                    // One mixed deployment = ONE command = ONE deployment key
-                    // shared by every co-deployed resource, so
-                    // `bindingType: deployment` forms / linked resources resolve
-                    // (#1193). Never split it into per-kind commands.
-                    let (events, commit) = engine
-                        .apply_command(Command::DeployBundle(
-                            nanobpmn_engine_core::DeploymentBundle {
-                                processes,
-                                decisions,
-                                forms,
-                                resources: generic_resources,
-                            },
-                        ))
-                        .map_err(|e| e.to_string())?;
-                    let all_events = (*events).clone();
-                    let events = Arc::new(all_events);
-                    let resolved: Resolved = requested_ids
-                        .iter()
-                        .filter_map(|id| {
-                            engine
-                                .state()
-                                .processes
-                                .get(id)
-                                .map(|d| (id.clone(), d.key, d.version))
-                        })
-                        .collect();
-                    let resolved_drgs: ResolvedDrgs = requested_drg_ids
-                        .iter()
-                        .filter_map(|id| {
-                            engine
-                                .state()
-                                .decision_requirements
-                                .get(id)
-                                .map(|d| (id.clone(), d.drg.name.clone(), d.key, d.version))
-                        })
-                        .collect();
-                    let resolved_decisions: ResolvedDecisions = requested_drg_ids
-                        .iter()
-                        .filter_map(|id| engine.state().decision_requirements.get(id))
-                        .flat_map(|drg| {
-                            drg.drg
-                                .decisions
-                                .iter()
-                                .filter_map(|d| {
-                                    engine.state().decisions.get(&d.id).map(|dep| {
-                                        (
-                                            dep.decision_id.clone(),
-                                            dep.decision_name.clone(),
-                                            dep.key,
-                                            dep.version,
-                                            drg.drg.id.clone(),
-                                            drg.key,
-                                        )
+            {
+                // The actor round-trip, commit wait, and deployment fan-out run in
+                // ONE detached owner task (#1855, mirroring the create path's #1582
+                // owner): the deploy actor applies a queued command even after its
+                // reply receiver is dropped, so awaiting any of these inline let a
+                // cancelled caller persist a definition on partition 0 that was
+                // never replicated — and an identical retry emits no definition
+                // events, so it could not repair that. Awaiting the JoinHandle here
+                // only OBSERVES the outcome; dropping it leaves the task running.
+                let owner = self.clone();
+                #[allow(clippy::type_complexity)]
+                let deploy =
+                    move |engine: &mut Journal| -> Result<
+                        (
+                            Arc<Vec<Event>>,
+                            Commit,
+                            Resolved,
+                            ResolvedDrgs,
+                            ResolvedDecisions,
+                            ResolvedForms,
+                            ResolvedResources,
+                        ),
+                        String,
+                    > {
+                        // One mixed deployment = ONE command = ONE deployment key
+                        // shared by every co-deployed resource, so
+                        // `bindingType: deployment` forms / linked resources resolve
+                        // (#1193). Never split it into per-kind commands.
+                        let (events, commit) = engine
+                            .apply_command(Command::DeployBundle(
+                                nanobpmn_engine_core::DeploymentBundle {
+                                    processes,
+                                    decisions,
+                                    forms,
+                                    resources: generic_resources,
+                                },
+                            ))
+                            .map_err(|e| e.to_string())?;
+                        let all_events = (*events).clone();
+                        let events = Arc::new(all_events);
+                        let resolved: Resolved = requested_ids
+                            .iter()
+                            .filter_map(|id| {
+                                engine
+                                    .state()
+                                    .processes
+                                    .get(id)
+                                    .map(|d| (id.clone(), d.key, d.version))
+                            })
+                            .collect();
+                        let resolved_drgs: ResolvedDrgs = requested_drg_ids
+                            .iter()
+                            .filter_map(|id| {
+                                engine
+                                    .state()
+                                    .decision_requirements
+                                    .get(id)
+                                    .map(|d| (id.clone(), d.drg.name.clone(), d.key, d.version))
+                            })
+                            .collect();
+                        let resolved_decisions: ResolvedDecisions = requested_drg_ids
+                            .iter()
+                            .filter_map(|id| engine.state().decision_requirements.get(id))
+                            .flat_map(|drg| {
+                                drg.drg
+                                    .decisions
+                                    .iter()
+                                    .filter_map(|d| {
+                                        engine.state().decisions.get(&d.id).map(|dep| {
+                                            (
+                                                dep.decision_id.clone(),
+                                                dep.decision_name.clone(),
+                                                dep.key,
+                                                dep.version,
+                                                drg.drg.id.clone(),
+                                                drg.key,
+                                            )
+                                        })
                                     })
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .collect();
-                    let resolved_forms: ResolvedForms =
-                        requested_form_ids
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+                        let resolved_forms: ResolvedForms = requested_form_ids
                             .iter()
                             .filter_map(|id| {
                                 engine.state().forms.get(id).map(|f| {
@@ -18660,8 +18685,7 @@ impl ServerImpl {
                                 })
                             })
                             .collect();
-                    let resolved_resources: ResolvedResources =
-                        requested_resource_ids
+                        let resolved_resources: ResolvedResources = requested_resource_ids
                             .iter()
                             .filter_map(|id| {
                                 engine.state().resources.get(id).map(|r| {
@@ -18669,7 +18693,22 @@ impl ServerImpl {
                                 })
                             })
                             .collect();
-                    Ok((
+                        Ok((
+                            events,
+                            commit,
+                            resolved,
+                            resolved_drgs,
+                            resolved_decisions,
+                            resolved_forms,
+                            resolved_resources,
+                        ))
+                    };
+                let task = tokio::spawn(async move {
+                    // Held until the fan-out finishes: a retry's owner queues
+                    // behind any in-flight (possibly cancelled) deploy, so its
+                    // success implies every earlier apply is fully replicated.
+                    let _serial = owner.deploy_pipeline.clone().lock_owned().await;
+                    let (
                         events,
                         commit,
                         resolved,
@@ -18677,12 +18716,41 @@ impl ServerImpl {
                         resolved_decisions,
                         resolved_forms,
                         resolved_resources,
+                    ) = owner.engine.deploy_partition().with(deploy).await?;
+                    // Durability first, then replicate the new definition(s) to the
+                    // other local partitions so any of them can instantiate the
+                    // process (the deployment itself is journaled only on partition
+                    // 0; replication is in-memory and re-derived on restart), and
+                    // under Raft (RF>1) into any follower replica engine actors. An
+                    // idempotent redeploy emits no events, so these are no-ops.
+                    commit.wait().await;
+                    owner.replicate_deployment(&events).await;
+                    owner.install_into_raft_replicas(&events).await;
+                    // Peer broadcast belongs to the same detached, serialized
+                    // owner: a cancelled caller must not leave peers without
+                    // the definition (an identical retry emits no definition
+                    // events, so it could never repair them). The synced spec's
+                    // deployment request carries no `operationReference` yet
+                    // (camunda#67491 re-sync) — `None`.
+                    owner.broadcast_deployment(&events, None).await;
+                    Ok((
+                        events,
+                        Commit::ready(),
+                        resolved,
+                        resolved_drgs,
+                        resolved_decisions,
+                        resolved_forms,
+                        resolved_resources,
                     ))
-                })
-                .await;
+                });
+                match task.await {
+                    Ok(r) => r,
+                    Err(e) => Err(format!("deployment owner task failed: {e}")),
+                }
+            };
         let (
             events,
-            commit,
+            _durable,
             resolved,
             resolved_drgs,
             resolved_decisions,
@@ -18692,14 +18760,6 @@ impl ServerImpl {
             Ok(t) => t,
             Err(e) => return Err(("Invalid deployment", e)),
         };
-        // Replicate the new definition(s) to the other local partitions so any of
-        // them can instantiate the process (the deployment itself is journaled
-        // only on partition 0; replication is in-memory and re-derived on restart).
-        // An idempotent redeploy emits no events, so these are no-ops.
-        self.replicate_deployment(&events).await;
-        // Under Raft (RF>1) also fan into any follower replica engine actors so a
-        // replicated create of this definition applies on every replica.
-        self.install_into_raft_replicas(&events).await;
 
         // Every deploy emits a DeploymentCreated first (issue #47, Option B):
         // the engine mints the shared deployment key unconditionally so the
@@ -18812,12 +18872,11 @@ impl ServerImpl {
         );
         // Deployments don't create jobs, but a freshly available process means a
         // later createProcessInstance can; nothing to notify here.
-        commit.wait().await;
         Ok((result, events))
     }
 
     /// Runs a forwarded deploy on the partition-0 owner: parses, deploys locally,
-    /// broadcasts to peers, and returns the deployment JSON. Invoked by the
+    /// broadcasts to peers (inside the detached deploy owner), and returns the deployment JSON. Invoked by the
     /// `Deploy` falcon frame handler. `Err` is `(status, detail)`.
     #[allow(
         clippy::expect_used,
@@ -18829,7 +18888,7 @@ impl ServerImpl {
         tenant_id: String,
     ) -> Result<serde_json::Value, (u16, String)> {
         let parsed = parse_deploy_resources(&resources).map_err(|(_, detail)| (400u16, detail))?;
-        let (result, events) = self
+        let (result, _events) = self
             .deploy_resources_locally_with_forms(
                 parsed.processes,
                 &parsed.process_resource_names,
@@ -18841,9 +18900,8 @@ impl ServerImpl {
             )
             .await
             .map_err(|(_, detail)| (400u16, detail))?;
-        // The synced spec's deployment request carries no `operationReference`
-        // yet (it arrives with the camunda#67491 re-sync) — `None` here.
-        self.broadcast_deployment(&events, None).await;
+        // The peer broadcast runs inside the detached deploy owner, so it
+        // survives caller cancellation (#1855 review).
         Ok(serde_json::to_value(result).expect("deployment result serializes"))
     }
 
@@ -18870,29 +18928,42 @@ impl ServerImpl {
         events: Vec<Event>,
         operation_reference: Option<i64>,
     ) {
-        let handles = self.engine.all();
-        let events = Arc::new(events);
-        let durable = {
-            let events = Arc::clone(&events);
-            // Owner's durable commit under its shared guard.
-            let _lifecycle = handles[0].lifecycle_shared().await;
-            handles[0]
-                .with(move |journal| {
-                    journal.install_deployment_durable_ref(&events, operation_reference)
-                })
-                .await
-        };
-        for handle in handles.iter().skip(1) {
-            let events = Arc::clone(&events);
-            // Each sibling install under its own shared guard.
-            let _lifecycle = handle.lifecycle_shared().await;
-            handle
-                .with(move |journal| journal.install_deployment(&events))
-                .await;
+        // ONE detached owner task (#1855): the durable receipt is held across
+        // the sibling lifecycle/actor awaits and the Raft fan-out, so cancelling
+        // the caller mid-install must neither drop a pending `Commit` nor
+        // abandon the fan-out. The owner runs to completion regardless; the
+        // caller merely awaits its handle.
+        let owner = self.clone();
+        let task = tokio::spawn(async move {
+            let handles = owner.engine.all();
+            let events = Arc::new(events);
+            let durable = {
+                let events = Arc::clone(&events);
+                // Owner's durable commit under its shared guard.
+                let _lifecycle = handles[0].lifecycle_shared().await;
+                handles[0]
+                    .with(move |journal| {
+                        journal.install_deployment_durable_ref(&events, operation_reference)
+                    })
+                    .await
+            };
+            for handle in handles.iter().skip(1) {
+                let events = Arc::clone(&events);
+                // Each sibling install under its own shared guard.
+                let _lifecycle = handle.lifecycle_shared().await;
+                handle
+                    .with(move |journal| journal.install_deployment(&events))
+                    .await;
+            }
+            // Under Raft (RF>1) also fan into any follower replica engine actors.
+            owner.install_into_raft_replicas(&events).await;
+            durable.wait().await;
+        });
+        if let Err(e) = task.await
+            && e.is_panic()
+        {
+            std::panic::resume_unwind(e.into_panic());
         }
-        // Under Raft (RF>1) also fan into any follower replica engine actors.
-        self.install_into_raft_replicas(&events).await;
-        durable.wait().await;
     }
 
     /// Forwards a deploy to the partition-0 owner over the Falcon protocol and
@@ -28357,8 +28428,13 @@ fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now:
     if !lenient || journal.engine().replicated_lenient_completion() {
         return;
     }
-    if let Err(e) = journal.apply_command_at(Command::SetLenientCompletion { lenient }, now) {
-        tracing::error!("applying SetLenientCompletion {{ lenient: {lenient} }} failed: {e}");
+    match journal.apply_command_at(Command::SetLenientCompletion { lenient }, now) {
+        // Fire-and-forget: the flag is in-memory immediately and its
+        // durability rides on the next awaited commit / shutdown fsync (#1855).
+        Ok((_, commit)) => commit.detach(),
+        Err(e) => {
+            tracing::error!("applying SetLenientCompletion {{ lenient: {lenient} }} failed: {e}");
+        }
     }
 }
 
@@ -30955,7 +31031,7 @@ mod snapshot_health_tick_tests {
         {
             let (mut journal, _recovery) =
                 journal::Journal::open_segmented(&dir).expect("open segmented");
-            let _ = journal
+            journal
                 .apply_command(Command::DeployProcess(
                     nanobpmn_engine_core::ProcessBuilder::new("p")
                         .start_event("s")
@@ -30964,11 +31040,17 @@ mod snapshot_health_tick_tests {
                         .build()
                         .unwrap(),
                 ))
-                .unwrap();
+                .unwrap()
+                .1
+                .wait()
+                .await;
             for _ in 0..50 {
-                let _ = journal
+                journal
                     .apply_command(Command::create_instance("p"))
-                    .unwrap();
+                    .unwrap()
+                    .1
+                    .wait()
+                    .await;
             }
         } // crash: no snapshot was ever taken, nothing was compacted.
 
@@ -33039,17 +33121,21 @@ async fn main() {
                             // Without Raft this journal is the partition's only
                             // replica: reconcile the lenient flag directly (#1661).
                             reconcile_lenient_completion_local(journal, lenient, now);
-                            let (fired, _commit) = journal.trigger_timers(now);
+                            let (fired, commit) = journal.trigger_timers(now);
+                            // Fire-and-forget tick: nothing reads disk after it and
+                            // follow-ups are re-derived from engine state (#1855).
+                            commit.detach();
                             #[allow(
                                 clippy::expect_used,
                                 reason = "invariant by construction: ExpireJobsByDurability is an internal timer-driven command that cannot be rejected"
                             )]
-                            let (leased_expired, _lease_commit) = journal
+                            let (leased_expired, lease_commit) = journal
                                 .apply_command_at(
                                     Command::ExpireJobsByDurability { now, durable: true },
                                     now,
                                 )
                                 .expect("expiry cannot reject");
+                            lease_commit.detach();
                             let expired = journal.expire_jobs(now);
                             // Shed to disk if hot RAM is over the high-water mark
                             // (cheap no-op below it / when unset): active-backlog
@@ -34140,7 +34226,11 @@ mod clustered_startup_tests {
             .connect("work", "end")
             .build()
             .expect("valid demo process");
-        let _ = journal.apply_command(Command::DeployProcess(demo)).unwrap();
+        journal
+            .apply_command(Command::DeployProcess(demo))
+            .unwrap()
+            .1
+            .blocking_wait();
         let (events, _) = journal
             .apply_command(Command::create_instance("demo"))
             .unwrap();
@@ -34621,18 +34711,26 @@ mod clustered_startup_tests {
             .engine
             .deploy_partition()
             .with(move |journal| {
-                let _ = journal
+                journal
                     .apply_command(Command::DeployResources(vec![process]))
-                    .expect("deploy process");
-                let _ = journal
+                    .expect("deploy process")
+                    .1
+                    .blocking_wait();
+                journal
                     .apply_command(Command::DeployDecisionRequirements(vec![drg]))
-                    .expect("deploy DRG");
-                let _ = journal
+                    .expect("deploy DRG")
+                    .1
+                    .blocking_wait();
+                journal
                     .apply_command(Command::DeployForms(vec![form]))
-                    .expect("deploy form");
-                let _ = journal
+                    .expect("deploy form")
+                    .1
+                    .blocking_wait();
+                journal
                     .apply_command(Command::DeployGenericResources(vec![resource]))
-                    .expect("deploy resource");
+                    .expect("deploy resource")
+                    .1
+                    .blocking_wait();
                 journal.state().clone()
             })
             .await;
@@ -34719,9 +34817,10 @@ mod clustered_startup_tests {
             jobs[0].instance_key, orphan0,
             "the oldest instance activates first"
         );
-        let _ = j0
-            .apply_command(Command::complete_job(jobs[0].key))
-            .unwrap();
+        j0.apply_command(Command::complete_job(jobs[0].key))
+            .unwrap()
+            .1
+            .blocking_wait();
         // Crash here: the terminal eviction forget is lost; re-write the row.
         store.put_cold(orphan0, &orphan0_row).unwrap();
         assert!(store.try_get_cold(orphan0).unwrap().is_some());
@@ -34856,7 +34955,7 @@ mod clustered_startup_tests {
     async fn raft_start_requires_cluster_variables_from_recovered_state() {
         use nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_VARIABLES as F;
         let mut journal = Journal::in_memory();
-        let _ = journal
+        journal
             .apply_command_at(
                 Command::CreateClusterVariable {
                     tenant_id: None,
@@ -34868,8 +34967,10 @@ mod clustered_startup_tests {
                 },
                 1,
             )
-            .expect("create");
-        let _ = journal
+            .expect("create")
+            .1
+            .blocking_wait();
+        journal
             .apply_command_at(
                 Command::DeleteClusterVariable {
                     tenant_id: None,
@@ -34878,7 +34979,9 @@ mod clustered_startup_tests {
                 },
                 2,
             )
-            .expect("delete");
+            .expect("delete")
+            .1
+            .blocking_wait();
         let topology = cluster::Topology {
             node_id: 0,
             peers: vec![
@@ -34969,9 +35072,11 @@ mod clustered_startup_tests {
                 .try_get_cold(key)
                 .unwrap()
                 .expect("cold row present before the cancel");
-            let _ = scratch
+            scratch
                 .apply_command(Command::cancel_instance(key))
-                .unwrap();
+                .unwrap()
+                .1
+                .blocking_wait();
             assert!(
                 store.try_get_cold(key).unwrap().is_none(),
                 "the cancel's eviction forget dropped the row"
@@ -35058,9 +35163,11 @@ mod clustered_startup_tests {
                 .try_get_cold(key)
                 .unwrap()
                 .expect("cold row present before the cancel");
-            let _ = scratch
+            scratch
                 .apply_command(Command::cancel_instance(key))
-                .unwrap();
+                .unwrap()
+                .1
+                .blocking_wait();
             store.put_cold(key, &orphan_row).unwrap();
             key
         };
@@ -35482,6 +35589,48 @@ mod clustered_startup_tests {
         }
     }
 
+    /// #1855 review: cancelling `install_replicated_deployment` after the
+    /// durable owner has applied (its receipt is pending) while a sibling
+    /// install is blocked must neither panic (dropped pending `Commit`) nor
+    /// abandon the sibling fan-out.
+    #[tokio::test]
+    async fn cancelled_replicated_install_still_fans_out_to_siblings() {
+        let node1 = clustered_node(1);
+        let events = demo_deployment_events().await;
+        assert!(!events.is_empty());
+        let handles = node1.engine.all();
+        assert!(handles.len() >= 2, "needs a sibling partition");
+        let exclusive = handles[1].lifecycle_exclusive().await;
+        {
+            let mut install = Box::pin(node1.install_replicated_deployment(events, None));
+            loop {
+                use std::future::Future;
+                let done = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(install.as_mut().poll(cx).is_ready())
+                })
+                .await;
+                assert!(!done, "the blocked sibling install must hold the install");
+                if handles[0].with(|j| !j.state().processes.is_empty()).await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(install);
+        }
+        drop(exclusive);
+        // No reliance on scheduling or lock fairness: poll every partition
+        // (bounded) until the detached owner's install has landed there.
+        for handle in handles.iter() {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while handle.with(|j| j.state().processes.is_empty()).await {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the cancelled install still reached every partition");
+        }
+    }
+
     /// #1473 (review): the rebuild supervisor's health probe must SURVIVE the
     /// engine actor dying with the probe queued — the actor's death drains the
     /// mailbox, so an infallible `with` would panic here and unwind the
@@ -35605,6 +35754,85 @@ mod clustered_startup_tests {
             .await
             .expect("peer creates after the wire broadcast");
         assert!(!completed);
+    }
+
+    /// #1855 review: the peer broadcast must survive caller cancellation too.
+    /// A deploy cancelled mid-fan-out on the partition-0 owner, followed by an
+    /// identical retry (which emits no definition events), must still leave
+    /// the peer node able to create the process.
+    #[tokio::test]
+    async fn cancelled_deploy_still_broadcasts_to_peers() {
+        let node1 = clustered_node(1);
+        let registry = falcon::Registry::new();
+        falcon::spawn_dispatcher(node1.clone(), registry.clone());
+        let app = peer_facing_app(node1.clone(), registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://unused".into(), format!("http://127.0.0.1:{port}")],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node0 = build_server_in_memory(journals, topology);
+        let proc = ProcessBuilder::new("cancel-bcast")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("cancel-bcast".to_string(), "cancel-bcast.bpmn".to_string());
+        let empty = std::collections::HashMap::new();
+        let handles = node0.engine.all();
+        assert!(handles.len() >= 2, "node 0 owns a sibling partition");
+        let exclusive = handles[1].lifecycle_exclusive().await;
+        {
+            let mut deploy = Box::pin(node0.deploy_resources_locally(
+                vec![proc.clone()],
+                &names,
+                Vec::new(),
+                &empty,
+                "<default>",
+            ));
+            loop {
+                use std::future::Future;
+                let done = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(deploy.as_mut().poll(cx).is_ready())
+                })
+                .await;
+                assert!(!done, "the blocked sibling install must hold the deploy");
+                if handles[0]
+                    .with(|j| j.state().processes.contains_key("cancel-bcast"))
+                    .await
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(deploy);
+        }
+        drop(exclusive);
+        // Owners are serialized, so the retry returns only after the cancelled
+        // owner's fan-out and broadcast have completed.
+        node0
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &empty, "<default>")
+            .await
+            .expect("retry deploy");
+        node1
+            .create_for_stream(Some("cancel-bcast".into()), None, Default::default())
+            .await
+            .expect("peer creates after cancel + retry");
     }
 
     /// A runtime SLA switch on one node propagates over the Falcon peer link to
@@ -43211,6 +43439,19 @@ mod clustered_startup_tests {
         let node0 = build_node(0);
         let node1 = build_node(1);
 
+        // Serve both nodes' falcon endpoints BEFORE deploying: the deploy owner
+        // broadcasts the definition to peers (#1855), and a broadcast dial to an
+        // unserved peer would put that link into its dial cooldown, failing the
+        // publication-gate probe closed below.
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = peer_facing_app(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+
         // Deploy a message-start process (parks at a service task so the created
         // instances persist) on the owner and replicate the definition to node 1.
         let proc = ProcessBuilder::new("intake")
@@ -43236,16 +43477,6 @@ mod clustered_startup_tests {
         node1
             .install_replicated_deployment(events.to_vec(), None)
             .await;
-
-        // Serve both nodes' falcon endpoints on their pre-bound ports.
-        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
-            let registry = falcon::Registry::new();
-            falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = peer_facing_app(server.clone(), registry);
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.ok();
-            });
-        }
 
         // Publish many distinctly-keyed messages at the owner; each fires the
         // message-start subscription on partition 0 and dispatches the created
@@ -52854,6 +53085,81 @@ mod subscription_placement_tests {
           </bpmn:extensionElements>
         </bpmn:message>
       </bpmn:definitions>"#;
+
+    /// #1855 review: a deploy caller cancelled after its first poll (the
+    /// command is already queued on the deploy actor) must still fan the
+    /// definition out to every local partition. Before the detached owner, the
+    /// actor applied the deploy on partition 0 but nobody ran the replication,
+    /// and an identical retry emits no definition events, so it never repaired.
+    #[tokio::test]
+    async fn cancelled_deploy_still_replicates_to_every_partition() {
+        let server = single_node_multi_partition();
+        let proc = ProcessBuilder::new("cancel-deploy")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert(
+            "cancel-deploy".to_string(),
+            "cancel-deploy.bpmn".to_string(),
+        );
+        let empty = std::collections::HashMap::new();
+        // Block a sibling partition's install (a rebuild's exclusive hold), so
+        // the fan-out cannot finish before the caller is dropped.
+        let handles = server.engine.all();
+        let exclusive = handles[1].lifecycle_exclusive().await;
+        {
+            let mut deploy = Box::pin(server.deploy_resources_locally(
+                vec![proc.clone()],
+                &names,
+                Vec::new(),
+                &empty,
+                "<default>",
+            ));
+            // Drive the deploy until partition 0 has applied it.
+            loop {
+                use std::future::Future;
+                let done = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(deploy.as_mut().poll(cx).is_ready())
+                })
+                .await;
+                assert!(!done, "the blocked sibling install must hold the deploy");
+                if handles[0]
+                    .with(|j| j.state().processes.contains_key("cancel-deploy"))
+                    .await
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            // Explicitly drop the caller mid-fan-out.
+            drop(deploy);
+        }
+        drop(exclusive);
+        // An identical retry must leave every partition able to instantiate it.
+        // Deploy owners are serialized (`deploy_pipeline`), so the retry
+        // returns only after the cancelled owner's fan-out (if it applied
+        // first) has completed — the assertions below are race-free.
+        server
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &empty, "<default>")
+            .await
+            .expect("retry deploy");
+        // Bounded poll per partition: no dependence on owner scheduling.
+        for handle in server.engine.all().iter() {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !handle
+                    .with(|j| j.state().processes.contains_key("cancel-deploy"))
+                    .await
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("definition missing on a partition after cancel + retry");
+        }
+    }
 
     /// Signed timeout updates use canonical job lookup and validation; zero is
     /// a valid duration, not a transport-specific error masking an unknown job.

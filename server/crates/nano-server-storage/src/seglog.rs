@@ -3890,10 +3890,10 @@ mod tests {
             assert!(recovery.fresh);
             assert!(journal.is_segmented());
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             // The active segment keeps the historical name.
             assert!(dir.join(ACTIVE_NAME).exists());
@@ -3924,10 +3924,10 @@ mod tests {
 
             // First instance: goes into the active segment.
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key1 = events.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -3951,8 +3951,8 @@ mod tests {
 
             // Second instance: lands in the fresh active segment, after the
             // compacted prefix.
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key2 = events.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -3997,10 +3997,10 @@ mod tests {
                 Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
             journal.set_cold_spill(Arc::clone(&store), 1, 0);
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key = events.iter().find_map(|e| e.instance_key()).unwrap();
             assert!(journal.force_cold_spill_all() >= 1, "precondition: cold");
@@ -4058,10 +4058,10 @@ mod tests {
                 Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
             journal.set_cold_spill(Arc::clone(&store), 1, 0);
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key = events.iter().find_map(|e| e.instance_key()).unwrap();
             assert!(journal.force_cold_spill_all() >= 1, "precondition: cold");
@@ -4101,7 +4101,7 @@ mod tests {
             crate::journal::Journal::open_segmented(&dir).expect("open segmented");
         let shared = Arc::clone(&recovery.shared);
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
         let sealed_bytes = fs::metadata(&shared.sealed.lock().unwrap()[0].path)
@@ -4133,7 +4133,7 @@ mod tests {
             crate::journal::Journal::open_segmented(&dir).expect("open segmented");
         let shared = Arc::clone(&recovery.shared);
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let _ = journal.snapshot_and_rotate().expect("snapshot+rotate");
         let before = shared.uncompacted_usage();
@@ -4251,8 +4251,8 @@ mod tests {
         for i in 0..4 {
             let mut vars = std::collections::BTreeMap::new();
             vars.insert("data".to_string(), Value::Str(format!("payload-{i}")));
-            let (events, _) = journal
-                .apply_command(Command::create_instance_with("demo", vars))
+            let events = journal
+                .apply_synced(Command::create_instance_with("demo", vars))
                 .unwrap();
             keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
         }
@@ -4338,12 +4338,12 @@ mod tests {
             crate::journal::Journal::open_segmented(&dir).expect("open segmented");
 
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("data".to_string(), Value::Str("lost".to_string()));
-        let (events, _) = journal
-            .apply_command(Command::create_instance_with("demo", vars))
+        let events = journal
+            .apply_synced(Command::create_instance_with("demo", vars))
             .unwrap();
         let key = events.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -4412,19 +4412,19 @@ mod tests {
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
 
             let mut vars0 = std::collections::BTreeMap::new();
             vars0.insert("data".to_string(), Value::Str("p0-payload".to_string()));
-            let (e0, _) = j0
-                .apply_command(Command::create_instance_with("demo", vars0))
+            let e0 = j0
+                .apply_synced(Command::create_instance_with("demo", vars0))
                 .unwrap();
             let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
             let mut vars1 = std::collections::BTreeMap::new();
             vars1.insert("data".to_string(), Value::Str("p1-payload".to_string()));
-            let (e1, _) = j1
-                .apply_command(Command::create_instance_with("demo", vars1))
+            let e1 = j1
+                .apply_synced(Command::create_instance_with("demo", vars1))
                 .unwrap();
             let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -4485,10 +4485,10 @@ mod tests {
                 crate::journal::Journal::open_segmented(&dir).expect("open segmented");
             let shared = Arc::clone(&recovery.shared);
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key1 = events.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -4501,8 +4501,8 @@ mod tests {
             );
             assert!(list_sealed(&dir).unwrap().is_empty());
 
-            let (events, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let events = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key2 = events.iter().find_map(|e| e.instance_key()).unwrap();
             (key1, key2)
@@ -4532,7 +4532,7 @@ mod tests {
             crate::journal::Journal::open_segmented(&dir).expect("open segmented");
         let shared = Arc::clone(&recovery.shared);
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let older_end = older_generation.then(|| {
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
@@ -4540,8 +4540,8 @@ mod tests {
             assert_eq!(compact(&shared, covered), 1, "older generation archived");
             covered
         });
-        let (events, _) = journal
-            .apply_command(Command::create_instance("demo"))
+        let events = journal
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let key = events.iter().find_map(|e| e.instance_key()).unwrap();
         let stale = journal
@@ -4549,14 +4549,14 @@ mod tests {
             .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
             .expect("stamp the original report");
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let fresh = journal
             .engine()
             .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
             .expect("re-stamp the retry");
-        let (events, _) = journal
-            .apply_command(Command::QuarantineOffheapOrphan {
+        let events = journal
+            .apply_synced(Command::QuarantineOffheapOrphan {
                 instance_key: key,
                 stamp: Some(fresh),
             })
@@ -4569,7 +4569,7 @@ mod tests {
             })
             .expect("the retry quarantines");
         let _ = journal
-            .apply_command(Command::ResolveIncident { incident_key })
+            .apply_synced(Command::ResolveIncident { incident_key })
             .unwrap();
         let (mut snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
         // A pre-#1608 build never wrote the settlement map.
@@ -4578,8 +4578,8 @@ mod tests {
         assert!(snap.state.variables_lost_quarantined.is_empty());
         write_snapshot(&dir, snap, covered).expect("write snapshot");
         assert_eq!(compact(&shared, covered), 1, "prefix archived cold");
-        let (events, _) = journal
-            .apply_command(Command::QuarantineOffheapOrphan {
+        let events = journal
+            .apply_synced(Command::QuarantineOffheapOrphan {
                 instance_key: key,
                 stamp: Some(stale),
             })
@@ -4830,25 +4830,25 @@ mod tests {
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
 
             // Each partition: original report, retry, quarantine, resolve —
             // a legacy resolved loss episode per partition.
             let episode = |j: &mut crate::journal::Journal| {
-                let (events, _) = j.apply_command(Command::create_instance("demo")).unwrap();
+                let events = j.apply_synced(Command::create_instance("demo")).unwrap();
                 let key = events.iter().find_map(|e| e.instance_key()).unwrap();
                 let stale = j
                     .engine()
                     .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
                     .expect("stamp the original report");
-                let _ = j.apply_command(Command::create_instance("demo")).unwrap();
+                let _ = j.apply_synced(Command::create_instance("demo")).unwrap();
                 let fresh = j
                     .engine()
                     .orphan_incident_stamp(key, nanobpmn_engine_core::OrphanKind::Resident)
                     .expect("re-stamp the retry");
-                let (events, _) = j
-                    .apply_command(Command::QuarantineOffheapOrphan {
+                let events = j
+                    .apply_synced(Command::QuarantineOffheapOrphan {
                         instance_key: key,
                         stamp: Some(fresh),
                     })
@@ -4861,7 +4861,7 @@ mod tests {
                     })
                     .expect("the retry quarantines");
                 let _ = j
-                    .apply_command(Command::ResolveIncident { incident_key })
+                    .apply_synced(Command::ResolveIncident { incident_key })
                     .unwrap();
                 (key, stale)
             };
@@ -4889,8 +4889,8 @@ mod tests {
             // The delayed duplicate of each partition's ORIGINAL report lands
             // in the surviving tail (superseded — the episode is long over).
             for (j, key, stale) in [(&mut j0, key0, stale0), (&mut j1, key1, stale1)] {
-                let (events, _) = j
-                    .apply_command(Command::QuarantineOffheapOrphan {
+                let events = j
+                    .apply_synced(Command::QuarantineOffheapOrphan {
                         instance_key: key,
                         stamp: Some(stale),
                     })
@@ -5066,8 +5066,8 @@ mod tests {
                 reopened.instance(key2).is_some(),
                 "active tail restores key2"
             );
-            let (events, _) = reopened
-                .apply_command(Command::create_instance("demo"))
+            let events = reopened
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             events.iter().find_map(|e| e.instance_key()).unwrap()
         };
@@ -5087,10 +5087,10 @@ mod tests {
         let shared = Arc::clone(&recovery.shared);
 
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (_snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
         assert_eq!(shared.sealed.lock().unwrap().len(), 1);
@@ -5120,14 +5120,14 @@ mod tests {
         let (keys, all_events) = {
             let (mut journal, _recovery) =
                 crate::journal::Journal::open_segmented(&dir).expect("open segmented");
-            let (deploy_events, _) = journal
-                .apply_command(Command::DeployProcess(demo()))
+            let deploy_events = journal
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let mut keys = Vec::new();
             let mut all_events: Vec<Event> = deploy_events.iter().cloned().collect();
             for _ in 0..5 {
-                let (events, _) = journal
-                    .apply_command(Command::create_instance("demo"))
+                let events = journal
+                    .apply_synced(Command::create_instance("demo"))
                     .unwrap();
                 keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
                 all_events.extend(events.iter().cloned());
@@ -5137,8 +5137,8 @@ mod tests {
             write_snapshot(&dir, snap, covered).expect("write snapshot");
             // A couple more instances after the snapshot boundary.
             for _ in 0..2 {
-                let (events, _) = journal
-                    .apply_command(Command::create_instance("demo"))
+                let events = journal
+                    .apply_synced(Command::create_instance("demo"))
                     .unwrap();
                 keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
                 all_events.extend(events.iter().cloned());
@@ -5203,12 +5203,12 @@ mod tests {
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
             // Deploy on partition 0, replicate the definition in-memory to p1.
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
 
-            let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let e0 = j0.apply_synced(Command::create_instance("demo")).unwrap();
             let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
-            let (e1, _) = j1.apply_command(Command::create_instance("demo")).unwrap();
+            let e1 = j1.apply_synced(Command::create_instance("demo")).unwrap();
             let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
             assert_eq!(nanobpmn_engine_core::partition_of(key1), 1);
 
@@ -5294,10 +5294,10 @@ mod tests {
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
-            let _ = j0.apply_command(Command::create_instance("demo")).unwrap();
-            let _ = j1.apply_command(Command::create_instance("demo")).unwrap();
+            let _ = j0.apply_synced(Command::create_instance("demo")).unwrap();
+            let _ = j1.apply_synced(Command::create_instance("demo")).unwrap();
 
             let (snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
             let (snap1, covered1) = j1.snapshot_and_rotate().expect("snapshot p1");
@@ -5352,11 +5352,11 @@ mod tests {
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
 
             // Pre-snapshot instance on partition 0.
-            let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let e0 = j0.apply_synced(Command::create_instance("demo")).unwrap();
             let pre0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
 
             let (snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
@@ -5434,7 +5434,7 @@ mod tests {
             j0.set_varstore(Arc::clone(&varstore));
             j1.set_varstore(Arc::clone(&varstore));
 
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
 
             // Create with initial variables, then merge a second batch — all
@@ -5442,13 +5442,13 @@ mod tests {
             // snapshot, never in a variable-bearing snapshot).
             let mut init = BTreeMap::new();
             init.insert("a".to_string(), Value::Int(1i64));
-            let (e0, _) = j0
-                .apply_command(Command::create_instance_with("demo", init))
+            let e0 = j0
+                .apply_synced(Command::create_instance_with("demo", init))
                 .unwrap();
             let key = e0.iter().find_map(|e| e.instance_key()).unwrap();
             let mut pre = BTreeMap::new();
             pre.insert("b".to_string(), Value::Int(2i64));
-            let _ = j0.apply_command(Command::set_variables(key, pre)).unwrap();
+            let _ = j0.apply_synced(Command::set_variables(key, pre)).unwrap();
 
             // Lean checkpoint on both partitions: drain + control-only snapshot +
             // seal, then persist the delta to the store BEFORE writing the snapshot.
@@ -5546,7 +5546,7 @@ mod tests {
             j0.set_varstore(Arc::clone(&varstore));
             j1.set_varstore(Arc::clone(&varstore));
 
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
 
             // One instance per partition, then a lean checkpoint on both so the
@@ -5703,15 +5703,15 @@ mod tests {
             let spill = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
             j0.set_spill(spill, 0);
 
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
             let mut vars = std::collections::BTreeMap::new();
             vars.insert(
                 "data".to_string(),
                 Value::Str("spilled-payload".to_string()),
             );
-            let (e0, _) = j0
-                .apply_command(Command::create_instance_with("demo", vars))
+            let e0 = j0
+                .apply_synced(Command::create_instance_with("demo", vars))
                 .unwrap();
             let key = e0.iter().find_map(|e| e.instance_key()).unwrap();
             j0.force_spill_scan();
@@ -5770,7 +5770,7 @@ mod tests {
         // partition-0-keyed `ProcessDeployed` events a peer node would receive.
         let deploy_events: Vec<Event> = {
             let mut p0 = crate::journal::Journal::in_memory_partition(0);
-            let (evs, _) = p0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let evs = p0.apply_synced(Command::DeployProcess(demo())).unwrap();
             evs.iter().cloned().collect()
         };
         assert!(deploy_events.iter().all(|e| partition_of(e.max_key()) == 0));
@@ -5800,12 +5800,13 @@ mod tests {
 
             // Durable copy on the first-owned partition (tagged 1, keyed 0);
             // in-memory on the rest. Dropping the writer at block end flushes it.
-            let _ = j1.install_deployment_durable(&deploy_events);
+            j1.install_deployment_durable(&deploy_events)
+                .blocking_wait();
             j2.install_deployment(&deploy_events);
 
-            let (e1, _) = j1.apply_command(Command::create_instance("demo")).unwrap();
+            let e1 = j1.apply_synced(Command::create_instance("demo")).unwrap();
             let inst1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
-            let (e2, _) = j2.apply_command(Command::create_instance("demo")).unwrap();
+            let e2 = j2.apply_synced(Command::create_instance("demo")).unwrap();
             let inst2 = e2.iter().find_map(|e| e.instance_key()).unwrap();
             assert_eq!(partition_of(inst1), 1);
             assert_eq!(partition_of(inst2), 2);
@@ -5888,7 +5889,7 @@ mod tests {
                     version_tag: None,
                 }]),
             ] {
-                let (e, _) = p0.apply_command(cmd).unwrap();
+                let e = p0.apply_synced(cmd).unwrap();
                 evs.extend(e.iter().filter(|e| e.is_deployment()).cloned());
             }
             evs
@@ -5916,7 +5917,8 @@ mod tests {
             );
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j2.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
-            let _ = j1.install_deployment_durable(&deploy_events);
+            j1.install_deployment_durable(&deploy_events)
+                .blocking_wait();
             j2.install_deployment(&deploy_events);
             let seg = Arc::clone(&recovery.shared);
             let (snap1, covered1) = j1.snapshot_and_rotate().expect("flush via rotate");
@@ -6104,7 +6106,7 @@ mod tests {
         // Serialize real events by minting them through an in-memory journal, so
         // the reader exercises the true event JSON shape.
         let mut j = crate::journal::Journal::in_memory_partition(0);
-        let (deploy, _) = j.apply_command(Command::DeployProcess(demo())).unwrap();
+        let deploy = j.apply_synced(Command::DeployProcess(demo())).unwrap();
         let mut lines = Vec::new();
         let mut n_events: u64 = 0;
         for e in deploy.iter() {
@@ -6118,8 +6120,8 @@ mod tests {
                 "payload".to_string(),
                 nanobpmn_engine_core::Value::Str("y".repeat(16384)),
             );
-            let (evs, _) = j
-                .apply_command(Command::create_instance_with("demo", vars))
+            let evs = j
+                .apply_synced(Command::create_instance_with("demo", vars))
                 .unwrap();
             for e in evs.iter() {
                 lines.extend_from_slice(serde_json::to_string(e).unwrap().as_bytes());
@@ -6211,9 +6213,9 @@ mod tests {
 
         // Mint two real events so the reader exercises the true JSON shape.
         let mut j = crate::journal::Journal::in_memory_partition(0);
-        let (deploy, _) = j.apply_command(Command::DeployProcess(demo())).unwrap();
-        let (create, _) = j
-            .apply_command(Command::create_instance_with(
+        let deploy = j.apply_synced(Command::DeployProcess(demo())).unwrap();
+        let create = j
+            .apply_synced(Command::create_instance_with(
                 "demo",
                 std::collections::BTreeMap::new(),
             ))
@@ -6327,20 +6329,20 @@ mod tests {
                 crate::journal::Journal::open_segmented(&dir).expect("open segmented");
             let shared = Arc::clone(&recovery.shared);
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
             write_snapshot(&dir, snap, covered).expect("write snapshot");
             assert_eq!(compact(&shared, covered), 1, "sealed prefix compacted away");
             // Post-compaction, self-consistent tail.
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
         }
 
@@ -6428,20 +6430,20 @@ mod tests {
                 crate::journal::Journal::open_segmented(&dir).expect("open segmented");
             let shared = Arc::clone(&recovery.shared);
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
             write_snapshot(&dir, snap, covered).expect("write snapshot");
             assert_eq!(compact(&shared, covered), 1, "sealed prefix compacted away");
             // Post-compaction tail: a second live instance.
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
         }
 
@@ -6797,10 +6799,10 @@ mod tests {
 
         // Generation 1: deploy + instance, snapshot, compact -> archived, not gone.
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (snap1, covered1) = journal.snapshot_and_rotate().expect("snapshot 1");
         write_snapshot(&dir, snap1, covered1).expect("write snapshot 1");
@@ -6816,7 +6818,7 @@ mod tests {
 
         // Generation 2: another instance, snapshot, compact -> a second cold gen.
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let (snap2, covered2) = journal.snapshot_and_rotate().expect("snapshot 2");
         write_snapshot(&dir, snap2, covered2).expect("write snapshot 2");
@@ -6887,10 +6889,10 @@ mod tests {
             let shared = Arc::clone(&recovery.shared);
 
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (e1, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let e1 = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -6928,8 +6930,8 @@ mod tests {
 
         // KEY HIGH-WATER: a new instance must advance PAST every pre-migration
         // key — the exact #1065 `instance 41` rewind guard.
-        let (e3, _) = reopened
-            .apply_command(Command::create_instance("demo"))
+        let e3 = reopened
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let key3 = e3.iter().find_map(|e| e.instance_key()).unwrap();
         use nanobpmn_engine_core::local_of;
@@ -6962,10 +6964,10 @@ mod tests {
                 crate::journal::Journal::open_segmented(&dir).expect("open segmented");
             let shared = Arc::clone(&recovery.shared);
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (e1, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let e1 = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
@@ -7022,10 +7024,10 @@ mod tests {
                 crate::journal::Journal::open_segmented(&dir).expect("open segmented");
             let shared = Arc::clone(&recovery.shared);
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (e1, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let e1 = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
@@ -7111,10 +7113,10 @@ mod tests {
             let shared = Arc::clone(&recovery.shared);
 
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
-            let (e1, _) = journal
-                .apply_command(Command::create_instance("demo"))
+            let e1 = journal
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
 
@@ -7151,8 +7153,8 @@ mod tests {
         );
 
         // No key rewind: a fresh instance advances past every prior key.
-        let (e3, _) = reopened
-            .apply_command(Command::create_instance("demo"))
+        let e3 = reopened
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         let key3 = e3.iter().find_map(|e| e.instance_key()).unwrap();
         use nanobpmn_engine_core::local_of;
@@ -7184,10 +7186,10 @@ mod tests {
             let shared = Arc::clone(&recovery.shared);
 
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
             write_snapshot(&dir, snap, covered).expect("write snapshot");
@@ -7225,10 +7227,10 @@ mod tests {
             let shared = Arc::clone(&recovery.shared);
 
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
             write_snapshot(&dir, snap, covered).expect("write snapshot");
@@ -7278,10 +7280,10 @@ mod tests {
             let shared = Arc::clone(&recovery.shared);
 
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
             write_snapshot(&dir, snap, covered).expect("write snapshot");
@@ -7329,10 +7331,10 @@ mod tests {
             let shared = Arc::clone(&recovery.shared);
 
             let _ = journal
-                .apply_command(Command::DeployProcess(demo()))
+                .apply_synced(Command::DeployProcess(demo()))
                 .unwrap();
             let _ = journal
-                .apply_command(Command::create_instance("demo"))
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
             write_snapshot(&dir, snap, covered).expect("write snapshot");
@@ -7396,10 +7398,10 @@ mod tests {
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
 
-            let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let e0 = j0.apply_synced(Command::create_instance("demo")).unwrap();
             let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
             let (e1, c1) = j1.apply_command(Command::create_instance("demo")).unwrap();
             let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
@@ -7475,10 +7477,10 @@ mod tests {
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
-            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
 
-            let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let e0 = j0.apply_synced(Command::create_instance("demo")).unwrap();
             let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
             let (e1, c1) = j1.apply_command(Command::create_instance("demo")).unwrap();
             let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
@@ -7991,8 +7993,8 @@ mod tests {
                     );
                     // NoSilentRewind: the key generator is not rewound — a fresh instance
                     // advances strictly past every prior key.
-                    let (events, _) = journal
-                        .apply_command(Command::create_instance("demo"))
+                    let events = journal
+                        .apply_synced(Command::create_instance("demo"))
                         .expect("post-recovery instance creation");
                     let fresh = events
                         .iter()
@@ -8184,11 +8186,11 @@ mod tests {
                 j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
                 j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
-                let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+                let deploy_events = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
                 j1.install_deployment(&deploy_events);
-                let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+                let e0 = j0.apply_synced(Command::create_instance("demo")).unwrap();
                 let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
-                let (e1, _) = j1.apply_command(Command::create_instance("demo")).unwrap();
+                let e1 = j1.apply_synced(Command::create_instance("demo")).unwrap();
                 let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
                 assert_eq!(partition_of(key1), 1);
 
@@ -8392,7 +8394,7 @@ mod tests {
     /// `RaftEntryApplied` record of the same frame.
     fn digest_entry(journal: &mut crate::journal::Journal, index: u64, cmd: Command) {
         journal.begin_raft_entry();
-        let _ = journal.apply_command(cmd).unwrap();
+        let _ = journal.apply_synced(cmd).unwrap();
         let digest = journal.raft_entry_digest(index, false);
         let state = serde_json::json!({ "digest": digest }).to_string();
         let (_, commit) = journal.commit_raft_entry(index, state).unwrap();
@@ -8987,11 +8989,11 @@ mod tests {
     fn donor_snapshot(tag: &str) -> (nanobpmn_engine_core::EngineSnapshot, u64) {
         let dir = temp_dir(tag);
         let (mut donor, _) = crate::journal::Journal::open_segmented(&dir).expect("donor");
-        let _ = donor.apply_command(Command::DeployProcess(demo())).unwrap();
+        let _ = donor.apply_synced(Command::DeployProcess(demo())).unwrap();
         let mut last = 0;
         for _ in 0..3 {
-            let (ev, _) = donor
-                .apply_command(Command::create_instance("demo"))
+            let ev = donor
+                .apply_synced(Command::create_instance("demo"))
                 .unwrap();
             last = ev.iter().find_map(|e| e.instance_key()).unwrap();
         }
@@ -9007,7 +9009,7 @@ mod tests {
         let (snap, donor_key) = donor_snapshot(tag);
         let (mut journal, _) = crate::journal::Journal::open_segmented(dir).expect("open");
         let _ = journal
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .unwrap();
         journal.restore_engine_from_snapshot(snap);
         // The permit is mandatory on a segmented journal.
@@ -9019,7 +9021,7 @@ mod tests {
             .expect("checkpoint base");
         drop(permit);
         let _ = journal
-            .apply_command(Command::create_instance("demo"))
+            .apply_synced(Command::create_instance("demo"))
             .unwrap();
         donor_key
     }
@@ -9236,8 +9238,8 @@ mod tests {
                 &writer,
             );
             j0.set_exporter(tx, Arc::new(AtomicU64::new(0)));
-            let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
-            let _ = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let _ = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
+            let _ = j0.apply_synced(Command::create_instance("demo")).unwrap();
             let j0 = Arc::new(Mutex::new(j0));
             let captured = Arc::new(Barrier::new(2));
             let adopted = Arc::new(Barrier::new(2));
@@ -9311,7 +9313,7 @@ mod tests {
             );
             j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
             j0.set_varstore(Arc::clone(&varstore));
-            let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let _ = j0.apply_synced(Command::DeployProcess(demo())).unwrap();
             let (base, covered, _, _) = j0.snapshot_and_rotate_lean().expect("lean base");
             let engine1 = engines.remove(&1).unwrap().snapshot();
             write_multi_snapshot(&dir, vec![(0, covered, base), (1, 0, engine1)])
@@ -9402,7 +9404,7 @@ mod tests {
         }
         assert!(!j0.is_fenced(), "a published adoption supersedes the fence");
         let _ = j0
-            .apply_command(Command::DeployProcess(demo()))
+            .apply_synced(Command::DeployProcess(demo()))
             .expect("the adopted journal accepts commands");
         drop((j0, j1, writer));
         let _ = fs::remove_dir_all(&dir);
