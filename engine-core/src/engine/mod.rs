@@ -322,13 +322,15 @@ pub struct Engine {
     /// Still-open persistent subscriptions that took a buffered message and
     /// may take the next one (#1874). Per-command scratch.
     buffer_requeue: VecDeque<Key>,
-    /// Per-subscription ordered candidate queue of buffered message keys
-    /// (#1874): built once (one buffer scan + sort) the first time a
-    /// subscription consults the buffer in a command, then consumed from the
-    /// front, so draining N messages through a persistent subscription is
-    /// O(N log N) rather than N full scans. Per-command scratch; invalidated
-    /// whenever a message is buffered.
-    pub(crate) buffer_candidates: BTreeMap<Key, VecDeque<Key>>,
+    /// Resume cursor into the `buffered_by_correlation` index, shared by
+    /// every subscription of one instance on one (name, correlation key)
+    /// (#1874): the last index entry proven ineligible for that instance
+    /// (expired, or already correlated to it). Ineligibility is permanent
+    /// within a command, so each candidate is visited at most once per
+    /// (instance, name, key) — k catches over M matching messages cost
+    /// O(k + M), never O(k*M). Per-command scratch; reset whenever a
+    /// message is buffered.
+    pub(crate) buffer_candidates: BTreeMap<(Key, String, String), (u64, Key)>,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -5054,8 +5056,8 @@ impl Engine {
                             }
                         }
                     }
-                    // A new buffered message invalidates the cached
-                    // per-subscription candidate queues.
+                    // Reset the resume cursors when a message is
+                    // buffered (cheap; they rebuild lazily on next use).
                     self.buffer_candidates.clear();
                     self.emit(
                         &mut log,
@@ -7468,42 +7470,44 @@ impl Engine {
         false
     }
 
-    /// The oldest live buffered message the subscription may still take, from
-    /// its cached ordered candidate queue (built on first use this command).
+    /// The oldest live buffered message the subscription may still take:
+    /// a lazy range over its (name, correlation key) index set, resumed from
+    /// the instance's shared cursor (see `buffer_candidates`).
     fn next_buffered_candidate(
         &mut self,
         subscription_key: Key,
         now: u64,
     ) -> Option<&state::BufferedMessage> {
+        use std::ops::Bound;
         let subscription = self.state.message_subscriptions.get(&subscription_key)?;
         let instance_key = subscription.instance_key;
-        if !self.buffer_candidates.contains_key(&subscription_key) {
-            // Read only the (name, correlation key) set, already in seq
-            // order — never a scan of the whole buffer.
-            let candidates: VecDeque<Key> = self
-                .state
-                .buffered_by_correlation
-                .get(&(
-                    subscription.message_name.clone(),
-                    subscription.correlation_key.clone(),
-                ))
-                .map(|set| set.iter().map(|&(_, k)| k).collect())
-                .unwrap_or_default();
+        let index_key = (
+            subscription.message_name.clone(),
+            subscription.correlation_key.clone(),
+        );
+        let set = self.state.buffered_by_correlation.get(&index_key)?;
+        let cursor_key = (instance_key, index_key.0, index_key.1);
+        let lower = match self.buffer_candidates.get(&cursor_key) {
+            Some(&c) => Bound::Excluded(c),
+            None => Bound::Unbounded,
+        };
+        let mut found = None;
+        let mut last_skipped = None;
+        for &entry in set.range((lower, Bound::Unbounded)) {
             #[cfg(test)]
-            self.buffer_scan_count
-                .set(self.buffer_scan_count.get() + candidates.len());
-            self.buffer_candidates.insert(subscription_key, candidates);
-        }
-        let queue = self.buffer_candidates.get_mut(&subscription_key)?;
-        while let Some(&key) = queue.front() {
-            if self.state.buffered_messages.get(&key).is_some_and(|m| {
+            self.buffer_scan_count.set(self.buffer_scan_count.get() + 1);
+            if self.state.buffered_messages.get(&entry.1).is_some_and(|m| {
                 m.is_live_at(now) && !m.correlated_instances.contains(&instance_key)
             }) {
-                return self.state.buffered_messages.get(&key);
+                found = Some(entry.1);
+                break;
             }
-            queue.pop_front();
+            last_skipped = Some(entry);
         }
-        None
+        if let Some(c) = last_skipped {
+            self.buffer_candidates.insert(cursor_key, c);
+        }
+        self.state.buffered_messages.get(&found?)
     }
 
     /// One subscription's turn at the buffer (see
@@ -7524,10 +7528,6 @@ impl Engine {
             .get(&subscription_key)
             .filter(|s| s.state == state::MessageSubscriptionState::Open)
         else {
-            // A settled subscription never takes another message: evict
-            // its candidate queue so consecutive one-shot catches do not
-            // retain quadratic scratch (#1874).
-            self.buffer_candidates.remove(&subscription_key);
             return false;
         };
         let instance_key = subscription.instance_key;
@@ -7541,7 +7541,6 @@ impl Engine {
         // Ack-paced remote delivery is tracked in
         // https://github.com/nanobpm/nano-bpm/issues/1949.
         if state::partition_of(instance_key) != self.partition_id {
-            self.buffer_candidates.remove(&subscription_key);
             return false;
         }
         // A buffered message must never reach a child whose ancestor has
@@ -7592,8 +7591,6 @@ impl Engine {
             .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
         {
             self.buffer_requeue.push_back(subscription_key);
-        } else {
-            self.buffer_candidates.remove(&subscription_key);
         }
         true
     }

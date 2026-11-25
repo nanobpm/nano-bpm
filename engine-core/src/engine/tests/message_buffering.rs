@@ -678,8 +678,9 @@ fn non_interrupting_subscription_drains_the_whole_backlog_locally() {
         "every buffered message, in order: {events:?}"
     );
     // r4692584915: the backlog is drained from one ordered read of the
-    // matching index set — each message visited once, not once per message.
-    assert_eq!(engine.buffer_scan_count.get(), published.len());
+    // matching index set — each message visited at most twice (found, then
+    // stepped past on resume), never once per message.
+    assert!(engine.buffer_scan_count.get() <= 2 * published.len());
     // r4693206193: the per-command candidate cache does not outlive the
     // command (no idle retention).
     assert!(engine.buffer_candidates.is_empty());
@@ -1001,4 +1002,35 @@ fn opening_subscriptions_never_scan_unrelated_buffered_messages() {
             engine.state().buffered_by_correlation
         );
     }
+}
+
+/// Adversarial review (PR 1944): k one-shot catches of ONE instance on the
+/// same (name, correlation key) against M matching buffered messages must
+/// cost O(k + M) index visits, not O(k*M) — each catch resumes from the
+/// instance's shared cursor instead of re-reading the whole matching set.
+#[test]
+fn consecutive_catches_over_a_matching_backlog_visit_linearly() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(fan_out_catches(50)), 0)
+        .unwrap();
+    for _ in 0..1_000u64 {
+        engine
+            .apply_command_at(publish("m", "o-1", Some(100_000), None), 1_000)
+            .unwrap();
+    }
+    engine.buffer_scan_count.set(0);
+    let events = engine
+        .apply_command_at(
+            Command::create_instance_with("fan", vars(&[("orderId", Value::Str("o-1".into()))])),
+            1_500,
+        )
+        .unwrap();
+    assert_eq!(buffered_correlations(&events).len(), 50);
+    assert!(
+        engine.buffer_scan_count.get() <= 2 * (50 + 50),
+        "visits must be O(k + taken), got {}",
+        engine.buffer_scan_count.get()
+    );
+    assert!(engine.buffer_candidates.is_empty());
 }
