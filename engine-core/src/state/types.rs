@@ -2091,6 +2091,13 @@ pub struct MessageSubscription {
         serde(default, skip_serializing_if = "std::ops::Not::not")
     )]
     pub resume_pending: bool,
+    /// Instance-partition `Opening` record only (#1949): bumped on every
+    /// DEFERRED answer, carried through the resume handshake and its
+    /// confirmation. Only a confirmation of the current generation clears
+    /// `resume_pending`, so a delayed confirmation of an older resume cannot
+    /// erase a newer obligation. Additive.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub resume_generation: u64,
 }
 
 /// An in-flight buffered delivery awaiting its acknowledgement (#1949): see
@@ -2650,8 +2657,9 @@ pub struct State {
     /// Whether a replicated envelope has EVER enabled remote buffered
     /// delivery on this partition (#1949). One-way and snapshotted, so a
     /// replica restored from a snapshot keeps the same sticky decision as one
-    /// that applied the enabling envelope live. Set by
-    /// [`crate::Engine::set_remote_buffered_delivery`]. Additive.
+    /// that applied the enabling envelope live. Set only by applying
+    /// [`crate::Event::RemoteBufferedDeliveryActivated`], so journal replay
+    /// restores it too. Additive.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "std::ops::Not::not")

@@ -12381,11 +12381,13 @@ impl ServerImpl {
             Event::MessageSubscriptionResuming {
                 subscription_key,
                 correlation_key,
+                generation,
                 ..
             } => Some((
                 nanobpmn_engine_core::subscription_partition(correlation_key, num_partitions),
                 Command::ResumeMessageSubscription {
                     subscription_key: *subscription_key,
+                    generation: *generation,
                 },
             )),
             // Its confirmation (#1949) goes back to the instance's partition,
@@ -12393,11 +12395,13 @@ impl ServerImpl {
             Event::MessageSubscriptionResumed {
                 subscription_key,
                 instance_key,
+                generation,
                 ..
             } => Some((
                 nanobpmn_engine_core::partition_of(*instance_key),
                 Command::ConfirmMessageSubscriptionResume {
                     subscription_key: *subscription_key,
+                    generation: *generation,
                 },
             )),
             Event::MessageSubscriptionClosing {
@@ -21938,7 +21942,7 @@ impl ServerImpl {
                         engine.replicated_lenient_completion(),
                         engine.cluster_variables_ever_used(),
                         engine.message_buffering_ever_used(),
-                        engine.message_correlation_ack_ever_used(),
+                        engine.message_correlation_ack_required(),
                     ]
                 }),
             )
@@ -53969,6 +53973,22 @@ mod subscription_placement_tests {
             crate::publication_gate::GateWait::TimedOut,
             "the create's subscription open must be routed before the baseline"
         );
+        // Likewise the resume's handshake (#1949) is routed to the message
+        // partition asynchronously; wait for its confirmation record so it
+        // cannot fall into the post-cancel suffix either.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !read_journal().values().flatten().any(|r| {
+            matches!(
+                &r.event,
+                Event::MessageSubscriptionResumed { instance_key: k, .. } if *k == instance_key
+            )
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resume handshake was never confirmed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let before_cancel: std::collections::BTreeMap<_, usize> = read_journal()
             .into_iter()
             .map(|(p, recs)| (p, recs.len()))
@@ -56484,14 +56504,15 @@ mod subscription_placement_tests {
             subscription_key: instance_key + 1,
             instance_key,
             partition: 1,
+            generation: 4,
         };
         assert!(ServerImpl::is_routable_event(&resumed));
         let (target, command) = ServerImpl::route_event(&resumed, 4).expect("routable");
         assert_eq!(target, 3);
         assert!(matches!(
             command,
-            Command::ConfirmMessageSubscriptionResume { subscription_key }
-                if subscription_key == instance_key + 1
+            Command::ConfirmMessageSubscriptionResume { subscription_key, generation }
+                if subscription_key == instance_key + 1 && generation == 4
         ));
         assert!(ServerImpl::routed_command_is_idempotent(&command));
     }

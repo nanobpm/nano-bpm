@@ -662,9 +662,11 @@ mod codec_tests {
             },
             Command::ResumeMessageSubscription {
                 subscription_key: 1,
+                generation: 1,
             },
             Command::ConfirmMessageSubscriptionResume {
                 subscription_key: 1,
+                generation: 1,
             },
             correlate(Some(0)),
         ] {

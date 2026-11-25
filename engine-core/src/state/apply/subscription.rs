@@ -73,6 +73,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     awaiting_ack: None,
                     rescan_from: None,
                     resume_pending: false,
+                    resume_generation: 0,
                 },
             );
         }
@@ -105,6 +106,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     awaiting_ack: None,
                     rescan_from: None,
                     resume_pending: false,
+                    resume_generation: 0,
                 },
             );
         }
@@ -373,6 +375,9 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
                 if s.state == MessageSubscriptionState::Opening {
                     s.resume_pending = *deferred;
+                    if *deferred {
+                        s.resume_generation = s.resume_generation.wrapping_add(1);
+                    }
                 }
             }
             if *delivery_key != 0 {
@@ -388,12 +393,21 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
         }
 
         // The message partition confirmed the resume handshake (#1949).
+        // Only the CURRENT generation clears it: a delayed confirmation of an
+        // older resume must not erase a newer obligation.
         Event::MessageSubscriptionResumeConfirmed {
-            subscription_key, ..
+            subscription_key,
+            generation,
+            ..
         } => {
             if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
-                s.resume_pending = false;
+                if s.resume_generation == *generation {
+                    s.resume_pending = false;
+                }
             }
+        }
+        Event::RemoteBufferedDeliveryActivated { .. } => {
+            state.remote_buffered_delivery_latched = true;
         }
 
         Event::MessageStartSubscriptionCreated {

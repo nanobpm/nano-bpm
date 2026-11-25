@@ -127,12 +127,14 @@
   {
     "MessageSubscriptionResuming": {
       "correlation_key": "order-1",
+      "generation": 2,
       "instance_key": 23,
       "subscription_key": 21
     }
   },
   {
     "MessageSubscriptionResumed": {
+      "generation": 2,
       "instance_key": 23,
       "partition": 1,
       "subscription_key": 21
@@ -140,8 +142,14 @@
   },
   {
     "MessageSubscriptionResumeConfirmed": {
+      "generation": 2,
       "instance_key": 23,
       "subscription_key": 21
+    }
+  },
+  {
+    "RemoteBufferedDeliveryActivated": {
+      "partition": 1
     }
   },
   {

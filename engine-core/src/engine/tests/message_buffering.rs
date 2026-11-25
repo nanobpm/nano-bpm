@@ -834,16 +834,26 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
             },
         ),
         Event::MessageSubscriptionResuming {
-            subscription_key, ..
+            subscription_key,
+            generation,
+            ..
         } => (
             true,
-            Command::ResumeMessageSubscription { subscription_key },
+            Command::ResumeMessageSubscription {
+                subscription_key,
+                generation,
+            },
         ),
         Event::MessageSubscriptionResumed {
-            subscription_key, ..
+            subscription_key,
+            generation,
+            ..
         } => (
             false,
-            Command::ConfirmMessageSubscriptionResume { subscription_key },
+            Command::ConfirmMessageSubscriptionResume {
+                subscription_key,
+                generation,
+            },
         ),
         Event::MessageCorrelationAcknowledging {
             subscription_key,
@@ -1946,6 +1956,7 @@ fn resume_handshake_redelivers_a_deferred_backlog_across_a_restart() {
     let again = rig.on_message(
         Command::ResumeMessageSubscription {
             subscription_key: sub,
+            generation: 1,
         },
         3_100,
     );
@@ -2184,6 +2195,9 @@ fn remote_buffered_delivery_latch_survives_snapshot_restore() {
     let mut live = Engine::with_partition(1);
     live.set_num_partitions(Rig::N);
     live.set_remote_buffered_delivery(true);
+    // The enabling envelope rides a command; applying it records the latch.
+    live.apply_command_at(Command::TriggerTimers { now: 1 }, 1)
+        .unwrap();
     assert!(!live.message_correlation_ack_ever_used());
     let json = serde_json::to_string(&live.snapshot()).unwrap();
     let mut restored = Engine::from_snapshot(serde_json::from_str(&json).unwrap());
@@ -2373,9 +2387,160 @@ fn a_resume_with_an_empty_backlog_is_confirmed_and_not_redriven() {
     assert!(rig
         .on_instance(
             Command::ConfirmMessageSubscriptionResume {
-                subscription_key: sub
+                subscription_key: sub,
+                generation: rig.instance.state().message_subscriptions[&sub].resume_generation,
             },
             deadline + 3
         )
         .is_empty());
+}
+
+/// The instance partition's `Opening` record for the rig's single remote
+/// subscription.
+fn opening_record(rig: &Rig) -> state::MessageSubscription {
+    rig.instance
+        .state()
+        .message_subscriptions
+        .values()
+        .find(|s| s.state == state::MessageSubscriptionState::Opening)
+        .cloned()
+        .expect("an Opening record")
+}
+
+/// #1949 (Copilot r4699223004): the activation latch is recorded in the
+/// EVENT journal, so a replica recovered by journal replay (no snapshot) —
+/// with the enabling envelope already applied and before any paced send —
+/// still ignores a later disabled envelope, like the live replica.
+#[test]
+fn activation_latch_survives_journal_replay_before_any_paced_send() {
+    let (mut rig, _order) = Rig::new(non_interrupting_esp_process());
+    rig.message.set_remote_buffered_delivery(true);
+    rig.on_message(Command::TriggerTimers { now: 1_000 }, 1_000);
+    assert!(rig.message_journal.iter().any(
+        |e| matches!(e, Event::RemoteBufferedDeliveryActivated { partition: 1 }
+            if e.owning_partition() == 1)
+    ));
+    // Recorded once only.
+    let again = rig.on_message(Command::TriggerTimers { now: 1_001 }, 1_001);
+    assert!(!again
+        .iter()
+        .any(|e| matches!(e, Event::RemoteBufferedDeliveryActivated { .. })));
+    assert!(
+        !rig.message.message_correlation_ack_ever_used(),
+        "no paced send"
+    );
+    let mut replayed = Engine::replay_partition(1, rig.message_journal.clone());
+    replayed.set_num_partitions(Rig::N);
+    replayed.set_remote_buffered_delivery(false);
+    assert!(
+        replayed.message_correlation_ack_required(),
+        "the replayed replica keeps the latch (and requires the capability)"
+    );
+    rig.message.set_remote_buffered_delivery(false);
+    assert!(rig.message.message_correlation_ack_required());
+    assert_eq!(replayed.state(), rig.message.state());
+}
+
+/// #1949 (Copilot r4699223106): a recorded latch alone (no paced send yet)
+/// requires `message-correlation-ack-v1`; a partition never enabled does not.
+#[test]
+fn a_recorded_latch_requires_the_capability() {
+    let (mut rig, _order) = Rig::new(non_interrupting_esp_process());
+    rig.message.set_remote_buffered_delivery(false);
+    rig.on_message(Command::TriggerTimers { now: 1_000 }, 1_000);
+    assert!(!rig.message.message_correlation_ack_required());
+    rig.message.set_remote_buffered_delivery(true);
+    rig.on_message(Command::TriggerTimers { now: 1_001 }, 1_001);
+    rig.message.set_remote_buffered_delivery(false);
+    assert!(rig.message.message_correlation_ack_required());
+}
+
+/// #1949 (Copilot r4699223177): a resume handshake that arrives while the
+/// ORIGINAL deferred delivery still awaits its ack must NOT confirm — the
+/// delayed ack clears `awaiting_ack` without re-offering anything, so the
+/// instance partition has to keep owing (and re-driving) the handshake.
+#[test]
+fn a_resume_while_the_deferred_ack_is_in_flight_is_not_confirmed() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 1);
+    let (instance_key, held_acks) = create_suspended(&mut rig, &order, &is_ack);
+    assert_eq!(held_acks.len(), 1, "the deferral's ack is delayed");
+    rig.run(false, Command::ResumeInstance { instance_key }, 3_000);
+    assert!(
+        !rig.trace
+            .iter()
+            .any(|e| matches!(e, Event::MessageSubscriptionResumed { .. })),
+        "no confirmation while the ack is in flight: {:?}",
+        rig.trace
+    );
+    // The delayed original ack lands: nothing re-offered yet, still owed.
+    for (to_message, command) in held_acks {
+        rig.run(to_message, command, 3_100);
+    }
+    let owed: Vec<_> = rig
+        .instance
+        .pending_resume_handshakes()
+        .iter()
+        .filter_map(routed)
+        .collect();
+    assert_eq!(owed.len(), 1, "still owed: {:?}", rig.trace);
+    for (to_message, command) in owed {
+        rig.run(to_message, command, 3_200);
+    }
+    assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
+    assert!(rig.instance.pending_resume_handshakes().is_empty());
+}
+
+/// #1949 (Copilot r4699223241): only a confirmation of the CURRENT resume
+/// generation clears the obligation; a delayed confirmation of an older
+/// resume (a stale generation) is a no-op.
+#[test]
+fn a_stale_generation_confirmation_does_not_clear_a_newer_resume() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    rig.publish_backlog(&order, 1);
+    let (instance_key, _) = create_suspended(&mut rig, &order, &|_| false);
+    let record = opening_record(&rig);
+    assert!(record.resume_pending);
+    let current = record.resume_generation;
+    assert!(current > 0, "a deferral bumps the generation");
+    rig.on_instance(Command::ResumeInstance { instance_key }, 3_000);
+    let stale = rig.on_instance(
+        Command::ConfirmMessageSubscriptionResume {
+            subscription_key: record.key,
+            generation: current - 1,
+        },
+        3_001,
+    );
+    assert!(stale.is_empty(), "{stale:?}");
+    assert!(opening_record(&rig).resume_pending, "still owed");
+    let fresh = rig.on_instance(
+        Command::ConfirmMessageSubscriptionResume {
+            subscription_key: record.key,
+            generation: current,
+        },
+        3_002,
+    );
+    assert!(fresh
+        .iter()
+        .any(|e| matches!(e, Event::MessageSubscriptionResumeConfirmed { .. })));
+    assert!(!opening_record(&rig).resume_pending);
+}
+
+/// #1949 (Copilot r4699223301): an instance that still owes a resume
+/// handshake is never cold-spilled, so the resident re-drive scan keeps
+/// seeing the obligation; once confirmed it may spill again.
+#[test]
+fn an_instance_owing_a_resume_handshake_is_not_cold_spilled() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    rig.publish_backlog(&order, 1);
+    let (instance_key, _) = create_suspended(&mut rig, &order, &|_| false);
+    let lost = rig.run_holding(
+        false,
+        Command::ResumeInstance { instance_key },
+        3_000,
+        &|c| matches!(c, Command::ResumeMessageSubscription { .. }),
+    );
+    assert_eq!(lost.len(), 1);
+    assert!(rig.instance.snapshot_instance(instance_key).is_none());
+    assert_eq!(rig.instance.pending_resume_handshakes().len(), 1);
 }

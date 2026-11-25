@@ -7241,6 +7241,8 @@ fn project_event(
         | Event::MessageSubscriptionResuming { .. }
         | Event::MessageSubscriptionResumed { .. }
         | Event::MessageSubscriptionResumeConfirmed { .. }
+        // The activation latch (#1949) is partition bookkeeping.
+        | Event::RemoteBufferedDeliveryActivated { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }
@@ -14660,6 +14662,7 @@ mod element_instance_tests {
                 awaiting_ack: None,
                 rescan_from: None,
                 resume_pending: false,
+                resume_generation: 0,
             },
         );
         state.signal_subscriptions.insert(

@@ -2012,6 +2012,12 @@ pub enum Event {
         subscription_key: Key,
         instance_key: Key,
         correlation_key: String,
+        /// The `Opening` record's [`crate::state::MessageSubscription::resume_generation`]
+        /// this handshake answers, echoed back through the confirmation so a
+        /// delayed confirmation of an OLDER resume never clears a newer
+        /// obligation. Additive.
+        #[cfg_attr(feature = "serde", serde(default))]
+        generation: u64,
     },
     /// The message partition processed a resume handshake (#1949): from
     /// here on its own durable state (`awaiting_ack` of any re-offered
@@ -2025,6 +2031,10 @@ pub enum Event {
         subscription_key: Key,
         instance_key: Key,
         partition: u64,
+        /// The handshake's generation, echoed (see
+        /// [`Event::MessageSubscriptionResuming`]). Additive.
+        #[cfg_attr(feature = "serde", serde(default))]
+        generation: u64,
     },
     /// The instance partition received the message partition's
     /// [`Event::MessageSubscriptionResumed`] confirmation (#1949): clears the
@@ -2032,7 +2042,18 @@ pub enum Event {
     MessageSubscriptionResumeConfirmed {
         subscription_key: Key,
         instance_key: Key,
+        /// The confirmed generation; it matched the record's current one.
+        /// Additive.
+        #[cfg_attr(feature = "serde", serde(default))]
+        generation: u64,
     },
+    /// A replicated envelope enabled remote buffered delivery on this
+    /// partition for the first time (#1949). Recorded in the journal so event
+    /// replay (not only a snapshot) restores the one-way activation latch:
+    /// a replica recovered from the journal then ignores a later disabled
+    /// envelope exactly like one that applied the enabling envelope live.
+    /// Partition-level; names no instance.
+    RemoteBufferedDeliveryActivated { partition: u64 },
     /// A process-level message start subscription was opened at deploy time: a
     /// later [`Event::MessagePublished`] with a matching `message_name` creates a
     /// new instance of `process_id`. Carried on the log so replay reconstructs
@@ -2424,6 +2445,7 @@ impl Event {
             | Event::BufferedMessageCorrelated { .. }
             | Event::MessageCorrelationAcknowledged { .. }
             | Event::MessageSubscriptionResumed { .. }
+            | Event::RemoteBufferedDeliveryActivated { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
@@ -2597,7 +2619,8 @@ impl Event {
             | Event::BufferedMessageCorrelated { partition, .. }
             | Event::MessageCorrelationAcknowledging { partition, .. }
             | Event::MessageCorrelationAcknowledged { partition, .. }
-            | Event::MessageSubscriptionResumed { partition, .. } => *partition,
+            | Event::MessageSubscriptionResumed { partition, .. }
+            | Event::RemoteBufferedDeliveryActivated { partition } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another
             // partition, so it never identifies the record's owner. Route by the

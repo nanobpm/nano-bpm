@@ -1181,17 +1181,22 @@ fn build_event_witnesses() -> Vec<Event> {
             subscription_key: 21,
             instance_key: 23,
             correlation_key: "order-1".into(),
+            generation: 2,
         },
         // #1949 resume confirmation (additive variants).
         Event::MessageSubscriptionResumed {
             subscription_key: 21,
             instance_key: 23,
             partition: 1,
+            generation: 2,
         },
         Event::MessageSubscriptionResumeConfirmed {
             subscription_key: 21,
             instance_key: 23,
+            generation: 2,
         },
+        // #1949 activation latch record (additive variant).
+        Event::RemoteBufferedDeliveryActivated { partition: 1 },
         Event::MessageCorrelationAcknowledged {
             subscription_key: 21,
             message_key: 20,

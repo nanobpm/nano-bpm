@@ -359,6 +359,10 @@ pub struct Engine {
     /// open remote subscription that opened while the gate was closed.
     /// Per-command scratch, consumed by `plan_command_at`.
     remote_backlog_scan_pending: bool,
+    /// The CURRENT replicated envelope's remote-buffered-delivery bit (#1949),
+    /// as last passed to [`Engine::set_remote_buffered_delivery`]. Drives the
+    /// one-time [`Event::RemoteBufferedDeliveryActivated`] record.
+    remote_buffered_delivery_envelope: bool,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -814,6 +818,7 @@ impl Engine {
             pending_correlation_ack: None,
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
+            remote_buffered_delivery_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
@@ -865,20 +870,38 @@ impl Engine {
     /// (the resume handshake would be skipped) and stop remote buffered
     /// delivery cluster-wide during an ordinary tolerated outage.
     ///
-    /// The latch lives in snapshotted state, so a replica restored from a
-    /// snapshot taken after the enabling envelope agrees with one that applied
-    /// it live. On the first disabled-to-enabled transition every open remote
-    /// subscription is offered its backlog on the next apply, so one that
-    /// opened while the gate was closed does not wait for a new publication.
+    /// The latch lives in durable state, set only by applying
+    /// [`Event::RemoteBufferedDeliveryActivated`]: the first command that
+    /// applies successfully under an enabling envelope records it, so BOTH a
+    /// snapshot and journal replay restore the latch (a replica recovered
+    /// from either agrees with one that applied the envelope live). On the
+    /// first disabled-to-enabled transition every open remote subscription is
+    /// offered its backlog on the next apply, so one that opened while the
+    /// gate was closed does not wait for a new publication.
     pub fn set_remote_buffered_delivery(&mut self, enabled: bool) {
-        let was = self.remote_buffered_delivery_active();
-        if enabled {
-            self.state.remote_buffered_delivery_latched = true;
-        }
-        self.remote_buffered_delivery = self.remote_buffered_delivery_active();
+        let was = self.remote_buffered_delivery;
+        self.remote_buffered_delivery_envelope = enabled;
+        self.remote_buffered_delivery = enabled || self.remote_buffered_delivery_active();
         if self.remote_buffered_delivery && !was {
             self.remote_backlog_scan_pending = true;
         }
+    }
+
+    /// Records the one-way activation latch (#1949) in the event log the
+    /// first time a command applies under an enabling envelope.
+    fn emit_remote_buffered_delivery_activation(&mut self, log: &mut Vec<Event>) {
+        if self.remote_buffered_delivery_envelope && !self.state.remote_buffered_delivery_latched {
+            let partition = self.partition_id;
+            self.emit(log, Event::RemoteBufferedDeliveryActivated { partition });
+        }
+    }
+
+    /// Whether this partition's retained log/snapshot depends on
+    /// `message-correlation-ack-v1` (#1949): the activation latch is recorded
+    /// (later disabled envelopes are ignored, so a legacy peer would diverge)
+    /// or an ack-paced delivery was ever sent. One-way.
+    pub fn message_correlation_ack_required(&self) -> bool {
+        self.remote_buffered_delivery_active()
     }
 
     /// The durable gate decision: latched on, or ack-paced delivery used.
@@ -1051,6 +1074,7 @@ impl Engine {
             pending_correlation_ack: None,
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
+            remote_buffered_delivery_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,
@@ -2700,6 +2724,7 @@ impl Engine {
                     self.run(&mut log, queue);
                     self.cascade_cancel_children(&mut log, 0);
                     self.emit_pending_correlation_ack(&mut log);
+                    self.emit_remote_buffered_delivery_activation(&mut log);
                     self.remote_backlog_scan_pending = false;
                     // Every engine test exercises the parent -> children index the
                     // cascade reads (#1827): a write path that bypassed it fails here.
@@ -5623,13 +5648,15 @@ impl Engine {
                 }
             }
 
-            Command::ResumeMessageSubscription { subscription_key } => {
+            Command::ResumeMessageSubscription {
+                subscription_key,
+                generation,
+            } => {
                 // The resume handshake (#1949): re-offer the backlog to an
-                // open subscription with nothing in flight. Anything else
-                // (closed, awaiting an ack, unknown) is a no-op — idempotent.
-                // A settled (closed / unknown) subscription is a no-op: its
-                // instance record already left `Opening` via the routed
-                // close or correlation, so nothing is owed.
+                // open subscription with nothing in flight. A settled
+                // (closed / unknown) subscription is a no-op: its instance
+                // record already left `Opening` via the routed close or
+                // correlation, so nothing is owed.
                 let Some(s) = self
                     .state
                     .message_subscriptions
@@ -5638,10 +5665,16 @@ impl Engine {
                 else {
                     return Ok((log, queue));
                 };
-                if s.awaiting_ack.is_none() {
-                    self.buffer_requeue.push_back(subscription_key);
+                // A delivery still awaits its ack (e.g. the original deferred
+                // ack is delayed): do NOT confirm. That ack may clear
+                // `awaiting_ack` without re-offering anything, so the instance
+                // partition must keep re-driving the handshake until it lands
+                // on a subscription with nothing in flight.
+                if s.awaiting_ack.is_some() {
+                    return Ok((log, queue));
                 }
-                // Confirm an open one (whatever the backlog holds): from here this
+                self.buffer_requeue.push_back(subscription_key);
+                // Confirm (whatever the backlog holds): from here this
                 // partition's own durable state re-drives any re-offered
                 // delivery, so the instance partition must stop re-driving
                 // the handshake — an empty backlog would otherwise never
@@ -5650,20 +5683,27 @@ impl Engine {
                     subscription_key,
                     instance_key: s.instance_key,
                     partition: self.partition_id,
+                    generation,
                 };
                 self.emit(&mut log, event);
             }
 
-            Command::ConfirmMessageSubscriptionResume { subscription_key } => {
+            Command::ConfirmMessageSubscriptionResume {
+                subscription_key,
+                generation,
+            } => {
+                // Only the CURRENT generation's confirmation counts: a delayed
+                // confirmation of an older resume is a no-op.
                 if let Some(s) = self
                     .state
                     .message_subscriptions
                     .get(&subscription_key)
-                    .filter(|s| s.resume_pending)
+                    .filter(|s| s.resume_pending && s.resume_generation == generation)
                 {
                     let event = Event::MessageSubscriptionResumeConfirmed {
                         subscription_key,
                         instance_key: s.instance_key,
+                        generation,
                     };
                     self.emit(&mut log, event);
                 }
@@ -7905,6 +7945,7 @@ impl Engine {
                 subscription_key: s.key,
                 instance_key: s.instance_key,
                 correlation_key: s.correlation_key.clone(),
+                generation: s.resume_generation,
             })
             .collect()
     }
@@ -8140,6 +8181,7 @@ impl Engine {
             subscription_key,
             instance_key: s.instance_key,
             correlation_key: s.correlation_key.clone(),
+            generation: s.resume_generation,
         };
         self.emit(log, event);
     }

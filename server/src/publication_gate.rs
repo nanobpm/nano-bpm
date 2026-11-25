@@ -589,6 +589,7 @@ mod tests {
             subscription_key: 7,
             instance_key: 8,
             correlation_key: "k".into(),
+            generation: 1,
         };
         let stalled = StalledDeliveries::default();
         assert!(stalled.due(vec![resuming.clone()]).is_empty());

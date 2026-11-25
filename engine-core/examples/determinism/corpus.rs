@@ -1251,7 +1251,10 @@ fn routed_protocol_entries() -> Vec<Command> {
 
     // (7): a resume handshake (#1949) for the now-closed subscription is a
     // no-op too (only an open, non-awaiting subscription is re-offered).
-    let resume = Command::ResumeMessageSubscription { subscription_key };
+    let resume = Command::ResumeMessageSubscription {
+        subscription_key,
+        generation: 0,
+    };
     let resumed = message_partition
         .apply_command_at(resume.clone(), T0 + 7)
         .expect("a resume handshake applies on the message partition");
@@ -1259,7 +1262,10 @@ fn routed_protocol_entries() -> Vec<Command> {
 
     // (8): a stale resume confirmation (#1949) on the instance partition —
     // the subscription is no longer awaiting a resume, so it is a no-op.
-    let confirm = Command::ConfirmMessageSubscriptionResume { subscription_key };
+    let confirm = Command::ConfirmMessageSubscriptionResume {
+        subscription_key,
+        generation: 0,
+    };
     let confirmed = instance_partition
         .apply_command_at(confirm.clone(), T0 + 8)
         .expect("a resume confirmation applies on the instance partition");
