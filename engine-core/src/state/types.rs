@@ -2399,6 +2399,13 @@ pub struct BufferedMessage {
     /// Instances this message already correlated to (Zeebe
     /// `existMessageCorrelation`): never correlated to them again.
     pub correlated_instances: BTreeSet<Key>,
+    /// Message-partition-local enqueue order (#1874): the position of this
+    /// message's `MessageBuffered` among every message this partition ever
+    /// buffered. Buffered correlation takes the OLDEST eligible message by
+    /// this, never by `key` — a key pre-minted by another partition (#1434)
+    /// does not sort in arrival order. Derived on apply, so replay restores it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub seq: u64,
 }
 
 impl BufferedMessage {
@@ -2506,6 +2513,11 @@ pub struct State {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub buffered_messages: BTreeMap<Key, BufferedMessage>,
+    /// Next [`BufferedMessage::seq`] to assign (#1874): bumped by every
+    /// applied `MessageBuffered`, never reused (an expired or removed message
+    /// leaves its slot behind), so enqueue order is total and replayable.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub next_buffered_seq: u64,
     /// Open and settled **signal** subscriptions, keyed by subscription key. A
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) as an audit trail.

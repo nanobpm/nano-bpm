@@ -4950,28 +4950,7 @@ impl Engine {
                     }
                 }
 
-                // Buffer the message until its deadline (#1874): a subscription
-                // opened before then correlates it (see
-                // `correlate_buffered_messages`). TTL 0 never buffers.
-                if buffers_here && time_to_live > 0 {
-                    self.emit(
-                        &mut log,
-                        Event::MessageBuffered {
-                            message_key,
-                            partition: self.partition_id,
-                            message_name: message_name.clone(),
-                            correlation_key: correlation_key.clone(),
-                            deadline: now.saturating_add(time_to_live),
-                            message_id: message_id.clone(),
-                            variables: variables.clone(),
-                            correlated_instances: correlated_instances.iter().copied().collect(),
-                        },
-                    );
-                    // Subscriptions opened later in THIS command (e.g. by the
-                    // tokens the publish just advanced) may take it too.
-                    self.buffer_scan_from = log.len();
-                }
-
+                let starts_from = log.len();
                 // Message start events: a matching message also creates a new
                 // instance of every process subscribed at the process level —
                 // but only when the message was not already claimed by an open
@@ -5013,6 +4992,45 @@ impl Engine {
                             correlation_key: correlation_key.clone(),
                         }),
                     );
+                }
+                // Buffer the message until its deadline (#1874): a subscription
+                // opened before then correlates it (see
+                // `correlate_buffered_messages`). TTL 0 never buffers. Emitted
+                // AFTER the message starts so the per-instance ledger also
+                // records every instance this publication started inline: a
+                // catch in that instance must wait for ANOTHER message, never
+                // consume the one that created it (Zeebe
+                // `existMessageCorrelation`).
+                if buffers_here && time_to_live > 0 {
+                    for e in &log[starts_from..] {
+                        if let Event::MessageStartEventCorrelated {
+                            message_key: k,
+                            instance_key,
+                            ..
+                        } = e
+                        {
+                            if *k == message_key {
+                                correlated_instances.insert(*instance_key);
+                            }
+                        }
+                    }
+                    self.emit(
+                        &mut log,
+                        Event::MessageBuffered {
+                            message_key,
+                            partition: self.partition_id,
+                            message_name: message_name.clone(),
+                            correlation_key: correlation_key.clone(),
+                            deadline: now.saturating_add(time_to_live),
+                            message_id: message_id.clone(),
+                            variables: variables.clone(),
+                            correlated_instances: correlated_instances.iter().copied().collect(),
+                        },
+                    );
+                    // Subscriptions opened later in THIS command (by the tokens
+                    // the publish advanced or the instances it started) may
+                    // take it too; they are all still queued, so scan from here.
+                    self.buffer_scan_from = log.len();
                 }
             }
 
@@ -6982,6 +7000,23 @@ impl Engine {
             // disarms it. A fire enqueues work, which the loop drains before the
             // sweep reconsiders the scope.
             cursor = self.reevaluate_conditionals(log, &mut queue, cursor);
+            // A subscription opened during this drain may take a buffered
+            // message (#1874). Like the conditional re-evaluation above, this
+            // runs BEFORE the drained-scope / instance-completion sweeps: a
+            // message event sub-process armed with a scope whose main flow has
+            // already drained gets its buffered-correlation opportunity before
+            // the sweep completes the scope and disarms it. A correlation
+            // enqueues work; drain it (the sweeps re-run after).
+            if queue.is_empty() {
+                let buffered_from = log.len();
+                self.correlate_buffered_messages(log, &mut queue);
+                if log.len() > buffered_from {
+                    if let Drive::Pause = driver.after_step(&log[drain_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                    continue;
+                }
+            }
             let mut swept = false;
             if queue.is_empty() {
                 let sweep_from = log.len();
@@ -7050,16 +7085,6 @@ impl Engine {
                         return Some(Paused { queue, cursor });
                     }
                 }
-            }
-            // Quiescent: a subscription opened during this drain may take a
-            // buffered message (#1874). A correlation enqueues work; drain it.
-            let buffered_from = log.len();
-            self.correlate_buffered_messages(log, &mut queue);
-            if log.len() > buffered_from {
-                if let Drive::Pause = driver.after_step(&log[buffered_from..]) {
-                    return Some(Paused { queue, cursor });
-                }
-                continue;
             }
             if let Some(fire) = self.pending_timer_fires.pop_front() {
                 let fired_from = log.len();
@@ -7313,28 +7338,37 @@ impl Engine {
     /// Correlates buffered messages (#1874) to the message subscriptions opened
     /// since `buffer_scan_from` — Zeebe `MessageSubscriptionCreateProcessor` →
     /// `correlateNextMessage`: each newly opened, still-open subscription takes
-    /// the oldest (lowest-keyed) live buffered message with its name and
-    /// correlation key that has not already correlated to its instance. A local
-    /// instance advances inline; a remote one is settled here and handed to
-    /// the host as a [`Event::RemoteMessageCorrelation`]. A suspended local
-    /// instance takes nothing (the message stays buffered).
+    /// the oldest (first-buffered, by [`state::BufferedMessage::seq`]) live
+    /// buffered message with its name and correlation key that has not already
+    /// correlated to its instance. A local instance advances inline; a remote
+    /// one is settled here and handed to the host as a
+    /// [`Event::RemoteMessageCorrelation`]. A suspended or no-longer-active
+    /// local instance takes nothing (the message stays buffered).
+    ///
+    /// At most ONE local correlation per call: its queued follow-ups (an
+    /// event-based gateway withdrawing its losing alternatives, an interrupting
+    /// boundary cancelling sibling catches) must drain before the remaining
+    /// opened subscriptions are reconsidered, so a withdrawn sibling never
+    /// takes a message too. `buffer_scan_from` is left at the next unprocessed
+    /// opening, so the caller's next quiescent pass resumes there.
     fn correlate_buffered_messages(&mut self, log: &mut Vec<Event>, queue: &mut VecDeque<Step>) {
         let from = self.buffer_scan_from.min(log.len());
         self.buffer_scan_from = log.len();
         if self.state.buffered_messages.is_empty() {
             return;
         }
-        let opened: Vec<Key> = log[from..]
+        let opened: Vec<(usize, Key)> = log[from..]
             .iter()
-            .filter_map(|e| match e {
+            .enumerate()
+            .filter_map(|(i, e)| match e {
                 Event::MessageSubscriptionCreated {
                     subscription_key, ..
-                } => Some(*subscription_key),
+                } => Some((from + i, *subscription_key)),
                 _ => None,
             })
             .collect();
         let now = self.now;
-        for subscription_key in opened {
+        for (idx, &(_, subscription_key)) in opened.iter().enumerate() {
             let Some(subscription) = self
                 .state
                 .message_subscriptions
@@ -7347,18 +7381,31 @@ impl Engine {
             let element_instance_key = subscription.element_instance_key;
             let element_id = subscription.element_id.clone();
             let kind = subscription.kind.clone();
-            let Some(message) = self.state.buffered_messages.values().find(|m| {
-                m.is_live_at(now)
-                    && m.message_name == subscription.message_name
-                    && m.correlation_key == subscription.correlation_key
-                    && !m.correlated_instances.contains(&instance_key)
-            }) else {
+            let Some(message) = self
+                .state
+                .buffered_messages
+                .values()
+                .filter(|m| {
+                    m.is_live_at(now)
+                        && m.message_name == subscription.message_name
+                        && m.correlation_key == subscription.correlation_key
+                        && !m.correlated_instances.contains(&instance_key)
+                })
+                .min_by_key(|m| (m.seq, m.key))
+            else {
                 continue;
             };
             let message_key = message.key;
             let variables = message.variables.clone();
             let local = state::partition_of(instance_key) == self.partition_id;
-            if local && self.instance_is_suspended(instance_key) {
+            if local
+                && (self.instance_is_suspended(instance_key)
+                    || self
+                        .state
+                        .instances
+                        .get(&instance_key)
+                        .is_none_or(|i| i.state != ProcessInstanceState::Active))
+            {
                 continue;
             }
             self.emit(
@@ -7382,26 +7429,29 @@ impl Engine {
                     kind,
                     &variables,
                 );
-            } else {
-                let delivery_key = self.mint_key();
-                self.emit(
-                    log,
-                    Event::RemoteMessageCorrelation {
-                        subscription_key,
-                        message_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind,
-                        variables,
-                        delivery_key,
-                    },
-                );
+                // Drain this correlation before reconsidering the rest; resume
+                // at the next unprocessed opening (anything the correlation
+                // itself opens is queued, so it lands after `log.len()`).
+                if let Some(&(next, _)) = opened.get(idx + 1) {
+                    self.buffer_scan_from = next;
+                }
+                return;
             }
+            let delivery_key = self.mint_key();
+            self.emit(
+                log,
+                Event::RemoteMessageCorrelation {
+                    subscription_key,
+                    message_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    kind,
+                    variables,
+                    delivery_key,
+                },
+            );
         }
-        // The correlations above are already scanned: nothing they emitted
-        // opens a subscription synchronously (the follow-ups are queued).
-        self.buffer_scan_from = log.len();
     }
 
     /// Records a correlation against a subscription whose **instance lives on this

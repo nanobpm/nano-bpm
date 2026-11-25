@@ -1806,6 +1806,7 @@
         "state": "Open"
       }
     },
+    "next_buffered_seq": 0,
     "pending_orphan_supersedes": {
       "103": "Cold"
     },

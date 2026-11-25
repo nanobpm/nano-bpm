@@ -356,3 +356,255 @@ fn buffered_run_replays_to_identical_state() {
     assert_eq!(replayed.state(), engine.state());
     assert_eq!(replayed.snapshot().next_local, engine.snapshot().next_local);
 }
+
+fn publish_with(
+    name: &str,
+    key: &str,
+    variables: BTreeMap<String, Value>,
+    message_key: Option<Key>,
+) -> Command {
+    Command::CorrelateMessage {
+        message_name: name.into(),
+        correlation_key: key.into(),
+        variables,
+        business_id: None,
+        message_key,
+        time_to_live: Some(10_000),
+        message_id: None,
+    }
+}
+
+fn buffered_correlations(events: &[Event]) -> Vec<(Key, Key)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::BufferedMessageCorrelated {
+                message_key,
+                instance_key,
+                ..
+            } => Some((*message_key, *instance_key)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// r4692161066: a publication that STARTS an instance (message start) is in
+/// that instance's ledger, so a catch for the same name + key inside it waits
+/// for another message instead of consuming the one that created it.
+#[test]
+fn message_start_instance_does_not_reconsume_its_starting_message() {
+    let mut engine = Engine::new();
+    let def = ProcessBuilder::new("start-then-catch")
+        .message_start_event("ms", "payment-received")
+        .message_intermediate_catch_event("await", "payment-received", "orderId")
+        .end_event("end")
+        .connect("ms", "await")
+        .connect("await", "end")
+        .build()
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command_at(
+            publish_with(
+                "payment-received",
+                "o-1",
+                vars(&[("orderId", Value::Str("o-1".into()))]),
+                None,
+            ),
+            1_000,
+        )
+        .unwrap();
+    let inst = events
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageStartEventCorrelated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        })
+        .expect("the publish starts an instance");
+    assert!(
+        buffered_correlations(&events).is_empty(),
+        "the starting message must not also resume the catch: {events:?}"
+    );
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Active
+    );
+    let buffered = engine.state().buffered_messages.values().next().unwrap();
+    assert!(buffered.correlated_instances.contains(&inst));
+}
+
+/// r4692161117: a message event sub-process armed with a scope whose main
+/// flow drains at once still takes a buffered message — the buffered scan
+/// runs before the completion sweeps disarm it (root and embedded scope).
+#[test]
+fn drained_scope_event_subprocess_takes_buffered_message() {
+    use crate::model::EventSubProcessTrigger as Trig;
+    for embedded in [false, true] {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("s")
+            .end_event("e")
+            .event_sub_process(
+                "esp",
+                "esp_start",
+                Trig::Message {
+                    message_name: "m".into(),
+                    correlation_key: "orderId".into(),
+                },
+                true,
+            )
+            .start_event("esp_start")
+            .service_task("esp_work", "esp")
+            .end_event("esp_end")
+            .connect("esp_start", "esp_work")
+            .connect("esp_work", "esp_end")
+            .contained_in("esp_start", "esp")
+            .contained_in("esp_work", "esp")
+            .contained_in("esp_end", "esp");
+        if embedded {
+            b = b
+                .sub_process("sub", "sub_s")
+                .start_event("sub_s")
+                .end_event("sub_e")
+                .connect("s", "sub")
+                .connect("sub_s", "sub_e")
+                .connect("sub", "e")
+                .contained_in("sub_s", "sub")
+                .contained_in("sub_e", "sub")
+                .contained_in("esp", "sub");
+        } else {
+            b = b.connect("s", "e");
+        }
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(b.build().unwrap()))
+            .unwrap();
+        engine
+            .apply_command_at(publish_with("m", "o-1", BTreeMap::new(), None), 1_000)
+            .unwrap();
+        let events = engine
+            .apply_command_at(
+                Command::create_instance_with("p", vars(&[("orderId", Value::Str("o-1".into()))])),
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(
+            buffered_correlations(&events).len(),
+            1,
+            "embedded={embedded}: the event sub-process takes the message: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ElementActivated { element_id, .. } if element_id.as_str() == "esp_work")),
+            "embedded={embedded}: the event sub-process runs"
+        );
+    }
+}
+
+/// r4692161163: two event-based gateway alternatives with distinct buffered
+/// messages — only the winner correlates; the withdrawn loser takes nothing,
+/// so its payload is never merged and its message stays available.
+#[test]
+fn event_based_gateway_takes_only_one_buffered_message() {
+    let def = ProcessBuilder::new("race")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "M1", "orderId")
+        .message_intermediate_catch_event("onM2", "M2", "orderId")
+        .end_event("end")
+        .connect("start", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "end")
+        .connect("onM2", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command_at(
+            publish_with(
+                "M1",
+                "o-1",
+                vars(&[("winner", Value::Str("M1".into()))]),
+                None,
+            ),
+            1_000,
+        )
+        .unwrap();
+    engine
+        .apply_command_at(
+            publish_with(
+                "M2",
+                "o-1",
+                vars(&[("winner", Value::Str("M2".into()))]),
+                None,
+            ),
+            1_000,
+        )
+        .unwrap();
+    let events = engine
+        .apply_command_at(
+            Command::create_instance_with("race", vars(&[("orderId", Value::Str("o-1".into()))])),
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(
+        buffered_correlations(&events).len(),
+        1,
+        "only the winning alternative takes a message: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::MessageCorrelated { .. }))
+            .count(),
+        1
+    );
+    let untouched = engine
+        .state()
+        .buffered_messages
+        .values()
+        .filter(|m| m.correlated_instances.is_empty())
+        .count();
+    assert_eq!(untouched, 1, "the loser's message stays available");
+}
+
+/// r4692161207: buffered correlation takes the OLDEST buffered message by
+/// enqueue order, not by key — a key pre-minted by another partition sorts
+/// after this partition's newer keys. Holds across replay too.
+#[test]
+fn oldest_buffered_message_wins_regardless_of_key_origin() {
+    let foreign = (1u64 << state::LOCAL_BITS) | 7; // partition-1 pre-minted key
+    let mut journal = Vec::new();
+    let mut engine = Engine::new();
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(process_with_message_catch()), 0)
+            .unwrap(),
+    );
+    journal.extend(
+        engine
+            .apply_command_at(
+                publish_with("payment-received", "o-1", BTreeMap::new(), Some(foreign)),
+                1_000,
+            )
+            .unwrap(),
+    );
+    journal.extend(
+        engine
+            .apply_command_at(
+                publish_with("payment-received", "o-1", BTreeMap::new(), None),
+                1_100,
+            )
+            .unwrap(),
+    );
+    let mut replayed = Engine::replay_partition(0, journal);
+    assert_eq!(replayed.state(), engine.state());
+    for e in [&mut engine, &mut replayed] {
+        let (_, events) = create(e, "o-1", 2_000);
+        let got = buffered_correlations(&events);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, foreign, "the first-published message wins");
+    }
+}

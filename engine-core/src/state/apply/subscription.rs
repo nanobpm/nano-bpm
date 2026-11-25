@@ -23,6 +23,8 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             correlated_instances,
             ..
         } => {
+            let seq = state.next_buffered_seq;
+            state.next_buffered_seq = seq.saturating_add(1);
             state.buffered_messages.insert(
                 *message_key,
                 BufferedMessage {
@@ -33,6 +35,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     message_id: message_id.clone(),
                     variables: variables.clone(),
                     correlated_instances: correlated_instances.iter().copied().collect(),
+                    seq,
                 },
             );
         }
