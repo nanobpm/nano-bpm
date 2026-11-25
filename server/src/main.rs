@@ -43439,6 +43439,19 @@ mod clustered_startup_tests {
         let node0 = build_node(0);
         let node1 = build_node(1);
 
+        // Serve both nodes' falcon endpoints BEFORE deploying: the deploy owner
+        // broadcasts the definition to peers (#1855), and a broadcast dial to an
+        // unserved peer would put that link into its dial cooldown, failing the
+        // publication-gate probe closed below.
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = peer_facing_app(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+
         // Deploy a message-start process (parks at a service task so the created
         // instances persist) on the owner and replicate the definition to node 1.
         let proc = ProcessBuilder::new("intake")
@@ -43464,16 +43477,6 @@ mod clustered_startup_tests {
         node1
             .install_replicated_deployment(events.to_vec(), None)
             .await;
-
-        // Serve both nodes' falcon endpoints on their pre-bound ports.
-        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
-            let registry = falcon::Registry::new();
-            falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = peer_facing_app(server.clone(), registry);
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.ok();
-            });
-        }
 
         // Publish many distinctly-keyed messages at the owner; each fires the
         // message-start subscription on partition 0 and dispatches the created
