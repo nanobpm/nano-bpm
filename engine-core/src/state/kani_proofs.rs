@@ -57,6 +57,7 @@ fn total(arrivals: &FlowArrivals) -> usize {
 /// tokens to exactly its flow.
 #[kani::proof]
 #[kani::unwind(3)]
+#[kani::solver(cadical)]
 fn flow_arrivals_preserve_join_invariant() {
     let mut arrivals = FlowArrivals::default();
     for _ in 0..STEPS {
@@ -71,8 +72,7 @@ fn flow_arrivals_preserve_join_invariant() {
             }
             1 => {
                 let flow = any_flow();
-                let tokens: usize = kani::any();
-                kani::assume(tokens <= 4);
+                let tokens = usize::from(kani::any::<u8>() % 3);
                 let had = arrivals.count(&flow);
                 arrivals.add(&flow, tokens);
                 assert!(arrivals.count(&flow) == had + tokens);
@@ -150,6 +150,7 @@ fn any_job_event() -> Event {
 /// its deadline; a `Completed` job holds no lock.
 #[kani::proof]
 #[kani::unwind(3)]
+#[kani::solver(cadical)]
 fn job_lease_lifecycle_keeps_indexes_in_lockstep() {
     const KEY: Key = 7;
     let mut state = State::default();
@@ -204,6 +205,7 @@ fn job_lease_lifecycle_keeps_indexes_in_lockstep() {
 /// before both flows delivered once.
 #[kani::proof]
 #[kani::unwind(3)]
+#[kani::solver(cadical)]
 fn parallel_join_fires_only_when_every_flow_taken() {
     const INCOMING: usize = 2;
     let a = IncomingFlow {

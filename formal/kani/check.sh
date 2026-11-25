@@ -17,11 +17,20 @@ fi
 # input domain, not be given more time (README "Running").
 HARNESS_TIMEOUT="${KANI_HARNESS_TIMEOUT:-300}"
 
-HARNESSES=(
+# Pass harness names to prove only those (CI runs one harness per matrix leg).
+ALL_HARNESSES=(
   flow_arrivals_preserve_join_invariant
   job_lease_lifecycle_keeps_indexes_in_lockstep
   parallel_join_fires_only_when_every_flow_taken
 )
+if [[ $# -gt 0 ]]; then
+  for h in "$@"; do
+    [[ " ${ALL_HARNESSES[*]} " == *" $h "* ]] || { echo "unknown harness: $h" >&2; exit 2; }
+  done
+  HARNESSES=("$@")
+else
+  HARNESSES=("${ALL_HARNESSES[@]}")
+fi
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 if ! cargo kani --version 2>/dev/null | grep -q "$KANI_VERSION"; then
