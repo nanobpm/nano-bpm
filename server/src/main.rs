@@ -55876,13 +55876,15 @@ mod subscription_placement_tests {
 
     /// End-to-end #1874 (multi-partition): three messages are BUFFERED on the
     /// correlation key's partition, then an instance on ANOTHER partition opens
-    /// a message event sub-process subscription. Buffered correlation is
-    /// LOCAL-ONLY in this slice (remote drain is #1949): once the routed open
-    /// is durable on the buffer's partition, the remote subscription must take
-    /// NOTHING from the buffer. Returns the `seq` variable each `handle` job
+    /// a message event sub-process subscription, which the buffer's partition
+    /// drains through ack-paced remote deliveries (#1949). Waits until
+    /// `expected` `handle` jobs exist, then returns the `seq` variable each
     /// saw and — per buffered message, in publish order — how many instances
     /// it has correlated to.
-    async fn drain_buffered_backlog_remotely(interrupting: bool) -> (Vec<Value>, Vec<usize>) {
+    async fn drain_buffered_backlog_remotely(
+        interrupting: bool,
+        expected: usize,
+    ) -> (Vec<Value>, Vec<usize>) {
         let server = single_node_multi_partition();
         let process_id = if interrupting {
             "drain-int"
@@ -56014,7 +56016,14 @@ mod subscription_placement_tests {
         })
         .await
         .expect("the routed subscription open reaches the buffer's partition");
-        // Let any (wrong) remote delivery land before asserting none did.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handle_jobs().await.len() < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the ack-paced remote drain delivers the backlog");
+        // Let any extra (wrong) delivery land before asserting none did.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let seen = handle_jobs().await;
         let correlated = sub_engine
@@ -56030,22 +56039,23 @@ mod subscription_placement_tests {
         (seen, correlated)
     }
 
-    /// #1874: a REMOTE non-interrupting (persistent) subscription takes
-    /// nothing from the buffer (local-only correlation; remote drain #1949).
+    /// #1949: a REMOTE non-interrupting (persistent) subscription drains the
+    /// whole buffered backlog, one ack-paced delivery at a time, in publish
+    /// order — each message consumed exactly once.
     #[tokio::test]
-    async fn remote_persistent_subscription_leaves_buffer_untouched() {
-        let (seen, correlated) = drain_buffered_backlog_remotely(false).await;
-        assert!(seen.is_empty(), "no remote delivery: {seen:?}");
-        assert_eq!(correlated, vec![0, 0, 0]);
+    async fn remote_persistent_subscription_drains_the_backlog_in_order() {
+        let (seen, correlated) = drain_buffered_backlog_remotely(false, 3).await;
+        assert_eq!(seen, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert_eq!(correlated, vec![1, 1, 1]);
     }
 
-    /// #1874: a REMOTE interrupting subscription takes nothing from the
-    /// buffer either; every message stays buffered, uncorrelated.
+    /// #1949: a REMOTE interrupting subscription takes exactly the oldest
+    /// buffered message; the rest stay buffered, uncorrelated.
     #[tokio::test]
-    async fn remote_interrupting_subscription_leaves_buffer_untouched() {
-        let (seen, correlated) = drain_buffered_backlog_remotely(true).await;
-        assert!(seen.is_empty(), "no remote delivery: {seen:?}");
-        assert_eq!(correlated, vec![0, 0, 0]);
+    async fn remote_interrupting_subscription_takes_exactly_the_oldest() {
+        let (seen, correlated) = drain_buffered_backlog_remotely(true, 1).await;
+        assert_eq!(seen, vec![Value::Int(1)]);
+        assert_eq!(correlated, vec![1, 0, 0]);
     }
 
     /// #1604 (crash recovery): if a single-node server crashes AFTER the
