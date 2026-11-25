@@ -8,6 +8,7 @@
 // java and the pinned tla2tools.jar (formal/tla/check.sh fetches it); the
 // formal (tlc) CI job runs this after check.sh.
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -17,7 +18,7 @@ import { loadGraphs } from '../../corpus/generate.mjs'
 import { readSpec, tlaJar } from '../../corpus/exhaustive.mjs'
 import {
   acceptanceFromLog, captureScript, casesFor, decisionsFromLog, inSpecVocabulary, isCyclic,
-  checkCapturedPins, modelDecisions, observedDecisions, parseArgs, pinnedSha, signatureOf, stepMilestones, traceMilestones,
+  checkCapturedPins, checkPin, modelDecisions, reproCommand, observedDecisions, parseArgs, pinnedSha, signatureOf, stepMilestones, traceMilestones,
   validateTrace
 } from './zeebe-conformance.mjs'
 
@@ -198,4 +199,41 @@ test('an event-based gateway takes NO flow to the triggered catch (Zeebe, #1962)
 test('the unconstrained model enumerates both join decisions of a diamond', async () => {
   const d = await modelDecisions(ctx(), graph('ParallelDiamond'))
   assert.deepEqual([...d].sort(), ['defer:P2', 'fire:P2'])
+})
+
+// #1964: every finding's repro line must be complete — pasting it verbatim
+// reproduces with exactly the verdict-shaping options of the finding run.
+const verdictOptions = (a) => ({ bound: a.bound, gateways: a.gateways, flows: a.flows, kinds: a.kinds, corpus: a.corpus })
+
+/** Split a command line with a REAL POSIX shell (what pasting it does). */
+const shellWords = (cmd) => {
+  const r = spawnSync('sh', ['-c', `set -- ${cmd}; printf '%s\\0' "$@"`], { encoding: 'utf8' })
+  assert.equal(r.status, 0, r.stderr)
+  return r.stdout.split('\0').slice(0, -1)
+}
+
+test('the repro command round-trips every verdict-shaping option and the pin', () => {
+  const runs = [
+    ['--bound', 'ci'],
+    ['--bound', 'nightly', '--gateways', '3', '--flows', '7', '--kinds', 'xor,and', '--no-corpus'],
+    ['--gateways', '2', '--work', '/tmp/w', '--jobs', '3', '--file', '--captured', '/tmp/c'],
+    []
+  ]
+  for (const argv of runs) {
+    const a = parseArgs(argv)
+    const cmd = reproCommand(a, "evt|0>1d,1>2m 'x'", 'abc123')
+    assert.doesNotMatch(cmd, /\n/, 'one line')
+    const words = shellWords(cmd)
+    assert.deepEqual(words.slice(0, 2), ['node', 'formal/traces/conformance/zeebe-conformance.mjs'])
+    const back = parseArgs(words.slice(2))
+    assert.deepEqual(verdictOptions(back), verdictOptions(a), cmd)
+    assert.deepEqual(back.graphs, ["evt|0>1d,1>2m 'x'"])
+    assert.equal(back.pin, 'abc123')
+  }
+})
+
+test('a repro naming another Zeebe pin refuses to run', () => {
+  assert.doesNotThrow(() => checkPin(null, 'a'))
+  assert.doesNotThrow(() => checkPin('a', 'a'))
+  assert.throws(() => checkPin('b', 'a'), /--pin b does not match/)
 })

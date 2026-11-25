@@ -31,7 +31,11 @@
 //   node formal/traces/conformance/zeebe-conformance.mjs [--bound ci|nightly]
 //        [--gateways N] [--flows M] [--kinds xor,and,or,evt] [--no-corpus]
 //        [--graph ID]... [--work DIR] [--captured DIR] [--jobs N] [--file]
+//        [--pin SHA]
 //
+// Every finding prints a complete `repro:` command (all verdict-shaping
+// options plus `--pin`, the Zeebe commit it was captured on; a run with a
+// different pin refuses to start) to paste verbatim.
 // `--captured DIR` reuses a traces root an earlier run captured (skips the
 // JVM capture). `--file` files each NEW divergence class as an issue (an open
 // issue carrying the signature gets a comment instead), like the parity fuzz.
@@ -58,7 +62,7 @@ export const SPEC_KINDS = new Set(['start', 'end', 'task', 'xor', 'and', 'or', '
 // Arguments
 
 export function parseArgs (argv) {
-  const a = { bound: null, gateways: null, flows: null, kinds: null, corpus: true, graphs: [], work: null, captured: null, jobs: os.availableParallelism(), file: false }
+  const a = { bound: null, gateways: null, flows: null, kinds: null, corpus: true, graphs: [], work: null, captured: null, jobs: os.availableParallelism(), file: false, pin: null }
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i]
     const val = () => { if (i + 1 >= argv.length) throw new Error(`${x} needs a value`); return argv[++i] }
@@ -77,9 +81,44 @@ export function parseArgs (argv) {
       a.jobs = Number(v)
     }
     else if (x === '--file') a.file = true
+    else if (x === '--pin') a.pin = val()
     else throw new Error(`unknown argument: ${x}`)
   }
   return a
+}
+
+// ---------------------------------------------------------------------------
+// Reproduction
+
+const SCRIPT = 'formal/traces/conformance/zeebe-conformance.mjs'
+
+/** POSIX-shell-quote one argument (bare when it is a plain token). */
+export const shellQuote = (v) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(v) ? v : `'${String(v).replace(/'/g, `'\\''`)}'`
+
+/**
+ * The complete one-line command reproducing a finding on `graphId` (#1964):
+ * every option that shapes WHICH graphs and traces are checked (bound,
+ * gateways, flows, kinds, corpus) plus the Zeebe pin the traces were captured
+ * on, so it can be pasted verbatim. Operational options (--work, --captured,
+ * --jobs, --file) do not change a verdict and are left out. `parseArgs` of its
+ * arguments yields the same verdict-shaping options (round-trip tested).
+ */
+export function reproCommand (args, graphId, pin) {
+  const a = []
+  if (args.bound != null) a.push('--bound', args.bound)
+  if (args.gateways != null) a.push('--gateways', String(args.gateways))
+  if (args.flows != null) a.push('--flows', String(args.flows))
+  if (args.kinds != null) a.push('--kinds', args.kinds.join(','))
+  if (!args.corpus) a.push('--no-corpus')
+  a.push('--graph', graphId, '--pin', pin)
+  return ['node', SCRIPT, ...a].map(shellQuote).join(' ')
+}
+
+/** Refuse to run against a different Zeebe pin than the one a repro names. */
+export function checkPin (wanted, actual) {
+  if (wanted != null && wanted !== actual) {
+    throw new Error(`--pin ${wanted} does not match formal/parity/zeebe-pin.json (${actual}): check out a revision that pins ${wanted} to reproduce`)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +389,7 @@ function fileIssue (d, sig) {
     '',
     what,
     '',
-    `Reproduce: \`node formal/traces/conformance/zeebe-conformance.mjs --graph ${d.graphId}${d.bound ? ` --bound ${d.bound}` : ''}\``,
+    `Reproduce: \`${d.repro}\``,
     '',
     `<!-- ${marker} -->`
   ].join('\n')
@@ -390,6 +429,8 @@ export function checkCapturedPins (root, names, pin) {
 
 async function main (argv) {
   const args = parseArgs(argv)
+  const pin = pinnedSha()
+  checkPin(args.pin, pin)
   const graphs = selectGraphs(args)
   if (graphs.length === 0) throw new Error('no graphs selected')
   // Absolute: runTlc runs TLC with cwd inside it, so a relative path would re-resolve (#1964).
@@ -399,7 +440,7 @@ async function main (argv) {
   console.log(`conformance: ${graphs.length} graph(s), ${cases.length} scenario(s), work dir ${work}`)
 
   const root = args.captured ?? path.join(work, 'traces')
-  if (args.captured) checkCapturedPins(root, cases.map((c) => c.name), pinnedSha())
+  if (args.captured) checkCapturedPins(root, cases.map((c) => c.name), pin)
   else {
     stage(root, cases)
     console.log('conformance: capturing on the pinned Zeebe engine (formal/traces/capture.sh)…')
@@ -419,8 +460,8 @@ async function main (argv) {
     const v = await validateTrace(ctx, c.name, c.graph, trace)
     checked++
     if (!v.ok) {
-      divergences.push({ kind: 'trace', name: c.name, graphId: c.graph.id, graphKey: c.graph.key ?? c.graph.id, trace, matched: v.matched, unmatched: v.unmatched, bound: args.bound })
-      console.log(`REJECTED ${c.name}: model matches ${v.matched}/${trace.length}, then cannot produce ${v.unmatched}\n  ${trace.join(' ')}`)
+      divergences.push({ kind: 'trace', name: c.name, graphId: c.graph.id, graphKey: c.graph.key ?? c.graph.id, trace, matched: v.matched, unmatched: v.unmatched, repro: reproCommand(args, c.graph.id, pin) })
+      console.log(`REJECTED ${c.name}: model matches ${v.matched}/${trace.length}, then cannot produce ${v.unmatched}\n  ${trace.join(' ')}\n  repro: ${reproCommand(args, c.graph.id, pin)}`)
     }
   })
   console.log(`conformance: ${checked} trace(s) validated by TLC`)
@@ -432,8 +473,8 @@ async function main (argv) {
     for (const d of await modelDecisions(ctx, graph)) {
       decisions++
       if (!observed.has(d)) {
-        divergences.push({ kind: 'coverage', graphId: graph.id, graphKey: graph.key ?? graph.id, decision: d, bound: args.bound })
-        console.log(`UNCOVERED ${graph.id}: the model can take ${d}, no Zeebe trace of the graph does`)
+        divergences.push({ kind: 'coverage', graphId: graph.id, graphKey: graph.key ?? graph.id, decision: d, repro: reproCommand(args, graph.id, pin) })
+        console.log(`UNCOVERED ${graph.id}: the model can take ${d}, no Zeebe trace of the graph does\n  repro: ${reproCommand(args, graph.id, pin)}`)
       }
     }
   })

@@ -62,6 +62,11 @@ node formal/traces/conformance/zeebe-conformance.mjs --graph ParallelDiamond
 node formal/traces/conformance/zeebe-conformance.mjs --bound ci --captured /tmp/zc/traces  # reuse a capture
 ```
 
+Every finding (`REJECTED` / `UNCOVERED`, `divergences.json`, a filed issue) carries a
+complete `repro:` command — every verdict-shaping option, the graph and `--pin <sha>`
+(the Zeebe commit it was captured on; a mismatched pin refuses to run) — to paste
+verbatim.
+
 It needs JDK 21 (`ZEEBE_TRACES_JAVA_HOME`, as for `capture.sh`) and the pinned
 `tla2tools.jar`, which `formal/tla/check.sh` fetches. The first capture builds
 the pinned Zeebe engine, which takes a while; after that it's cached.

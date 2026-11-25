@@ -18,7 +18,9 @@
 # Bumping the Zeebe pin, or editing the reference model, re-runs it on the PR
 # (the `ci` bound) so a behaviour change in Zeebe is caught at the bump.
 #
-# Repro locally: node formal/traces/conformance/zeebe-conformance.mjs --bound ci [--graph <id>]
+# Repro locally: paste the `repro:` line a finding prints (complete: bound,
+# options, graph and the Zeebe --pin), or run e.g.
+#   node formal/traces/conformance/zeebe-conformance.mjs --bound ci [--graph <id>]
 
 name: Zeebe conformance (exporter traces vs ZeebeTokenFlow.tla, nightly)
 
@@ -94,7 +96,7 @@ jobs:
           ZEEBE_TRACES_JAVA_HOME: ${{ env.JAVA_HOME }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "::notice::bound $BOUND (repro: node formal/traces/conformance/zeebe-conformance.mjs --bound $BOUND --graph <id>)"
+          echo "::notice::bound $BOUND (each finding prints its complete repro: command)"
           file=""
           if [ "${{ github.event_name }}" = "schedule" ]; then file="--file"; fi
           node formal/traces/conformance/zeebe-conformance.mjs --bound "$BOUND" \

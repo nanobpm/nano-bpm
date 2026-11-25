@@ -256,6 +256,7 @@ jobs:
           fi
   fmt:
     name: rustfmt (pinned nightly)
+    # linker: rustfmt only — never compiles or links Rust.
     runs-on: ubuntu-24.04
     # Heavy Rust/engine/npm jobs skip when a PR only touches the marketing
     # website or the console landing page (see the `code` filter above). Manual
@@ -476,6 +477,10 @@ jobs:
         # Fails if any workflow installs an unpinned/other Rust toolchain
         # (`@stable` let Rust 1.99 break clippy + the armv6 release link).
         run: node --test scripts/rust-toolchain-pin.test.mjs
+      - name: Every Linux Rust job provisions mold (#1964)
+        # .cargo/config.toml forces -fuse-ld=mold on x86_64-linux; a job that
+        # installs Rust without mold dies with `cannot find 'ld'` (zeebe-fuzz).
+        run: node --test scripts/rust-linker-provisioned.test.mjs
       - name: No uncached GitHub Releases downloads in gates (#1461)
         # binaryen/wasm-bindgen (wasm-pack) and libduckdb must come through the
         # cached composites (.github/actions/wasm-pack-cache, libduckdb), so a
@@ -920,6 +925,8 @@ jobs:
 
   formal:
     name: formal (tlc)
+    # linker: its only Rust build (formal/lean/feel-diff.sh) falls back to
+    # rustc's self-contained lld when mold is absent.
     runs-on: ubuntu-24.04
     # Model-checks the TLA+ specs in formal/tla against the expected outcome per
     # model recorded in formal/tla/check.sh. That includes known-defect

@@ -201,3 +201,14 @@ test('shrink only accepts reductions that preserve the original divergence signa
   assert.equal(best.tree, tree)
   assert.equal(signature(best.verdict.diff), signature(sameDiff))
 })
+
+test('a failed runner error carries the tail of its log (#1964)', async () => {
+  const { runnerFailure, LOG_TAIL_LINES } = await import('./sweep.mjs')
+  const out = Array.from({ length: 80 }, (_, i) => `line ${i}`).join('\n') + "\ncollect2: fatal error: cannot find 'ld'\n"
+  const e = runnerFailure('nano runner failed', '/w/sweep/nano.log', out)
+  assert.match(e.message, /^nano runner failed — see \/w\/sweep\/nano\.log\n/)
+  assert.match(e.message, /cannot find 'ld'$/, 'the root cause at the end of the log is shown')
+  const shown = e.message.split('\n').slice(2)
+  assert.equal(shown.length, LOG_TAIL_LINES)
+  assert.ok(!e.message.includes('line 30\n'), 'only the tail is echoed')
+})
