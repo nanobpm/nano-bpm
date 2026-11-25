@@ -224,12 +224,24 @@ export class NanoBackend {
     const snapshot = JSON.parse(this.engine.snapshot());
     Object.assign(obs.incidents, incidentsFromSnapshot(snapshot, pik));
 
-    const vars = JSON.parse(
-      this.engine.searchVariables(
-        JSON.stringify({ filter: { processInstanceKey: String(pik) }, page: { limit: 10000 } }),
-      ),
-    );
-    obs.variables = rootVariablesFromSearch(vars.items, pik);
+    // `searchVariables` paginates: follow `endCursor` until the last page so
+    // an instance with more rows than one page is observed in full.
+    const varItems = [];
+    let after;
+    for (;;) {
+      const page = { limit: 10000 };
+      if (after !== undefined) page.after = after;
+      const res = JSON.parse(
+        this.engine.searchVariables(
+          JSON.stringify({ filter: { processInstanceKey: String(pik) }, page }),
+        ),
+      );
+      varItems.push(...res.items);
+      const next = res.page?.endCursor;
+      if (res.items.length === 0 || next == null || next === after) break;
+      after = next;
+    }
+    obs.variables = rootVariablesFromSearch(varItems, pik);
     // The bounded-exhaustive scenarios drive routing through `route_*` start /
     // set variables — the driver's own schedule, not a process outcome. Drop
     // them from the observation so the oracle compares the variables the

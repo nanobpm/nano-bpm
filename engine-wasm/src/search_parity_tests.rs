@@ -267,6 +267,68 @@ fn check_filters(op: &Op) -> usize {
     accepted
 }
 
+/// Schema-correct probes for the array-valued filters (`$or`, the variable
+/// joins). `check_filters` seeds operands from a fixture item, which carries
+/// no value for these, so its probes are malformed and both surfaces reject
+/// them — agreement without exercising the filter. Here each such property is
+/// driven with a well-formed matching AND non-matching clause; both must be
+/// accepted, the match must return rows and the miss must return fewer.
+fn check_array_filters(op: &Op) {
+    let props = spec_properties(op.filter_schema);
+    // A scalar property the fixture item carries, for the `$or` clause.
+    let key = ["userTaskKey", "processInstanceKey", "variableKey"]
+        .into_iter()
+        .find(|k| props.iter().any(|p| p == k) && op.sample[*k].is_string())
+        .unwrap_or_else(|| panic!("{}: no key property for $or", op.name));
+    let hit_key = op.sample[key].clone();
+    let mut probes: Vec<(String, J, J)> = Vec::new();
+    if props.iter().any(|p| p == "$or") {
+        probes.push((
+            "$or".into(),
+            json!([{ key: hit_key }]),
+            json!([{ key: "1" }]),
+        ));
+    }
+    // Every fixture instance carries the root variable `label`; the value
+    // filter compares the variable's JSON-serialised value.
+    for p in ["variables", "processInstanceVariables", "localVariables"] {
+        if props.iter().any(|q| q == p) {
+            probes.push((
+                p.into(),
+                json!([{ "name": "label", "value": "\"item-1\"" }]),
+                json!([{ "name": "label", "value": "\"no-such-item\"" }]),
+            ));
+        }
+    }
+    for (prop, hit, miss) in probes {
+        let all = compare(op, &json!({ "filter": op.page_filter }).to_string())
+            .unwrap_or_else(|| panic!("{}: baseline rejected", op.name));
+        let total = all["items"].as_array().expect("items").len();
+        let run = |cond: &J| {
+            let mut f = op.page_filter.clone();
+            f.as_object_mut()
+                .expect("page_filter is an object")
+                .insert(prop.clone(), cond.clone());
+            let body = json!({ "filter": f }).to_string();
+            let r = compare(op, &body).unwrap_or_else(|| panic!("{}: {body} rejected", op.name));
+            r["items"].as_array().expect("items").len()
+        };
+        let (h, m) = (run(&hit), run(&miss));
+        // `localVariables` matches element-scope variables only; the fixture's
+        // variables are root-scoped, so the probe must still be ACCEPTED and
+        // agree, but may match nothing.
+        if prop != "localVariables" {
+            assert!(h > 0, "{}: {prop} {hit} matched no rows", op.name);
+        }
+        assert!(m < total, "{}: {prop} {miss} did not filter", op.name);
+        assert!(
+            m <= h || prop == "localVariables",
+            "{}: {prop} miss > hit",
+            op.name
+        );
+    }
+}
+
 fn check_paging(op: &Op) {
     for field in spec_sort_fields(op.sort_schema) {
         for order in ["ASC", "DESC"] {
@@ -596,6 +658,7 @@ fn core_searches_match_the_server_for_every_spec_operator_sort_and_page() {
 
     for op in [&user_tasks, &instances, &variables(true), &variables(false)] {
         assert!(!op.sample.is_null(), "{}: fixture has items", op.name);
+        check_array_filters(op);
         let accepted = check_filters(op);
         assert!(accepted > 0, "{}: no filter request accepted", op.name);
         check_paging(op);
