@@ -99,6 +99,29 @@ fn spec_properties(name: &str) -> Vec<String> {
     out
 }
 
+/// The inline `type` of property `prop` of the spec object schema `name`
+/// (following `allOf` / local `$ref`s like [`spec_properties`]); `None` when
+/// the property is declared by composition rather than an inline type.
+fn spec_property_type(name: &str, prop: &str) -> Option<String> {
+    fn find(s: &serde_yaml::Value, prop: &str) -> Option<String> {
+        if let Some(t) = s["properties"][prop]["type"].as_str() {
+            return Some(t.to_string());
+        }
+        if let Some(r) = s["$ref"].as_str() {
+            let target = r.rsplit('/').next().expect("ref target");
+            if let Some(t) = find(&schema(target), prop) {
+                return Some(t);
+            }
+        }
+        s["allOf"]
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .find_map(|part| find(part, prop))
+    }
+    find(&schema(name), prop)
+}
+
 /// The `field` enum of a spec `*SearchQuerySortRequest`.
 fn spec_sort_fields(name: &str) -> Vec<String> {
     schema(name)["properties"]["field"]["enum"]
@@ -206,7 +229,12 @@ fn check_filters(op: &Op) -> usize {
     let ops = spec_operators();
     let mut accepted = 0;
     for prop in spec_properties(op.filter_schema) {
+        let is_bool = spec_property_type(op.filter_schema, &prop).as_deref() == Some("boolean");
         let v = match &op.sample[&prop] {
+            // A boolean filter the fixture item does not carry (e.g.
+            // `hasRetriesLeft`): a schema-valid boolean operand, never a
+            // string fallback that both surfaces would merely reject.
+            J::Null if is_bool => json!(true),
             // No fixture value (e.g. a never-completed `completionDate`):
             // a well-formed operand of the property's type.
             J::Null if prop.ends_with("Date") || prop.ends_with("At") => {
@@ -253,6 +281,18 @@ fn check_filters(op: &Op) -> usize {
                 "{}: {shorthand} matched no rows",
                 op.name
             );
+        }
+        // A boolean filter must be accepted for BOTH schema-valid operands, so
+        // its probes cannot all be (agreeing) rejections.
+        if is_bool {
+            for b in [true, false] {
+                let body = with_base(wrap(json!(b))).to_string();
+                accepted += usize::from(
+                    compare(op, &body)
+                        .unwrap_or_else(|| panic!("{}: {body} rejected", op.name))
+                        .is_object(),
+                );
+            }
         }
         let mut bodies = Vec::new();
         for o in &ops {
