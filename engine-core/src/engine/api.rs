@@ -152,6 +152,7 @@ impl Engine {
             | Command::DeployGenericResources(_)
             | Command::DeployBundle(_)
             | Command::DeleteDecisionInstance { .. }
+            | Command::DeleteProcessInstanceHistory { .. }
             | Command::CreateClusterVariable { .. }
             | Command::UpdateClusterVariable { .. }
             | Command::DeleteClusterVariable { .. }

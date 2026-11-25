@@ -3726,7 +3726,7 @@ pub fn catch_up_shard(
                      available (issue #831); any history never written to the archive (e.g. \
                      completed before the archive existed) is NOT restored."
                 );
-                reseed_from_engine_state(shard, total, state)?;
+                reseed_from_engine_state(shard, total, state, surviving)?;
             } else if read_model_lossy_rebuild_enabled() {
                 tracing::error!(
                     exported,
@@ -3775,6 +3775,7 @@ fn reseed_from_engine_state(
     shard: &crate::readstore::ReadStore,
     total: u64,
     state: &nanobpmn_engine_core::State,
+    surviving: &[&Event],
 ) -> rusqlite::Result<()> {
     shard.reset()?;
     shard.seed_from_engine_state(state)?;
@@ -3796,6 +3797,15 @@ fn reseed_from_engine_state(
              (issue #831); live instances are still recovered from the engine snapshot"
         ),
     }
+    // #1948: the cursor is planted past the surviving tail WITHOUT exporting it,
+    // so a history deletion committed in that tail but never exported would
+    // otherwise leave the just-restored archive history searchable. Retract
+    // every surviving deletion from both the live store and the archive before
+    // advancing. Deletions already compacted below the floor are not visible
+    // here; the normal export path retracts the archive before the cursor
+    // advances, so those were retracted unless the read model lagged behind
+    // compaction itself.
+    shard.retract_deleted_history(surviving.iter().copied())?;
     if total > 0 {
         shard.advance_exported(total as usize)?;
     }
@@ -6573,6 +6583,63 @@ mod tests {
             "terminal/completed history must be restored from the durable archive \
              during a below-floor reprojection (issue #831)"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&empty_dir);
+    }
+
+    /// #1948 review: a history deletion committed to the journal but never
+    /// exported (the node stopped first) sits in the surviving tail. Below-floor
+    /// reprojection restores the archive and plants the cursor past that tail
+    /// without exporting it — the deletion must still be honoured.
+    #[test]
+    fn reprojection_honours_unexported_history_deletion_in_surviving_tail() {
+        use crate::readstore::ReadStore;
+
+        let dir = temp_dir("readmodel-archive-reproject-1948");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let store = ReadStore::open(Some(&dir.join("read-model.sqlite"))).expect("read store");
+        let created = |k| Event::ProcessInstanceCreated {
+            instance_key: k,
+            process_id: "demo".to_string(),
+            variables: std::collections::BTreeMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let (c1, d1) = (
+            created(999),
+            Event::ProcessInstanceCompleted { instance_key: 999 },
+        );
+        let (c2, d2) = (
+            created(1000),
+            Event::ProcessInstanceCompleted { instance_key: 1000 },
+        );
+        store
+            .export(&[&c1, &d1, &c2, &d2])
+            .expect("export terminal");
+        store.reset().expect("wipe read model");
+
+        let empty_dir = temp_dir("readmodel-archive-reproject-1948-engine");
+        let (engine, _recovery) =
+            crate::journal::Journal::open_segmented(&empty_dir).expect("open empty engine");
+        let deleted = Event::ProcessInstanceHistoryDeleted { instance_key: 999 };
+        catch_up_shard(&store, 100, &[&deleted], Some(engine.engine_state()))
+            .expect("reprojection catch-up succeeds");
+
+        assert!(
+            store.process_instance(999).is_none(),
+            "unexported deletion in the surviving tail resurrected by archive replay"
+        );
+        assert!(
+            store.process_instance(1000).is_some(),
+            "unrelated history kept"
+        );
+        assert_eq!(store.exported_position(), 101);
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&empty_dir);

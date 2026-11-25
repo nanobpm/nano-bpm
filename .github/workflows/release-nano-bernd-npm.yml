@@ -20,6 +20,8 @@ jobs:
   publish:
     if: startsWith(github.ref, 'refs/tags/nano-bernd-npm-v')
     name: Publish @nanobpm/nano-bernd
+    # linker: builds only `--target wasm32-unknown-unknown`, so the host-target
+    # mold rustflag never applies.
     runs-on: ubuntu-24.04
     permissions:
       # id-token: write lets npm exchange the GitHub OIDC token for a

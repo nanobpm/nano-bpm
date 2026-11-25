@@ -430,7 +430,40 @@ export class CamundaBackend {
   // SYNCHRONOUS `/messages/correlation` INSTEAD of a buffered publication: it
   // returns only once a subscription correlated, so the delivery is its own
   // acknowledgement and no second message is ever sent.
-  async publishMessage(handle, name, correlationKey, variables, settled) {
+  //
+  // An explicit `timeToLive` / `messageId` (#1969) is published AS GIVEN: the
+  // scenario is exercising Zeebe message buffering itself (TTL expiry, TTL 0,
+  // messageId dedup). `expectRejected` asserts the publish is refused with
+  // HTTP 409 (ALREADY_EXISTS: the messageId is still buffered).
+  async publishMessage(handle, name, correlationKey, variables, settled, publication = {}) {
+    const { timeToLive, messageId, expectRejected } = publication;
+    if (timeToLive != null || messageId != null) {
+      if (settled != null) {
+        throw new Error("a timeToLive/messageId publication takes no `settled` barrier");
+      }
+      const body = { name, correlationKey, variables: variables ?? {} };
+      body.timeToLive = timeToLive ?? 0;
+      if (messageId != null) body.messageId = messageId;
+      if (expectRejected) {
+        const res = await fetch(`${this.base}/messages/publication`, {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(this.requestTimeoutMs),
+        });
+        const text = await res.text();
+        if (res.status !== 409) {
+          throw new Error(
+            `publish of '${name}' (messageId ${messageId}) was expected to be rejected ` +
+              `with 409 ALREADY_EXISTS, got HTTP ${res.status}: ${text}`,
+          );
+        }
+        return;
+      }
+      await this.#json("POST", "/messages/publication", body, "publish message");
+      return;
+    }
+    if (expectRejected) throw new Error("expectRejected needs a messageId or timeToLive publication");
     if (settled?.ack) {
       // Correlate SYNCHRONOUSLY instead of publishing: `/messages/correlation`
       // is itself the delivery and returns only once the message correlated,

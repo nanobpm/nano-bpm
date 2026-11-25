@@ -166,6 +166,9 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
         },
+        Command::DeleteProcessInstanceHistory { .. } => Surface::NotSurfaced {
+            reason: "audit-only read-model history deletion (#1948); no core engine state, irrelevant in-browser",
+        },
         Command::CreateClusterVariable { .. }
         | Command::UpdateClusterVariable { .. }
         | Command::DeleteClusterVariable { .. } => Surface::NotSurfaced {

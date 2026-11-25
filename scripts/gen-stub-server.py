@@ -35,6 +35,7 @@ METHOD_RE = re.compile(
 OVERRIDES: dict[tuple[str, str], str] = {
     ("process_instance", "create_process_instance"): "self.create_process_instance_impl(body).await",
     ("process_instance", "cancel_process_instance"): "self.cancel_process_instance_impl(path_params, body).await",
+    ("process_instance", "delete_process_instance"): "self.delete_process_instance_impl(path_params, body).await",
     ("process_instance", "suspend_process_instance"): "self.suspend_process_instance_impl(path_params, body).await",
     ("process_instance", "resume_process_instance"): "self.resume_process_instance_impl(path_params, body).await",
     ("process_instance", "migrate_process_instance"): "self.migrate_process_instance_impl(path_params, body).await",
@@ -97,6 +98,7 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("batch_operation", "resume_batch_operation"): "self.resume_batch_operation_impl(path_params).await",
     ("batch_operation", "cancel_batch_operation"): "self.cancel_batch_operation_impl(path_params).await",
     ("process_instance", "cancel_process_instances_batch_operation"): "self.cancel_process_instances_batch_operation_impl(body).await",
+    ("process_instance", "delete_process_instances_batch_operation"): "self.delete_process_instances_batch_operation_impl(body).await",
     ("process_instance", "resolve_incidents_batch_operation"): "self.resolve_incidents_batch_operation_impl(body).await",
     ("process_instance", "migrate_process_instances_batch_operation"): "self.migrate_process_instances_batch_operation_impl(body).await",
     ("process_instance", "modify_process_instances_batch_operation"): "self.modify_process_instances_batch_operation_impl(body).await",

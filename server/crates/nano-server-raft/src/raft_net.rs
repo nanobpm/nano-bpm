@@ -487,7 +487,8 @@ impl RaftTransport for PeerTransport {
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
         FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES, FEATURE_MESSAGE_BUFFERING,
-        FEATURE_MESSAGE_CORRELATION_ACK, FEATURE_REPLICATED_LENIENT_COMPLETION,
+        FEATURE_MESSAGE_CORRELATION_ACK, FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
+        FEATURE_REPLICATED_LENIENT_COMPLETION,
         FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
@@ -538,6 +539,9 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
                     ack_partition: Some(_),
                     ..
                 } => FEATURE_MESSAGE_CORRELATION_ACK,
+                Command::DeleteProcessInstanceHistory { .. } => {
+                    FEATURE_PROCESS_INSTANCE_HISTORY_DELETION
+                }
                 _ => continue,
             };
             if !required.contains(&feature) {
@@ -697,6 +701,13 @@ mod codec_tests {
             vec![nano_falcon_protocol::cluster_join::FEATURE_TERMINAL_DEADLINES]
         );
         assert!(required_features_for(&req(vec![entry(Command::cancel_instance(1))])).is_empty());
+        // #1948: a history deletion never ships to a peer that cannot decode it.
+        assert_eq!(
+            required_features_for(&req(vec![entry(Command::DeleteProcessInstanceHistory {
+                instance_key: 1
+            })])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_PROCESS_INSTANCE_HISTORY_DELETION]
+        );
         // #1863: a SUSPENDED-terminating cancel never ships to a peer that
         // would reject it; the legacy cancel requires nothing.
         assert_eq!(

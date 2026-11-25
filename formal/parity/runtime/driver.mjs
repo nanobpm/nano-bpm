@@ -24,6 +24,8 @@ import { join } from "node:path";
  *       { "op": "setVariables", "variables": { "route_G1": [["f2"]] } },
  *       { "op": "correlateMessage", "name": "M", "correlationKey": "k", "variables": {} },
  *       { "op": "publishMessage", "name": "M", "correlationKey": "k", "variables": {} },
+ *       { "op": "publishMessage", "name": "M", "correlationKey": "k", "variables": {},
+ *         "timeToLive": 60000, "messageId": "m1", "expectRejected": false },
  *       { "op": "broadcastSignal", "name": "S", "variables": {} },
  *       { "op": "advanceTime", "ms": 1000 },
  *       { "op": "cancelInstance" }
@@ -60,6 +62,11 @@ async function dispatchStep(backend, handle, step) {
         step.correlationKey,
         step.variables ?? {},
         step.settled,
+        {
+          timeToLive: step.timeToLive,
+          messageId: step.messageId,
+          expectRejected: step.expectRejected === true,
+        },
       );
     case "broadcastSignal":
       return backend.broadcastSignal(handle, step.name, step.variables ?? {});

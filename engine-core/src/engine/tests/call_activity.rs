@@ -1875,3 +1875,293 @@ fn child_index_is_empty_after_completed_instances_are_evicted() {
         engine.state.children_by_parent
     );
 }
+
+/// Deploys `orch` (one call activity into the parked `callee`), creates an
+/// instance and cancels it, so a terminated parent + terminated child tree
+/// remains resident. Returns (engine, parent key, child key, journal).
+fn ended_call_activity_tree() -> (Engine, Key, Key, Vec<Event>) {
+    let def = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "callee")
+        .end_event("done")
+        .connect("start", "c1")
+        .connect("c1", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let mut journal = engine
+        .apply_command(Command::DeployProcess(parked_callee()))
+        .unwrap();
+    journal.extend(engine.apply_command(Command::DeployProcess(def)).unwrap());
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent = parent_key_of(&created, "orch");
+    let child = parent_key_of(&created, "callee");
+    assert_ne!(parent, child);
+    journal.extend(created);
+    journal.extend(
+        engine
+            .apply_command(Command::cancel_instance(parent))
+            .unwrap(),
+    );
+    assert!(
+        engine.instance(child).is_some(),
+        "ended child stays resident"
+    );
+    (engine, parent, child, journal)
+}
+
+/// #1948 event-sourced deletion: the command journals the ended root, and
+/// apply resolves its resident tree and removes the parent, the call-activity child and every
+/// instance-scoped entity (jobs, incidents, timers, subscriptions, user
+/// tasks) from engine state — so a snapshot taken afterwards, and an engine
+/// restored from it, never carry the deleted history (no reseed resurrection),
+/// and a full replay from genesis converges to the same state.
+#[test]
+fn delete_process_instance_history_removes_the_ended_tree_from_engine_state() {
+    let (mut engine, parent, child, mut journal) = ended_call_activity_tree();
+    let events = engine
+        .apply_command(Command::DeleteProcessInstanceHistory {
+            instance_key: parent,
+        })
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![Event::ProcessInstanceHistoryDeleted {
+            instance_key: parent
+        }]
+    );
+    journal.extend(events);
+    for key in [parent, child] {
+        assert!(engine.instance(key).is_none(), "{key} must leave state");
+        assert!(!engine.state.jobs_by_instance.contains_key(&key));
+        assert!(!engine.state.jobs.values().any(|j| j.instance_key == key));
+        assert!(!engine
+            .state
+            .incidents
+            .values()
+            .any(|i| i.instance_key == key));
+        assert!(!engine.state.timers.values().any(|t| t.instance_key == key));
+        assert!(!engine
+            .state
+            .user_tasks
+            .values()
+            .any(|t| t.instance_key == key));
+        assert!(!engine
+            .state
+            .message_subscriptions
+            .values()
+            .any(|s| s.instance_key == key));
+        assert!(!engine.state.children_by_parent.contains_key(&key));
+    }
+
+    // Re-applying the deletion is an idempotent no-op on state.
+    let again = engine
+        .apply_command(Command::DeleteProcessInstanceHistory {
+            instance_key: parent,
+        })
+        .unwrap();
+    assert_eq!(
+        again,
+        vec![Event::ProcessInstanceHistoryDeleted {
+            instance_key: parent
+        }]
+    );
+
+    // Full replay from genesis converges to the same (deleted) state.
+    let replayed = Engine::replay_partition(0, journal);
+    for key in [parent, child] {
+        assert!(replayed.instance(key).is_none(), "replay resurrected {key}");
+    }
+    assert_eq!(
+        replayed.state.instances.keys().collect::<Vec<_>>(),
+        engine.state.instances.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(replayed.state.jobs.len(), engine.state.jobs.len());
+
+    // Snapshot + restore (the reseed source) never carries the deleted tree.
+    #[cfg(feature = "serde")]
+    {
+        let restored = Engine::from_snapshot(engine.snapshot());
+        for key in [parent, child] {
+            assert!(restored.instance(key).is_none(), "reseed resurrected {key}");
+        }
+    }
+}
+
+/// A snapshot taken BEFORE the deletion plus the journal tail that carries it
+/// (the compacted-prefix recovery path) also converges: the tail's deletion
+/// event removes the tree the snapshot still holds.
+#[cfg(feature = "serde")]
+#[test]
+fn delete_process_instance_history_snapshot_plus_tail_converges() {
+    let (mut engine, parent, child, _) = ended_call_activity_tree();
+    let snap = engine.snapshot();
+    let tail = engine
+        .apply_command(Command::DeleteProcessInstanceHistory {
+            instance_key: parent,
+        })
+        .unwrap();
+    let mut restored = Engine::from_snapshot(snap);
+    assert!(restored.instance(child).is_some());
+    restored.apply_replayed_events(tail);
+    for key in [parent, child] {
+        assert!(restored.instance(key).is_none(), "tail replay kept {key}");
+    }
+}
+
+/// Replica determinism (#1948): residency of ended instances is replica-local
+/// (a follower evicts terminal shells at apply time, the leader only when its
+/// exporter catches up), so two replicas can apply the same deletion with
+/// different resident trees. They must still emit IDENTICAL events — a
+/// residency-derived event would trip the Raft divergence fail-stop — and each
+/// must remove whatever of the tree it still holds.
+#[test]
+fn delete_process_instance_history_events_do_not_depend_on_residency() {
+    let (mut leader, parent, child, _) = ended_call_activity_tree();
+    let (mut follower, parent_f, child_f, _) = ended_call_activity_tree();
+    assert_eq!((parent, child), (parent_f, child_f));
+    // Follower-side eviction schedules: the child alone, then nothing at all.
+    let (mut evicted_all, _, _, _) = ended_call_activity_tree();
+    evicted_all.evict_instances(&[child, parent]);
+    assert!(evicted_all.instance(parent).is_none());
+    follower.evict_instances(&[child]);
+    assert!(follower.instance(child).is_none());
+    let del = || Command::DeleteProcessInstanceHistory {
+        instance_key: parent,
+    };
+    let a = leader.apply_command(del()).unwrap();
+    let b = follower.apply_command(del()).unwrap();
+    let c = evicted_all.apply_command(del()).unwrap();
+    assert_eq!(a, b, "event must not depend on child residency");
+    assert_eq!(a, c, "event must not depend on root residency");
+    for engine in [&leader, &follower, &evicted_all] {
+        for key in [parent, child] {
+            assert!(engine.instance(key).is_none(), "{key} left resident");
+        }
+    }
+}
+
+/// Deploys `root` → call `mid` → call `leaf` (the leaf parks on a user task),
+/// creates an instance and cancels it, so a three-level ended tree with a
+/// retained user task on the leaf remains resident. Returns (engine, root,
+/// mid, leaf).
+fn ended_three_level_tree() -> (Engine, Key, Key, Key) {
+    let leaf = ProcessBuilder::new("leaf")
+        .start_event("ls")
+        .user_task("ut")
+        .end_event("le")
+        .connect("ls", "ut")
+        .connect("ut", "le")
+        .build()
+        .unwrap();
+    let mid = ProcessBuilder::new("mid")
+        .start_event("ms")
+        .call_activity("mc", "leaf")
+        .end_event("me")
+        .connect("ms", "mc")
+        .connect("mc", "me")
+        .build()
+        .unwrap();
+    let root = ProcessBuilder::new("root")
+        .start_event("rs")
+        .call_activity("rc", "mid")
+        .end_event("re")
+        .connect("rs", "rc")
+        .connect("rc", "re")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    for def in [leaf, mid, root] {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let created = engine
+        .apply_command(Command::create_instance("root"))
+        .unwrap();
+    let root_key = parent_key_of(&created, "root");
+    let mid_key = parent_key_of(&created, "mid");
+    let leaf_key = parent_key_of(&created, "leaf");
+    engine
+        .apply_command(Command::cancel_instance(root_key))
+        .unwrap();
+    (engine, root_key, mid_key, leaf_key)
+}
+
+fn holds_any_state_for(engine: &Engine, key: Key) -> bool {
+    engine.instance(key).is_some()
+        || engine
+            .state
+            .user_tasks
+            .values()
+            .any(|t| t.instance_key == key)
+        || engine.state.children_by_parent.contains_key(&key)
+}
+
+/// #1948 review: evicting an ended INTERMEDIATE instance must not strand its
+/// ended grandchild (and the grandchild's retained user task) outside the
+/// root's reachable tree — else deleting the root leaves that state behind
+/// for a snapshot to reseed. Eviction closes over terminal descendants.
+#[test]
+fn evicting_an_ended_intermediate_takes_its_ended_descendants_along() {
+    let (mut engine, root, mid, leaf) = ended_three_level_tree();
+    assert!(engine
+        .state
+        .user_tasks
+        .values()
+        .any(|t| t.instance_key == leaf));
+    assert!(engine.evict_instance(mid));
+    for key in [mid, leaf] {
+        assert!(!holds_any_state_for(&engine, key), "{key} stranded");
+    }
+    engine
+        .apply_command(Command::DeleteProcessInstanceHistory { instance_key: root })
+        .unwrap();
+    for key in [root, mid, leaf] {
+        assert!(
+            !holds_any_state_for(&engine, key),
+            "{key} survived deletion"
+        );
+    }
+}
+
+/// #1948 review: evicting an ended LEAF child drops its retained user tasks
+/// with it (they were previously left behind, unreachable from the root).
+/// Covers every eviction entry point, which share one removal pass.
+#[test]
+fn evicting_an_ended_child_drops_its_retained_user_tasks() {
+    for entry in 0..3 {
+        let (mut engine, root, mid, leaf) = ended_three_level_tree();
+        match entry {
+            0 => assert!(engine.evict_instance(leaf)),
+            1 => assert_eq!(engine.evict_instances(&[leaf]), 1),
+            _ => assert_eq!(engine.retire_instances(&[leaf]), vec![leaf]),
+        }
+        assert!(!holds_any_state_for(&engine, leaf), "entry {entry}");
+        engine
+            .apply_command(Command::DeleteProcessInstanceHistory { instance_key: root })
+            .unwrap();
+        for key in [root, mid, leaf] {
+            assert!(!holds_any_state_for(&engine, key), "entry {entry}: {key}");
+        }
+    }
+}
+
+/// #1948 review: `retire_below` must honour `max_remove` across an ended
+/// call-activity tree (no descendant closure past the budget): it reaps
+/// leaf-first, one instance per call, retaining each parent until its
+/// descendants are drained, and the drained tree leaves no state behind.
+#[test]
+fn retire_below_reaps_an_ended_tree_leaf_first_within_budget() {
+    let (mut engine, root, mid, leaf) = ended_three_level_tree();
+    let low_water = engine.retirement_low_water();
+    assert_eq!(engine.retire_below(low_water, 1), vec![leaf]);
+    assert!(engine.instance(mid).is_some() && engine.instance(root).is_some());
+    assert_eq!(engine.retire_below(low_water, 1), vec![mid]);
+    assert!(engine.instance(root).is_some());
+    assert_eq!(engine.retire_below(low_water, 1), vec![root]);
+    assert!(engine.retire_below(low_water, 1).is_empty());
+    for key in [root, mid, leaf] {
+        assert!(!holds_any_state_for(&engine, key), "{key} left behind");
+    }
+}

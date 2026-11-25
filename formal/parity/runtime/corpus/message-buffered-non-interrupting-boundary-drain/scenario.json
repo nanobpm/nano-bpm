@@ -1,0 +1,83 @@
+{
+  "name": "message-buffered-non-interrupting-boundary-drain",
+  "bpmn": "process.bpmn",
+  "processId": "parity-msg-ni-drain",
+  "variables": {
+    "key": "parity-msg-ni-drain"
+  },
+  "steps": [
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-ni-drain",
+      "variables": {
+        "n": 1
+      },
+      "timeToLive": 600000
+    },
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-ni-drain",
+      "variables": {
+        "n": 2
+      },
+      "timeToLive": 600000
+    },
+    {
+      "op": "publishMessage",
+      "name": "M",
+      "correlationKey": "parity-msg-ni-drain",
+      "variables": {
+        "n": 3
+      },
+      "timeToLive": 600000
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "a",
+      "variables": {}
+    },
+    {
+      "op": "completeOneJob",
+      "jobType": "b",
+      "variables": {}
+    },
+    {
+      "op": "completeOneJob",
+      "jobType": "b",
+      "variables": {}
+    },
+    {
+      "op": "completeOneJob",
+      "jobType": "b",
+      "variables": {}
+    },
+    {
+      "op": "activateAndComplete",
+      "jobType": "w",
+      "variables": {}
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": {
+      "key": "parity-msg-ni-drain",
+      "n": 3
+    },
+    "jobsCreated": {
+      "a": 1,
+      "w": 1,
+      "b": 3
+    },
+    "completedElements": {
+      "StartEvent_1": 1,
+      "Task_A": 1,
+      "Task_W": 1,
+      "EndEvent_1": 1,
+      "Boundary_M": 3,
+      "Task_B": 3,
+      "End_B": 3
+    }
+  }
+}

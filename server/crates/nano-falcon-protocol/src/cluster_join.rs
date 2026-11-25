@@ -103,6 +103,13 @@ pub const FEATURE_CANCEL_SUSPENDED_INSTANCE: &str = "cancel-suspended-instance-v
 /// entry carrying either never ships to a peer that does not advertise this.
 pub const FEATURE_MESSAGE_CORRELATION_ACK: &str = "message-correlation-ack-v1";
 
+/// Process-instance history deletion (#1948): this binary decodes and applies
+/// `Command::DeleteProcessInstanceHistory` / `Event::ProcessInstanceHistoryDeleted`.
+/// An older binary cannot decode either, so a gateway proposes the command only
+/// while every peer advertises this (ADR 0066 rolling-upgrade gate), and an
+/// entry carrying it never ships to a peer that does not.
+pub const FEATURE_PROCESS_INSTANCE_HISTORY_DELETION: &str = "process-instance-history-deletion-v1";
+
 /// Every replicated-command feature this binary supports — the single source
 /// of truth for what the handshake advertises.
 pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
@@ -115,6 +122,7 @@ pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_MESSAGE_BUFFERING,
     FEATURE_CANCEL_SUSPENDED_INSTANCE,
     FEATURE_MESSAGE_CORRELATION_ACK,
+    FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
 ];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.
