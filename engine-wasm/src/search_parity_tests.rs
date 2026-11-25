@@ -1427,6 +1427,29 @@ fn ts_filter_probes(query: &str) -> Vec<String> {
                 json!([{ "name": "label", "value": "\"item-1\"" }])
             };
             bodies.push(json!({ "filter": { field.as_str(): v } }).to_string());
+            // Variable-value lists: each element's `value` is itself a filter
+            // property (`VariableValueFilterProperty.value:
+            // StringFilterProperty`), so probe its operators nested.
+            if let Some(elem) = ts_array_elem(resolved) {
+                let elem = decls.get(elem).map(String::as_str).unwrap_or(elem);
+                let value_ty = ts_fields(&decls, elem)
+                    .into_iter()
+                    .find(|(k, _)| k == "value")
+                    .map(|(_, t)| t);
+                if let Some(value_ty) = value_ty {
+                    let base = json!("\"item-1\"");
+                    for o in ts_operators(&decls, &value_ty) {
+                        for operand in operands(&o, &base) {
+                            bodies.push(
+                                json!({ "filter": { field.as_str(): [
+                                    { "name": "label", "value": { o.as_str(): operand } }
+                                ] } })
+                                .to_string(),
+                            );
+                        }
+                    }
+                }
+            }
             continue;
         }
         let prop_schema = spec_property_schema(&filter_ty, &field).unwrap_or_else(|| {
@@ -1526,4 +1549,18 @@ fn ts_probes_include_the_1883_date_range_operator() {
         "{probes:?}"
     );
     assert!(probes.iter().any(|b| b.contains(r#""tenantId":{"$like""#)));
+}
+
+#[test]
+fn ts_probes_include_nested_variable_value_operators() {
+    // `VariableValueFilterProperty.value` is a `StringFilterProperty`: the
+    // guard must probe its operators inside `variables`, not just plain values.
+    let probes = ts_filter_probes("ProcessInstanceSearchQuery");
+    for o in ["$like", "$in", "$eq", "$exists"] {
+        let needle = format!(r#""variables":[{{"name":"label","value":{{"{o}""#);
+        assert!(
+            probes.iter().any(|b| b.contains(&needle)),
+            "{o}: {probes:?}"
+        );
+    }
 }
