@@ -533,7 +533,9 @@ pub fn engine_error_status_for(kind: &str, e: &nanobpmn_engine_core::EngineError
         // ad-hoc-completion and business-id rejections (`complete_job_impl`):
         // an unknown/contradictory ad-hoc activation target and an invalid
         // business id are 400 (invalid data), a business-id conflict is 409.
-        // The shared mapping would otherwise surface these as 404 / 500.
+        // The shared mapping (`EngineError::problem`) already agrees for all of
+        // these except `AdHocUnknownElement`, which it maps to 404; this override
+        // exists to keep that one at 400 for `CompleteJob`.
         match e {
             E::AdHocUnknownElement { .. }
             | E::AdHocActivateWithCompletion { .. }
