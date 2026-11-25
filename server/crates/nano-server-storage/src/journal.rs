@@ -3594,8 +3594,12 @@ impl Journal {
     }
 
     /// [`apply_command`](Self::apply_command) followed by
-    /// [`Commit::blocking_wait`]: the command's events are durable when this
-    /// returns. The canonical form for synchronous callers (tests, tooling) that
+    /// [`Commit::blocking_wait`]: the journal writer has *settled* this
+    /// command's write when this returns. Settled is not "confirmed on disk":
+    /// `blocking_wait` treats a failed commit and a closed acknowledgement
+    /// channel as settled, and in async durability mode the acknowledgement is
+    /// page-cache admission, not fsync — so `Ok(events)` reports the engine
+    /// command's outcome, not confirmed persistence. The canonical form for synchronous callers (tests, tooling) that
     /// do not need to overlap the write with other work — discarding the commit
     /// instead is the #1477 race, and trips the `Commit` drop bomb (#1855).
     /// Must NOT be called from within an async runtime (use `apply_command`
