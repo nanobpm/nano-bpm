@@ -6,7 +6,9 @@ use super::*;
 use crate::model::ProcessBuilder;
 
 #[kani::proof]
-#[kani::unwind(4)]
+// ProcessBuilder::build iterates all 6 elements and 6 flows, so the bound
+// must exceed 6 (Kani applies it to callees too).
+#[kani::unwind(8)]
 fn parallel_diamond_creates_one_instance() {
     let def = ProcessBuilder::new("p")
         .start_event("S")
