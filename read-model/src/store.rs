@@ -835,15 +835,6 @@ fn shared_column_list(
     Ok(list)
 }
 
-/// Removes the history of the given deleted instances — each instance, every
-/// call-activity descendant the archive holds, and their archived dependent
-/// rows — from the durable terminal archive at `archive` (#1948). Without this,
-/// a snapshot-gap recovery's [`ReadStore::replay_terminal_archive`] would
-/// resurrect deleted history and then advance the cursor past the deletion
-/// event. Runs in one archive transaction; the caller runs it **before**
-/// committing the projection batch, so a failure fails the batch (the cursor
-/// does not advance and the deletion is re-projected) rather than leaving a
-/// deleted instance restorable.
 /// The instance keys of every [`Event::ProcessInstanceHistoryDeleted`] in `events`.
 fn history_deletions<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<Key> {
     events
@@ -855,6 +846,16 @@ fn history_deletions<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<Key
         .collect()
 }
 
+/// Removes the history of the given deleted instances — each instance and
+/// every call-activity descendant found by walking the union of the live store
+/// and the archive, plus their dependent rows — from both the live projection
+/// (via `conn`) and, when `archive` is `Some`, the durable terminal archive
+/// (#1948). Without this, a snapshot-gap recovery's
+/// [`ReadStore::replay_terminal_archive`] would resurrect deleted history and
+/// then advance the cursor past the deletion event. The caller runs it
+/// **before** committing the projection batch, so a failure fails the batch
+/// (the cursor does not advance and the deletion is re-projected) rather than
+/// leaving a deleted instance restorable.
 fn delete_history_from_archive(
     conn: &Connection,
     archive: Option<&Path>,
