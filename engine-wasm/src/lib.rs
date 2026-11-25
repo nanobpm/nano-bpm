@@ -921,7 +921,7 @@ impl TestEngine {
     pub fn cancel_instance(&mut self, instance_key: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
         let key = parse_key(instance_key)?;
-        self.apply(Command::CancelInstance { instance_key: key })
+        self.apply(Command::cancel_instance_including_suspended(key))
             .map_err(|e| js_err(&format!("cancel instance error: {e}")))?;
         to_json(&self.snapshot_value(None))
     }

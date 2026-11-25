@@ -4920,7 +4920,7 @@ fn cancelling_a_parent_terminates_its_catalog_only_call_activity_child() {
         .expect("the call-activity tool spawned a child process instance");
 
     engine
-        .apply_command(Command::CancelInstance { instance_key: inst })
+        .apply_command(Command::cancel_instance(inst))
         .expect("cancel the parent");
 
     assert_eq!(

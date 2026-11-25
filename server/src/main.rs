@@ -10409,7 +10409,7 @@ impl ServerImpl {
         match self
             .apply_partition_command_ref(
                 instance_key,
-                Command::cancel_instance(instance_key),
+                Command::cancel_instance_including_suspended(instance_key),
                 operation_reference,
             )
             .await
@@ -12849,7 +12849,7 @@ impl ServerImpl {
         let _ = self
             .apply_partition_command_ref(
                 instance_key,
-                Command::cancel_instance(instance_key),
+                Command::cancel_instance_including_suspended(instance_key),
                 operation_reference,
             )
             .await?;

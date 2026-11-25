@@ -5255,18 +5255,22 @@ impl Engine {
                 }
             }
 
-            Command::CancelInstance { instance_key } => {
-                // Only a live (ACTIVE or SUSPENDED) instance can be cancelled
-                // (Camunda parity: "only ACTIVE and SUSPENDED root instances can
-                // be cancelled"). An unknown key, or one that has already
+            Command::CancelInstance {
+                instance_key,
+                terminate_suspended,
+            } => {
+                // An ACTIVE instance can be cancelled; a SUSPENDED one only when
+                // the command opts in (Camunda parity: "only ACTIVE and
+                // SUSPENDED root instances can be cancelled", #1863 — gated on
+                // a cluster capability so pre-upgrade replicas, which reject it,
+                // never diverge). An unknown key, or one that has already
                 // completed/terminated/is terminating, is rejected so the caller
                 // gets a clean 404.
                 match self.state.instances.get(&instance_key) {
                     Some(instance)
-                        if matches!(
-                            instance.state,
-                            ProcessInstanceState::Active | ProcessInstanceState::Suspended
-                        ) => {}
+                        if instance.state == ProcessInstanceState::Active
+                            || (terminate_suspended
+                                && instance.state == ProcessInstanceState::Suspended) => {}
                     _ => return Err(EngineError::InstanceNotFound { instance_key }),
                 }
 

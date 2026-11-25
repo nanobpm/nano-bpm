@@ -474,8 +474,8 @@ impl RaftTransport for PeerTransport {
 /// (#1661). Single canonical mapping from log content to wire requirement.
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
-        FEATURE_CLUSTER_VARIABLES, FEATURE_REPLICATED_LENIENT_COMPLETION,
-        FEATURE_TERMINAL_DEADLINES,
+        FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES,
+        FEATURE_REPLICATED_LENIENT_COMPLETION, FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
     let RaftRpcRequest::AppendEntries(r) = req else {
@@ -499,6 +499,10 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
                 Command::CreateClusterVariable { .. }
                 | Command::UpdateClusterVariable { .. }
                 | Command::DeleteClusterVariable { .. } => FEATURE_CLUSTER_VARIABLES,
+                Command::CancelInstance {
+                    terminate_suspended: true,
+                    ..
+                } => FEATURE_CANCEL_SUSPENDED_INSTANCE,
                 _ => continue,
             };
             if !required.contains(&feature) {
@@ -575,7 +579,7 @@ mod codec_tests {
         }
         // #1856 review: a stamped entry is never shipped to a peer that would
         // ignore the deadline map; an unstamped one requires nothing.
-        let mut stamped = entry(Command::CancelInstance { instance_key: 1 });
+        let mut stamped = entry(Command::cancel_instance(1));
         if let EntryPayload::Normal(batch) = &mut stamped.payload {
             batch.items[0].terminal_deadlines.insert(7, 1_000);
         }
@@ -583,11 +587,14 @@ mod codec_tests {
             required_features_for(&req(vec![stamped])),
             vec![nano_falcon_protocol::cluster_join::FEATURE_TERMINAL_DEADLINES]
         );
-        assert!(
-            required_features_for(&req(vec![entry(Command::CancelInstance {
-                instance_key: 1
-            })]))
-            .is_empty()
+        assert!(required_features_for(&req(vec![entry(Command::cancel_instance(1))])).is_empty());
+        // #1863: a SUSPENDED-terminating cancel never ships to a peer that
+        // would reject it; the legacy cancel requires nothing.
+        assert_eq!(
+            required_features_for(&req(vec![entry(
+                Command::cancel_instance_including_suspended(1)
+            )])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_CANCEL_SUSPENDED_INSTANCE]
         );
         assert!(
             required_features_for(&req(vec![Entry::<RaftConfig> {

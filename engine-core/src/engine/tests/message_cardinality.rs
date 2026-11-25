@@ -179,7 +179,7 @@ fn cancel_clears_armed_races() {
     );
 
     engine
-        .apply_command(Command::CancelInstance { instance_key: inst })
+        .apply_command(Command::cancel_instance(inst))
         .unwrap();
 
     let instance = engine.instance(inst).unwrap();

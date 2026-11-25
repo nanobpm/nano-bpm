@@ -1854,7 +1854,7 @@ fn terminate_while_a_whole_scope_throw_is_in_flight_leaves_no_wait_behind() {
     // Now cancel the whole instance while the throw is still resting on the
     // in-flight handler: the in-flight compensation must not strand the wait.
     let events = engine
-        .apply_command(Command::CancelInstance { instance_key })
+        .apply_command(Command::cancel_instance(instance_key))
         .unwrap();
     assert!(events
         .iter()
