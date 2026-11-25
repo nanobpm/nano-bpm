@@ -235,6 +235,11 @@ pub struct Engine {
     /// children, never walk the resident instance map.
     #[cfg(test)]
     pub(crate) cascade_scan_count: std::cell::Cell<usize>,
+    /// Test-only count of full buffered-message scans (#1874): a persistent
+    /// subscription draining a backlog must scan the buffer once, not per
+    /// message.
+    #[cfg(test)]
+    pub(crate) buffer_scan_count: std::cell::Cell<usize>,
     /// When `true`, runtime event application ([`Engine::emit`]) records the
     /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
     /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
@@ -316,6 +321,13 @@ pub struct Engine {
     /// Still-open persistent subscriptions that took a buffered message and
     /// may take the next one (#1874). Per-command scratch.
     buffer_requeue: VecDeque<Key>,
+    /// Per-subscription ordered candidate queue of buffered message keys
+    /// (#1874): built once (one buffer scan + sort) the first time a
+    /// subscription consults the buffer in a command, then consumed from the
+    /// front, so draining N messages through a persistent subscription is
+    /// O(N log N) rather than N full scans. Per-command scratch; invalidated
+    /// whenever a message is buffered.
+    buffer_candidates: BTreeMap<Key, VecDeque<Key>>,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -756,6 +768,8 @@ impl Engine {
             resource_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            buffer_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             retire_cursor: 0,
             dirty_vars: BTreeSet::new(),
@@ -766,6 +780,7 @@ impl Engine {
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
+            buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
         }
@@ -939,6 +954,8 @@ impl Engine {
             resource_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            buffer_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             retire_cursor: 0,
             dirty_vars: BTreeSet::new(),
@@ -949,6 +966,7 @@ impl Engine {
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
+            buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,
         }
@@ -2669,6 +2687,7 @@ impl Engine {
         self.pending_timer_fires.clear();
         self.buffer_scan_from = 0;
         self.buffer_requeue.clear();
+        self.buffer_candidates.clear();
         self.sweep_from = 0;
         // Per-command terminal-deadline stamp (#1494): set from THIS command
         // only, merged with any envelope stamps armed by
@@ -5020,6 +5039,9 @@ impl Engine {
                             }
                         }
                     }
+                    // A new buffered message invalidates the cached
+                    // per-subscription candidate queues.
+                    self.buffer_candidates.clear();
                     self.emit(
                         &mut log,
                         Event::MessageBuffered {
@@ -7363,6 +7385,7 @@ impl Engine {
         self.buffer_scan_from = end;
         if self.state.buffered_messages.is_empty() {
             self.buffer_requeue.clear();
+            self.buffer_candidates.clear();
             return;
         }
         // Persistent subscriptions (non-interrupting boundary / event
@@ -7392,6 +7415,73 @@ impl Engine {
         }
     }
 
+    /// Whether any resident ancestor (call-activity parent chain) of
+    /// `instance_key` is no longer live — its cancellation cascade is pending.
+    fn has_ended_ancestor(&self, instance_key: Key) -> bool {
+        let mut current = instance_key;
+        while let Some(parent) = self
+            .state
+            .instances
+            .get(&current)
+            .and_then(|i| i.parent_process_instance_key)
+        {
+            match self.state.instances.get(&parent) {
+                Some(p)
+                    if !matches!(
+                        p.state,
+                        ProcessInstanceState::Active | ProcessInstanceState::Suspended
+                    ) =>
+                {
+                    return true;
+                }
+                Some(_) => current = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// The oldest live buffered message the subscription may still take, from
+    /// its cached ordered candidate queue (built on first use this command).
+    fn next_buffered_candidate(
+        &mut self,
+        subscription_key: Key,
+        now: u64,
+    ) -> Option<&state::BufferedMessage> {
+        let subscription = self.state.message_subscriptions.get(&subscription_key)?;
+        let instance_key = subscription.instance_key;
+        if !self.buffer_candidates.contains_key(&subscription_key) {
+            #[cfg(test)]
+            self.buffer_scan_count
+                .set(self.buffer_scan_count.get() + 1);
+            let mut candidates: Vec<(u64, Key)> = self
+                .state
+                .buffered_messages
+                .values()
+                .filter(|m| {
+                    m.message_name == subscription.message_name
+                        && m.correlation_key == subscription.correlation_key
+                })
+                .map(|m| (m.seq, m.key))
+                .collect();
+            candidates.sort_unstable();
+            self.buffer_candidates.insert(
+                subscription_key,
+                candidates.into_iter().map(|(_, k)| k).collect(),
+            );
+        }
+        let queue = self.buffer_candidates.get_mut(&subscription_key)?;
+        while let Some(&key) = queue.front() {
+            if self.state.buffered_messages.get(&key).is_some_and(|m| {
+                m.is_live_at(now) && !m.correlated_instances.contains(&instance_key)
+            }) {
+                return self.state.buffered_messages.get(&key);
+            }
+            queue.pop_front();
+        }
+        None
+    }
+
     /// One subscription's turn at the buffer (see
     /// [`Self::correlate_buffered_messages`]). Returns `true` when a LOCAL
     /// correlation advanced a token (the caller must drain before going on);
@@ -7417,18 +7507,14 @@ impl Engine {
             let element_instance_key = subscription.element_instance_key;
             let element_id = subscription.element_id.clone();
             let kind = subscription.kind.clone();
-            let Some(message) = self
-                .state
-                .buffered_messages
-                .values()
-                .filter(|m| {
-                    m.is_live_at(now)
-                        && m.message_name == subscription.message_name
-                        && m.correlation_key == subscription.correlation_key
-                        && !m.correlated_instances.contains(&instance_key)
-                })
-                .min_by_key(|m| (m.seq, m.key))
-            else {
+            // A buffered message must never reach a child whose ancestor has
+            // already ended (e.g. a top-level terminate end raced a call
+            // activity): the pending cascade will terminate it, and a
+            // correlation first could complete it instead (#1874).
+            if self.has_ended_ancestor(instance_key) {
+                return false;
+            }
+            let Some(message) = self.next_buffered_candidate(subscription_key, now) else {
                 return false;
             };
             let message_key = message.key;

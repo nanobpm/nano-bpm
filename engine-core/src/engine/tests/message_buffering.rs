@@ -661,6 +661,7 @@ fn non_interrupting_subscription_drains_the_whole_backlog_locally() {
                 .expect("buffered"),
         );
     }
+    engine.buffer_scan_count.set(0);
     let events = engine
         .apply_command_at(
             Command::create_instance_with("ni", vars(&[("orderId", Value::Str("o-1".into()))])),
@@ -675,6 +676,9 @@ fn non_interrupting_subscription_drains_the_whole_backlog_locally() {
         taken, published,
         "every buffered message, in order: {events:?}"
     );
+    // r4692584915: the backlog is drained from one ordered scan of the
+    // buffer, not one full scan per message.
+    assert_eq!(engine.buffer_scan_count.get(), 1);
 }
 
 /// The routed twin: the message partition settles every backlog message to a
@@ -736,4 +740,58 @@ fn non_interrupting_subscription_drains_the_whole_backlog_routed() {
         .count();
     assert_eq!(buffered_correlations(&opened).len(), 2, "{opened:?}");
     assert_eq!(remote, 2, "{opened:?}");
+}
+
+/// A parent that forks into a call activity and a top-level terminate end must
+/// terminate the child before a buffered message can complete it (#1874): the
+/// child's freshly opened catch must not correlate while its parent has ended.
+#[test]
+fn buffered_message_never_reaches_a_child_of_an_ended_parent() {
+    let mut engine = deployed();
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .parallel_gateway("split")
+        .call_activity("c1", "await-payment")
+        .end_event("c1_end")
+        .terminate_end_event("stop")
+        .connect("start", "split")
+        .connect("split", "c1")
+        .connect("split", "stop")
+        .connect("c1", "c1_end")
+        .build()
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    engine
+        .apply_command_at(
+            publish("payment-received", "o-1", Some(10_000), None),
+            1_000,
+        )
+        .unwrap();
+    let events = engine
+        .apply_command_at(
+            Command::create_instance_with("orch", vars(&[("orderId", Value::Str("o-1".into()))])),
+            2_000,
+        )
+        .unwrap();
+    let parent = events.iter().find_map(|e| e.instance_key()).unwrap();
+    let child = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated { instance_key, .. } if *instance_key != parent => {
+                Some(*instance_key)
+            }
+            _ => None,
+        })
+        .expect("call activity spawned a child");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::BufferedMessageCorrelated { .. })),
+        "no buffered correlation into a child of an ended parent: {events:?}"
+    );
+    assert_eq!(
+        engine.instance(child).unwrap().state,
+        ProcessInstanceState::Terminated
+    );
+    assert_eq!(engine.state().buffered_messages.len(), 1);
 }

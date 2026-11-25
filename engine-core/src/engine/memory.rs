@@ -122,6 +122,8 @@ impl Engine {
             resource_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            buffer_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             retire_cursor: 0,
             dirty_vars: std::collections::BTreeSet::new(),
@@ -132,6 +134,7 @@ impl Engine {
             pending_timer_fires: std::collections::VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: std::collections::VecDeque::new(),
+            buffer_candidates: std::collections::BTreeMap::new(),
             sweep_from: 0,
             raft_applied: snapshot.raft_applied,
         }
