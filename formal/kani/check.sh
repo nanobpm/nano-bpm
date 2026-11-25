@@ -51,7 +51,12 @@ for h in "${HARNESSES[@]}"; do
   start=$(date +%s)
   log="$(mktemp)"
   rc=0
-  timeout "$HARNESS_TIMEOUT" cargo kani "${UNWIND_ARGS[@]}" --harness "$h" 2>&1 | tee "$log" || rc=$?
+  # Peak memory (#1994): report max RSS via GNU time so each run records how
+  # close the harness is to the runner's memory ceiling.
+  timefile="$(mktemp)"
+  timer=()
+  [[ -x /usr/bin/time ]] && timer=(/usr/bin/time -v -o "$timefile")
+  timeout "$HARNESS_TIMEOUT" "${timer[@]}" cargo kani "${UNWIND_ARGS[@]}" --harness "$h" 2>&1 | tee "$log" || rc=$?
   echo "::endgroup::"
   elapsed=$(( $(date +%s) - start ))
   grep -E '^(VERIFICATION:|Verification Time:|Complete - )' "$log" || true
@@ -64,6 +69,9 @@ for h in "${HARNESSES[@]}"; do
     rc=1
   fi
   rm -f "$log"
+  peak_kb="$(sed -n 's/^\s*Maximum resident set size (kbytes): //p' "$timefile")"
+  rm -f "$timefile"
+  [[ -n "$peak_kb" ]] && echo "kani $h: peak RSS $((peak_kb / 1024)) MiB"
   if [[ $rc -ne 0 ]]; then
     echo "::error::kani $h failed (exit $rc, ${elapsed}s; 124 = exceeded ${HARNESS_TIMEOUT}s box)"
     exit 1

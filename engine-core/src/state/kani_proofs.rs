@@ -5,7 +5,7 @@
 //! Compiled only under `cargo kani` (`cfg(kani)`). See `formal/kani/README.md`
 //! for what is proven, the bounds and how to run them.
 
-use super::kani_model::{BoundedArrivals, JobIndexes};
+use super::kani_model::{BoundedArrivals, JobIndexes, assert_job_index_lockstep};
 use super::*;
 use crate::model::IncomingFlow;
 
@@ -136,18 +136,7 @@ fn job_index_resync_keeps_lockstep() {
         let job_state = any_job_state();
         let backoff = kani::any::<bool>().then(kani::any::<u64>);
         indexes.resync(KEY, priority, job_state, backoff);
-        let activated = job_state == JobState::Activated;
-        assert!(activated == indexes.activated.contains(&KEY));
-        assert!(indexes.activated.len() == usize::from(activated));
-        let deferred = job_state == JobState::Created && backoff.is_some();
-        let activatable = indexes.activatable.contains(&order);
-        assert!(activatable == (job_state == JobState::Created && !deferred));
-        assert!(indexes.activatable.len() == usize::from(activatable));
-        let until = backoff.unwrap_or(0);
-        let expected_deadline = deferred.then_some(until);
-        assert!(indexes.deferred_deadline == expected_deadline);
-        assert!(deferred == indexes.deferred_jobs.contains(&(until, KEY)));
-        assert!(indexes.deferred_jobs.len() == usize::from(deferred));
+        assert_job_index_lockstep(&indexes, KEY, order, job_state, backoff);
     }
 }
 

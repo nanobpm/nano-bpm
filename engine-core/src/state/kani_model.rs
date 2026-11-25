@@ -202,6 +202,46 @@ impl JobIndexes {
     }
 }
 
+/// The lockstep invariant between job `key` (at activation `order`, in
+/// `job_state` with `backoff`) and its derived indexes, checked in BOTH
+/// directions: every index entry the job's state calls for is present, and no
+/// index holds any other entry — in particular a job that has left the
+/// deferred state leaves no stale `deferred_jobs` entry behind, and every
+/// `deferred_jobs` entry has a matching live `deferred_deadline` (#1994).
+/// Shared by the Kani harness and the broken-variant unit tests below, so the
+/// tests prove this very check catches a leftover entry.
+pub(crate) fn assert_job_index_lockstep(
+    indexes: &JobIndexes,
+    key: Key,
+    order: (i64, Key),
+    job_state: JobState,
+    backoff: Option<u64>,
+) {
+    let activated = job_state == JobState::Activated;
+    assert!(activated == indexes.activated.contains(&key));
+    assert!(indexes.activated.len() == usize::from(activated));
+    let deferred = job_state == JobState::Created && backoff.is_some();
+    let activatable = indexes.activatable.contains(&order);
+    assert!(activatable == (job_state == JobState::Created && !deferred));
+    assert!(indexes.activatable.len() == usize::from(activatable));
+    // Forward: the deadline entry exists exactly when deferred, at the backoff.
+    let expected_deadline = if deferred { backoff } else { None };
+    assert!(indexes.deferred_deadline == expected_deadline);
+    // Reverse: every `deferred_jobs` entry is backed by the live deadline of
+    // a deferred job; none survives the job leaving the deferred state.
+    for &(until, k) in indexes.deferred_jobs.as_slice() {
+        assert!(k == key && deferred, "stale deferred_jobs entry");
+        assert!(
+            indexes.deferred_deadline == Some(until),
+            "orphan deferred_jobs entry"
+        );
+    }
+    if let Some(until) = indexes.deferred_deadline {
+        assert!(indexes.deferred_jobs.contains(&(until, key)));
+    }
+    assert!(indexes.deferred_jobs.len() == usize::from(deferred));
+}
+
 /// Refinement: the stand-ins agree with the production types on every
 /// operation sequence up to a bound (exhaustively enumerated, so stronger than
 /// sampling on this domain).
@@ -383,9 +423,47 @@ mod refinement {
                 }
                 resync_job_index(&mut r, KEY);
                 m.resync(KEY, priority, job_state, backoff);
+                let order = types::activation_order(priority, KEY);
+                assert_job_index_lockstep(&m, KEY, order, job_state, backoff);
                 walk_jobs(priority, m, &r, depth - 1);
             }
         }
+    }
+
+    #[test]
+    fn lockstep_accepts_correct_resync() {
+        let mut m = JobIndexes::default();
+        let order = types::activation_order(0, KEY);
+        m.resync(KEY, 0, JobState::Created, Some(5));
+        assert_job_index_lockstep(&m, KEY, order, JobState::Created, Some(5));
+        m.resync(KEY, 0, JobState::Activated, None);
+        assert_job_index_lockstep(&m, KEY, order, JobState::Activated, None);
+    }
+
+    /// Broken variant: a resync that forgets to drop the reverse
+    /// (`deferred_jobs`) entry when the job leaves the deferred state.
+    #[test]
+    #[should_panic(expected = "stale deferred_jobs entry")]
+    fn lockstep_catches_leftover_reverse_entry() {
+        let mut m = JobIndexes::default();
+        let order = types::activation_order(0, KEY);
+        m.resync(KEY, 0, JobState::Created, Some(5));
+        m.resync(KEY, 0, JobState::Activated, None);
+        m.deferred_jobs.insert((5, KEY));
+        assert_job_index_lockstep(&m, KEY, order, JobState::Activated, None);
+    }
+
+    /// Broken variant: a reverse entry left at an old deadline after a
+    /// re-deferral (forward entry live, reverse entry mismatched).
+    #[test]
+    #[should_panic(expected = "orphan deferred_jobs entry")]
+    fn lockstep_catches_orphan_reverse_entry_on_redeferral() {
+        let mut m = JobIndexes::default();
+        let order = types::activation_order(0, KEY);
+        m.resync(KEY, 0, JobState::Created, Some(5));
+        m.resync(KEY, 0, JobState::Created, Some(9));
+        m.deferred_jobs.insert((5, KEY));
+        assert_job_index_lockstep(&m, KEY, order, JobState::Created, Some(9));
     }
 
     #[test]
