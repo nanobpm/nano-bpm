@@ -1032,3 +1032,52 @@ test("publishMessage with timeToLive/messageId publishes as given and asserts a 
     await once(server, "close");
   }
 });
+
+test("CamundaBackend observes an awaitCompletion DEADLINE_EXCEEDED on a live instance as completed:false (#1988)", async () => {
+  // A correctly stuck instance (a token still parked on a task) never completes,
+  // so the awaitCompletion create ends in HTTP 504 DEADLINE_EXCEEDED. That is an
+  // OBSERVATION (`completed: false`), not a backend error: surfacing it as
+  // `camunda:error` hid the Reference defect behind #1794. Any OTHER create
+  // failure must still fail loudly.
+  let createStatus = 504;
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      if (req.url.endsWith("/process-instances")) {
+        res.writeHead(createStatus, { "content-type": "application/problem+json" });
+        res.end(JSON.stringify({
+          type: "about:blank",
+          title: createStatus === 504 ? "DEADLINE_EXCEEDED" : "INTERNAL",
+          status: createStatus,
+          detail: "Expected to complete the process instance within the timeout",
+          instance: "/v2/process-instances",
+        }));
+        return;
+      }
+      res.writeHead(204);
+      res.end();
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const obs = await backend.observe(await backend.start("P", {}));
+    assert.equal(obs.completed, false);
+    assert.deepEqual(obs.unobserved, ["variables"]);
+    // The differential then compares `completed` only: nano's variables of a
+    // still-running instance are not contradicted by an unread Camunda value.
+    const nanoObs = { ...emptyObservation(), completed: false, variables: { x: 1 } };
+    const diff = diffObservations(nanoObs, obs, new Set(["completed", "variables"]), backend.provides);
+    assert.deepEqual(diff.comparedFields, ["completed"]);
+    assert.equal(diff.ok, true);
+    // A completing nano run against the stuck Camunda instance still diverges.
+    assert.equal(diffObservations({ ...nanoObs, completed: true }, obs, backend.provides, backend.provides).ok, false);
+    createStatus = 500;
+    await assert.rejects(async () => backend.observe(await backend.start("P", {})), /HTTP 500/);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});

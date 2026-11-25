@@ -103,8 +103,12 @@ function fieldsEqual(field, a, b) {
  * is nondeterministic, a driver defect to root-cause).
  */
 export function diffObservations(a, b, provideA, provideB) {
+  // A field a backend provides in general but did NOT read on THIS run (listed
+  // in the observation's `unobserved`, e.g. Camunda's variables of an instance
+  // whose awaitCompletion create timed out, #1988) is not compared.
+  const unread = new Set([...(a?.unobserved ?? []), ...(b?.unobserved ?? [])]);
   const shared = OBSERVATION_FIELDS.filter(
-    (f) => provideA.has(f) && provideB.has(f),
+    (f) => provideA.has(f) && provideB.has(f) && !unread.has(f),
   );
   const mismatches = [];
   for (const field of shared) {

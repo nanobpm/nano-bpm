@@ -100,6 +100,18 @@ function requireOk(res, body, what) {
   }
 }
 
+/**
+ * Whether a create-instance failure is the awaitCompletion deadline (HTTP 504
+ * `DEADLINE_EXCEEDED`) — the instance is still running, not a broken backend.
+ */
+export function isAwaitCompletionTimeout(err) {
+  return (
+    err instanceof CamundaHttpError &&
+    err.status === 504 &&
+    err.body?.title === "DEADLINE_EXCEEDED"
+  );
+}
+
 export class CamundaBackend {
   static id = "camunda";
 
@@ -278,8 +290,9 @@ export class CamundaBackend {
     //     as the first step) has no such barrier: v2 correlation does not buffer,
     //     so a dispatch racing ahead of the subscription is dropped. But then the
     //     instance simply never leaves its catch, the `awaitCompletion` create
-    //     times out (DEFAULT_COMPLETION_TIMEOUT_MS) and THROWS — the run fails
-    //     loudly instead of reporting a bogus match. Adding such a scenario is
+    //     times out (DEFAULT_COMPLETION_TIMEOUT_MS) and is observed as
+    //     `completed: false` (#1988) — a loud differential mismatch against a
+    //     completing nano run, never a bogus match. Adding such a scenario is
     //     gated on wiring the query-API barrier above (#1260 review).
     const handle = { processId, abort: new AbortController(), instanceKeys: new Set() };
     this.#inflight.add(handle);
@@ -577,7 +590,22 @@ export class CamundaBackend {
 
   async observe(handle) {
     const obs = emptyObservation();
-    const result = await handle.pending;
+    let result;
+    try {
+      result = await handle.pending;
+    } catch (err) {
+      // An awaitCompletion create that hits its deadline on an instance that is
+      // still ACTIVE (a token correctly parked on a task — e.g. Zeebe
+      // correlating one publish once per process, #1988) is an OBSERVATION, not
+      // a backend error: Camunda reports it as HTTP 504 DEADLINE_EXCEEDED, so
+      // the instance did not complete. Its final variables were never read, so
+      // they are marked `unobserved` and the differential skips them (#1794).
+      // Every other create failure still fails loudly.
+      if (!isAwaitCompletionTimeout(err)) throw err;
+      obs.completed = false;
+      obs.unobserved = ["variables"];
+      return obs;
+    }
     // A successful Camunda v2 awaitCompletion create response IS the completion
     // signal: HTTP 200 carries the result variables but NOT a `processCompleted`
     // field (an await-completion timeout surfaces as an error status, not a 200 +
