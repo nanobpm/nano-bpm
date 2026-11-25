@@ -36,9 +36,12 @@ pub fn search_process_instances<S: ReadSource + ?Sized>(
         body.and_then(|q| q.sort.as_ref()),
         |r: &models::ProcessInstanceSearchQuerySortRequest| (r.field.clone(), r.order),
     );
-    query::sort_items(&mut matched, &sort, |inst, field| process_instance_sort_val(inst, field), |inst| {
-        inst.key
-    });
+    query::sort_items(
+        &mut matched,
+        &sort,
+        |inst, field| process_instance_sort_val(inst, field),
+        |inst| inst.key,
+    );
 
     let sorted: Vec<(u64, &readstore::ProcessInstanceRow)> =
         matched.into_iter().map(|inst| (inst.key, inst)).collect();
@@ -56,7 +59,10 @@ pub fn search_process_instances<S: ReadSource + ?Sized>(
 }
 
 /// The `searchProcessInstances` sort projection: every spec sort field.
-pub fn process_instance_sort_val(inst: &readstore::ProcessInstanceRow, field: &str) -> query::SortVal {
+pub fn process_instance_sort_val(
+    inst: &readstore::ProcessInstanceRow,
+    field: &str,
+) -> query::SortVal {
     match field {
         "processDefinitionId" => query::SortVal::Str(inst.process_definition_id.clone()),
         "processDefinitionKey" => query::key_sort_val(&inst.process_definition_key),
@@ -786,7 +792,9 @@ pub fn process_instance_result(
 }
 
 /// Maps an engine [`ProcessInstanceState`] to the REST state enum.
-pub fn process_instance_state_enum(state: ProcessInstanceState) -> models::ProcessInstanceStateEnum {
+pub fn process_instance_state_enum(
+    state: ProcessInstanceState,
+) -> models::ProcessInstanceStateEnum {
     match state {
         ProcessInstanceState::Active => models::ProcessInstanceStateEnum::Active,
         ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,

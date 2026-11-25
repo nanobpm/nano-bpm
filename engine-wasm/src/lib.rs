@@ -4632,7 +4632,10 @@ mod read_channel_tests {
         let key = snap["userTasks"][0]["key"].as_str().unwrap().to_string();
 
         // An open task shows up under CREATED (state filtered via the read model)…
-        let created = parse(&eng.search_user_tasks(r#"{"filter":{"state":"CREATED"}}"#).unwrap());
+        let created = parse(
+            &eng.search_user_tasks(r#"{"filter":{"state":"CREATED"}}"#)
+                .unwrap(),
+        );
         assert_eq!(created["items"].as_array().unwrap().len(), 1);
         assert_eq!(created["items"][0]["elementId"], "review");
         assert_eq!(created["items"][0]["state"], "CREATED");
@@ -4640,7 +4643,10 @@ mod read_channel_tests {
         assert_eq!(created["page"]["totalItems"], 1);
 
         // …and NOT under COMPLETED.
-        let completed = parse(&eng.search_user_tasks(r#"{"filter":{"state":"COMPLETED"}}"#).unwrap());
+        let completed = parse(
+            &eng.search_user_tasks(r#"{"filter":{"state":"COMPLETED"}}"#)
+                .unwrap(),
+        );
         assert_eq!(completed["items"].as_array().unwrap().len(), 0);
 
         // No filter returns every task.
@@ -4658,13 +4664,19 @@ mod read_channel_tests {
         // After completion the task leaves the CREATED (open) set entirely.
         eng.complete_user_task(&key, r#"{"approved":true}"#)
             .unwrap();
-        let open = parse(&eng.search_user_tasks(r#"{"filter":{"state":"CREATED"}}"#).unwrap());
+        let open = parse(
+            &eng.search_user_tasks(r#"{"filter":{"state":"CREATED"}}"#)
+                .unwrap(),
+        );
         assert_eq!(
             open["items"].as_array().unwrap().len(),
             0,
             "a completed task is no longer CREATED"
         );
-        let done = parse(&eng.search_user_tasks(r#"{"filter":{"state":"COMPLETED"}}"#).unwrap());
+        let done = parse(
+            &eng.search_user_tasks(r#"{"filter":{"state":"COMPLETED"}}"#)
+                .unwrap(),
+        );
         assert_eq!(done["items"].as_array().unwrap().len(), 1);
     }
 
@@ -4929,7 +4941,9 @@ mod read_channel_tests {
             assert!(eng.search_variables_json(body, None).is_err(), "{body:?}");
         }
         // The pre-#1898 top-level shorthand is not the spec shape: rejected.
-        assert!(eng.search_user_tasks_json(r#"{"state":"CREATED"}"#).is_err());
+        assert!(eng
+            .search_user_tasks_json(r#"{"state":"CREATED"}"#)
+            .is_err());
         // An unknown `UserTaskStateEnum` spelling is a request error, exactly as
         // the gateway rejects it at deserialization (case-sensitive).
         for bad in ["FOO", "created", ""] {
@@ -5636,5 +5650,4 @@ mod read_channel_tests {
             .search_agent_instance_history_json(&key, r#"{"commitStatus":"PENDING"}"#)
             .is_err());
     }
-
 }

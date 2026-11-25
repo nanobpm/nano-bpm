@@ -43,7 +43,12 @@ pub fn search_variables<S: ReadSource + ?Sized>(
         body.and_then(|q| q.sort.as_ref()),
         |r: &models::VariableSearchQuerySortRequest| (r.field.clone(), r.order),
     );
-    query::sort_items(&mut matched, &sort, |v, field| variable_sort_val(v, field), |v| v.key);
+    query::sort_items(
+        &mut matched,
+        &sort,
+        |v, field| variable_sort_val(v, field),
+        |v| v.key,
+    );
 
     let sorted: Vec<(u64, &readstore::VariableRow)> =
         matched.into_iter().map(|v| (v.key, v)).collect();

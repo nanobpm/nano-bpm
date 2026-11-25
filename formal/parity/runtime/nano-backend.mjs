@@ -225,7 +225,9 @@ export class NanoBackend {
     Object.assign(obs.incidents, incidentsFromSnapshot(snapshot, pik));
 
     const vars = JSON.parse(
-      this.engine.searchVariables(JSON.stringify({ processInstanceKey: pik })),
+      this.engine.searchVariables(
+        JSON.stringify({ filter: { processInstanceKey: String(pik) }, page: { limit: 10000 } }),
+      ),
     );
     obs.variables = rootVariablesFromSearch(vars.items, pik);
     // The bounded-exhaustive scenarios drive routing through `route_*` start /

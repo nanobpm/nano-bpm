@@ -34,7 +34,12 @@ pub fn search_user_tasks<S: ReadSource + ?Sized>(
         body.and_then(|q| q.sort.as_ref()),
         |r: &models::UserTaskSearchQuerySortRequest| (r.field.clone(), r.order),
     );
-    query::sort_items(&mut matched, &sort, |task, field| user_task_sort_val(task, field), |task| task.key);
+    query::sort_items(
+        &mut matched,
+        &sort,
+        |task, field| user_task_sort_val(task, field),
+        |task| task.key,
+    );
 
     let sorted: Vec<(u64, &readstore::UserTaskRow)> =
         matched.into_iter().map(|task| (task.key, task)).collect();
@@ -78,10 +83,12 @@ pub fn user_task_sort_val(task: &readstore::UserTaskRow, field: &str) -> query::
 ///
 /// Every advertised field is matched against what the row actually projects.
 /// Fields Nano never projects onto a user task — `name` (the result's `name`
-/// is always null), `completionDate` (always null), `tags` (always empty), and
-/// `tenantId` (single-tenant Nano stores no tenant on tasks) — match against an
-/// absent value: value operators exclude the row (honest, never silently
-/// widening the search) while `$exists: false` still matches. The variable
+/// is always null), `completionDate` (always null) and `tags` (always empty) —
+/// match against an absent value: value operators exclude the row (honest,
+/// never silently widening the search) while `$exists: false` still matches.
+/// `tenantId` matches the `<default>` the result projects (single-tenant Nano),
+/// exactly as the process-instance filter does — filtering on a value the
+/// result reports must find the row (#1898 parity guard). The variable
 /// filters match through `vars` (#1293): `processInstanceVariables` against
 /// the owning instance's root-scope variables, `localVariables` against the
 /// variables held at the task's element-instance scope.
@@ -146,7 +153,7 @@ pub fn match_user_task_fields(
         // Never projected: task tags (result is always empty), so any listed
         // tag excludes the row.
         && f.tags.as_ref().is_none_or(|tags| tags.is_empty())
-        && query::match_string_opt(&f.tenant_id, None)
+        && query::match_string(&f.tenant_id, "<default>")
         && match_instance_variables(
             &f.process_instance_variables,
             vars.process_instance.get(&task.instance_key),
@@ -294,7 +301,9 @@ pub fn user_task_priority(stored: i32) -> u8 {
 
 /// Maps an engine [`nanobpmn_engine_core::UserTaskState`] to the REST user-task
 /// state enum.
-pub fn user_task_state_enum(state: nanobpmn_engine_core::UserTaskState) -> models::UserTaskStateEnum {
+pub fn user_task_state_enum(
+    state: nanobpmn_engine_core::UserTaskState,
+) -> models::UserTaskStateEnum {
     use nanobpmn_engine_core::UserTaskState;
     match state {
         UserTaskState::Created => models::UserTaskStateEnum::Created,

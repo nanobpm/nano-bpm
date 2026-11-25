@@ -15336,7 +15336,8 @@ impl ServerImpl {
         use nanobpmn_search::get::Lookup;
 
         Ok(
-            match nanobpmn_search::get::get_form_by_key(&self.read_source(), &path_params.form_key) {
+            match nanobpmn_search::get::get_form_by_key(&self.read_source(), &path_params.form_key)
+            {
                 Lookup::Found(r) => Resp::Status200_TheFormIsSuccessfullyReturned(r),
                 Lookup::NotFound { title, detail } | Lookup::Invalid { title, detail } => {
                     Resp::Status404_TheFormWithTheGivenKeyWasNotFound(problem(title, 404, detail))
@@ -15575,7 +15576,8 @@ impl ServerImpl {
         use nanobpmn_search::get::Lookup;
 
         Ok(
-            match nanobpmn_search::get::get_resource(&self.read_source(), &path_params.resource_key) {
+            match nanobpmn_search::get::get_resource(&self.read_source(), &path_params.resource_key)
+            {
                 Lookup::Found(r) => Resp::Status200_TheResourceIsSuccessfullyReturned(r),
                 Lookup::NotFound { title, detail } | Lookup::Invalid { title, detail } => {
                     Resp::Status404_AResourceWithTheGivenKeyWasNotFound(problem(title, 404, detail))
@@ -16628,10 +16630,11 @@ impl ServerImpl {
         use apis::agent_instance::GetAgentInstanceResponse as Resp;
         use nanobpmn_search::get::Lookup;
 
-        let lookup = nanobpmn_search::get::get_agent_instance(&path_params.agent_instance_key, |k| {
-            self.store.try_agent_instance(k)
-        })
-        .map_err(|_| ())?;
+        let lookup =
+            nanobpmn_search::get::get_agent_instance(&path_params.agent_instance_key, |k| {
+                self.store.try_agent_instance(k)
+            })
+            .map_err(|_| ())?;
         Ok(match lookup {
             Lookup::Found(r) => Resp::Status200_TheAgentInstanceIsSuccessfullyReturned(r),
             Lookup::NotFound { title, detail } => {
@@ -24947,7 +24950,6 @@ impl ServerImpl {
     }
 }
 
-
 /// v2 REST batch-operations surface (epic #903, sub-issue #905).
 ///
 /// Kept in its own `impl` block so this slice never touches the shared
@@ -26113,7 +26115,6 @@ fn decision_definition_result(
     )
 }
 
-
 fn decision_requirements_result(
     row: &readstore::DecisionRequirementsRow,
 ) -> models::DecisionRequirementsResult {
@@ -26146,7 +26147,6 @@ fn resource_sort_val(row: &readstore::ResourceMetaRow, field: &str) -> query::So
         _ => query::SortVal::Num(row.resource_key as i128),
     }
 }
-
 
 fn decision_instance_result(
     row: &readstore::DecisionInstanceRow,
@@ -26258,22 +26258,6 @@ fn decision_instance_get_result(
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// A synthesized resource (file) name for a process id. The engine does not
 /// retain the original deployment resource name, so derive a stable `.bpmn`
 /// name from the id.
@@ -26324,7 +26308,6 @@ fn process_definition_state(_deployed: &readstore::ProcessDefinitionRow) -> &'st
 #[cfg(test)]
 pub(crate) use nanobpmn_read_model::VARIABLE_VALUE_PREVIEW_LEN;
 
-
 /// Storage-level truncation state of a cluster variable's value, as seen by the
 /// `isTruncated` *filter* (spec: "based on the underlying storage
 /// characteristic, not the response format"). This in-memory store always
@@ -26334,10 +26317,6 @@ pub(crate) use nanobpmn_read_model::VARIABLE_VALUE_PREVIEW_LEN;
 /// item's `isTruncated` flag is separate: it reflects response-preview
 /// truncation via `nanobpmn_search::variable::value_is_truncated`.)
 const CLUSTER_VARIABLE_STORED_TRUNCATED: bool = false;
-
-
-
-
 
 /// Tests one element-instance row against a single set of element-instance
 /// filter fields (the shared field set of `ElementInstanceFilter` and its `$or`
@@ -26413,11 +26392,6 @@ fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilte
         && query::match_string_opt(&f.tenant_id, None)
 }
 
-
-
-
-
-
 /// Copies the shared filter fields out of a top-level `ElementInstanceFilter`
 /// into an `ElementInstanceFilterFields` so the top-level base match reuses the
 /// same predicate as each `$or` clause. `startDate`/`endDate` date-time filters
@@ -26460,8 +26434,6 @@ fn match_element_instance_filter(
         _ => true,
     }
 }
-
-
 
 /// Parses an element type's wire spelling (e.g. `SERVICE_TASK`) into the
 /// `WaitStateElementTypeEnum`, leaning on serde's rename map. Falls back to
@@ -26972,8 +26944,6 @@ fn job_kind_enums(
     }
 }
 
-
-
 /// Sort projection for job search: string-encoded definition keys sort
 /// numerically (so `"2"` precedes `"10"`), optional fields sort as
 /// [`query::SortVal::Null`] (before every present value), and unknown fields
@@ -27099,8 +27069,6 @@ fn job_search_result(
     }
     result
 }
-
-
 
 /// Maps an engine [`ActivatedJob`] into the generated `ActivatedJobResult`,
 /// resolving process-definition identity from engine state. When `fetch_variable`
@@ -58628,8 +58596,8 @@ mod call_activity_hierarchy_read_model_tests {
     //! a real engine run, so the projection cannot silently regress.
     use nanobpmn_search::{
         agent::{
-            agent_history_metrics_result, agent_instance_result, agent_message_content, agent_system_prompt,
-            match_agent_instance_filter,
+            agent_history_metrics_result, agent_instance_result, agent_message_content,
+            agent_system_prompt, match_agent_instance_filter,
         },
         convert::ms_to_datetime,
     };

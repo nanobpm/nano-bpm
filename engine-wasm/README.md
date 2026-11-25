@@ -122,7 +122,7 @@ engine.createInstance("my-process", "{}");
 
 // Same lean surface as above, PLUS the gateway's REST read channel:
 const form  = JSON.parse(engine.getFormByKey("2251799813685250"));
-const open  = JSON.parse(engine.searchUserTasks(JSON.stringify({ state: "CREATED" })));
+const open  = JSON.parse(engine.searchUserTasks(JSON.stringify({ filter: { state: "CREATED" } })));
 const insts = JSON.parse(engine.searchProcessInstances("{}"));
 const res   = JSON.parse(engine.getResourceByKey("2251799813685251"));
 const vars  = JSON.parse(engine.searchVariables("{}"));
@@ -130,24 +130,35 @@ const vars  = JSON.parse(engine.searchVariables("{}"));
 
 ### Read methods (read-model subpath only)
 
-Each returns the same JSON shapes the Camunda v2 REST surface returns; each
-delegates to the in-memory read model, kept current after every command and
-cleared by `reset()`.
+Every read method runs the SAME spec-derived pipeline the gateway serves (the
+shared `nanobpmn-search` crate): the request body is the spec's `*SearchQuery`
+(`{ filter?, sort?, page? }` — every filter field and operator, `$or`,
+variable filters, sort fields and limit/offset/cursor paging; an empty string
+means "no query"), parsed strictly — a property or enum value the spec does not
+define throws, it is never silently ignored — and the result is the generated
+`*SearchQueryResult` / `*Result`, byte-for-byte what the gateway returns. A
+server/WASM parity guard (`src/search_parity_tests.rs`) enforces this for every
+operation. Each reads the in-memory read model, kept current after every
+command and cleared by `reset()`.
 
-- **`getFormByKey(formKey)`** → the latest deployed form for `formKey`
-  (`{ tenantId, formId, schema, version, formKey }`), or `null`.
-  Mirrors `GET /forms/{formKey}`.
-- **`searchUserTasks(filterJson)`** → `{ items, page }`. Honours an optional
-  `{ state? }` filter (e.g. `"CREATED"`) through the read model.
+- **`searchUserTasks(queryJson)`** → `UserTaskSearchQueryResult`.
   Mirrors `POST /user-tasks/search`.
-- **`searchProcessInstances(filterJson)`** → `{ items, page }`. Body is
-  shape-validated; filter/sort/page fields are not yet honoured (returns every
-  instance). Mirrors `POST /process-instances/search`.
-- **`getResourceByKey(resourceKey)`** → the generic resource, or `null`.
-  Mirrors `GET /resources/{resourceKey}`.
-- **`searchVariables(filterJson)`** → `{ items, page }`. Body is shape-validated;
-  long values are truncated with `isTruncated: true`.
+- **`searchProcessInstances(queryJson)`** → `ProcessInstanceSearchQueryResult`.
+  Mirrors `POST /process-instances/search`.
+- **`searchVariables(queryJson, truncateValues?)`** → `VariableSearchQueryResult`.
+  `truncateValues` (default `true`) is the endpoint's query parameter: long
+  values are cut to the preview length and flagged `isTruncated: true`.
   Mirrors `POST /variables/search`.
+- **`searchAgentInstances(queryJson)`** / **`searchAgentInstanceHistory(key,
+  queryJson)`** → the agent search results. Mirror `POST /agent-instances/search`
+  and `POST /agent-instances/{key}/history/search`.
+- **`getFormByKey(formKey)`** → `FormResult`, or `null` where the gateway
+  answers 404. Mirrors `GET /forms/{formKey}`.
+- **`getResourceByKey(resourceKey)`** → `ResourceResult`, or `null` where the
+  gateway answers 404. Mirrors `GET /resources/{resourceKey}`.
+- **`getAgentInstance(agentInstanceKey)`** → `AgentInstanceResult`, `null` where
+  the gateway answers 404, and throws where it answers 400 (a malformed key).
+  Mirrors `GET /agent-instances/{agentInstanceKey}`.
 
 ### Typing the results — `@nanobpm/engine-wasm/readmodel-types`
 
