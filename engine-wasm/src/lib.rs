@@ -185,7 +185,7 @@ impl TestEngine {
             Ok(defs) => {
                 let ids: Vec<String> = defs.iter().map(|d| d.id.clone()).collect();
                 self.apply(Command::DeployResources(defs))
-                    .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+                    .map_err(|e| engine_err("deploy error", &e))?;
                 let snapshot = self.snapshot_value(None);
                 to_json(&serde_json::json!({
                     "processIds": ids,
@@ -235,7 +235,7 @@ impl TestEngine {
     ) -> Result<serde_json::Value, JsValue> {
         let drg_id = drg.id.clone();
         self.apply(Command::DeployDecisionRequirements(vec![drg]))
-            .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+            .map_err(|e| engine_err("deploy error", &e))?;
         let (drg_key, version, decisions) = {
             let state = self.engine.state();
             let deployed = state.decision_requirements.get(&drg_id).ok_or_else(|| {
@@ -329,7 +329,7 @@ impl TestEngine {
             // `versionTag`-bound user-task form (#1193).
             version_tag: nanobpmn_engine_core::form_version_tag_of(schema),
         }]))
-        .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        .map_err(|e| engine_err("deploy error", &e))?;
         // Resolve from post-apply state rather than the emitted events: an
         // idempotent redeploy of the identical latest form emits no
         // `FormDeployed` event, but the deploy still succeeds and must return
@@ -379,7 +379,7 @@ impl TestEngine {
             // engine-side tag storage a future parameter populates).
             version_tag: None,
         }]))
-        .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        .map_err(|e| engine_err("deploy error", &e))?;
         // Resolve from post-apply state rather than the emitted events: an
         // idempotent redeploy of the identical latest resource emits no
         // `GenericResourceDeployed` event, but the deploy still succeeds as a
@@ -426,7 +426,7 @@ impl TestEngine {
                 process_definition_key: None,
                 version,
             })
-            .map_err(|e| js_err(&format!("create error: {e}")))?;
+            .map_err(|e| engine_err("create error", &e))?;
         let created = events.iter().find_map(|e| match e {
             Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
@@ -479,7 +479,7 @@ impl TestEngine {
                 self.now,
                 breakpoints,
             )
-            .map_err(|e| js_err(&format!("debug create error: {e}")))?;
+            .map_err(|e| engine_err("debug create error", &e))?;
         self.debug = Some(session);
         self.fold_debug_delta();
         to_json(&self.debug_state())
@@ -564,7 +564,7 @@ impl TestEngine {
             task_listener_result: None,
             business_id: None,
         })
-        .map_err(|e| js_err(&format!("complete error: {e}")))?;
+        .map_err(|e| engine_err("complete error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -611,7 +611,7 @@ impl TestEngine {
             task_listener_result: None,
             business_id: None,
         })
-        .map_err(|e| js_err(&format!("complete agent job error: {e}")))?;
+        .map_err(|e| engine_err("complete agent job error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -638,7 +638,7 @@ impl TestEngine {
             error_message: message.to_string(),
             retry_back_off: 0,
         })
-        .map_err(|e| js_err(&format!("fail error: {e}")))?;
+        .map_err(|e| engine_err("fail error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -708,7 +708,7 @@ impl TestEngine {
             time_to_live,
             message_id,
         })
-        .map_err(|e| js_err(&format!("correlate error: {e}")))?;
+        .map_err(|e| engine_err("correlate error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -725,9 +725,9 @@ impl TestEngine {
         self.now = self.now.saturating_add(delta);
         let now = self.now;
         self.apply(Command::TriggerTimers { now })
-            .map_err(|e| js_err(&format!("timer error: {e}")))?;
+            .map_err(|e| engine_err("timer error", &e))?;
         self.apply(Command::ExpireJobs { now })
-            .map_err(|e| js_err(&format!("expire error: {e}")))?;
+            .map_err(|e| engine_err("expire error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -748,9 +748,9 @@ impl TestEngine {
         }
         let now = self.now;
         self.apply(Command::TriggerTimers { now })
-            .map_err(|e| js_err(&format!("timer error: {e}")))?;
+            .map_err(|e| engine_err("timer error", &e))?;
         self.apply(Command::ExpireJobs { now })
-            .map_err(|e| js_err(&format!("expire error: {e}")))?;
+            .map_err(|e| engine_err("expire error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -786,7 +786,7 @@ impl TestEngine {
                     ..Default::default()
                 },
             ))
-            .map_err(|e| js_err(&format!("activate error: {e}")))?;
+            .map_err(|e| engine_err("activate error", &e))?;
         // Derive the returned job keys from the `JobActivated` events *this*
         // call emitted — not by scanning all `Activated` jobs, which would also
         // surface jobs locked by earlier `activateJobs` calls and could exceed
@@ -855,7 +855,7 @@ impl TestEngine {
             variables: BTreeMap::new(),
             lease_token,
         })
-        .map_err(|e| js_err(&format!("throw error: {e}")))?;
+        .map_err(|e| engine_err("throw error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -876,7 +876,7 @@ impl TestEngine {
             retries,
             lease_token,
         })
-        .map_err(|e| js_err(&format!("update retries error: {e}")))?;
+        .map_err(|e| engine_err("update retries error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -895,7 +895,7 @@ impl TestEngine {
             timeout,
             lease_token,
         })
-        .map_err(|e| js_err(&format!("update timeout error: {e}")))?;
+        .map_err(|e| engine_err("update timeout error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -908,7 +908,7 @@ impl TestEngine {
         self.guard_paused()?;
         let key = parse_key(incident_key)?;
         self.apply(Command::ResolveIncident { incident_key: key })
-            .map_err(|e| js_err(&format!("resolve incident error: {e}")))?;
+            .map_err(|e| engine_err("resolve incident error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -931,7 +931,7 @@ impl TestEngine {
             variables,
             local,
         })
-        .map_err(|e| js_err(&format!("set variables error: {e}")))?;
+        .map_err(|e| engine_err("set variables error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -951,7 +951,7 @@ impl TestEngine {
             signal_name: signal_name.to_string(),
             variables,
         })
-        .map_err(|e| js_err(&format!("broadcast signal error: {e}")))?;
+        .map_err(|e| engine_err("broadcast signal error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -963,7 +963,7 @@ impl TestEngine {
         self.guard_paused()?;
         let key = parse_key(instance_key)?;
         self.apply(Command::cancel_instance_including_suspended(key))
-            .map_err(|e| js_err(&format!("cancel instance error: {e}")))?;
+            .map_err(|e| engine_err("cancel instance error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -993,7 +993,7 @@ impl TestEngine {
             terminate_element_ids: Vec::new(),
             move_instructions: Vec::new(),
         })
-        .map_err(|e| js_err(&format!("modify instance error: {e}")))?;
+        .map_err(|e| engine_err("modify instance error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1019,7 +1019,7 @@ impl TestEngine {
             target_process_definition_key: target_key,
             mapping_instructions,
         })
-        .map_err(|e| js_err(&format!("migrate instance error: {e}")))?;
+        .map_err(|e| engine_err("migrate instance error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1039,7 +1039,7 @@ impl TestEngine {
             user_task_key: key,
             variables,
         })
-        .map_err(|e| js_err(&format!("complete user task error: {e}")))?;
+        .map_err(|e| engine_err("complete user task error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1060,7 +1060,7 @@ impl TestEngine {
             assignee: assignee.to_string(),
             allow_override,
         })
-        .map_err(|e| js_err(&format!("assign user task error: {e}")))?;
+        .map_err(|e| engine_err("assign user task error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1071,7 +1071,7 @@ impl TestEngine {
         self.guard_paused()?;
         let key = parse_key(user_task_key)?;
         self.apply(Command::UnassignUserTask { user_task_key: key })
-            .map_err(|e| js_err(&format!("unassign user task error: {e}")))?;
+            .map_err(|e| engine_err("unassign user task error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1093,7 +1093,7 @@ impl TestEngine {
             user_task_key: key,
             changeset,
         })
-        .map_err(|e| js_err(&format!("update user task error: {e}")))?;
+        .map_err(|e| engine_err("update user task error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1193,7 +1193,7 @@ impl TestEngine {
                 limits: None,
                 history,
             })
-            .map_err(|e| js_err(&format!("create agent instance error: {e}")))?;
+            .map_err(|e| engine_err("create agent instance error", &e))?;
         let key = events
             .iter()
             .find_map(|event| match event {
@@ -1253,7 +1253,7 @@ impl TestEngine {
                 tools: None,
                 history,
             })
-            .map_err(|e| js_err(&format!("update agent instance error: {e}")))?;
+            .map_err(|e| engine_err("update agent instance error", &e))?;
         to_json(&serde_json::json!({
             "createdHistory": self.created_history_result(agent_instance_key, &history_ids, &events)?,
         }))
@@ -1269,7 +1269,7 @@ impl TestEngine {
         self.apply(Command::CompleteAgentInstance {
             agent_instance_key: key,
         })
-        .map_err(|e| js_err(&format!("complete agent instance error: {e}")))?;
+        .map_err(|e| engine_err("complete agent instance error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 }
@@ -1878,7 +1878,7 @@ impl TestEngine {
             fetch_variables: Vec::new(),
             with_lease: false,
         })
-        .map_err(|e| js_err(&format!("activate error: {e}")))?;
+        .map_err(|e| engine_err("activate error", &e))?;
         Ok(())
     }
 
@@ -2338,6 +2338,35 @@ fn user_task_state(s: &UserTaskState) -> String {
         UserTaskState::Canceled => "Canceled",
     }
     .to_string()
+}
+
+/// An engine rejection as a ProblemDetail-shaped JS `Error` (#1937): its
+/// `message` is `"<context>: <detail>"` and it carries `status`, `title`,
+/// `detail` and `nonRetryable`, all from the ONE mapping the server shares,
+/// [`nanobpmn_engine_core::EngineError::problem`] — so the wasm surface and the
+/// REST gateway cannot drift.
+#[cfg(target_arch = "wasm32")]
+fn engine_err(context: &str, e: &nanobpmn_engine_core::EngineError) -> JsValue {
+    let p = e.problem();
+    let err = js_sys::Error::new(&format!("{context}: {}", p.detail));
+    let obj: &JsValue = err.as_ref();
+    // `Reflect::set` on a fresh, extensible `Error` object cannot fail.
+    let _ = js_sys::Reflect::set(obj, &"status".into(), &JsValue::from(p.status));
+    let _ = js_sys::Reflect::set(obj, &"title".into(), &JsValue::from_str(p.title));
+    let _ = js_sys::Reflect::set(obj, &"detail".into(), &JsValue::from_str(&p.detail));
+    let _ = js_sys::Reflect::set(obj, &"nonRetryable".into(), &JsValue::from(!p.retryable));
+    err.into()
+}
+
+/// Off wasm32 (host tests): the same catchable panic as [`js_err`], with the
+/// shared ProblemDetail fields appended so host callers can assert on them.
+#[cfg(not(target_arch = "wasm32"))]
+fn engine_err(context: &str, e: &nanobpmn_engine_core::EngineError) -> JsValue {
+    let p = e.problem();
+    js_err(&format!(
+        "{context}: {} [status={} title={} nonRetryable={}]",
+        p.detail, p.status, p.title, !p.retryable
+    ))
 }
 
 #[cfg(target_arch = "wasm32")]
