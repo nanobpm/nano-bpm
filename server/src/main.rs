@@ -3497,6 +3497,12 @@ pub struct ServerImpl {
     /// an identical retry (which emits no events) cannot return success while a
     /// cancelled predecessor's fan-out of the same definition is still running.
     deploy_pipeline: Arc<tokio::sync::Mutex<()>>,
+    /// Bounds the number of queued + running deploy owners (#1932). A permit is
+    /// taken with `try_acquire_owned` BEFORE the owner is spawned and moved into
+    /// it, so it is released only when the owner finishes. When none is left
+    /// the deploy is shed with 503 (+ Retry-After) and nothing is spawned, so a
+    /// stalled peer cannot make waiting owners grow with the request rate.
+    deploy_owners: Arc<tokio::sync::Semaphore>,
     /// Notified by the read-model exporter after every projected batch, so an
     /// `awaitCompletion` create request can wake the moment its instance reaches
     /// a terminal state (the exporter is the single point through which all
@@ -4477,6 +4483,7 @@ impl ServerImpl {
             jobs_available: Arc::new(tokio::sync::Notify::new()),
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
             deploy_pipeline: Arc::new(tokio::sync::Mutex::new(())),
+            deploy_owners: Arc::new(tokio::sync::Semaphore::new(deploy_owner_cap_from_env())),
             instances_changed: Arc::new(tokio::sync::Notify::new()),
             backpressure,
             sla_mode,
@@ -6216,6 +6223,39 @@ fn deploy_problem(status: u16, detail: String) -> models::ProblemDetail {
 /// REST path of the deployments endpoint, used as the `ProblemDetail.instance`
 /// for deploy rejections (Zeebe/C8 wire-shape parity, #793).
 const DEPLOYMENTS_ENDPOINT_PATH: &str = "/v2/deployments";
+
+/// Error title of a deploy shed because the owner queue is full (#1932).
+const DEPLOY_OWNERS_SATURATED: &str = "Deployment owners saturated";
+
+/// Default cap on queued + running deploy owners (#1932).
+const DEFAULT_DEPLOY_OWNER_CAP: usize = 64;
+
+/// HTTP status for a local deploy error title: owner saturation is a
+/// retryable 503, every other local deploy failure is a client 400.
+fn deploy_error_status(title: &str) -> u16 {
+    if title == DEPLOY_OWNERS_SATURATED {
+        503
+    } else {
+        400
+    }
+}
+
+/// Parses the deploy-owner cap (`NANOBPMN_DEPLOY_OWNER_QUEUE_MAX`): a positive
+/// integer no larger than `Semaphore::MAX_PERMITS` (above which
+/// `Semaphore::new` panics), else the default.
+fn parse_deploy_owner_cap(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0 && *n <= tokio::sync::Semaphore::MAX_PERMITS)
+        .unwrap_or(DEFAULT_DEPLOY_OWNER_CAP)
+}
+
+fn deploy_owner_cap_from_env() -> usize {
+    parse_deploy_owner_cap(
+        std::env::var("NANOBPMN_DEPLOY_OWNER_QUEUE_MAX")
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// Maps the `(status, detail)` outcome of a forwarded deploy (`forward_deploy`)
 /// onto the generated `/v2/deployments` response. The endpoint models only a
@@ -18277,9 +18317,10 @@ impl ServerImpl {
             {
                 // Peer broadcast runs inside the detached deploy owner.
                 Ok((result, _events)) => Ok(Resp::Status200_TheResourcesAreDeployed(result)),
-                Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
-                    400, detail,
-                ))),
+                Err((title, detail)) => Ok(forward_deploy_response(Err((
+                    deploy_error_status(title),
+                    detail,
+                )))),
             }
         } else {
             Ok(forward_deploy_response(
@@ -18604,6 +18645,14 @@ impl ServerImpl {
                 // never replicated — and an identical retry emits no definition
                 // events, so it could not repair that. Awaiting the JoinHandle here
                 // only OBSERVES the outcome; dropping it leaves the task running.
+                // Admission (#1932): reserve an owner slot before spawning, or
+                // shed the deploy without spawning anything.
+                let Ok(owner_permit) = self.deploy_owners.clone().try_acquire_owned() else {
+                    return Err((
+                        DEPLOY_OWNERS_SATURATED,
+                        "Too many deployments are in flight; retry later".to_string(),
+                    ));
+                };
                 let owner = self.clone();
                 #[allow(clippy::type_complexity)]
                 let deploy =
@@ -18704,6 +18753,8 @@ impl ServerImpl {
                         ))
                     };
                 let task = tokio::spawn(async move {
+                    // Released when this owner finishes (#1932).
+                    let _owner_permit = owner_permit;
                     // Held until the fan-out finishes: a retry's owner queues
                     // behind any in-flight (possibly cancelled) deploy, so its
                     // success implies every earlier apply is fully replicated.
@@ -18899,7 +18950,7 @@ impl ServerImpl {
                 &tenant_id,
             )
             .await
-            .map_err(|(_, detail)| (400u16, detail))?;
+            .map_err(|(title, detail)| (deploy_error_status(title), detail))?;
         // The peer broadcast runs inside the detached deploy owner, so it
         // survives caller cancellation (#1855 review).
         Ok(serde_json::to_value(result).expect("deployment result serializes"))
@@ -53159,6 +53210,91 @@ mod subscription_placement_tests {
             .await
             .expect("definition missing on a partition after cancel + retry");
         }
+    }
+
+    #[test]
+    fn deploy_owner_cap_parses_with_default() {
+        assert_eq!(parse_deploy_owner_cap(None), DEFAULT_DEPLOY_OWNER_CAP);
+        assert_eq!(parse_deploy_owner_cap(Some("0")), DEFAULT_DEPLOY_OWNER_CAP);
+        assert_eq!(parse_deploy_owner_cap(Some("x")), DEFAULT_DEPLOY_OWNER_CAP);
+        assert_eq!(parse_deploy_owner_cap(Some(" 8 ")), 8);
+        let max = tokio::sync::Semaphore::MAX_PERMITS;
+        assert_eq!(parse_deploy_owner_cap(Some(&max.to_string())), max);
+        assert_eq!(
+            parse_deploy_owner_cap(Some(&(max + 1).to_string())),
+            DEFAULT_DEPLOY_OWNER_CAP
+        );
+        // Must not panic: the parsed cap always constructs a semaphore.
+        let _ = tokio::sync::Semaphore::new(parse_deploy_owner_cap(Some(&usize::MAX.to_string())));
+        assert_eq!(deploy_error_status(DEPLOY_OWNERS_SATURATED), 503);
+        assert_eq!(deploy_error_status("Invalid deployment"), 400);
+    }
+
+    /// #1932: while the fan-out is stalled, deploy owners are bounded by the
+    /// cap; excess deploys are shed with 503 without spawning, and every
+    /// admitted owner drains once the stall clears.
+    #[tokio::test(start_paused = true)]
+    async fn deploy_owner_queue_is_bounded_and_sheds_with_503() {
+        const CAP: usize = 3;
+        const EXTRA: usize = 2;
+        let mut server = single_node_multi_partition();
+        server.deploy_owners = Arc::new(tokio::sync::Semaphore::new(CAP));
+        let proc = |id: &str| {
+            ProcessBuilder::new(id)
+                .start_event("s")
+                .end_event("e")
+                .connect("s", "e")
+                .build()
+                .expect("valid process")
+        };
+        // Stall the fan-out: a sibling partition's install blocks behind an
+        // exclusive lifecycle hold (the stalled "peer").
+        let handles = server.engine.all();
+        let exclusive = handles[1].lifecycle_exclusive().await;
+        let mut admitted = Vec::new();
+        for i in 0..CAP {
+            let srv = server.clone();
+            let p = proc(&format!("bounded-{i}"));
+            admitted.push(tokio::spawn(async move {
+                let empty = std::collections::HashMap::new();
+                srv.deploy_resources_locally(vec![p], &empty, Vec::new(), &empty, "<default>")
+                    .await
+            }));
+        }
+        while server.deploy_owners.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
+        let empty = std::collections::HashMap::new();
+        for i in 0..EXTRA {
+            let err = server
+                .deploy_resources_locally(
+                    vec![proc(&format!("shed-{i}"))],
+                    &empty,
+                    Vec::new(),
+                    &empty,
+                    "<default>",
+                )
+                .await
+                .expect_err("over-cap deploy must be shed");
+            assert_eq!(deploy_error_status(err.0), 503);
+            assert_eq!(server.deploy_owners.available_permits(), 0);
+        }
+        // Shed deploys spawned nothing and applied nothing.
+        assert!(
+            !handles[0]
+                .with(|j| j.state().processes.contains_key("shed-0"))
+                .await
+        );
+        drop(exclusive);
+        for task in admitted {
+            task.await.expect("join").expect("admitted deploy succeeds");
+        }
+        assert_eq!(server.deploy_owners.available_permits(), CAP);
+        // The queue admits again after draining.
+        server
+            .deploy_resources_locally(vec![proc("after")], &empty, Vec::new(), &empty, "<default>")
+            .await
+            .expect("deploy after drain");
     }
 
     /// Signed timeout updates use canonical job lookup and validation; zero is
