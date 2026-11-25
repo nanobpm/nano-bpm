@@ -57,7 +57,9 @@ for h in "${HARNESSES[@]}"; do
   grep -E '^(VERIFICATION:|Verification Time:|Complete - )' "$log" || true
   # Kani reports an unreachable `kani::cover!` without failing the run; treat
   # it as a vacuous proof (a guarded branch the harness never exercises).
-  if grep -qE 'Status: (UNSATISFIABLE|UNREACHABLE)' "$log"; then
+  # Only cover records count: an ordinary assertion may legitimately be
+  # reported UNREACHABLE (e.g. a default match branch) on a passing proof.
+  if awk '/^Check [0-9]+: /{cover = ($3 ~ /\.cover\./)} cover && /Status: (UNSATISFIABLE|UNREACHABLE)/{found=1} END{exit !found}' "$log"; then
     echo "::error::kani $h has an unsatisfiable/unreachable cover! (vacuous branch)"
     rc=1
   fi
