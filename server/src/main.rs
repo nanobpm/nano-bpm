@@ -6241,10 +6241,11 @@ fn deploy_error_status(title: &str) -> u16 {
 }
 
 /// Parses the deploy-owner cap (`NANOBPMN_DEPLOY_OWNER_QUEUE_MAX`): a positive
-/// integer, else the default.
+/// integer no larger than `Semaphore::MAX_PERMITS` (above which
+/// `Semaphore::new` panics), else the default.
 fn parse_deploy_owner_cap(raw: Option<&str>) -> usize {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
+        .filter(|n| *n > 0 && *n <= tokio::sync::Semaphore::MAX_PERMITS)
         .unwrap_or(DEFAULT_DEPLOY_OWNER_CAP)
 }
 
@@ -53217,6 +53218,14 @@ mod subscription_placement_tests {
         assert_eq!(parse_deploy_owner_cap(Some("0")), DEFAULT_DEPLOY_OWNER_CAP);
         assert_eq!(parse_deploy_owner_cap(Some("x")), DEFAULT_DEPLOY_OWNER_CAP);
         assert_eq!(parse_deploy_owner_cap(Some(" 8 ")), 8);
+        let max = tokio::sync::Semaphore::MAX_PERMITS;
+        assert_eq!(parse_deploy_owner_cap(Some(&max.to_string())), max);
+        assert_eq!(
+            parse_deploy_owner_cap(Some(&(max + 1).to_string())),
+            DEFAULT_DEPLOY_OWNER_CAP
+        );
+        // Must not panic: the parsed cap always constructs a semaphore.
+        let _ = tokio::sync::Semaphore::new(parse_deploy_owner_cap(Some(&usize::MAX.to_string())));
         assert_eq!(deploy_error_status(DEPLOY_OWNERS_SATURATED), 503);
         assert_eq!(deploy_error_status("Invalid deployment"), 400);
     }
