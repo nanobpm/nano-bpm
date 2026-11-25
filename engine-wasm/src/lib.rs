@@ -296,7 +296,10 @@ impl TestEngine {
         let variables = parse_vars(variables_json)?;
         let result = self
             .evaluate_decision_json(decision_id, variables)
-            .map_err(|e| js_err(&e))?;
+            .map_err(|e| match e {
+                DecisionEvalError::Engine(e) => engine_err("evaluate error", &e),
+                DecisionEvalError::Evaluation(msg) => js_err(&msg),
+            })?;
         to_json(&result)
     }
 
@@ -1634,17 +1637,19 @@ impl TestEngine {
         &mut self,
         decision_id: &str,
         variables: BTreeMap<String, Value>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, DecisionEvalError> {
         let events = self
             .apply(Command::EvaluateDecision {
                 decision: nanobpmn_engine_core::DecisionReference::Id(decision_id.to_string()),
                 variables,
             })
-            .map_err(|e| format!("evaluate error: {e}"))?;
+            .map_err(DecisionEvalError::Engine)?;
         let evaluated = events
             .iter()
             .find(|e| matches!(e, Event::DecisionEvaluated { .. }))
-            .ok_or("evaluate error: no evaluation was recorded")?;
+            .ok_or_else(|| {
+                DecisionEvalError::Evaluation("evaluate error: no evaluation was recorded".into())
+            })?;
         let Event::DecisionEvaluated {
             decision_key,
             decision_output,
@@ -1655,10 +1660,10 @@ impl TestEngine {
             unreachable!()
         };
         if let Some(failure) = failure {
-            return Err(format!(
+            return Err(DecisionEvalError::Evaluation(format!(
                 "evaluate error: failed to evaluate decision '{}': {}",
                 failure.failed_decision_id, failure.message
-            ));
+            )));
         }
         #[allow(
             clippy::expect_used,
@@ -2367,6 +2372,15 @@ fn engine_err(context: &str, e: &nanobpmn_engine_core::EngineError) -> JsValue {
         "{context}: {} [status={} title={} nonRetryable={}]",
         p.detail, p.status, p.title, !p.retryable
     ))
+}
+
+/// Why `evaluate_decision_json` failed: a typed engine rejection (thrown with
+/// the shared ProblemDetail fields via [`engine_err`]) kept apart from a DMN
+/// evaluation failure, which is recorded state, not a command rejection.
+#[derive(Debug)]
+enum DecisionEvalError {
+    Engine(nanobpmn_engine_core::EngineError),
+    Evaluation(String),
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4482,12 +4496,19 @@ mod tests {
         let err = eng
             .evaluate_decision_json("pick", vars(r#"{"lang":"xx"}"#))
             .unwrap_err();
+        let DecisionEvalError::Evaluation(err) = err else {
+            panic!("expected an evaluation failure, got {err:?}")
+        };
         assert!(
             err.starts_with("evaluate error: failed to evaluate decision 'pick'"),
             "{err}"
         );
         let err = eng.evaluate_decision_json("nope", vars("{}")).unwrap_err();
-        assert_eq!(err, "evaluate error: no deployed decision with id 'nope'");
+        let DecisionEvalError::Engine(err) = err else {
+            panic!("expected a typed engine rejection, got {err:?}")
+        };
+        assert_eq!(err.problem().status, 404);
+        assert_eq!(err.to_string(), "no deployed decision with id 'nope'");
         let snap = parse(&eng.snapshot().unwrap());
         let decisions = snap["decisionInstances"].as_array().unwrap();
         assert_eq!(decisions.len(), 1, "{decisions:?}");

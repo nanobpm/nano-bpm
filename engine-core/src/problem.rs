@@ -325,4 +325,58 @@ mod tests {
             assert!(f.contains(&format!("E::{v} ")), "{v} not classified");
         }
     }
+
+    /// Variants per arm of a `match` whose arms are `E::A { .. } | … => RHS`.
+    fn arm_sets<'a>(body: &'a str, prefix: &str) -> Vec<(String, Vec<&'a str>)> {
+        let mut out = Vec::new();
+        let mut cur: Vec<&str> = Vec::new();
+        for line in body.lines() {
+            let t = line.trim().trim_start_matches("| ");
+            if let Some(rest) = t.strip_prefix(prefix) {
+                let name = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or_default();
+                cur.push(name);
+                if let Some((_, rhs)) = rest.split_once("=>") {
+                    out.push((
+                        rhs.trim().trim_end_matches(',').to_string(),
+                        std::mem::take(&mut cur),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Behavioural guard on the retryable class: the `Unavailable` arm is
+    /// exactly the set `is_environmental()` reports `true` for, and is pinned
+    /// to the one known transient variant. Moving any other variant into
+    /// `Unavailable` (making it retryable) — or making it environmental
+    /// without classifying it `Unavailable` — fails here (#1931 class).
+    #[test]
+    fn unavailable_class_is_exactly_the_environmental_set() {
+        let src = include_str!("problem.rs");
+        let f = &src[src.find("fn problem_kind").expect("fn")..];
+        let f = &f[..f.find("\n    }\n").expect("fn end")];
+        let mut unavailable: Vec<&str> = arm_sets(f, "E::")
+            .into_iter()
+            .filter(|(rhs, _)| rhs == "K::Unavailable")
+            .flat_map(|(_, v)| v)
+            .collect();
+        unavailable.sort_unstable();
+
+        let engine_src = include_str!("engine/mod.rs");
+        let g = &engine_src[engine_src.find("pub fn is_environmental").expect("fn")..];
+        let g = &g[..g.find("\n    }\n").expect("fn end")];
+        let mut environmental: Vec<&str> = arm_sets(g, "EngineError::")
+            .into_iter()
+            .filter(|(rhs, _)| rhs == "true")
+            .flat_map(|(_, v)| v)
+            .collect();
+        environmental.sort_unstable();
+
+        assert_eq!(unavailable, environmental);
+        assert_eq!(unavailable, ["InstanceUnavailable"]);
+    }
 }

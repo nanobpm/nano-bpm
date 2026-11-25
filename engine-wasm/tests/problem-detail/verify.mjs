@@ -62,6 +62,11 @@ async function checkVariant(label, glueSpecifier, wasmSpecifier) {
     rejection(() => engine.cancelInstance("424242")),
     { status: 404, title: "NOT_FOUND", nonRetryable: true, context: "cancel instance error" },
   );
+  checkProblem(
+    `${label}: evaluateDecision(unknown decision)`,
+    rejection(() => engine.evaluateDecision("no-such-decision", "{}")),
+    { status: 404, title: "NOT_FOUND", nonRetryable: true, context: "evaluate error" },
+  );
   engine.free();
 }
 
