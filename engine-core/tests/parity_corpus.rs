@@ -34,7 +34,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use nanobpmn_engine_core::{bpmn::parse_bpmn, Command, Engine, Event, Key, Value};
+use nanobpmn_engine_core::{bpmn::parse_bpmn, Command, Engine, EngineError, Event, Key, Value};
 use serde_json::Value as Json;
 
 /// The same activation cap as `observation.mjs`'s `MAX_JOBS_TO_ACTIVATE`
@@ -165,7 +165,14 @@ fn run_scenario(path: &Path) -> (Key, Vec<Event>) {
                 };
                 if step.get("expectRejected").and_then(Json::as_bool) == Some(true) {
                     let res = run.engine.apply_command_at(cmd, run.now);
-                    assert!(res.is_err(), "the publish was expected to be rejected");
+                    assert!(
+                        step.get("timeToLive").is_some() || step.get("messageId").is_some(),
+                        "expectRejected needs a messageId or timeToLive publication"
+                    );
+                    assert!(
+                        matches!(res, Err(EngineError::MessageAlreadyExists { .. })),
+                        "the publish was expected to be rejected as a duplicate messageId, got {res:?}"
+                    );
                 } else {
                     run.apply(cmd);
                 }

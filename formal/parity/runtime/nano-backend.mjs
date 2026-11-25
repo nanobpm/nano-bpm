@@ -186,6 +186,9 @@ export class NanoBackend {
       throw new Error(`publish of '${name}' (messageId ${messageId}) was expected to be rejected`);
     }
     if (!expectRejected && rejected) throw rejected;
+    // Only the duplicate-messageId rejection (Zeebe's 409 ALREADY_EXISTS) is the
+    // expected one; any other failure must not pass for it.
+    if (rejected && !/is already published/.test(String(rejected?.message ?? rejected))) throw rejected;
   }
 
   async broadcastSignal(_handle, name, variables) {
