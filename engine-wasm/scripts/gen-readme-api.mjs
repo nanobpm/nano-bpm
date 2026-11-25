@@ -113,10 +113,26 @@ function toMethod(sig, attr, docs, readModel) {
     if (d === "") break;
     para.push(d);
   }
-  const text = para.join(" ");
-  const end = text.search(/[.!?](\s|$)/);
-  const summary = end < 0 ? text : text.slice(0, end + 1);
+  const summary = firstSentence(para.join(" "));
   return { jsName, kind, params, returns: jsReturn(ret), summary, readModel };
+}
+
+/**
+ * The first sentence of `text`. A terminator only counts outside inline code spans and when it
+ * does not end a common abbreviation (`e.g.`, `i.e.`, `etc.`, `vs.`), so neither `` `x?` `` nor
+ * "e.g. foo" cuts the sentence short and leaves an unbalanced backtick.
+ */
+export function firstSentence(text) {
+  let inCode = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "`") inCode = !inCode;
+    else if (!inCode && /[.!?]/.test(c) && (i + 1 === text.length || /\s/.test(text[i + 1]))) {
+      if (c === "." && /(?:^|[\s(])(?:e\.g|i\.e|etc|vs|cf)$/i.test(text.slice(0, i))) continue;
+      return text.slice(0, i + 1);
+    }
+  }
+  return text;
 }
 
 function jsType(t) {
@@ -193,14 +209,18 @@ export function render(methods, ops) {
     "when this section is stale._",
     "",
     "Every argument and result that carries structured data is a JSON **string**. The **REST operation**",
-    "column names the spec operation the method mirrors; its request/response schemas are the",
-    "contract for the JSON the method accepts and returns. `—` marks an embedded-only method.",
+    "column names the spec operation the method mirrors, and the REST request/response columns name",
+    "that operation's schemas. They are **REST counterparts for orientation, not the WASM payload",
+    "contract**: some methods take or return a different shape (for example `deploy` returns",
+    "`{ processIds, snapshot }`, and `evaluateDecision` takes a plain variables object). The method's",
+    "doc comment in [`src/lib.rs`](src/lib.rs) is authoritative for its WASM JSON. `—` marks an",
+    "embedded-only method.",
   );
   for (const [title, readModel] of [
     ["### Lean surface (both subpaths)", false],
     ["### Read-model surface (`@nanobpm/engine-wasm/readmodel` only)", true],
   ]) {
-    out.push("", title, "", "| Method | Returns | REST operation | Request schema | Response schema | Description |", "| --- | --- | --- | --- | --- | --- |");
+    out.push("", title, "", "| Method | Returns | REST operation | REST request schema | REST response schema | Description |", "| --- | --- | --- | --- | --- | --- |");
     for (const m of methods.filter((x) => x.readModel === readModel)) {
       const opId = OPERATION_ALIASES[m.jsName] ?? (ops.has(m.jsName) ? m.jsName : null);
       const op = opId ? ops.get(opId) : null;

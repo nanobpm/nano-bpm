@@ -118,3 +118,11 @@ test("splice requires markers", () => {
   assert.throws(() => splice("no markers", "x"), /markers/);
   assert.equal(splice(`a${BEGIN}old${END}b`, "NEW"), "aNEWb");
 });
+
+test("firstSentence keeps code spans and abbreviations intact", async () => {
+  const { firstSentence } = await import("./gen-readme-api.mjs");
+  assert.equal(firstSentence("Patch `name?` and `tags?` fields. More."), "Patch `name?` and `tags?` fields.");
+  assert.equal(firstSentence("Deploy a resource (e.g. a BPMN file). Next."), "Deploy a resource (e.g. a BPMN file).");
+  assert.equal(firstSentence("Plain i.e. text, etc. done! Tail"), "Plain i.e. text, etc. done!");
+  assert.equal(firstSentence("No terminator"), "No terminator");
+});
