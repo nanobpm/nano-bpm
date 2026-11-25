@@ -103,6 +103,8 @@ impl Engine {
         snapshot.state.deferred_jobs = deferred.into_iter().collect();
         // The parent -> children index (#1827) is serde-skipped too.
         snapshot.state.rebuild_children_index();
+        // So is the buffered messageId index (#1874).
+        snapshot.state.rebuild_buffered_message_id_index();
         Self {
             state: snapshot.state,
             partition_id: snapshot.partition_id,
@@ -122,6 +124,8 @@ impl Engine {
             resource_scan_count: std::cell::Cell::new(0),
             #[cfg(test)]
             cascade_scan_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            buffer_scan_count: std::cell::Cell::new(0),
             track_dirty_vars: false,
             retire_cursor: 0,
             dirty_vars: std::collections::BTreeSet::new(),
@@ -130,6 +134,9 @@ impl Engine {
             esp_start_payloads: std::collections::BTreeMap::new(),
             boundary_payloads: std::collections::BTreeMap::new(),
             pending_timer_fires: std::collections::VecDeque::new(),
+            buffer_scan_from: 0,
+            buffer_requeue: std::collections::VecDeque::new(),
+            buffer_candidates: std::collections::BTreeMap::new(),
             sweep_from: 0,
             raft_applied: snapshot.raft_applied,
         }
