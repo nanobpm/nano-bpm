@@ -40,6 +40,7 @@ export const OPERATION_ALIASES = {
   cancelInstance: "cancelProcessInstance",
   modify: "modifyProcessInstance",
   migrate: "migrateProcessInstance",
+  completeAgentJob: "completeJob",
   throwError: "throwJobError",
   updateRetries: "updateJob",
   updateTimeout: "updateJob",
