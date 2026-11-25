@@ -475,7 +475,8 @@ impl RaftTransport for PeerTransport {
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
         FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES,
-        FEATURE_PROCESS_INSTANCE_HISTORY_DELETION, FEATURE_REPLICATED_LENIENT_COMPLETION, FEATURE_TERMINAL_DEADLINES,
+        FEATURE_PROCESS_INSTANCE_HISTORY_DELETION, FEATURE_REPLICATED_LENIENT_COMPLETION,
+        FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
     let RaftRpcRequest::AppendEntries(r) = req else {
