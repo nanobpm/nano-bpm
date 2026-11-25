@@ -216,7 +216,7 @@ impl ColdIndex {
                     targets.extend(self.instance_for_scope(*scope_key));
                 }
             }
-            Command::CancelInstance { instance_key } => {
+            Command::CancelInstance { instance_key, .. } => {
                 if self.contains(*instance_key) {
                     targets.push(*instance_key);
                 }

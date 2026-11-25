@@ -2704,9 +2704,7 @@ fn job_type_expression_resolves_against_updated_variables() {
             .len(),
         1
     );
-    engine
-        .apply_command(Command::CancelInstance { instance_key: key })
-        .unwrap();
+    engine.apply_command(Command::cancel_instance(key)).unwrap();
 
     // Absent `model` → the bare type.
     engine
@@ -5019,7 +5017,7 @@ fn stamped_orphan_quarantine_is_a_noop_for_terminal_instance() {
         .unwrap();
     let key = created.iter().find_map(|e| e.instance_key()).unwrap();
     engine
-        .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+        .apply_command_at(Command::cancel_instance(key), 3)
         .unwrap();
     let after_cancel = engine
         .apply_command_at(
@@ -5113,7 +5111,7 @@ fn stamped_orphan_quarantine_after_ring_wrap_is_a_uniform_noop() {
     let (mut evicted, _) = boot();
     for replica in [&mut leader, &mut resident, &mut evicted] {
         replica
-            .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+            .apply_command_at(Command::cancel_instance(key), 3)
             .unwrap();
     }
     // The leader already evicted its terminal shell (eviction is
@@ -5245,7 +5243,7 @@ fn stamped_orphan_quarantine_with_a_stale_stamp_still_raises() {
     // terminal transitions after the cancel than the ring holds).
     for replica in [&mut resident, &mut evicted] {
         replica
-            .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+            .apply_command_at(Command::cancel_instance(key), 3)
             .unwrap();
     }
     // Each filler is a start→end process: its create's RTC drain completes it
@@ -5440,7 +5438,7 @@ fn stamped_orphan_quarantine_cold_path_matches_resident_after_wrap() {
     // recovered from the replicated ring.
     for replica in [&mut leader, &mut resident, &mut evicted] {
         replica
-            .apply_command_at(Command::CancelInstance { instance_key: key }, 3)
+            .apply_command_at(Command::cancel_instance(key), 3)
             .unwrap();
     }
     assert!(

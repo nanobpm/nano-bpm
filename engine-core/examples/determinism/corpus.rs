@@ -766,9 +766,7 @@ fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
     ));
     let to_cancel_instance =
         find(&to_cancel, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
-    g.push(Command::CancelInstance {
-        instance_key: to_cancel_instance,
-    });
+    g.push(Command::cancel_instance(to_cancel_instance));
 
     // ---- Migration and modification ---------------------------------------
     g.scenario("migration-and-modification");
@@ -1062,6 +1060,21 @@ fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
     }}));
     g.push(Command::SetLenientCompletion { lenient: true });
     g.push(create("order", vars(&[("amount", Value::Int(42))])));
+
+    // ---- Suspend then cancel (#1863) ---------------------------------------
+    // A SUSPENDED root: the legacy cancel (the gate-closed, mixed-version
+    // behaviour) is rejected and leaves it SUSPENDED; the capability-gated
+    // `terminate_suspended` cancel (every member advertises
+    // `cancel-suspended-instance-v1`) terminates it.
+    g.scenario("suspend-then-cancel");
+    let sc = g.push(create(
+        "messaging",
+        vars(&[("orderId", Value::Str("o-sc".into()))]),
+    ));
+    let sc_instance = find(&sc, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
+    g.push(Command::suspend_instance(sc_instance));
+    g.push(Command::cancel_instance(sc_instance));
+    g.push(Command::cancel_instance_including_suspended(sc_instance));
 
     let outcomes = std::mem::take(&mut g.outcomes);
     let labels = std::mem::take(&mut g.labels);

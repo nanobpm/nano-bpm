@@ -180,7 +180,28 @@ struct BatchOperationRecord {
     item_index: std::collections::HashMap<u64, usize>,
 }
 
-/// One item (target process instance) of a batch operation.
+/// One item a batch operation acts on, as handed to
+/// [`ServerImpl::drive_process_instance_batch`]: the `item_key` is the entity the
+/// per-item command targets (a process instance, an incident or a job — #1863)
+/// and `process_instance_key` the instance it belongs to (surfaced on the
+/// batch-operation item read API).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchItem {
+    item_key: u64,
+    process_instance_key: Option<u64>,
+}
+
+impl BatchItem {
+    /// An item that IS a process instance (cancel / migrate / modify batches).
+    fn process_instance(key: u64) -> Self {
+        Self {
+            item_key: key,
+            process_instance_key: Some(key),
+        }
+    }
+}
+
+/// One item (target process instance, incident or job) of a batch operation.
 #[derive(Clone)]
 struct BatchOperationItemRecord {
     item_key: u64,
@@ -202,14 +223,15 @@ enum BatchLifecycleOutcome {
 }
 
 impl BatchOperationStore {
-    /// Mints and registers a new batch operation over `item_keys` (target
-    /// process-instance keys), returning the allocated batch-operation key.
+    /// Mints and registers a new batch operation over `items` (the process
+    /// instances, incidents or jobs it acts on — [`BatchItem`]), returning the
+    /// allocated batch-operation key.
     ///
     /// The batch is registered `ACTIVE` with every item `ACTIVE`: this gateway's
     /// job here is to make the operation *trackable* (get/search) and expose its
     /// item counts, and to keep it in a state where the documented lifecycle
     /// transitions (`ACTIVE → SUSPENDED → ACTIVE`; any `→ CANCELED`) are valid.
-    fn create(&self, op_type: models::BatchOperationTypeEnum, item_keys: Vec<u64>) -> u64 {
+    fn create(&self, op_type: models::BatchOperationTypeEnum, items: Vec<BatchItem>) -> u64 {
         let now = now_millis();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.seq == 0 {
@@ -217,11 +239,11 @@ impl BatchOperationStore {
         }
         inner.seq += 1;
         let key = inner.seq;
-        let items: Vec<BatchOperationItemRecord> = item_keys
+        let items: Vec<BatchOperationItemRecord> = items
             .into_iter()
-            .map(|item_key| BatchOperationItemRecord {
-                item_key,
-                process_instance_key: Some(item_key),
+            .map(|item| BatchOperationItemRecord {
+                item_key: item.item_key,
+                process_instance_key: item.process_instance_key,
                 state: models::BatchOperationItemStateEnum::Active,
                 processed_date_ms: None,
                 error_message: None,
@@ -2735,7 +2757,7 @@ mod converted_lock_poison_tests {
         let store = BatchOperationStore::default();
         let key = store.create(
             models::BatchOperationTypeEnum::MigrateProcessInstance,
-            vec![10, 20, 30],
+            [10, 20, 30].map(BatchItem::process_instance).to_vec(),
         );
 
         store.record_item(key, 20, Err("no mapping for element".to_string()));
@@ -2781,7 +2803,7 @@ mod converted_lock_poison_tests {
         let store = BatchOperationStore::default();
         let key = store.create(
             models::BatchOperationTypeEnum::CancelProcessInstance,
-            vec![1, 2],
+            [1, 2].map(BatchItem::process_instance).to_vec(),
         );
 
         poison(store.inner.clone());
@@ -2795,7 +2817,7 @@ mod converted_lock_poison_tests {
         // Writes recover: a fresh create and a lifecycle transition still apply.
         let key2 = store.create(
             models::BatchOperationTypeEnum::CancelProcessInstance,
-            vec![3],
+            vec![BatchItem::process_instance(3)],
         );
         assert_ne!(key2, key, "create recovers and mints a distinct key");
         assert!(
@@ -3283,38 +3305,6 @@ impl JobStatisticsState {
             .filter(|e| e.at_ms >= from_ms && e.at_ms <= to_ms && e.job_type == job_type)
             .cloned()
             .collect()
-    }
-}
-
-/// High-water mark backing synthesised batch-operation keys (issue #907's
-/// `/v2/jobs/batch-update`). Durable batch-operation *tracking* is a sibling
-/// slice (#905); this slice only needs a plausible, process-unique 64-bit key to
-/// return, so we synthesise one from the wall clock and this counter without
-/// touching the engine or the shared `ServerImpl` surface. Storing the last key
-/// (rather than a bare sequence) lets us guarantee monotonicity even if the wall
-/// clock steps backwards (NTP correction).
-static LAST_BATCH_OP_KEY: AtomicU64 = AtomicU64::new(0);
-
-/// Mint a process-unique, strictly-monotonic, Camunda-shaped (64-bit numeric) key
-/// for a created batch operation. The high 48 bits carry the wall-clock instant
-/// so keys sort by creation time when the clock advances normally; the low 16
-/// bits disambiguate keys minted within the same millisecond. Monotonicity is
-/// enforced independently of the clock: each key is at least the previous key
-/// plus one, so a backwards clock step can never yield a key that sorts before an
-/// already-returned one.
-fn mint_batch_operation_key() -> u64 {
-    let mut prev = LAST_BATCH_OP_KEY.load(Ordering::Relaxed);
-    loop {
-        let next = (now_millis() << 16).max(prev.saturating_add(1));
-        match LAST_BATCH_OP_KEY.compare_exchange_weak(
-            prev,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return next,
-            Err(actual) => prev = actual,
-        }
     }
 }
 
@@ -9868,15 +9858,59 @@ impl ServerImpl {
             )));
         }
 
-        // Minting a trackable batch-operation key is the contract this endpoint
-        // owes its caller; durable execution/tracking of the batch is a separate
-        // slice (#905) and deliberately out of scope here.
-        let key = mint_batch_operation_key();
+        // The filter selects which jobs are MUTATED, so it fails closed: an
+        // empty filter (the spec requires at least one dimension) or a
+        // dimension `job_matches_filter` does not evaluate is a 400, never a
+        // silently widened selection that updates jobs the caller excluded.
+        if let Err(detail) = validate_job_batch_filter(&body.filter) {
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
+                "Invalid filter",
+                400,
+                detail,
+            )));
+        }
+
+        // Execute the batch (#1863): every job the filter matches (the same
+        // algebra as `POST /v2/jobs/search`) gets the changeset applied through
+        // the single-job `update_job_core`, via the shared batch seam, with the
+        // request's `operationReference` stamped on every per-item record.
+        let op_type = models::BatchOperationTypeEnum::UpdateJob;
+        let mut jobs: Vec<BatchItem> = self
+            .store
+            .jobs()
+            .iter()
+            .filter(|job| job_matches_filter(&body.filter, job))
+            .map(|job| BatchItem {
+                item_key: job.key,
+                process_instance_key: Some(job.instance_key),
+            })
+            .collect();
+        jobs.sort_unstable_by_key(|item| item.item_key);
+        let operation_reference = body.operation_reference;
+        let key =
+            self.drive_process_instance_batch(op_type, jobs, move |server, job_key| async move {
+                // Nano models no job priority (every job projects priority 0), so a
+                // non-zero priority cannot be applied: the item FAILS with that
+                // reason instead of reporting a silent success.
+                if let Some(p) = priority
+                    && p != 0
+                {
+                    return Err(format!(
+                        "Job priority is not supported: cannot set priority {p} on job '{job_key}'."
+                    ));
+                }
+                // No no-op shortcut: even a priority-0-only changeset goes
+                // through `update_job_core`, whose engine command runs the
+                // single-job eligibility check (job exists and is not terminal)
+                // with the same error as `PATCH /v2/jobs/{key}` — so a terminal
+                // job FAILS rather than reporting a blanket success.
+                server
+                    .update_job_core(job_key, retries, timeout, operation_reference, None)
+                    .await
+                    .map_err(|(_, detail)| detail)
+            });
         Ok(Resp::Status200_TheBatchOperationWasCreated(
-            models::BatchOperationCreatedResult {
-                batch_operation_key: key.to_string(),
-                batch_operation_type: models::BatchOperationTypeEnum::UpdateJob,
-            },
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
         ))
     }
 
@@ -10396,7 +10430,7 @@ impl ServerImpl {
         match self
             .apply_partition_command_ref(
                 instance_key,
-                Command::cancel_instance(instance_key),
+                Command::cancel_instance_including_suspended(instance_key),
                 operation_reference,
             )
             .await
@@ -12836,7 +12870,7 @@ impl ServerImpl {
         let _ = self
             .apply_partition_command_ref(
                 instance_key,
-                Command::cancel_instance(instance_key),
+                Command::cancel_instance_including_suspended(instance_key),
                 operation_reference,
             )
             .await?;
@@ -16357,53 +16391,7 @@ impl ServerImpl {
 
         let mut matched: Vec<&readstore::JobRow> = jobs
             .iter()
-            .filter(|job| match filter {
-                None => true,
-                Some(f) => {
-                    query::match_job_key(&f.job_key, &job.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &job.instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &job.process_definition_key,
-                        )
-                        && query::match_element_instance_key(
-                            &f.element_instance_key,
-                            &job.element_instance_key.to_string(),
-                        )
-                        && query::match_string(&f.r_type, &job.job_type)
-                        && query::match_string(&f.element_id, &job.element_id)
-                        && query::match_job_state(&f.state, &job_state_enum(job.state).to_string())
-                        && query::match_string_opt(&f.error_message, job.error_message.as_deref())
-                        && query::match_string_opt(&f.error_code, job.error_code.as_deref())
-                        && f.has_failed_with_retries_left
-                            .is_none_or(|want| want == job.has_failed_with_retries_left)
-                        // Camunda-parity timing filters (#1344).
-                        && query::match_date_time_ms(
-                            &f.creation_time,
-                            (job.created_at_ms != 0).then_some(job.created_at_ms as i64),
-                        )
-                        && query::match_date_time_ms(
-                            &f.last_update_time,
-                            job.last_update_ms.map(|v| v as i64),
-                        )
-                        && query::match_date_time_ms(&f.end_time, job.end_ms.map(|v| v as i64))
-                        // `deadline` is the one NULLABLE job filter (#1344): an
-                        // explicit `{"deadline": null}` is a real filter value that
-                        // selects jobs with NO deadline, distinct from omitting the
-                        // filter entirely (which matches everything).
-                        && match &f.deadline {
-                            None => true,
-                            Some(types::Nullable::Null) => job.deadline_ms.is_none(),
-                            Some(types::Nullable::Present(d)) => query::match_date_time_ms(
-                                &Some(d.clone()),
-                                job.deadline_ms.map(|v| v as i64),
-                            ),
-                        }
-                }
-            })
+            .filter(|job| filter.is_none_or(|f| job_matches_filter(f, job)))
             .collect();
 
         let roots = readstore::RootResolver::new(|k| self.store.process_instance(k));
@@ -25055,6 +25043,104 @@ impl ServerImpl {
     }
 }
 
+/// The `JobFilter` wire dimensions [`job_matches_filter`] evaluates — the
+/// single list a mutating job batch may select by. Any other supplied
+/// dimension would be silently ignored by the matcher, widening the selection,
+/// so [`validate_job_batch_filter`] rejects it instead.
+const JOB_FILTER_EVALUATED_DIMENSIONS: &[&str] = &[
+    "jobKey",
+    "processInstanceKey",
+    "processDefinitionKey",
+    "elementInstanceKey",
+    "type",
+    "elementId",
+    "state",
+    "errorMessage",
+    "errorCode",
+    "hasFailedWithRetriesLeft",
+    "creationTime",
+    "lastUpdateTime",
+    "endTime",
+    "deadline",
+];
+
+/// Fail-closed gate for a job filter that selects jobs to MUTATE (#1863):
+/// rejects an empty filter (`spec/jobs.yaml`: "At least one dimension must be
+/// set") and any supplied dimension outside [`JOB_FILTER_EVALUATED_DIMENSIONS`].
+/// Derived from the filter's own wire form, so a new spec field is rejected
+/// until the matcher learns it.
+fn validate_job_batch_filter(f: &models::JobFilter) -> Result<(), String> {
+    let wire = serde_json::to_value(f).map_err(|e| format!("Unreadable job filter: {e}."))?;
+    let keys: Vec<&String> = wire
+        .as_object()
+        .map(|o| o.keys().collect())
+        .unwrap_or_default();
+    if keys.is_empty() {
+        return Err("The job filter must set at least one dimension.".to_string());
+    }
+    let mut unsupported: Vec<&str> = keys
+        .into_iter()
+        .map(String::as_str)
+        .filter(|k| !JOB_FILTER_EVALUATED_DIMENSIONS.contains(k))
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    unsupported.sort_unstable();
+    Err(format!(
+        "Job filter dimension(s) not supported for batch updates: {}.",
+        unsupported.join(", ")
+    ))
+}
+
+/// The `JobFilter` algebra over one projected job — the single predicate shared
+/// by `POST /v2/jobs/search` and the job-update batch item selection (#1863), so
+/// a batch updates exactly the jobs the same filter would search.
+fn job_matches_filter(f: &models::JobFilter, job: &readstore::JobRow) -> bool {
+    query::match_job_key(&f.job_key, &job.key.to_string())
+            && query::match_process_instance_key(
+                &f.process_instance_key,
+                &job.instance_key.to_string(),
+            )
+            && query::match_process_definition_key(
+                &f.process_definition_key,
+                &job.process_definition_key,
+            )
+            && query::match_element_instance_key(
+                &f.element_instance_key,
+                &job.element_instance_key.to_string(),
+            )
+            && query::match_string(&f.r_type, &job.job_type)
+            && query::match_string(&f.element_id, &job.element_id)
+            && query::match_job_state(&f.state, &job_state_enum(job.state).to_string())
+            && query::match_string_opt(&f.error_message, job.error_message.as_deref())
+            && query::match_string_opt(&f.error_code, job.error_code.as_deref())
+            && f.has_failed_with_retries_left
+                .is_none_or(|want| want == job.has_failed_with_retries_left)
+            // Camunda-parity timing filters (#1344).
+            && query::match_date_time_ms(
+                &f.creation_time,
+                (job.created_at_ms != 0).then_some(job.created_at_ms as i64),
+            )
+            && query::match_date_time_ms(
+                &f.last_update_time,
+                job.last_update_ms.map(|v| v as i64),
+            )
+            && query::match_date_time_ms(&f.end_time, job.end_ms.map(|v| v as i64))
+            // `deadline` is the one NULLABLE job filter (#1344): an
+            // explicit `{"deadline": null}` is a real filter value that
+            // selects jobs with NO deadline, distinct from omitting the
+            // filter entirely (which matches everything).
+            && match &f.deadline {
+                None => true,
+                Some(types::Nullable::Null) => job.deadline_ms.is_none(),
+                Some(types::Nullable::Present(d)) => query::match_date_time_ms(
+                    &Some(d.clone()),
+                    job.deadline_ms.map(|v| v as i64),
+                ),
+            }
+}
+
 /// v2 REST batch-operations surface (epic #903, sub-issue #905).
 ///
 /// Kept in its own `impl` block so this slice never touches the shared
@@ -25077,15 +25163,15 @@ impl ServerImpl {
     /// **and** an unfiltered cancellation must not enqueue active call-activity
     /// children either.
     ///
-    /// The caller's `filter.state` is **always ignored and overridden to ACTIVE**:
-    /// every process-instance batch operation that consumes this matcher is
-    /// ACTIVE-only by contract — cancellation (only ACTIVE root instances are
-    /// cancellable, `spec/process-instances.yaml:371-375`) and incident-resolution
-    /// (only ACTIVE instances can have unresolved incidents,
-    /// `spec/process-instances.yaml:416-418`) both state "any given filters for
-    /// state … are ignored and overridden". Enforcing ACTIVE here (rather than
-    /// threading a per-call `state` policy) keeps the override in one place so a
-    /// caller cannot forget it and enqueue a COMPLETED/TERMINATED instance.
+    /// The caller's `filter.state` is **always ignored and overridden**: this
+    /// entry point applies the ACTIVE-only override every non-cancellation
+    /// batch uses (incident-resolution: only ACTIVE instances can have
+    /// unresolved incidents, `spec/process-instances.yaml:416-418`; migration /
+    /// modification), while cancellation calls
+    /// [`Self::batch_matched_process_instances_in`] with
+    /// [`ProcessInstanceStatePolicy::LiveOnly`] (ACTIVE and SUSPENDED roots,
+    /// `spec/process-instances.yaml:443-445`). Both overrides live in the
+    /// policy enum so a caller cannot enqueue a COMPLETED/TERMINATED instance.
     ///
     /// The `variables` filter is honoured exactly as
     /// `search_process_instances_impl` honours it: matched against the
@@ -25099,6 +25185,23 @@ impl ServerImpl {
         filter: &models::ProcessInstanceFilter,
         honour_hierarchy: BatchHierarchyPolicy,
     ) -> Vec<u64> {
+        self.batch_matched_process_instances_in(
+            filter,
+            ProcessInstanceStatePolicy::ActiveOnly,
+            honour_hierarchy,
+        )
+    }
+
+    /// [`Self::batch_matched_process_instances`] with an explicit state
+    /// override. Cancellation uses [`ProcessInstanceStatePolicy::LiveOnly`]
+    /// (ACTIVE and SUSPENDED roots, `spec/process-instances.yaml:443-445`);
+    /// every other batch keeps the ACTIVE-only override.
+    fn batch_matched_process_instances_in(
+        &self,
+        filter: &models::ProcessInstanceFilter,
+        state_policy: ProcessInstanceStatePolicy,
+        honour_hierarchy: BatchHierarchyPolicy,
+    ) -> Vec<u64> {
         // The same matcher `search_process_instances_impl` uses (one algebra,
         // including `$or` — #1293: an ignored `$or` here would silently broaden
         // a mutating batch), with the batch-specific state/hierarchy overrides.
@@ -25107,13 +25210,7 @@ impl ServerImpl {
             .store
             .process_instances()
             .into_iter()
-            .filter(|inst| {
-                matcher.matches(
-                    inst,
-                    ProcessInstanceStatePolicy::ActiveOnly,
-                    honour_hierarchy,
-                )
-            })
+            .filter(|inst| matcher.matches(inst, state_policy, honour_hierarchy))
             .map(|inst| inst.key)
             .collect();
         keys.sort_unstable();
@@ -25121,7 +25218,9 @@ impl ServerImpl {
     }
 
     /// `POST /v2/process-instances/cancellation` — mint a `CANCEL_PROCESS_INSTANCE`
-    /// batch operation over every process instance matched by the request filter.
+    /// batch operation over every ACTIVE or SUSPENDED root process instance matched by the
+    /// request filter and cancel each one (via the same
+    /// [`Self::cancel_instance_core`] as the single-instance endpoint, #1863).
     async fn cancel_process_instances_batch_operation_impl(
         &self,
         body: &models::ProcessInstanceCancellationBatchOperationRequest,
@@ -25129,12 +25228,33 @@ impl ServerImpl {
         use apis::process_instance::CancelProcessInstancesBatchOperationResponse as Resp;
         let op_type = models::BatchOperationTypeEnum::CancelProcessInstance;
         // Cancellation ignores/overrides the supplied parent filters and targets
-        // only ACTIVE **root** instances (spec §371-375): the call-activity
+        // only ACTIVE/SUSPENDED **root** instances (spec §443-445): the call-activity
         // hierarchy filters must not scope this batch to a parent's children, and
         // an unfiltered request must not enqueue active call-activity children.
-        let items =
-            self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::RootOnly);
-        let key = self.batch_operations.create(op_type, items);
+        let items = self
+            .batch_matched_process_instances_in(
+                &body.filter,
+                ProcessInstanceStatePolicy::LiveOnly,
+                BatchHierarchyPolicy::RootOnly,
+            )
+            .into_iter()
+            .map(BatchItem::process_instance)
+            .collect();
+        // Execute (#1863) through the single-instance cancel core, stamping the
+        // request's `operationReference` on every per-item record.
+        let operation_reference = body.operation_reference;
+        let key =
+            self.drive_process_instance_batch(op_type, items, move |server, instance| async move {
+                match server
+                    .cancel_instance_core(instance, operation_reference)
+                    .await
+                {
+                    CancelInstanceOutcome::Canceled => Ok(()),
+                    CancelInstanceOutcome::NotFound(d)
+                    | CancelInstanceOutcome::Unavailable(d)
+                    | CancelInstanceOutcome::Internal(d) => Err(d),
+                }
+            });
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
         ))
@@ -25145,13 +25265,16 @@ impl ServerImpl {
     /// `apply` to each item and recording a per-item `COMPLETED` / `FAILED`
     /// outcome. Between items the executor honours the batch lifecycle — it
     /// waits while the batch is `SUSPENDED` and stops when it is `CANCELED`
-    /// (remaining items stay unprocessed). Every executing process-instance batch
-    /// (migration, and the modification slice #1552) goes through here, so there
-    /// is exactly one batch-execution implementation.
+    /// (remaining items stay unprocessed). EVERY executing batch — process
+    /// instance cancellation / migration / modification, incident resolution and
+    /// job update (#1863) — goes through here, so there is exactly one
+    /// batch-execution implementation. The `batch_endpoints_execute_through_the_shared_seam`
+    /// guard (request_field_guard.rs) fails any spec batch endpoint whose handler
+    /// mints a batch without driving it through this seam.
     fn drive_process_instance_batch<F, Fut>(
         &self,
         op_type: models::BatchOperationTypeEnum,
-        items: Vec<u64>,
+        items: Vec<BatchItem>,
         apply: F,
     ) -> u64
     where
@@ -25161,7 +25284,7 @@ impl ServerImpl {
         let key = self.batch_operations.create(op_type, items.clone());
         let server = self.clone();
         tokio::spawn(async move {
-            for item in items {
+            for BatchItem { item_key: item, .. } in items {
                 loop {
                     match server.batch_operations.state(key) {
                         Some(models::BatchOperationStateEnum::Suspended) => {
@@ -25227,8 +25350,11 @@ impl ServerImpl {
         let op_type = models::BatchOperationTypeEnum::MigrateProcessInstance;
         // Migration honours the supplied filters; `state` is overridden to
         // ACTIVE by the matcher (only ACTIVE instances can be migrated).
-        let items =
-            self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::HonourFilters);
+        let items = self
+            .batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::HonourFilters)
+            .into_iter()
+            .map(BatchItem::process_instance)
+            .collect();
         let key = self.drive_process_instance_batch(op_type, items, move |server, instance| {
             let mappings = mappings.clone();
             async move {
@@ -25324,8 +25450,11 @@ impl ServerImpl {
         let op_type = models::BatchOperationTypeEnum::ModifyProcessInstance;
         // Modification honours the supplied filters; `state` is overridden to
         // ACTIVE by the matcher (only ACTIVE instances can be modified).
-        let items =
-            self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::HonourFilters);
+        let items = self
+            .batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::HonourFilters)
+            .into_iter()
+            .map(BatchItem::process_instance)
+            .collect();
         let key = self.drive_process_instance_batch(op_type, items, move |server, instance| {
             let move_instructions = move_instructions.clone();
             async move {
@@ -25354,7 +25483,8 @@ impl ServerImpl {
     }
 
     /// `POST /v2/process-instances/incident-resolution` — mint a `RESOLVE_INCIDENT`
-    /// batch operation over every process instance matched by the request filter.
+    /// batch operation over every ACTIVE incident of the process instances
+    /// matched by the request filter and resolve each one (#1863).
     async fn resolve_incidents_batch_operation_impl(
         &self,
         body: &Option<models::ProcessInstanceIncidentResolutionBatchOperationRequest>,
@@ -25372,9 +25502,41 @@ impl ServerImpl {
         let op_type = models::BatchOperationTypeEnum::ResolveIncident;
         // Incident resolution honours the call-activity hierarchy filters; `state`
         // is ignored/overridden to ACTIVE by the matcher (spec §416-418).
-        let items =
-            self.batch_matched_process_instances(&req.filter, BatchHierarchyPolicy::HonourFilters);
-        let key = self.batch_operations.create(op_type, items);
+        let instances: std::collections::BTreeSet<u64> = self
+            .batch_matched_process_instances(&req.filter, BatchHierarchyPolicy::HonourFilters)
+            .into_iter()
+            .collect();
+        // The items are the ACTIVE incidents of the matched instances (Zeebe:
+        // one item per incident key), each resolved through the single-incident
+        // `resolve_incident_core` with the request's `operationReference` (#1863).
+        let mut items: Vec<BatchItem> = self
+            .store
+            .incidents()
+            .into_iter()
+            .filter(|i| {
+                i.state == nanobpmn_engine_core::IncidentState::Active
+                    && instances.contains(&i.instance_key)
+            })
+            .map(|i| BatchItem {
+                item_key: i.key,
+                process_instance_key: Some(i.instance_key),
+            })
+            .collect();
+        items.sort_unstable_by_key(|item| item.item_key);
+        let operation_reference = req.operation_reference;
+        let key =
+            self.drive_process_instance_batch(op_type, items, move |server, incident| async move {
+                match server
+                    .resolve_incident_core(incident, operation_reference)
+                    .await
+                {
+                    ResolveIncidentOutcome::Resolved => Ok(()),
+                    ResolveIncidentOutcome::NotFound(d)
+                    | ResolveIncidentOutcome::NotResolvable(d)
+                    | ResolveIncidentOutcome::Unavailable(d)
+                    | ResolveIncidentOutcome::Internal(d) => Err(d),
+                }
+            });
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
         ))
@@ -50566,8 +50728,7 @@ mod clustered_startup_tests {
     async fn rest_batch_update_jobs_validates_and_mints_a_batch_key() {
         use apis::job::UpdateJobsBatchOperationResponse as Resp;
         let server = ServerImpl::default();
-        let request =
-            |changeset| models::JobBatchUpdateRequest::new(models::JobFilter::new(), changeset);
+        let request = |changeset| models::JobBatchUpdateRequest::new(work_job_filter(), changeset);
         let rejected = |resp| matches!(resp, Resp::Status400_TheJobBatchUpdateOperationFailed(_));
 
         // Each changeset field alone is a valid update and mints a trackable batch key.
@@ -50629,6 +50790,83 @@ mod clustered_startup_tests {
                 "an out-of-range {what} must be rejected"
             );
         }
+    }
+
+    /// A job filter selecting `type = "work"` — an explicit, evaluated dimension.
+    pub(crate) fn work_job_filter() -> models::JobFilter {
+        serde_json::from_value(serde_json::json!({ "type": "work" })).expect("job filter")
+    }
+
+    /// #1863: a job batch MUTATES what its filter selects, so the filter fails
+    /// closed — an empty filter and every dimension the matcher does not
+    /// evaluate are 400s (never a silently widened selection), while every
+    /// evaluated dimension is accepted.
+    #[tokio::test]
+    async fn rest_batch_update_jobs_rejects_empty_and_unevaluated_filters() {
+        use apis::job::UpdateJobsBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let mut changeset = models::JobChangeset::new();
+        changeset.retries = Some(types::Nullable::Present(7));
+        let run = |filter: serde_json::Value| {
+            let server = &server;
+            let changeset = changeset.clone();
+            async move {
+                let filter: models::JobFilter =
+                    serde_json::from_value(filter.clone()).expect("filter decodes");
+                server
+                    .update_jobs_batch_operation_impl(&models::JobBatchUpdateRequest::new(
+                        filter, changeset,
+                    ))
+                    .await
+                    .expect("handler runs")
+            }
+        };
+        assert!(
+            matches!(
+                run(serde_json::json!({})).await,
+                Resp::Status400_TheJobBatchUpdateOperationFailed(_)
+            ),
+            "an empty filter must be rejected"
+        );
+        // Every spec dimension the matcher ignores is rejected, alone or
+        // alongside an evaluated one.
+        for (field, value) in [
+            ("retries", serde_json::json!(0)),
+            ("worker", serde_json::json!("w")),
+            ("processDefinitionId", serde_json::json!("p")),
+            ("tenantId", serde_json::json!("<default>")),
+            ("priority", serde_json::json!(0)),
+            ("deniedReason", serde_json::json!("x")),
+            ("isDenied", serde_json::json!(true)),
+        ] {
+            for filter in [
+                serde_json::json!({ field: value.clone() }),
+                serde_json::json!({ field: value.clone(), "type": "work" }),
+            ] {
+                assert!(
+                    matches!(
+                        run(filter.clone()).await,
+                        Resp::Status400_TheJobBatchUpdateOperationFailed(_)
+                    ),
+                    "unevaluated dimension must be rejected: {filter}"
+                );
+            }
+        }
+        assert!(
+            matches!(
+                run(serde_json::json!({ "type": "work" })).await,
+                Resp::Status200_TheBatchOperationWasCreated(_)
+            ),
+            "an evaluated dimension is accepted"
+        );
+        // An explicit `deadline: null` is a real (evaluated) dimension.
+        assert!(
+            matches!(
+                run(serde_json::json!({ "deadline": null })).await,
+                Resp::Status200_TheBatchOperationWasCreated(_)
+            ),
+            "`deadline: null` is an evaluated dimension"
+        );
     }
 
     /// Wait for a job of `job_type` to project into the read model, returning its
@@ -52032,19 +52270,6 @@ mod clustered_startup_tests {
         assert_eq!(completed, vec![2, 0, 2], "completed per bucket");
         assert_eq!(failed, vec![0, 0, 1], "failed per bucket");
     }
-
-    /// Minted batch-operation keys must be strictly increasing even for many
-    /// same-millisecond calls, so consumers that sort or page by key never see a
-    /// regression or duplicate.
-    #[test]
-    fn mint_batch_operation_key_is_strictly_monotonic() {
-        let mut prev = 0u64;
-        for _ in 0..10_000 {
-            let k = mint_batch_operation_key();
-            assert!(k > prev, "key {k} did not exceed the previous key {prev}");
-            prev = k;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -52882,6 +53107,472 @@ mod subscription_placement_tests {
         assert!(
             records.iter().any(|r| r.operation_reference.is_none()),
             "the unreferenced deploy records prove the stamp is the create's own"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1863 (red-first): the cancel, resolve-incident and job-update batch
+    /// endpoints must EXECUTE their per-item engine command — before #1863 each
+    /// only minted a tracking record and returned 200, leaving every instance
+    /// running, every incident open and every job untouched — and every record
+    /// a per-item command journals carries the batch request's
+    /// `operationReference`. Disk-backed: asserts the persisted envelopes.
+    #[tokio::test]
+    async fn batch_operations_execute_and_stamp_operation_reference() {
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use nanobpmn_engine_core::{IncidentState, ProcessInstanceState};
+
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-1863-batch-exec-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let owned = topology.local_partitions();
+        let varstore = Arc::new(varstore::VarStore::open(None).unwrap());
+        let (writer, recovery) =
+            SharedWriter::open_segmented(&dir, &owned, 4, Some(&varstore)).unwrap();
+        let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+            recovery.engines.into_iter().collect();
+        let journals: Vec<Journal> = owned
+            .iter()
+            .map(|&p| {
+                let engine = engines
+                    .remove(&p)
+                    .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                Journal::from_engine_shared(p, engine, true, &writer)
+            })
+            .collect();
+        let server = build_server_in_memory(journals, topology);
+        server
+            .deploy_centralized(
+                vec![("work-then-wait.bpmn".into(), SERVICE_THEN_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the service-task process deploys");
+
+        let mut instances = Vec::new();
+        for i in 0..2 {
+            let mut instruction =
+                models::ProcessInstanceCreationInstructionById::new("work-then-wait".to_string());
+            instruction.variables = Some(std::collections::HashMap::from([(
+                "orderId".to_string(),
+                types::Object(serde_json::Value::String(format!("order-1863-{i}"))),
+            )]));
+            let body =
+                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                    instruction,
+                );
+            let apis::process_instance::CreateProcessInstanceResponse::Status200_TheProcessInstanceWasCreated(result) =
+                server.create_process_instance_impl(&body).await.expect("create")
+            else {
+                panic!("create must succeed");
+            };
+            instances.push(result.process_instance_key.0.parse::<u64>().expect("key"));
+        }
+
+        // Poll a read-model predicate (projection is asynchronous).
+        async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
+            for _ in 0..500 {
+                if ok() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for: {what}");
+        }
+        let settle = |key: String| {
+            let server = server.clone();
+            async move {
+                let path = models::GetBatchOperationPathParams {
+                    batch_operation_key: key,
+                };
+                for _ in 0..500 {
+                    let GetResp::Status200_TheBatchOperationWasFound(r) =
+                        server.get_batch_operation_impl(&path).await.unwrap()
+                    else {
+                        panic!("batch must be found");
+                    };
+                    if r.state != models::BatchOperationStateEnum::Active {
+                        return r.state;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("batch never settled");
+            }
+        };
+        eventually("both jobs project", || {
+            server
+                .store
+                .jobs()
+                .iter()
+                .filter(|j| instances.contains(&j.instance_key))
+                .count()
+                == 2
+        })
+        .await;
+
+        // Raise an incident on the first instance: activate its job and fail it
+        // with no retries left.
+        let activated = server
+            .activate_for_stream("work", "w", 10, 60_000, None)
+            .await;
+        let failing = activated
+            .iter()
+            .find(|j| j.process_instance_key.0 == instances[0].to_string())
+            .expect("first instance's job activates")
+            .job_key
+            .0
+            .clone();
+        let mut fail = models::JobFailRequest::new();
+        fail.retries = Some(0);
+        let resp = server
+            .fail_job_impl(&models::FailJobPathParams { job_key: failing }, &Some(fail))
+            .await
+            .expect("fail");
+        assert!(
+            matches!(resp, apis::job::FailJobResponse::Status204_TheJobIsFailed),
+            "fail must succeed: {resp:?}"
+        );
+        eventually("the incident projects", || {
+            server
+                .store
+                .incidents()
+                .iter()
+                .any(|i| i.instance_key == instances[0] && i.state == IncidentState::Active)
+        })
+        .await;
+
+        // --- Job update batch: every matched job gets the new retries. ---
+        const JOB_REF: i64 = 0x0018_6301;
+        let mut changeset = models::JobChangeset::new();
+        changeset.retries = Some(types::Nullable::Present(7));
+        let mut job_req = models::JobBatchUpdateRequest::new(
+            crate::clustered_startup_tests::work_job_filter(),
+            changeset,
+        );
+        job_req.operation_reference = Some(JOB_REF);
+        let apis::job::UpdateJobsBatchOperationResponse::Status200_TheBatchOperationWasCreated(
+            created,
+        ) = server
+            .update_jobs_batch_operation_impl(&job_req)
+            .await
+            .expect("job batch")
+        else {
+            panic!("job batch must be created");
+        };
+        assert_eq!(
+            settle(created.batch_operation_key).await,
+            models::BatchOperationStateEnum::Completed
+        );
+        eventually("every job carries the batch's retries", || {
+            server
+                .store
+                .jobs()
+                .iter()
+                .filter(|j| instances.contains(&j.instance_key))
+                .all(|j| j.retries == 7)
+        })
+        .await;
+
+        // --- Non-zero priority batch: every item FAILS, jobs unchanged. ---
+        let mut changeset = models::JobChangeset::new();
+        changeset.priority = Some(types::Nullable::Present(5));
+        let apis::job::UpdateJobsBatchOperationResponse::Status200_TheBatchOperationWasCreated(
+            created,
+        ) = server
+            .update_jobs_batch_operation_impl(&models::JobBatchUpdateRequest::new(
+                crate::clustered_startup_tests::work_job_filter(),
+                changeset,
+            ))
+            .await
+            .expect("priority batch")
+        else {
+            panic!("priority batch must be created");
+        };
+        let priority_key = created.batch_operation_key;
+        assert_ne!(
+            settle(priority_key.clone()).await,
+            models::BatchOperationStateEnum::Completed,
+            "an unsupported priority must not report success"
+        );
+        let GetResp::Status200_TheBatchOperationWasFound(priority_batch) = server
+            .get_batch_operation_impl(&models::GetBatchOperationPathParams {
+                batch_operation_key: priority_key,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("priority batch must be found");
+        };
+        assert_eq!(priority_batch.operations_total_count, 2);
+        assert_eq!(priority_batch.operations_failed_count, 2);
+        assert_eq!(priority_batch.operations_completed_count, 0);
+        assert!(
+            server
+                .store
+                .jobs()
+                .iter()
+                .filter(|j| instances.contains(&j.instance_key))
+                .all(|j| j.retries == 7),
+            "a failed priority batch leaves job properties unchanged"
+        );
+
+        // --- Resolve-incident batch: the open incident is resolved. ---
+        const RESOLVE_REF: i64 = 0x0018_6302;
+        let mut resolve_req = models::ProcessInstanceIncidentResolutionBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+        );
+        resolve_req.operation_reference = Some(RESOLVE_REF);
+        let apis::process_instance::ResolveIncidentsBatchOperationResponse::Status200_TheBatchOperationRequestWasCreated(created) =
+            server
+                .resolve_incidents_batch_operation_impl(&Some(resolve_req))
+                .await
+                .expect("resolve batch")
+        else {
+            panic!("resolve batch must be created");
+        };
+        assert_eq!(
+            settle(created.batch_operation_key).await,
+            models::BatchOperationStateEnum::Completed
+        );
+        eventually("the incident is resolved", || {
+            server
+                .store
+                .incidents()
+                .iter()
+                .filter(|i| i.instance_key == instances[0])
+                .all(|i| i.state == IncidentState::Resolved)
+        })
+        .await;
+
+        // --- Job timeout batch: every matched job's deadline is moved. ---
+        // A timeout only applies to an ACTIVATED job: the second job is still
+        // activated from above; re-activate the failed one (its incident is
+        // resolved and the batch gave it retries).
+        const TIMEOUT_REF: i64 = 0x0018_6304;
+        let mut activated_count = 0;
+        for _ in 0..200 {
+            activated_count += server
+                .activate_for_stream("work", "w", 10, 60_000, None)
+                .await
+                .len();
+            if activated_count >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(activated_count, 1, "the failed job re-activates");
+        let mut changeset = models::JobChangeset::new();
+        changeset.timeout = Some(types::Nullable::Present(3_600_000));
+        let mut timeout_req = models::JobBatchUpdateRequest::new(
+            crate::clustered_startup_tests::work_job_filter(),
+            changeset,
+        );
+        timeout_req.operation_reference = Some(TIMEOUT_REF);
+        let apis::job::UpdateJobsBatchOperationResponse::Status200_TheBatchOperationWasCreated(
+            created,
+        ) = server
+            .update_jobs_batch_operation_impl(&timeout_req)
+            .await
+            .expect("timeout batch")
+        else {
+            panic!("timeout batch must be created");
+        };
+        let timeout_key = created.batch_operation_key;
+        let timeout_state = settle(timeout_key.clone()).await;
+        let GetResp::Status200_TheBatchOperationWasFound(timeout_batch) = server
+            .get_batch_operation_impl(&models::GetBatchOperationPathParams {
+                batch_operation_key: timeout_key,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("timeout batch must be found");
+        };
+        assert_eq!(timeout_state, models::BatchOperationStateEnum::Completed);
+        assert_eq!(timeout_batch.operations_total_count, 2);
+
+        // --- Priority-0-only batch: an effective no-op still runs the single-
+        // job eligibility check per item, so a terminal (COMPLETED) job FAILS
+        // with the same reason as `PATCH /v2/jobs/{key}` while an eligible job
+        // completes — never a blanket success over every matched job. ---
+        let first_job = server
+            .store
+            .jobs()
+            .iter()
+            .find(|j| j.instance_key == instances[0])
+            .expect("first instance's job")
+            .key;
+        let resp = server
+            .complete_job_impl(
+                &models::CompleteJobPathParams {
+                    job_key: first_job.to_string(),
+                },
+                &None,
+            )
+            .await
+            .expect("complete");
+        assert!(
+            matches!(
+                resp,
+                apis::job::CompleteJobResponse::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "complete must succeed: {resp:?}"
+        );
+        eventually("the first job projects COMPLETED", || {
+            server
+                .store
+                .jobs()
+                .iter()
+                .any(|j| j.key == first_job && j.state == nanobpmn_engine_core::JobState::Completed)
+        })
+        .await;
+        let single = server
+            .update_job_impl(
+                &models::UpdateJobPathParams {
+                    job_key: first_job.to_string(),
+                },
+                &serde_json::from_value(serde_json::json!({ "changeset": { "priority": 0 } }))
+                    .expect("update body"),
+            )
+            .await
+            .expect("single update");
+        let single_detail = match single {
+            apis::job::UpdateJobResponse::Status404_TheJobWithTheJobKeyIsNotFound(p) => p.detail,
+            other => panic!("PATCH priority 0 on a completed job must 404: {other:?}"),
+        };
+        let mut changeset = models::JobChangeset::new();
+        changeset.priority = Some(types::Nullable::Present(0));
+        let apis::job::UpdateJobsBatchOperationResponse::Status200_TheBatchOperationWasCreated(
+            created,
+        ) = server
+            .update_jobs_batch_operation_impl(&models::JobBatchUpdateRequest::new(
+                crate::clustered_startup_tests::work_job_filter(),
+                changeset,
+            ))
+            .await
+            .expect("priority-0 batch")
+        else {
+            panic!("priority-0 batch must be created");
+        };
+        let zero_key = created.batch_operation_key;
+        settle(zero_key.clone()).await;
+        let GetResp::Status200_TheBatchOperationWasFound(zero_batch) = server
+            .get_batch_operation_impl(&models::GetBatchOperationPathParams {
+                batch_operation_key: zero_key.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("priority-0 batch must be found");
+        };
+        assert_eq!(zero_batch.operations_total_count, 2);
+        assert_eq!(zero_batch.operations_completed_count, 1);
+        assert_eq!(zero_batch.operations_failed_count, 1);
+        let zero_key: u64 = zero_key.parse().expect("batch key");
+        let failed: Vec<(u64, String)> = {
+            let inner = server
+                .batch_operations
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            inner.ops[&zero_key]
+                .items
+                .iter()
+                .filter_map(|i| i.error_message.clone().map(|e| (i.item_key, e)))
+                .collect()
+        };
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, first_job);
+        assert_eq!(
+            failed[0].1, single_detail,
+            "batch reason == single PATCH reason"
+        );
+
+        // --- Cancel batch: every ACTIVE *and SUSPENDED* root instance is
+        // cancelled (`spec/process-instances.yaml`: "only ACTIVE and SUSPENDED
+        // root instances can be cancelled"). Suspend one first so a selected
+        // suspended root is proven to be cancelled, not silently skipped. ---
+        assert!(matches!(
+            server.suspend_instance_core(instances[1], None).await,
+            TransitionInstanceOutcome::Ok
+        ));
+        eventually("the second instance is suspended", || {
+            server
+                .store
+                .process_instance(instances[1])
+                .is_some_and(|i| i.state == ProcessInstanceState::Suspended)
+        })
+        .await;
+        const CANCEL_REF: i64 = 0x0018_6303;
+        let mut cancel_req = models::ProcessInstanceCancellationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+        );
+        cancel_req.operation_reference = Some(CANCEL_REF);
+        let apis::process_instance::CancelProcessInstancesBatchOperationResponse::Status200_TheBatchOperationRequestWasCreated(created) =
+            server
+                .cancel_process_instances_batch_operation_impl(&cancel_req)
+                .await
+                .expect("cancel batch")
+        else {
+            panic!("cancel batch must be created");
+        };
+        assert_eq!(
+            settle(created.batch_operation_key).await,
+            models::BatchOperationStateEnum::Completed
+        );
+        eventually("every instance is terminated", || {
+            instances.iter().all(|k| {
+                server
+                    .store
+                    .process_instance(*k)
+                    .is_some_and(|i| i.state == ProcessInstanceState::Terminated)
+            })
+        })
+        .await;
+
+        drop(server);
+        let records: Vec<nanobpmn_engine_core::Record> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("journal") && n.ends_with(".jsonl"))
+            })
+            .flat_map(|p| seglog::read_segment_records(&p).unwrap())
+            .collect();
+        let refs_of = |pred: &dyn Fn(&Event) -> bool| -> Vec<Option<i64>> {
+            records
+                .iter()
+                .filter(|r| pred(&r.event))
+                .map(|r| r.operation_reference)
+                .collect()
+        };
+        let retries = refs_of(&|e| matches!(e, Event::JobRetriesUpdated { .. }));
+        assert_eq!(retries, vec![Some(JOB_REF); 2], "job-update records");
+        let timeouts = refs_of(&|e| matches!(e, Event::JobTimeoutUpdated { .. }));
+        assert_eq!(timeouts, vec![Some(TIMEOUT_REF); 2], "job-timeout records");
+        let resolved = refs_of(&|e| matches!(e, Event::IncidentResolved { .. }));
+        assert_eq!(
+            resolved,
+            vec![Some(RESOLVE_REF)],
+            "incident-resolution records"
+        );
+        let terminated = refs_of(&|e| matches!(e, Event::ProcessInstanceTerminated { .. }));
+        assert_eq!(
+            terminated,
+            vec![Some(CANCEL_REF); 2],
+            "cancellation records"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -57377,7 +58068,10 @@ mod batch_operation_tests {
         items: Vec<u64>,
     ) -> (ServerImpl, u64) {
         let server = ServerImpl::default();
-        let key = server.batch_operations.create(op_type, items);
+        let key = server.batch_operations.create(
+            op_type,
+            items.into_iter().map(BatchItem::process_instance).collect(),
+        );
         (server, key)
     }
 
@@ -57655,7 +58349,7 @@ mod batch_operation_tests {
         let apply_started = started.clone();
         let key = server.drive_process_instance_batch(
             models::BatchOperationTypeEnum::MigrateProcessInstance,
-            vec![1, 2, 3],
+            [1, 2, 3].map(BatchItem::process_instance).to_vec(),
             move |_server, _item| {
                 let gate = apply_gate.clone();
                 let started = apply_started.clone();
