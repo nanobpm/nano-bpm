@@ -26,6 +26,11 @@
 //! router deserialises the body with serde and runs the generated validation,
 //! then the handler calls the shared pipeline over `ReadModel`. Extending the
 //! guard to an operation migrated later (#1898) is one more `Op` entry.
+//!
+//! A second guard (#1900, bottom of this file) enumerates filters from the
+//! published `@nanobpm/engine-wasm/readmodel-types` (`types.gen.ts`) instead of
+//! the spec, and asserts the WASM engine accepts every advertised filter field
+//! × operator.
 
 use std::sync::Arc;
 
@@ -1220,4 +1225,377 @@ fn filter_guard_fails_when_one_well_formed_operand_variant_is_rejected() {
     assert!(guard_rejects("\"$exists\":false"), "$exists false rejected");
     // A rejected `$like` wildcard pattern is not masked by an exact pattern.
     assert!(guard_rejects("no-match*"), "$like pattern rejected");
+}
+
+// ---------------------------------------------------------------------------
+// Published TS `readmodel-types` ⇄ WASM acceptance guard (#1900).
+//
+// `@nanobpm/engine-wasm/readmodel-types` ships `types.gen.ts`, generated from
+// the spec. The parity tests above enumerate filters from the SPEC; this guard
+// enumerates them from the PUBLISHED TYPES, so the types package can never
+// advertise a filter field or operator the WASM engine rejects (#1883 item 5):
+// every filter field of every WASM search request type × every advanced
+// operator its TS type admits (plus the implicit-equality shorthand) must be
+// ACCEPTED by the WASM engine.
+// ---------------------------------------------------------------------------
+
+/// The published TS declarations (`export type Name = <expr>;`), comments
+/// stripped, keyed by name.
+fn ts_decls() -> std::collections::BTreeMap<String, String> {
+    let src = include_str!("../readmodel-types/types.gen.ts");
+    // Strip block comments (doc comments contain braces and `$or` examples).
+    let mut text = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(i) = rest.find("/*") {
+        text.push_str(&rest[..i]);
+        let end = rest[i..].find("*/").expect("unterminated comment");
+        rest = &rest[i + end + 2..];
+    }
+    text.push_str(rest);
+    let text: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut decls = std::collections::BTreeMap::new();
+    for chunk in text.split("export type ").skip(1) {
+        let (name, expr) = chunk.split_once(" = ").expect("type alias");
+        let mut depth = 0i32;
+        let mut quote = None;
+        let mut end = expr.len();
+        for (i, c) in expr.char_indices() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), _) => {}
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '{' | '<' | '(' | '[') => depth += 1,
+                (None, '}' | '>' | ')' | ']') => depth -= 1,
+                (None, ';') if depth == 0 => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        decls.insert(name.trim().to_string(), expr[..end].trim().to_string());
+    }
+    decls
+}
+
+/// Split a TS type expression on `sep` at nesting depth 0.
+fn ts_split(expr: &str, sep: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut cur = String::new();
+    for c in expr.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '{' | '<' | '(' | '[') => depth += 1,
+            (None, '}' | '>' | ')' | ']') => depth -= 1,
+            (None, c) if c == sep && depth == 0 => {
+                parts.push(std::mem::take(&mut cur).trim().to_string());
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    let last = cur.trim().to_string();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
+/// The `(field, type)` members of a TS object-literal type `{ a?: T; … }`.
+fn ts_object_fields(lit: &str) -> Vec<(String, String)> {
+    let inner = lit
+        .trim()
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .expect("object literal");
+    ts_split(inner, ';')
+        .into_iter()
+        .map(|m| {
+            let (k, t) = m.split_once(':').expect("member `name: type`");
+            let k = k.trim().trim_end_matches('?').trim_matches('\'');
+            (k.to_string(), t.trim().to_string())
+        })
+        .collect()
+}
+
+/// The fields of a TS object type expression, following `&` intersections
+/// and named aliases (`UserTaskFilter = UserTaskFilterFields & { $or… }`).
+fn ts_fields(
+    decls: &std::collections::BTreeMap<String, String>,
+    expr: &str,
+) -> Vec<(String, String)> {
+    ts_split(expr, '&')
+        .into_iter()
+        .flat_map(|part| {
+            if part.starts_with('{') {
+                ts_object_fields(&part)
+            } else {
+                let d = decls
+                    .get(&part)
+                    .unwrap_or_else(|| panic!("TS type {part} declared"));
+                ts_fields(decls, d)
+            }
+        })
+        .collect()
+}
+
+/// The element type of `Array<T>` / `T[]`, if `expr` is an array type.
+fn ts_array_elem(expr: &str) -> Option<&str> {
+    expr.strip_prefix("Array<")
+        .and_then(|s| s.strip_suffix('>'))
+        .or_else(|| expr.strip_suffix("[]"))
+}
+
+/// The advanced-filter operators (`$`-prefixed members) a TS filter-property
+/// type admits, following `|` / `&` composition and named aliases. An array
+/// property (`elementInstanceKeys`) admits its element type's operators.
+fn ts_operators(
+    decls: &std::collections::BTreeMap<String, String>,
+    expr: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for alt in ts_split(expr, '|') {
+        for part in ts_split(&alt, '&') {
+            if let Some(elem) = ts_array_elem(&part) {
+                out.extend(ts_operators(decls, elem));
+            } else if part.starts_with('{') {
+                out.extend(
+                    ts_object_fields(&part)
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .filter(|k| k.starts_with('$')),
+                );
+            } else if let Some(d) = decls.get(&part) {
+                out.extend(ts_operators(decls, d));
+            }
+        }
+    }
+    out
+}
+
+/// The WASM search methods and the published TS request type each accepts.
+/// Must cover exactly the WASM `search*` read methods (checked below).
+const TS_SEARCH_REQUESTS: [(&str, &str); 5] = [
+    ("searchAgentInstances", "AgentInstanceSearchQuery"),
+    (
+        "searchAgentInstanceHistory",
+        "AgentInstanceHistorySearchQuery",
+    ),
+    ("searchUserTasks", "UserTaskSearchQuery"),
+    ("searchProcessInstances", "ProcessInstanceSearchQuery"),
+    ("searchVariables", "VariableSearchQuery"),
+];
+
+/// Every TS-advertised filter probe for the request type `query`, as WASM
+/// request bodies. The probe operand per field is derived from the spec
+/// schema the TS type is generated from (a TS field the spec lacks fails).
+fn ts_filter_probes(query: &str) -> Vec<String> {
+    let decls = ts_decls();
+    let q = decls
+        .get(query)
+        .unwrap_or_else(|| panic!("TS declares {query}"));
+    let filter_ty = ts_fields(&decls, q)
+        .into_iter()
+        .find(|(k, _)| k == "filter")
+        .unwrap_or_else(|| panic!("{query} has a filter"))
+        .1;
+    ts_filter_object_probes(&decls, &filter_ty)
+        .into_iter()
+        .map(|f| json!({ "filter": f }).to_string())
+        .collect()
+}
+
+/// Every TS-advertised probe for the filter type `filter_ty`, as filter
+/// objects. `$or` lists recurse into their element type, so each operator
+/// is also probed nested inside `$or` (`{"$or":[{field:{op:…}}]}`).
+fn ts_filter_object_probes(
+    decls: &std::collections::BTreeMap<String, String>,
+    filter_ty: &str,
+) -> Vec<J> {
+    let filter_ty = filter_ty.to_string();
+    let fields = ts_fields(decls, &filter_ty);
+    assert!(!fields.is_empty(), "{filter_ty} advertises fields");
+    let mut bodies = Vec::new();
+    for (field, ty) in fields {
+        // Resolve named aliases (`tags?: TagSet`, `TagSet = Array<Tag>`).
+        let mut resolved = ty.as_str();
+        while let Some(d) = decls.get(resolved).filter(|d| !d.contains('|')) {
+            resolved = d;
+        }
+        let is_array = ts_array_elem(resolved).is_some();
+        let wrap = |f: J| if is_array { json!([f]) } else { f };
+        if ARRAY_FILTERS.contains(&field.as_str()) {
+            let v = if field == "$or" {
+                json!([{}])
+            } else {
+                json!([{ "name": "label", "value": "\"item-1\"" }])
+            };
+            bodies.push(json!({ field.as_str(): v }));
+            if field == "$or" {
+                let elem = ts_array_elem(resolved)
+                    .unwrap_or_else(|| panic!("{filter_ty}.$or is an array"));
+                for f in ts_filter_object_probes(decls, elem) {
+                    bodies.push(json!({ "$or": [f] }));
+                }
+                continue;
+            }
+            // Variable-value lists: each element's `value` is itself a filter
+            // property (`VariableValueFilterProperty.value:
+            // StringFilterProperty`), so probe its operators nested.
+            if let Some(elem) = ts_array_elem(resolved) {
+                let elem = decls.get(elem).map(String::as_str).unwrap_or(elem);
+                let value_ty = ts_fields(decls, elem)
+                    .into_iter()
+                    .find(|(k, _)| k == "value")
+                    .map(|(_, t)| t);
+                if let Some(value_ty) = value_ty {
+                    let base = json!("\"item-1\"");
+                    for o in ts_operators(decls, &value_ty) {
+                        for operand in operands(&o, &base) {
+                            bodies.push(json!({ field.as_str(): [
+                                    { "name": "label", "value": { o.as_str(): operand } }
+                                ] }));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let prop_schema = spec_property_schema(&filter_ty, &field).unwrap_or_else(|| {
+            panic!("{filter_ty}.{field}: advertised by readmodel-types but not in the spec")
+        });
+        let elem_schema = spec_array_items(&prop_schema).unwrap_or(prop_schema);
+        let v = spec_scalar_operand(&elem_schema)
+            .unwrap_or_else(|| panic!("{filter_ty}.{field}: no scalar operand"));
+        bodies.push(json!({ field.as_str(): wrap(v.clone()) }));
+        for o in ts_operators(decls, &ty) {
+            for operand in operands(&o, &v) {
+                bodies.push(json!({ field.as_str(): wrap(json!({ o.as_str(): operand })) }));
+            }
+        }
+    }
+    bodies
+}
+
+#[test]
+fn ts_parser_reads_fields_and_operators_through_composition() {
+    let decls = ts_decls();
+    let fields: Vec<String> = ts_fields(&decls, &decls["UserTaskFilter"])
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(fields.iter().any(|f| f == "$or"), "{fields:?}");
+    assert!(fields.iter().any(|f| f == "assignee"), "{fields:?}");
+    // `$like` lives in `AdvancedStringFilter = BasicStringFilter & { $like }`.
+    let ops = ts_operators(&decls, "StringFilterProperty");
+    for o in ["$eq", "$neq", "$exists", "$in", "$notIn", "$like"] {
+        assert!(ops.contains(o), "{o} in {ops:?}");
+    }
+    assert!(ts_operators(&decls, "DateTimeFilterProperty").contains("$gte"));
+    assert!(ts_operators(&decls, "Array<IntegerFilterProperty>").contains("$lt"));
+}
+
+#[test]
+fn ts_search_requests_cover_every_wasm_search_method() {
+    let wasm: std::collections::BTreeSet<String> = wasm_read_operations()
+        .into_iter()
+        .filter(|n| n.starts_with("search"))
+        .collect();
+    let covered: std::collections::BTreeSet<String> = TS_SEARCH_REQUESTS
+        .iter()
+        .map(|(n, _)| n.to_string())
+        .collect();
+    assert_eq!(
+        wasm, covered,
+        "every WASM search method maps to its TS request type"
+    );
+}
+
+#[test]
+fn every_readmodel_types_filter_field_and_operator_is_accepted_by_wasm() {
+    let (agent_eng, history_key, _) = fixture();
+    let (core_eng, _) = core_fixture();
+    let mut rejected = Vec::new();
+    let mut probes = 0;
+    for (method, query) in TS_SEARCH_REQUESTS {
+        for body in ts_filter_probes(query) {
+            let r = match method {
+                "searchAgentInstances" => agent_eng.search_agent_instances_json(&body),
+                "searchAgentInstanceHistory" => {
+                    agent_eng.search_agent_instance_history_json(&history_key, &body)
+                }
+                "searchUserTasks" => core_eng.search_user_tasks_json(&body),
+                "searchProcessInstances" => core_eng.search_process_instances_json(&body),
+                "searchVariables" => core_eng.search_variables_json(&body, None),
+                other => panic!("no WASM dispatch for {other}"),
+            };
+            probes += 1;
+            if let Err(e) = r {
+                rejected.push(format!("{method} {body}: {e}"));
+            }
+        }
+    }
+    assert!(probes > 100, "probed {probes} TS filters");
+    assert!(
+        rejected.is_empty(),
+        "readmodel-types advertises filters the WASM engine rejects:\n{}",
+        rejected.join("\n")
+    );
+}
+
+#[test]
+fn ts_probes_include_the_1883_date_range_operator() {
+    // The #1883 symptom: `creationDate: {$gte: …}` was advertised by the
+    // types and rejected by WASM. The guard must probe exactly that request.
+    let probes = ts_filter_probes("AgentInstanceSearchQuery");
+    assert!(
+        probes
+            .iter()
+            .any(|b| b.contains(r#""creationDate":{"$gte""#)),
+        "{probes:?}"
+    );
+    assert!(probes.iter().any(|b| b.contains(r#""tenantId":{"$like""#)));
+}
+
+#[test]
+fn ts_probes_include_nested_variable_value_operators() {
+    // `VariableValueFilterProperty.value` is a `StringFilterProperty`: the
+    // guard must probe its operators inside `variables`, not just plain values.
+    let probes = ts_filter_probes("ProcessInstanceSearchQuery");
+    for o in ["$like", "$in", "$eq", "$exists"] {
+        let needle = format!(r#""variables":[{{"name":"label","value":{{"{o}""#);
+        assert!(
+            probes.iter().any(|b| b.contains(&needle)),
+            "{o}: {probes:?}"
+        );
+    }
+}
+
+#[test]
+fn ts_probes_include_nested_or_operators() {
+    // `$or` elements are full filter-field types: the guard must probe each
+    // advertised operator inside `$or`, not only an empty clause.
+    for (query, needle) in [
+        ("UserTaskSearchQuery", r#"{"$or":[{"assignee":{"$like""#),
+        (
+            "ProcessInstanceSearchQuery",
+            r#"{"$or":[{"processDefinitionId":{"$like""#,
+        ),
+    ] {
+        let probes = ts_filter_probes(query);
+        assert!(
+            probes.iter().any(|b| b.contains(needle)),
+            "{query}: {needle}"
+        );
+    }
 }
