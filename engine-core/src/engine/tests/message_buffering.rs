@@ -200,11 +200,15 @@ fn suspended_instance_keeps_the_message_buffered() {
     assert!(buffered.correlated_instances.is_empty());
 }
 
-/// The cross-partition path: the canonical subscription is opened on the
-/// message partition by a routed `OpenMessageSubscription`; a buffered message
-/// there is settled as a `RemoteMessageCorrelation` for the host to route.
+/// The cross-partition path is LOCAL-ONLY for buffered messages (#1874): a
+/// subscription opened on the message partition by a routed
+/// `OpenMessageSubscription` for an instance on ANOTHER partition takes no
+/// buffered message — no `BufferedMessageCorrelated`, no
+/// `RemoteMessageCorrelation` — and the message stays buffered, untouched,
+/// until its TTL expires. Remote delivery is tracked in
+/// https://github.com/nanobpm/nano-bpm/issues/1949.
 #[test]
-fn routed_open_correlates_a_buffered_message_remotely() {
+fn routed_open_leaves_buffered_messages_untouched_until_ttl() {
     const N: u64 = 2;
     let order = ('a'..='z')
         .map(|c| c.to_string())
@@ -253,41 +257,38 @@ fn routed_open_correlates_a_buffered_message_remotely() {
         })
         .expect("a cross-partition Opening");
     let opened = message_engine.apply_command_at(open, 3_000).unwrap();
-    let continuation = opened
-        .iter()
-        .find_map(|e| match e {
-            Event::RemoteMessageCorrelation {
-                subscription_key,
-                message_key,
-                instance_key,
-                element_instance_key,
-                element_id,
-                kind,
-                variables,
-                delivery_key,
-            } => Some(Command::CorrelateMessageSubscription {
-                subscription_key: *subscription_key,
-                message_key: *message_key,
-                instance_key: *instance_key,
-                element_instance_key: *element_instance_key,
-                element_id: element_id.clone(),
-                kind: kind.clone(),
-                variables: variables.clone(),
-                delivery_key: *delivery_key,
-            }),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("the buffered message settles remotely: {opened:?}"));
-    assert!(opened
-        .iter()
-        .any(|e| matches!(e, Event::BufferedMessageCorrelated { .. })));
-    instance_engine
-        .apply_command_at(continuation, 3_001)
+    assert!(
+        !opened.iter().any(|e| matches!(
+            e,
+            Event::RemoteMessageCorrelation { .. } | Event::BufferedMessageCorrelated { .. }
+        )),
+        "a remote subscription must not take a buffered message: {opened:?}"
+    );
+    let buffered = message_engine
+        .state()
+        .buffered_messages
+        .values()
+        .next()
         .unwrap();
+    assert!(buffered.correlated_instances.is_empty());
     assert_eq!(
         instance_engine.instance(instance_key).unwrap().state,
-        ProcessInstanceState::Completed
+        ProcessInstanceState::Active
     );
+
+    // Still buffered just before the deadline (published at 1_000, TTL 10_000)...
+    message_engine
+        .apply_command_at(Command::TriggerTimers { now: 10_999 }, 10_999)
+        .unwrap();
+    assert_eq!(message_engine.state().buffered_messages.len(), 1);
+    // ...and expired by the TTL checker at the deadline.
+    let ticked = message_engine
+        .apply_command_at(Command::TriggerTimers { now: 11_000 }, 11_000)
+        .unwrap();
+    assert!(ticked
+        .iter()
+        .any(|e| matches!(e, Event::MessageExpired { .. })));
+    assert!(message_engine.state().buffered_messages.is_empty());
 }
 
 /// Only the correlation-key partition buffers: the partition-0 copy of a
@@ -684,10 +685,12 @@ fn non_interrupting_subscription_drains_the_whole_backlog_locally() {
     assert!(engine.buffer_candidates.is_empty());
 }
 
-/// The routed twin: the message partition settles every backlog message to a
-/// still-open non-interrupting subscription.
+/// The routed twin: a still-open non-interrupting subscription whose instance
+/// is on another partition takes NONE of the backlog (local-only buffered
+/// correlation, #1874; remote delivery is
+/// https://github.com/nanobpm/nano-bpm/issues/1949) — never a partial drain.
 #[test]
-fn non_interrupting_subscription_drains_the_whole_backlog_routed() {
+fn non_interrupting_remote_subscription_takes_none_of_the_backlog() {
     const N: u64 = 2;
     let order = ('a'..='z')
         .map(|c| c.to_string())
@@ -741,8 +744,13 @@ fn non_interrupting_subscription_drains_the_whole_backlog_routed() {
         .iter()
         .filter(|e| matches!(e, Event::RemoteMessageCorrelation { .. }))
         .count();
-    assert_eq!(buffered_correlations(&opened).len(), 2, "{opened:?}");
-    assert_eq!(remote, 2, "{opened:?}");
+    assert!(buffered_correlations(&opened).is_empty(), "{opened:?}");
+    assert_eq!(remote, 0, "{opened:?}");
+    assert!(message_engine
+        .state()
+        .buffered_messages
+        .values()
+        .all(|m| m.correlated_instances.is_empty()));
 }
 
 /// A parent that forks into a call activity and a top-level terminate end must

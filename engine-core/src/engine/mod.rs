@@ -7374,10 +7374,12 @@ impl Engine {
     /// `correlateNextMessage`: each newly opened, still-open subscription takes
     /// the oldest (first-buffered, by [`state::BufferedMessage::seq`]) live
     /// buffered message with its name and correlation key that has not already
-    /// correlated to its instance. A local instance advances inline; a remote
-    /// one is settled here and handed to the host as a
-    /// [`Event::RemoteMessageCorrelation`]. A suspended or no-longer-active
-    /// local instance takes nothing (the message stays buffered).
+    /// correlated to its instance. Only a LOCAL instance (on this partition)
+    /// takes a buffered message, advancing inline; a subscription whose
+    /// instance lives on another partition takes nothing and the message stays
+    /// buffered until TTL expiry (remote delivery is tracked in
+    /// https://github.com/nanobpm/nano-bpm/issues/1949). A suspended or
+    /// no-longer-active instance takes nothing either.
     ///
     /// At most ONE local correlation per call: its queued follow-ups (an
     /// event-based gateway withdrawing its losing alternatives, an interrupting
@@ -7491,7 +7493,7 @@ impl Engine {
     /// [`Self::correlate_buffered_messages`]). Returns `true` when a LOCAL
     /// correlation advanced a token (the caller must drain before going on);
     /// a still-open local subscription is requeued for the next message. A
-    /// remote subscription is settled here, repeatedly while it stays open.
+    /// remote subscription never takes a buffered message (#1949).
     fn correlate_one_buffered(
         &mut self,
         log: &mut Vec<Event>,
@@ -7499,94 +7501,84 @@ impl Engine {
         subscription_key: Key,
     ) -> bool {
         let now = self.now;
-        loop {
-            let Some(subscription) = self
-                .state
-                .message_subscriptions
-                .get(&subscription_key)
-                .filter(|s| s.state == state::MessageSubscriptionState::Open)
-            else {
-                // A settled subscription never takes another message: evict
-                // its candidate queue so consecutive one-shot catches do not
-                // retain quadratic scratch (#1874).
-                self.buffer_candidates.remove(&subscription_key);
-                return false;
-            };
-            let instance_key = subscription.instance_key;
-            let element_instance_key = subscription.element_instance_key;
-            let element_id = subscription.element_id.clone();
-            let kind = subscription.kind.clone();
-            // A buffered message must never reach a child whose ancestor has
-            // already ended (e.g. a top-level terminate end raced a call
-            // activity): the pending cascade will terminate it, and a
-            // correlation first could complete it instead (#1874).
-            if self.has_ended_ancestor(instance_key) {
-                return false;
-            }
-            let Some(message) = self.next_buffered_candidate(subscription_key, now) else {
-                return false;
-            };
-            let message_key = message.key;
-            let variables = message.variables.clone();
-            let local = state::partition_of(instance_key) == self.partition_id;
-            if local
-                && (self.instance_is_suspended(instance_key)
-                    || self
-                        .state
-                        .instances
-                        .get(&instance_key)
-                        .is_none_or(|i| i.state != ProcessInstanceState::Active))
-            {
-                return false;
-            }
-            self.emit(
-                log,
-                Event::BufferedMessageCorrelated {
-                    message_key,
-                    partition: self.partition_id,
-                    subscription_key,
-                    instance_key,
-                },
-            );
-            if local {
-                self.advance_correlated_token(
-                    log,
-                    queue,
-                    subscription_key,
-                    message_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    kind,
-                    &variables,
-                );
-                if self
-                    .state
-                    .message_subscriptions
-                    .get(&subscription_key)
-                    .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
-                {
-                    self.buffer_requeue.push_back(subscription_key);
-                } else {
-                    self.buffer_candidates.remove(&subscription_key);
-                }
-                return true;
-            }
-            let delivery_key = self.mint_key();
-            self.emit(
-                log,
-                Event::RemoteMessageCorrelation {
-                    subscription_key,
-                    message_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    kind,
-                    variables,
-                    delivery_key,
-                },
-            );
+        let Some(subscription) = self
+            .state
+            .message_subscriptions
+            .get(&subscription_key)
+            .filter(|s| s.state == state::MessageSubscriptionState::Open)
+        else {
+            // A settled subscription never takes another message: evict
+            // its candidate queue so consecutive one-shot catches do not
+            // retain quadratic scratch (#1874).
+            self.buffer_candidates.remove(&subscription_key);
+            return false;
+        };
+        let instance_key = subscription.instance_key;
+        let element_instance_key = subscription.element_instance_key;
+        let element_id = subscription.element_id.clone();
+        let kind = subscription.kind.clone();
+        // LOCAL-ONLY buffered correlation (#1874): a subscription whose
+        // instance lives on ANOTHER partition never takes a buffered
+        // message — no partial or one-shot remote drain. The message stays
+        // buffered until a local subscription takes it or its TTL expires.
+        // Ack-paced remote delivery is tracked in
+        // https://github.com/nanobpm/nano-bpm/issues/1949.
+        if state::partition_of(instance_key) != self.partition_id {
+            self.buffer_candidates.remove(&subscription_key);
+            return false;
         }
+        // A buffered message must never reach a child whose ancestor has
+        // already ended (e.g. a top-level terminate end raced a call
+        // activity): the pending cascade will terminate it, and a
+        // correlation first could complete it instead (#1874).
+        if self.has_ended_ancestor(instance_key) {
+            return false;
+        }
+        let Some(message) = self.next_buffered_candidate(subscription_key, now) else {
+            return false;
+        };
+        let message_key = message.key;
+        let variables = message.variables.clone();
+        if self.instance_is_suspended(instance_key)
+            || self
+                .state
+                .instances
+                .get(&instance_key)
+                .is_none_or(|i| i.state != ProcessInstanceState::Active)
+        {
+            return false;
+        }
+        self.emit(
+            log,
+            Event::BufferedMessageCorrelated {
+                message_key,
+                partition: self.partition_id,
+                subscription_key,
+                instance_key,
+            },
+        );
+        self.advance_correlated_token(
+            log,
+            queue,
+            subscription_key,
+            message_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind,
+            &variables,
+        );
+        if self
+            .state
+            .message_subscriptions
+            .get(&subscription_key)
+            .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
+        {
+            self.buffer_requeue.push_back(subscription_key);
+        } else {
+            self.buffer_candidates.remove(&subscription_key);
+        }
+        true
     }
 
     /// Records a correlation against a subscription whose **instance lives on this

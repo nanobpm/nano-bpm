@@ -1404,9 +1404,10 @@ pub enum Event {
     /// published (#1874, Zeebe `MessageSubscriptionCreateProcessor` →
     /// `correlateNextMessage`). Records `instance_key` against the message so
     /// it never correlates to that instance again; the
-    /// [`Event::MessageCorrelated`] (local instance) or
-    /// [`Event::RemoteMessageCorrelation`] (instance on another partition) that
-    /// follows carries the actual correlation.
+    /// [`Event::MessageCorrelated`] that follows carries the actual
+    /// correlation. Buffered correlation is LOCAL-ONLY: an instance on another
+    /// partition never takes a buffered message (remote delivery is tracked in
+    /// https://github.com/nanobpm/nano-bpm/issues/1949).
     BufferedMessageCorrelated {
         message_key: Key,
         partition: u64,
