@@ -655,6 +655,48 @@ impl TestEngine {
         correlation_key: &str,
         variables_json: &str,
     ) -> Result<String, JsValue> {
+        self.publish(message_name, correlation_key, variables_json, None, None)
+    }
+
+    /// Publish a message with a Zeebe `timeToLive` (ms) and optional
+    /// `messageId` (#1874, #1969): it correlates to any instance waiting on it
+    /// now, and with a positive TTL is additionally BUFFERED until the virtual
+    /// clock passes `now + ttl_ms`, so a subscription opened later still
+    /// correlates it. A `ttl_ms` of `0` never buffers. A `message_id` still
+    /// buffered for the same name and correlation key is rejected (an error,
+    /// as Zeebe's `ALREADY_EXISTS`). Returns the snapshot.
+    #[wasm_bindgen(js_name = publishMessage)]
+    pub fn publish_message(
+        &mut self,
+        message_name: &str,
+        correlation_key: &str,
+        variables_json: &str,
+        ttl_ms: f64,
+        message_id: Option<String>,
+    ) -> Result<String, JsValue> {
+        let ttl = if ttl_ms.is_finite() && ttl_ms > 0.0 {
+            ttl_ms as u64
+        } else {
+            0
+        };
+        self.publish(
+            message_name,
+            correlation_key,
+            variables_json,
+            Some(ttl),
+            message_id,
+        )
+    }
+
+    /// The single publish path behind `correlateMessage` / `publishMessage`.
+    fn publish(
+        &mut self,
+        message_name: &str,
+        correlation_key: &str,
+        variables_json: &str,
+        time_to_live: Option<u64>,
+        message_id: Option<String>,
+    ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let variables = parse_vars(variables_json)?;
         self.apply(Command::CorrelateMessage {
@@ -663,8 +705,8 @@ impl TestEngine {
             variables,
             business_id: None,
             message_key: None,
-            time_to_live: None,
-            message_id: None,
+            time_to_live,
+            message_id,
         })
         .map_err(|e| js_err(&format!("correlate error: {e}")))?;
         to_json(&self.snapshot_value(None))

@@ -148,15 +148,28 @@ fn run_scenario(path: &Path) -> (Key, Vec<Event>) {
                 variables: v,
                 local: false,
             }),
-            "correlateMessage" | "publishMessage" => run.apply(Command::CorrelateMessage {
-                message_name: s("name"),
-                correlation_key: s("correlationKey"),
-                variables: v,
-                business_id: None,
-                message_key: None,
-                time_to_live: None,
-                message_id: None,
-            }),
+            "correlateMessage" | "publishMessage" => {
+                // `timeToLive` / `messageId` (#1969): the same mapping as the
+                // wasm `TestEngine.publishMessage` the nano backend calls.
+                let cmd = Command::CorrelateMessage {
+                    message_name: s("name"),
+                    correlation_key: s("correlationKey"),
+                    variables: v,
+                    business_id: None,
+                    message_key: None,
+                    time_to_live: step.get("timeToLive").and_then(Json::as_u64),
+                    message_id: step
+                        .get("messageId")
+                        .and_then(Json::as_str)
+                        .map(str::to_string),
+                };
+                if step.get("expectRejected").and_then(Json::as_bool) == Some(true) {
+                    let res = run.engine.apply_command_at(cmd, run.now);
+                    assert!(res.is_err(), "the publish was expected to be rejected");
+                } else {
+                    run.apply(cmd);
+                }
+            }
             "broadcastSignal" => run.apply(Command::BroadcastSignal {
                 signal_name: s("name"),
                 variables: v,

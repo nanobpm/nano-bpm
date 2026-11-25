@@ -158,8 +158,34 @@ export class NanoBackend {
   // step runs and an immediate correlation is the same thing — the barrier the
   // Camunda adapter needs (`settled`) is free here: the correlation itself has
   // already settled the follow-on work by the time it returns.
-  async publishMessage(handle, name, correlationKey, variables) {
-    return this.correlateMessage(handle, name, correlationKey, variables);
+  //
+  // An explicit `timeToLive` / `messageId` (#1969) is a real Zeebe-buffered
+  // publication instead: the message is buffered until the virtual clock passes
+  // its TTL, a later subscription correlates it, and a `messageId` still
+  // buffered rejects the publish. `expectRejected` asserts that rejection
+  // (Zeebe's ALREADY_EXISTS); a rejection that was not expected throws.
+  async publishMessage(handle, name, correlationKey, variables, _settled, publication = {}) {
+    const { timeToLive, messageId, expectRejected } = publication;
+    if (timeToLive == null && messageId == null) {
+      if (expectRejected) throw new Error("expectRejected needs a messageId or timeToLive publication");
+      return this.correlateMessage(handle, name, correlationKey, variables);
+    }
+    let rejected = null;
+    try {
+      this.engine.publishMessage(
+        name,
+        correlationKey,
+        JSON.stringify(variables ?? {}),
+        timeToLive ?? 0,
+        messageId ?? undefined,
+      );
+    } catch (err) {
+      rejected = err;
+    }
+    if (expectRejected && !rejected) {
+      throw new Error(`publish of '${name}' (messageId ${messageId}) was expected to be rejected`);
+    }
+    if (!expectRejected && rejected) throw rejected;
   }
 
   async broadcastSignal(_handle, name, variables) {
