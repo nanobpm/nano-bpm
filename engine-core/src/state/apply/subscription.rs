@@ -72,6 +72,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     correlated_message_keys: Default::default(),
                     awaiting_ack: None,
                     rescan_from: None,
+                    resume_pending: false,
                 },
             );
         }
@@ -103,6 +104,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     correlated_message_keys: Default::default(),
                     awaiting_ack: None,
                     rescan_from: None,
+                    resume_pending: false,
                 },
             );
         }
@@ -365,8 +367,14 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             consumed,
             deferred,
             delivery_key,
+            subscription_key,
             ..
         } => {
+            if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
+                if s.state == MessageSubscriptionState::Opening {
+                    s.resume_pending = *deferred;
+                }
+            }
             if *delivery_key != 0 {
                 state.routed_deliveries.set_receipt(
                     *delivery_key,

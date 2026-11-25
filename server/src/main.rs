@@ -12174,7 +12174,8 @@ impl ServerImpl {
 
     /// The ack-paced buffered deliveries (#1949) still awaiting their ack on
     /// every partition this node writes (leads under Raft, owns otherwise),
-    /// rebuilt from durable engine state.
+    /// plus the resume handshakes still owed after a deferral, rebuilt from
+    /// durable engine state.
     async fn in_flight_buffered_deliveries(&self) -> Vec<Event> {
         let topology = self.engine.topology();
         let mut in_flight = Vec::new();
@@ -12186,7 +12187,12 @@ impl ServerImpl {
                 continue;
             };
             if let Some(events) = handle
-                .try_with(|journal| journal.engine().pending_buffered_deliveries())
+                .try_with(|journal| {
+                    let engine = journal.engine();
+                    let mut events = engine.pending_buffered_deliveries();
+                    events.extend(engine.pending_resume_handshakes());
+                    events
+                })
                 .await
             {
                 in_flight.extend(events);
@@ -12357,12 +12363,14 @@ impl ServerImpl {
                 consumed,
                 deferred,
                 target_partition,
+                delivery_key,
                 ..
             } => Some((
                 *target_partition,
                 Command::AcknowledgeMessageCorrelation {
                     subscription_key: *subscription_key,
                     message_key: *message_key,
+                    delivery_key: *delivery_key,
                     accepted: *accepted,
                     consumed: *consumed,
                     deferred: *deferred,
@@ -12473,7 +12481,8 @@ impl ServerImpl {
     /// [`Command::routed_delivery_key`].
     fn routed_command_is_idempotent(command: &Command) -> bool {
         // An ack (#1874) is idempotent by content: the message partition
-        // applies it only while that subscription awaits that exact message.
+        // applies it only while that subscription awaits that exact delivery
+        // (message AND delivery key, #1949).
         // A resume handshake (#1949) only re-offers an open, non-awaiting
         // subscription its backlog, so a repeat is harmless too.
         command.routed_delivery_key().is_some()

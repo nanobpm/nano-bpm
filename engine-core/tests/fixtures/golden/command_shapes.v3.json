@@ -3,6 +3,7 @@
   "AcknowledgeMessageCorrelation.accepted",
   "AcknowledgeMessageCorrelation.consumed",
   "AcknowledgeMessageCorrelation.deferred",
+  "AcknowledgeMessageCorrelation.delivery_key",
   "AcknowledgeMessageCorrelation.message_key",
   "AcknowledgeMessageCorrelation.subscription_key",
   "ActivateAdHocActivities",

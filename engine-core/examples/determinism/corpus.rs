@@ -1239,6 +1239,7 @@ fn routed_protocol_entries() -> Vec<Command> {
     let ack = Command::AcknowledgeMessageCorrelation {
         subscription_key,
         message_key,
+        delivery_key: 0,
         accepted: true,
         consumed: true,
         deferred: false,

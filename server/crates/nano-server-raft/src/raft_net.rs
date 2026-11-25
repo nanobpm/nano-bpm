@@ -654,6 +654,7 @@ mod codec_tests {
             Command::AcknowledgeMessageCorrelation {
                 subscription_key: 1,
                 message_key: 2,
+                delivery_key: 5,
                 accepted: true,
                 consumed: true,
                 deferred: false,

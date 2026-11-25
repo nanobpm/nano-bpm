@@ -527,7 +527,10 @@ pub(crate) struct StalledDeliveries {
 impl StalledDeliveries {
     /// Of the deliveries in flight now, the ones also in flight on the
     /// previous pass (by `(subscription_key, delivery_key)`); remembers `now`
-    /// for the next pass. Any other event is ignored.
+    /// for the next pass. A pending resume handshake (#1949,
+    /// `Engine::pending_resume_handshakes`) is paced the same way, keyed by
+    /// `(subscription_key, 0)` (a real delivery key is never `0`). Any other
+    /// event is ignored.
     pub(crate) fn due(&self, now: Vec<Event>) -> Vec<Event> {
         let identity = |event: &Event| match event {
             Event::RemoteMessageCorrelation {
@@ -536,6 +539,9 @@ impl StalledDeliveries {
                 ack_partition: Some(_),
                 ..
             } => Some((*subscription_key, *delivery_key)),
+            Event::MessageSubscriptionResuming {
+                subscription_key, ..
+            } => Some((*subscription_key, 0)),
             _ => None,
         };
         let mut previous = self.previous.lock().unwrap_or_else(|e| e.into_inner());
@@ -574,6 +580,21 @@ impl Drop for PendingOpens {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1949: a pending resume handshake is re-driven like a stalled
+    /// delivery — only once it was already pending on the previous pass.
+    #[test]
+    fn stalled_resume_handshake_is_due_on_the_second_pass() {
+        let resuming = Event::MessageSubscriptionResuming {
+            subscription_key: 7,
+            instance_key: 8,
+            correlation_key: "k".into(),
+        };
+        let stalled = StalledDeliveries::default();
+        assert!(stalled.due(vec![resuming.clone()]).is_empty());
+        assert_eq!(stalled.due(vec![resuming.clone()]), vec![resuming]);
+        assert!(stalled.due(Vec::new()).is_empty());
+    }
 
     fn opening(name: &str, key: &str) -> Event {
         Event::MessageSubscriptionOpening {

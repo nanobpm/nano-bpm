@@ -595,10 +595,17 @@ pub enum Command {
     /// the subscription closes and the remaining messages stay buffered. Not
     /// `consumed`: the message's reservation is released.
     /// **Idempotent** — ignored unless the subscription is awaiting exactly
-    /// this `message_key`, so a duplicate ack is a no-op.
+    /// this delivery (`message_key` AND `delivery_key`), so a duplicate or a
+    /// stale ack of an earlier delivery of the same message is a no-op.
     AcknowledgeMessageCorrelation {
         subscription_key: Key,
         message_key: Key,
+        /// The acknowledged delivery's key (#1949): the same message may be
+        /// re-reserved for this subscription after a deferral, so the message
+        /// key alone cannot tell a delayed ack of the old delivery from the
+        /// ack of the current one.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
         accepted: bool,
         /// Whether the instance's token took the message.
         consumed: bool,
@@ -1306,12 +1313,14 @@ impl Command {
             Command::AcknowledgeMessageCorrelation {
                 subscription_key,
                 message_key,
+                delivery_key,
                 accepted,
                 consumed,
                 deferred,
             } => {
                 h.key(*subscription_key);
                 h.key(*message_key);
+                h.key(*delivery_key);
                 h.str(if *accepted { "1" } else { "0" });
                 h.str(if *consumed { "1" } else { "0" });
                 h.str(if *deferred { "1" } else { "0" });

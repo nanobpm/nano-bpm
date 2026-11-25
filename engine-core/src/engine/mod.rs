@@ -354,8 +354,11 @@ pub struct Engine {
     /// behaviour while any member of the group cannot apply ack-paced
     /// delivery (rolling upgrade). Not snapshotted: re-set before each apply.
     remote_buffered_delivery: bool,
-    /// Set once `set_remote_buffered_delivery(true)` has been observed (#1949).
-    remote_buffered_delivery_latched: bool,
+    /// Set when this apply's envelope turned remote buffered delivery ON for
+    /// the first time (#1949): the next command seeds a backlog scan of every
+    /// open remote subscription that opened while the gate was closed.
+    /// Per-command scratch, consumed by `plan_command_at`.
+    remote_backlog_scan_pending: bool,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -810,7 +813,7 @@ impl Engine {
             buffer_requeue: VecDeque::new(),
             pending_correlation_ack: None,
             remote_buffered_delivery: true,
-            remote_buffered_delivery_latched: false,
+            remote_backlog_scan_pending: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
@@ -861,11 +864,26 @@ impl Engine {
     /// Turning delivery back off mid-flight would strand deferred deliveries
     /// (the resume handshake would be skipped) and stop remote buffered
     /// delivery cluster-wide during an ordinary tolerated outage.
+    ///
+    /// The latch lives in snapshotted state, so a replica restored from a
+    /// snapshot taken after the enabling envelope agrees with one that applied
+    /// it live. On the first disabled-to-enabled transition every open remote
+    /// subscription is offered its backlog on the next apply, so one that
+    /// opened while the gate was closed does not wait for a new publication.
     pub fn set_remote_buffered_delivery(&mut self, enabled: bool) {
-        self.remote_buffered_delivery = self.remote_buffered_delivery_latched
-            || enabled
-            || self.message_correlation_ack_ever_used();
-        self.remote_buffered_delivery_latched |= enabled;
+        let was = self.remote_buffered_delivery_active();
+        if enabled {
+            self.state.remote_buffered_delivery_latched = true;
+        }
+        self.remote_buffered_delivery = self.remote_buffered_delivery_active();
+        if self.remote_buffered_delivery && !was {
+            self.remote_backlog_scan_pending = true;
+        }
+    }
+
+    /// The durable gate decision: latched on, or ack-paced delivery used.
+    fn remote_buffered_delivery_active(&self) -> bool {
+        self.state.remote_buffered_delivery_latched || self.message_correlation_ack_ever_used()
     }
 
     /// Whether this partition has EVER sent an ack-paced remote buffered
@@ -1032,7 +1050,7 @@ impl Engine {
             buffer_requeue: VecDeque::new(),
             pending_correlation_ack: None,
             remote_buffered_delivery: true,
-            remote_buffered_delivery_latched: false,
+            remote_backlog_scan_pending: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,
@@ -2682,6 +2700,7 @@ impl Engine {
                     self.run(&mut log, queue);
                     self.cascade_cancel_children(&mut log, 0);
                     self.emit_pending_correlation_ack(&mut log);
+                    self.remote_backlog_scan_pending = false;
                     // Every engine test exercises the parent -> children index the
                     // cascade reads (#1827): a write path that bypassed it fails here.
                     #[cfg(test)]
@@ -2765,6 +2784,24 @@ impl Engine {
         self.pending_correlation_ack = None;
         self.buffer_candidates.clear();
         self.sweep_from = 0;
+        // The gate just opened (#1949): offer every open REMOTE subscription
+        // that opened while it was closed its backlog on this command's
+        // quiescent pass (the flag is cleared once the command applies).
+        if self.remote_backlog_scan_pending {
+            let partition_id = self.partition_id;
+            let remote_open: Vec<Key> = self
+                .state
+                .message_subscriptions
+                .values()
+                .filter(|s| {
+                    s.state == state::MessageSubscriptionState::Open
+                        && s.awaiting_ack.is_none()
+                        && state::partition_of(s.instance_key) != partition_id
+                })
+                .map(|s| s.key)
+                .collect();
+            self.buffer_requeue.extend(remote_open);
+        }
         // Per-command terminal-deadline stamp (#1494): set from THIS command
         // only, merged with any envelope stamps armed by
         // `apply_command_events` (#1570). The job's own `JobAttribution`
@@ -5472,17 +5509,24 @@ impl Engine {
             Command::AcknowledgeMessageCorrelation {
                 subscription_key,
                 message_key,
+                delivery_key,
                 accepted,
                 consumed,
                 deferred,
             } => {
                 // Idempotent: only the exact delivery this subscription awaits
-                // is acknowledged; a duplicate or stale ack is a no-op.
+                // (message AND delivery key) is acknowledged; a duplicate or a
+                // delayed ack of an earlier delivery of the same message is a
+                // no-op (#1949).
                 let Some(subscription) = self
                     .state
                     .message_subscriptions
                     .get(&subscription_key)
-                    .filter(|s| s.awaiting_ack.is_some_and(|a| a.message_key == message_key))
+                    .filter(|s| {
+                        s.awaiting_ack.is_some_and(|a| {
+                            a.message_key == message_key && a.delivery_key == delivery_key
+                        })
+                    })
                 else {
                     return Ok((log, queue));
                 };
@@ -5540,7 +5584,7 @@ impl Engine {
                             }
                         }
                     }
-                } else {
+                } else if !deferred {
                     // The reservation was released: the message is available
                     // again, so every OTHER open subscription of this instance
                     // on the same (name, correlation key) — which skipped it
@@ -5560,6 +5604,10 @@ impl Engine {
                         .collect();
                     self.buffer_requeue.extend(others);
                 }
+                // A deferral releases the message too, but the WHOLE instance
+                // is suspended: a sibling would bounce off it just the same,
+                // ping-ponging deliveries without progress (#1949). The resume
+                // handshake re-offers every subscription of the instance.
                 // Still open (accepted, scope alive): offer it the next
                 // buffered message on this command's quiescent pass. A
                 // deferred (suspended) subscription is not re-offered: it
@@ -7789,6 +7837,42 @@ impl Engine {
                     delivery_key: ack.delivery_key,
                     ack_partition: Some(self.partition_id),
                 })
+            })
+            .collect()
+    }
+
+    /// The resume handshakes this (instance) partition still owes a message
+    /// partition (#1949): every cross-partition `Opening` subscription whose
+    /// last buffered delivery was answered DEFERRED (`resume_pending`) and
+    /// whose instance is no longer suspended. Rebuilt from durable state as
+    /// the exact [`Event::MessageSubscriptionResuming`] the resume emits, so
+    /// the host can re-drive a handshake lost to exhausted routing retries or
+    /// a stop between `ResumeInstance` committing and its routing. Re-driving
+    /// is idempotent on the message partition. The flag clears once a later
+    /// delivery to the subscription is answered without deferral. Empty while
+    /// remote buffered delivery is off. Ordered by subscription key.
+    pub fn pending_resume_handshakes(&self) -> Vec<Event> {
+        if !self.remote_buffered_delivery {
+            return Vec::new();
+        }
+        self.state
+            .message_subscriptions
+            .values()
+            .filter(|s| {
+                s.resume_pending
+                    && s.state == state::MessageSubscriptionState::Opening
+                    && state::subscription_partition(&s.correlation_key, self.num_partitions)
+                        != self.partition_id
+                    && self
+                        .state
+                        .instances
+                        .get(&s.instance_key)
+                        .is_some_and(|i| i.state == ProcessInstanceState::Active)
+            })
+            .map(|s| Event::MessageSubscriptionResuming {
+                subscription_key: s.key,
+                instance_key: s.instance_key,
+                correlation_key: s.correlation_key.clone(),
             })
             .collect()
     }

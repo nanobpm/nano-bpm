@@ -2077,6 +2077,20 @@ pub struct MessageSubscription {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub rescan_from: Option<(u64, Key)>,
+    /// Instance-partition `Opening` record only (#1949): the last answer this
+    /// partition gave a buffered delivery to it was a DEFERRAL (the instance
+    /// was suspended), so the message partition holds a backlog this
+    /// subscription has not seen. Set/cleared by applying
+    /// [`crate::Event::MessageCorrelationAcknowledging`] (deferred / not).
+    /// While set and the instance is active, the host re-drives the resume
+    /// handshake from [`crate::Engine::pending_resume_handshakes`], so a
+    /// handshake lost after `ResumeInstance` committed is recovered.
+    /// Additive, omitted when `false`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub resume_pending: bool,
 }
 
 /// An in-flight buffered delivery awaiting its acknowledgement (#1949): see
@@ -2633,6 +2647,16 @@ pub struct State {
         serde(default, skip_serializing_if = "std::ops::Not::not")
     )]
     pub message_correlation_ack_used: bool,
+    /// Whether a replicated envelope has EVER enabled remote buffered
+    /// delivery on this partition (#1949). One-way and snapshotted, so a
+    /// replica restored from a snapshot keeps the same sticky decision as one
+    /// that applied the enabling envelope live. Set by
+    /// [`crate::Engine::set_remote_buffered_delivery`]. Additive.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub remote_buffered_delivery_latched: bool,
     /// Open and settled **signal** subscriptions, keyed by subscription key. A
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) as an audit trail.

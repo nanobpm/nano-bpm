@@ -845,12 +845,14 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
             accepted,
             consumed,
             deferred,
+            delivery_key,
             ..
         } => (
             true,
             Command::AcknowledgeMessageCorrelation {
                 subscription_key,
                 message_key,
+                delivery_key,
                 accepted,
                 consumed,
                 deferred,
@@ -1154,6 +1156,7 @@ fn ack_paced_drain_replays_deterministically() {
             Command::AcknowledgeMessageCorrelation {
                 subscription_key: sub,
                 message_key: 1,
+                delivery_key: 0,
                 accepted: true,
                 consumed: true,
                 deferred: false,
@@ -2157,4 +2160,156 @@ fn a_release_during_a_sibling_ack_is_not_skipped_by_its_cursor() {
     let mut taken = correlated(&rig, instance_key);
     taken.sort_unstable();
     assert_eq!(taken, published, "each message exactly once");
+}
+
+/// #1949 (Copilot r4698796509): the one-way delivery latch is snapshotted
+/// state, so a replica restored from a snapshot taken after the enabling
+/// envelope applies a later DISABLED envelope exactly like the replica that
+/// applied the enabling one live.
+#[cfg(feature = "serde")]
+#[test]
+fn remote_buffered_delivery_latch_survives_snapshot_restore() {
+    let mut live = Engine::with_partition(1);
+    live.set_num_partitions(Rig::N);
+    live.set_remote_buffered_delivery(true);
+    assert!(!live.message_correlation_ack_ever_used());
+    let json = serde_json::to_string(&live.snapshot()).unwrap();
+    let mut restored = Engine::from_snapshot(serde_json::from_str(&json).unwrap());
+    restored.set_num_partitions(Rig::N);
+    live.set_remote_buffered_delivery(false);
+    restored.set_remote_buffered_delivery(false);
+    assert!(live.remote_buffered_delivery);
+    assert_eq!(
+        restored.remote_buffered_delivery,
+        live.remote_buffered_delivery
+    );
+}
+
+/// #1949 (Copilot r4698796595): a delayed duplicate ack of an earlier
+/// (deferred) delivery of the SAME message must not settle the current,
+/// re-reserved delivery of it — acks match on the delivery key too.
+#[test]
+fn a_stale_ack_of_an_earlier_delivery_of_the_same_message_is_ignored() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 1);
+    let (instance_key, held_acks) = create_suspended(&mut rig, &order, &is_ack);
+    assert_eq!(held_acks.len(), 1);
+    let (_, stale_ack) = held_acks[0].clone();
+    // The deferral's ack lands; a duplicate copy of it is still in transit.
+    rig.run(true, stale_ack.clone(), 2_500);
+    // Resume re-reserves the same message as a NEW delivery, held in flight.
+    let held = rig.run_holding(
+        false,
+        Command::ResumeInstance { instance_key },
+        3_000,
+        &is_delivery,
+    );
+    assert_eq!(held.len(), 1, "{:?}", rig.trace);
+    let current = rig
+        .message
+        .state()
+        .message_subscriptions
+        .values()
+        .find_map(|s| s.awaiting_ack)
+        .expect("the resumed delivery is in flight");
+    assert_eq!(current.message_key, published[0]);
+    // The delayed duplicate of the OLD delivery's ack arrives: a no-op.
+    assert!(rig.on_message(stale_ack, 3_100).is_empty());
+    assert_eq!(
+        rig.message
+            .state()
+            .message_subscriptions
+            .values()
+            .find_map(|s| s.awaiting_ack),
+        Some(current),
+        "the current reservation is still awaited"
+    );
+    for (to_message, command) in held {
+        rig.run(to_message, command, 3_200);
+    }
+    assert_eq!(correlated(&rig, instance_key), published);
+    assert!(redrive(&rig).is_empty());
+}
+
+/// #1949 (Copilot r4698796640): two persistent subscriptions of one
+/// SUSPENDED instance and one buffered message: a deferral must not requeue
+/// the sibling (it would bounce off the same suspension, ping-ponging
+/// deliveries without progress). After resume the message is taken once.
+#[test]
+fn a_deferral_does_not_requeue_a_sibling_of_a_suspended_instance() {
+    let (mut rig, order) = Rig::new(two_non_interrupting_esps());
+    let published = rig.publish_backlog(&order, 1);
+    // Both subscriptions are open; A's delivery is in flight (B skipped the
+    // reserved message) when the instance is suspended.
+    let (instance_key, held) = rig.create_holding("two", &order, 2_000, &is_delivery);
+    assert_eq!(held.len(), 1);
+    rig.run(false, Command::SuspendInstance { instance_key }, 2_001);
+    let before = rig.trace.len();
+    for (to_message, command) in held {
+        rig.run(to_message, command, 2_002);
+    }
+    let deliveries = rig.trace[before..]
+        .iter()
+        .filter(|e| matches!(e, Event::RemoteMessageCorrelation { .. }))
+        .count();
+    assert_eq!(deliveries, 0, "no sibling ping-pong: {:?}", rig.trace);
+    rig.run(false, Command::ResumeInstance { instance_key }, 3_000);
+    assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
+}
+
+/// #1949 (Copilot r4698796783): a remote subscription that opened while the
+/// capability gate was CLOSED gets its buffered backlog as soon as the gate
+/// opens — on the next applied command — without reopening it or publishing
+/// another message.
+#[test]
+fn opening_the_gate_drains_subscriptions_opened_while_it_was_closed() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    rig.instance.set_remote_buffered_delivery(false);
+    rig.message.set_remote_buffered_delivery(false);
+    let published = rig.publish_backlog(&order, 2);
+    let instance_key = rig.create("ni", &order, 2_000);
+    assert!(rig.delivered_to(instance_key).is_empty(), "gated off");
+    rig.instance.set_remote_buffered_delivery(true);
+    rig.message.set_remote_buffered_delivery(true);
+    rig.run(true, Command::TriggerTimers { now: 2_500 }, 2_500);
+    assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
+}
+
+/// #1949 (Copilot r4698796872): the resume handshake is lost (routing
+/// exhausted, or the node stopped after `ResumeInstance` committed). The
+/// instance partition still owes it — rebuilt from durable state across a
+/// restart — and the re-driven handshake delivers the deferred backlog; once
+/// a delivery is answered without deferral nothing is owed any more.
+#[test]
+fn a_lost_resume_handshake_is_redriven_from_durable_state() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 1);
+    let (instance_key, _) = create_suspended(&mut rig, &order, &|_| false);
+    assert!(
+        rig.instance.pending_resume_handshakes().is_empty(),
+        "nothing owed while suspended"
+    );
+    let lost = rig.run_holding(
+        false,
+        Command::ResumeInstance { instance_key },
+        3_000,
+        &|c| matches!(c, Command::ResumeMessageSubscription { .. }),
+    );
+    assert_eq!(lost.len(), 1);
+    assert!(correlated(&rig, instance_key).is_empty());
+    let mut replayed = Engine::replay_partition(0, rig.instance_journal.clone());
+    replayed.set_num_partitions(Rig::N);
+    rig.instance = replayed;
+    let owed: Vec<_> = rig
+        .instance
+        .pending_resume_handshakes()
+        .iter()
+        .filter_map(routed)
+        .collect();
+    assert_eq!(owed, lost, "re-derived verbatim");
+    for (to_message, command) in owed {
+        rig.run(to_message, command, 3_100);
+    }
+    assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
+    assert!(rig.instance.pending_resume_handshakes().is_empty());
 }

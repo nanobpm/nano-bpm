@@ -14657,6 +14657,7 @@ mod element_instance_tests {
                 correlated_message_keys: Default::default(),
                 awaiting_ack: None,
                 rescan_from: None,
+                resume_pending: false,
             },
         );
         state.signal_subscriptions.insert(

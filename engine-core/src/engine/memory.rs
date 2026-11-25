@@ -138,7 +138,7 @@ impl Engine {
             buffer_requeue: std::collections::VecDeque::new(),
             pending_correlation_ack: None,
             remote_buffered_delivery: true,
-            remote_buffered_delivery_latched: false,
+            remote_backlog_scan_pending: false,
             buffer_candidates: std::collections::BTreeMap::new(),
             sweep_from: 0,
             raft_applied: snapshot.raft_applied,
