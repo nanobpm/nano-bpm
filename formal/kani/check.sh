@@ -13,9 +13,10 @@ if [[ -n "${KANI_UNWIND:-}" ]]; then
 else
   UNWIND_ARGS=(--default-unwind 3)
 fi
-# Wall-clock box per harness: one that cannot prove within it must shrink its
+# Wall-clock box per harness, including its ~2 min cold `cargo kani` build
+# (so ~5 min of verification): one that cannot prove within it must shrink its
 # input domain, not be given more time (README "Running").
-HARNESS_TIMEOUT="${KANI_HARNESS_TIMEOUT:-300}"
+HARNESS_TIMEOUT="${KANI_HARNESS_TIMEOUT:-420}"
 
 # Pass harness names to prove only those (CI runs one harness per matrix leg).
 ALL_HARNESSES=(

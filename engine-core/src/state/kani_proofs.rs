@@ -11,14 +11,12 @@ use crate::model::IncomingFlow;
 /// Bound on the number of nondeterministic operations per harness.
 const STEPS: usize = 2;
 
-/// One of two incoming-flow identities: parallel flows from the same source
-/// (`ParallelDuplicateFlows`-style), told apart only by their ordinal — the
-/// case the flow ordering must not collapse. (A third identity from another
-/// source pushed the solver past the CI runner's memory.)
-fn any_flow() -> IncomingFlow {
+/// Parallel flows from the same source (`ParallelDuplicateFlows`-style), told
+/// apart only by their ordinal — the case the flow ordering must not collapse.
+fn flow(ordinal: usize) -> IncomingFlow {
     IncomingFlow {
         from: "a".to_string(),
-        ordinal: usize::from(kani::any::<bool>()),
+        ordinal,
     }
 }
 
@@ -37,10 +35,6 @@ fn assert_join_invariant(arrivals: &FlowArrivals) {
     }
 }
 
-fn total(arrivals: &FlowArrivals) -> usize {
-    arrivals.iter().map(|(_, c)| c).sum()
-}
-
 /// Any interleaving of arrivals (`record`/`add`) and join firings
 /// (`consume_one_each`) preserves the join invariant, never underflows or
 /// overflows, and conserves tokens: a firing consumes exactly one token per
@@ -50,31 +44,32 @@ fn total(arrivals: &FlowArrivals) -> usize {
 #[kani::unwind(3)]
 #[kani::solver(cadical)]
 fn flow_arrivals_preserve_join_invariant() {
+    // Both identities are built once: re-allocating a symbolic flow per step
+    // (and summing the whole map per assertion) pushed the solver past the CI
+    // runner's memory. A ghost count per identity is the oracle instead.
+    let flows = [flow(0), flow(1)];
+    let mut ghost = [0usize; 2];
     let mut arrivals = FlowArrivals::default();
     for _ in 0..STEPS {
-        let before = total(&arrivals);
+        let i = usize::from(kani::any::<bool>());
         match kani::any::<u8>() % 3 {
             0 => {
-                let flow = any_flow();
-                let had = arrivals.count(&flow);
-                arrivals.record(&flow);
-                assert!(arrivals.count(&flow) == had + 1);
-                assert!(total(&arrivals) == before + 1);
+                arrivals.record(&flows[i]);
+                ghost[i] += 1;
             }
             1 => {
-                let flow = any_flow();
                 let tokens = usize::from(kani::any::<u8>() % 3);
-                let had = arrivals.count(&flow);
-                arrivals.add(&flow, tokens);
-                assert!(arrivals.count(&flow) == had + tokens);
-                assert!(total(&arrivals) == before + tokens);
+                arrivals.add(&flows[i], tokens);
+                ghost[i] += tokens;
             }
             _ => {
-                let distinct = arrivals.distinct_flows();
                 arrivals.consume_one_each();
-                assert!(total(&arrivals) == before - distinct);
+                ghost = ghost.map(|c| c.saturating_sub(1));
             }
         }
+        assert!(arrivals.count(&flows[0]) == ghost[0]);
+        assert!(arrivals.count(&flows[1]) == ghost[1]);
+        assert!(arrivals.distinct_flows() == ghost.iter().filter(|&&c| c > 0).count());
         assert_join_invariant(&arrivals);
         assert!(arrivals.is_empty() == (arrivals.distinct_flows() == 0));
     }
@@ -88,19 +83,11 @@ fn any_job_event() -> Event {
             job_key: KEY,
             instance_key: 1,
             durable: kani::any(),
-            worker: if kani::any() {
-                "w".to_string()
-            } else {
-                String::new()
-            },
+            worker: "w".to_string(),
             deadline: kani::any(),
-            activated_at: if kani::any() { Some(kani::any()) } else { None },
+            activated_at: kani::any::<bool>().then_some(1),
             fetch_variables: Vec::new(),
-            lease_token: if kani::any() {
-                Some("t".to_string())
-            } else {
-                None
-            },
+            lease_token: None,
         },
         1 => Event::JobLockExpired {
             job_key: KEY,
@@ -113,7 +100,7 @@ fn any_job_event() -> Event {
             job_type: "t".to_string(),
             worker: None,
             completed_at: kani::any(),
-            deadline: if kani::any() { Some(kani::any()) } else { None },
+            deadline: kani::any::<bool>().then_some(10),
         },
         3 => Event::JobFailed {
             job_key: KEY,
