@@ -504,6 +504,14 @@ jobs:
         # pushes its branch and then fails, losing the PR. Every `gh pr create`
         # step must use a GitHub App token (actions/create-github-app-token).
         run: node --test scripts/no-github-token-pr-create.test.mjs
+      - name: engine-wasm README API section is generated, not stale (#1899)
+        # The README's API reference is derived from the `#[wasm_bindgen]` exports
+        # in engine-wasm/src/lib.rs plus spec/*.yaml (method -> operationId,
+        # request/response schema). Fails when an export or spec change lands
+        # without regenerating: `node engine-wasm/scripts/gen-readme-api.mjs`.
+        run: |
+          node --test engine-wasm/scripts/gen-readme-api.test.mjs
+          node engine-wasm/scripts/gen-readme-api.mjs --check
       - name: Only main-reachable release tags publish (#1830)
         # Every job that publishes (npm, release assets, S3, Maven, a write to
         # another repo, OIDC trusted publishing, a release script) must be
