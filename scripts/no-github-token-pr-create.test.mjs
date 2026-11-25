@@ -128,3 +128,17 @@ test('no workflow or action runs `gh pr create` with GITHUB_TOKEN', () => {
     .flatMap((p) => prCreateOffenders(readFileSync(p, 'utf8')).map((l) => `${relative(root, p)} ${l}`));
   assert.deepEqual(offenders, []);
 });
+
+// actions/create-github-app-token@v2 runs on Node 20, which the runner forces
+// onto Node 24 with a deprecation annotation (#1928). v3 is the first major
+// declaring `using: node24`; its `token` output is what GH_TOKEN reads above.
+test('every create-github-app-token use is a Node 24 major (>= v3)', () => {
+  const stale = walk(join(root, '.github'))
+    .filter((p) => /\.ya?ml$/.test(p))
+    .flatMap((p) =>
+      [...readFileSync(p, 'utf8').matchAll(/actions\/create-github-app-token@(\S+)/g)]
+        .filter((m) => !(/^v(\d+)/.test(m[1]) && Number(m[1].match(/^v(\d+)/)[1]) >= 3))
+        .map((m) => `${relative(root, p)} @${m[1]}`),
+    );
+  assert.deepEqual(stale, []);
+});
