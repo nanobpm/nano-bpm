@@ -9856,25 +9856,26 @@ impl ServerImpl {
             .collect();
         jobs.sort_unstable_by_key(|item| item.item_key);
         let operation_reference = body.operation_reference;
-        let key = self.drive_process_instance_batch(op_type, jobs, move |server, job_key| async move {
-            // Nano models no job priority (every job projects priority 0), so a
-            // non-zero priority cannot be applied: the item FAILS with that
-            // reason instead of reporting a silent success.
-            if let Some(p) = priority
-                && p != 0
-            {
-                return Err(format!(
-                    "Job priority is not supported: cannot set priority {p} on job '{job_key}'."
-                ));
-            }
-            if retries.is_none() && timeout.is_none() {
-                return Ok(());
-            }
-            server
-                .update_job_core(job_key, retries, timeout, operation_reference, None)
-                .await
-                .map_err(|(_, detail)| detail)
-        });
+        let key =
+            self.drive_process_instance_batch(op_type, jobs, move |server, job_key| async move {
+                // Nano models no job priority (every job projects priority 0), so a
+                // non-zero priority cannot be applied: the item FAILS with that
+                // reason instead of reporting a silent success.
+                if let Some(p) = priority
+                    && p != 0
+                {
+                    return Err(format!(
+                        "Job priority is not supported: cannot set priority {p} on job '{job_key}'."
+                    ));
+                }
+                if retries.is_none() && timeout.is_none() {
+                    return Ok(());
+                }
+                server
+                    .update_job_core(job_key, retries, timeout, operation_reference, None)
+                    .await
+                    .map_err(|(_, detail)| detail)
+            });
         Ok(Resp::Status200_TheBatchOperationWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
         ))
@@ -25227,7 +25228,7 @@ impl ServerImpl {
 /// by `POST /v2/jobs/search` and the job-update batch item selection (#1863), so
 /// a batch updates exactly the jobs the same filter would search.
 fn job_matches_filter(f: &models::JobFilter, job: &readstore::JobRow) -> bool {
-        query::match_job_key(&f.job_key, &job.key.to_string())
+    query::match_job_key(&f.job_key, &job.key.to_string())
             && query::match_process_instance_key(
                 &f.process_instance_key,
                 &job.instance_key.to_string(),
@@ -25377,17 +25378,18 @@ impl ServerImpl {
         // Execute (#1863) through the single-instance cancel core, stamping the
         // request's `operationReference` on every per-item record.
         let operation_reference = body.operation_reference;
-        let key = self.drive_process_instance_batch(op_type, items, move |server, instance| async move {
-            match server
-                .cancel_instance_core(instance, operation_reference)
-                .await
-            {
-                CancelInstanceOutcome::Canceled => Ok(()),
-                CancelInstanceOutcome::NotFound(d)
-                | CancelInstanceOutcome::Unavailable(d)
-                | CancelInstanceOutcome::Internal(d) => Err(d),
-            }
-        });
+        let key =
+            self.drive_process_instance_batch(op_type, items, move |server, instance| async move {
+                match server
+                    .cancel_instance_core(instance, operation_reference)
+                    .await
+                {
+                    CancelInstanceOutcome::Canceled => Ok(()),
+                    CancelInstanceOutcome::NotFound(d)
+                    | CancelInstanceOutcome::Unavailable(d)
+                    | CancelInstanceOutcome::Internal(d) => Err(d),
+                }
+            });
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
         ))
@@ -25657,18 +25659,19 @@ impl ServerImpl {
             .collect();
         items.sort_unstable_by_key(|item| item.item_key);
         let operation_reference = req.operation_reference;
-        let key = self.drive_process_instance_batch(op_type, items, move |server, incident| async move {
-            match server
-                .resolve_incident_core(incident, operation_reference)
-                .await
-            {
-                ResolveIncidentOutcome::Resolved => Ok(()),
-                ResolveIncidentOutcome::NotFound(d)
-                | ResolveIncidentOutcome::NotResolvable(d)
-                | ResolveIncidentOutcome::Unavailable(d)
-                | ResolveIncidentOutcome::Internal(d) => Err(d),
-            }
-        });
+        let key =
+            self.drive_process_instance_batch(op_type, items, move |server, incident| async move {
+                match server
+                    .resolve_incident_core(incident, operation_reference)
+                    .await
+                {
+                    ResolveIncidentOutcome::Resolved => Ok(()),
+                    ResolveIncidentOutcome::NotFound(d)
+                    | ResolveIncidentOutcome::NotResolvable(d)
+                    | ResolveIncidentOutcome::Unavailable(d)
+                    | ResolveIncidentOutcome::Internal(d) => Err(d),
+                }
+            });
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
         ))
@@ -53479,7 +53482,6 @@ mod clustered_startup_tests {
         assert_eq!(completed, vec![2, 0, 2], "completed per bucket");
         assert_eq!(failed, vec![0, 0, 1], "failed per bucket");
     }
-
 }
 
 #[cfg(test)]
@@ -54432,7 +54434,9 @@ mod subscription_placement_tests {
 
         // Raise an incident on the first instance: activate its job and fail it
         // with no retries left.
-        let activated = server.activate_for_stream("work", "w", 10, 60_000, None).await;
+        let activated = server
+            .activate_for_stream("work", "w", 10, 60_000, None)
+            .await;
         let failing = activated
             .iter()
             .find(|j| j.process_instance_key.0 == instances[0].to_string())
@@ -54565,9 +54569,17 @@ mod subscription_placement_tests {
         let retries = refs_of(&|e| matches!(e, Event::JobRetriesUpdated { .. }));
         assert_eq!(retries, vec![Some(JOB_REF); 2], "job-update records");
         let resolved = refs_of(&|e| matches!(e, Event::IncidentResolved { .. }));
-        assert_eq!(resolved, vec![Some(RESOLVE_REF)], "incident-resolution records");
+        assert_eq!(
+            resolved,
+            vec![Some(RESOLVE_REF)],
+            "incident-resolution records"
+        );
         let terminated = refs_of(&|e| matches!(e, Event::ProcessInstanceTerminated { .. }));
-        assert_eq!(terminated, vec![Some(CANCEL_REF); 2], "cancellation records");
+        assert_eq!(
+            terminated,
+            vec![Some(CANCEL_REF); 2],
+            "cancellation records"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
