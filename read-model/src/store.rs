@@ -7237,6 +7237,8 @@ fn project_event(
         // already projects.
         | Event::MessageCorrelationAcknowledging { .. }
         | Event::MessageCorrelationAcknowledged { .. }
+        // The resume handshake (#1949) is a routing record only.
+        | Event::MessageSubscriptionResuming { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }
@@ -14654,6 +14656,7 @@ mod element_instance_tests {
                 kind: ni.clone(),
                 correlated_message_keys: Default::default(),
                 awaiting_ack: None,
+                rescan_from: None,
             },
         );
         state.signal_subscriptions.insert(

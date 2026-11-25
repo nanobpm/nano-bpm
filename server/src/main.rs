@@ -4094,6 +4094,14 @@ impl ServerImpl {
                     now_millis(),
                 );
             }
+            // Cluster-wide rolling-upgrade gate for ack-paced remote buffered
+            // delivery (#1949, ADR 0066): a multi-node node starts with it OFF
+            // (the 1944 behaviour: remote subscriptions take no buffered
+            // messages) until every member is known to advertise
+            // `message-correlation-ack-v1` — the Raft batcher decides it per
+            // entry, the non-Raft tick via `remote_buffered_delivery_gate`. A
+            // single node has no other binary to disagree with.
+            journal.set_remote_buffered_delivery(topology.is_single_node());
         }
         // The deployment partition (id 0) is the only one that seeds the demo
         // process and owns the message-/timer-start subscriptions. In a clustered
@@ -12360,6 +12368,18 @@ impl ServerImpl {
                     deferred: *deferred,
                 },
             )),
+            // The resume handshake (#1949) goes to the subscription's message
+            // partition, which re-offers its buffered backlog.
+            Event::MessageSubscriptionResuming {
+                subscription_key,
+                correlation_key,
+                ..
+            } => Some((
+                nanobpmn_engine_core::subscription_partition(correlation_key, num_partitions),
+                Command::ResumeMessageSubscription {
+                    subscription_key: *subscription_key,
+                },
+            )),
             Event::MessageSubscriptionClosing {
                 subscription_key,
                 instance_key,
@@ -12454,8 +12474,14 @@ impl ServerImpl {
     fn routed_command_is_idempotent(command: &Command) -> bool {
         // An ack (#1874) is idempotent by content: the message partition
         // applies it only while that subscription awaits that exact message.
+        // A resume handshake (#1949) only re-offers an open, non-awaiting
+        // subscription its backlog, so a repeat is harmless too.
         command.routed_delivery_key().is_some()
-            || matches!(command, Command::AcknowledgeMessageCorrelation { .. })
+            || matches!(
+                command,
+                Command::AcknowledgeMessageCorrelation { .. }
+                    | Command::ResumeMessageSubscription { .. }
+            )
     }
 
     /// Removes the routable follow-ups from a proposal result whose detached
@@ -27411,6 +27437,20 @@ fn local_lenient_reconcile(topology: &cluster::Topology, policy: ActivationPolic
     topology.is_single_node() && policy.may_be_leader_local()
 }
 
+/// The non-Raft cluster-wide rolling-upgrade gate for ack-paced remote
+/// buffered delivery (#1949, ADR 0066): on only when EVERY other cluster
+/// member is known to advertise `message-correlation-ack-v1` (an unreachable
+/// or unknown member fails closed). A single node is trivially on.
+async fn remote_buffered_delivery_gate(
+    topology: &cluster::Topology,
+    peers: &peer::PeerSet,
+) -> bool {
+    topology.is_single_node()
+        || peers
+            .all_peers_support(nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK)
+            .await
+}
+
 fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now: u64) {
     if !lenient || journal.engine().replicated_lenient_completion() {
         return;
@@ -32103,11 +32143,18 @@ async fn main() {
                         tick_server.engine.topology(),
                         tick_server.activation_policy,
                     );
+                    let remote_delivery = remote_buffered_delivery_gate(
+                        tick_server.engine.topology(),
+                        &tick_server.peers,
+                    )
+                    .await;
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
                             // Without Raft this journal is the partition's only
                             // replica: reconcile the lenient flag directly (#1661).
                             reconcile_lenient_completion_local(journal, lenient, now);
+                            // The cluster-wide #1949 capability gate (ADR 0066).
+                            journal.set_remote_buffered_delivery(remote_delivery);
                             let (fired, commit) = journal.trigger_timers(now);
                             // Fire-and-forget tick: nothing reads disk after it and
                             // follow-ups are re-derived from engine state (#1855).
@@ -34021,6 +34068,33 @@ mod clustered_startup_tests {
         let _transport = server.raft_transport_for_start().await;
         assert!(server.peers.requires_feature(F));
         assert_eq!(server.required_cluster_features().await, Some(vec![F]));
+    }
+
+    /// #1949 cluster-wide capability gate (ADR 0066), non-Raft path: a
+    /// multi-node cluster keeps remote ack-paced delivery OFF while any member
+    /// is not known to advertise `message-correlation-ack-v1` (here: both
+    /// peers unreachable, i.e. unknown — fails closed); a single node is on.
+    #[tokio::test]
+    async fn remote_buffered_delivery_gate_fails_closed_on_an_unknown_member() {
+        let multi = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 2,
+            replication_factor: 1,
+        };
+        let peers = peer::PeerSet::new(multi.clone());
+        assert!(!remote_buffered_delivery_gate(&multi, &peers).await);
+        let single = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://127.0.0.1:1".to_string()],
+            num_partitions: 2,
+            replication_factor: 1,
+        };
+        let peers = peer::PeerSet::new(single.clone());
+        assert!(remote_buffered_delivery_gate(&single, &peers).await);
     }
 
     /// #1949: a node whose recovered state has EVER sent an ack-paced remote
@@ -46244,8 +46318,17 @@ mod clustered_startup_tests {
             "every replica holds the replicated flag: {upgraded:?}"
         );
 
-        // A featureless (pre-#1661) binary is now refused at join.
-        assert_eq!(n0.required_cluster_features().await, Some(vec![F]));
+        // A featureless (pre-#1661) binary is now refused at join. The
+        // upgrade also opened the cluster-wide #1949 gate, so the entries
+        // committed since carry ack-paced remote delivery and require that
+        // capability too (one-way, like lenience).
+        assert_eq!(
+            n0.required_cluster_features().await,
+            Some(vec![
+                F,
+                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK
+            ])
+        );
         assert!(
             n0.peers.requires_feature(F),
             "outbound dials require it too"

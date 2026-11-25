@@ -1248,7 +1248,15 @@ fn routed_protocol_entries() -> Vec<Command> {
         .expect("a stale ack applies on the message partition");
     assert!(acked.is_empty(), "a stale ack is a no-op: {acked:?}");
 
-    vec![opening, continuation, close, ack]
+    // (7): a resume handshake (#1949) for the now-closed subscription is a
+    // no-op too (only an open, non-awaiting subscription is re-offered).
+    let resume = Command::ResumeMessageSubscription { subscription_key };
+    let resumed = message_partition
+        .apply_command_at(resume.clone(), T0 + 7)
+        .expect("a resume handshake applies on the message partition");
+    assert!(resumed.is_empty(), "a stale resume is a no-op: {resumed:?}");
+
+    vec![opening, continuation, close, ack, resume]
 }
 
 /// The [`Command::kind`] of every corpus entry (coverage evidence).

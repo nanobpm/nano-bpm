@@ -168,6 +168,7 @@ impl Engine {
             | Command::OpenMessageSubscription { .. }
             | Command::CloseMessageSubscription { .. }
             | Command::AcknowledgeMessageCorrelation { .. }
+            | Command::ResumeMessageSubscription { .. }
             | Command::SuspendInstance { .. }
             | Command::ResumeInstance { .. }
             | Command::DispatchStartInstance { .. }

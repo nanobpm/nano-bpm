@@ -1559,6 +1559,13 @@ pub enum Event {
         deferred: bool,
         partition: u64,
         target_partition: u64,
+        /// The answered delivery's key (#1949). Applying this record stores
+        /// the answer as that delivery's durable receipt on the emitting
+        /// (instance) partition, so a re-driven duplicate is answered with
+        /// the ORIGINAL outcome — never one recomputed from later state.
+        /// Additive: `0` on a pre-receipt record (no receipt stored).
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
     },
     /// The message partition applied an instance partition's acknowledgement
     /// (#1949): clears the canonical subscription's `awaiting_ack`; an
@@ -1993,6 +2000,19 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
     },
+    /// The resume handshake (#1949): a SUSPENDED instance with a
+    /// cross-partition subscription was resumed, so the message partition
+    /// (`subscription_partition(correlation_key)`) is told to re-offer that
+    /// subscription its buffered backlog — the ack-paced delivery it
+    /// deferred while the instance was suspended. The host routes it as a
+    /// [`crate::Command::ResumeMessageSubscription`]. Idempotent on the
+    /// receiver (it only re-offers an open, non-awaiting subscription).
+    /// State-neutral on the emitting (instance) partition.
+    MessageSubscriptionResuming {
+        subscription_key: Key,
+        instance_key: Key,
+        correlation_key: String,
+    },
     /// A process-level message start subscription was opened at deploy time: a
     /// later [`Event::MessagePublished`] with a matching `message_name` creates a
     /// new instance of `process_id`. Carried on the log so replay reconstructs
@@ -2345,6 +2365,7 @@ impl Event {
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::MessageCorrelationAcknowledging { instance_key, .. }
+            | Event::MessageSubscriptionResuming { instance_key, .. }
             | Event::VariablesLostQuarantined { instance_key, .. }
             | Event::OrphanStampSuperseded { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
@@ -2469,6 +2490,7 @@ impl Event {
             Event::MessageSubscriptionOpening { .. }
                 | Event::RemoteMessageCorrelation { .. }
                 | Event::MessageCorrelationAcknowledging { .. }
+                | Event::MessageSubscriptionResuming { .. }
                 | Event::MessageSubscriptionClosing { .. }
                 | Event::StartInstanceDispatched { .. }
         )
@@ -2786,6 +2808,9 @@ impl Event {
                 message_key,
                 ..
             } => m = m.max(*subscription_key).max(*message_key),
+            Event::MessageSubscriptionResuming {
+                subscription_key, ..
+            } => m = m.max(*subscription_key),
             Event::SignalBroadcast { signal_key, .. } => m = m.max(*signal_key),
             Event::SignalSubscriptionCreated {
                 subscription_key,

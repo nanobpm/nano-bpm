@@ -833,6 +833,12 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
                 ack_partition,
             },
         ),
+        Event::MessageSubscriptionResuming {
+            subscription_key, ..
+        } => (
+            true,
+            Command::ResumeMessageSubscription { subscription_key },
+        ),
         Event::MessageCorrelationAcknowledging {
             subscription_key,
             message_key,
@@ -860,6 +866,8 @@ struct Rig {
     instance: Engine,
     message: Engine,
     message_journal: Vec<Event>,
+    /// The instance partition's journal, for restart checks on that side.
+    instance_journal: Vec<Event>,
     /// Every event either partition emitted, in routing order.
     trace: Vec<Event>,
 }
@@ -874,7 +882,7 @@ impl Rig {
             .expect("some key hashes to partition 1");
         let mut instance = Engine::with_partition(0);
         instance.set_num_partitions(Self::N);
-        instance
+        let instance_journal = instance
             .apply_command(Command::DeployProcess(definition))
             .unwrap();
         let mut message = Engine::with_partition(1);
@@ -883,9 +891,16 @@ impl Rig {
             instance,
             message,
             message_journal: Vec::new(),
+            instance_journal,
             trace: Vec::new(),
         };
         (rig, order)
+    }
+
+    fn on_instance(&mut self, command: Command, now: u64) -> Vec<Event> {
+        let events = self.instance.apply_command_at(command, now).unwrap();
+        self.instance_journal.extend(events.iter().cloned());
+        events
     }
 
     fn on_message(&mut self, command: Command, now: u64) -> Vec<Event> {
@@ -902,7 +917,7 @@ impl Rig {
             let events = if to_message {
                 self.on_message(command, now)
             } else {
-                self.instance.apply_command_at(command, now).unwrap()
+                self.on_instance(command, now)
             };
             pending.extend(events.iter().filter_map(routed));
             self.trace.extend(events);
@@ -1525,7 +1540,7 @@ impl Rig {
             let events = if to_message {
                 self.on_message(command, now)
             } else {
-                self.instance.apply_command_at(command, now).unwrap()
+                self.on_instance(command, now)
             };
             for routed in events.iter().filter_map(routed) {
                 if hold(&routed.1) {
@@ -1816,4 +1831,220 @@ fn remote_ack_paced_drain_scans_linearly() {
         visits <= 2 * N + 2,
         "visits must be O(N), got {visits} for N = {N}"
     );
+}
+
+/// The `(accepted, consumed, deferred)` answers the instance partition
+/// emitted, in order (#1949).
+fn receipts(trace: &[Event]) -> Vec<(Key, bool, bool, bool)> {
+    trace
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCorrelationAcknowledging {
+                delivery_key,
+                accepted,
+                consumed,
+                deferred,
+                ..
+            } => Some((*delivery_key, *accepted, *consumed, *deferred)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Creates a `ni` instance whose subscription open is routed only AFTER the
+/// instance is suspended, so the buffered delivery is answered `deferred`.
+/// Holds whatever `hold` matches.
+fn create_suspended(
+    rig: &mut Rig,
+    order: &str,
+    hold: &dyn Fn(&Command) -> bool,
+) -> (Key, Vec<(bool, Command)>) {
+    let created = rig.on_instance(
+        Command::create_instance_with("ni", vars(&[("orderId", Value::Str(order.into()))])),
+        2_000,
+    );
+    let instance_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        })
+        .expect("created");
+    let opens: Vec<_> = created.iter().filter_map(routed).collect();
+    rig.trace.extend(created);
+    rig.run(false, Command::SuspendInstance { instance_key }, 2_001);
+    let mut held = Vec::new();
+    for (to_message, command) in opens {
+        held.extend(rig.run_holding(to_message, command, 2_002, hold));
+    }
+    (instance_key, held)
+}
+
+fn correlated(rig: &Rig, instance_key: Key) -> Vec<Key> {
+    rig.trace
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCorrelated {
+                instance_key: i,
+                message_key,
+                ..
+            } if *i == instance_key => Some(*message_key),
+            _ => None,
+        })
+        .collect()
+}
+
+/// #1949 resume handshake: a delivery DEFERRED while the instance was
+/// suspended is re-offered when it resumes — without waiting for a new
+/// publication — and the handshake survives a restart of the message
+/// partition between the deferral and the resume.
+#[test]
+fn resume_handshake_redelivers_a_deferred_backlog_across_a_restart() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 2);
+    let (instance_key, _) = create_suspended(&mut rig, &order, &|_| false);
+    assert!(correlated(&rig, instance_key).is_empty());
+    assert_eq!(
+        receipts(&rig.trace)
+            .iter()
+            .map(|r| (r.1, r.2, r.3))
+            .collect::<Vec<_>>(),
+        vec![(false, false, true)],
+        "deferred while suspended"
+    );
+    // Restart (leader change) of the message partition before the resume.
+    let mut replayed = Engine::replay_partition(1, rig.message_journal.clone());
+    replayed.set_num_partitions(Rig::N);
+    assert_eq!(replayed.state(), rig.message.state());
+    rig.message = replayed;
+    rig.run(false, Command::ResumeInstance { instance_key }, 3_000);
+    assert!(
+        rig.trace
+            .iter()
+            .any(|e| matches!(e, Event::MessageSubscriptionResuming { .. })),
+        "the resume announces itself to the message partition"
+    );
+    assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
+    // A repeated handshake is a no-op (idempotent).
+    let sub = *rig
+        .message
+        .state()
+        .message_subscriptions
+        .keys()
+        .next()
+        .unwrap();
+    let again = rig.on_message(
+        Command::ResumeMessageSubscription {
+            subscription_key: sub,
+        },
+        3_100,
+    );
+    assert!(again.is_empty(), "{again:?}");
+}
+
+/// #1949 durable receipt + duplicate ack: the deferral's ack is LOST, the
+/// instance resumes (its handshake finds the delivery still in flight, a
+/// no-op), then the re-driven duplicate delivery is answered with the STORED
+/// receipt (`deferred`, never recomputed from the now-resumed state) plus a
+/// fresh handshake, so the message is still taken exactly once. A duplicate
+/// of the lost ack is a no-op. The instance partition is restarted between
+/// the lost ack and the duplicate: the receipt is durable.
+#[test]
+fn duplicate_delivery_is_answered_with_its_stored_receipt_across_a_restart() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 1);
+    let (instance_key, lost_acks) = create_suspended(&mut rig, &order, &is_ack);
+    assert_eq!(lost_acks.len(), 1);
+    let first = receipts(&rig.trace);
+    assert_eq!(first.len(), 1);
+    assert_ne!(first[0].0, 0, "the receipt carries its delivery key");
+    assert!(first[0].3, "deferred");
+    rig.run(false, Command::ResumeInstance { instance_key }, 3_000);
+    assert!(correlated(&rig, instance_key).is_empty(), "still in flight");
+
+    // Restart of the instance partition: the receipt is rebuilt from the log.
+    let mut replayed = Engine::replay_partition(0, rig.instance_journal.clone());
+    replayed.set_num_partitions(Rig::N);
+    assert_eq!(replayed.state(), rig.instance.state());
+    assert_eq!(
+        replayed.state().routed_deliveries.receipt(first[0].0),
+        Some(state::CorrelationReceipt {
+            accepted: false,
+            consumed: false,
+            deferred: true,
+        })
+    );
+    rig.instance = replayed;
+
+    let before = rig.trace.len();
+    for (to_message, command) in redrive(&rig) {
+        rig.run(to_message, command, 3_100);
+    }
+    let answered = receipts(&rig.trace[before..]);
+    assert_eq!(answered[0], first[0], "the stored receipt, verbatim");
+    assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
+    assert_eq!(correlated(&rig, instance_key).len(), 1, "exactly once");
+    // The lost original ack, arriving late, changes nothing.
+    for (_, command) in lost_acks {
+        assert!(rig.on_message(command, 3_200).is_empty());
+    }
+    assert!(redrive(&rig).is_empty());
+}
+
+/// #1949 mixed-version cluster: with remote buffered delivery gated OFF (a
+/// member lacks `message-correlation-ack-v1`), a resume emits no handshake —
+/// a legacy message partition would not know the command — and the routed
+/// open takes nothing from the buffer (the 1944 behaviour).
+#[test]
+fn resume_handshake_is_gated_off_in_a_mixed_version_cluster() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    rig.instance.set_remote_buffered_delivery(false);
+    rig.message.set_remote_buffered_delivery(false);
+    rig.publish_backlog(&order, 1);
+    let (instance_key, _) = create_suspended(&mut rig, &order, &|_| false);
+    rig.run(false, Command::ResumeInstance { instance_key }, 3_000);
+    assert!(!rig.trace.iter().any(|e| matches!(
+        e,
+        Event::MessageSubscriptionResuming { .. }
+            | Event::RemoteMessageCorrelation { .. }
+            | Event::MessageCorrelationAcknowledging { .. }
+    )));
+    assert_eq!(rig.message.state().buffered_messages.len(), 1);
+}
+
+/// #1949 reservation release on subscription close: the instance is
+/// cancelled while a delivery is in flight; the late delivery is answered
+/// unconsumed, the reservation is released, and the message is never
+/// stranded — a later instance takes it.
+#[test]
+fn reservation_is_released_when_the_subscription_closes_mid_flight() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 1);
+    let (first, held) = rig.create_holding("ni", &order, 2_000, &is_delivery);
+    assert_eq!(held.len(), 1);
+    assert!(rig.message.state().buffered_messages[&published[0]]
+        .correlated_instances
+        .contains(&first));
+    rig.run(
+        false,
+        Command::CancelInstance {
+            instance_key: first,
+            terminate_suspended: false,
+        },
+        2_100,
+    );
+    for (to_message, command) in held {
+        rig.run(to_message, command, 2_200);
+    }
+    assert!(correlated(&rig, first).is_empty());
+    assert!(
+        rig.message.state().buffered_messages[&published[0]]
+            .correlated_instances
+            .is_empty(),
+        "released: {:?}",
+        rig.trace
+    );
+    assert!(redrive(&rig).is_empty(), "nothing left in flight");
+    let second = rig.create("ni", &order, 3_000);
+    assert_eq!(correlated(&rig, second), published);
 }

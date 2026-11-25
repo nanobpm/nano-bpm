@@ -2067,6 +2067,16 @@ pub struct MessageSubscription {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub awaiting_ack: Option<AwaitingAck>,
+    /// The earliest buffered entry `(seq, message_key)` whose reservation was
+    /// released (#1949) while this subscription could not take it (it was
+    /// awaiting its own ack): its next scan must start no later than this,
+    /// so the released message is not skipped by the resume-after-consumed
+    /// cursor. Cleared once that scan ran. Additive, omitted when `None`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub rescan_from: Option<(u64, Key)>,
 }
 
 /// An in-flight buffered delivery awaiting its acknowledgement (#1949): see
@@ -2280,6 +2290,27 @@ pub struct RoutedDelivery {
     /// `true` only for a `CloseMessageSubscription` delivery.
     #[cfg_attr(feature = "serde", serde(default))]
     pub close_tombstone: bool,
+    /// For an ack-paced `CorrelateMessageSubscription` (#1949): the answer
+    /// this (instance) partition gave, recorded when its
+    /// [`crate::Event::MessageCorrelationAcknowledging`] is applied. A
+    /// duplicate (re-driven) delivery is answered with exactly this receipt,
+    /// independent of the subscription's later lifetime (resume, terminal
+    /// eviction). Additive, omitted when `None`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub receipt: Option<CorrelationReceipt>,
+}
+
+/// The durable answer to one ack-paced buffered delivery (#1949): see
+/// [`RoutedDelivery::receipt`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CorrelationReceipt {
+    pub accepted: bool,
+    pub consumed: bool,
+    pub deferred: bool,
 }
 
 /// The routed-delivery ledger (#1497): dedup set + applied-order FIFO + a
@@ -2305,6 +2336,9 @@ pub struct RoutedDeliveries {
     /// `subscription_key -> delivery_key` of the live close tombstone (derived
     /// from `order`): an O(1) lookup instead of a ledger scan per open.
     tombstones: std::collections::BTreeMap<Key, Key>,
+    /// `delivery_key -> receipt` of every retained entry carrying one
+    /// (derived from `order`, #1949).
+    receipts: std::collections::BTreeMap<Key, CorrelationReceipt>,
 }
 
 impl RoutedDeliveries {
@@ -2326,6 +2360,30 @@ impl RoutedDeliveries {
     pub fn iter(&self) -> impl Iterator<Item = &RoutedDelivery> {
         self.order.iter()
     }
+    /// The durable answer recorded for ack-paced delivery `delivery_key`
+    /// (#1949), while its entry is retained.
+    pub fn receipt(&self, delivery_key: Key) -> Option<CorrelationReceipt> {
+        self.receipts.get(&delivery_key).copied()
+    }
+    /// Attach `receipt` to the retained entry for `delivery_key` (#1949).
+    /// First write wins: a receipt, once recorded, is the delivery's
+    /// immutable outcome. A key not (or no longer) retained is a no-op.
+    pub fn set_receipt(&mut self, delivery_key: Key, receipt: CorrelationReceipt) {
+        if !self.keys.contains(&delivery_key) || self.receipts.contains_key(&delivery_key) {
+            return;
+        }
+        // The ack follows its delivery's record within the same command, so
+        // the entry is (almost always) the newest: search from the back.
+        if let Some(entry) = self
+            .order
+            .iter_mut()
+            .rev()
+            .find(|e| e.delivery_key == delivery_key)
+        {
+            entry.receipt = Some(receipt);
+            self.receipts.insert(delivery_key, receipt);
+        }
+    }
     /// Record an applied delivery, evicting the earliest-APPLIED entries
     /// beyond `cap`. A key already present is a no-op (never re-ordered).
     pub fn record(&mut self, entry: RoutedDelivery, cap: usize) {
@@ -2337,12 +2395,16 @@ impl RoutedDeliveries {
                 self.tombstones.insert(sub, entry.delivery_key);
             }
         }
+        if let Some(receipt) = entry.receipt {
+            self.receipts.insert(entry.delivery_key, receipt);
+        }
         self.order.push_back(entry);
         while self.order.len() > cap {
             let Some(old) = self.order.pop_front() else {
                 break;
             };
             self.keys.remove(&old.delivery_key);
+            self.receipts.remove(&old.delivery_key);
             if let Some(sub) = old.subscription_key {
                 if self.tombstones.get(&sub) == Some(&old.delivery_key) {
                     self.tombstones.remove(&sub);

@@ -79,6 +79,7 @@ struct PendingCorrelationAck {
     message_key: Key,
     instance_key: Key,
     target_partition: u64,
+    delivery_key: Key,
 }
 
 /// The version of the serialized snapshot/event **payload** shape (the
@@ -5348,15 +5349,30 @@ impl Engine {
                     // durable state, so the message partition's in-flight
                     // delivery settles exactly as it would have.
                     if let Some(target_partition) = ack_partition {
-                        self.emit_correlation_ack(
-                            &mut log,
-                            PendingCorrelationAck {
-                                subscription_key,
-                                message_key,
-                                instance_key,
-                                target_partition,
-                            },
-                        );
+                        let ack = PendingCorrelationAck {
+                            subscription_key,
+                            message_key,
+                            instance_key,
+                            target_partition,
+                            delivery_key,
+                        };
+                        match self.state.routed_deliveries.receipt(delivery_key) {
+                            // The ORIGINAL answer, never one recomputed from
+                            // the subscription's later state (#1949).
+                            Some(receipt) => {
+                                self.emit_receipt(&mut log, &ack, receipt);
+                                // A deferral answered while suspended whose
+                                // instance has since resumed: the message
+                                // partition re-opens the subscription on this
+                                // ack, then needs the resume handshake the
+                                // earlier resume could not complete (it found
+                                // the delivery still awaiting this ack).
+                                if receipt.deferred && !self.instance_is_suspended(instance_key) {
+                                    self.emit_subscription_resuming(&mut log, subscription_key);
+                                }
+                            }
+                            None => self.emit_correlation_ack(&mut log, ack),
+                        }
                     }
                     return Ok((log, queue));
                 }
@@ -5423,6 +5439,7 @@ impl Engine {
                         message_key,
                         instance_key,
                         target_partition,
+                        delivery_key,
                     });
                 }
                 if delivery_key != 0 {
@@ -5460,6 +5477,9 @@ impl Engine {
                     subscription.message_name.clone(),
                     subscription.correlation_key.clone(),
                 );
+                // A reservation released while this subscription awaited its
+                // own ack (#1949): read before the ack's apply clears it.
+                let rescan_from = subscription.rescan_from;
                 self.emit(
                     &mut log,
                     Event::MessageCorrelationAcknowledged {
@@ -5477,14 +5497,34 @@ impl Engine {
                     // ineligible when it was chosen, so draining N buffered
                     // messages through ack commands visits O(N) entries in
                     // total, not O(N^2).
+                    //
+                    // An entry released earlier while this subscription
+                    // awaited its ack was skipped by every scan since, so
+                    // the cursor then resumes just BEFORE it instead (#1949).
                     if let Some(seq) = self
                         .state
                         .buffered_messages
                         .get(&message_key)
                         .map(|m| m.seq)
                     {
-                        self.buffer_candidates
-                            .insert((instance_key, index_key.0, index_key.1), (seq, message_key));
+                        let consumed_entry = (seq, message_key);
+                        let cursor = match rescan_from {
+                            Some(floor) if floor < consumed_entry => self
+                                .state
+                                .buffered_by_correlation
+                                .get(&index_key)
+                                .and_then(|set| set.range(..floor).next_back().copied()),
+                            _ => Some(consumed_entry),
+                        };
+                        let cursor_key = (instance_key, index_key.0, index_key.1);
+                        match cursor {
+                            Some(c) => {
+                                self.buffer_candidates.insert(cursor_key, c);
+                            }
+                            None => {
+                                self.buffer_candidates.remove(&cursor_key);
+                            }
+                        }
                     }
                 } else {
                     // The reservation was released: the message is available
@@ -5516,6 +5556,22 @@ impl Engine {
                         .message_subscriptions
                         .get(&subscription_key)
                         .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
+                {
+                    self.buffer_requeue.push_back(subscription_key);
+                }
+            }
+
+            Command::ResumeMessageSubscription { subscription_key } => {
+                // The resume handshake (#1949): re-offer the backlog to an
+                // open subscription with nothing in flight. Anything else
+                // (closed, awaiting an ack, unknown) is a no-op — idempotent.
+                if self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .is_some_and(|s| {
+                        s.state == state::MessageSubscriptionState::Open && s.awaiting_ack.is_none()
+                    })
                 {
                     self.buffer_requeue.push_back(subscription_key);
                 }
@@ -5863,6 +5919,7 @@ impl Engine {
                     Some(instance) => match instance.state {
                         ProcessInstanceState::Suspended => {
                             self.emit(&mut log, Event::ProcessInstanceResumed { instance_key });
+                            self.reoffer_buffered_after_resume(&mut log, instance_key);
                         }
                         ProcessInstanceState::Active => {
                             // Already active — no-op.
@@ -7873,19 +7930,88 @@ impl Engine {
             subscription.is_some_and(|s| s.state == state::MessageSubscriptionState::Opening);
         let accepted = consumed && waiting;
         let deferred = !consumed && waiting && self.instance_is_suspended(ack.instance_key);
+        let receipt = state::CorrelationReceipt {
+            accepted,
+            consumed,
+            deferred,
+        };
+        self.emit_receipt(log, &ack, receipt);
+    }
+
+    /// Emits `receipt` as the answer to `ack`'s delivery. Applying it records
+    /// the receipt durably under the delivery key (first write wins), so
+    /// every later duplicate is answered with this same outcome (#1949).
+    fn emit_receipt(
+        &mut self,
+        log: &mut Vec<Event>,
+        ack: &PendingCorrelationAck,
+        receipt: state::CorrelationReceipt,
+    ) {
         self.emit(
             log,
             Event::MessageCorrelationAcknowledging {
                 subscription_key: ack.subscription_key,
                 message_key: ack.message_key,
                 instance_key: ack.instance_key,
-                accepted,
-                consumed,
-                deferred,
+                accepted: receipt.accepted,
+                consumed: receipt.consumed,
+                deferred: receipt.deferred,
                 partition: self.partition_id,
                 target_partition: ack.target_partition,
+                delivery_key: ack.delivery_key,
             },
         );
+    }
+
+    /// The resume handshake (#1949): a resumed instance's subscriptions are
+    /// offered their buffered backlog again — a delivery deferred while it
+    /// was suspended would otherwise wait for the next publication. A LOCAL
+    /// canonical subscription is requeued for this command's quiescent pass;
+    /// a cross-partition one is announced to its message partition with an
+    /// [`Event::MessageSubscriptionResuming`] (only while remote buffered
+    /// delivery is enabled: a legacy peer does not know the command, and
+    /// without remote delivery nothing was deferred). Ordered by
+    /// subscription key.
+    fn reoffer_buffered_after_resume(&mut self, log: &mut Vec<Event>, instance_key: Key) {
+        let mut remote = Vec::new();
+        for s in self.state.message_subscriptions.values() {
+            if s.instance_key != instance_key {
+                continue;
+            }
+            match s.state {
+                state::MessageSubscriptionState::Open => self.buffer_requeue.push_back(s.key),
+                state::MessageSubscriptionState::Opening
+                    if self.remote_buffered_delivery
+                        && state::subscription_partition(
+                            &s.correlation_key,
+                            self.num_partitions,
+                        ) != self.partition_id =>
+                {
+                    remote.push(s.key);
+                }
+                _ => {}
+            }
+        }
+        for subscription_key in remote {
+            self.emit_subscription_resuming(log, subscription_key);
+        }
+    }
+
+    /// Emits the [`Event::MessageSubscriptionResuming`] handshake for the
+    /// (instance-partition) `Opening` record `subscription_key`.
+    fn emit_subscription_resuming(&mut self, log: &mut Vec<Event>, subscription_key: Key) {
+        let Some(s) = self.state.message_subscriptions.get(&subscription_key) else {
+            return;
+        };
+        if s.state != state::MessageSubscriptionState::Opening {
+            return;
+        }
+        let event = Event::MessageSubscriptionResuming {
+            subscription_key,
+            instance_key: s.instance_key,
+            correlation_key: s.correlation_key.clone(),
+        };
+        self.emit(log, event);
     }
 
     /// Records a correlation against a subscription whose **instance lives on this

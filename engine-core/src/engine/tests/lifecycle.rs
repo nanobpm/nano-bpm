@@ -8467,6 +8467,7 @@ fn routed_delivery_ledger_evicts_in_applied_order() {
         delivery_key: k,
         subscription_key: Some(k + 1000),
         close_tombstone: close,
+        receipt: None,
     };
     for i in 1..=cap as u64 {
         ledger.record(entry(state::compose_key(3, i), true), cap);
@@ -8506,6 +8507,7 @@ fn routed_delivery_ledger_round_trips_with_indexes() {
                 delivery_key: k,
                 subscription_key: Some(k * 10),
                 close_tombstone: close,
+                receipt: None,
             },
             usize::MAX,
         );

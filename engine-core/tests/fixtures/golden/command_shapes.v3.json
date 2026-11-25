@@ -298,6 +298,8 @@
   "ResolveIncident.incident_key",
   "ResumeInstance",
   "ResumeInstance.instance_key",
+  "ResumeMessageSubscription",
+  "ResumeMessageSubscription.subscription_key",
   "ScriptTask",
   "ScriptTask.expression",
   "ScriptTask.result_variable",

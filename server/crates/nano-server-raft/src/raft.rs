@@ -3757,12 +3757,22 @@ impl Batcher {
                 // would take nothing where an upgraded replica delivers, so
                 // the leader enables it — in the entry, for every replica —
                 // only once every member advertises the capability.
+                //
+                // CLUSTER-wide, not only this group (ADR 0066): the delivery's
+                // ack and resume handshake are applied by the subscription's
+                // other partition, whose group may include members outside
+                // this one.
                 if all_members_support(
                     &raft,
                     transport.as_ref(),
                     nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
                 )
                 .await
+                    && transport
+                        .cluster_supports(
+                            nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
+                        )
+                        .await
                 {
                     items
                         .iter_mut()
@@ -9916,6 +9926,50 @@ mod tests {
             remote_open_on_group(cluster, all_new).await,
             vec![(true, true); 3],
             "an all-new group delivers ack-paced on every replica"
+        );
+    }
+
+    /// A transport whose group members are all upgraded, but some OTHER
+    /// cluster member (outside this group) is not (#1949 cluster-wide gate).
+    struct LegacyElsewhere {
+        inner: crate::raft_net::LocalCluster,
+    }
+
+    impl RaftTransport for LegacyElsewhere {
+        fn send<'a>(
+            &'a self,
+            target: NodeId,
+            partition: u64,
+            req: crate::raft_net::RaftRpcRequest,
+        ) -> futures_util::future::BoxFuture<
+            'a,
+            Result<crate::raft_net::RaftRpcResponse, crate::raft_net::TransportError>,
+        > {
+            self.inner.send(target, partition, req)
+        }
+
+        fn cluster_supports<'a>(
+            &'a self,
+            _feature: &'static str,
+        ) -> futures_util::future::BoxFuture<'a, bool> {
+            Box::pin(async { false })
+        }
+    }
+
+    /// #1949 / ADR 0066: the gate is CLUSTER-wide — a remote delivery is
+    /// acked and resumed by another partition's group, so a legacy member
+    /// anywhere in the cluster keeps the local-only behaviour even when every
+    /// member of this group is upgraded.
+    #[tokio::test]
+    async fn remote_buffered_delivery_is_gated_on_every_cluster_member() {
+        let cluster = crate::raft_net::LocalCluster::default();
+        let transport: Arc<dyn RaftTransport> = Arc::new(LegacyElsewhere {
+            inner: cluster.clone(),
+        });
+        assert_eq!(
+            remote_open_on_group(cluster, transport).await,
+            vec![(false, false); 3],
+            "a legacy member outside the group keeps every replica local-only"
         );
     }
 

@@ -607,6 +607,13 @@ pub enum Command {
         #[cfg_attr(feature = "serde", serde(default))]
         deferred: bool,
     },
+    /// The resume handshake (#1949), applied on the **message** partition
+    /// (routed from [`crate::Event::MessageSubscriptionResuming`]): the
+    /// subscription's instance was resumed, so an open subscription not
+    /// awaiting an ack is offered its buffered backlog again (a delivery it
+    /// deferred while the instance was suspended). Idempotent: anything else
+    /// is a no-op.
+    ResumeMessageSubscription { subscription_key: Key },
     /// Close a canonical subscription on the message partition because the
     /// instance disarmed it (the guarded activity left the flow, the instance was
     /// cancelled, or a sibling boundary fired). Routed by the host after the
@@ -1309,6 +1316,9 @@ impl Command {
                 h.str(if *consumed { "1" } else { "0" });
                 h.str(if *deferred { "1" } else { "0" });
             }
+            Command::ResumeMessageSubscription { subscription_key } => {
+                h.key(*subscription_key);
+            }
             Command::CancelInstance {
                 instance_key,
                 terminate_suspended,
@@ -1412,6 +1422,7 @@ impl Command {
             Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
             Command::AcknowledgeMessageCorrelation { .. } => "acknowledge_message_correlation",
+            Command::ResumeMessageSubscription { .. } => "resume_message_subscription",
             Command::CancelInstance { .. } => "cancel_instance",
             Command::SuspendInstance { .. } => "suspend_instance",
             Command::ResumeInstance { .. } => "resume_instance",

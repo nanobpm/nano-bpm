@@ -1174,6 +1174,13 @@ fn build_event_witnesses() -> Vec<Event> {
             deferred: false,
             partition: 0,
             target_partition: 1,
+            delivery_key: 26,
+        },
+        // #1949 resume handshake (additive variant).
+        Event::MessageSubscriptionResuming {
+            subscription_key: 21,
+            instance_key: 23,
+            correlation_key: "order-1".into(),
         },
         Event::MessageCorrelationAcknowledged {
             subscription_key: 21,

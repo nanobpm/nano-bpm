@@ -71,6 +71,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     kind: kind.clone(),
                     correlated_message_keys: Default::default(),
                     awaiting_ack: None,
+                    rescan_from: None,
                 },
             );
         }
@@ -101,6 +102,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     kind: kind.clone(),
                     correlated_message_keys: Default::default(),
                     awaiting_ack: None,
+                    rescan_from: None,
                 },
             );
         }
@@ -245,6 +247,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     delivery_key: *delivery_key,
                     subscription_key: *subscription_key,
                     close_tombstone: *close_tombstone,
+                    receipt: None,
                 },
                 ROUTED_DELIVERY_LEDGER_CAP,
             );
@@ -322,12 +325,57 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     } else if !*accepted && subscription.state == MessageSubscriptionState::Open {
                         subscription.state = MessageSubscriptionState::Correlated;
                     }
-                    if !*consumed {
-                        if let Some(message) = state.buffered_messages.get_mut(message_key) {
-                            message.correlated_instances.remove(&instance_key);
+                    let index_key = (
+                        subscription.message_name.clone(),
+                        subscription.correlation_key.clone(),
+                    );
+                    if *consumed {
+                        // Its post-ack scan honours any earlier release (the
+                        // engine read `rescan_from` before emitting this).
+                        subscription.rescan_from = None;
+                    } else if let Some(message) = state.buffered_messages.get_mut(message_key) {
+                        message.correlated_instances.remove(&instance_key);
+                        // Every OTHER subscription of this instance on the same
+                        // (name, correlation key) that is awaiting its own ack
+                        // skipped this message while it was reserved: its next
+                        // scan must not resume past it.
+                        let entry = (message.seq, *message_key);
+                        for other in state.message_subscriptions.values_mut() {
+                            if other.key != *subscription_key
+                                && other.instance_key == instance_key
+                                && other.awaiting_ack.is_some()
+                                && other.message_name == index_key.0
+                                && other.correlation_key == index_key.1
+                            {
+                                other.rescan_from =
+                                    Some(other.rescan_from.map_or(entry, |r| r.min(entry)));
+                            }
                         }
                     }
                 }
+            }
+        }
+
+        // The instance partition's answer to an ack-paced delivery (#1949),
+        // applied on the EMITTING (instance) partition: record it as that
+        // delivery's durable receipt, so a re-driven duplicate is answered
+        // with exactly this outcome whatever happens to the subscription.
+        Event::MessageCorrelationAcknowledging {
+            accepted,
+            consumed,
+            deferred,
+            delivery_key,
+            ..
+        } => {
+            if *delivery_key != 0 {
+                state.routed_deliveries.set_receipt(
+                    *delivery_key,
+                    CorrelationReceipt {
+                        accepted: *accepted,
+                        consumed: *consumed,
+                        deferred: *deferred,
+                    },
+                );
             }
         }
 

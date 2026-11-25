@@ -151,6 +151,14 @@ pub trait RaftTransport: Send + Sync + 'static {
     fn peer_supports<'a>(&'a self, _target: NodeId, _feature: &'static str) -> BoxFuture<'a, bool> {
         Box::pin(async { true })
     }
+    /// Whether EVERY cluster member — not only this Raft group's — is known
+    /// to support `feature` (#1949): the gate for behaviour whose effects
+    /// cross partitions (a remote delivery lands on another group, possibly
+    /// hosted by members outside this one). Unknown / unreachable answers
+    /// `false`. In-process transports route to this same binary: `true`.
+    fn cluster_supports<'a>(&'a self, _feature: &'static str) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
 }
 
 /// Feeds an inbound RPC into a local Raft instance and returns its response. The
@@ -465,6 +473,10 @@ impl RaftTransport for PeerTransport {
         })
     }
 
+    fn cluster_supports<'a>(&'a self, feature: &'static str) -> BoxFuture<'a, bool> {
+        Box::pin(async move { self.peers.all_peers_support(feature).await })
+    }
+
     fn peer_supports<'a>(&'a self, target: NodeId, feature: &'static str) -> BoxFuture<'a, bool> {
         Box::pin(async move { self.peers.peer_advertises(target as u32, feature).await })
     }
@@ -520,6 +532,7 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
                     ..
                 } => FEATURE_CANCEL_SUSPENDED_INSTANCE,
                 Command::AcknowledgeMessageCorrelation { .. }
+                | Command::ResumeMessageSubscription { .. }
                 | Command::CorrelateMessageSubscription {
                     ack_partition: Some(_),
                     ..
@@ -644,6 +657,9 @@ mod codec_tests {
                 accepted: true,
                 consumed: true,
                 deferred: false,
+            },
+            Command::ResumeMessageSubscription {
+                subscription_key: 1,
             },
             correlate(Some(0)),
         ] {
