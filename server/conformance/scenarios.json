@@ -87,6 +87,41 @@
       ]
     },
     {
+      "name": "update-retries",
+      "steps": [
+        { "id": "deploy", "op": "createDeployment", "resources": ["conformance-service.bpmn"], "compare": "status" },
+        {
+          "id": "create",
+          "op": "createProcessInstance",
+          "body": { "processDefinitionId": "conformance-service", "variables": { "orderId": "o-4" } },
+          "capture": { "pi": ["/processInstanceKey", "/created"] },
+          "compare": "status"
+        },
+        {
+          "id": "activate",
+          "op": "activateJobs",
+          "body": { "type": "conformance-work", "maxJobsToActivate": 1, "timeout": 60000, "worker": "conformance", "requestTimeout": -1 },
+          "capture": { "job": ["/jobs/0/jobKey", "/0/key"] },
+          "compare": "status"
+        },
+        {
+          "id": "fail",
+          "op": "failJob",
+          "params": { "jobKey": "${job}" },
+          "body": { "retries": 1, "errorMessage": "boom", "retryBackOff": 0 },
+          "compare": "status"
+        },
+        { "id": "update-retries", "op": "updateJob", "params": { "jobKey": "${job}" }, "body": { "changeset": { "retries": 5 } }, "compare": "status" },
+        {
+          "id": "activate-after-update",
+          "op": "activateJobs",
+          "body": { "type": "conformance-work", "maxJobsToActivate": 1, "timeout": 60000, "worker": "conformance", "requestTimeout": -1 },
+          "compare": "body"
+        },
+        { "id": "cancel", "op": "cancelProcessInstance", "params": { "processInstanceKey": "${pi}" }, "compare": "status" }
+      ]
+    },
+    {
       "name": "throw-error-and-user-task",
       "steps": [
         { "id": "deploy", "op": "createDeployment", "resources": ["conformance-service.bpmn"], "compare": "status" },
@@ -133,6 +168,12 @@
           "compare": "body"
         },
         { "id": "unassign", "op": "unassignUserTask", "params": { "userTaskKey": "${task}" }, "compare": "status" },
+        {
+          "id": "search-unassigned",
+          "op": "searchUserTasks",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "compare": "body"
+        },
         { "id": "complete-task", "op": "completeUserTask", "params": { "userTaskKey": "${task}" }, "body": { "variables": { "handled": true } }, "compare": "status" },
         {
           "id": "search-completed",

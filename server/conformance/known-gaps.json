@@ -96,5 +96,11 @@
       "/items: server [{\"isTruncated\":false,\"name\":\"orderId\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"o-3\\\"\",\"variableKey\":\"<volatile:string>\"},{\"isTruncated\":false,\"name\":\"reason\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"card-declined\\\"\",\"variableKey\":\"<volatile:string>\"}], wasm [{\"isTruncated\":false,\"name\":\"orderId\",\"processInstanceKey\":\"<volatile:string>\",\"rootProcessInstanceKey\":null,\"scopeKey\":\"<volatile:string>\",\"tenantId\":\"<default>\",\"value\":\"\\\"o-3\\\"\",\"variableKey\":\"<volatile:string>\"}]",
       "/page/totalItems: server 2, wasm 1"
     ]
+  },
+  "update-retries/activate-after-update": {
+    "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
+    "diffs": [
+      "/: server {\"jobs\":[{\"businessId\":null,\"customHeaders\":{},\"deadline\":\"<volatile:number>\",\"elementId\":\"work\",\"elementInstanceKey\":\"<volatile:string>\",\"jobKey\":\"<volatile:string>\",\"jobLeaseToken\":null,\"kind\":\"BPMN_ELEMENT\",\"leaseToken\":null,\"listenerEventType\":\"UNSPECIFIED\",\"physicalTenantId\":\"default\",\"priority\":50,\"processDefinitionId\":\"conformance-service\",\"processDefinitionKey\":\"<volatile:string>\",\"processDefinitionVersion\":1,\"processInstanceKey\":\"<volatile:string>\",\"retries\":5,\"rootProcessInstanceKey\":null,\"tags\":[],\"tenantId\":\"<default>\",\"type\":\"conformance-work\",\"userTask\":null,\"variables\":{\"orderId\":\"o-4\"},\"worker\":\"conformance\"}]}, wasm [{\"bpmnProcessId\":\"conformance-service\",\"businessId\":null,\"customHeaders\":{},\"deadline\":\"<volatile:number>\",\"elementId\":\"work\",\"elementInstanceKey\":\"<volatile:string>\",\"instanceKey\":\"<volatile:string>\",\"jobLeaseToken\":null,\"key\":\"6\",\"priority\":50,\"processDefinitionKey\":\"<volatile:string>\",\"processDefinitionVersion\":1,\"retries\":5,\"tags\":[],\"type\":\"conformance-work\",\"variables\":{\"orderId\":\"o-4\"},\"worker\":\"conformance\"}]"
+    ]
   }
 }
