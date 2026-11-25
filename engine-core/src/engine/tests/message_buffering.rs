@@ -795,3 +795,92 @@ fn buffered_message_never_reaches_a_child_of_an_ended_parent() {
     );
     assert_eq!(engine.state().buffered_messages.len(), 1);
 }
+
+/// Publish-time messageId dedup is an INDEX lookup (#1874, Zeebe's messageId
+/// column family), not a buffer scan: the index tracks every buffered id,
+/// frees an expired id (even before the sweep removes the message), drops it
+/// on expiry, and is re-derived on replay and on snapshot restore.
+#[test]
+fn message_id_dedup_uses_an_index_that_survives_replay_and_restore() {
+    let mut engine = Engine::new();
+    let mut journal: Vec<Event> = Vec::new();
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(process_with_message_catch()), 0)
+            .unwrap(),
+    );
+    for (i, id) in ["m-1", "m-2", "m-3"].iter().enumerate() {
+        journal.extend(
+            engine
+                .apply_command_at(
+                    publish("payment-received", "o-1", Some(1_000 + i as u64), Some(id)),
+                    1_000,
+                )
+                .unwrap(),
+        );
+    }
+    let index_key = |id: &str| {
+        (
+            "payment-received".to_string(),
+            "o-1".to_string(),
+            id.to_string(),
+        )
+    };
+    assert_eq!(engine.state().buffered_message_ids.len(), 3);
+    assert!(engine
+        .state()
+        .buffered_message_ids
+        .contains_key(&index_key("m-2")));
+
+    let is_dup = |e: &mut Engine, id: &str, now: u64| {
+        matches!(
+            e.apply_command_at(
+                publish("payment-received", "o-1", Some(1_000), Some(id)),
+                now
+            ),
+            Err(EngineError::MessageAlreadyExists { .. })
+        )
+    };
+
+    // Replay re-derives the index; a duplicate is still rejected there.
+    let mut replayed = Engine::replay_partition(0, journal);
+    assert_eq!(replayed.state(), engine.state());
+    assert_eq!(
+        replayed.state().buffered_message_ids,
+        engine.state().buffered_message_ids
+    );
+    assert!(is_dup(&mut replayed, "m-2", 1_500));
+
+    // Snapshot restore re-derives the serde-skipped index.
+    #[cfg(feature = "serde")]
+    {
+        let json = serde_json::to_string(&engine.snapshot()).unwrap();
+        let mut restored = Engine::from_snapshot(serde_json::from_str(&json).unwrap());
+        assert_eq!(
+            restored.state().buffered_message_ids,
+            engine.state().buffered_message_ids
+        );
+        assert!(is_dup(&mut restored, "m-3", 1_500));
+    }
+
+    assert!(is_dup(&mut engine, "m-1", 1_500));
+    // m-1 (deadline 2_000) has expired but is not yet swept: still indexed,
+    // yet its id is free again.
+    assert_eq!(engine.state().buffered_messages.len(), 3);
+    engine
+        .apply_command_at(
+            publish("payment-received", "o-1", Some(10_000), Some("m-1")),
+            2_000,
+        )
+        .unwrap();
+    assert!(is_dup(&mut engine, "m-1", 2_100));
+
+    // The sweep removes the expired messages; their index entries go too,
+    // except m-1, which now points at the fresh re-publish.
+    engine
+        .apply_command_at(Command::TriggerTimers { now: 5_000 }, 5_000)
+        .unwrap();
+    assert_eq!(engine.state().buffered_messages.len(), 1);
+    assert_eq!(engine.state().buffered_message_ids.len(), 1);
+    assert!(is_dup(&mut engine, "m-1", 5_000));
+}

@@ -12044,9 +12044,15 @@ impl ServerImpl {
             panic!("injected subscription routing pump failure (test)");
         }
         let num_partitions = self.engine.topology().num_partitions;
-        let mut work = events;
+        // A FIFO queue, not a stack (#1874): follow-ups are routed in the
+        // order the engine emitted them — a buffered backlog drained to a
+        // remote persistent subscription arrives oldest first, and an
+        // Opening is never overtaken by its own later Closing. A cascade's
+        // produced follow-ups are routed before the remaining siblings
+        // (depth-first), in their own emission order.
+        let mut work: std::collections::VecDeque<Event> = events.into();
         let mut all_delivered = true;
-        while let Some(event) = work.pop() {
+        while let Some(event) = work.pop_front() {
             let Some((target, command)) = Self::route_event(&event, num_partitions) else {
                 continue;
             };
@@ -12066,7 +12072,9 @@ impl ServerImpl {
                         panic!("injected mid-cascade routing pump failure (test)");
                     }
                     release(&event);
-                    work.extend(produced);
+                    for follow_up in produced.into_iter().rev() {
+                        work.push_front(follow_up);
+                    }
                 }
                 Err(RouteFailure::Rejected) => {
                     all_delivered = false;
@@ -12610,19 +12618,7 @@ impl ServerImpl {
         if !Self::has_routable_subscription_events(events) {
             return;
         }
-        let routable: Vec<Event> = events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Event::MessageSubscriptionOpening { .. }
-                        | Event::RemoteMessageCorrelation { .. }
-                        | Event::MessageSubscriptionClosing { .. }
-                        | Event::StartInstanceDispatched { .. }
-                )
-            })
-            .cloned()
-            .collect();
+        let routable = Self::routable_events(events);
         let server = self.clone();
         tokio::spawn(async move {
             server
@@ -56181,8 +56177,8 @@ mod subscription_placement_tests {
 
         // Pick two correlation keys that map to two DISTINCT partitions, both
         // distinct from `create_partition`. Note: `drive_subscription_routing_now`
-        // pops from the back of `work`, so `catch_b` is routed first and
-        // `catch_a` second — stall whichever target is popped first.
+        // routes `work` in emission order (FIFO, #1874), so `catch_a` is routed
+        // first and `catch_b` second — stall whichever target is routed first.
         let key_a = cross_partition_order(create_partition);
         let target_a = nanobpmn_engine_core::subscription_partition(&key_a, 4);
         let key_b = (0..256u32)
@@ -56195,10 +56191,10 @@ mod subscription_placement_tests {
         let target_b = nanobpmn_engine_core::subscription_partition(&key_b, 4);
         assert_ne!(target_a, target_b);
 
-        // Stall `target_b` (the first target popped by `work.pop()`), leaving
-        // `target_a` completely healthy.
+        // Stall `target_a` (the first target routed), leaving `target_b`
+        // completely healthy.
         let stalled_engine = server
-            .engine_handle_for(target_b)
+            .engine_handle_for(target_a)
             .expect("the stalled target partition is local");
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
@@ -56210,7 +56206,7 @@ mod subscription_placement_tests {
                 })
                 .await;
         });
-        parked_rx.await.expect("the barrier holds target_b's actor");
+        parked_rx.await.expect("the barrier holds target_a's actor");
 
         let mut variables = std::collections::BTreeMap::new();
         variables.insert("keyA".to_string(), Value::Str(key_a.clone()));
@@ -56245,20 +56241,20 @@ mod subscription_placement_tests {
         );
         let created = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
-            .expect("the create answers at commit despite stalled target_b")
+            .expect("the create answers at commit despite stalled target_a")
             .expect("the detached owner is alive")
             .expect("the create applied");
         assert!(
-            server.publication_gate.is_pending("msg-a", &key_a),
-            "msg-a's open is pending while target_b stalls the serial pump"
+            server.publication_gate.is_pending("msg-b", &key_b),
+            "msg-b's open is pending while target_a stalls the serial pump"
         );
 
-        // Publish to the HEALTHY second target (`msg-a` / `key_a`) while
-        // `target_b` stays stalled past the 80ms gate deadline. Must return a
+        // Publish to the HEALTHY second target (`msg-b` / `key_b`) while
+        // `target_a` stays stalled past the 80ms gate deadline. Must return a
         // retryable 503 — NOT 200 (unmatched, silently losing the message).
         let publish_req = models::MessagePublicationRequest {
-            name: "msg-a".to_string(),
-            correlation_key: Some(key_a.clone()),
+            name: "msg-b".to_string(),
+            correlation_key: Some(key_b.clone()),
             time_to_live: None,
             message_id: None,
             variables: None,
@@ -56276,14 +56272,14 @@ mod subscription_placement_tests {
                     _
                 )
             ),
-            "publish to healthy target_a while open is still pending must fail retryably with 503, got: {pub_resp:?}"
+            "publish to healthy target_b while open is still pending must fail retryably with 503, got: {pub_resp:?}"
         );
 
         // Same for `correlate_message_impl`: must return retryable 503, NOT
         // 404 (which would falsely claim no subscription matched).
         let corr_req = models::MessageCorrelationRequest {
-            name: "msg-a".to_string(),
-            correlation_key: Some(key_a.clone()),
+            name: "msg-b".to_string(),
+            correlation_key: Some(key_b.clone()),
             variables: None,
             tenant_id: None,
             business_id: None,
@@ -56299,11 +56295,11 @@ mod subscription_placement_tests {
                     _
                 )
             ),
-            "correlate to healthy target_a while open is still pending must fail retryably with 503, got: {corr_resp:?}"
+            "correlate to healthy target_b while open is still pending must fail retryably with 503, got: {corr_resp:?}"
         );
 
-        // Release target_b's stall; the routing pump now delivers both opens
-        // and releases the gate. Retrying correlation for msg-a must succeed
+        // Release target_a's stall; the routing pump now delivers both opens
+        // and releases the gate. Retrying correlation for msg-b must succeed
         // and correlate to the instance.
         release_tx.send(()).expect("the barrier is parked");
         barrier.await.expect("the barrier completes");
@@ -56320,6 +56316,218 @@ mod subscription_placement_tests {
             }
             other => panic!("retried correlate after stall cleared must correlate, got: {other:?}"),
         }
+    }
+
+    /// A main flow parked on a service task (`work`) plus a message event
+    /// sub-process keyed on `orderId` whose handler parks on a `handle` job,
+    /// so every delivery leaves a job (keyed in arrival order on the instance
+    /// partition) carrying that message's variables.
+    fn buffered_esp_process(process_id: &str, interrupting: bool) -> ProcessDefinition {
+        use nanobpmn_engine_core::EventSubProcessTrigger as Trig;
+        ProcessBuilder::new(process_id)
+            .start_event("s")
+            .service_task("work", "work")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .event_sub_process(
+                "esp",
+                "esp_start",
+                Trig::Message {
+                    message_name: "drain".into(),
+                    correlation_key: "orderId".into(),
+                },
+                interrupting,
+            )
+            .start_event("esp_start")
+            .service_task("handle", "handle")
+            .end_event("esp_end")
+            .connect("esp_start", "handle")
+            .connect("handle", "esp_end")
+            .contained_in("esp_start", "esp")
+            .contained_in("handle", "esp")
+            .contained_in("esp_end", "esp")
+            // Capture THIS delivery's `seq` locally at activation: the message
+            // variables also propagate to the root scope, where later
+            // deliveries overwrite them.
+            .with_io(
+                "handle",
+                nanobpmn_engine_core::IoMapping {
+                    inputs: vec![nanobpmn_engine_core::Mapping {
+                        source: "=seq".into(),
+                        target: "mySeq".into(),
+                    }],
+                    outputs: Vec::new(),
+                },
+            )
+            .build()
+            .expect("valid process")
+    }
+
+    /// End-to-end #1874 (multi-partition): three messages are BUFFERED on the
+    /// correlation key's partition, then an instance on ANOTHER partition opens
+    /// a message event sub-process subscription. The host routing pump must
+    /// deliver the remote correlations in publish order; returns the `seq`
+    /// variable each `handle` job saw, in job (= delivery) order, and — per
+    /// buffered message, in publish order — how many instances it has
+    /// correlated to (a correlated message stays buffered until it expires,
+    /// Zeebe parity).
+    async fn drain_buffered_backlog_remotely(interrupting: bool) -> (Vec<Value>, Vec<usize>) {
+        let server = single_node_multi_partition();
+        let process_id = if interrupting {
+            "drain-int"
+        } else {
+            "drain-ni"
+        };
+        let mut names = std::collections::HashMap::new();
+        names.insert(process_id.to_string(), format!("{process_id}.bpmn"));
+        server
+            .deploy_resources_locally(
+                vec![buffered_esp_process(process_id, interrupting)],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy");
+
+        let create_partition = server.engine.for_create().stats().partition;
+        let order = cross_partition_order(create_partition);
+        let sub_partition = nanobpmn_engine_core::subscription_partition(&order, 4);
+        assert_ne!(sub_partition, create_partition);
+
+        // Publish through the engine with a TTL (REST `timeToLive` wiring is
+        // the follow-up #1943), on the partition that buffers the key.
+        for seq in 1..=3i64 {
+            let mut variables = std::collections::BTreeMap::new();
+            variables.insert("seq".to_string(), Value::Int(seq));
+            let applied = server
+                .apply_routed_command(
+                    sub_partition,
+                    Command::CorrelateMessage {
+                        message_name: "drain".into(),
+                        correlation_key: order.clone(),
+                        variables,
+                        business_id: None,
+                        message_key: None,
+                        time_to_live: Some(60_000),
+                        message_id: None,
+                    },
+                    None,
+                )
+                .await;
+            assert!(matches!(applied, RoutedApply::Applied(_)), "publish {seq}");
+        }
+        let sub_engine = server
+            .engine_handle_for(sub_partition)
+            .expect("the subscription partition is local");
+        assert_eq!(
+            sub_engine.with(|j| j.state().buffered_messages.len()).await,
+            3,
+            "all three messages are buffered on the correlation key's partition"
+        );
+
+        let create_engine = server
+            .engine_handle_for(create_partition)
+            .expect("the create partition is local");
+        let mut variables = std::collections::BTreeMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+        let pid = process_id.to_string();
+        let accounting = CreateAccounting::enter(&server, 0);
+        let rx = server.submit_create_detached_on(
+            accounting,
+            create_engine.clone(),
+            move |engine| {
+                let (process_id, sel_key, sel_ver) =
+                    resolve_create_selector(engine.state(), Some(pid), None, None)?;
+                apply_create_instance_direct(
+                    engine,
+                    Command::create_instance_versioned(
+                        process_id.clone(),
+                        variables,
+                        Vec::new(),
+                        None,
+                        sel_key,
+                        sel_ver,
+                    ),
+                    &process_id,
+                    None,
+                )
+                .map_err(|e| (500, e.to_string()))
+            },
+            None,
+        );
+        let instance_key = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the create is answered")
+            .expect("the detached owner is alive")
+            .expect("the create applied")
+            .instance_key;
+
+        let expected_jobs = if interrupting { 1 } else { 3 };
+        let handle_jobs = || async {
+            create_engine
+                .with(move |j| {
+                    j.state()
+                        .jobs
+                        .values()
+                        .filter(|job| job.instance_key == instance_key && job.job_type == "handle")
+                        .map(|job| {
+                            j.engine()
+                                .element_variables(instance_key, job.element_instance_key)
+                                .get("mySeq")
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect::<Vec<Value>>()
+                })
+                .await
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handle_jobs().await.len() < expected_jobs {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the routed correlations reach the instance partition");
+        // Let any (wrong) extra delivery land before asserting exactly-N.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let seen = handle_jobs().await;
+        let correlated = sub_engine
+            .with(|j| {
+                let mut messages: Vec<_> = j.state().buffered_messages.values().collect();
+                messages.sort_by_key(|m| m.seq);
+                messages
+                    .iter()
+                    .map(|m| m.correlated_instances.len())
+                    .collect::<Vec<usize>>()
+            })
+            .await;
+        (seen, correlated)
+    }
+
+    /// #1874: a REMOTE non-interrupting (persistent) subscription drains the
+    /// whole buffered backlog in PUBLISH order. The host pump used to route
+    /// follow-ups as a stack (`Vec::pop`), delivering the newest first.
+    #[tokio::test]
+    async fn remote_persistent_subscription_drains_buffer_in_publish_order() {
+        let (seen, correlated) = drain_buffered_backlog_remotely(false).await;
+        assert_eq!(seen, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert_eq!(correlated, vec![1, 1, 1]);
+    }
+
+    /// #1874: a REMOTE interrupting subscription takes exactly one buffered
+    /// message — the oldest — and the rest stay buffered.
+    #[tokio::test]
+    async fn remote_interrupting_subscription_takes_only_the_oldest_buffered() {
+        let (seen, correlated) = drain_buffered_backlog_remotely(true).await;
+        assert_eq!(seen, vec![Value::Int(1)]);
+        assert_eq!(
+            correlated,
+            vec![1, 0, 0],
+            "only the oldest correlates; the two newer stay buffered, uncorrelated"
+        );
     }
 
     /// #1604 (crash recovery): if a single-node server crashes AFTER the

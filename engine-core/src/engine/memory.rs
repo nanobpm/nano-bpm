@@ -103,6 +103,8 @@ impl Engine {
         snapshot.state.deferred_jobs = deferred.into_iter().collect();
         // The parent -> children index (#1827) is serde-skipped too.
         snapshot.state.rebuild_children_index();
+        // So is the buffered messageId index (#1874).
+        snapshot.state.rebuild_buffered_message_id_index();
         Self {
             state: snapshot.state,
             partition_id: snapshot.partition_id,

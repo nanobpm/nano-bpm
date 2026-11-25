@@ -25,19 +25,16 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
         } => {
             let seq = state.next_buffered_seq;
             state.next_buffered_seq = seq.saturating_add(1);
-            state.buffered_messages.insert(
-                *message_key,
-                BufferedMessage {
-                    key: *message_key,
-                    message_name: message_name.clone(),
-                    correlation_key: correlation_key.clone(),
-                    deadline: *deadline,
-                    message_id: message_id.clone(),
-                    variables: variables.clone(),
-                    correlated_instances: correlated_instances.iter().copied().collect(),
-                    seq,
-                },
-            );
+            state.insert_buffered_message(BufferedMessage {
+                key: *message_key,
+                message_name: message_name.clone(),
+                correlation_key: correlation_key.clone(),
+                deadline: *deadline,
+                message_id: message_id.clone(),
+                variables: variables.clone(),
+                correlated_instances: correlated_instances.iter().copied().collect(),
+                seq,
+            });
         }
         Event::BufferedMessageCorrelated {
             message_key,
@@ -49,7 +46,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             }
         }
         Event::MessageExpired { message_key, .. } => {
-            state.buffered_messages.remove(message_key);
+            state.remove_buffered_message(*message_key);
         }
 
         Event::MessageSubscriptionCreated {

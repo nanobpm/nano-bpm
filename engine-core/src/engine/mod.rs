@@ -2618,6 +2618,8 @@ impl Engine {
                     // cascade reads (#1827): a write path that bypassed it fails here.
                     #[cfg(test)]
                     self.state.assert_children_index_covers_instances();
+                    #[cfg(test)]
+                    self.state.assert_buffered_message_id_index_consistent();
                     log
                 });
         self.operation_reference = None;
@@ -4838,12 +4840,12 @@ impl Engine {
                         // buffered for the same name + correlation key is
                         // ALREADY_EXISTS. An expired-but-unswept message no
                         // longer counts.
-                        if self.state.buffered_messages.values().any(|m| {
-                            m.is_live_at(now)
-                                && m.message_id.as_deref() == Some(id)
-                                && m.message_name == message_name
-                                && m.correlation_key == correlation_key
-                        }) {
+                        // Indexed lookup, not a buffer scan: O(log n) per publish.
+                        if self
+                            .state
+                            .live_buffered_message_by_id(&message_name, &correlation_key, id, now)
+                            .is_some()
+                        {
                             return Err(EngineError::MessageAlreadyExists {
                                 message_name,
                                 correlation_key,
