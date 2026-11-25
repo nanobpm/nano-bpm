@@ -19,7 +19,7 @@
 //! L3  event → model, state::types
 //! L4  command · agent · lease → L0..L3
 //! L5  validate → model      bpmn → model, xml, validate
-//! L6  engine → L0..L5       ffi → engine, bpmn, json
+//! L6  engine → L0..L5       ffi → engine, bpmn, json   problem → engine
 //! ```
 //!
 //! A `use crate::<module>` import from a module at level *Ls* to one at level
@@ -82,6 +82,7 @@ const MODULES: &[&str] = &[
     "bpmn",
     "engine",
     "ffi",
+    "problem",
 ];
 
 /// The layer of each module (the allowed-edges table's spine). `None` is
@@ -94,7 +95,7 @@ fn module_level(module: &str) -> Option<u32> {
         "event" => 3,
         "command" | "agent" | "lease" => 4,
         "validate" | "bpmn" => 5,
-        "engine" | "ffi" => 6,
+        "engine" | "ffi" | "problem" => 6,
         _ => return None,
     })
 }

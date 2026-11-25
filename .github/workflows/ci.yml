@@ -612,6 +612,12 @@ jobs:
         # engine-wasm/pkg. Guards the guard injected by scripts/inject-free-guard.mjs.
         run: npm install && npm test
         working-directory: engine-wasm/tests/use-after-free
+      - name: ProblemDetail error contract (#1937)
+        # Engine rejections throw a JS Error carrying status/title/detail/
+        # nonRetryable from the shared engine-core mapping (the one the REST
+        # gateway uses), for both entrypoints of the freshly built pkg.
+        run: npm install && npm test
+        working-directory: engine-wasm/tests/problem-detail
       - name: AgentInstance/AgentHistory + element-support e2e (read-model TestEngine)
         # The probe behind `make engine-wasm-agent-instance-e2e`, run directly so
         # it reuses the package built above instead of rebuilding it.

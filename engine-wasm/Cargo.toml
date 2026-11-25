@@ -41,6 +41,8 @@ serde_json = "1"
 nanobpmn-search = { path = "../server/crates/nano-search", default-features = false, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# Builds the ProblemDetail-shaped JS `Error` engine rejections throw (#1937).
+js-sys = "0.3"
 nanobpmn-read-model = { path = "../read-model", default-features = false, features = ["wasm"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
