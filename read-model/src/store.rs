@@ -5194,13 +5194,18 @@ fn project_engine_state(
     // 10) Open message subscriptions (waiting states). A settled subscription
     //     (Correlated/Canceled) is retained in engine state as an audit trail but
     //     is not a live wait, so the event projector deletes its read-model row;
-    //     mirror that by projecting only the open ones.
+    //     mirror that by projecting only the open ones. An ack-paced (#1949)
+    //     subscription awaiting its acknowledgement is still a live wait (the
+    //     event projector keeps it until the ack settles it), even when a
+    //     one-shot reservation already marked it `Correlated`; its captured
+    //     paced-correlation metadata is rebuilt below so the ack still
+    //     records history after the reseed.
     for sub in state.message_subscriptions.values() {
         let open = matches!(
             sub.state,
             nanobpmn_engine_core::MessageSubscriptionState::Open
                 | nanobpmn_engine_core::MessageSubscriptionState::Opening
-        );
+        ) || sub.awaiting_ack.is_some();
         if open && is_tracked_message_wait(sub.element_instance_key, &sub.kind) {
             let non_interrupting = is_non_interrupting(&sub.kind);
             tx.cexecute(
@@ -5225,6 +5230,22 @@ fn project_engine_state(
                     non_interrupting as i64,
                 ],
             )?;
+            if let Some(awaiting) = &sub.awaiting_ack {
+                tx.cexecute(
+                    "INSERT OR REPLACE INTO paced_message_correlations (subscription_key, \
+                     message_key, instance_key, element_instance_key, element_id, \
+                     message_name, correlation_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        sub.key as i64,
+                        awaiting.message_key as i64,
+                        sub.instance_key as i64,
+                        wait_host_key(sub.instance_key, sub.element_instance_key) as i64,
+                        sub.element_id,
+                        sub.message_name,
+                        sub.correlation_key,
+                    ],
+                )?;
+            }
         }
     }
 
@@ -13558,6 +13579,54 @@ mod element_instance_tests {
             .unwrap();
         assert_eq!(store.message_subscriptions().len(), 1);
         assert_eq!(store.correlated_message_subscriptions().len(), 1);
+        assert_eq!(paced_in_flight(&store), 0);
+    }
+
+    /// #1949 (operator review): a reseed from engine state while an
+    /// ack-paced delivery is in flight must rebuild both the open wait (a
+    /// one-shot reservation already marked the subscription `Correlated`)
+    /// and its captured metadata, so the later consuming ack still settles
+    /// the wait and records history — exactly as the event projector would.
+    #[test]
+    fn reseed_then_ack_records_paced_correlation() {
+        use nanobpmn_engine_core::{
+            AwaitingAck, MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState,
+            State,
+        };
+        let mut state = State::default();
+        state.message_subscriptions.insert(
+            3501,
+            MessageSubscription {
+                key: 3501,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".into(),
+                message_name: "OrderPlaced".into(),
+                correlation_key: "P1".into(),
+                state: MessageSubscriptionState::Correlated,
+                kind: MessageSubscriptionKind::IntermediateCatch,
+                correlated_message_keys: Default::default(),
+                awaiting_ack: Some(AwaitingAck {
+                    message_key: 51,
+                    delivery_key: 951,
+                }),
+                rescan_from: None,
+                resume_pending: false,
+                resume_generation: 0,
+            },
+        );
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1, "wait reseeded");
+        assert_eq!(paced_in_flight(&store), 1, "capture reseeded");
+        store.export(&[&paced_ack(3501, 51, false, true)]).unwrap();
+        assert!(store.message_subscriptions().is_empty());
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].message_key, 51);
+        assert_eq!(corr[0].element_instance_key, TASK_EI);
+        assert_eq!(corr[0].message_name, "OrderPlaced");
         assert_eq!(paced_in_flight(&store), 0);
     }
 
