@@ -61,6 +61,15 @@ for h in "${HARNESSES[@]}"; do
   while read -r sat total; do
     [[ "$sat" == "$total" ]] || cover_bad="$sat of $total"
   done < <(sed -nE 's/^[[:space:]]*\*\* ([0-9]+) of ([0-9]+) cover properties satisfied.*/\1 \2/p' "$log")
+  # Fail closed if the summary format drifts: any per-cover result that is not
+  # SATISFIED is bad, and a log with cover results but no parsed summary is bad.
+  if grep -qiE 'cover.*(UNSATISFIABLE|UNREACHABLE)|(UNSATISFIABLE|UNREACHABLE).*cover' "$log"; then
+    cover_bad="${cover_bad:-some} (unsatisfied cover result reported)"
+  fi
+  if grep -qiE 'kani::cover|cover property|cover_' "$log" \
+     && ! grep -qE '^[[:space:]]*\*\* [0-9]+ of [0-9]+ cover properties satisfied' "$log"; then
+    cover_bad="${cover_bad:-unknown} (cover summary line not found)"
+  fi
   rm -f "$log"
   if [[ $rc -ne 0 ]]; then
     echo "::error::kani $h failed (exit $rc, ${elapsed}s; 124 = exceeded ${HARNESS_TIMEOUT}s box)"
