@@ -17,7 +17,7 @@ import { loadGraphs } from '../../corpus/generate.mjs'
 import { readSpec, tlaJar } from '../../corpus/exhaustive.mjs'
 import {
   acceptanceFromLog, captureScript, casesFor, decisionsFromLog, inSpecVocabulary, isCyclic,
-  modelDecisions, observedDecisions, parseArgs, signatureOf, stepMilestones, traceMilestones,
+  checkCapturedPins, modelDecisions, observedDecisions, parseArgs, pinnedSha, signatureOf, stepMilestones, traceMilestones,
   validateTrace
 } from './zeebe-conformance.mjs'
 
@@ -49,6 +49,39 @@ test('arguments parse; unknown ones are rejected', () => {
   assert.ok(!a.corpus)
   assert.throws(() => parseArgs(['--nope']), /unknown argument/)
   assert.throws(() => parseArgs(['--bound']), /needs a value/)
+})
+
+test('--jobs must be a positive integer: zero or NaN workers would validate nothing (#1964)', () => {
+  for (const bad of ['0', '-1', 'x', '1.5', '']) {
+    assert.throws(() => parseArgs(['--jobs', bad]), /--jobs must be a positive integer/)
+  }
+  assert.equal(parseArgs(['--jobs', '3']).jobs, 3)
+})
+
+test('--captured traces must carry the current Zeebe pin (#1964)', () => {
+  const pin = pinnedSha()
+  assert.match(pin, /^[0-9a-f]{40}$/)
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zc-pin-'))
+  try {
+    const g = path.join(root, 'goldens')
+    fs.mkdirSync(g)
+    const write = (p, z) => {
+      fs.writeFileSync(path.join(g, 'PIN'), p == null ? '' : `${p}\n`)
+      fs.writeFileSync(path.join(g, 'a.trace.json'), JSON.stringify(z === undefined ? {} : { zeebePin: z }))
+    }
+    write(pin, pin)
+    checkCapturedPins(root, ['a'], pin)
+    write('old', pin)
+    assert.throws(() => checkCapturedPins(root, ['a'], pin), /Zeebe pin old/)
+    fs.rmSync(path.join(g, 'PIN'))
+    assert.throws(() => checkCapturedPins(root, ['a'], pin), /missing PIN/)
+    write(pin, 'old')
+    assert.throws(() => checkCapturedPins(root, ['a'], pin), /trace a is for Zeebe pin old/)
+    write(pin, undefined)
+    assert.throws(() => checkCapturedPins(root, ['a'], pin), /trace a is for Zeebe pin \(missing\)/)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('only graphs in the ZeebeTokenFlow vocabulary are in scope', () => {

@@ -70,7 +70,12 @@ export function parseArgs (argv) {
     else if (x === '--graph') a.graphs.push(val())
     else if (x === '--work') a.work = val()
     else if (x === '--captured') a.captured = val()
-    else if (x === '--jobs') a.jobs = Number(val())
+    else if (x === '--jobs') {
+      const v = val()
+      // A zero/NaN worker count would run no validation and "pass" (#1964).
+      if (!/^[1-9][0-9]*$/.test(v)) throw new Error(`--jobs must be a positive integer, got ${JSON.stringify(v)}`)
+      a.jobs = Number(v)
+    }
     else if (x === '--file') a.file = true
     else throw new Error(`unknown argument: ${x}`)
   }
@@ -361,6 +366,25 @@ function fileIssue (d, sig) {
   return { known: false, ref: r.out.trim() }
 }
 
+/** The Zeebe commit pinned in formal/parity/zeebe-pin.json (the one pin). */
+export const pinnedSha = () =>
+  JSON.parse(fs.readFileSync(path.join(here, '..', '..', 'parity', 'zeebe-pin.json'), 'utf8')).sha
+
+/**
+ * Reject a `--captured` trace dir not captured on `pin`: its PIN file and every
+ * case's golden `zeebePin` must equal it, else a stale capture would be
+ * "validated" in place of the pinned engine's behaviour (#1964).
+ */
+export function checkCapturedPins (root, names, pin) {
+  const pinFile = path.join(root, 'goldens', 'PIN')
+  const filePin = fs.existsSync(pinFile) ? fs.readFileSync(pinFile, 'utf8').trim() : null
+  if (filePin !== pin) throw new Error(`captured traces in ${root} are for Zeebe pin ${filePin ?? '(missing PIN)'}, expected ${pin}`)
+  for (const name of names) {
+    const golden = JSON.parse(fs.readFileSync(path.join(root, 'goldens', `${name}.trace.json`), 'utf8'))
+    if (golden.zeebePin !== pin) throw new Error(`captured trace ${name} is for Zeebe pin ${golden.zeebePin ?? '(missing)'}, expected ${pin}`)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 
@@ -368,13 +392,15 @@ async function main (argv) {
   const args = parseArgs(argv)
   const graphs = selectGraphs(args)
   if (graphs.length === 0) throw new Error('no graphs selected')
-  const work = args.work ?? fs.mkdtempSync(path.join(os.tmpdir(), 'nano-zeebe-conformance-'))
+  // Absolute: runTlc runs TLC with cwd inside it, so a relative path would re-resolve (#1964).
+  const work = args.work ? path.resolve(args.work) : fs.mkdtempSync(path.join(os.tmpdir(), 'nano-zeebe-conformance-'))
   fs.mkdirSync(work, { recursive: true })
   const cases = graphs.flatMap(casesFor)
   console.log(`conformance: ${graphs.length} graph(s), ${cases.length} scenario(s), work dir ${work}`)
 
   const root = args.captured ?? path.join(work, 'traces')
-  if (!args.captured) {
+  if (args.captured) checkCapturedPins(root, cases.map((c) => c.name), pinnedSha())
+  else {
     stage(root, cases)
     console.log('conformance: capturing on the pinned Zeebe engine (formal/traces/capture.sh)…')
     capture(root, path.join(work, 'capture.log'))
