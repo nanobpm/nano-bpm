@@ -6,7 +6,7 @@ set -euo pipefail
 
 KANI_VERSION="0.67.0"
 # An explicit KANI_UNWIND overrides every harness (--unwind beats
-# #[kani::unwind]); otherwise each harness's own attribute wins and 4 is only
+# #[kani::unwind]); otherwise each harness's own attribute wins and 3 is only
 # the default for loops a harness does not bound itself.
 if [[ -n "${KANI_UNWIND:-}" ]]; then
   UNWIND_ARGS=(--unwind "$KANI_UNWIND")
@@ -55,6 +55,12 @@ for h in "${HARNESSES[@]}"; do
   echo "::endgroup::"
   elapsed=$(( $(date +%s) - start ))
   grep -E '^(VERIFICATION:|Verification Time:|Complete - )' "$log" || true
+  # Kani reports an unreachable `kani::cover!` without failing the run; treat
+  # it as a vacuous proof (a guarded branch the harness never exercises).
+  if grep -qE 'Status: (UNSATISFIABLE|UNREACHABLE)' "$log"; then
+    echo "::error::kani $h has an unsatisfiable/unreachable cover! (vacuous branch)"
+    rc=1
+  fi
   rm -f "$log"
   if [[ $rc -ne 0 ]]; then
     echo "::error::kani $h failed (exit $rc, ${elapsed}s; 124 = exceeded ${HARNESS_TIMEOUT}s box)"

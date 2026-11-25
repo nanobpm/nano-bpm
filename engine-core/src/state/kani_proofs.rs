@@ -53,10 +53,14 @@ fn assert_bounded_join_invariant<const N: usize>(arrivals: &BoundedArrivals<N>) 
 #[kani::unwind(4)]
 #[kani::solver(cadical)]
 fn flow_arrivals_preserve_join_invariant() {
-    const FLOWS: u8 = 3;
+    // FLOWS = 2 with 3 steps lets two arrivals fill every flow before a
+    // third step fires the join; the `cover!` below fails the proof if the
+    // firing branch ever becomes unreachable (vacuous) again.
+    const FLOWS: u8 = 2;
+    const JOIN_STEPS: usize = 3;
     let mut ghost = [0usize; FLOWS as usize];
     let mut arrivals = BoundedArrivals::<{ FLOWS as usize }>::default();
-    for _ in 0..STEPS {
+    for _ in 0..JOIN_STEPS {
         let f: u8 = kani::any();
         kani::assume(f < FLOWS);
         match kani::any::<u8>() % 3 {
@@ -74,6 +78,7 @@ fn flow_arrivals_preserve_join_invariant() {
                 // token (`Engine::activate_join`).
                 kani::assume(arrivals.distinct_flows() == usize::from(FLOWS));
                 arrivals.consume_one_each();
+                kani::cover!(true, "join firing branch is reachable");
                 for g in &mut ghost {
                     *g -= 1;
                 }
