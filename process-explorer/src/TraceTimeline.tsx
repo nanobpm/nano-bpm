@@ -190,11 +190,19 @@ function ElementRow({
         {el.elementId}
         {el.incidents > 0 && <span className="ml-1 text-danger">⚠</span>}
       </div>
+      <div
+        className="w-28 shrink-0 font-mono text-[11px] text-fg-faint"
+        title={`entered ${fmt.clock(el.enteredAt)}`}
+      >
+        {fmt.clock(el.enteredAt)}
+      </div>
       <div className="relative h-6 flex-1 rounded bg-inset">
         <div
           className="absolute top-1/2 h-3 -translate-y-1/2 rounded-sm bg-edge-strong"
           style={{ left: `${left}%`, width: `${width}%` }}
-          title={`${el.elementId} · ${headline.title}`}
+          title={`${el.elementId} · ${fmt.clock(el.enteredAt)} → ${
+            el.exitedAt != null ? fmt.clock(el.exitedAt) : "…"
+          } · ${fmt.duration(el.durationMs)} · ${headline.title}`}
         />
         {job && <JobBars job={job} pct={pct} fmt={fmt} />}
       </div>
@@ -230,7 +238,7 @@ function JobBars({
         key="q"
         className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-l-sm bg-warn/80"
         style={{ left: `${qLeft}%`, width: `${qWidth}%` }}
-        title={`queue ${fmt.duration(job.queueMs)} · worker ${job.worker ?? "—"}`}
+        title={`queue ${fmt.duration(job.queueMs)} · created ${fmt.clock(created)} → activated ${fmt.clock(activated)} · worker ${job.worker ?? "—"}`}
       />,
     );
     const sEnd = completed ?? activated;
@@ -241,7 +249,7 @@ function JobBars({
         key="s"
         className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-r-sm bg-ok/80"
         style={{ left: `${sLeft}%`, width: `${sWidth}%` }}
-        title={`service ${fmt.duration(job.serviceMs)} · worker ${job.worker ?? "—"}`}
+        title={`service ${fmt.duration(job.serviceMs)} · activated ${fmt.clock(activated)} → completed ${completed != null ? fmt.clock(completed) : "…"} · worker ${job.worker ?? "—"}`}
       />,
     );
   } else {
@@ -253,7 +261,7 @@ function JobBars({
         key="w"
         className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-sm bg-warn/50"
         style={{ left: `${left}%`, width: `${width}%` }}
-        title={`wait ${fmt.duration(job.waitMs)} (activation not observed)`}
+        title={`wait ${fmt.duration(job.waitMs)} · created ${fmt.clock(created)} → completed ${completed != null ? fmt.clock(completed) : "…"} (activation not observed)`}
       />,
     );
   }
