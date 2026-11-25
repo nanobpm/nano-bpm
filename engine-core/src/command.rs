@@ -455,6 +455,9 @@ pub enum Command {
     /// ([`crate::Event::MessageBuffered`]); a subscription opened before that
     /// deadline correlates the oldest still-buffered message its instance has
     /// not already correlated ([`crate::Event::BufferedMessageCorrelated`]).
+    /// Buffered delivery is currently **partition-local**: a subscription
+    /// whose instance lives on another partition is skipped, so the message
+    /// stays buffered until it expires (cross-partition delivery is #1949).
     /// `TriggerTimers` expires buffered messages past their deadline
     /// ([`crate::Event::MessageExpired`]). A `time_to_live` of `None`/`0`
     /// never buffers: the message correlates at publish time only, otherwise

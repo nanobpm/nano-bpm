@@ -220,7 +220,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   retained so it never re-correlates. A message published with a positive
   `time_to_live` is **buffered** (#1874, Zeebe parity: `MessageBuffered`) until
   `now + ttl`; a subscription opened before then correlates the oldest buffered
-  message its instance has not already taken (`BufferedMessageCorrelated`),
+  message its instance has not already taken (`BufferedMessageCorrelated`) —
+  delivery is currently partition-local (a subscription on another partition
+  leaves the message buffered until expiry; cross-partition delivery is #1949),
   `TriggerTimers` expires it (`MessageExpired`), and a `message_id` still
   buffered for the same name and correlation key is rejected. TTL 0 (the
   default) correlates at publish time only, otherwise the message is dropped.
