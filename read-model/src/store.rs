@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -88,7 +88,7 @@ const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 8122877193281723944;
+const SCHEMA_FINGERPRINT: i64 = 5412230291263395802;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -144,6 +144,7 @@ const PROCESS_INSTANCE_HISTORY_TABLES: &[(&str, &str)] = &[
     ("message_subscriptions", "instance_key"),
     ("event_waits", "instance_key"),
     ("correlated_message_subscriptions", "instance_key"),
+    ("paced_message_correlations", "instance_key"),
     ("agent_history", "process_instance_key"),
     ("agent_instances", "process_instance_key"),
     ("process_instances", "key"),
@@ -411,6 +412,20 @@ CREATE TABLE correlated_message_subscriptions (
     PRIMARY KEY (message_key, subscription_key)
 );
 CREATE INDEX idx_correlated_message_subscriptions_instance ON correlated_message_subscriptions(instance_key);
+-- In-flight ack-paced (#1949) deliveries: the open wait's metadata captured at
+-- reservation time, so a consuming acknowledgement still records history after
+-- a routed close already dropped the open wait. Removed on a settling ack.
+CREATE TABLE paced_message_correlations (
+    subscription_key       INTEGER NOT NULL,
+    message_key            INTEGER NOT NULL,
+    instance_key           INTEGER NOT NULL,
+    element_instance_key   INTEGER NOT NULL,
+    element_id             TEXT NOT NULL,
+    message_name           TEXT NOT NULL,
+    correlation_key        TEXT NOT NULL,
+    PRIMARY KEY (subscription_key, message_key)
+);
+CREATE INDEX idx_paced_message_correlations_instance ON paced_message_correlations(instance_key);
 CREATE TABLE forms (
     form_key      INTEGER PRIMARY KEY,
     form_id       TEXT NOT NULL,
@@ -5577,6 +5592,46 @@ fn project(
 /// Records a message correlation's history row and settles its open wait
 /// row (kept for a non-interrupting boundary, which can correlate again).
 /// `host_key` is the wait's [`wait_host_key`].
+/// One instance-scoped `correlated_message_subscriptions` history row.
+struct CorrelationHistory<'a> {
+    subscription_key: Key,
+    message_key: Key,
+    host_key: Key,
+    instance_key: Key,
+    element_id: &'a str,
+    message_name: &'a str,
+    correlation_key: &'a str,
+}
+
+/// The single canonical insert of an instance-scoped correlation history row.
+fn insert_correlation_history(
+    tx: &rusqlite::Transaction,
+    now_ms: u64,
+    h: CorrelationHistory<'_>,
+) -> rusqlite::Result<()> {
+    tx.cexecute(
+        "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
+         instance_key, element_instance_key, element_id, message_name, correlation_key, \
+         correlation_time_ms, partition_id, business_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT business_id FROM process_instances WHERE key = ?3)) \
+         ON CONFLICT(message_key, subscription_key) DO NOTHING",
+        params![
+            h.message_key as i64,
+            h.subscription_key as i64,
+            h.instance_key as i64,
+            h.host_key as i64,
+            h.element_id,
+            h.message_name,
+            h.correlation_key,
+            now_ms as i64,
+            // 1-based partition id (Camunda/Zeebe convention), to
+            // match the topology mapping in main.rs.
+            (partition_of(h.subscription_key) + 1) as i64,
+        ],
+    )?;
+    Ok(())
+}
+
 fn project_message_correlation(
     tx: &rusqlite::Transaction,
     now_ms: u64,
@@ -5606,25 +5661,18 @@ fn project_message_correlation(
             )
             .optional()?;
         if let Some((message_name, correlation_key, non_interrupting)) = captured {
-            tx.cexecute(
-                "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
-                 instance_key, element_instance_key, element_id, message_name, correlation_key, \
-                 correlation_time_ms, partition_id, business_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT business_id FROM process_instances WHERE key = ?3)) \
-                 ON CONFLICT(message_key, subscription_key) DO NOTHING",
-                params![
-                    message_key as i64,
-                    subscription_key as i64,
-                    instance_key as i64,
-                    host_key as i64,
+            insert_correlation_history(
+                tx,
+                now_ms,
+                CorrelationHistory {
+                    subscription_key,
+                    message_key,
+                    host_key,
+                    instance_key,
                     element_id,
-                    message_name,
-                    correlation_key,
-                    now_ms as i64,
-                    // 1-based partition id (Camunda/Zeebe convention), to
-                    // match the topology mapping in main.rs.
-                    (partition_of(subscription_key) + 1) as i64,
-                ],
+                    message_name: &message_name,
+                    correlation_key: &correlation_key,
+                },
             )?;
             // A non-interrupting boundary subscription stays open in the
             // engine so it can correlate again (each correlation spawns a
@@ -6141,36 +6189,78 @@ fn project_event(
             )?;
         }
         // An ack-paced (#1949) delivery is only a RESERVATION: the instance
-        // partition may still defer it (suspended) or reject it. The open wait
-        // and its history row are settled only once the message partition
-        // applies a CONSUMING acknowledgement (below).
+        // partition may still defer it (suspended) or reject it. Capture the
+        // open wait's metadata now, because a routed close (e.g. a
+        // non-interrupting boundary whose scope ends) can drop the open wait
+        // before the consuming acknowledgement arrives. The open wait and its
+        // history row are settled only by the acknowledgement (below).
         Event::RemoteMessageCorrelation {
+            subscription_key,
+            message_key,
             ack_partition: Some(_),
             ..
-        } => {}
+        } => {
+            tx.cexecute(
+                "INSERT OR REPLACE INTO paced_message_correlations (subscription_key, \
+                 message_key, instance_key, element_instance_key, element_id, message_name, \
+                 correlation_key) \
+                 SELECT subscription_key, ?2, instance_key, element_instance_key, element_id, \
+                 message_name, correlation_key FROM message_subscriptions \
+                 WHERE subscription_key = ?1",
+                params![*subscription_key as i64, *message_key as i64],
+            )?;
+        }
+        // The settling answer to an ack-paced reservation. A deferral leaves
+        // everything in flight. Otherwise: a consuming ack records history
+        // from the captured metadata, and `accepted == false` means the
+        // engine closed the subscription (a one-shot consumed, or a
+        // permanently rejected delivery such as a losing event-gateway catch,
+        // whose reservation already marked it correlated so no cancellation
+        // follows) — drop the open wait.
         Event::MessageCorrelationAcknowledged {
             subscription_key,
             message_key,
-            consumed: true,
+            accepted,
+            consumed,
+            deferred: false,
             ..
         } => {
-            let row: Option<(i64, i64, String)> = tx
+            let captured: Option<(i64, i64, String, String, String)> = tx
                 .query_row(
-                    "SELECT instance_key, element_instance_key, element_id \
-                     FROM message_subscriptions WHERE subscription_key = ?1",
-                    params![*subscription_key as i64],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    "SELECT instance_key, element_instance_key, element_id, message_name, \
+                     correlation_key FROM paced_message_correlations \
+                     WHERE subscription_key = ?1 AND message_key = ?2",
+                    params![*subscription_key as i64, *message_key as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
-            if let Some((instance_key, host_key, element_id)) = row {
-                project_message_correlation(
-                    tx,
-                    now_ms,
-                    *subscription_key,
-                    *message_key,
-                    host_key as Key,
-                    instance_key as Key,
-                    &element_id,
+            if *consumed
+                && let Some((instance_key, host_key, element_id, message_name, correlation_key)) =
+                    &captured
+            {
+                    insert_correlation_history(
+                        tx,
+                        now_ms,
+                        CorrelationHistory {
+                            subscription_key: *subscription_key,
+                            message_key: *message_key,
+                            host_key: *host_key as Key,
+                            instance_key: *instance_key as Key,
+                            element_id,
+                            message_name,
+                            correlation_key,
+                        },
+                    )?;
+            }
+            tx.cexecute(
+                "DELETE FROM paced_message_correlations \
+                 WHERE subscription_key = ?1 AND message_key = ?2",
+                params![*subscription_key as i64, *message_key as i64],
+            )?;
+            if !*accepted {
+                tx.cexecute(
+                    "DELETE FROM message_subscriptions WHERE subscription_key = ?1",
+                    params![*subscription_key as i64],
                 )?;
             }
         }
@@ -13335,15 +13425,9 @@ mod element_instance_tests {
             .unwrap();
         assert_eq!(store.message_subscriptions().len(), 1, "deferral");
         assert!(store.correlated_message_subscriptions().is_empty());
-        // Rejected: still no correlation recorded.
-        store
-            .export(&[&paced(12), &ack(12, false, false, false)])
-            .unwrap();
-        assert_eq!(store.message_subscriptions().len(), 1, "rejection");
-        assert!(store.correlated_message_subscriptions().is_empty());
         // A later consuming delivery settles the wait and records history.
         store
-            .export(&[&paced(13), &ack(13, true, true, false)])
+            .export(&[&paced(13), &ack(13, false, true, false)])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
         let corr = store.correlated_message_subscriptions();
@@ -13352,6 +13436,119 @@ mod element_instance_tests {
         assert_eq!(corr[0].instance_key, INST);
         assert_eq!(corr[0].element_instance_key, TASK_EI);
         assert_eq!(corr[0].element_id, "await");
+    }
+
+    fn paced_sub_created(subscription_key: Key) -> Event {
+        Event::MessageSubscriptionCreated {
+            subscription_key,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "await".to_string(),
+            message_name: "OrderPlaced".to_string(),
+            correlation_key: "P1".to_string(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+        }
+    }
+
+    fn paced_delivery(subscription_key: Key, message_key: Key) -> Event {
+        Event::RemoteMessageCorrelation {
+            subscription_key,
+            message_key,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "await".to_string(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            variables: std::collections::BTreeMap::new(),
+            delivery_key: 900 + message_key,
+            ack_partition: Some(0),
+        }
+    }
+
+    fn paced_ack(subscription_key: Key, message_key: Key, accepted: bool, consumed: bool) -> Event {
+        Event::MessageCorrelationAcknowledged {
+            subscription_key,
+            message_key,
+            accepted,
+            consumed,
+            deferred: false,
+            partition: 0,
+        }
+    }
+
+    /// #1949 (Copilot r4701849028): a permanently rejected one-shot delivery
+    /// (e.g. a losing event-gateway catch) closes the subscription in the
+    /// engine with no cancellation, so the open wait must be dropped — and no
+    /// history recorded.
+    #[test]
+    fn ack_paced_permanent_rejection_drops_the_open_wait() {
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[&deploy(), &created(), &paced_sub_created(3201)])
+            .unwrap();
+        store
+            .export(&[
+                &paced_delivery(3201, 21),
+                &paced_ack(3201, 21, false, false),
+            ])
+            .unwrap();
+        assert!(store.message_subscriptions().is_empty());
+        assert!(store.correlated_message_subscriptions().is_empty());
+        assert_eq!(paced_in_flight(&store), 0);
+    }
+
+    /// #1949 (Copilot r4701849083): the routed close can drop the open wait
+    /// (the subscription's shard) before the consuming acknowledgement
+    /// arrives; the correlation must still be recorded from the metadata
+    /// captured at reservation time.
+    #[test]
+    fn ack_paced_consuming_ack_after_close_still_records_history() {
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[&deploy(), &created(), &paced_sub_created(3301)])
+            .unwrap();
+        store
+            .export(&[
+                &paced_delivery(3301, 31),
+                &Event::MessageSubscriptionCanceled {
+                    subscription_key: 3301,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "await".to_string(),
+                },
+                &paced_ack(3301, 31, false, true),
+            ])
+            .unwrap();
+        assert!(store.message_subscriptions().is_empty());
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].message_key, 31);
+        assert_eq!(corr[0].element_instance_key, TASK_EI);
+        assert_eq!(corr[0].message_name, "OrderPlaced");
+        assert_eq!(paced_in_flight(&store), 0);
+    }
+
+    /// A consuming ack whose persistent scope survives (`accepted`) keeps
+    /// the open wait (it can correlate again).
+    #[test]
+    fn ack_paced_accepted_consuming_ack_keeps_the_wait() {
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[&deploy(), &created(), &paced_sub_created(3401)])
+            .unwrap();
+        store
+            .export(&[&paced_delivery(3401, 41), &paced_ack(3401, 41, true, true)])
+            .unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1);
+        assert_eq!(store.correlated_message_subscriptions().len(), 1);
+        assert_eq!(paced_in_flight(&store), 0);
+    }
+
+    fn paced_in_flight(store: &ReadStore) -> i64 {
+        let conn = store.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM paced_message_correlations", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
     }
 
     #[test]
