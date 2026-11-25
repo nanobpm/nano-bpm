@@ -8889,33 +8889,19 @@ impl ServerImpl {
     }
 
     /// Surface-independent core of "delete an ended process instance's history"
-    /// (#1948), shared by the single-instance endpoint, the deletion batch and
-    /// resource deletion with `deleteHistory`. Resolves the instance from the
-    /// read model (404 when absent; 409 fast-path for a live instance), then
-    /// proposes [`Command::DeleteProcessInstanceHistory`] on the owning
-    /// partition — replicated through Raft before success is reported, and
-    /// re-checked by the engine (which rejects a live instance deterministically
-    /// on every replica). Rolling-upgrade gate: 503 while any peer does not
-    /// advertise `FEATURE_PROCESS_INSTANCE_HISTORY_DELETION`.
+    /// (#1948), shared by the single-instance endpoint and the deletion batch.
+    /// Rolling-upgrade gate first (503 while any peer does not advertise
+    /// `FEATURE_PROCESS_INSTANCE_HISTORY_DELETION` — which also guarantees every
+    /// peer decodes the `DeleteInstanceHistory` forward frame), then
+    /// leader-forward when this node is not the instance's leader (mirroring
+    /// [`Self::cancel_instance_core`]), else
+    /// [`Self::delete_process_instance_history_local`].
     pub(crate) async fn delete_process_instance_history_core(
         &self,
         instance_key: u64,
         operation_reference: Option<i64>,
     ) -> TransitionInstanceOutcome {
         use TransitionInstanceOutcome as Out;
-        let Some(row) = self.store.process_instance(instance_key) else {
-            return Out::NotFound(format!("No process instance with key '{instance_key}'."));
-        };
-        if !matches!(
-            row.state,
-            ProcessInstanceState::Completed | ProcessInstanceState::Terminated
-        ) {
-            return Out::Conflict(format!(
-                "Process instance {instance_key} is {} and cannot be deleted; only COMPLETED \
-                 or TERMINATED instances can be deleted.",
-                row.state.as_str()
-            ));
-        }
         if !self
             .peers
             .all_peers_support(
@@ -8929,23 +8915,72 @@ impl ServerImpl {
                     .to_string(),
             );
         }
-        match self
+        if let Some(node) = self.route_by_leader(instance_key) {
+            return match self.peer_link(node).await {
+                Ok(link) => match link
+                    .delete_instance_history(instance_key.to_string(), operation_reference)
+                    .await
+                {
+                    Ok(r) if is_ok_status(r.status) => Out::Ok,
+                    Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
+                    Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
+                    Ok(r) => Out::Internal(peer_detail(&r)),
+                    // Unknown outcome is safe to retry: deleting already-deleted
+                    // history is a deterministic 404 / idempotent no-op (#1931).
+                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
+                    Err(e) => Out::Internal(e.to_string()),
+                },
+                Err((503, m)) => Out::Unavailable(m),
+                Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
+            };
+        }
+        self.delete_process_instance_history_local(instance_key, operation_reference)
+            .await
+            .into()
+    }
+
+    /// Deletes an ended instance's history on this node (the instance's
+    /// leader). Resolves the instance from the read model (404 when absent; 409
+    /// fast-path for a live instance), then proposes
+    /// [`Command::DeleteProcessInstanceHistory`] on the owning partition —
+    /// replicated through Raft before success is reported, and re-checked by
+    /// the engine (which rejects a live instance deterministically on every
+    /// replica, paging a cold one in first). Shared by the REST core and the
+    /// intra-cluster `DeleteInstanceHistory` frame so the two cannot drift.
+    pub(crate) async fn delete_process_instance_history_local(
+        &self,
+        instance_key: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<(), (u16, String)> {
+        let Some(row) = self.store.process_instance(instance_key) else {
+            return Err((
+                404,
+                format!("No process instance with key '{instance_key}'."),
+            ));
+        };
+        if !matches!(
+            row.state,
+            ProcessInstanceState::Completed | ProcessInstanceState::Terminated
+        ) {
+            return Err((
+                409,
+                format!(
+                    "Process instance {instance_key} is {} and cannot be deleted; only \
+                     COMPLETED or TERMINATED instances can be deleted.",
+                    row.state.as_str()
+                ),
+            ));
+        }
+        let (_events, commit) = self
             .apply_partition_command_ref(
                 instance_key,
                 Command::DeleteProcessInstanceHistory { instance_key },
                 operation_reference,
             )
-            .await
-        {
-            Ok((_events, commit)) => {
-                commit.wait().await;
-                Out::Ok
-            }
-            Err((409, d)) => Out::Conflict(d),
-            Err((404, d)) => Out::NotFound(d),
-            Err((503, d)) => Out::Unavailable(d),
-            Err((_, d)) => Out::Internal(d),
-        }
+            .await?;
+        commit.wait().await;
+        Ok(())
     }
 
     async fn suspend_process_instance_impl(
@@ -25378,27 +25413,45 @@ impl ServerImpl {
 
     /// `POST /v2/process-instances/deletion` (#1948) — mint a
     /// `DELETE_PROCESS_INSTANCE` batch operation over every ENDED (COMPLETED or
-    /// TERMINATED) **root** process instance matched by the request filter and
-    /// delete each one's history (with its call-activity descendants) through the
-    /// same [`Self::delete_process_instance_history_core`] as the single-instance
+    /// TERMINATED) process instance matched by the request filter and delete
+    /// each one's history (with its call-activity descendants) through the same
+    /// [`Self::delete_process_instance_history_core`] as the single-instance
     /// endpoint. The caller's `state` predicate is honoured on top of the
-    /// ended-only override ([`ProcessInstanceStatePolicy::EndedOnly`]); children
-    /// are deleted with their root, so only roots are enqueued.
+    /// ended-only override ([`ProcessInstanceStatePolicy::EndedOnly`]). Unlike
+    /// cancellation, deletion honours the hierarchy filters
+    /// (`parentProcessInstanceKey` / `parentElementInstanceKey`), so an ended
+    /// child can be selected on its own; a selected instance whose ancestor is
+    /// also selected is dropped, since the ancestor's deletion already removes
+    /// it ([`dedupe_selected_descendants`]).
     async fn delete_process_instances_batch_operation_impl(
         &self,
         body: &models::ProcessInstanceDeletionBatchOperationRequest,
     ) -> Result<apis::process_instance::DeleteProcessInstancesBatchOperationResponse, ()> {
         use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as Resp;
         let op_type = models::BatchOperationTypeEnum::DeleteProcessInstance;
-        let items = self
-            .batch_matched_process_instances_in(
-                &body.filter,
-                ProcessInstanceStatePolicy::EndedOnly,
-                BatchHierarchyPolicy::RootOnly,
-            )
-            .into_iter()
-            .map(BatchItem::process_instance)
-            .collect();
+        // Same contract validation as the other process-instance batches
+        // (spec/process-instances.yaml): both deprecated `batchOperationId`
+        // and `batchOperationKey` together is a 400, before any batch exists.
+        if body.filter.batch_operation_id.is_some() && body.filter.batch_operation_key.is_some() {
+            return Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(problem(
+                "INVALID_ARGUMENT",
+                400,
+                "Provide only one of batchOperationId and batchOperationKey; batchOperationId is deprecated.".to_string(),
+            )));
+        }
+        let selected = self.batch_matched_process_instances_in(
+            &body.filter,
+            ProcessInstanceStatePolicy::EndedOnly,
+            BatchHierarchyPolicy::HonourFilters,
+        );
+        let items = dedupe_selected_descendants(selected, |key| {
+            self.store
+                .process_instance(key)
+                .and_then(|row| row.parent_process_instance_key)
+        })
+        .into_iter()
+        .map(BatchItem::process_instance)
+        .collect();
         let operation_reference = body.operation_reference;
         let key =
             self.drive_process_instance_batch(op_type, items, move |server, instance| async move {
@@ -63263,6 +63316,33 @@ pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
     "tenantId",
 ];
 
+/// Drops every key in `selected` that has an ancestor (via `parent_of`) also in
+/// `selected` (#1948): deleting an instance's history deletes its call-activity
+/// descendants, so enqueuing both would make the descendant's item fail with a
+/// 404 once its ancestor's deletion projected. Order of `selected` is kept.
+fn dedupe_selected_descendants(
+    selected: Vec<u64>,
+    parent_of: impl Fn(u64) -> Option<u64>,
+) -> Vec<u64> {
+    let set: std::collections::HashSet<u64> = selected.iter().copied().collect();
+    selected
+        .into_iter()
+        .filter(|&key| {
+            // Bounded walk: a corrupt parent cycle cannot hang the batch.
+            const MAX_DEPTH: usize = 4096;
+            let mut cur = parent_of(key);
+            for _ in 0..MAX_DEPTH {
+                match cur {
+                    Some(p) if set.contains(&p) => return false,
+                    Some(p) => cur = parent_of(p),
+                    None => return true,
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 /// Process-instance history deletion (#1948): single-instance endpoint, batch
 /// by filter (through the shared batch seam) and a load-shaped batch.
 #[cfg(test)]
@@ -63407,6 +63487,52 @@ mod process_instance_deletion_tests {
             delete(&server, "not-a-key").await,
             Resp::Status404_TheProcessInstanceIsNotFound(_)
         ));
+    }
+
+    /// #1948 review: both `batchOperationId` and `batchOperationKey` in the
+    /// filter is a 400, before any batch is minted (the shared
+    /// `ProcessInstanceFilter` contract).
+    #[tokio::test]
+    async fn batch_deletion_rejects_both_batch_operation_id_and_key() {
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let mut filter = models::ProcessInstanceFilter::new();
+        filter.batch_operation_id = Some(models::StringFilterProperty::String("1".into()));
+        filter.batch_operation_key = Some(models::StringFilterProperty::String("1".into()));
+        let resp = server
+            .delete_process_instances_batch_operation_impl(
+                &models::ProcessInstanceDeletionBatchOperationRequest::new(filter),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                resp,
+                Resp::Status400_TheProcessInstanceBatchOperationFailed(_)
+            ),
+            "got {resp:?}"
+        );
+    }
+
+    /// #1948 review: a selected instance whose (transitive) ancestor is also
+    /// selected is dropped — the ancestor's deletion removes it — while a child
+    /// selected on its own (ancestor not selected) is kept.
+    #[test]
+    fn dedupe_drops_only_descendants_of_selected_ancestors() {
+        let parents: std::collections::HashMap<u64, u64> =
+            [(2, 1), (3, 2), (5, 4)].into_iter().collect();
+        let parent_of = |k: u64| parents.get(&k).copied();
+        assert_eq!(
+            dedupe_selected_descendants(vec![1, 3, 5, 6], parent_of),
+            vec![1, 5, 6]
+        );
+        assert_eq!(
+            dedupe_selected_descendants(vec![3, 5], parent_of),
+            vec![3, 5]
+        );
+        // A corrupt parent cycle terminates.
+        let cyclic = |k: u64| Some(k + 100);
+        assert_eq!(dedupe_selected_descendants(vec![1], cyclic), vec![1]);
     }
 
     /// Load-shaped (#1948): batch-delete ~10k ended instances by filter. The

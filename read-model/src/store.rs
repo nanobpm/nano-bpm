@@ -835,6 +835,68 @@ fn shared_column_list(
     Ok(list)
 }
 
+/// Removes the history of the given deleted instances — each instance, every
+/// call-activity descendant the archive holds, and their archived dependent
+/// rows — from the durable terminal archive at `archive` (#1948). Without this,
+/// a snapshot-gap recovery's [`ReadStore::replay_terminal_archive`] would
+/// resurrect deleted history and then advance the cursor past the deletion
+/// event. Runs in one archive transaction; the caller runs it **before**
+/// committing the projection batch, so a failure fails the batch (the cursor
+/// does not advance and the deletion is re-projected) rather than leaving a
+/// deleted instance restorable.
+fn delete_history_from_archive(
+    conn: &Connection,
+    archive: &Path,
+    keys: &[Key],
+) -> rusqlite::Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    attach_archive(conn, archive)?;
+    let result = (|| -> rusqlite::Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let body = (|| -> rusqlite::Result<()> {
+            for key in keys {
+                let tree: Vec<i64> = {
+                    let mut stmt = conn.prepare_cached(
+                        "WITH RECURSIVE tree(k) AS ( \
+                           SELECT ?1 \
+                           UNION SELECT p.key FROM terminal_archive.process_instances p \
+                             JOIN tree ON p.parent_process_instance_key = tree.k \
+                         ) SELECT k FROM tree",
+                    )?;
+                    stmt.query_map(params![*key as i64], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?
+                };
+                for k in tree {
+                    for table in TERMINAL_ARCHIVE_DEP_TABLES {
+                        conn.execute(
+                            &format!(
+                                "DELETE FROM terminal_archive.{table} WHERE instance_key = ?1"
+                            ),
+                            params![k],
+                        )?;
+                    }
+                    conn.execute(
+                        "DELETE FROM terminal_archive.process_instances WHERE key = ?1",
+                        params![k],
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        match body {
+            Ok(()) => conn.execute_batch("COMMIT"),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    })();
+    let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
+    result
+}
+
 /// Copies the given terminal instances (and their instance-scoped dependent rows)
 /// from the live store on `conn` into the durable archive at `archive`
 /// (`INSERT OR REPLACE`, append-only in effect since keys are unique and
@@ -2331,6 +2393,20 @@ impl ReadStore {
         // common path (pruner idle) and a short wait when the pruner is active.
         let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // #1948: retract deleted history from the durable terminal archive
+        // BEFORE this batch commits, so a crash or failure can never advance the
+        // cursor past a deletion the archive would later resurrect on
+        // snapshot-gap recovery. Idempotent, so a re-projected batch is safe.
+        if let Some(archive) = &self.archive_path {
+            let deleted: Vec<Key> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ProcessInstanceHistoryDeleted { instance_key } => Some(*instance_key),
+                    _ => None,
+                })
+                .collect();
+            delete_history_from_archive(&conn, archive, &deleted)?;
+        }
         let tx = conn.transaction()?;
         let mut terminal_keys = Vec::new();
         let mut inflight_delta: i64 = 0;
@@ -17580,5 +17656,70 @@ mod history_deletion_tests {
         // Idempotent replay.
         store.export(&del.iter().collect::<Vec<_>>()).unwrap();
         assert_eq!(total_rows(&store, kept), kept_before);
+    }
+
+    fn created(key: u64, parent: Option<u64>) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key: key,
+            process_id: "p".to_string(),
+            variables: BTreeMap::new(),
+            created_at: 1,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 1,
+            version: 1,
+            parent_process_instance_key: parent,
+            parent_element_instance_key: parent.map(|p| p + 1),
+        }
+    }
+
+    /// #1948 review: deletion must also retract the instance tree from the
+    /// durable terminal archive, else snapshot-gap recovery
+    /// (`replay_terminal_archive`) resurrects the deleted history. File-backed
+    /// delete-then-recover; an unrelated archived instance is still restored.
+    #[test]
+    fn deleted_history_is_not_resurrected_by_archive_replay() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("nanobpm-history-del-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("read-model.sqlite");
+        {
+            let store = ReadStore::open(Some(&path)).unwrap();
+            let events = [
+                created(10, None),
+                created(20, Some(10)),
+                created(30, None),
+                Event::ProcessInstanceCompleted { instance_key: 20 },
+                Event::ProcessInstanceTerminated { instance_key: 10 },
+                Event::ProcessInstanceCompleted { instance_key: 30 },
+            ];
+            store.export(&events.iter().collect::<Vec<_>>()).unwrap();
+            store
+                .export(&[&Event::ProcessInstanceHistoryDeleted { instance_key: 10 }])
+                .unwrap();
+            assert!(store.process_instance(10).is_none());
+            assert!(store.process_instance(20).is_none());
+
+            // Snapshot-gap recovery stand-in: wipe, then replay the archive.
+            store.reset().unwrap();
+            store.replay_terminal_archive().unwrap();
+            assert!(
+                store.process_instance(10).is_none(),
+                "deleted root resurrected"
+            );
+            assert!(
+                store.process_instance(20).is_none(),
+                "deleted child resurrected"
+            );
+            assert!(
+                store.process_instance(30).is_some(),
+                "unrelated archived history must still be restored"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
