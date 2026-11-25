@@ -871,6 +871,14 @@ impl Engine {
         !self.state.cluster_variables.is_unused()
     }
 
+    /// Whether this partition has EVER buffered a message (#1874). One-way:
+    /// the buffer sequence cursor is never reset (an expired message leaves
+    /// its slot behind) and survives snapshot recovery, so the retained
+    /// log/snapshot depends on `message-buffering-v1` once this is `true`.
+    pub fn message_buffering_ever_used(&self) -> bool {
+        self.state.next_buffered_seq > 0
+    }
+
     /// The cluster-wide partition count this engine is configured with.
     pub fn num_partitions(&self) -> u64 {
         self.num_partitions

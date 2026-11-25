@@ -21997,7 +21997,9 @@ impl ServerImpl {
     /// never counts: it is what a pre-#1661 cluster already runs). Likewise
     /// `cluster-variables-v1` (#1657) once any hosted partition has EVER applied
     /// a cluster-variable create — sticky even after every variable is deleted,
-    /// because the retained log/snapshot still carries those records.
+    /// because the retained log/snapshot still carries those records — and
+    /// `message-buffering-v1` (#1874) once any hosted partition has EVER
+    /// buffered a message (sticky across expiry, compaction and restart).
     ///
     /// `None` = UNKNOWN: some partition's engine actor is dead or did not answer
     /// within [`ENGINE_HEALTH_PROBE_BOUND`]. The probe is bounded and uses
@@ -22008,7 +22010,8 @@ impl ServerImpl {
     /// on `None`; best-effort syncs simply retry on the next tick.
     async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
         use nano_falcon_protocol::cluster_join::{
-            FEATURE_CLUSTER_VARIABLES as CV, FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
+            FEATURE_CLUSTER_VARIABLES as CV, FEATURE_MESSAGE_BUFFERING as MB,
+            FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
         };
         // A single node never replicates its log to anyone, so its local state
         // places no requirement on a peer.
@@ -22017,7 +22020,7 @@ impl ServerImpl {
         }
         // Every feature the recovered/replicated state can depend on, each
         // with its one-way state predicate (sticky once observed).
-        const FEATURES: [&str; 2] = [LC, CV];
+        const FEATURES: [&str; 3] = [LC, CV, MB];
         let mut required: Vec<&'static str> = FEATURES
             .into_iter()
             .filter(|f| self.peers.requires_feature(f))
@@ -22041,6 +22044,7 @@ impl ServerImpl {
                     [
                         engine.replicated_lenient_completion(),
                         engine.cluster_variables_ever_used(),
+                        engine.message_buffering_ever_used(),
                     ]
                 }),
             )
@@ -35136,6 +35140,47 @@ mod clustered_startup_tests {
             .expect("delete")
             .1
             .blocking_wait();
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(!server.peers.requires_feature(F), "precondition");
+        let _transport = server.raft_transport_for_start().await;
+        assert!(server.peers.requires_feature(F));
+        assert_eq!(server.required_cluster_features().await, Some(vec![F]));
+    }
+
+    /// PR #1944 review: a node whose recovered state has EVER buffered a
+    /// message must require `message-buffering-v1` from every peer after
+    /// restart/compaction (the AppendEntries-only gate cannot see compacted
+    /// entries), even once the buffer is empty again.
+    #[tokio::test]
+    async fn raft_start_requires_message_buffering_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_BUFFERING as F;
+        let mut journal = Journal::in_memory();
+        journal
+            .apply_command_at(
+                Command::CorrelateMessage {
+                    message_name: "m".into(),
+                    correlation_key: "k".into(),
+                    variables: Default::default(),
+                    business_id: None,
+                    message_key: None,
+                    time_to_live: Some(60_000),
+                    message_id: None,
+                },
+                1,
+            )
+            .expect("buffer")
+            .1
+            .blocking_wait();
+        assert!(journal.engine().message_buffering_ever_used(), "precondition");
         let topology = cluster::Topology {
             node_id: 0,
             peers: vec![
@@ -56366,12 +56411,12 @@ mod subscription_placement_tests {
 
     /// End-to-end #1874 (multi-partition): three messages are BUFFERED on the
     /// correlation key's partition, then an instance on ANOTHER partition opens
-    /// a message event sub-process subscription. The host routing pump must
-    /// deliver the remote correlations in publish order; returns the `seq`
-    /// variable each `handle` job saw, in job (= delivery) order, and — per
-    /// buffered message, in publish order — how many instances it has
-    /// correlated to (a correlated message stays buffered until it expires,
-    /// Zeebe parity).
+    /// a message event sub-process subscription. Buffered correlation is
+    /// LOCAL-ONLY in this slice (remote drain is #1949): once the routed open
+    /// is durable on the buffer's partition, the remote subscription must take
+    /// NOTHING from the buffer. Returns the `seq` variable each `handle` job
+    /// saw and — per buffered message, in publish order — how many instances
+    /// it has correlated to.
     async fn drain_buffered_backlog_remotely(interrupting: bool) -> (Vec<Value>, Vec<usize>) {
         let server = single_node_multi_partition();
         let process_id = if interrupting {
@@ -56465,7 +56510,6 @@ mod subscription_placement_tests {
             .expect("the create applied")
             .instance_key;
 
-        let expected_jobs = if interrupting { 1 } else { 3 };
         let handle_jobs = || async {
             create_engine
                 .with(move |j| {
@@ -56484,14 +56528,28 @@ mod subscription_placement_tests {
                 })
                 .await
         };
+        // Wait for the routed subscription open to be durable on the buffer's
+        // partition: that is the point at which a (wrong) remote drain would
+        // be triggered.
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while handle_jobs().await.len() < expected_jobs {
+            loop {
+                let opened = sub_engine
+                    .with(move |j| {
+                        j.state()
+                            .message_subscriptions
+                            .values()
+                            .any(|s| s.instance_key == instance_key)
+                    })
+                    .await;
+                if opened {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("the routed correlations reach the instance partition");
-        // Let any (wrong) extra delivery land before asserting exactly-N.
+        .expect("the routed subscription open reaches the buffer's partition");
+        // Let any (wrong) remote delivery land before asserting none did.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let seen = handle_jobs().await;
         let correlated = sub_engine
@@ -56507,27 +56565,22 @@ mod subscription_placement_tests {
         (seen, correlated)
     }
 
-    /// #1874: a REMOTE non-interrupting (persistent) subscription drains the
-    /// whole buffered backlog in PUBLISH order. The host pump used to route
-    /// follow-ups as a stack (`Vec::pop`), delivering the newest first.
+    /// #1874: a REMOTE non-interrupting (persistent) subscription takes
+    /// nothing from the buffer (local-only correlation; remote drain #1949).
     #[tokio::test]
-    async fn remote_persistent_subscription_drains_buffer_in_publish_order() {
+    async fn remote_persistent_subscription_leaves_buffer_untouched() {
         let (seen, correlated) = drain_buffered_backlog_remotely(false).await;
-        assert_eq!(seen, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
-        assert_eq!(correlated, vec![1, 1, 1]);
+        assert!(seen.is_empty(), "no remote delivery: {seen:?}");
+        assert_eq!(correlated, vec![0, 0, 0]);
     }
 
-    /// #1874: a REMOTE interrupting subscription takes exactly one buffered
-    /// message — the oldest — and the rest stay buffered.
+    /// #1874: a REMOTE interrupting subscription takes nothing from the
+    /// buffer either; every message stays buffered, uncorrelated.
     #[tokio::test]
-    async fn remote_interrupting_subscription_takes_only_the_oldest_buffered() {
+    async fn remote_interrupting_subscription_leaves_buffer_untouched() {
         let (seen, correlated) = drain_buffered_backlog_remotely(true).await;
-        assert_eq!(seen, vec![Value::Int(1)]);
-        assert_eq!(
-            correlated,
-            vec![1, 0, 0],
-            "only the oldest correlates; the two newer stay buffered, uncorrelated"
-        );
+        assert!(seen.is_empty(), "no remote delivery: {seen:?}");
+        assert_eq!(correlated, vec![0, 0, 0]);
     }
 
     /// #1604 (crash recovery): if a single-node server crashes AFTER the
