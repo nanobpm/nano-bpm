@@ -131,7 +131,12 @@ export function diffObservations(a, b, provideA, provideB) {
 export function checkExpectations(observation, expect) {
   if (!expect) return { ok: true, mismatches: [] };
   const mismatches = [];
+  // A field this run did not read (`unobserved`, e.g. Camunda's variables after
+  // an awaitCompletion timeout, #1988) cannot be checked — same rule as
+  // diffObservations.
+  const unread = new Set(observation?.unobserved ?? []);
   for (const field of Object.keys(expect)) {
+    if (unread.has(field) && OBSERVATION_FIELDS.includes(field)) continue;
     if (!OBSERVATION_FIELDS.includes(field)) {
       mismatches.push({ field, error: `unknown expect field '${field}'` });
       continue;

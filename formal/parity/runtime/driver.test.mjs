@@ -1081,3 +1081,12 @@ test("CamundaBackend observes an awaitCompletion DEADLINE_EXCEEDED on a live ins
     await once(server, "close");
   }
 });
+
+test("checkExpectations skips fields the observation marks unobserved (#1988)", () => {
+  const obs = { ...emptyObservation(), completed: false, unobserved: ["variables"] };
+  const res = checkExpectations(obs, { completed: false, variables: { k: "v" } });
+  assert.deepEqual(res, { ok: true, mismatches: [] });
+  // An observed field still mismatches.
+  const res2 = checkExpectations({ ...obs, unobserved: [] }, { variables: { k: "v" } });
+  assert.equal(res2.ok, false);
+});
