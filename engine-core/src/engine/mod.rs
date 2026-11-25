@@ -354,6 +354,8 @@ pub struct Engine {
     /// behaviour while any member of the group cannot apply ack-paced
     /// delivery (rolling upgrade). Not snapshotted: re-set before each apply.
     remote_buffered_delivery: bool,
+    /// Set once `set_remote_buffered_delivery(true)` has been observed (#1949).
+    remote_buffered_delivery_latched: bool,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -808,6 +810,7 @@ impl Engine {
             buffer_requeue: VecDeque::new(),
             pending_correlation_ack: None,
             remote_buffered_delivery: true,
+            remote_buffered_delivery_latched: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
@@ -851,8 +854,18 @@ impl Engine {
     /// instances (#1949; see the field docs). A replicated host MUST set this
     /// from the replicated command envelope before every apply, never from
     /// local knowledge, so all replicas agree.
+    ///
+    /// One-way latch (#1949): once enabled — or once this partition has ever
+    /// sent an ack-paced delivery — a later `false` (e.g. a peer transiently
+    /// unreachable, so the cluster-wide capability probe fails) is ignored.
+    /// Turning delivery back off mid-flight would strand deferred deliveries
+    /// (the resume handshake would be skipped) and stop remote buffered
+    /// delivery cluster-wide during an ordinary tolerated outage.
     pub fn set_remote_buffered_delivery(&mut self, enabled: bool) {
-        self.remote_buffered_delivery = enabled;
+        self.remote_buffered_delivery = self.remote_buffered_delivery_latched
+            || enabled
+            || self.message_correlation_ack_ever_used();
+        self.remote_buffered_delivery_latched |= enabled;
     }
 
     /// Whether this partition has EVER sent an ack-paced remote buffered
@@ -1019,6 +1032,7 @@ impl Engine {
             buffer_requeue: VecDeque::new(),
             pending_correlation_ack: None,
             remote_buffered_delivery: true,
+            remote_buffered_delivery_latched: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,

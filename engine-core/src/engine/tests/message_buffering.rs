@@ -1942,6 +1942,31 @@ fn resume_handshake_redelivers_a_deferred_backlog_across_a_restart() {
     assert!(again.is_empty(), "{again:?}");
 }
 
+/// #1949 one-way gate: once ack-paced delivery is enabled, a transient peer
+/// outage (the host's cluster-wide capability probe briefly reports `false`)
+/// must NOT turn it back off — otherwise a delivery deferred while the
+/// instance was suspended would never be re-offered on resume.
+#[test]
+fn remote_buffered_delivery_gate_is_latched_across_a_peer_outage() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    rig.instance.set_remote_buffered_delivery(true);
+    rig.message.set_remote_buffered_delivery(true);
+    let published = rig.publish_backlog(&order, 1);
+    let (instance_key, _) = create_suspended(&mut rig, &order, &|_| false);
+    assert!(correlated(&rig, instance_key).is_empty(), "deferred");
+    // A peer becomes unreachable: the probe now reports `false`.
+    rig.instance.set_remote_buffered_delivery(false);
+    rig.message.set_remote_buffered_delivery(false);
+    rig.run(false, Command::ResumeInstance { instance_key }, 3_000);
+    assert!(
+        rig.trace
+            .iter()
+            .any(|e| matches!(e, Event::MessageSubscriptionResuming { .. })),
+        "the resume handshake is still emitted during the outage"
+    );
+    assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
+}
+
 /// #1949 durable receipt + duplicate ack: the deferral's ack is LOST, the
 /// instance resumes (its handshake finds the delivery still in flight, a
 /// no-op), then the re-driven duplicate delivery is answered with the STORED
