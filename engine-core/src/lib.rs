@@ -139,7 +139,6 @@ pub use event::{
     SubscriptionMigrationAction,
 };
 pub use feel::FeelError;
-pub use problem::{EngineProblem, ProblemKind};
 #[cfg(feature = "serde")]
 pub use model::value_from_json;
 pub use model::{
@@ -151,6 +150,7 @@ pub use model::{
     TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections, UserTaskProps, Value,
     TOOL_NAME_PROPERTY, TOOL_PROPERTY_PREFIX,
 };
+pub use problem::{EngineProblem, ProblemKind};
 pub use read_query::ReadQuery;
 pub use state::{
     compose_key, local_of, partition_of, restore_instance_snapshot, stable_hash,

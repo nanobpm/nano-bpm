@@ -242,7 +242,12 @@ mod tests {
                 "UNAVAILABLE",
                 true,
             ),
-            (EngineError::JobNotFound { job_key: 1 }, 404, "NOT_FOUND", false),
+            (
+                EngineError::JobNotFound { job_key: 1 },
+                404,
+                "NOT_FOUND",
+                false,
+            ),
             (
                 EngineError::JobNotActive { job_key: 1 },
                 409,
@@ -299,9 +304,7 @@ mod tests {
                 if t.starts_with(' ') || t.starts_with("//") || t.starts_with('#') {
                     return None;
                 }
-                let name: &str = t
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .next()?;
+                let name: &str = t.split(|c: char| !c.is_alphanumeric() && c != '_').next()?;
                 (!name.is_empty()).then_some(name)
             })
             .collect();
