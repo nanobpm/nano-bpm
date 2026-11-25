@@ -70,6 +70,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     state: MessageSubscriptionState::Open,
                     kind: kind.clone(),
                     correlated_message_keys: Default::default(),
+                    awaiting_ack: None,
                 },
             );
         }
@@ -99,6 +100,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     state: MessageSubscriptionState::Opening,
                     kind: kind.clone(),
                     correlated_message_keys: Default::default(),
+                    awaiting_ack: None,
                 },
             );
         }
@@ -267,11 +269,46 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
         // token advance happens on the instance partition, driven by the
         // `CorrelateMessageSubscription` continuation the host routes there.
         Event::RemoteMessageCorrelation {
-            subscription_key, ..
+            subscription_key,
+            message_key,
+            ack_partition,
+            ..
         } => {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
                 if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
+                } else if ack_partition.is_some() {
+                    // Ack-paced buffered drain (#1874): nothing more is sent
+                    // until the instance partition answers.
+                    subscription.awaiting_ack = Some(*message_key);
+                }
+            }
+        }
+
+        // The instance partition answered an ack-paced delivery (#1874). A
+        // rejection closes the subscription (its scope ended or the element no
+        // longer waits), leaving the untaken buffered messages buffered. A
+        // deferral (suspended instance) keeps it open and un-takes the message.
+        Event::MessageCorrelationAcknowledged {
+            subscription_key,
+            message_key,
+            accepted,
+            deferred,
+            ..
+        } => {
+            if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
+                if subscription.awaiting_ack == Some(*message_key) {
+                    subscription.awaiting_ack = None;
+                    if *deferred {
+                        // Suspended instance (#1874): the subscription stays
+                        // open and the message stays buffered for it.
+                        let instance_key = subscription.instance_key;
+                        if let Some(message) = state.buffered_messages.get_mut(message_key) {
+                            message.correlated_instances.remove(&instance_key);
+                        }
+                    } else if !*accepted {
+                        subscription.state = MessageSubscriptionState::Correlated;
+                    }
                 }
             }
         }

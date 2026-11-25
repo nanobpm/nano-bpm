@@ -475,6 +475,7 @@ impl RaftTransport for PeerTransport {
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
         FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES, FEATURE_MESSAGE_BUFFERING,
+        FEATURE_MESSAGE_CORRELATION_ACK,
         FEATURE_REPLICATED_LENIENT_COMPLETION, FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
@@ -512,6 +513,11 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
                     terminate_suspended: true,
                     ..
                 } => FEATURE_CANCEL_SUSPENDED_INSTANCE,
+                Command::AcknowledgeMessageCorrelation { .. }
+                | Command::CorrelateMessageSubscription {
+                    ack_partition: Some(_),
+                    ..
+                } => FEATURE_MESSAGE_CORRELATION_ACK,
                 _ => continue,
             };
             if !required.contains(&feature) {
@@ -611,6 +617,34 @@ mod codec_tests {
         for command in [publish(None, None), publish(Some(0), None)] {
             assert!(required_features_for(&req(vec![entry(command)])).is_empty());
         }
+        // #1874: the ack and an ack-paced correlation require the ack
+        // feature; an un-paced correlation requires nothing.
+        let correlate = |ack_partition| Command::CorrelateMessageSubscription {
+            subscription_key: 1,
+            message_key: 2,
+            instance_key: 3,
+            element_instance_key: 4,
+            element_id: "e".into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            variables: Default::default(),
+            delivery_key: 5,
+            ack_partition,
+        };
+        for command in [
+            Command::AcknowledgeMessageCorrelation {
+                subscription_key: 1,
+                message_key: 2,
+                accepted: true,
+                deferred: false,
+            },
+            correlate(Some(0)),
+        ] {
+            assert_eq!(
+                required_features_for(&req(vec![entry(command)])),
+                vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK]
+            );
+        }
+        assert!(required_features_for(&req(vec![entry(correlate(None))])).is_empty());
         // #1856 review: a stamped entry is never shipped to a peer that would
         // ignore the deadline map; an unstamped one requires nothing.
         let mut stamped = entry(Command::cancel_instance(1));

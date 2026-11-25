@@ -72,6 +72,16 @@ struct Paused {
     cursor: usize,
 }
 
+/// See [`Engine::emit_pending_correlation_ack`] (#1874).
+#[derive(Debug, Clone)]
+struct PendingCorrelationAck {
+    subscription_key: Key,
+    message_key: Key,
+    instance_key: Key,
+    advanced: bool,
+    target_partition: u64,
+}
+
 /// The version of the serialized snapshot/event **payload** shape (the
 /// serde-derived form of [`EngineSnapshot`] / [`State`] / [`crate::Event`]).
 ///
@@ -331,6 +341,11 @@ pub struct Engine {
     /// O(k + M), never O(k*M). Per-command scratch; reset whenever a
     /// message is buffered.
     pub(crate) buffer_candidates: BTreeMap<(Key, String, String), (u64, Key)>,
+    /// The ack an ack-paced `CorrelateMessageSubscription` owes the message
+    /// partition (#1874), emitted once the command has fully drained so
+    /// `accepted` reflects whether the scope survived the delivery. Per-command
+    /// scratch.
+    pending_correlation_ack: Option<PendingCorrelationAck>,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -783,6 +798,7 @@ impl Engine {
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
+            pending_correlation_ack: None,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
@@ -977,6 +993,7 @@ impl Engine {
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
+            pending_correlation_ack: None,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,
@@ -2625,6 +2642,7 @@ impl Engine {
                 .map(|(mut log, queue)| {
                     self.run(&mut log, queue);
                     self.cascade_cancel_children(&mut log, 0);
+                    self.emit_pending_correlation_ack(&mut log);
                     // Every engine test exercises the parent -> children index the
                     // cascade reads (#1827): a write path that bypassed it fails here.
                     #[cfg(test)]
@@ -2639,6 +2657,7 @@ impl Engine {
         // retains no candidate queues (#1874).
         self.buffer_candidates.clear();
         self.buffer_requeue.clear();
+        self.pending_correlation_ack = None;
         result
     }
 
@@ -2704,6 +2723,7 @@ impl Engine {
         self.pending_timer_fires.clear();
         self.buffer_scan_from = 0;
         self.buffer_requeue.clear();
+        self.pending_correlation_ack = None;
         self.buffer_candidates.clear();
         self.sweep_from = 0;
         // Per-command terminal-deadline stamp (#1494): set from THIS command
@@ -4935,6 +4955,13 @@ impl Engine {
                     if correlated_instances.contains(&instance_key) {
                         continue;
                     }
+                    // Zeebe `CORRELATING` (#1874): a subscription awaiting the
+                    // instance partition's ack for a buffered delivery takes
+                    // nothing now; a TTL message stays buffered for it, so it
+                    // is delivered in publish order once the ack arrives.
+                    if subscription.awaiting_ack.is_some() {
+                        continue;
+                    }
                     let element_instance_key = subscription.element_instance_key;
                     let element_id = subscription.element_id.clone();
                     let kind = subscription.kind.clone();
@@ -4987,6 +5014,7 @@ impl Engine {
                                 kind,
                                 variables: variables.clone(),
                                 delivery_key,
+                                ack_partition: None,
                             },
                         );
                     }
@@ -5267,6 +5295,7 @@ impl Engine {
                 kind,
                 variables,
                 delivery_key,
+                ack_partition,
             } => {
                 // At-least-once ⇒ exactly-once (#1497): a re-delivered
                 // continuation whose `delivery_key` this partition already
@@ -5289,7 +5318,10 @@ impl Engine {
                 // gated jobs and timers): the routed correlation is *dropped*. The
                 // message model is unbuffered, so a dropped correlation does not
                 // re-correlate on resume — drop-on-suspend is the documented
-                // suspension semantics for messages.
+                // suspension semantics for messages. An ack-paced buffered
+                // delivery is the exception: it is *deferred* (see
+                // `emit_pending_correlation_ack`), so the message stays
+                // buffered and the persistent subscription stays open (#1874).
                 //
                 // A persistent subscription (non-interrupting boundary / event
                 // sub-process) never settles, so it instead dedupes on delivery
@@ -5329,6 +5361,18 @@ impl Engine {
                         &variables,
                     );
                 }
+                // Ack-paced buffered drain (#1874, Zeebe `CORRELATING`): answer
+                // the message partition once this command has drained (see
+                // `emit_pending_correlation_ack`).
+                if let Some(target_partition) = ack_partition {
+                    self.pending_correlation_ack = Some(PendingCorrelationAck {
+                        subscription_key,
+                        message_key,
+                        instance_key,
+                        advanced: advance,
+                        target_partition,
+                    });
+                }
                 if delivery_key != 0 {
                     self.emit(
                         &mut log,
@@ -5339,6 +5383,46 @@ impl Engine {
                             close_tombstone: false,
                         },
                     );
+                }
+            }
+
+            Command::AcknowledgeMessageCorrelation {
+                subscription_key,
+                message_key,
+                accepted,
+                deferred,
+            } => {
+                // Idempotent: only the exact delivery this subscription awaits
+                // is acknowledged; a redelivered or stale ack is a no-op.
+                if self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .is_some_and(|s| s.awaiting_ack == Some(message_key))
+                {
+                    self.emit(
+                        &mut log,
+                        Event::MessageCorrelationAcknowledged {
+                            subscription_key,
+                            message_key,
+                            accepted,
+                            deferred,
+                            partition: self.partition_id,
+                        },
+                    );
+                    // Still open (accepted, scope alive): offer it the next
+                    // buffered message on this command's quiescent pass. A
+                    // deferred (suspended) subscription is not re-offered: it
+                    // would bounce off the suspended instance again.
+                    if !deferred
+                        && self
+                            .state
+                            .message_subscriptions
+                            .get(&subscription_key)
+                            .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
+                    {
+                        self.buffer_requeue.push_back(subscription_key);
+                    }
                 }
             }
 
@@ -7514,7 +7598,9 @@ impl Engine {
     /// [`Self::correlate_buffered_messages`]). Returns `true` when a LOCAL
     /// correlation advanced a token (the caller must drain before going on);
     /// a still-open local subscription is requeued for the next message. A
-    /// remote subscription never takes a buffered message (#1949).
+    /// remote subscription gets at most ONE delivery per turn (Zeebe
+    /// `CORRELATING`, #1874): a one-shot kind settles; a kind that stays open
+    /// awaits the instance partition's ack before the next message.
     fn correlate_one_buffered(
         &mut self,
         log: &mut Vec<Event>,
@@ -7534,15 +7620,6 @@ impl Engine {
         let element_instance_key = subscription.element_instance_key;
         let element_id = subscription.element_id.clone();
         let kind = subscription.kind.clone();
-        // LOCAL-ONLY buffered correlation (#1874): a subscription whose
-        // instance lives on ANOTHER partition never takes a buffered
-        // message — no partial or one-shot remote drain. The message stays
-        // buffered until a local subscription takes it or its TTL expires.
-        // Ack-paced remote delivery is tracked in
-        // https://github.com/nanobpm/nano-bpm/issues/1949.
-        if state::partition_of(instance_key) != self.partition_id {
-            return false;
-        }
         // A buffered message must never reach a child whose ancestor has
         // already ended (e.g. a top-level terminate end raced a call
         // activity): the pending cascade will terminate it, and a
@@ -7550,17 +7627,24 @@ impl Engine {
         if self.has_ended_ancestor(instance_key) {
             return false;
         }
+        // Zeebe `CORRELATING`: one buffered delivery in flight per
+        // remote subscription until the instance partition acks it.
+        if subscription.awaiting_ack.is_some() {
+            return false;
+        }
         let Some(message) = self.next_buffered_candidate(subscription_key, now) else {
             return false;
         };
         let message_key = message.key;
         let variables = message.variables.clone();
-        if self.instance_is_suspended(instance_key)
-            || self
-                .state
-                .instances
-                .get(&instance_key)
-                .is_none_or(|i| i.state != ProcessInstanceState::Active)
+        let local = state::partition_of(instance_key) == self.partition_id;
+        if local
+            && (self.instance_is_suspended(instance_key)
+                || self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .is_none_or(|i| i.state != ProcessInstanceState::Active))
         {
             return false;
         }
@@ -7573,26 +7657,87 @@ impl Engine {
                 instance_key,
             },
         );
-        self.advance_correlated_token(
-            log,
-            queue,
-            subscription_key,
-            message_key,
-            instance_key,
-            element_instance_key,
-            element_id,
-            kind,
-            &variables,
-        );
-        if self
-            .state
-            .message_subscriptions
-            .get(&subscription_key)
-            .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
-        {
-            self.buffer_requeue.push_back(subscription_key);
+        if local {
+            self.advance_correlated_token(
+                log,
+                queue,
+                subscription_key,
+                message_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind,
+                &variables,
+            );
+            if self
+                .state
+                .message_subscriptions
+                .get(&subscription_key)
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
+            {
+                self.buffer_requeue.push_back(subscription_key);
+            }
+            return true;
         }
-        true
+        let stays_open = kind.stays_open_after_trigger();
+        let delivery_key = self.mint_key();
+        self.emit(
+            log,
+            Event::RemoteMessageCorrelation {
+                subscription_key,
+                message_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind,
+                variables,
+                delivery_key,
+                ack_partition: stays_open.then_some(self.partition_id),
+            },
+        );
+        // A remote delivery advances nothing here, so there is nothing to
+        // drain; an open subscription now awaits the ack (#1874) and gets
+        // the next message only once it arrives.
+        false
+    }
+
+    /// Emits the ack an ack-paced `CorrelateMessageSubscription` owes the
+    /// message partition (#1874, Zeebe `CORRELATING`), after the command has
+    /// fully drained. Accepted = the token took the message AND the
+    /// subscription still waits for more (its scope survived); otherwise the
+    /// message partition stops this subscription and the backlog stays
+    /// buffered for others.
+    fn emit_pending_correlation_ack(&mut self, log: &mut Vec<Event>) {
+        let Some(ack) = self.pending_correlation_ack.take() else {
+            return;
+        };
+        let accepted = ack.advanced
+            && self
+                .state
+                .message_subscriptions
+                .get(&ack.subscription_key)
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Opening);
+        // A suspended instance whose scope still waits takes nothing now but
+        // must keep its persistent subscription (#1874): defer, don't reject.
+        let deferred = !ack.advanced
+            && self.instance_is_suspended(ack.instance_key)
+            && self
+                .state
+                .message_subscriptions
+                .get(&ack.subscription_key)
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Opening);
+        self.emit(
+            log,
+            Event::MessageCorrelationAcknowledging {
+                subscription_key: ack.subscription_key,
+                message_key: ack.message_key,
+                instance_key: ack.instance_key,
+                accepted,
+                deferred,
+                partition: self.partition_id,
+                target_partition: ack.target_partition,
+            },
+        );
     }
 
     /// Records a correlation against a subscription whose **instance lives on this

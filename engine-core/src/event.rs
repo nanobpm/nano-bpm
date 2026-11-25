@@ -1519,6 +1519,54 @@ pub enum Event {
         variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
+        /// Ack-paced buffered drain (#1874, Zeebe `CORRELATING`): when `Some`,
+        /// this delivery came from the message buffer to a subscription that
+        /// stays open, and the instance partition must answer with an
+        /// [`Event::MessageCorrelationAcknowledging`] routed back to this
+        /// (message) partition before the next buffered message is sent. The
+        /// applier marks the canonical subscription `awaiting_ack`. `None` on
+        /// every other correlation and on a pre-#1874 record (additive).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        ack_partition: Option<u64>,
+    },
+    /// The instance partition's answer (#1874) to an ack-paced
+    /// [`Event::RemoteMessageCorrelation`]: `accepted` when the parked token
+    /// took the message, `false` when it was rejected (the scope ended, the
+    /// element no longer waits, or the instance is gone). A suspended instance
+    /// whose scope is alive answers `deferred` instead (see the field). The
+    /// host routes it to `target_partition` (the message partition) as a
+    /// [`crate::Command::AcknowledgeMessageCorrelation`]. `partition` is the
+    /// emitting (instance) partition, recorded explicitly because the message
+    /// key may be foreign. State-neutral on the emitting partition.
+    MessageCorrelationAcknowledging {
+        subscription_key: Key,
+        message_key: Key,
+        instance_key: Key,
+        accepted: bool,
+        /// The instance is SUSPENDED but its subscription scope is alive
+        /// (#1874): the message partition keeps the subscription open and the
+        /// message buffered for it, instead of closing it. Additive.
+        #[cfg_attr(feature = "serde", serde(default))]
+        deferred: bool,
+        partition: u64,
+        target_partition: u64,
+    },
+    /// The message partition applied an instance partition's acknowledgement
+    /// (#1874): clears the canonical subscription's `awaiting_ack`; a rejected
+    /// delivery also closes the subscription, so the untaken buffered messages
+    /// stay buffered for other subscriptions. `partition` is this (message)
+    /// partition: the subscription key is foreign.
+    MessageCorrelationAcknowledged {
+        subscription_key: Key,
+        message_key: Key,
+        accepted: bool,
+        /// See [`Event::MessageCorrelationAcknowledging`]'s `deferred`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        deferred: bool,
+        partition: u64,
     },
     /// A published message correlated to a process-level **message start
     /// event** and created instance `instance_key` (#1300; Zeebe records this as
@@ -2286,6 +2334,7 @@ impl Event {
             | Event::AdHocCompletionConditionFulfilled { instance_key, .. }
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
+            | Event::MessageCorrelationAcknowledging { instance_key, .. }
             | Event::VariablesLostQuarantined { instance_key, .. }
             | Event::OrphanStampSuperseded { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
@@ -2321,6 +2370,7 @@ impl Event {
             | Event::MessageBuffered { .. }
             | Event::MessageExpired { .. }
             | Event::BufferedMessageCorrelated { .. }
+            | Event::MessageCorrelationAcknowledged { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
@@ -2399,14 +2449,21 @@ impl Event {
         }
     }
 
-    /// The highest [`Key`] this event references in any field.
-    ///
-    /// Replay uses the maximum across the whole log to restore the engine's key
-    /// generator past every key the original run assigned, so newly minted keys
-    /// never collide with replayed ones. (Keys are only ever minted by the
-    /// engine and stamped onto events, so the log is an exact record of them —
-    /// including transient ones like completed element-instance keys that no
-    /// longer appear in final state.)
+    /// Whether this is a cross-partition follow-up the host must route to
+    /// another partition as a command (the single canonical routable set):
+    /// a subscription open / close, a remote correlation, its ack (#1874), or
+    /// a start-instance dispatch.
+    pub fn is_routable(&self) -> bool {
+        matches!(
+            self,
+            Event::MessageSubscriptionOpening { .. }
+                | Event::RemoteMessageCorrelation { .. }
+                | Event::MessageCorrelationAcknowledging { .. }
+                | Event::MessageSubscriptionClosing { .. }
+                | Event::StartInstanceDispatched { .. }
+        )
+    }
+
     /// The source-minted routed-delivery identity (#1497) this event carries,
     /// if it is one of the four routable source events
     /// (`MessageSubscriptionOpening` / `RemoteMessageCorrelation` /
@@ -2482,7 +2539,9 @@ impl Event {
             // may all be foreign.
             Event::MessageBuffered { partition, .. }
             | Event::MessageExpired { partition, .. }
-            | Event::BufferedMessageCorrelated { partition, .. } => *partition,
+            | Event::BufferedMessageCorrelated { partition, .. }
+            | Event::MessageCorrelationAcknowledging { partition, .. }
+            | Event::MessageCorrelationAcknowledged { partition, .. } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another
             // partition, so it never identifies the record's owner. Route by the
@@ -2518,6 +2577,14 @@ impl Event {
         }
     }
 
+    /// The highest [`Key`] this event references in any field.
+    ///
+    /// Replay uses the maximum across the whole log to restore the engine's key
+    /// generator past every key the original run assigned, so newly minted keys
+    /// never collide with replayed ones. (Keys are only ever minted by the
+    /// engine and stamped onto events, so the log is an exact record of them —
+    /// including transient ones like completed element-instance keys that no
+    /// longer appear in final state.)
     pub fn max_key(&self) -> Key {
         let mut m = self.instance_key().unwrap_or(0);
         match self {
@@ -2699,6 +2766,16 @@ impl Event {
             | Event::MessageBuffered { message_key, .. }
             | Event::MessageExpired { message_key, .. }
             | Event::BufferedMessageCorrelated { message_key, .. } => m = m.max(*message_key),
+            Event::MessageCorrelationAcknowledging {
+                subscription_key,
+                message_key,
+                ..
+            }
+            | Event::MessageCorrelationAcknowledged {
+                subscription_key,
+                message_key,
+                ..
+            } => m = m.max(*subscription_key).max(*message_key),
             Event::SignalBroadcast { signal_key, .. } => m = m.max(*signal_key),
             Event::SignalSubscriptionCreated {
                 subscription_key,

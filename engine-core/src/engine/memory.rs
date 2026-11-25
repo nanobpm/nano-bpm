@@ -136,6 +136,7 @@ impl Engine {
             pending_timer_fires: std::collections::VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: std::collections::VecDeque::new(),
+            pending_correlation_ack: None,
             buffer_candidates: std::collections::BTreeMap::new(),
             sweep_from: 0,
             raft_applied: snapshot.raft_applied,

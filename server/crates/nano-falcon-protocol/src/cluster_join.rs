@@ -96,6 +96,13 @@ pub const FEATURE_MESSAGE_BUFFERING: &str = "message-buffering-v1";
 /// and never ships a flagged entry to a peer that does not.
 pub const FEATURE_CANCEL_SUSPENDED_INSTANCE: &str = "cancel-suspended-instance-v1";
 
+/// Ack-paced buffered-message drain (#1874, Zeebe `CORRELATING`): this binary
+/// applies `Command::AcknowledgeMessageCorrelation` and honours
+/// `CorrelateMessageSubscription::ack_partition`. A pre-#1874 binary would drop
+/// the field (never acking, stalling the drain) and reject the ack, so an
+/// entry carrying either never ships to a peer that does not advertise this.
+pub const FEATURE_MESSAGE_CORRELATION_ACK: &str = "message-correlation-ack-v1";
+
 /// Every replicated-command feature this binary supports — the single source
 /// of truth for what the handshake advertises.
 pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
@@ -107,6 +114,7 @@ pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_CLUSTER_PUBLICATION_GATE,
     FEATURE_MESSAGE_BUFFERING,
     FEATURE_CANCEL_SUSPENDED_INSTANCE,
+    FEATURE_MESSAGE_CORRELATION_ACK,
 ];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.

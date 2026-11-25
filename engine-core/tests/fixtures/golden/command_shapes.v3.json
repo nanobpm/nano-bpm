@@ -1,4 +1,9 @@
 [
+  "AcknowledgeMessageCorrelation",
+  "AcknowledgeMessageCorrelation.accepted",
+  "AcknowledgeMessageCorrelation.deferred",
+  "AcknowledgeMessageCorrelation.message_key",
+  "AcknowledgeMessageCorrelation.subscription_key",
   "ActivateAdHocActivities",
   "ActivateAdHocActivities.activate_elements",
   "ActivateAdHocActivities.ad_hoc_instance_key",
