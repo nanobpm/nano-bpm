@@ -925,8 +925,10 @@ jobs:
     # formal/kani/README.md). Its own job with a hard job-level timeout so a
     # harness that outgrows its bound can never hold the TLC job hostage; each
     # harness is additionally boxed by check.sh (KANI_HARNESS_TIMEOUT).
-    needs: changes
-    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true' }}
+    # NON-GATING, manual only (workflow_dispatch) until #1994: even the join
+    # harness is memory-borderline on a hosted runner (killed in SSA
+    # conversion), so it cannot gate PRs or the merge queue.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -962,16 +964,9 @@ jobs:
     # model recorded in formal/tla/check.sh. That includes known-defect
     # ratchets, which fail once the defect stops reproducing. Also guards the
     # Zeebe parity coverage matrix in formal/parity (#1245).
-    # Also the merge gate for the (non-required) kani job: `always()` keeps this
-    # required check running when kani fails, and the first step fails it.
-    needs: [changes, kani]
-    if: ${{ always() && needs.changes.result == 'success' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true') }}
+    needs: changes
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true' }}
     steps:
-      - name: Kani proofs passed
-        if: ${{ needs.kani.result != 'success' }}
-        run: |
-          echo "kani (engine-core proofs) result: ${{ needs.kani.result }}" >&2
-          exit 1
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
