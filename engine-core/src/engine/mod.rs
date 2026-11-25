@@ -327,7 +327,7 @@ pub struct Engine {
     /// front, so draining N messages through a persistent subscription is
     /// O(N log N) rather than N full scans. Per-command scratch; invalidated
     /// whenever a message is buffered.
-    buffer_candidates: BTreeMap<Key, VecDeque<Key>>,
+    pub(crate) buffer_candidates: BTreeMap<Key, VecDeque<Key>>,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -2624,6 +2624,10 @@ impl Engine {
                 });
         self.operation_reference = None;
         self.terminal_deadline_stamps.clear();
+        // Per-command scratch must not outlive the command: an idle engine
+        // retains no candidate queues (#1874).
+        self.buffer_candidates.clear();
+        self.buffer_requeue.clear();
         result
     }
 
@@ -7502,6 +7506,10 @@ impl Engine {
                 .get(&subscription_key)
                 .filter(|s| s.state == state::MessageSubscriptionState::Open)
             else {
+                // A settled subscription never takes another message: evict
+                // its candidate queue so consecutive one-shot catches do not
+                // retain quadratic scratch (#1874).
+                self.buffer_candidates.remove(&subscription_key);
                 return false;
             };
             let instance_key = subscription.instance_key;
@@ -7559,6 +7567,8 @@ impl Engine {
                     .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
                 {
                     self.buffer_requeue.push_back(subscription_key);
+                } else {
+                    self.buffer_candidates.remove(&subscription_key);
                 }
                 return true;
             }

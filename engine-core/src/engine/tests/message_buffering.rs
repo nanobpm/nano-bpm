@@ -679,6 +679,9 @@ fn non_interrupting_subscription_drains_the_whole_backlog_locally() {
     // r4692584915: the backlog is drained from one ordered scan of the
     // buffer, not one full scan per message.
     assert_eq!(engine.buffer_scan_count.get(), 1);
+    // r4693206193: the per-command candidate cache does not outlive the
+    // command (no idle retention).
+    assert!(engine.buffer_candidates.is_empty());
 }
 
 /// The routed twin: the message partition settles every backlog message to a
