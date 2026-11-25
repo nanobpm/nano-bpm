@@ -596,6 +596,7 @@ mod codec_tests {
                 subscription_key: 1,
                 message_key: 2,
                 accepted: true,
+                deferred: false,
             },
             correlate(Some(0)),
         ] {

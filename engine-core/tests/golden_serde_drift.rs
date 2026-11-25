@@ -1170,6 +1170,7 @@ fn build_event_witnesses() -> Vec<Event> {
             message_key: 20,
             instance_key: 23,
             accepted: true,
+            deferred: false,
             partition: 0,
             target_partition: 1,
         },
@@ -1177,6 +1178,7 @@ fn build_event_witnesses() -> Vec<Event> {
             subscription_key: 21,
             message_key: 20,
             accepted: false,
+            deferred: false,
             partition: 1,
         },
         // The #1497 routed-delivery ledger frame (additive variant, no version

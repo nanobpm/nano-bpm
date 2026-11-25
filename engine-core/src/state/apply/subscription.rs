@@ -287,17 +287,26 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
 
         // The instance partition answered an ack-paced delivery (#1874). A
         // rejection closes the subscription (its scope ended or the element no
-        // longer waits), leaving the untaken buffered messages buffered.
+        // longer waits), leaving the untaken buffered messages buffered. A
+        // deferral (suspended instance) keeps it open and un-takes the message.
         Event::MessageCorrelationAcknowledged {
             subscription_key,
             message_key,
             accepted,
+            deferred,
             ..
         } => {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
                 if subscription.awaiting_ack == Some(*message_key) {
                     subscription.awaiting_ack = None;
-                    if !*accepted {
+                    if *deferred {
+                        // Suspended instance (#1874): the subscription stays
+                        // open and the message stays buffered for it.
+                        let instance_key = subscription.instance_key;
+                        if let Some(message) = state.buffered_messages.get_mut(message_key) {
+                            message.correlated_instances.remove(&instance_key);
+                        }
+                    } else if !*accepted {
                         subscription.state = MessageSubscriptionState::Correlated;
                     }
                 }

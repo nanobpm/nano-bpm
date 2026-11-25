@@ -758,6 +758,7 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
             subscription_key,
             message_key,
             accepted,
+            deferred,
             ..
         } => (
             true,
@@ -765,6 +766,7 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
                 subscription_key,
                 message_key,
                 accepted,
+                deferred,
             },
         ),
         _ => return None,
@@ -1033,6 +1035,7 @@ fn ack_paced_drain_replays_deterministically() {
                 subscription_key: sub,
                 message_key: 1,
                 accepted: true,
+                deferred: false,
             },
             2_002,
         )
@@ -1197,4 +1200,67 @@ fn message_id_dedup_uses_an_index_that_survives_replay_and_restore() {
     assert_eq!(engine.state().buffered_messages.len(), 1);
     assert_eq!(engine.state().buffered_message_ids.len(), 1);
     assert!(is_dup(&mut engine, "m-1", 5_000));
+}
+
+/// #1874 (adversarial review): an ack-paced buffered delivery that reaches a
+/// SUSPENDED instance must not close the canonical persistent subscription.
+/// The token takes nothing while suspended (the message stays buffered for the
+/// instance, matching the local path), and after `ResumeInstance` the still
+/// waiting non-interrupting event sub-process keeps receiving messages.
+#[test]
+fn remote_delivery_to_suspended_instance_keeps_subscription_open() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 2);
+    // Create the instance, but suspend it before routing its open.
+    let created = rig
+        .instance
+        .apply_command_at(
+            Command::create_instance_with("ni", vars(&[("orderId", Value::Str(order.clone()))])),
+            2_000,
+        )
+        .unwrap();
+    let instance_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        })
+        .expect("created");
+    let opens: Vec<_> = created.iter().filter_map(routed).collect();
+    rig.trace.extend(created);
+    rig.run(false, Command::SuspendInstance { instance_key }, 2_001);
+    for (to_message, command) in opens {
+        rig.run(to_message, command, 2_002);
+    }
+    // The suspended token took nothing.
+    assert!(!rig
+        .trace
+        .iter()
+        .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+    // The canonical subscription is still open, not awaiting, and the offered
+    // message is still buffered for this instance.
+    let subs: Vec<_> = rig.message.state().message_subscriptions.values().collect();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].state, state::MessageSubscriptionState::Open);
+    assert!(subs[0].awaiting_ack.is_none());
+    for key in &published {
+        let m = &rig.message.state().buffered_messages[key];
+        assert!(!m.correlated_instances.contains(&instance_key));
+    }
+    // After resume, a live publish still reaches the waiting sub-process.
+    rig.run(false, Command::ResumeInstance { instance_key }, 3_000);
+    rig.run(
+        true,
+        publish_with("m", &order, BTreeMap::new(), None),
+        3_001,
+    );
+    assert!(
+        rig.trace.iter().any(
+            |e| matches!(e, Event::MessageCorrelated { instance_key: i, .. } if *i == instance_key)
+        ),
+        "{:?}",
+        rig.trace
+    );
+    let replayed = Engine::replay_partition(1, rig.message_journal.clone());
+    assert_eq!(replayed.state(), rig.message.state());
 }
