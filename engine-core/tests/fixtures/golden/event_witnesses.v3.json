@@ -132,6 +132,19 @@
     }
   },
   {
+    "MessageSubscriptionResumed": {
+      "instance_key": 23,
+      "partition": 1,
+      "subscription_key": 21
+    }
+  },
+  {
+    "MessageSubscriptionResumeConfirmed": {
+      "instance_key": 23,
+      "subscription_key": 21
+    }
+  },
+  {
     "MessageCorrelationAcknowledged": {
       "accepted": false,
       "consumed": false,

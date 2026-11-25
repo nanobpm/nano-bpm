@@ -5627,15 +5627,45 @@ impl Engine {
                 // The resume handshake (#1949): re-offer the backlog to an
                 // open subscription with nothing in flight. Anything else
                 // (closed, awaiting an ack, unknown) is a no-op — idempotent.
-                if self
+                // A settled (closed / unknown) subscription is a no-op: its
+                // instance record already left `Opening` via the routed
+                // close or correlation, so nothing is owed.
+                let Some(s) = self
                     .state
                     .message_subscriptions
                     .get(&subscription_key)
-                    .is_some_and(|s| {
-                        s.state == state::MessageSubscriptionState::Open && s.awaiting_ack.is_none()
-                    })
-                {
+                    .filter(|s| s.state == state::MessageSubscriptionState::Open)
+                else {
+                    return Ok((log, queue));
+                };
+                if s.awaiting_ack.is_none() {
                     self.buffer_requeue.push_back(subscription_key);
+                }
+                // Confirm an open one (whatever the backlog holds): from here this
+                // partition's own durable state re-drives any re-offered
+                // delivery, so the instance partition must stop re-driving
+                // the handshake — an empty backlog would otherwise never
+                // clear its `resume_pending`.
+                let event = Event::MessageSubscriptionResumed {
+                    subscription_key,
+                    instance_key: s.instance_key,
+                    partition: self.partition_id,
+                };
+                self.emit(&mut log, event);
+            }
+
+            Command::ConfirmMessageSubscriptionResume { subscription_key } => {
+                if let Some(s) = self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .filter(|s| s.resume_pending)
+                {
+                    let event = Event::MessageSubscriptionResumeConfirmed {
+                        subscription_key,
+                        instance_key: s.instance_key,
+                    };
+                    self.emit(&mut log, event);
                 }
             }
 
@@ -7848,8 +7878,10 @@ impl Engine {
     /// the exact [`Event::MessageSubscriptionResuming`] the resume emits, so
     /// the host can re-drive a handshake lost to exhausted routing retries or
     /// a stop between `ResumeInstance` committing and its routing. Re-driving
-    /// is idempotent on the message partition. The flag clears once a later
-    /// delivery to the subscription is answered without deferral. Empty while
+    /// is idempotent on the message partition. The flag clears once the
+    /// message partition confirms the handshake
+    /// ([`Event::MessageSubscriptionResumed`]) or a later delivery to the
+    /// subscription is answered without deferral. Empty while
     /// remote buffered delivery is off. Ordered by subscription key.
     pub fn pending_resume_handshakes(&self) -> Vec<Event> {
         if !self.remote_buffered_delivery {

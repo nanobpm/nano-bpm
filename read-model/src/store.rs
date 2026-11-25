@@ -7239,6 +7239,8 @@ fn project_event(
         | Event::MessageCorrelationAcknowledged { .. }
         // The resume handshake (#1949) is a routing record only.
         | Event::MessageSubscriptionResuming { .. }
+        | Event::MessageSubscriptionResumed { .. }
+        | Event::MessageSubscriptionResumeConfirmed { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }

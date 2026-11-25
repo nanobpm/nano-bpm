@@ -197,6 +197,10 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
             reason: "internal cross-partition resume handshake for a paced buffered delivery; \
                  single-partition test engine never paces",
         },
+        Command::ConfirmMessageSubscriptionResume { .. } => Surface::NotSurfaced {
+            reason: "internal cross-partition resume confirmation; \
+                 single-partition test engine never paces",
+        },
         Command::AcknowledgeMessageCorrelation { .. } => Surface::NotSurfaced {
             reason: "internal cross-partition ack of a paced buffered delivery; single-partition \
                  test engine never paces",

@@ -51,6 +51,8 @@
   "CompleteUserTask.variables",
   "ConditionalStartEvent",
   "ConditionalStartEvent.condition",
+  "ConfirmMessageSubscriptionResume",
+  "ConfirmMessageSubscriptionResume.subscription_key",
   "CorrelateMessage",
   "CorrelateMessage.business_id",
   "CorrelateMessage.correlation_key",

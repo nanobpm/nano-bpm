@@ -533,6 +533,7 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
                 } => FEATURE_CANCEL_SUSPENDED_INSTANCE,
                 Command::AcknowledgeMessageCorrelation { .. }
                 | Command::ResumeMessageSubscription { .. }
+                | Command::ConfirmMessageSubscriptionResume { .. }
                 | Command::CorrelateMessageSubscription {
                     ack_partition: Some(_),
                     ..
@@ -660,6 +661,9 @@ mod codec_tests {
                 deferred: false,
             },
             Command::ResumeMessageSubscription {
+                subscription_key: 1,
+            },
+            Command::ConfirmMessageSubscriptionResume {
                 subscription_key: 1,
             },
             correlate(Some(0)),

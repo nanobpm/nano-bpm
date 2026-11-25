@@ -1257,7 +1257,18 @@ fn routed_protocol_entries() -> Vec<Command> {
         .expect("a resume handshake applies on the message partition");
     assert!(resumed.is_empty(), "a stale resume is a no-op: {resumed:?}");
 
-    vec![opening, continuation, close, ack, resume]
+    // (8): a stale resume confirmation (#1949) on the instance partition —
+    // the subscription is no longer awaiting a resume, so it is a no-op.
+    let confirm = Command::ConfirmMessageSubscriptionResume { subscription_key };
+    let confirmed = instance_partition
+        .apply_command_at(confirm.clone(), T0 + 8)
+        .expect("a resume confirmation applies on the instance partition");
+    assert!(
+        confirmed.is_empty(),
+        "a stale confirmation is a no-op: {confirmed:?}"
+    );
+
+    vec![opening, continuation, close, ack, resume, confirm]
 }
 
 /// The [`Command::kind`] of every corpus entry (coverage evidence).

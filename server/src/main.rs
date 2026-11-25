@@ -12388,6 +12388,18 @@ impl ServerImpl {
                     subscription_key: *subscription_key,
                 },
             )),
+            // Its confirmation (#1949) goes back to the instance's partition,
+            // ending the handshake re-drive.
+            Event::MessageSubscriptionResumed {
+                subscription_key,
+                instance_key,
+                ..
+            } => Some((
+                nanobpmn_engine_core::partition_of(*instance_key),
+                Command::ConfirmMessageSubscriptionResume {
+                    subscription_key: *subscription_key,
+                },
+            )),
             Event::MessageSubscriptionClosing {
                 subscription_key,
                 instance_key,
@@ -12490,6 +12502,7 @@ impl ServerImpl {
                 command,
                 Command::AcknowledgeMessageCorrelation { .. }
                     | Command::ResumeMessageSubscription { .. }
+                    | Command::ConfirmMessageSubscriptionResume { .. }
             )
     }
 
@@ -56459,6 +56472,28 @@ mod subscription_placement_tests {
             .collect();
         assert_eq!(picks, vec![1, 3, 1, 3]);
         assert_eq!(ServerImpl::rotate_replica(&[2], 2, 0), None);
+    }
+
+    /// #1949: the message partition's resume confirmation is routed back
+    /// to the INSTANCE's partition (not the subscription's), as an
+    /// idempotent `ConfirmMessageSubscriptionResume`.
+    #[test]
+    fn resume_confirmation_routes_to_the_instance_partition() {
+        let instance_key = (3u64 << nanobpmn_engine_core::LOCAL_BITS) | 7;
+        let resumed = Event::MessageSubscriptionResumed {
+            subscription_key: instance_key + 1,
+            instance_key,
+            partition: 1,
+        };
+        assert!(ServerImpl::is_routable_event(&resumed));
+        let (target, command) = ServerImpl::route_event(&resumed, 4).expect("routable");
+        assert_eq!(target, 3);
+        assert!(matches!(
+            command,
+            Command::ConfirmMessageSubscriptionResume { subscription_key }
+                if subscription_key == instance_key + 1
+        ));
+        assert!(ServerImpl::routed_command_is_idempotent(&command));
     }
 
     /// #1582: only keyed (deduped) routed commands may have their proposal

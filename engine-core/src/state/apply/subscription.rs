@@ -387,6 +387,15 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             }
         }
 
+        // The message partition confirmed the resume handshake (#1949).
+        Event::MessageSubscriptionResumeConfirmed {
+            subscription_key, ..
+        } => {
+            if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
+                s.resume_pending = false;
+            }
+        }
+
         Event::MessageStartSubscriptionCreated {
             process_definition_key,
             process_id,

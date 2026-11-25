@@ -1182,6 +1182,16 @@ fn build_event_witnesses() -> Vec<Event> {
             instance_key: 23,
             correlation_key: "order-1".into(),
         },
+        // #1949 resume confirmation (additive variants).
+        Event::MessageSubscriptionResumed {
+            subscription_key: 21,
+            instance_key: 23,
+            partition: 1,
+        },
+        Event::MessageSubscriptionResumeConfirmed {
+            subscription_key: 21,
+            instance_key: 23,
+        },
         Event::MessageCorrelationAcknowledged {
             subscription_key: 21,
             message_key: 20,

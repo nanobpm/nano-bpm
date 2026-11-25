@@ -2013,6 +2013,26 @@ pub enum Event {
         instance_key: Key,
         correlation_key: String,
     },
+    /// The message partition processed a resume handshake (#1949): from
+    /// here on its own durable state (`awaiting_ack` of any re-offered
+    /// delivery) drives the subscription, so the instance partition can stop
+    /// re-driving the handshake even when the backlog turned out empty. The
+    /// host routes it as a
+    /// [`crate::Command::ConfirmMessageSubscriptionResume`] to the instance's
+    /// partition. State-neutral here; `partition` is this (message) partition:
+    /// the subscription and instance keys are foreign.
+    MessageSubscriptionResumed {
+        subscription_key: Key,
+        instance_key: Key,
+        partition: u64,
+    },
+    /// The instance partition received the message partition's
+    /// [`Event::MessageSubscriptionResumed`] confirmation (#1949): clears the
+    /// `Opening` record's `resume_pending`, ending the handshake re-drive.
+    MessageSubscriptionResumeConfirmed {
+        subscription_key: Key,
+        instance_key: Key,
+    },
     /// A process-level message start subscription was opened at deploy time: a
     /// later [`Event::MessagePublished`] with a matching `message_name` creates a
     /// new instance of `process_id`. Carried on the log so replay reconstructs
@@ -2366,6 +2386,7 @@ impl Event {
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::MessageCorrelationAcknowledging { instance_key, .. }
             | Event::MessageSubscriptionResuming { instance_key, .. }
+            | Event::MessageSubscriptionResumeConfirmed { instance_key, .. }
             | Event::VariablesLostQuarantined { instance_key, .. }
             | Event::OrphanStampSuperseded { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
@@ -2402,6 +2423,7 @@ impl Event {
             | Event::MessageExpired { .. }
             | Event::BufferedMessageCorrelated { .. }
             | Event::MessageCorrelationAcknowledged { .. }
+            | Event::MessageSubscriptionResumed { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
@@ -2491,6 +2513,7 @@ impl Event {
                 | Event::RemoteMessageCorrelation { .. }
                 | Event::MessageCorrelationAcknowledging { .. }
                 | Event::MessageSubscriptionResuming { .. }
+                | Event::MessageSubscriptionResumed { .. }
                 | Event::MessageSubscriptionClosing { .. }
                 | Event::StartInstanceDispatched { .. }
         )
@@ -2573,7 +2596,8 @@ impl Event {
             | Event::MessageExpired { partition, .. }
             | Event::BufferedMessageCorrelated { partition, .. }
             | Event::MessageCorrelationAcknowledging { partition, .. }
-            | Event::MessageCorrelationAcknowledged { partition, .. } => *partition,
+            | Event::MessageCorrelationAcknowledged { partition, .. }
+            | Event::MessageSubscriptionResumed { partition, .. } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another
             // partition, so it never identifies the record's owner. Route by the
@@ -2810,7 +2834,15 @@ impl Event {
             } => m = m.max(*subscription_key).max(*message_key),
             Event::MessageSubscriptionResuming {
                 subscription_key, ..
+            }
+            | Event::MessageSubscriptionResumeConfirmed {
+                subscription_key, ..
             } => m = m.max(*subscription_key),
+            Event::MessageSubscriptionResumed {
+                subscription_key,
+                instance_key,
+                ..
+            } => m = m.max(*subscription_key).max(*instance_key),
             Event::SignalBroadcast { signal_key, .. } => m = m.max(*signal_key),
             Event::SignalSubscriptionCreated {
                 subscription_key,

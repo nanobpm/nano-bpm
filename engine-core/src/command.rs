@@ -621,6 +621,12 @@ pub enum Command {
     /// deferred while the instance was suspended). Idempotent: anything else
     /// is a no-op.
     ResumeMessageSubscription { subscription_key: Key },
+    /// The message partition's confirmation of a resume handshake (#1949),
+    /// applied on the **instance** partition (routed from
+    /// [`crate::Event::MessageSubscriptionResumed`]): clears the `Opening`
+    /// record's `resume_pending` so the host stops re-driving the handshake.
+    /// Idempotent: a no-op unless the record is still pending.
+    ConfirmMessageSubscriptionResume { subscription_key: Key },
     /// Close a canonical subscription on the message partition because the
     /// instance disarmed it (the guarded activity left the flow, the instance was
     /// cancelled, or a sibling boundary fired). Routed by the host after the
@@ -1325,7 +1331,8 @@ impl Command {
                 h.str(if *consumed { "1" } else { "0" });
                 h.str(if *deferred { "1" } else { "0" });
             }
-            Command::ResumeMessageSubscription { subscription_key } => {
+            Command::ResumeMessageSubscription { subscription_key }
+            | Command::ConfirmMessageSubscriptionResume { subscription_key } => {
                 h.key(*subscription_key);
             }
             Command::CancelInstance {
@@ -1432,6 +1439,7 @@ impl Command {
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
             Command::AcknowledgeMessageCorrelation { .. } => "acknowledge_message_correlation",
             Command::ResumeMessageSubscription { .. } => "resume_message_subscription",
+            Command::ConfirmMessageSubscriptionResume { .. } => "confirm_subscription_resume",
             Command::CancelInstance { .. } => "cancel_instance",
             Command::SuspendInstance { .. } => "suspend_instance",
             Command::ResumeInstance { .. } => "resume_instance",

@@ -839,6 +839,12 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
             true,
             Command::ResumeMessageSubscription { subscription_key },
         ),
+        Event::MessageSubscriptionResumed {
+            subscription_key, ..
+        } => (
+            false,
+            Command::ConfirmMessageSubscriptionResume { subscription_key },
+        ),
         Event::MessageCorrelationAcknowledging {
             subscription_key,
             message_key,
@@ -1928,7 +1934,8 @@ fn resume_handshake_redelivers_a_deferred_backlog_across_a_restart() {
         "the resume announces itself to the message partition"
     );
     assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
-    // A repeated handshake is a no-op (idempotent).
+    // A repeated handshake re-offers nothing (idempotent); it only
+    // re-confirms, which the instance partition ignores once settled.
     let sub = *rig
         .message
         .state()
@@ -1942,7 +1949,12 @@ fn resume_handshake_redelivers_a_deferred_backlog_across_a_restart() {
         },
         3_100,
     );
-    assert!(again.is_empty(), "{again:?}");
+    assert!(
+        again
+            .iter()
+            .all(|e| matches!(e, Event::MessageSubscriptionResumed { .. })),
+        "{again:?}"
+    );
 }
 
 /// #1949 one-way gate: once ack-paced delivery is enabled, a transient peer
@@ -2312,4 +2324,58 @@ fn a_lost_resume_handshake_is_redriven_from_durable_state() {
     }
     assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
     assert!(rig.instance.pending_resume_handshakes().is_empty());
+}
+
+/// #1949 (adversarial review): the deferred message EXPIRES while the
+/// instance is suspended, so the resume finds an empty backlog and no later
+/// delivery ever clears `resume_pending`. The message partition must confirm
+/// the handshake itself, or the host re-drives it forever.
+#[test]
+fn a_resume_with_an_empty_backlog_is_confirmed_and_not_redriven() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 1);
+    let deadline = rig.message.state().buffered_messages[&published[0]].deadline;
+    let (instance_key, held) = create_suspended(&mut rig, &order, &is_ack);
+    for (to_message, command) in held {
+        rig.run(to_message, command, 2_500);
+    }
+    let swept = rig.on_message(Command::TriggerTimers { now: deadline + 1 }, deadline + 1);
+    assert!(swept
+        .iter()
+        .any(|e| matches!(e, Event::MessageExpired { .. })));
+    rig.trace.extend(swept);
+    rig.run(
+        false,
+        Command::ResumeInstance { instance_key },
+        deadline + 2,
+    );
+    assert!(correlated(&rig, instance_key).is_empty());
+    assert!(
+        rig.instance.pending_resume_handshakes().is_empty(),
+        "the confirmed handshake is not owed any more: {:?}",
+        rig.trace
+    );
+    // Durable: a replayed instance partition owes nothing either.
+    let replayed = Engine::replay_partition(0, rig.instance_journal.clone());
+    assert!(!replayed
+        .state()
+        .message_subscriptions
+        .values()
+        .any(|s| s.resume_pending));
+    // A duplicate confirmation is a no-op.
+    let sub = *rig
+        .instance
+        .state()
+        .message_subscriptions
+        .keys()
+        .next()
+        .unwrap();
+    assert!(rig
+        .on_instance(
+            Command::ConfirmMessageSubscriptionResume {
+                subscription_key: sub
+            },
+            deadline + 3
+        )
+        .is_empty());
 }
