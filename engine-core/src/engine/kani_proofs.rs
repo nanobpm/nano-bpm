@@ -22,7 +22,9 @@ fn parallel_diamond_creates_one_instance() {
         .connect("B", "P2")
         .connect("P2", "E")
         .build();
-    let Ok(def) = def else { return };
+    // Fail, never pass vacuously, if the builder rejects the diamond.
+    assert!(def.is_ok(), "diamond process must build");
+    let Ok(def) = def else { unreachable!() };
     let mut engine = Engine::new();
     let _ = engine.apply_command(Command::DeployProcess(def));
     let _ = engine.apply_command(Command::create_instance("p"));
