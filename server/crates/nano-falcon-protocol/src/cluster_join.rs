@@ -81,6 +81,13 @@ pub const FEATURE_TERMINAL_DEADLINES: &str = "terminal-deadlines-v1";
 /// ordered behind the pending open.
 pub const FEATURE_CLUSTER_PUBLICATION_GATE: &str = "cluster-publication-gate-v1";
 
+/// Ack-paced buffered-message drain (#1874, Zeebe `CORRELATING`): this binary
+/// applies `Command::AcknowledgeMessageCorrelation` and honours
+/// `CorrelateMessageSubscription::ack_partition`. A pre-#1874 binary would drop
+/// the field (never acking, stalling the drain) and reject the ack, so an
+/// entry carrying either never ships to a peer that does not advertise this.
+pub const FEATURE_MESSAGE_CORRELATION_ACK: &str = "message-correlation-ack-v1";
+
 /// Every replicated-command feature this binary supports — the single source
 /// of truth for what the handshake advertises.
 pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
@@ -90,6 +97,7 @@ pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_REPLICA_DIGEST_CUTOVER,
     FEATURE_TERMINAL_DEADLINES,
     FEATURE_CLUSTER_PUBLICATION_GATE,
+    FEATURE_MESSAGE_CORRELATION_ACK,
 ];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.

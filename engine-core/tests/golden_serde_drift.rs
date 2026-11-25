@@ -1150,6 +1150,35 @@ fn build_event_witnesses() -> Vec<Event> {
             message_key: 20,
             partition: 1,
         },
+        // The #1874 ack-paced buffered drain (additive variants + an
+        // additive `ack_partition` on `RemoteMessageCorrelation`).
+        Event::RemoteMessageCorrelation {
+            subscription_key: 21,
+            message_key: 20,
+            instance_key: 23,
+            element_instance_key: 24,
+            element_id: "b".into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary {
+                boundary_element_id: "nb".into(),
+            },
+            variables: vars.clone(),
+            delivery_key: 26,
+            ack_partition: Some(1),
+        },
+        Event::MessageCorrelationAcknowledging {
+            subscription_key: 21,
+            message_key: 20,
+            instance_key: 23,
+            accepted: true,
+            partition: 0,
+            target_partition: 1,
+        },
+        Event::MessageCorrelationAcknowledged {
+            subscription_key: 21,
+            message_key: 20,
+            accepted: false,
+            partition: 1,
+        },
         // The #1497 routed-delivery ledger frame (additive variant, no version
         // bump): the recipient partition's dedup / close-tombstone record.
         Event::RoutedDeliveryRecorded {
@@ -1436,6 +1465,17 @@ fn pre_1497_routed_events_decode_with_zero_delivery_key() {
             other => panic!("{name} decoded to {other:?}"),
         };
         assert_eq!(delivery_key, 0, "{name} defaults delivery_key to 0");
+    }
+}
+
+/// The #1874 additive `ack_partition` defaults to `None` (no ack pacing) when
+/// absent: a pre-#1874 `RemoteMessageCorrelation` still decodes unchanged.
+#[test]
+fn pre_1874_remote_correlation_decodes_without_ack_pacing() {
+    let json = r#"{"RemoteMessageCorrelation":{"subscription_key":1,"message_key":2,"instance_key":3,"element_instance_key":4,"element_id":"e","kind":"IntermediateCatch","variables":{},"delivery_key":5}}"#;
+    match nanobpmn_engine_core::decode_event_json(json).expect("decode pre-#1874 record") {
+        Event::RemoteMessageCorrelation { ack_partition, .. } => assert_eq!(ack_partition, None),
+        other => panic!("decoded to {other:?}"),
     }
 }
 

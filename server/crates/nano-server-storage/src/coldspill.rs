@@ -518,6 +518,7 @@ mod tests {
             state: MessageSubscriptionState::Open,
             kind: MessageSubscriptionKind::IntermediateCatch,
             correlated_message_keys: Default::default(),
+            awaiting_ack: None,
         });
         snap.timers.push(Timer {
             key: 320,

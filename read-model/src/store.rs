@@ -7232,6 +7232,11 @@ fn project_event(
         | Event::MessageBuffered { .. }
         | Event::MessageExpired { .. }
         | Event::BufferedMessageCorrelated { .. }
+        // The ack-paced drain's handshake (#1874): a rejection only follows
+        // the instance partition closing its own record, which the read model
+        // already projects.
+        | Event::MessageCorrelationAcknowledging { .. }
+        | Event::MessageCorrelationAcknowledged { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }
@@ -12757,6 +12762,7 @@ mod element_instance_tests {
                 kind: MessageSubscriptionKind::IntermediateCatch,
                 variables: std::collections::BTreeMap::new(),
                 delivery_key: 0,
+                ack_partition: None,
             }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
@@ -14647,6 +14653,7 @@ mod element_instance_tests {
                 state: S::Open,
                 kind: ni.clone(),
                 correlated_message_keys: Default::default(),
+                awaiting_ack: None,
             },
         );
         state.signal_subscriptions.insert(

@@ -1224,6 +1224,7 @@ fn off_partition_boundary_correlates_onto_migrated_target_boundary() {
             kind: stale_kind,
             variables: BTreeMap::new(),
             delivery_key: 0,
+            ack_partition: None,
         })
         .unwrap();
     assert!(
