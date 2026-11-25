@@ -63997,11 +63997,6 @@ mod process_instance_deletion_tests {
         assert_eq!(dedupe_selected_descendants(vec![1], cyclic), vec![1]);
     }
 
-    /// Load-shaped (#1948): batch-delete ~10k ended instances by filter. The
-    /// batch runs through the shared seam to COMPLETED with every item
-    /// completed and none failed; search totals drop by exactly that many and
-    /// the read model shrinks, while a live instance is neither enqueued nor
-    /// deleted.
     /// #1948 review: an ended instance that retention pruned into the
     /// file-backed terminal archive must still be selected — and deleted — by
     /// the batch deletion endpoint, exactly as the single-instance endpoint
@@ -64098,6 +64093,11 @@ mod process_instance_deletion_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Load-shaped (#1948): batch-delete ~10k ended instances by filter. The
+    /// batch runs through the shared seam to COMPLETED with every item
+    /// completed and none failed; search totals drop by exactly that many and
+    /// the read model shrinks, while a live instance is neither enqueued nor
+    /// deleted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn batch_deletion_of_10k_ended_instances_shrinks_the_read_model() {
         use apis::batch_operation::GetBatchOperationResponse as GetResp;

@@ -3238,10 +3238,7 @@ impl ReadStore {
     pub fn process_instances(&self) -> Vec<ProcessInstanceRow> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
-            .prepare(
-                "SELECT key, process_id, process_definition_id, process_definition_key, \
-                 version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key, suspended_date_ms FROM process_instances",
-            )
+            .prepare(PROCESS_INSTANCES_SQL)
             .or_corrupt("prepare process_instances");
         let rows = stmt
             .query_map([], map_instance)
@@ -3359,10 +3356,7 @@ impl ReadStore {
         let live: std::collections::HashSet<Key> = rows.iter().map(|r| r.key).collect();
         let conn =
             Connection::open_with_flags(archive, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let mut stmt = conn.prepare(
-            "SELECT key, process_id, process_definition_id, process_definition_key, \
-             version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key, suspended_date_ms FROM process_instances",
-        )?;
+        let mut stmt = conn.prepare(PROCESS_INSTANCES_SQL)?;
         for row in stmt.query_map([], map_instance)? {
             let row = row?;
             if !live.contains(&row.key) {
@@ -4012,11 +4006,21 @@ impl VariablePushdown {
     }
 }
 
+/// Full-row scan of `process_instances`, in the column order `map_instance`
+/// reads. The single source of the column list: every instance query (live
+/// store and archive, scan and point lookup) derives from it so none can drift.
+macro_rules! process_instances_select {
+    () => {
+        "SELECT key, process_id, process_definition_id, process_definition_key, \
+         version, state, start_date_ms, has_incident, tags, business_id, \
+         parent_process_instance_key, parent_element_instance_key, suspended_date_ms \
+         FROM process_instances"
+    };
+}
+const PROCESS_INSTANCES_SQL: &str = process_instances_select!();
 /// Point lookup of one process instance by key, shared by the live-store and
-/// archive lookups so their column lists cannot drift.
-const PROCESS_INSTANCE_BY_KEY_SQL: &str = "SELECT key, process_id, process_definition_id, process_definition_key, \
-     version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, \
-     parent_element_instance_key, suspended_date_ms FROM process_instances WHERE key = ?1";
+/// archive lookups.
+const PROCESS_INSTANCE_BY_KEY_SQL: &str = concat!(process_instances_select!(), " WHERE key = ?1");
 
 fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
     let tags_str: String = r.get(8)?;
