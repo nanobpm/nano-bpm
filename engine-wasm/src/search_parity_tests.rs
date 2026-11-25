@@ -245,6 +245,31 @@ fn spec_accepts_operators(s: &serde_yaml::Value) -> bool {
     })
 }
 
+/// The advanced-filter operators (`$eq`, `$gt`, …) the filter property schema
+/// `s` declares, following `$ref` / `allOf` / `oneOf` / `anyOf` like
+/// [`spec_accepts_operators`]. Each must have an accepted probe.
+fn spec_supported_operators(s: &serde_yaml::Value) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if let Some(m) = s["properties"].as_mapping() {
+        out.extend(
+            m.keys()
+                .filter_map(|k| k.as_str())
+                .filter(|k| k.starts_with('$'))
+                .map(str::to_string),
+        );
+    }
+    if let Some(r) = s["$ref"].as_str() {
+        let target = r.rsplit('/').next().expect("ref target");
+        out.extend(spec_supported_operators(&schema(target)));
+    }
+    for k in ["allOf", "oneOf", "anyOf"] {
+        for part in s[k].as_sequence().into_iter().flatten() {
+            out.extend(spec_supported_operators(part));
+        }
+    }
+    out
+}
+
 /// Scalar filter properties that cannot take ANY accepted well-formed
 /// operand, each with the reason. Keep this empty unless genuinely needed.
 const UNEXERCISABLE_FILTERS: &[(&str, &str)] = &[];
@@ -427,23 +452,27 @@ fn check_filters(op: &Op) -> usize {
                 );
             }
         }
-        // Per-operator probes: the property counts as exercised only when at
-        // least one operator probe was accepted.
-        let mut exercised = false;
+        // Per-operator probes: EVERY operator the property's spec schema
+        // declares must have at least one accepted probe (one accepted `$eq`
+        // must not mask a rejected `$gt`); unsupported operators only need
+        // the surfaces to agree.
+        let supported = elem_schema
+            .as_ref()
+            .map(spec_supported_operators)
+            .unwrap_or_default();
+        let exempt = UNEXERCISABLE_FILTERS.iter().any(|(p, _)| *p == prop);
         for o in &ops {
+            let mut ok = false;
             for operand in operands(o, &v) {
                 let body = with_base(wrap(json!({ o.as_str(): operand }))).to_string();
                 if compare(op, &body).is_some() {
                     accepted += 1;
-                    exercised = true;
+                    ok = true;
                 }
             }
-        }
-        // Only a property whose spec schema admits operator objects must have
-        // an accepted operator probe; a plain scalar is exercised by the
-        // (required-accepted) shorthand above.
-        if takes_operators && !exercised && !UNEXERCISABLE_FILTERS.iter().any(|(p, _)| *p == prop) {
-            unexercised.push(prop);
+            if takes_operators && supported.contains(o) && !ok && !exempt {
+                unexercised.push(format!("{prop}.{o}"));
+            }
         }
     }
     assert!(
@@ -1109,6 +1138,20 @@ fn filter_guard_fails_when_both_surfaces_reject_a_well_formed_enum_operand() {
         check_filters(&stub_op("\"CREATING\""))
     }));
     assert!(r.is_err(), "guard passed despite rejected enum operand");
+}
+
+#[test]
+fn filter_guard_fails_when_both_surfaces_reject_one_supported_operator() {
+    // `priority` supports `$gt`; rejecting only `$gt` (while `$eq` etc. are
+    // accepted) must still fail the guard.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_filters(&stub_op("\"$gt\""))
+    }));
+    assert!(r.is_err(), "guard passed despite rejected $gt operator");
+    assert!(
+        spec_supported_operators(&spec_property_schema("UserTaskFilter", "priority").unwrap())
+            .contains("$gt")
+    );
 }
 
 #[test]
