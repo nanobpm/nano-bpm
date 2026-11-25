@@ -970,3 +970,161 @@ fn response_field_walk_detects_a_known_read_field() {
         "expected batch operation read results to be walked"
     );
 }
+
+/// Served batch-operation endpoints whose handler deliberately does NOT execute
+/// through the shared batch seam, each with its `not-executing #<issue>` marker.
+/// Empty: every served batch endpoint executes (#1863). Adding an entry here is
+/// an explicit, tracked decision, never a silent no-op.
+const NOT_EXECUTING_BATCH_ENDPOINTS: &[(&str, &str)] = &[];
+
+/// Every spec operation (served or not) whose 2xx response is (or embeds) a
+/// `BatchOperationCreatedResult` - i.e. the operation mints a batch.
+fn batch_operation_endpoints() -> BTreeSet<String> {
+    let mut spec = Spec {
+        dir: build_spec_dir(),
+        files: BTreeMap::new(),
+    };
+    let paths = spec
+        .file("rest-api.yaml")
+        .get("paths")
+        .and_then(Value::as_mapping)
+        .expect("rest-api.yaml has paths")
+        .clone();
+    let mut out = BTreeSet::new();
+    for (_, item) in paths {
+        let (item, file) = match item.get("$ref").and_then(Value::as_str) {
+            Some(r) => {
+                let (v, f, _) = spec.resolve(r, "rest-api.yaml");
+                (v, f)
+            }
+            None => (item.clone(), "rest-api.yaml".to_string()),
+        };
+        let Some(ops) = item.as_mapping() else {
+            continue;
+        };
+        for (_, op) in ops.clone() {
+            let Some(op_id) = op.get("operationId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(responses) = op.get("responses").and_then(Value::as_mapping) else {
+                continue;
+            };
+            // Walk every 2xx response schema RECURSIVELY (the same `walk` the
+            // response-field guard uses), so a `BatchOperationCreatedResult`
+            // embedded behind `$ref`s (e.g. `DeleteResourceResponse.batchOperation`)
+            // is found, not just one named in the immediate response text.
+            let mut fields = BTreeSet::new();
+            let mut visited = BTreeSet::new();
+            for (status, resp) in responses.clone() {
+                let status = match &status {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    _ => continue,
+                };
+                if !status.starts_with('2') {
+                    continue;
+                }
+                let (resp, resp_file) = match resp.get("$ref").and_then(Value::as_str) {
+                    Some(r) => {
+                        let (v, f, _) = spec.resolve(r, &file);
+                        (v, f)
+                    }
+                    None => (resp, file.clone()),
+                };
+                let Some(content) = resp.get("content").and_then(Value::as_mapping) else {
+                    continue;
+                };
+                for (_, media) in content.clone() {
+                    if let Some(schema) = media.get("schema") {
+                        let name = format!("{op_id}Response");
+                        walk(
+                            &mut spec,
+                            schema,
+                            &resp_file,
+                            &name,
+                            &mut fields,
+                            &mut visited,
+                        );
+                    }
+                }
+            }
+            let mints = fields
+                .iter()
+                .any(|f| f.starts_with("BatchOperationCreatedResult."));
+            if mints {
+                out.insert(snake(op_id));
+            }
+        }
+    }
+    out
+}
+
+/// #1863: a batch endpoint that mints a batch record and applies nothing
+/// reports success while leaving every item untouched (the cancel /
+/// resolve-incident / job-update batches did exactly that). Every SERVED spec
+/// batch endpoint's handler must drive its items through the single shared
+/// executor `drive_process_instance_batch`, or be listed in
+/// [`NOT_EXECUTING_BATCH_ENDPOINTS`] with a `not-executing #<issue>` marker.
+/// (Unserved endpoints answer 501 from the generated stub - not a silent no-op.)
+#[test]
+fn batch_endpoints_execute_through_the_shared_seam() {
+    let endpoints = batch_operation_endpoints();
+    let served = served_operations();
+    let handlers = override_handlers();
+    let exempt: BTreeMap<&str, &str> = NOT_EXECUTING_BATCH_ENDPOINTS.iter().copied().collect();
+    for (op, marker) in &exempt {
+        assert!(
+            marker.starts_with("not-executing #"),
+            "{op}: exemption marker must read `not-executing #<issue>`, got {marker:?}"
+        );
+        assert!(
+            endpoints.contains(*op),
+            "{op}: stale exemption, not a spec batch endpoint"
+        );
+    }
+    let mut checked = 0;
+    let mut silent = Vec::new();
+    for op in endpoints.iter().filter(|op| served.contains(*op)) {
+        if exempt.contains_key(op.as_str()) {
+            continue;
+        }
+        checked += 1;
+        let Some((handler, _)) = handlers.get(op) else {
+            silent.push(format!("{op}: served but no OVERRIDES handler"));
+            continue;
+        };
+        let executes = fn_source(handler).is_some_and(|src| {
+            strip_rust_comments(&src).contains(".drive_process_instance_batch(")
+        });
+        if !executes {
+            silent.push(format!("{op} -> {handler}"));
+        }
+    }
+    assert!(
+        checked >= 5,
+        "found only {checked} served batch endpoints - is the derivation blind? {endpoints:?}"
+    );
+    assert!(
+        silent.is_empty(),
+        "batch endpoints whose handler never executes through \
+         `drive_process_instance_batch` (a minted batch that applies nothing is \
+         a silent no-op) - execute it, or list it in NOT_EXECUTING_BATCH_ENDPOINTS \
+         with `not-executing #<issue>`: {silent:#?}"
+    );
+}
+
+#[test]
+fn batch_endpoint_derivation_finds_the_known_batches() {
+    let endpoints = batch_operation_endpoints();
+    for op in [
+        "cancel_process_instances_batch_operation",
+        "resolve_incidents_batch_operation",
+        "update_jobs_batch_operation",
+        "migrate_process_instances_batch_operation",
+        "modify_process_instances_batch_operation",
+        // Embedded behind `$ref`s: `DeleteResourceResponse.batchOperation`.
+        "delete_resource",
+    ] {
+        assert!(endpoints.contains(op), "{op} not derived: {endpoints:?}");
+    }
+}

@@ -1820,9 +1820,7 @@ fn cancel_cascades_to_the_child_after_a_snapshot_restore() {
 
     let mut restored = Engine::from_snapshot(engine.snapshot());
     restored
-        .apply_command(Command::CancelInstance {
-            instance_key: parent,
-        })
+        .apply_command(Command::cancel_instance(parent))
         .unwrap();
     assert_eq!(
         restored.state.instances[&child].state,
@@ -1845,9 +1843,7 @@ fn cancel_cascades_to_a_rehydrated_child() {
     assert!(!engine.state.instances.contains_key(&child));
     engine.rehydrate_instance(cold);
     engine
-        .apply_command(Command::CancelInstance {
-            instance_key: parent,
-        })
+        .apply_command(Command::cancel_instance(parent))
         .unwrap();
     assert_eq!(
         engine.state.instances[&child].state,
