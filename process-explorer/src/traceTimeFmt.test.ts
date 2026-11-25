@@ -25,3 +25,22 @@ test("fmtDuration keeps the seconds component in 0..59", () => {
   assert.equal(fmtDuration(60_000), "1m 0s");
   assert.equal(fmtDuration(3_599_999), "59m 59s");
 });
+
+// fmtClock runs per row per live tick: it must reuse one shared formatter, not
+// construct an Intl.DateTimeFormat on every call.
+test("fmtClock does not construct a formatter per call", () => {
+  fmtClock(0); // warm the shared formatter
+  const Orig = Intl.DateTimeFormat;
+  let constructed = 0;
+  const Spy = function (this: unknown, ...args: ConstructorParameters<typeof Orig>) {
+    constructed++;
+    return new Orig(...args);
+  } as unknown as typeof Intl.DateTimeFormat;
+  (Intl as { DateTimeFormat: typeof Intl.DateTimeFormat }).DateTimeFormat = Spy;
+  try {
+    for (let i = 0; i < 100; i++) fmtClock(i * 60_000);
+  } finally {
+    (Intl as { DateTimeFormat: typeof Intl.DateTimeFormat }).DateTimeFormat = Orig;
+  }
+  assert.equal(constructed, 0);
+});

@@ -20,14 +20,20 @@ export function fmtDuration(ms: number | null): string {
  * regardless of the browser's locale; the time zone stays local (Intl uses the
  * host zone when none is supplied).
  */
+// One shared formatter: `fmtClock` runs for every trace row on every live
+// re-render tick, and constructing an `Intl.DateTimeFormat` is expensive.
+// Built lazily on first use so the host time zone is resolved at that point.
+let clockFormatter: Intl.DateTimeFormat | null = null;
+
 export function fmtClock(ms: number): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
+  clockFormatter ??= new Intl.DateTimeFormat("en-US", {
     hour: "numeric",
     minute: "2-digit",
     hour12: true,
     month: "short",
     day: "numeric",
-  }).formatToParts(new Date(ms));
+  });
+  const parts = clockFormatter.formatToParts(new Date(ms));
   const get = (type: Intl.DateTimeFormatPartTypes): string =>
     parts.find((p) => p.type === type)?.value ?? "";
   const period = get("dayPeriod")
