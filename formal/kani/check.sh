@@ -21,7 +21,7 @@ HARNESS_TIMEOUT="${KANI_HARNESS_TIMEOUT:-420}"
 # Pass harness names to prove only those (CI runs one harness per matrix leg).
 ALL_HARNESSES=(
   flow_arrivals_preserve_join_invariant
-  job_lease_lifecycle_keeps_indexes_in_lockstep
+  job_index_resync_keeps_lockstep
   parallel_join_fires_only_when_every_flow_taken
 )
 if [[ $# -gt 0 ]]; then

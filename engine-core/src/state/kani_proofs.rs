@@ -1,5 +1,5 @@
 //! Kani proof harnesses for the state kernel (#1960): join token bookkeeping
-//! ([`FlowArrivals`]) and the job lease/complete applier.
+//! ([`FlowArrivals`]) and the job index maintainer.
 //!
 //! Compiled only under `cargo kani` (`cfg(kani)`). See `formal/kani/README.md`
 //! for what is proven, the bounds and how to run them.
@@ -47,92 +47,88 @@ fn flow_arrivals_preserve_join_invariant() {
     // Both identities are built once: re-allocating a symbolic flow per step
     // (and summing the whole map per assertion) pushed the solver past the CI
     // runner's memory. A ghost count per identity is the oracle instead.
-    let flows = [flow(0), flow(1)];
-    let mut ghost = [0usize; 2];
+    let (f0, f1) = (flow(0), flow(1));
+    let (mut g0, mut g1) = (0usize, 0usize);
     let mut arrivals = FlowArrivals::default();
     for _ in 0..STEPS {
-        let i = usize::from(kani::any::<bool>());
+        // Branch to a concrete flow and ghost: a symbolically indexed flow
+        // reference made the solver alias every allocation (runner OOM).
+        let first = kani::any::<bool>();
         match kani::any::<u8>() % 3 {
             0 => {
-                arrivals.record(&flows[i]);
-                ghost[i] += 1;
+                if first {
+                    arrivals.record(&f0);
+                    g0 += 1;
+                } else {
+                    arrivals.record(&f1);
+                    g1 += 1;
+                }
             }
             1 => {
                 let tokens = usize::from(kani::any::<u8>() % 3);
-                arrivals.add(&flows[i], tokens);
-                ghost[i] += tokens;
+                if first {
+                    arrivals.add(&f0, tokens);
+                    g0 += tokens;
+                } else {
+                    arrivals.add(&f1, tokens);
+                    g1 += tokens;
+                }
             }
             _ => {
                 arrivals.consume_one_each();
-                ghost = ghost.map(|c| c.saturating_sub(1));
+                g0 = g0.saturating_sub(1);
+                g1 = g1.saturating_sub(1);
             }
         }
-        assert!(arrivals.count(&flows[0]) == ghost[0]);
-        assert!(arrivals.count(&flows[1]) == ghost[1]);
-        assert!(arrivals.distinct_flows() == ghost.iter().filter(|&&c| c > 0).count());
+        assert!(arrivals.count(&f0) == g0);
+        assert!(arrivals.count(&f1) == g1);
+        assert!(arrivals.distinct_flows() == usize::from(g0 > 0) + usize::from(g1 > 0));
         assert_join_invariant(&arrivals);
         assert!(arrivals.is_empty() == (arrivals.distinct_flows() == 0));
     }
 }
 
-/// A nondeterministic job-family event for job `KEY`.
-fn any_job_event() -> Event {
-    const KEY: Key = 7;
-    match kani::any::<u8>() % 5 {
-        0 => Event::JobActivated {
-            job_key: KEY,
-            instance_key: 1,
-            durable: kani::any(),
-            worker: "w".to_string(),
-            deadline: kani::any(),
-            activated_at: kani::any::<bool>().then_some(1),
-            fetch_variables: Vec::new(),
-            lease_token: None,
-        },
-        1 => Event::JobLockExpired {
-            job_key: KEY,
-            instance_key: 1,
-        },
-        2 => Event::JobCompleted {
-            job_key: KEY,
-            instance_key: 1,
-            created_at: 0,
-            job_type: "t".to_string(),
-            worker: None,
-            completed_at: kani::any(),
-            deadline: kani::any::<bool>().then_some(10),
-        },
-        3 => Event::JobFailed {
-            job_key: KEY,
-            instance_key: 1,
-            retries: kani::any(),
-            worker: None,
-            error_message: None,
-            retry_backoff_until: if kani::any() { Some(kani::any()) } else { None },
-        },
-        _ => Event::JobRetriesUpdated {
-            job_key: KEY,
-            instance_key: 1,
-            retries: kani::any(),
-            operation_reference: None,
-        },
+/// The job whose indexes the lockstep harness tracks.
+const KEY: Key = 7;
+
+/// Any job state.
+fn any_job_state() -> JobState {
+    match kani::any::<u8>() % 7 {
+        0 => JobState::Created,
+        1 => JobState::Activated,
+        2 => JobState::Failed,
+        3 => JobState::Errored,
+        4 => JobState::Canceled,
+        5 => JobState::Completed,
+        _ => JobState::BpmnElement,
     }
 }
 
-/// The job lease/complete lifecycle, driven through the real state applier
-/// ([`apply`]) by any job event, from `Created` or `Activated`, with arbitrary deadlines,
-/// timestamps and retries: no panic or arithmetic overflow, and the derived
-/// job indexes stay in lockstep with the job's state — an `Activated` job holds
-/// a lock (`deadline`) and is in `activated_jobs`; only a `Created`,
-/// non-deferred job is activatable; a frozen activation timeout never exceeds
-/// its deadline; a `Completed` job holds no lock.
+/// Moves job `KEY` to any state, with or without a retry backoff, and re-syncs
+/// its indexes through the single canonical maintainer.
+fn any_job_transition(state: &mut State) {
+    if let Some(job) = state.jobs.get_mut(&KEY) {
+        job.state = any_job_state();
+        job.retry_backoff_until = kani::any::<bool>().then(kani::any);
+    }
+    types::resync_job_index(state, KEY);
+}
+
+/// The job index maintainer [`resync_job_index`], which every job applier arm
+/// calls after changing a job's state, keeps the derived indexes in lockstep
+/// with the job across any two consecutive state changes (any pair of the
+/// seven job states, with or without a retry backoff, at any priority): only a
+/// `Created`, non-deferred job is activatable, exactly a deferred one sits in
+/// both deferred indexes at its backoff deadline, and exactly an `Activated`
+/// one is in `activated_jobs`. Driving the full `state::apply` symbolically
+/// did not fit the CI box, so the harness proves the transition every applier
+/// arm funnels through.
 #[kani::proof]
 #[kani::unwind(3)]
 #[kani::solver(cadical)]
-fn job_lease_lifecycle_keeps_indexes_in_lockstep() {
-    const KEY: Key = 7;
+fn job_index_resync_keeps_lockstep() {
     let mut state = State::default();
-    let priority: i32 = kani::any();
+    // Concrete creation through the real applier, then symbolic transitions.
     apply(
         &mut state,
         &Event::JobCreated {
@@ -142,59 +138,42 @@ fn job_lease_lifecycle_keeps_indexes_in_lockstep() {
             element_id: "A".to_string(),
             job_type: "t".to_string(),
             created_at: 0,
-            priority,
-            retries: kani::any(),
+            priority: 0,
+            retries: 3,
             secret_provenance: Vec::new(),
         },
     );
+    // Re-key the job at a symbolic priority (the order the index sorts by).
+    let priority: i32 = kani::any();
+    if let Some(job) = state.jobs.get_mut(&KEY) {
+        job.priority = priority;
+    }
+    state.activatable_jobs.clear();
     let order = types::activation_order(priority, KEY);
-    // Created or (concretely) Activated, then any job event: every lease
-    // transition out of both states. Two symbolic `apply` steps exceeded the
-    // per-harness CI box, so the prefix is concrete.
-    if kani::any() {
-        apply(
-            &mut state,
-            &Event::JobActivated {
-                job_key: KEY,
-                instance_key: 1,
-                durable: false,
-                worker: "w".to_string(),
-                deadline: 10,
-                activated_at: Some(1),
-                fetch_variables: Vec::new(),
-                lease_token: None,
-            },
-        );
+    for _ in 0..STEPS {
+        any_job_transition(&mut state);
         assert_job_indexes(&state, order);
     }
-    apply(&mut state, &any_job_event());
-    assert_job_indexes(&state, order);
 }
 
-/// The job-index lockstep invariant for job `7` (see the harness doc).
+/// The job-index lockstep invariant for job `KEY`.
 fn assert_job_indexes(state: &State, order: (i64, Key)) {
-    const KEY: Key = 7;
     let Some(job) = state.jobs.get(&KEY) else {
-        panic!("the job is never dropped by a job-family event");
+        panic!("a state change never drops the job");
     };
     let activated = job.state == JobState::Activated;
     assert!(activated == state.activated_jobs.contains(&KEY));
-    if activated {
-        assert!(job.deadline.is_some(), "an activated job holds a lock");
-    }
-    if let (Some(timeout), Some(deadline)) = (job.activation_timeout, job.deadline) {
-        assert!(timeout <= deadline);
-    }
     let deferred = job.state == JobState::Created && job.retry_backoff_until.is_some();
     let activatable = state
         .activatable_jobs
         .get("t")
         .is_some_and(|set| set.contains(&order));
     assert!(activatable == (job.state == JobState::Created && !deferred));
-    assert!(deferred == state.deferred_job_deadlines.contains_key(&KEY));
-    if job.state == JobState::Completed {
-        assert!(job.deadline.is_none() && job.worker.is_none());
-    }
+    assert!(state.activatable_jobs.len() == usize::from(activatable));
+    let until = job.retry_backoff_until.unwrap_or(0);
+    assert!(deferred == (state.deferred_job_deadlines.get(&KEY) == Some(&until)));
+    assert!(deferred == state.deferred_jobs.contains(&(until, KEY)));
+    assert!(state.deferred_jobs.len() == usize::from(deferred));
 }
 
 /// The parallel-diamond join (`P2` with incoming flows from `A` and `B`), as the

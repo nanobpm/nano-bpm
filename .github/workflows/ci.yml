@@ -936,7 +936,7 @@ jobs:
         # ALL_HARNESSES in formal/kani/check.sh (it rejects unknown names).
         harness:
           - flow_arrivals_preserve_join_invariant
-          - job_lease_lifecycle_keeps_indexes_in_lockstep
+          - job_index_resync_keeps_lockstep
           - parallel_join_fires_only_when_every_flow_taken
     steps:
       - uses: actions/checkout@v5
