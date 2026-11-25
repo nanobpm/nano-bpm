@@ -19,7 +19,7 @@ Harnesses are compiled only under `cfg(kani)` (declared in
 
 The earlier engine-level diamond harness (full deploy + create-instance through `Engine::apply_command`) did not prove inside the CI box — it needed unwind 24 over the whole command path — so it was replaced by the pure join transition above.
 
-Harnesses declare their own unwind: `#[kani::unwind(3)]` for the 2-step harnesses, `#[kani::unwind(4)]` for the 3-arrival parallel-join harness (so it fires with a surplus token); every collection holds ≤ 2 entries. `kani::cover!` checks make the firing-with-surplus and firing-without-surplus cases reachability-checked, so they cannot silently go untested; `--default-unwind 3` covers anything else. Setting `KANI_UNWIND` passes `--unwind`, overriding every harness.
+Harnesses declare their own unwind: `#[kani::unwind(3)]` for the 2-step harnesses, `#[kani::unwind(4)]` for the 3-arrival parallel-join harness (so it fires with a surplus token); every collection holds ≤ 2 entries. `kani::cover!` checks make the firing-with-surplus and firing-without-surplus cases reachability-checked: `check.sh` fails a harness unless every cover property is satisfied (Kani itself exits 0 on an unsatisfiable cover), so they cannot silently go untested; `--default-unwind 3` covers anything else. Setting `KANI_UNWIND` passes `--unwind`, overriding every harness.
 
 ## Running
 

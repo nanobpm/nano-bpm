@@ -6,7 +6,7 @@ set -euo pipefail
 
 KANI_VERSION="0.67.0"
 # An explicit KANI_UNWIND overrides every harness (--unwind beats
-# #[kani::unwind]); otherwise each harness's own attribute wins and 4 is only
+# #[kani::unwind]); otherwise each harness's own attribute wins and 3 is only
 # the default for loops a harness does not bound itself.
 if [[ -n "${KANI_UNWIND:-}" ]]; then
   UNWIND_ARGS=(--unwind "$KANI_UNWIND")
@@ -54,10 +54,20 @@ for h in "${HARNESSES[@]}"; do
   timeout "$HARNESS_TIMEOUT" cargo kani "${UNWIND_ARGS[@]}" --harness "$h" 2>&1 | tee "$log" || rc=$?
   echo "::endgroup::"
   elapsed=$(( $(date +%s) - start ))
-  grep -E '^(VERIFICATION:|Verification Time:|Complete - )' "$log" || true
+  grep -E '^(VERIFICATION:|Verification Time:|Complete - |\*\* [0-9]+ of [0-9]+ cover)' "$log" || true
+  # Kani exits 0 even when a kani::cover! is UNSATISFIABLE/UNREACHABLE, so
+  # enforce cover reachability here: every reported cover must be satisfied.
+  cover_bad=""
+  while read -r sat total; do
+    [[ "$sat" == "$total" ]] || cover_bad="$sat of $total"
+  done < <(sed -nE 's/^\*\* ([0-9]+) of ([0-9]+) cover properties satisfied.*/\1 \2/p' "$log")
   rm -f "$log"
   if [[ $rc -ne 0 ]]; then
     echo "::error::kani $h failed (exit $rc, ${elapsed}s; 124 = exceeded ${HARNESS_TIMEOUT}s box)"
+    exit 1
+  fi
+  if [[ -n "$cover_bad" ]]; then
+    echo "::error::kani $h: only $cover_bad cover properties satisfied (unreachable cover)"
     exit 1
   fi
   echo "kani $h: VERIFICATION:- SUCCESSFUL in ${elapsed}s"
