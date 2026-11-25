@@ -302,7 +302,7 @@
       "type" : "cancel-job",
       "retries" : 3,
       "processInstanceKey" : 1,
-      "elementInstanceKey" : 5
+      "elementInstanceKey" : 4
     } ]
   } ]
 }

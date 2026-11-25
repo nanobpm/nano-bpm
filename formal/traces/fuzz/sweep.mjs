@@ -107,6 +107,17 @@ function run (cmd, args, opts = {}) {
   return { code: r.status ?? 1, out: (r.stdout ?? '') + (r.stderr ?? '') }
 }
 
+/** Lines of a failed runner's log echoed into the error (#1964): the log
+ *  lives in the work dir, which CI only uploads as an artifact, so without the
+ *  tail a crash (e.g. a linker missing) is invisible in the job output. */
+export const LOG_TAIL_LINES = 50
+
+/** The error for a runner that exited non-zero, carrying its log's tail. */
+export function runnerFailure (what, log, out, lines = LOG_TAIL_LINES) {
+  const tail = out.replace(/\s+$/, '').split('\n').slice(-lines).join('\n')
+  return new Error(`${what} — see ${log}\n--- last ${lines} lines of ${path.basename(log)} ---\n${tail}`)
+}
+
 /** A fresh traces root with the committed normaliser and the given cases. */
 function stage (root, cases) {
   fs.rmSync(root, { recursive: true, force: true })
@@ -122,7 +133,7 @@ function capture (root, log) {
   fs.writeFileSync(log, r.out)
   if (r.code !== 0) {
     const last = [...r.out.matchAll(/^capture (\S+)$/gm)].pop()
-    throw new Error(`Zeebe capture failed${last ? ` on ${last[1]}` : ''} (a generated case Zeebe rejects is a generator defect) — see ${log}`)
+    throw runnerFailure(`Zeebe capture failed${last ? ` on ${last[1]}` : ''} (a generated case Zeebe rejects is a generator defect)`, log, r.out)
   }
 }
 
@@ -134,7 +145,7 @@ function nano (root, log) {
     env: { ...process.env, NANO_TRACES_DIR: root, NANO_TRACES_OUTCOMES: outcomes }
   })
   fs.writeFileSync(log, r.out)
-  if (r.code !== 0) throw new Error(`nano runner failed — see ${log}`)
+  if (r.code !== 0) throw runnerFailure('nano runner failed', log, r.out)
   return JSON.parse(fs.readFileSync(outcomes, 'utf8'))
 }
 

@@ -291,8 +291,14 @@ CompleteTask(t) ==
     /\ UNCHANGED <<open, fired, earlyPar, done>>
 
 \* A message correlation (#1246): a waiting event-based gateway completes on
-\* the triggered subscription and takes the ONE flow `g` to its catch event
-\* (`EventBasedGatewayProcessor` / `BpmnEventSubscriptionBehavior`).
+\* the triggered subscription and ACTIVATES the catch event at the end of the
+\* ONE flow `g` (`EventBasedGatewayProcessor` / `BpmnEventSubscriptionBehavior
+\* .activateTriggeredEvent`). Zeebe does NOT take `g`: no SEQUENCE_FLOW_TAKEN
+\* is written for it, so `g`'s queue entry here is the catch event's
+\* activation, not a taken flow — a correlation is SILENT in the exporter
+\* vocabulary (pinned against real Zeebe records by #1962,
+\* formal/tla/conformance/ZeebeTokenFlowTrace.tla). The catch event is never
+\* a join, so `RecordTaken` is a no-op on `g`.
 CorrelateEvent(n, g) ==
     /\ Settled
     /\ ~done
