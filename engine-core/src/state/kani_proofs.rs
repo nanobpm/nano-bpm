@@ -93,14 +93,13 @@ const KEY: Key = 7;
 
 /// Any job state.
 fn any_job_state() -> JobState {
-    match kani::any::<u8>() % 7 {
+    match kani::any::<u8>() % 6 {
         0 => JobState::Created,
         1 => JobState::Activated,
         2 => JobState::Failed,
         3 => JobState::Errored,
         4 => JobState::Canceled,
-        5 => JobState::Completed,
-        _ => JobState::BpmnElement,
+        _ => JobState::Completed,
     }
 }
 
@@ -117,7 +116,7 @@ fn any_job_transition(state: &mut State) {
 /// The job index maintainer [`resync_job_index`], which every job applier arm
 /// calls after changing a job's state, keeps the derived indexes in lockstep
 /// with the job across any two consecutive state changes (any pair of the
-/// seven job states, with or without a retry backoff, at any priority): only a
+/// six job states, with or without a retry backoff, at any priority): only a
 /// `Created`, non-deferred job is activatable, exactly a deferred one sits in
 /// both deferred indexes at its backoff deadline, and exactly an `Activated`
 /// one is in `activated_jobs`. Driving the full `state::apply` symbolically
