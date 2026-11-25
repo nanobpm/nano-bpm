@@ -116,6 +116,16 @@ pub struct ReplicatedCommand {
     /// and omitted when empty so the common path stays byte-identical.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub terminal_deadlines: std::collections::BTreeMap<nanobpmn_engine_core::Key, u64>,
+    /// Whether this command may deliver a buffered message to a REMOTE
+    /// instance, ack-paced (#1949). Decided once by the proposing leader —
+    /// `true` only while every member advertises
+    /// [`FEATURE_MESSAGE_CORRELATION_ACK`](nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK)
+    /// — and applied identically on every replica, so a rolling upgrade keeps
+    /// the pre-#1949 local-only behaviour everywhere until the group is fully
+    /// upgraded. Additive: absent decodes as `false` (the legacy behaviour a
+    /// pre-#1949 entry was applied with), omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote_buffered_delivery: bool,
 }
 
 /// Serialized-size estimate of one `terminal_deadlines` entry: a JSON
@@ -125,6 +135,9 @@ const TERMINAL_DEADLINE_ENTRY_BYTES: u64 = 44;
 
 /// Fixed overhead of a non-empty map: `,"terminal_deadlines":{}`.
 const TERMINAL_DEADLINES_FIELD_BYTES: u64 = 24;
+
+/// Serialized size of `,"remote_buffered_delivery":true` (#1949).
+const REMOTE_BUFFERED_DELIVERY_FIELD_BYTES: u64 = 32;
 
 impl ReplicatedCommand {
     /// Approximate serialized size of the whole replicated item — the command
@@ -136,7 +149,12 @@ impl ReplicatedCommand {
             0 => 0,
             n => TERMINAL_DEADLINES_FIELD_BYTES + n * TERMINAL_DEADLINE_ENTRY_BYTES,
         };
-        self.command.approx_bytes() + stamps
+        let remote = if self.remote_buffered_delivery {
+            REMOTE_BUFFERED_DELIVERY_FIELD_BYTES
+        } else {
+            0
+        };
+        self.command.approx_bytes() + stamps + remote
     }
 
     /// Drops the envelope deadline stamps (#1856 review): emitted only while
@@ -174,6 +192,13 @@ impl ReplicatedCommand {
             *terminate_suspended = false;
         }
     }
+
+    /// Enables ack-paced remote buffered delivery for this command (#1949):
+    /// called by the propose batcher only once every member advertises
+    /// [`FEATURE_MESSAGE_CORRELATION_ACK`](nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK).
+    fn enable_remote_buffered_delivery(&mut self) {
+        self.remote_buffered_delivery = true;
+    }
 }
 
 /// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
@@ -186,6 +211,8 @@ struct ReplicatedCommandWire {
     operation_reference: Option<i64>,
     #[serde(default)]
     terminal_deadlines: std::collections::BTreeMap<nanobpmn_engine_core::Key, u64>,
+    #[serde(default)]
+    remote_buffered_delivery: bool,
 }
 
 /// A [`Command`] plus any legacy (pre-#1556) `operation_reference` that was
@@ -225,6 +252,7 @@ impl From<ReplicatedCommandWire> for ReplicatedCommand {
             now: wire.now,
             operation_reference: wire.operation_reference.or(wire.command.nested_reference),
             terminal_deadlines: wire.terminal_deadlines,
+            remote_buffered_delivery: wire.remote_buffered_delivery,
         }
     }
 }
@@ -237,6 +265,7 @@ impl ReplicatedCommand {
             now,
             operation_reference: None,
             terminal_deadlines: std::collections::BTreeMap::new(),
+            remote_buffered_delivery: false,
         }
     }
 }
@@ -2766,8 +2795,13 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 now,
                                 operation_reference,
                                 terminal_deadlines,
+                                remote_buffered_delivery,
                             } in batch.items
                             {
+                                // The leader's replicated rolling-upgrade
+                                // decision (#1949), re-armed before EVERY
+                                // apply so no command inherits another's.
+                                journal.set_remote_buffered_delivery(remote_buffered_delivery);
                                 // Per-command actor profiling (off unless
                                 // NANOBPM_CMD_PROFILE): time + allocated-byte
                                 // delta by command kind, on the engine thread.
@@ -3718,6 +3752,22 @@ impl Batcher {
                         .iter_mut()
                         .for_each(ReplicatedCommand::strip_terminate_suspended);
                 }
+                // Rolling-upgrade gate for ack-paced remote buffered delivery
+                // (#1949): a member still on the local-only buffering binary
+                // would take nothing where an upgraded replica delivers, so
+                // the leader enables it — in the entry, for every replica —
+                // only once every member advertises the capability.
+                if all_members_support(
+                    &raft,
+                    transport.as_ref(),
+                    nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
+                )
+                .await
+                {
+                    items
+                        .iter_mut()
+                        .for_each(ReplicatedCommand::enable_remote_buffered_delivery);
+                }
                 // Carry this (leader) replica's latest chain digest so
                 // followers can compare at that index (#1664).
                 // Rolling-upgrade gate (#1664 / #1661): stamp only while
@@ -3841,6 +3891,8 @@ impl Batcher {
                 now,
                 operation_reference,
                 terminal_deadlines,
+                // Decided by the batcher at proposal time (#1949).
+                remote_buffered_delivery: false,
             },
             resp,
         })
@@ -5315,6 +5367,33 @@ mod tests {
         let decoded: ReplicatedCommand = serde_json::from_str(&stamped_json).unwrap();
         assert_eq!(decoded.terminal_deadlines.get(&7), Some(&12_345));
         assert_eq!(decoded.terminal_deadlines.get(&9), Some(&67_890));
+    }
+
+    /// #1949: the remote-buffered-delivery stamp is additive on the wire — an
+    /// unstamped (or pre-#1949) entry carries no field and decodes as the
+    /// legacy local-only `false`; a stamped one round-trips, and the size
+    /// estimate never undercounts it.
+    #[test]
+    fn replicated_command_remote_buffered_delivery_is_additive_on_the_wire() {
+        let plain = ReplicatedCommand::new(Command::cancel_instance(42), 10);
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !plain_json.contains("remote_buffered_delivery"),
+            "{plain_json}"
+        );
+        let decoded_plain: ReplicatedCommand = serde_json::from_str(&plain_json).unwrap();
+        assert!(!decoded_plain.remote_buffered_delivery);
+
+        let mut stamped = plain.clone();
+        stamped.enable_remote_buffered_delivery();
+        let stamped_json = serde_json::to_string(&stamped).unwrap();
+        let decoded: ReplicatedCommand = serde_json::from_str(&stamped_json).unwrap();
+        assert!(decoded.remote_buffered_delivery);
+        let extra = (stamped_json.len() - plain_json.len()) as u64;
+        assert!(
+            stamped.approx_bytes() - plain.approx_bytes() >= extra,
+            "estimate undercounts the stamp ({extra} bytes)"
+        );
     }
 
     /// #1570: proposing `CancelInstance` through `RaftPartition::propose`
@@ -9701,6 +9780,143 @@ mod tests {
         let (applied, states) = cancel_suspended_on_group(cluster, all_new).await;
         assert!(applied, "an all-new group terminates the SUSPENDED root");
         assert_eq!(states, vec![S::Terminated; 3]);
+    }
+
+    /// Boots a 3-voter group for engine partition 0 of a 2-partition cluster
+    /// over `transport`, buffers a TTL message on it (the message partition),
+    /// then routes in the canonical `OpenMessageSubscription` of an instance
+    /// living on partition 1. Returns, per replica (after the applied-index
+    /// barrier), whether that subscription is awaiting an ack-paced delivery
+    /// and whether the buffered message is reserved for the instance (#1949).
+    async fn remote_open_on_group(
+        cluster: crate::raft_net::LocalCluster,
+        transport: Arc<dyn RaftTransport>,
+    ) -> Vec<(bool, bool)> {
+        use nanobpmn_engine_core::{MessageSubscriptionKind, compose_key, subscription_partition};
+        const N: u64 = 2;
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let mut journal = Journal::in_memory_partition(0);
+            journal.set_num_partitions(N);
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                DeepthiHandle::spawn(journal, 0, None),
+                transport.clone(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        let order = ('a'..='z')
+            .map(|c| c.to_string())
+            .find(|k| subscription_partition(k, N) == 0)
+            .expect("some key hashes to partition 0");
+        parts[0]
+            .propose(
+                Command::CorrelateMessage {
+                    message_name: "m".into(),
+                    correlation_key: order.clone(),
+                    variables: Default::default(),
+                    business_id: None,
+                    message_key: None,
+                    time_to_live: Some(60_000),
+                    message_id: None,
+                },
+                1_000,
+            )
+            .await
+            .expect("buffer");
+        let subscription_key = compose_key(1, 10);
+        let instance_key = compose_key(1, 11);
+        parts[0]
+            .propose(
+                Command::OpenMessageSubscription {
+                    subscription_key,
+                    instance_key,
+                    element_instance_key: compose_key(1, 12),
+                    element_id: "catch".into(),
+                    message_name: "m".into(),
+                    correlation_key: order,
+                    kind: MessageSubscriptionKind::IntermediateCatch,
+                    delivery_key: compose_key(1, 13),
+                },
+                2_000,
+            )
+            .await
+            .expect("routed open");
+        // A later entry so every replica has applied past the open.
+        parts[0]
+            .propose(deploy_command(), 3_000)
+            .await
+            .expect("deploy");
+        wait_all_applied(&parts).await;
+        let mut seen = Vec::new();
+        for p in &parts {
+            seen.push(
+                p.sm_engine()
+                    .with(move |j| {
+                        let state = j.engine().state();
+                        let awaiting = state
+                            .message_subscriptions
+                            .get(&subscription_key)
+                            .is_some_and(|s| s.awaiting_ack.is_some());
+                        let reserved = state
+                            .buffered_messages
+                            .values()
+                            .any(|m| m.correlated_instances.contains(&instance_key));
+                        (awaiting, reserved)
+                    })
+                    .await,
+            );
+        }
+        for p in parts {
+            p.raft.shutdown().await.ok();
+        }
+        seen
+    }
+
+    /// #1949 rolling-upgrade gate: while one member does not advertise
+    /// `message-correlation-ack-v1` (e.g. it still runs the local-only
+    /// `message-buffering-v1` binary), the leader keeps the local-only
+    /// behaviour on EVERY replica — a routed open of a remote instance takes
+    /// nothing from the buffer, exactly as the legacy member applies it — so
+    /// leader and followers never diverge. Once every member advertises it,
+    /// every replica delivers ack-paced, identically.
+    #[tokio::test]
+    async fn remote_buffered_delivery_is_gated_on_every_member_advertising() {
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let mixed: Arc<dyn RaftTransport> = Arc::new(MixedVersion {
+            inner: cluster.clone(),
+            legacy: 1,
+        });
+        assert_eq!(
+            remote_open_on_group(cluster, mixed).await,
+            vec![(false, false); 3],
+            "a mixed group keeps the local-only behaviour on every replica"
+        );
+
+        let cluster = LocalCluster::default();
+        let all_new: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+        assert_eq!(
+            remote_open_on_group(cluster, all_new).await,
+            vec![(true, true); 3],
+            "an all-new group delivers ack-paced on every replica"
+        );
     }
 
     /// #1863: the `terminate_suspended` flag is additive on the wire — an

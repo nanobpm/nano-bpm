@@ -21841,7 +21841,10 @@ impl ServerImpl {
     /// a cluster-variable create — sticky even after every variable is deleted,
     /// because the retained log/snapshot still carries those records — and
     /// `message-buffering-v1` (#1874) once any hosted partition has EVER
-    /// buffered a message (sticky across expiry, compaction and restart).
+    /// buffered a message (sticky across expiry, compaction and restart), and
+    /// `message-correlation-ack-v1` (#1949) once any hosted partition has EVER
+    /// sent an ack-paced remote buffered delivery (its snapshot carries the
+    /// in-flight `awaiting_ack` state a legacy peer would drop).
     ///
     /// `None` = UNKNOWN: some partition's engine actor is dead or did not answer
     /// within [`ENGINE_HEALTH_PROBE_BOUND`]. The probe is bounded and uses
@@ -21853,7 +21856,7 @@ impl ServerImpl {
     async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
         use nano_falcon_protocol::cluster_join::{
             FEATURE_CLUSTER_VARIABLES as CV, FEATURE_MESSAGE_BUFFERING as MB,
-            FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
+            FEATURE_MESSAGE_CORRELATION_ACK as MCA, FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
         };
         // A single node never replicates its log to anyone, so its local state
         // places no requirement on a peer.
@@ -21862,7 +21865,7 @@ impl ServerImpl {
         }
         // Every feature the recovered/replicated state can depend on, each
         // with its one-way state predicate (sticky once observed).
-        const FEATURES: [&str; 3] = [LC, CV, MB];
+        const FEATURES: [&str; 4] = [LC, CV, MB, MCA];
         let mut required: Vec<&'static str> = FEATURES
             .into_iter()
             .filter(|f| self.peers.requires_feature(f))
@@ -21887,6 +21890,7 @@ impl ServerImpl {
                         engine.replicated_lenient_completion(),
                         engine.cluster_variables_ever_used(),
                         engine.message_buffering_ever_used(),
+                        engine.message_correlation_ack_ever_used(),
                     ]
                 }),
             )
@@ -34001,6 +34005,48 @@ mod clustered_startup_tests {
             .blocking_wait();
         assert!(
             journal.engine().message_buffering_ever_used(),
+            "precondition"
+        );
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(!server.peers.requires_feature(F), "precondition");
+        let _transport = server.raft_transport_for_start().await;
+        assert!(server.peers.requires_feature(F));
+        assert_eq!(server.required_cluster_features().await, Some(vec![F]));
+    }
+
+    /// #1949: a node whose recovered state has EVER sent an ack-paced remote
+    /// buffered delivery must require `message-correlation-ack-v1` from every
+    /// peer after restart/compaction — the AppendEntries-only gate cannot see
+    /// compacted entries, and the snapshot carries `awaiting_ack` state a
+    /// legacy peer would silently drop.
+    #[tokio::test]
+    async fn raft_start_requires_message_correlation_ack_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK as F;
+        let journal = Journal::in_memory_from_events(
+            0,
+            vec![Event::RemoteMessageCorrelation {
+                subscription_key: 1,
+                message_key: 2,
+                instance_key: 3,
+                element_instance_key: 4,
+                element_id: "catch".into(),
+                kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+                variables: Default::default(),
+                delivery_key: 5,
+                ack_partition: Some(0),
+            }],
+        );
+        assert!(
+            journal.engine().message_correlation_ack_ever_used(),
             "precondition"
         );
         let topology = cluster::Topology {

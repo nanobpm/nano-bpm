@@ -4233,6 +4233,14 @@ impl Journal {
         self.engine.set_num_partitions(num_partitions);
     }
 
+    /// Sets, for the NEXT applied command, whether it may deliver a buffered
+    /// message to a remote instance (#1949; see
+    /// [`Engine::set_remote_buffered_delivery`]). The Raft apply loop sets it
+    /// from each replicated command's envelope before applying it.
+    pub fn set_remote_buffered_delivery(&mut self, enabled: bool) {
+        self.engine.set_remote_buffered_delivery(enabled);
+    }
+
     /// Sets the pre-cutover LEGACY lenient-completion host flag (#1661, ADR 0066
     /// "Rolling upgrade"; see `Engine::set_legacy_lenient_completion`). Set
     /// identically on every node from the activation policy at startup; kept

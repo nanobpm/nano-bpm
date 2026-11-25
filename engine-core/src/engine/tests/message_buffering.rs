@@ -200,6 +200,80 @@ fn suspended_instance_keeps_the_message_buffered() {
     assert!(buffered.correlated_instances.is_empty());
 }
 
+/// Rolling-upgrade gate (#1949): with remote buffered delivery disabled (a
+/// group member cannot apply ack-paced delivery), a routed open takes nothing
+/// from the buffer — byte-for-byte the pre-#1949 local-only behaviour, so a
+/// legacy follower applying the same command stays in step.
+#[test]
+fn routed_open_with_remote_delivery_disabled_stays_local_only() {
+    const N: u64 = 2;
+    let order = ('a'..='z')
+        .map(|c| c.to_string())
+        .find(|k| state::subscription_partition(k, N) == 1)
+        .expect("some key hashes to partition 1");
+    let mut instance_engine = Engine::with_partition(0);
+    instance_engine.set_num_partitions(N);
+    instance_engine
+        .apply_command(Command::DeployProcess(process_with_message_catch()))
+        .unwrap();
+    let mut message_engine = Engine::with_partition(1);
+    message_engine.set_num_partitions(N);
+    message_engine.set_remote_buffered_delivery(false);
+    message_engine
+        .apply_command_at(
+            publish("payment-received", &order, Some(10_000), None),
+            1_000,
+        )
+        .unwrap();
+    let (_, created) = create(&mut instance_engine, &order, 2_000);
+    let open = created
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+                delivery_key,
+            } => Some(Command::OpenMessageSubscription {
+                subscription_key: *subscription_key,
+                instance_key: *instance_key,
+                element_instance_key: *element_instance_key,
+                element_id: element_id.clone(),
+                message_name: message_name.clone(),
+                correlation_key: correlation_key.clone(),
+                kind: kind.clone(),
+                delivery_key: *delivery_key,
+            }),
+            _ => None,
+        })
+        .expect("a cross-partition Opening");
+    let opened = message_engine.apply_command_at(open, 3_000).unwrap();
+    assert!(
+        !opened.iter().any(|e| matches!(
+            e,
+            Event::RemoteMessageCorrelation { .. } | Event::BufferedMessageCorrelated { .. }
+        )),
+        "gate closed: no remote buffered delivery, got {opened:?}"
+    );
+    assert!(message_engine
+        .state()
+        .message_subscriptions
+        .values()
+        .all(|s| s.awaiting_ack.is_none()));
+    let buffered = message_engine
+        .state()
+        .buffered_messages
+        .values()
+        .next()
+        .unwrap();
+    assert!(buffered.correlated_instances.is_empty());
+    assert!(!message_engine.message_correlation_ack_ever_used());
+}
+
 /// The cross-partition path: the canonical subscription is opened on the
 /// message partition by a routed `OpenMessageSubscription`; a buffered message
 /// there is settled as a `RemoteMessageCorrelation` for the host to route.
@@ -252,7 +326,11 @@ fn routed_open_correlates_a_buffered_message_remotely() {
             _ => None,
         })
         .expect("a cross-partition Opening");
+    assert!(!message_engine.message_correlation_ack_ever_used());
     let opened = message_engine.apply_command_at(open, 3_000).unwrap();
+    // Sticky capability requirement (#1949): once sent, the partition's
+    // retained state depends on `message-correlation-ack-v1`.
+    assert!(message_engine.message_correlation_ack_ever_used());
     let continuation = opened
         .iter()
         .find_map(|e| match e {

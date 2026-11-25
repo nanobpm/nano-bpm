@@ -2563,6 +2563,14 @@ pub struct State {
     /// leaves its slot behind), so enqueue order is total and replayable.
     #[cfg_attr(feature = "serde", serde(default))]
     pub next_buffered_seq: u64,
+    /// Whether this partition has EVER routed an ack-paced buffered delivery
+    /// to a remote instance (#1949). One-way: the host's sticky
+    /// `message-correlation-ack-v1` peer requirement keys on it. Additive.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub message_correlation_ack_used: bool,
     /// Open and settled **signal** subscriptions, keyed by subscription key. A
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) as an audit trail.

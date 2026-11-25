@@ -275,6 +275,9 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             ack_partition,
             ..
         } => {
+            if ack_partition.is_some() {
+                state.message_correlation_ack_used = true;
+            }
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
                 if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;

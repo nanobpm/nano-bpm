@@ -495,6 +495,12 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
             {
                 required.push(FEATURE_TERMINAL_DEADLINES);
             }
+            // #1949: an entry the leader enabled ack-paced remote buffered
+            // delivery for would be applied local-only by a legacy peer.
+            if item.remote_buffered_delivery && !required.contains(&FEATURE_MESSAGE_CORRELATION_ACK)
+            {
+                required.push(FEATURE_MESSAGE_CORRELATION_ACK);
+            }
             let feature = match item.command {
                 Command::SetLenientCompletion { .. } => FEATURE_REPLICATED_LENIENT_COMPLETION,
                 Command::CreateClusterVariable { .. }
@@ -547,6 +553,7 @@ mod codec_tests {
                     now: 0,
                     operation_reference: None,
                     terminal_deadlines: std::collections::BTreeMap::new(),
+                    remote_buffered_delivery: false,
                 },
             ])),
         };
@@ -646,6 +653,16 @@ mod codec_tests {
             );
         }
         assert!(required_features_for(&req(vec![entry(correlate(None))])).is_empty());
+        // #1949: an entry stamped for remote buffered delivery never ships
+        // to a peer that would apply it local-only.
+        let mut remote = entry(Command::cancel_instance(1));
+        if let EntryPayload::Normal(batch) = &mut remote.payload {
+            batch.items[0].remote_buffered_delivery = true;
+        }
+        assert_eq!(
+            required_features_for(&req(vec![remote])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK]
+        );
         // #1856 review: a stamped entry is never shipped to a peer that would
         // ignore the deadline map; an unstamped one requires nothing.
         let mut stamped = entry(Command::cancel_instance(1));

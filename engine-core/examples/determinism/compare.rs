@@ -268,6 +268,7 @@ pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("message_subscriptions", FieldRule::EntityMap),
     ("buffered_messages", FieldRule::EntityMap),
     ("next_buffered_seq", FieldRule::Exact),
+    ("message_correlation_ack_used", FieldRule::Exact),
     ("signal_subscriptions", FieldRule::EntityMap),
     ("conditional_subscriptions", FieldRule::EntityMap),
     ("message_start_subscriptions", FieldRule::Exact),

@@ -345,6 +345,14 @@ pub struct Engine {
     /// `accepted` reflects whether the scope survived the delivery. Per-command
     /// scratch.
     pending_correlation_ack: Option<PendingCorrelationAck>,
+    /// Whether a buffered message may be delivered to a subscription whose
+    /// instance lives on ANOTHER partition (ack-paced, #1949). `true` for a
+    /// standalone engine. A replicated host sets it per command from the
+    /// replicated envelope (decided by the proposing leader), so every replica
+    /// applies the same choice: `false` keeps the pre-#1949 local-only
+    /// behaviour while any member of the group cannot apply ack-paced
+    /// delivery (rolling upgrade). Not snapshotted: re-set before each apply.
+    remote_buffered_delivery: bool,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -798,6 +806,7 @@ impl Engine {
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
             pending_correlation_ack: None,
+            remote_buffered_delivery: true,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
@@ -835,6 +844,21 @@ impl Engine {
     /// of the cluster.
     pub fn set_num_partitions(&mut self, num_partitions: u64) {
         self.num_partitions = num_partitions.max(1);
+    }
+
+    /// Enables or disables ack-paced delivery of buffered messages to remote
+    /// instances (#1949; see the field docs). A replicated host MUST set this
+    /// from the replicated command envelope before every apply, never from
+    /// local knowledge, so all replicas agree.
+    pub fn set_remote_buffered_delivery(&mut self, enabled: bool) {
+        self.remote_buffered_delivery = enabled;
+    }
+
+    /// Whether this partition has EVER sent an ack-paced remote buffered
+    /// delivery (#1949). One-way and snapshotted, so the retained
+    /// log/snapshot depends on `message-correlation-ack-v1` once `true`.
+    pub fn message_correlation_ack_ever_used(&self) -> bool {
+        self.state.message_correlation_ack_used
     }
 
     /// The worker a terminal job event attributes (#963): the replicated
@@ -993,6 +1017,7 @@ impl Engine {
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
             pending_correlation_ack: None,
+            remote_buffered_delivery: true,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,
@@ -7735,12 +7760,18 @@ impl Engine {
         if subscription.awaiting_ack.is_some() {
             return false;
         }
+        let local = state::partition_of(instance_key) == self.partition_id;
+        // Rolling-upgrade gate (#1949): until every replica can apply
+        // ack-paced delivery, a remote subscription takes nothing (the
+        // pre-#1949 local-only behaviour) — the message stays buffered.
+        if !local && !self.remote_buffered_delivery {
+            return false;
+        }
         let Some(message) = self.next_buffered_candidate(subscription_key, now) else {
             return false;
         };
         let message_key = message.key;
         let variables = message.variables.clone();
-        let local = state::partition_of(instance_key) == self.partition_id;
         if local
             && (self.instance_is_suspended(instance_key)
                 || self
