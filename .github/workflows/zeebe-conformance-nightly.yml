@@ -42,8 +42,8 @@ on:
       - 'formal/traces/capture.sh'
       - 'formal/traces/capture/**'
       - 'formal/traces/normaliser.json'
-      - 'formal/corpus/enumerate.mjs'
-      - 'formal/corpus/graphs/**'
+      - 'formal/corpus/**'
+      - 'formal/tla/check.sh'
 
 permissions:
   contents: read
