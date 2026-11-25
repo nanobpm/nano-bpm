@@ -3047,7 +3047,7 @@
       "signature": "nano:completed,completedElements,jobsCreated,sequenceFlows:completed=false/true",
       "kind": "nano",
       "issue": "#1989",
-      "fixed": false,
+      "fixed": true,
       "seed": 3675536154,
       "graph": {
         "id": "Gen_730e7e574b",
@@ -3247,7 +3247,7 @@
       "signature": "spec-oracle:completed,jobsCreated,sequenceFlows",
       "kind": "spec-oracle",
       "issue": "#1989",
-      "fixed": false,
+      "fixed": true,
       "seed": 3675536154,
       "graph": {
         "id": "Gen_730e7e574b",
@@ -3426,7 +3426,7 @@
       "signature": "nano:completed,completedElements,jobsCreated,sequenceFlows:completed=false/true",
       "kind": "nano",
       "issue": "#1989",
-      "fixed": false,
+      "fixed": true,
       "seed": 3080194952,
       "graph": {
         "id": "Gen_2d18f93dc0",
@@ -3678,7 +3678,7 @@
       "signature": "spec-oracle:completed,jobsCreated,sequenceFlows",
       "kind": "spec-oracle",
       "issue": "#1989",
-      "fixed": false,
+      "fixed": true,
       "seed": 3080194952,
       "graph": {
         "id": "Gen_2d18f93dc0",

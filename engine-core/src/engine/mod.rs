@@ -18238,11 +18238,17 @@ impl Engine {
         ) else {
             return false;
         };
+        // An activity whose interrupting boundary timer is due in the current
+        // `TriggerTimers` batch is already doomed (#1989): Zeebe's guard for an
+        // arrival caused by an earlier timer of the batch sees it torn down
+        // (both TRIGGERs precede the join's ACTIVATE), so its token can only
+        // continue from the boundary event, never over the activity's own flow.
+        let doomed = self.doomed_by_due_boundary_timers(instance_key);
         let active = instance
             .active
             .iter()
             .filter(|(eik, id)| id.as_str() != join && self.scope_of(instance_key, **eik) == scope)
-            .map(|(_, id)| id.as_str());
+            .map(|(eik, id)| doomed.get(eik).copied().unwrap_or(id.as_str()));
         let in_transit = pending.iter().filter_map(|step| match step {
             Step::Activate {
                 instance_key: key,
@@ -18258,6 +18264,26 @@ impl Engine {
         active
             .chain(in_transit)
             .any(|source| path_reaches_join(process, source, join, taken))
+    }
+
+    /// The activities of `instance_key` an interrupting boundary timer still
+    /// due in the current `TriggerTimers` batch will tear down, each mapped to
+    /// the boundary event its token continues from (#1989).
+    fn doomed_by_due_boundary_timers(&self, instance_key: Key) -> BTreeMap<Key, &str> {
+        self.pending_timer_fires
+            .iter()
+            .filter_map(|fire| match fire {
+                PendingTimerFire::Timer(key) => self.state.timers.get(key),
+                PendingTimerFire::Start(_) => None,
+            })
+            .filter(|t| t.instance_key == instance_key && t.state == state::TimerState::Created)
+            .filter_map(|t| match &t.kind {
+                state::TimerKind::InterruptingBoundary {
+                    boundary_element_id,
+                } => Some((t.element_instance_key, boundary_element_id.as_str())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A join fires: [`Event::ParallelJoinFired`] consumes one token per incoming
