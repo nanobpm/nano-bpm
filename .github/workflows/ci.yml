@@ -934,10 +934,11 @@ jobs:
         # One leg per harness, so each is timed and reported on its own and
         # one harness's memory/time cannot starve another. Keep in sync with
         # ALL_HARNESSES in formal/kani/check.sh (it rejects unknown names).
-        # Only the join harness is CI-gated for now; the other two
-        # (flow_arrivals_preserve_join_invariant, job_index_resync_keeps_lockstep)
-        # run locally via check.sh until #1994 brings them into the CI box.
+        # The first two prove over the bounded stand-ins in
+        # engine-core/src/state/kani_model.rs (#1994).
         harness:
+          - flow_arrivals_preserve_join_invariant
+          - job_index_resync_keeps_lockstep
           - parallel_join_fires_only_when_every_flow_taken
     steps:
       - uses: actions/checkout@v5
