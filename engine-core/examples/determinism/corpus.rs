@@ -767,6 +767,11 @@ fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
     let to_cancel_instance =
         find(&to_cancel, "ProcessInstanceCreated", "instance_key").unwrap_or(0);
     g.push(Command::cancel_instance(to_cancel_instance));
+    // #1948: delete the ended instance's history (live-instance rejection is
+    // covered by the engine unit test; here the accepted path is replayed).
+    g.push(Command::DeleteProcessInstanceHistory {
+        instance_key: to_cancel_instance,
+    });
 
     // ---- Migration and modification ---------------------------------------
     g.scenario("migration-and-modification");
