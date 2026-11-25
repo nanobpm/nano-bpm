@@ -122,6 +122,107 @@ fn spec_property_type(name: &str, prop: &str) -> Option<String> {
     find(&schema(name), prop)
 }
 
+/// A well-formed scalar operand for the spec schema `s` (a filter property
+/// schema), derived from the spec alone: the first `enum` value for an enum,
+/// an integer for numeric types, a date-time for `format: date-time`, the
+/// schema's `example` (keys, ids) or `"1"` for other strings, `true` for
+/// booleans. Follows local/cross-file `$ref`s, `allOf`, and picks the
+/// exact-match (non-object) branch of a `oneOf` advanced-filter property.
+/// `None` for object/array properties (`$or`, variable joins), which have no
+/// scalar shorthand.
+fn spec_scalar_operand(s: &serde_yaml::Value) -> Option<J> {
+    if let Some(first) = s["enum"].as_sequence().and_then(|e| e.first()) {
+        return Some(serde_json::to_value(first).expect("enum value"));
+    }
+    if let Some(r) = s["$ref"].as_str() {
+        let target = r.rsplit('/').next().expect("ref target");
+        return spec_scalar_operand(&schema(target));
+    }
+    if let Some(v) = s["allOf"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .find_map(spec_scalar_operand)
+    {
+        return Some(v);
+    }
+    if let Some(v) = s["oneOf"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .find_map(spec_scalar_operand)
+    {
+        return Some(v);
+    }
+    match s["type"].as_str()? {
+        "boolean" => Some(json!(true)),
+        "integer" | "number" => Some(json!(1)),
+        "string" if s["format"].as_str() == Some("date-time") => {
+            Some(json!("2026-01-01T00:00:00Z"))
+        }
+        "string" => Some(
+            s["example"]
+                .as_str()
+                .map_or_else(|| json!("1"), |e| json!(e)),
+        ),
+        _ => None,
+    }
+}
+
+/// The schema of property `prop` of spec object schema `name` (following
+/// `allOf` / `$ref` like [`spec_properties`]).
+fn spec_property_schema(name: &str, prop: &str) -> Option<serde_yaml::Value> {
+    fn find(s: &serde_yaml::Value, prop: &str) -> Option<serde_yaml::Value> {
+        let p = &s["properties"][prop];
+        if !p.is_null() {
+            return Some(p.clone());
+        }
+        if let Some(r) = s["$ref"].as_str() {
+            let target = r.rsplit('/').next().expect("ref target");
+            if let Some(t) = find(&schema(target), prop) {
+                return Some(t);
+            }
+        }
+        s["allOf"]
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .find_map(|part| find(part, prop))
+    }
+    find(&schema(name), prop)
+}
+
+/// Whether the filter property schema `s` admits advanced-filter operator
+/// objects (`{"$eq": …}`): some `$ref`/`allOf`/`oneOf` branch declares
+/// `$`-prefixed properties. A plain scalar property (e.g. a bare `string`
+/// key) takes only the implicit-equality shorthand.
+fn spec_accepts_operators(s: &serde_yaml::Value) -> bool {
+    if s["properties"].as_mapping().is_some_and(|m| {
+        m.keys()
+            .filter_map(|k| k.as_str())
+            .any(|k| k.starts_with('$'))
+    }) {
+        return true;
+    }
+    if let Some(r) = s["$ref"].as_str() {
+        let target = r.rsplit('/').next().expect("ref target");
+        if spec_accepts_operators(&schema(target)) {
+            return true;
+        }
+    }
+    ["allOf", "oneOf", "anyOf"].iter().any(|k| {
+        s[*k]
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .any(spec_accepts_operators)
+    })
+}
+
+/// Scalar filter properties that cannot take ANY accepted well-formed
+/// operand, each with the reason. Keep this empty unless genuinely needed.
+const UNEXERCISABLE_FILTERS: &[(&str, &str)] = &[];
+
 /// The `field` enum of a spec `*SearchQuerySortRequest`.
 fn spec_sort_fields(name: &str) -> Vec<String> {
     schema(name)["properties"]["field"]["enum"]
@@ -228,28 +329,16 @@ fn compare(op: &Op, body: &str) -> Option<J> {
 fn check_filters(op: &Op) -> usize {
     let ops = spec_operators();
     let mut accepted = 0;
+    let mut unexercised = Vec::new();
     for prop in spec_properties(op.filter_schema) {
         let is_bool = spec_property_type(op.filter_schema, &prop).as_deref() == Some("boolean");
-        let v = match &op.sample[&prop] {
-            // A boolean filter the fixture item does not carry (e.g.
-            // `hasRetriesLeft`): a schema-valid boolean operand, never a
-            // string fallback that both surfaces would merely reject.
-            J::Null if is_bool => json!(true),
-            // No fixture value (e.g. a never-completed `completionDate`):
-            // a well-formed operand of the property's type.
-            J::Null if prop.ends_with("Date") || prop.ends_with("At") => {
-                json!("2026-01-01T00:00:00Z")
-            }
-            J::Null => json!("1"),
-            J::Array(a) => a.first().cloned().unwrap_or(json!("1")),
-            v => v.clone(),
+        // The spec-derived well-formed operand; `None` = no scalar shorthand
+        // (`$or`, variable joins — covered by `check_array_filters`).
+        let prop_schema = spec_property_schema(op.filter_schema, &prop);
+        let Some(spec_operand) = prop_schema.as_ref().and_then(spec_scalar_operand) else {
+            continue;
         };
-        // The implicit-equality shorthand on a real fixture value must be
-        // accepted, so the matrix cannot pass vacuously by both surfaces
-        // rejecting everything.
-        // An array-typed property (`elementInstanceKeys`) carries a LIST of
-        // per-element filter properties.
-        let is_array = op.sample[&prop].is_array();
+        let takes_operators = prop_schema.as_ref().is_some_and(spec_accepts_operators);
         // Whether the fixture carries a real value for the property (an empty
         // list, e.g. no `tags`, is as good as absent).
         let present = match &op.sample[&prop] {
@@ -257,6 +346,14 @@ fn check_filters(op: &Op) -> usize {
             J::Array(a) => !a.is_empty(),
             _ => true,
         };
+        let v = match &op.sample[&prop] {
+            J::Array(a) => a.first().cloned().unwrap_or(spec_operand),
+            J::Null => spec_operand,
+            v => v.clone(),
+        };
+        // An array-typed property (`elementInstanceKeys`) carries a LIST of
+        // per-element filter properties.
+        let is_array = op.sample[&prop].is_array();
         let wrap = |f: J| if is_array { json!([f]) } else { f };
         // Every request carries the op's baseline filter (e.g. history's
         // `commitStatus: PENDING`, without which every history query matches
@@ -268,22 +365,22 @@ fn check_filters(op: &Op) -> usize {
                 .insert(prop.clone(), cond);
             json!({ "filter": f })
         };
+        // The implicit-equality shorthand with a well-formed operand must be
+        // ACCEPTED by both surfaces, whether or not the fixture carries a
+        // value — agreeing rejections would let the matrix pass vacuously.
         let shorthand = with_base(wrap(v.clone())).to_string();
-        let hit = compare(op, &shorthand);
-        // A real fixture value must be accepted AND match rows, so the
-        // comparison is never two empty results. (A property the fixture has no
-        // value for — `$or`, variable filters, … — only needs both surfaces to
-        // agree.)
+        let hit =
+            compare(op, &shorthand).unwrap_or_else(|| panic!("{}: {shorthand} rejected", op.name));
+        // A real fixture value must also match rows, so the comparison is
+        // never two empty results.
         if present {
-            let hit = hit.unwrap_or_else(|| panic!("{}: {shorthand} rejected", op.name));
             assert!(
                 !hit["items"].as_array().expect("items").is_empty(),
                 "{}: {shorthand} matched no rows",
                 op.name
             );
         }
-        // A boolean filter must be accepted for BOTH schema-valid operands, so
-        // its probes cannot all be (agreeing) rejections.
+        // A boolean filter must be accepted for BOTH schema-valid operands.
         if is_bool {
             for b in [true, false] {
                 let body = with_base(wrap(json!(b))).to_string();
@@ -294,16 +391,30 @@ fn check_filters(op: &Op) -> usize {
                 );
             }
         }
-        let mut bodies = Vec::new();
+        // Per-operator probes: the property counts as exercised only when at
+        // least one operator probe was accepted.
+        let mut exercised = false;
         for o in &ops {
             for operand in operands(o, &v) {
-                bodies.push(with_base(wrap(json!({ o.as_str(): operand }))));
+                let body = with_base(wrap(json!({ o.as_str(): operand }))).to_string();
+                if compare(op, &body).is_some() {
+                    accepted += 1;
+                    exercised = true;
+                }
             }
         }
-        for body in bodies {
-            accepted += usize::from(compare(op, &body.to_string()).is_some());
+        // Only a property whose spec schema admits operator objects must have
+        // an accepted operator probe; a plain scalar is exercised by the
+        // (required-accepted) shorthand above.
+        if takes_operators && !exercised && !UNEXERCISABLE_FILTERS.iter().any(|(p, _)| *p == prop) {
+            unexercised.push(prop);
         }
     }
+    assert!(
+        unexercised.is_empty(),
+        "{}: no operator probe accepted for {unexercised:?}",
+        op.name
+    );
     accepted
 }
 
@@ -887,4 +998,62 @@ fn parity_guard_enumerates_every_spec_search_and_get_operation() {
         stale.is_empty(),
         "parity entries naming no spec operation: {stale:?}"
     );
+}
+
+/// A stub surface pair that accepts every body except those containing
+/// `reject`, answering one empty-ish row.
+fn stub_op<'a>(reject: &'a str) -> Op<'a> {
+    let accept = move |b: &str| {
+        if !reject.is_empty() && b.contains(reject) {
+            Err(format!("rejected {b}"))
+        } else {
+            Ok(json!({ "items": [{}] }))
+        }
+    };
+    Op {
+        name: "stub",
+        filter_schema: "UserTaskFilter",
+        sort_schema: "UserTaskSearchQuerySortRequest",
+        wasm: Box::new(move |b| accept(b).map(|j| j.to_string())),
+        server: Box::new(move |b| accept(b)),
+        sample: json!({}),
+        page_filter: json!({}),
+    }
+}
+
+#[test]
+fn spec_operands_are_well_formed_per_property_type() {
+    let op = |p: &str| {
+        spec_property_schema("UserTaskFilter", p)
+            .as_ref()
+            .and_then(spec_scalar_operand)
+    };
+    assert_eq!(op("state"), Some(json!("CREATING")));
+    assert_eq!(op("priority"), Some(json!(1)));
+    assert_eq!(op("creationDate"), Some(json!("2026-01-01T00:00:00Z")));
+    let key = op("userTaskKey").expect("key operand");
+    assert!(
+        key.as_str().is_some_and(|k| k.parse::<i64>().is_ok()),
+        "{key}"
+    );
+    assert_eq!(op("$or"), None);
+    let ops = |p: &str| {
+        spec_property_schema("UserTaskFilter", p)
+            .as_ref()
+            .is_some_and(spec_accepts_operators)
+    };
+    assert!(ops("state"), "state is an advanced filter");
+    assert!(!ops("userTaskKey"), "userTaskKey is a plain scalar");
+}
+
+#[test]
+fn filter_guard_fails_when_both_surfaces_reject_a_well_formed_enum_operand() {
+    // Control: surfaces accepting everything pass the guard.
+    check_filters(&stub_op(""));
+    // Both surfaces rejecting the well-formed enum value AGREE — the old guard
+    // counted that as parity; it must now fail.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_filters(&stub_op("\"CREATING\""))
+    }));
+    assert!(r.is_err(), "guard passed despite rejected enum operand");
 }
