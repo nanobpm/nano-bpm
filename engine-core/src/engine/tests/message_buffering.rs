@@ -2301,6 +2301,43 @@ fn opening_the_gate_drains_subscriptions_opened_while_it_was_closed() {
     assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
 }
 
+/// #1949 (Copilot r4700605219): a follower that installs a PRE-activation
+/// snapshot (an open remote subscription + its buffered backlog, gate never
+/// enabled) must scan that backlog on the first enabling envelope exactly like
+/// the live replica. The scan edge is derived from the durable latch, not
+/// from the in-memory gate flag a restore defaults.
+#[cfg(feature = "serde")]
+#[test]
+fn pre_activation_snapshot_scans_the_backlog_like_the_live_replica() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    rig.instance.set_remote_buffered_delivery(false);
+    rig.message.set_remote_buffered_delivery(false);
+    rig.publish_backlog(&order, 2);
+    let instance_key = rig.create("ni", &order, 2_000);
+    assert!(rig.delivered_to(instance_key).is_empty(), "gated off");
+    let json = serde_json::to_string(&rig.message.snapshot()).unwrap();
+    let mut restored = Engine::from_snapshot(serde_json::from_str(&json).unwrap());
+    restored.set_num_partitions(Rig::N);
+    rig.message.set_remote_buffered_delivery(true);
+    restored.set_remote_buffered_delivery(true);
+    let command = Command::TriggerTimers { now: 2_500 };
+    let live = rig
+        .message
+        .apply_command_at(command.clone(), 2_500)
+        .unwrap();
+    let follower = restored.apply_command_at(command, 2_500).unwrap();
+    assert!(
+        live.iter()
+            .any(|e| matches!(e, Event::RemoteMessageCorrelation { .. })),
+        "the live replica delivers the backlog: {live:?}"
+    );
+    assert_eq!(
+        follower, live,
+        "the follower diverged from the live replica"
+    );
+    assert_eq!(restored.state(), rig.message.state());
+}
+
 /// #1949 (Copilot r4698796872): the resume handshake is lost (routing
 /// exhausted, or the node stopped after `ResumeInstance` committed). The
 /// instance partition still owes it — rebuilt from durable state across a

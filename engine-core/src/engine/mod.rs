@@ -875,14 +875,17 @@ impl Engine {
     /// applies successfully under an enabling envelope records it, so BOTH a
     /// snapshot and journal replay restore the latch (a replica recovered
     /// from either agrees with one that applied the envelope live). On the
-    /// first disabled-to-enabled transition every open remote subscription is
-    /// offered its backlog on the next apply, so one that opened while the
+    /// first enabling envelope before the latch is recorded, every open remote
+    /// subscription is offered its backlog on the next apply, so one that opened while the
     /// gate was closed does not wait for a new publication.
     pub fn set_remote_buffered_delivery(&mut self, enabled: bool) {
-        let was = self.remote_buffered_delivery;
         self.remote_buffered_delivery_envelope = enabled;
         self.remote_buffered_delivery = enabled || self.remote_buffered_delivery_active();
-        if self.remote_buffered_delivery && !was {
+        // The scan edge is derived from DURABLE state only (Copilot
+        // r4700605219): an enabling envelope before the latch is journaled.
+        // Never from the in-memory gate flag, whose default differs between a
+        // live engine and one restored from a pre-activation snapshot.
+        if enabled && !self.state.remote_buffered_delivery_latched {
             self.remote_backlog_scan_pending = true;
         }
     }
