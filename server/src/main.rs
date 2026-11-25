@@ -8832,6 +8832,122 @@ impl ServerImpl {
         })
     }
 
+    /// `POST /v2/process-instances/{processInstanceKey}/deletion` (#1948):
+    /// deletes an ENDED instance's history. 404 for an unknown key, 409 for a
+    /// live (ACTIVE / SUSPENDED / TERMINATING) instance.
+    async fn delete_process_instance_impl(
+        &self,
+        path_params: &models::DeleteProcessInstancePathParams,
+        body: &Option<models::DeleteProcessInstanceRequest>,
+    ) -> Result<apis::process_instance::DeleteProcessInstanceResponse, ()> {
+        use apis::process_instance::DeleteProcessInstanceResponse as Resp;
+        let Ok(instance_key) = path_params.process_instance_key.parse::<u64>() else {
+            return Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                "Process instance not found",
+                404,
+                format!(
+                    "Process instance key '{}' is not a valid key.",
+                    path_params.process_instance_key
+                ),
+            )));
+        };
+        let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
+        Ok(
+            match self
+                .delete_process_instance_history_core(instance_key, operation_reference)
+                .await
+            {
+                TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsMarkedForDeletion,
+                TransitionInstanceOutcome::Conflict(d) => {
+                    Resp::Status409_TheProcessInstanceIsNotInACompletedOrTerminatedStateAndCannotBeDeleted(
+                        problem("Invalid state", 409, d),
+                    )
+                }
+                TransitionInstanceOutcome::NotFound(d) => {
+                    Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                        "Process instance not found",
+                        404,
+                        d,
+                    ))
+                }
+                TransitionInstanceOutcome::Unavailable(d) => {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
+                        d,
+                    ))
+                }
+                TransitionInstanceOutcome::Internal(d) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        500,
+                        d,
+                    ))
+                }
+            },
+        )
+    }
+
+    /// Surface-independent core of "delete an ended process instance's history"
+    /// (#1948), shared by the single-instance endpoint, the deletion batch and
+    /// resource deletion with `deleteHistory`. Resolves the instance from the
+    /// read model (404 when absent; 409 fast-path for a live instance), then
+    /// proposes [`Command::DeleteProcessInstanceHistory`] on the owning
+    /// partition — replicated through Raft before success is reported, and
+    /// re-checked by the engine (which rejects a live instance deterministically
+    /// on every replica). Rolling-upgrade gate: 503 while any peer does not
+    /// advertise `FEATURE_PROCESS_INSTANCE_HISTORY_DELETION`.
+    pub(crate) async fn delete_process_instance_history_core(
+        &self,
+        instance_key: u64,
+        operation_reference: Option<i64>,
+    ) -> TransitionInstanceOutcome {
+        use TransitionInstanceOutcome as Out;
+        let Some(row) = self.store.process_instance(instance_key) else {
+            return Out::NotFound(format!("No process instance with key '{instance_key}'."));
+        };
+        if !matches!(
+            row.state,
+            ProcessInstanceState::Completed | ProcessInstanceState::Terminated
+        ) {
+            return Out::Conflict(format!(
+                "Process instance {instance_key} is {} and cannot be deleted; only COMPLETED \
+                 or TERMINATED instances can be deleted.",
+                row.state.as_str()
+            ));
+        }
+        if !self
+            .peers
+            .all_peers_support(
+                nano_falcon_protocol::cluster_join::FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
+            )
+            .await
+        {
+            return Out::Unavailable(
+                "process-instance deletion unavailable: a peer does not support it yet \
+                 (rolling upgrade in progress) or is unreachable"
+                    .to_string(),
+            );
+        }
+        match self
+            .apply_partition_command_ref(
+                instance_key,
+                Command::DeleteProcessInstanceHistory { instance_key },
+                operation_reference,
+            )
+            .await
+        {
+            Ok((_events, commit)) => {
+                commit.wait().await;
+                Out::Ok
+            }
+            Err((409, d)) => Out::Conflict(d),
+            Err((404, d)) => Out::NotFound(d),
+            Err((503, d)) => Out::Unavailable(d),
+            Err((_, d)) => Out::Internal(d),
+        }
+    }
+
     async fn suspend_process_instance_impl(
         &self,
         path_params: &models::SuspendProcessInstancePathParams,
@@ -25253,6 +25369,48 @@ impl ServerImpl {
                     CancelInstanceOutcome::NotFound(d)
                     | CancelInstanceOutcome::Unavailable(d)
                     | CancelInstanceOutcome::Internal(d) => Err(d),
+                }
+            });
+        Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
+        ))
+    }
+
+    /// `POST /v2/process-instances/deletion` (#1948) — mint a
+    /// `DELETE_PROCESS_INSTANCE` batch operation over every ENDED (COMPLETED or
+    /// TERMINATED) **root** process instance matched by the request filter and
+    /// delete each one's history (with its call-activity descendants) through the
+    /// same [`Self::delete_process_instance_history_core`] as the single-instance
+    /// endpoint. The caller's `state` predicate is honoured on top of the
+    /// ended-only override ([`ProcessInstanceStatePolicy::EndedOnly`]); children
+    /// are deleted with their root, so only roots are enqueued.
+    async fn delete_process_instances_batch_operation_impl(
+        &self,
+        body: &models::ProcessInstanceDeletionBatchOperationRequest,
+    ) -> Result<apis::process_instance::DeleteProcessInstancesBatchOperationResponse, ()> {
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as Resp;
+        let op_type = models::BatchOperationTypeEnum::DeleteProcessInstance;
+        let items = self
+            .batch_matched_process_instances_in(
+                &body.filter,
+                ProcessInstanceStatePolicy::EndedOnly,
+                BatchHierarchyPolicy::RootOnly,
+            )
+            .into_iter()
+            .map(BatchItem::process_instance)
+            .collect();
+        let operation_reference = body.operation_reference;
+        let key =
+            self.drive_process_instance_batch(op_type, items, move |server, instance| async move {
+                match server
+                    .delete_process_instance_history_core(instance, operation_reference)
+                    .await
+                {
+                    TransitionInstanceOutcome::Ok => Ok(()),
+                    TransitionInstanceOutcome::Conflict(d)
+                    | TransitionInstanceOutcome::NotFound(d)
+                    | TransitionInstanceOutcome::Unavailable(d)
+                    | TransitionInstanceOutcome::Internal(d) => Err(d),
                 }
             });
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
@@ -63104,3 +63262,240 @@ pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
     "versionTag",
     "tenantId",
 ];
+
+/// Process-instance history deletion (#1948): single-instance endpoint, batch
+/// by filter (through the shared batch seam) and a load-shaped batch.
+#[cfg(test)]
+mod process_instance_deletion_tests {
+    use super::*;
+
+    async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
+        for _ in 0..3000 {
+            if ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    async fn deploy(server: &ServerImpl, proc: ProcessDefinition) {
+        let id = proc.id.clone();
+        let mut names = std::collections::HashMap::new();
+        names.insert(id.clone(), format!("{id}.bpmn"));
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+    }
+
+    async fn create(server: &ServerImpl, id: &str) -> u64 {
+        server
+            .create_for_stream(Some(id.into()), None, std::collections::BTreeMap::new())
+            .await
+            .expect("create the instance")
+            .0
+    }
+
+    fn waiting() -> ProcessDefinition {
+        ProcessBuilder::new("waiting")
+            .start_event("s")
+            .user_task("wait")
+            .end_event("e")
+            .connect("s", "wait")
+            .connect("wait", "e")
+            .build()
+            .expect("valid process")
+    }
+
+    fn straight() -> ProcessDefinition {
+        ProcessBuilder::new("straight")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process")
+    }
+
+    async fn delete(server: &ServerImpl, key: &str) -> apis::process_instance::DeleteProcessInstanceResponse {
+        server
+            .delete_process_instance_impl(
+                &models::DeleteProcessInstancePathParams {
+                    process_instance_key: key.to_string(),
+                },
+                &None,
+            )
+            .await
+            .expect("handler returns a response")
+    }
+
+    async fn search_total(server: &ServerImpl) -> i64 {
+        use apis::process_instance::SearchProcessInstancesResponse as Resp;
+        match server.search_process_instances_impl(&None).await.unwrap() {
+            Resp::Status200_TheProcessInstanceSearchResult(r) => r.page.total_items,
+            other => panic!("expected a search result, got {other:?}"),
+        }
+    }
+
+    /// A live instance is rejected (409, history intact); once terminated it
+    /// is deleted (204) with its element instances and variables; a second
+    /// delete and a malformed key are 404.
+    #[tokio::test]
+    async fn single_deletion_rejects_live_and_deletes_ended() {
+        use apis::process_instance::DeleteProcessInstanceResponse as Resp;
+        let server = ServerImpl::default();
+        deploy(&server, waiting()).await;
+        let key = create(&server, "waiting").await;
+        eventually("instance projects", || server.store.process_instance(key).is_some()).await;
+
+        let live = delete(&server, &key.to_string()).await;
+        assert!(
+            matches!(
+                live,
+                Resp::Status409_TheProcessInstanceIsNotInACompletedOrTerminatedStateAndCannotBeDeleted(_)
+            ),
+            "live instance must be 409, got {live:?}"
+        );
+        assert!(server.store.process_instance(key).is_some());
+
+        assert!(matches!(
+            server.cancel_instance_core(key, None).await,
+            CancelInstanceOutcome::Canceled
+        ));
+        eventually("instance terminates", || {
+            server
+                .store
+                .process_instance(key)
+                .is_some_and(|r| r.state == ProcessInstanceState::Terminated)
+        })
+        .await;
+        assert!(
+            server
+                .store
+                .element_instances()
+                .iter()
+                .any(|e| e.instance_key == key)
+        );
+
+        let ok = delete(&server, &key.to_string()).await;
+        assert!(
+            matches!(ok, Resp::Status204_TheProcessInstanceIsMarkedForDeletion),
+            "ended instance must be 204, got {ok:?}"
+        );
+        eventually("history is gone", || {
+            server.store.process_instance(key).is_none()
+                && !server
+                    .store
+                    .element_instances()
+                    .iter()
+                    .any(|e| e.instance_key == key)
+                && !server.store.variables().iter().any(|v| v.instance_key == key)
+        })
+        .await;
+
+        assert!(matches!(
+            delete(&server, &key.to_string()).await,
+            Resp::Status404_TheProcessInstanceIsNotFound(_)
+        ));
+        assert!(matches!(
+            delete(&server, "not-a-key").await,
+            Resp::Status404_TheProcessInstanceIsNotFound(_)
+        ));
+    }
+
+    /// Load-shaped (#1948): batch-delete ~10k ended instances by filter. The
+    /// batch runs through the shared seam to COMPLETED with every item
+    /// completed and none failed; search totals drop by exactly that many and
+    /// the read model shrinks, while a live instance is neither enqueued nor
+    /// deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_deletion_of_10k_ended_instances_shrinks_the_read_model() {
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as CreateResp;
+        const N: usize = 10_000;
+        let server = ServerImpl::default();
+        deploy(&server, straight()).await;
+        deploy(&server, waiting()).await;
+        let live = create(&server, "waiting").await;
+        let mut ended = Vec::with_capacity(N);
+        for _ in 0..N {
+            ended.push(create(&server, "straight").await);
+        }
+        eventually("all instances project as ended", || {
+            server.store.process_instance(live).is_some()
+                && ended.iter().all(|k| {
+                    server
+                        .store
+                        .process_instance(*k)
+                        .is_some_and(|r| r.state == ProcessInstanceState::Completed)
+                })
+        })
+        .await;
+        let total_before = search_total(&server).await;
+        let elements_before = server.store.element_instances().len();
+        assert_eq!(total_before, (N + 1) as i64);
+
+        let created = match server
+            .delete_process_instances_batch_operation_impl(
+                &models::ProcessInstanceDeletionBatchOperationRequest::new(
+                    models::ProcessInstanceFilter::new(),
+                ),
+            )
+            .await
+            .unwrap()
+        {
+            CreateResp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected 200, got {other:?}"),
+        };
+        assert_eq!(
+            created.batch_operation_type,
+            models::BatchOperationTypeEnum::DeleteProcessInstance
+        );
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: created.batch_operation_key,
+        };
+        let mut batch = None;
+        for _ in 0..12_000 {
+            let GetResp::Status200_TheBatchOperationWasFound(r) =
+                server.get_batch_operation_impl(&path).await.unwrap()
+            else {
+                panic!("batch must be found");
+            };
+            if r.state != models::BatchOperationStateEnum::Active {
+                batch = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let batch = batch.expect("batch settles");
+        assert_eq!(batch.state, models::BatchOperationStateEnum::Completed);
+        assert_eq!(batch.operations_total_count, N as i32);
+        assert_eq!(batch.operations_completed_count, N as i32);
+        assert_eq!(batch.operations_failed_count, 0);
+
+        eventually("deletions project", || {
+            server.store.process_instances().len() == 1
+        })
+        .await;
+        assert_eq!(search_total(&server).await, 1);
+        assert!(server.store.process_instance(live).is_some());
+        let elements_after = server.store.element_instances().len();
+        assert!(
+            elements_after < elements_before / 100,
+            "read model must shrink: {elements_before} -> {elements_after}"
+        );
+        assert!(
+            server
+                .store
+                .element_instances()
+                .iter()
+                .all(|e| e.instance_key == live)
+        );
+    }
+}

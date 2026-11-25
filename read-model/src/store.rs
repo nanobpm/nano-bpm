@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -88,7 +88,7 @@ const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 9147392393431493541;
+const SCHEMA_FINGERPRINT: i64 = 8122877193281723944;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -178,6 +178,8 @@ CREATE TABLE process_instances (
     parent_element_instance_key INTEGER,
     suspended_date_ms INTEGER
 );
+-- Backs the call-activity descendant walk of history deletion (#1948).
+CREATE INDEX idx_process_instances_parent ON process_instances(parent_process_instance_key);
 CREATE TABLE jobs (
     business_id            TEXT,
     key                    INTEGER PRIMARY KEY,
@@ -500,6 +502,14 @@ CREATE TABLE agent_history (
     metrics_json               TEXT
 );
 CREATE INDEX idx_agent_history_instance ON agent_history(agent_instance_key);
+-- Instance-keyed indexes backing history deletion (#1948): without them each
+-- deleted instance full-scans these tables. Pinned by
+-- `history_deletion_covers_every_instance_scoped_table`.
+CREATE INDEX idx_jobs_instance ON jobs(instance_key);
+CREATE INDEX idx_incidents_instance ON incidents(instance_key);
+CREATE INDEX idx_user_tasks_instance ON user_tasks(instance_key);
+CREATE INDEX idx_decision_instances_instance ON decision_instances(instance_key);
+CREATE INDEX idx_agent_history_process_instance ON agent_history(process_instance_key);
 ";
 
 // --- read-model schema migration (issue #831) ---
@@ -6982,18 +6992,26 @@ fn project_event(
             // instance-scoped rows. The engine already rejected a live instance,
             // so this only ever retracts finished history. Idempotent: a replay,
             // or a shard that never held the instance, deletes nothing.
-            for table_and_column in PROCESS_INSTANCE_HISTORY_TABLES {
-                let (table, column) = table_and_column;
-                tx.cexecute(
-                    &format!(
-                        "WITH RECURSIVE tree(k) AS ( \
-                           SELECT ?1 \
-                           UNION SELECT p.key FROM process_instances p \
-                             JOIN tree ON p.parent_process_instance_key = tree.k \
-                         ) DELETE FROM {table} WHERE {column} IN (SELECT k FROM tree)"
-                    ),
-                    params![*instance_key as i64],
+            // Resolve the instance + its descendants once (indexed walk), then
+            // clear each table by key.
+            let tree: Vec<i64> = {
+                let mut stmt = tx.prepare_cached(
+                    "WITH RECURSIVE tree(k) AS ( \
+                       SELECT ?1 \
+                       UNION SELECT p.key FROM process_instances p \
+                         JOIN tree ON p.parent_process_instance_key = tree.k \
+                     ) SELECT k FROM tree",
                 )?;
+                stmt.query_map(params![*instance_key as i64], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for key in tree {
+                for (table, column) in PROCESS_INSTANCE_HISTORY_TABLES {
+                    tx.cexecute(
+                        &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                        params![key],
+                    )?;
+                }
             }
         }
 
@@ -17465,6 +17483,21 @@ mod history_deletion_tests {
                     );
                 }
             }
+        }
+        // Every deletion is keyed lookup, not a full scan: the column must be
+        // the table's integer primary key or lead an index.
+        for (table, column) in PROCESS_INSTANCE_HISTORY_TABLES {
+            let plan: String = conn
+                .query_row(
+                    &format!("EXPLAIN QUERY PLAN DELETE FROM {table} WHERE {column} = 1"),
+                    [],
+                    |r| r.get(3),
+                )
+                .unwrap();
+            assert!(
+                !plan.starts_with("SCAN"),
+                "history deletion of {table}.{column} full-scans: {plan}"
+            );
         }
         assert!(
             PROCESS_INSTANCE_HISTORY_TABLES

@@ -437,6 +437,11 @@ pub enum ProcessInstanceStatePolicy {
     /// Process-instance cancellation batch: `state` is ignored and overridden to
     /// ACTIVE or SUSPENDED (`spec/process-instances.yaml:443-445`).
     LiveOnly,
+    /// Process-instance deletion batch (#1948): only ENDED (COMPLETED or
+    /// TERMINATED) instances are deletable, so that is enforced on top of the
+    /// caller's `state` predicate — which is still honoured, so a
+    /// `state = COMPLETED` filter never broadens to TERMINATED instances.
+    EndedOnly,
 }
 
 /// One AND-group of a process-instance filter (the top-level fields, or one
@@ -532,6 +537,10 @@ impl ProcessInstanceMatcher {
             ProcessInstanceStatePolicy::LiveOnly => matches!(
                 inst.state,
                 ProcessInstanceState::Active | ProcessInstanceState::Suspended
+            ),
+            ProcessInstanceStatePolicy::EndedOnly => matches!(
+                inst.state,
+                ProcessInstanceState::Completed | ProcessInstanceState::Terminated
             ),
         };
         let root_ok = match hierarchy {
@@ -655,10 +664,12 @@ pub fn match_process_instance_group(
 ) -> bool {
     let f = &g.filter;
     let state_ok = match state_policy {
-        ProcessInstanceStatePolicy::HonourFilter => query::match_process_instance_state(
+        ProcessInstanceStatePolicy::HonourFilter | ProcessInstanceStatePolicy::EndedOnly => {
+            query::match_process_instance_state(
             &f.state,
             &process_instance_state_enum(inst.state).to_string(),
-        ),
+            )
+        }
         // Overridden to ACTIVE by the caller; the supplied `state` is ignored.
         ProcessInstanceStatePolicy::ActiveOnly | ProcessInstanceStatePolicy::LiveOnly => true,
     };
