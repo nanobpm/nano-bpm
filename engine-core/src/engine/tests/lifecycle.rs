@@ -8793,3 +8793,77 @@ fn cancel_of_a_suspended_instance_honours_the_terminate_suspended_flag() {
         );
     }
 }
+
+/// `DeleteProcessInstanceHistory` (#1948, Camunda 8.8 `/process-instances/
+/// {key}/deletion`): a live (ACTIVE / SUSPENDED) instance is rejected with
+/// `InstanceTransitionInvalid { to: "DELETED" }` and no event; an ENDED
+/// (terminated) instance — and a key absent from engine state, i.e. evicted
+/// after ending — yields exactly one `ProcessInstanceHistoryDeleted`. Running the
+/// same command sequence on a second engine gives identical outcomes (replay
+/// determinism), and the event touches no engine state.
+#[test]
+fn delete_process_instance_history_rejects_live_and_accepts_ended() {
+    use crate::state::ProcessInstanceState;
+    type Outcomes = Vec<Result<Vec<Event>, EngineError>>;
+    fn run() -> (Engine, Key, Outcomes) {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let key = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .unwrap();
+        let del = || Command::DeleteProcessInstanceHistory { instance_key: key };
+        let mut out = vec![engine.apply_command(del())];
+        engine
+            .apply_command(Command::suspend_instance(key))
+            .unwrap();
+        out.push(engine.apply_command(del()));
+        engine
+            .apply_command(Command::cancel_instance_including_suspended(key))
+            .unwrap();
+        out.push(engine.apply_command(del()));
+        out.push(engine.apply_command(Command::DeleteProcessInstanceHistory {
+            instance_key: 987_654_321,
+        }));
+        (engine, key, out)
+    }
+    let (a, key, out_a) = run();
+    let (_b, _, out_b) = run();
+    assert_eq!(out_a, out_b, "replay must be deterministic");
+    for (i, from) in [(0, "ACTIVE"), (1, "SUSPENDED")] {
+        match &out_a[i] {
+            Err(EngineError::InstanceTransitionInvalid {
+                instance_key,
+                from: f,
+                to,
+            }) => {
+                assert_eq!(*instance_key, key);
+                assert_eq!(*f, from);
+                assert_eq!(*to, "DELETED");
+            }
+            other => panic!("live instance must be rejected, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        out_a[2].as_ref().unwrap(),
+        &vec![Event::ProcessInstanceHistoryDeleted { instance_key: key }]
+    );
+    assert_eq!(
+        out_a[3].as_ref().unwrap(),
+        &vec![Event::ProcessInstanceHistoryDeleted {
+            instance_key: 987_654_321
+        }]
+    );
+    assert_eq!(
+        a.instance(key).unwrap().state,
+        ProcessInstanceState::Terminated
+    );
+}

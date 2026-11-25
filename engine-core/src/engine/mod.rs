@@ -2765,6 +2765,28 @@ impl Engine {
                 );
             }
 
+            Command::DeleteProcessInstanceHistory { instance_key } => {
+                // Only an ENDED instance's history may be deleted (Camunda 8.8).
+                // A live instance — still in engine state as active, suspended
+                // or terminating — is rejected. An instance absent from engine
+                // state has ended (and been evicted) or never existed on this
+                // partition; either way the read-model deletion is an idempotent
+                // no-op for keys it does not hold.
+                if let Some(instance) = self.state.instances.get(&instance_key) {
+                    match instance.state {
+                        ProcessInstanceState::Completed | ProcessInstanceState::Terminated => {}
+                        live => {
+                            return Err(EngineError::InstanceTransitionInvalid {
+                                instance_key,
+                                from: live.as_str(),
+                                to: "DELETED",
+                            });
+                        }
+                    }
+                }
+                self.emit(&mut log, Event::ProcessInstanceHistoryDeleted { instance_key });
+            }
+
             Command::CreateClusterVariable {
                 tenant_id,
                 name,

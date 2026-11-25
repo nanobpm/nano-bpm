@@ -149,6 +149,11 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
             // instance rows. No core engine state to mutate.
         }
 
+        Event::ProcessInstanceHistoryDeleted { .. } => {
+            // Audit/projection-only (#1948): the read model deletes the ended
+            // instance's history. No core engine state to mutate.
+        }
+
         // Cluster variables (#1657): replicated configuration state, folded
         // from the log so every replica and every replay reads the same set.
         Event::ClusterVariableCreated {

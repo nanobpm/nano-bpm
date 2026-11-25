@@ -425,6 +425,14 @@ pub enum Event {
         decision_evaluation_key: Key,
     },
 
+    /// An ENDED process instance's history was deleted via the
+    /// `DeleteProcessInstanceHistory` management API (#1948). Journaled on the
+    /// instance's own partition, so the read-model shard that projected the
+    /// instance removes it — with every descendant (call-activity child)
+    /// instance and all their instance-scoped rows. Audit/projection-only: no
+    /// core engine state to mutate.
+    ProcessInstanceHistoryDeleted { instance_key: Key },
+
     /// A cluster variable was created (#1657; Zeebe `ClusterVariableIntent.CREATED`)
     /// — or, for a distributed fan-out copy, upserted (an existing variable keeps
     /// its id). `tenant_id` `None` is the global scope. Partition-agnostic
@@ -2239,7 +2247,8 @@ impl Event {
             | Event::VariablesLostQuarantined { instance_key, .. }
             | Event::OrphanStampSuperseded { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
-            | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+            | Event::ProcessInstanceTerminated { instance_key }
+            | Event::ProcessInstanceHistoryDeleted { instance_key } => Some(*instance_key),
             // A standalone decision evaluation (and its deletion) belongs to no
             // process instance: `0` is the "none" sentinel (Zeebe's `-1`).
             Event::DecisionEvaluated { instance_key, .. }

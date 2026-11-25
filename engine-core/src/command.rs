@@ -112,6 +112,18 @@ pub enum Command {
         instance_key: Key,
         decision_evaluation_key: Key,
     },
+    /// Delete an ENDED (completed or terminated) process instance's history
+    /// from the read model (#1948; Camunda 8.8 `POST
+    /// /process-instances/{key}/deletion`). The engine rejects the command with
+    /// [`crate::EngineError::InstanceTransitionInvalid`] (`to: "DELETED"`) while
+    /// the instance is still live (active, suspended or terminating) in engine
+    /// state, so the check is replicated and deterministic. On success it emits
+    /// [`Event::ProcessInstanceHistoryDeleted`], which the read-model projection
+    /// turns into the removal of the instance, its element instances, variables,
+    /// jobs, incidents, user tasks, subscriptions, decision instances and agent
+    /// rows — and the same for every descendant (call-activity child) instance.
+    /// Audit/projection-only: no core engine state changes.
+    DeleteProcessInstanceHistory { instance_key: Key },
     /// Create a **cluster variable** (#1657; Zeebe `ClusterVariableIntent.CREATE`).
     /// `tenant_id` `None` is the global scope. Rejected with
     /// [`crate::EngineError::ClusterVariableAlreadyExists`] when one already
@@ -1132,6 +1144,9 @@ impl Command {
                 h.key(*instance_key);
                 h.key(*decision_evaluation_key);
             }
+            Command::DeleteProcessInstanceHistory { instance_key } => {
+                h.key(*instance_key);
+            }
             Command::CreateClusterVariable {
                 tenant_id, name, ..
             }
@@ -1307,6 +1322,7 @@ impl Command {
             Command::DeployGenericResources(_) => "deploy_generic_resources",
             Command::DeployBundle(_) => "deploy_bundle",
             Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
+            Command::DeleteProcessInstanceHistory { .. } => "delete_process_instance_history",
             Command::CreateClusterVariable { .. } => "create_cluster_variable",
             Command::UpdateClusterVariable { .. } => "update_cluster_variable",
             Command::DeleteClusterVariable { .. } => "delete_cluster_variable",
