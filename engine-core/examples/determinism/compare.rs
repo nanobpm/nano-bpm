@@ -266,6 +266,7 @@ pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("incidents", FieldRule::EntityMap),
     ("timers", FieldRule::EntityMap),
     ("message_subscriptions", FieldRule::EntityMap),
+    ("buffered_messages", FieldRule::EntityMap),
     ("signal_subscriptions", FieldRule::EntityMap),
     ("conditional_subscriptions", FieldRule::EntityMap),
     ("message_start_subscriptions", FieldRule::Exact),

@@ -5,11 +5,49 @@ use crate::state::types::*;
 
 pub(super) fn apply_subscription(state: &mut State, event: &Event) {
     match event {
-        // Publishing a message is, in nano, a transient fact: messages are not
-        // buffered, so there is nothing to record. The event exists only to mint
+        // Publishing a message is itself a transient fact (a buffered message is
+        // recorded by the `MessageBuffered` that follows). The event exists to mint
         // a deterministic message key (carried to the host for its response and
         // restored on replay) and to head the events a correlation produced.
         Event::MessagePublished { .. } => {}
+
+        // Message buffering (#1874): the buffered message, the instances it
+        // has correlated to, and its removal on expiry.
+        Event::MessageBuffered {
+            message_key,
+            message_name,
+            correlation_key,
+            deadline,
+            message_id,
+            variables,
+            correlated_instances,
+            ..
+        } => {
+            state.buffered_messages.insert(
+                *message_key,
+                BufferedMessage {
+                    key: *message_key,
+                    message_name: message_name.clone(),
+                    correlation_key: correlation_key.clone(),
+                    deadline: *deadline,
+                    message_id: message_id.clone(),
+                    variables: variables.clone(),
+                    correlated_instances: correlated_instances.iter().copied().collect(),
+                },
+            );
+        }
+        Event::BufferedMessageCorrelated {
+            message_key,
+            instance_key,
+            ..
+        } => {
+            if let Some(message) = state.buffered_messages.get_mut(message_key) {
+                message.correlated_instances.insert(*instance_key);
+            }
+        }
+        Event::MessageExpired { message_key, .. } => {
+            state.buffered_messages.remove(message_key);
+        }
 
         Event::MessageSubscriptionCreated {
             subscription_key,

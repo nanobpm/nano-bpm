@@ -666,6 +666,8 @@ impl TestEngine {
             variables,
             business_id: None,
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         })
         .map_err(|e| js_err(&format!("correlate error: {e}")))?;
         to_json(&self.snapshot_value(None))

@@ -447,9 +447,20 @@ pub enum Command {
     /// message name and correlation key match. A message intermediate catch
     /// event resumes its parked token; an interrupting message boundary event
     /// interrupts its activity. The message's `variables` are merged into each
-    /// correlated instance before its token advances. Messages are **not
-    /// buffered**: a message with no matching open subscription is simply
-    /// dropped (no TTL, no dedup).
+    /// correlated instance before its token advances.
+    ///
+    /// **Buffering (#1874, Zeebe `MessagePublishProcessor` parity).** With a
+    /// positive `time_to_live` the message is additionally buffered on the
+    /// partition owning `hash(correlation_key)` until `now + time_to_live`
+    /// ([`crate::Event::MessageBuffered`]); a subscription opened before that
+    /// deadline correlates the oldest still-buffered message its instance has
+    /// not already correlated ([`crate::Event::BufferedMessageCorrelated`]).
+    /// `TriggerTimers` expires buffered messages past their deadline
+    /// ([`crate::Event::MessageExpired`]). A `time_to_live` of `None`/`0`
+    /// never buffers: the message correlates at publish time only, otherwise
+    /// it is dropped. A `message_id` still buffered for the same
+    /// `(message_name, correlation_key)` rejects the publish with
+    /// [`crate::EngineError::MessageAlreadyExists`].
     CorrelateMessage {
         message_name: String,
         correlation_key: String,
@@ -469,6 +480,20 @@ pub enum Command {
         /// serialized before the field existed) mints a fresh key here.
         #[cfg_attr(feature = "serde", serde(default))]
         message_key: Option<Key>,
+        /// Zeebe `timeToLive` in milliseconds (#1874). `None`/`0` = correlate
+        /// at publish time only (never buffered). Defaulted for old commands.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        time_to_live: Option<u64>,
+        /// Zeebe `messageId` (#1874): deduplicates a publish against a message
+        /// still buffered for the same name and correlation key.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        message_id: Option<String>,
     },
     /// Broadcast a signal and correlate it to **every** open subscription whose
     /// signal name matches, across all instances. A signal intermediate catch
@@ -580,8 +605,9 @@ pub enum Command {
     /// Suspend a running process instance (Camunda parity). The instance stops
     /// making progress — its jobs become non-activatable and its timers/other
     /// triggers do not fire — while retaining all runtime state, and its state
-    /// becomes `Suspended`. Because the message model is unbuffered, a message
-    /// correlated to a suspended instance is *dropped* (not buffered) and does
+    /// becomes `Suspended`. A message published to a suspended instance's open
+    /// subscription is not correlated to it (a TTL-buffered message stays
+    /// buffered, but only a newly opened subscription takes it), and does
     /// not re-correlate on resume — drop-on-suspend is the message suspension
     /// semantics. Only an instance currently `Active` can be suspended
     /// (the sole valid live-transition source); suspending an already
@@ -1185,11 +1211,17 @@ impl Command {
                 correlation_key,
                 business_id,
                 message_key,
+                message_id,
                 ..
             } => {
                 h.str(message_name);
                 h.str(correlation_key);
                 h.opt(business_id.as_deref());
+                // Only a present id feeds the seed, so every pre-#1874 command
+                // keeps its exact fingerprint (determinism vs previous release).
+                if let Some(id) = message_id {
+                    h.str(id);
+                }
                 if let Some(k) = message_key {
                     h.key(*k);
                 }
@@ -1851,6 +1883,8 @@ impl Command {
             variables: BTreeMap::new(),
             business_id: None,
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         }
     }
 
@@ -1867,6 +1901,8 @@ impl Command {
             variables,
             business_id: None,
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         }
     }
 

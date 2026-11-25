@@ -521,6 +521,8 @@ fn fire(engine: &mut Engine, inst: Key, t: T, due: u64) -> Vec<Event> {
                 variables: vars(&[("payload", Value::Int(42))]),
                 business_id: None,
                 message_key: None,
+                time_to_live: None,
+                message_id: None,
             })
             .unwrap(),
         T::Timer => engine.trigger_timers(due),
@@ -1390,6 +1392,8 @@ fn esp_output_satisfying_a_sibling_condition_fires_before_the_host_drains() {
             variables: BTreeMap::new(),
             business_id: None,
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         })
         .unwrap();
     // Complete the HOST's own job first: the host then has no flow-flow child
@@ -1482,6 +1486,8 @@ fn modify_created_flow_scope_arms_its_event_subprocesses() {
             variables: BTreeMap::new(),
             business_id: None,
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         })
         .unwrap();
     assert_eq!(
@@ -1562,6 +1568,8 @@ fn modify_created_flow_scope_arms_its_event_subprocesses_against_host_locals() {
         variables: BTreeMap::new(),
         business_id: None,
         message_key: None,
+        time_to_live: None,
+        message_id: None,
     });
     assert_eq!(
         job_count(&mut engine, "esp"),
@@ -1575,6 +1583,8 @@ fn modify_created_flow_scope_arms_its_event_subprocesses_against_host_locals() {
             variables: BTreeMap::new(),
             business_id: None,
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         })
         .unwrap();
     assert_eq!(
@@ -1886,6 +1896,8 @@ fn container_start_listener_defers_the_start_without_losing_its_payload() {
                     variables: vars(&[("payload", Value::Int(42))]),
                     business_id: None,
                     message_key: None,
+                    time_to_live: None,
+                    message_id: None,
                 })
                 .unwrap(),
         );
@@ -1926,6 +1938,8 @@ fn start_event_activation_expressions_see_the_local_payload() {
             ]),
             business_id: None,
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         })
         .unwrap();
     assert!(
@@ -1960,6 +1974,8 @@ fn held_esp_payloads_are_dropped_when_the_container_finishes_or_the_instance_end
                     variables: vars(&[("payload", Value::Int(n))]),
                     business_id: None,
                     message_key: None,
+                    time_to_live: None,
+                    message_id: None,
                 })
                 .unwrap();
         }

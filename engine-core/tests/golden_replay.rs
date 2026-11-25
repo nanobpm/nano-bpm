@@ -285,6 +285,73 @@ fn legacy_record_missing_a_defaulted_field_replays() {
     let _engine = Engine::replay(std::iter::once(decoded));
 }
 
+/// **Message buffering (#1874).** A journal that buffers a message with a TTL,
+/// correlates it to a later-opened subscription and expires another must
+/// round-trip through the typed journal decoder and replay into exactly the
+/// live engine's state (buffer included) and key high-water.
+#[test]
+fn message_buffering_journal_replays_through_typed_decoder() {
+    let process = ProcessBuilder::new("await")
+        .start_event("start")
+        .message_intermediate_catch_event("catch", "paid", "orderId")
+        .end_event("end")
+        .connect("start", "catch")
+        .connect("catch", "end")
+        .build()
+        .unwrap();
+    let publish = |key: &str, ttl: u64| Command::CorrelateMessage {
+        message_name: "paid".into(),
+        correlation_key: key.into(),
+        variables: Default::default(),
+        business_id: None,
+        message_key: None,
+        time_to_live: Some(ttl),
+        message_id: Some(format!("id-{key}")),
+    };
+    let mut engine = Engine::new();
+    let mut journal = Vec::new();
+    for (command, now) in [
+        (Command::DeployProcess(process), 0),
+        (publish("a", 10_000), 1_000),
+        (publish("b", 500), 1_000),
+        (
+            Command::create_instance_with(
+                "await",
+                [(
+                    "orderId".to_string(),
+                    nanobpmn_engine_core::Value::Str("a".into()),
+                )]
+                .into(),
+            ),
+            2_000,
+        ),
+        (Command::TriggerTimers { now: 2_000 }, 2_000),
+    ] {
+        journal.extend(engine.apply_command_at(command, now).unwrap());
+    }
+    for kind in [
+        "MessageBuffered",
+        "BufferedMessageCorrelated",
+        "MessageExpired",
+    ] {
+        assert!(
+            journal
+                .iter()
+                .any(|e| serde_json::to_string(e).unwrap().contains(kind)),
+            "the scenario must journal a {kind}"
+        );
+    }
+    let decoded: Vec<Event> = journal
+        .iter()
+        .map(|e| decode_event_json(&serde_json::to_string(e).unwrap()).unwrap())
+        .collect();
+    assert_eq!(decoded, journal);
+    let replayed = Engine::replay_partition(0, decoded);
+    assert_eq!(replayed.state(), engine.state());
+    assert_eq!(replayed.state().buffered_messages.len(), 1);
+    assert_eq!(replayed.snapshot().next_local, engine.snapshot().next_local);
+}
+
 /// **Pre-#1676 `ElementActivating`.** An activation journaled before the
 /// event-based-gateway race identity existed carries no `race` key: it must
 /// decode with `race: None` (the additive `serde(default)` contract). A

@@ -2383,6 +2383,31 @@ pub fn record_job_settlement(state: &mut State, job_key: Key, entry: JobSettleme
     }
 }
 
+/// A published message held in the buffer until `deadline` (#1874, Zeebe
+/// `MessageState`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BufferedMessage {
+    pub key: Key,
+    pub message_name: String,
+    pub correlation_key: String,
+    /// Absolute expiry (ms): `publish time + time_to_live`. The message is
+    /// correlatable only while `now < deadline`.
+    pub deadline: u64,
+    pub message_id: Option<String>,
+    pub variables: BTreeMap<String, crate::model::Value>,
+    /// Instances this message already correlated to (Zeebe
+    /// `existMessageCorrelation`): never correlated to them again.
+    pub correlated_instances: BTreeSet<Key>,
+}
+
+impl BufferedMessage {
+    /// `true` while the message may still correlate at `now`.
+    pub fn is_live_at(&self, now: u64) -> bool {
+        now < self.deadline
+    }
+}
+
 /// The complete working state of the engine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2471,6 +2496,16 @@ pub struct State {
     /// [`MessageSubscriptionState::Correlated`]) so a later message never
     /// correlates it twice.
     pub message_subscriptions: BTreeMap<Key, MessageSubscription>,
+    /// Messages **buffered** with a time-to-live (#1874), keyed by message key,
+    /// awaiting a subscription to open before their deadline. Derived only from
+    /// [`crate::Event::MessageBuffered`] / [`crate::Event::BufferedMessageCorrelated`]
+    /// / [`crate::Event::MessageExpired`]. `serde(default)`: snapshots written
+    /// before #1874 load with an empty buffer.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub buffered_messages: BTreeMap<Key, BufferedMessage>,
     /// Open and settled **signal** subscriptions, keyed by subscription key. A
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) as an audit trail.

@@ -122,6 +122,9 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::ProcessStartTimerArmed { .. }
         | Event::ProcessStartTimerFired { .. } => timer::apply_timer(state, event),
         Event::MessagePublished { .. }
+        | Event::MessageBuffered { .. }
+        | Event::MessageExpired { .. }
+        | Event::BufferedMessageCorrelated { .. }
         | Event::MessageSubscriptionCreated { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MessageCorrelated { .. }

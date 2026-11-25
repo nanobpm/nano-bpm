@@ -2681,6 +2681,8 @@ mod tests {
                     .collect(),
                 business_id: None,
                 message_key: None,
+                time_to_live: None,
+                message_id: None,
             });
         }
         fn set(&mut self, instance_key: u64, vars: &[(&str, Value)]) {

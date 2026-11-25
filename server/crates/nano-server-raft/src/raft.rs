@@ -570,6 +570,9 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         // Replicated cluster-variable mutations (#1657).
         E::ClusterVariableAlreadyExists { .. } => (409, e.to_string()),
         E::ClusterVariableNotFound { .. } => (404, e.to_string()),
+        // A publish whose messageId is still buffered (#1874, Zeebe
+        // ALREADY_EXISTS).
+        E::MessageAlreadyExists { .. } => (409, e.to_string()),
         other => (500, other.to_string()),
     }
 }

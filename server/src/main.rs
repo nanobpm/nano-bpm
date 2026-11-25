@@ -11299,6 +11299,8 @@ impl ServerImpl {
                 // mints it (unless the cluster fan-out already did), every
                 // later target reuses it.
                 message_key: key,
+                time_to_live: None,
+                message_id: None,
             };
             self.apply_routed_command(target, command, operation_reference)
         })
@@ -56596,6 +56598,8 @@ mod subscription_placement_tests {
             variables: Default::default(),
             business_id: None,
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         };
         assert!(!ServerImpl::routed_command_is_idempotent(&publish));
         let num_partitions = 4;

@@ -130,6 +130,7 @@ impl Engine {
             esp_start_payloads: std::collections::BTreeMap::new(),
             boundary_payloads: std::collections::BTreeMap::new(),
             pending_timer_fires: std::collections::VecDeque::new(),
+            buffer_scan_from: 0,
             sweep_from: 0,
             raft_applied: snapshot.raft_applied,
         }

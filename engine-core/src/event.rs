@@ -1355,14 +1355,63 @@ pub enum Event {
         deadline: Option<u64>,
     },
 
-    /// A message was published. In nano messages are not buffered, so this
-    /// records no durable state; it carries the minted `message_key` (returned to
-    /// the host and used to restore the key generator on replay) and heads the
-    /// [`Event::MessageCorrelated`] events the same command produced.
+    /// A message was published. This records no durable state itself; it
+    /// carries the minted `message_key` (returned to the host and used to
+    /// restore the key generator on replay) and heads the
+    /// [`Event::MessageCorrelated`] events the same command produced. A message
+    /// published with a positive time-to-live is additionally buffered by the
+    /// [`Event::MessageBuffered`] that follows.
     MessagePublished {
         message_key: Key,
         message_name: String,
         correlation_key: String,
+    },
+    /// A published message was **buffered** until `deadline` (#1874, Zeebe
+    /// `MessageRecord.deadline = timestamp + timeToLive`) on `partition` — the
+    /// partition owning `hash(correlation_key)`. While buffered, a newly opened
+    /// subscription for `(message_name, correlation_key)` correlates it
+    /// ([`Event::BufferedMessageCorrelated`]) and a publish carrying the same
+    /// `message_id` is rejected. `correlated_instances` are the instances the
+    /// publish already correlated (Zeebe `existMessageCorrelation`): a message
+    /// correlates to an instance at most once. Removed by
+    /// [`Event::MessageExpired`].
+    MessageBuffered {
+        message_key: Key,
+        partition: u64,
+        message_name: String,
+        correlation_key: String,
+        deadline: u64,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        message_id: Option<String>,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "BTreeMap::is_empty")
+        )]
+        variables: BTreeMap<String, Value>,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        correlated_instances: Vec<Key>,
+    },
+    /// A buffered message passed its deadline and was removed from the buffer
+    /// (#1874, Zeebe `MessageIntent.EXPIRED`). Emitted by `TriggerTimers`.
+    MessageExpired { message_key: Key, partition: u64 },
+    /// A buffered message was correlated to a subscription opened after it was
+    /// published (#1874, Zeebe `MessageSubscriptionCreateProcessor` →
+    /// `correlateNextMessage`). Records `instance_key` against the message so
+    /// it never correlates to that instance again; the
+    /// [`Event::MessageCorrelated`] (local instance) or
+    /// [`Event::RemoteMessageCorrelation`] (instance on another partition) that
+    /// follows carries the actual correlation.
+    BufferedMessageCorrelated {
+        message_key: Key,
+        partition: u64,
+        subscription_key: Key,
+        instance_key: Key,
     },
     /// A message subscription was opened: either on a message intermediate catch
     /// event (the token rests on it) or as an interrupting message boundary on an
@@ -2266,6 +2315,11 @@ impl Event {
             | Event::GenericResourceDeployed { .. }
             | Event::DeploymentCreated { .. }
             | Event::MessagePublished { .. }
+            // Buffer bookkeeping (#1874) lives on the message partition; the
+            // correlation record that follows names the instance.
+            | Event::MessageBuffered { .. }
+            | Event::MessageExpired { .. }
+            | Event::BufferedMessageCorrelated { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
@@ -2421,6 +2475,13 @@ impl Event {
                 recipient_partition,
                 ..
             } => *recipient_partition,
+            // Message-buffer records (#1874) belong to the buffering (message)
+            // partition, recorded explicitly: the shared publication key
+            // (#1434) and a buffered correlation's subscription / instance keys
+            // may all be foreign.
+            Event::MessageBuffered { partition, .. }
+            | Event::MessageExpired { partition, .. }
+            | Event::BufferedMessageCorrelated { partition, .. } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another
             // partition, so it never identifies the record's owner. Route by the
@@ -2633,7 +2694,10 @@ impl Event {
                 element_instance_key,
                 ..
             } => m = m.max(*timer_key).max(*element_instance_key),
-            Event::MessagePublished { message_key, .. } => m = m.max(*message_key),
+            Event::MessagePublished { message_key, .. }
+            | Event::MessageBuffered { message_key, .. }
+            | Event::MessageExpired { message_key, .. }
+            | Event::BufferedMessageCorrelated { message_key, .. } => m = m.max(*message_key),
             Event::SignalBroadcast { signal_key, .. } => m = m.max(*signal_key),
             Event::SignalSubscriptionCreated {
                 subscription_key,

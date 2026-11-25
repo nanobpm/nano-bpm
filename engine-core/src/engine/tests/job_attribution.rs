@@ -690,6 +690,8 @@ fn interrupting_message_boundary_stamps_soft_job_deadline_on_every_replica() {
             variables: BTreeMap::new(),
             business_id: None,
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         },
         600,
     );
