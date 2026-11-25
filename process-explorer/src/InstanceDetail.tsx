@@ -32,6 +32,7 @@ import {
   useAgentInstances,
 } from "./useAgentSessions";
 import { IncidentReason } from "./IncidentReason";
+import { InstanceTimes } from "./InstanceTimes";
 import { TraceTimeline, fmtClock, fmtDuration } from "./TraceTimeline";
 import {
   Badge,
@@ -412,6 +413,14 @@ export default function InstanceDetail({
       <div className="mt-1 font-mono text-xs break-all text-fg-faint">
         instance {instance.key} · definition {instance.process_definition_key} ·
         v{instance.version}
+      </div>
+      <div className="mt-1 font-mono text-xs text-fg-faint">
+        <InstanceTimes
+          startedAt={instance.start_date_ms}
+          endedAt={trace?.endedAt ?? null}
+          durationMs={trace?.durationMs ?? null}
+          suspendedDate={instance.suspendedDate}
+        />
       </div>
     </header>
   );
