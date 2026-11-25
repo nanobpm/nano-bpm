@@ -25513,11 +25513,19 @@ impl ServerImpl {
         // Deletion's candidate set spans the live store AND the terminal
         // archive (#1948): retention prunes ended instances into the archive,
         // and the single-instance endpoint can still delete them via
-        // `try_process_instance_any`, so a batch must select them too. The
-        // filter is evaluated by the same matcher; filter facets backed only by
-        // live secondary tables (e.g. root variables) never match an archived
-        // row, which NARROWS the batch — never broadens it.
-        let candidates = match self.store.try_process_instances_any() {
+        // `try_process_instance_any`, so a batch must select them too — unless
+        // the filter reads live-only secondary data (see `live_only` below).
+        // Fail closed (#1948): archive-only rows have no live secondary data
+        // (root variables, elements, jobs, incidents), so a filter reading
+        // such a facet cannot be evaluated against them — a negated predicate
+        // (`$exists:false`, `$neq`, …) would match the ABSENT data and select
+        // history the filter excludes. Such filters select live rows only.
+        let live_only = ProcessInstanceMatcher::reads_live_secondary_data(&body.filter);
+        let candidates = match if live_only {
+            Ok(self.store.process_instances())
+        } else {
+            self.store.try_process_instances_any()
+        } {
             Ok(rows) => rows,
             Err(e) => {
                 return Ok(
@@ -64089,6 +64097,105 @@ mod process_instance_deletion_tests {
         })
         .await;
         assert!(server.store.process_instance(kept).is_some());
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948 review: an archive-only instance has no live secondary data, so a
+    /// NEGATED variable filter (`$exists:false`) — at top level or inside an
+    /// `$or` clause — must not select it (it would match the ABSENT variables
+    /// and delete history the filter excludes). Fail closed: such filters
+    /// select live rows only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_deletion_negated_variable_filter_never_selects_archived_instances() {
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as CreateResp;
+        let dir = std::env::temp_dir().join(format!(
+            "nano-1948-batch-archive-negvar-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = Journal::in_memory();
+        let pid = journal.partition_id();
+        let shard = Arc::new(
+            nano_server_storage::readstore::ReadStore::open(Some(&dir.join("read-model.sqlite")))
+                .unwrap(),
+        );
+        let store = Arc::new(ReadModel::from_shards(vec![(pid, Arc::clone(&shard))]));
+        let server = build_server(vec![journal], store, cluster::Topology::single(1));
+        deploy(&server, straight()).await;
+        let pruned = create(&server, "straight").await;
+        let kept = create(&server, "straight").await;
+        eventually("both instances project as ended", || {
+            [pruned, kept].iter().all(|k| {
+                server
+                    .store
+                    .process_instance(*k)
+                    .is_some_and(|r| r.state == ProcessInstanceState::Completed)
+            })
+        })
+        .await;
+        shard.prune_terminal_instances(1, 0).unwrap();
+        assert!(
+            server.store.process_instance(pruned).is_none(),
+            "not pruned"
+        );
+
+        let absent = || {
+            Some(vec![models::VariableValueFilterProperty::new(
+                "keep".to_string(),
+                models::StringFilterProperty::AdvancedStringFilter(models::AdvancedStringFilter {
+                    dollar_exists: Some(false),
+                    ..models::AdvancedStringFilter::new()
+                }),
+            )])
+        };
+        let key_filter = || {
+            Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(pruned.to_string()),
+                ),
+            )
+        };
+        let mut top = models::ProcessInstanceFilter::new();
+        top.process_instance_key = key_filter();
+        top.variables = absent();
+        let mut in_or = models::ProcessInstanceFilter::new();
+        in_or.process_instance_key = key_filter();
+        let mut clause = models::ProcessInstanceFilterFields::new();
+        clause.variables = absent();
+        in_or.dollar_or = Some(vec![clause]);
+        for filter in [top, in_or] {
+            let created = match server
+                .delete_process_instances_batch_operation_impl(
+                    &models::ProcessInstanceDeletionBatchOperationRequest::new(filter),
+                )
+                .await
+                .unwrap()
+            {
+                CreateResp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+                other => panic!("expected 200, got {other:?}"),
+            };
+            let path = models::GetBatchOperationPathParams {
+                batch_operation_key: created.batch_operation_key,
+            };
+            let GetResp::Status200_TheBatchOperationWasFound(r) =
+                server.get_batch_operation_impl(&path).await.unwrap()
+            else {
+                panic!("batch must be found");
+            };
+            assert_eq!(r.operations_total_count, 0, "archived instance selected");
+        }
+        assert!(
+            server
+                .store
+                .try_process_instance_any(pruned)
+                .unwrap()
+                .is_some(),
+            "archived history must survive"
+        );
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

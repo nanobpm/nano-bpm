@@ -523,6 +523,27 @@ impl ProcessInstanceMatcher {
         }
     }
 
+    /// Whether any group of `filter` (the base filter or an `$or` clause) reads a facet
+    /// backed by LIVE secondary tables (root variables, element instances,
+    /// jobs, incidents) rather than the instance row itself. Rows that exist
+    /// only in the terminal archive have no such secondary data, so for them
+    /// these facets cannot be evaluated: a negated predicate (`$exists:false`,
+    /// `$neq`, `hasRetriesLeft:false`) would match the ABSENT data and broaden
+    /// the selection. Callers selecting archive-only rows must fail closed
+    /// (exclude them) when this is `true` (#1948).
+    pub fn reads_live_secondary_data(filter: &models::ProcessInstanceFilter) -> bool {
+        let group_reads = |f: &models::ProcessInstanceFilter| {
+            f.variables.as_ref().is_some_and(|v| !v.is_empty())
+                || InstanceCrossEntityIndex::is_needed(f)
+        };
+        group_reads(filter)
+            || filter
+                .dollar_or
+                .iter()
+                .flatten()
+                .any(|c| group_reads(&process_instance_or_clause(c.clone())))
+    }
+
     pub fn matches(
         &self,
         inst: &readstore::ProcessInstanceRow,
