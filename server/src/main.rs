@@ -6224,15 +6224,6 @@ fn deploy_problem(status: u16, detail: String) -> models::ProblemDetail {
 /// for deploy rejections (Zeebe/C8 wire-shape parity, #793).
 const DEPLOYMENTS_ENDPOINT_PATH: &str = "/v2/deployments";
 
-/// Maps the `(status, detail)` outcome of a forwarded deploy (`forward_deploy`)
-/// onto the generated `/v2/deployments` response. The endpoint models only a
-/// client-side `400` (invalid BPMN → `INVALID_ARGUMENT`) and an infrastructure
-/// `503`, so a genuine client rejection surfaces as `400` while any other
-/// failure (e.g. `502` partition-0 owner unreachable, a malformed forwarded
-/// body) surfaces as `503`. This keeps the HTTP status and `ProblemDetail.status`
-/// consistent — the old code always wrapped the error in the `400` variant, so a
-/// `502` produced HTTP 400 with a `502` body, breaking clients that key off the
-/// HTTP status.
 /// Error title of a deploy shed because the owner queue is full (#1932).
 const DEPLOY_OWNERS_SATURATED: &str = "Deployment owners saturated";
 
@@ -6265,6 +6256,15 @@ fn deploy_owner_cap_from_env() -> usize {
     )
 }
 
+/// Maps the `(status, detail)` outcome of a forwarded deploy (`forward_deploy`)
+/// onto the generated `/v2/deployments` response. The endpoint models only a
+/// client-side `400` (invalid BPMN → `INVALID_ARGUMENT`) and an infrastructure
+/// `503`, so a genuine client rejection surfaces as `400` while any other
+/// failure (e.g. `502` partition-0 owner unreachable, a malformed forwarded
+/// body) surfaces as `503`. This keeps the HTTP status and `ProblemDetail.status`
+/// consistent — the old code always wrapped the error in the `400` variant, so a
+/// `502` produced HTTP 400 with a `502` body, breaking clients that key off the
+/// HTTP status.
 fn forward_deploy_response(
     result: Result<models::DeploymentResult, (u16, String)>,
 ) -> apis::resource::CreateDeploymentResponse {
