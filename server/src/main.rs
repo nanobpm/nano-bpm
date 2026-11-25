@@ -13976,6 +13976,7 @@ impl ServerImpl {
         request_timeout: Option<i64>,
         operation_reference: Option<i64>,
     ) -> ForwardCreateOutcome {
+        let business_id_keyed = business_id.is_some();
         let res = match self.peer_link(node).await {
             Ok(link) => {
                 link.forward_create(
@@ -14020,8 +14021,12 @@ impl ServerImpl {
             Ok(r) => ForwardCreateOutcome::Error(500, peer_detail(&r)),
             // A transport error AFTER the request was sent is ambiguous — the peer
             // may have applied the create — so it is NOT rerouted (that would risk
-            // a duplicate instance); it surfaces as a retryable error instead.
-            Err(e) => ForwardCreateOutcome::Error(e.http_status(), e.to_string()),
+            // a duplicate instance). It is retryable only when the owner
+            // deduplicates the create (a `businessId`); an unkeyed create with an
+            // unknown outcome stays a non-retryable 500 (#1931 review).
+            Err(e) => {
+                ForwardCreateOutcome::Error(e.write_http_status(business_id_keyed), e.to_string())
+            }
         }
     }
 
@@ -14121,6 +14126,13 @@ impl ServerImpl {
                     return Some(Resp::Status400_TheProvidedDataIsNotValid(problem(
                         "Invalid create",
                         400,
+                        detail,
+                    )));
+                }
+                ForwardCreateOutcome::Error(503, detail) => {
+                    return Some(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
                         detail,
                     )));
                 }
@@ -23353,7 +23365,9 @@ impl ServerImpl {
                 None,
             )
             .await
-            .map_err(|e| (e.http_status(), e.to_string()))?;
+            // Unkeyed (no businessId): an unknown-outcome failure must not be
+            // advertised as retryable, or a retry could duplicate the instance.
+            .map_err(|e| (e.write_http_status(false), e.to_string()))?;
         if !is_ok_status(res.status) {
             return Err((res.status, peer_detail(&res)));
         }

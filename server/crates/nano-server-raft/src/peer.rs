@@ -98,6 +98,30 @@ impl PeerError {
     pub fn http_status(&self) -> u16 {
         if self.is_retryable() { 503 } else { 500 }
     }
+
+    /// Whether the request may already have reached (and been applied by) the
+    /// owner: a link that closed or timed out **after** the send leaves the
+    /// outcome unknown, while a connect failure is definitely pre-send.
+    /// Exhaustive on purpose.
+    pub fn outcome_unknown(&self) -> bool {
+        match self {
+            PeerError::Connect(_) => false,
+            PeerError::Closed | PeerError::Timeout => true,
+        }
+    }
+
+    /// The HTTP status for a failed **non-idempotent write** (e.g. an
+    /// instance create): retrying an unknown-outcome write is only safe when
+    /// the owner deduplicates it (`deduplicated`, e.g. a `businessId`).
+    /// Otherwise an unknown outcome is surfaced as a non-retryable 500 so a
+    /// client retry cannot mint a duplicate (#1931 review).
+    pub fn write_http_status(&self, deduplicated: bool) -> u16 {
+        if self.outcome_unknown() && !deduplicated {
+            500
+        } else {
+            self.http_status()
+        }
+    }
 }
 
 /// Maps a failed WebSocket handshake to [`PeerError::Connect`], keeping the
@@ -1939,6 +1963,22 @@ fn fast_forward_timeout() -> Duration {
         .filter(|&n| n > 0)
         .unwrap_or(2500);
     Duration::from_millis(ms)
+}
+
+#[cfg(test)]
+mod write_status_tests {
+    use super::PeerError;
+
+    #[test]
+    fn unknown_outcome_unkeyed_write_is_not_retryable() {
+        for e in [PeerError::Closed, PeerError::Timeout] {
+            assert_eq!(e.write_http_status(false), 500, "{e}");
+            assert_eq!(e.write_http_status(true), 503, "{e}");
+        }
+        let c = PeerError::Connect("refused".into());
+        assert_eq!(c.write_http_status(false), 503);
+        assert_eq!(c.write_http_status(true), 503);
+    }
 }
 
 #[cfg(test)]
