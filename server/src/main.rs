@@ -9880,9 +9880,11 @@ impl ServerImpl {
                         "Job priority is not supported: cannot set priority {p} on job '{job_key}'."
                     ));
                 }
-                if retries.is_none() && timeout.is_none() {
-                    return Ok(());
-                }
+                // No no-op shortcut: even a priority-0-only changeset goes
+                // through `update_job_core`, whose engine command runs the
+                // single-job eligibility check (job exists and is not terminal)
+                // with the same error as `PATCH /v2/jobs/{key}` — so a terminal
+                // job FAILS rather than reporting a blanket success.
                 server
                     .update_job_core(job_key, retries, timeout, operation_reference, None)
                     .await
@@ -54772,6 +54774,103 @@ mod subscription_placement_tests {
         };
         assert_eq!(timeout_state, models::BatchOperationStateEnum::Completed);
         assert_eq!(timeout_batch.operations_total_count, 2);
+
+        // --- Priority-0-only batch: an effective no-op still runs the single-
+        // job eligibility check per item, so a terminal (COMPLETED) job FAILS
+        // with the same reason as `PATCH /v2/jobs/{key}` while an eligible job
+        // completes — never a blanket success over every matched job. ---
+        let first_job = server
+            .store
+            .jobs()
+            .iter()
+            .find(|j| j.instance_key == instances[0])
+            .expect("first instance's job")
+            .key;
+        let resp = server
+            .complete_job_impl(
+                &models::CompleteJobPathParams {
+                    job_key: first_job.to_string(),
+                },
+                &None,
+            )
+            .await
+            .expect("complete");
+        assert!(
+            matches!(
+                resp,
+                apis::job::CompleteJobResponse::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "complete must succeed: {resp:?}"
+        );
+        eventually("the first job projects COMPLETED", || {
+            server
+                .store
+                .jobs()
+                .iter()
+                .any(|j| j.key == first_job && j.state == nanobpmn_engine_core::JobState::Completed)
+        })
+        .await;
+        let single = server
+            .update_job_impl(
+                &models::UpdateJobPathParams {
+                    job_key: first_job.to_string(),
+                },
+                &serde_json::from_value(serde_json::json!({ "changeset": { "priority": 0 } }))
+                    .expect("update body"),
+            )
+            .await
+            .expect("single update");
+        let single_detail = match single {
+            apis::job::UpdateJobResponse::Status404_TheJobWithTheJobKeyIsNotFound(p) => p.detail,
+            other => panic!("PATCH priority 0 on a completed job must 404: {other:?}"),
+        };
+        let mut changeset = models::JobChangeset::new();
+        changeset.priority = Some(types::Nullable::Present(0));
+        let apis::job::UpdateJobsBatchOperationResponse::Status200_TheBatchOperationWasCreated(
+            created,
+        ) = server
+            .update_jobs_batch_operation_impl(&models::JobBatchUpdateRequest::new(
+                crate::clustered_startup_tests::work_job_filter(),
+                changeset,
+            ))
+            .await
+            .expect("priority-0 batch")
+        else {
+            panic!("priority-0 batch must be created");
+        };
+        let zero_key = created.batch_operation_key;
+        settle(zero_key.clone()).await;
+        let GetResp::Status200_TheBatchOperationWasFound(zero_batch) = server
+            .get_batch_operation_impl(&models::GetBatchOperationPathParams {
+                batch_operation_key: zero_key.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("priority-0 batch must be found");
+        };
+        assert_eq!(zero_batch.operations_total_count, 2);
+        assert_eq!(zero_batch.operations_completed_count, 1);
+        assert_eq!(zero_batch.operations_failed_count, 1);
+        let zero_key: u64 = zero_key.parse().expect("batch key");
+        let failed: Vec<(u64, String)> = {
+            let inner = server
+                .batch_operations
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            inner.ops[&zero_key]
+                .items
+                .iter()
+                .filter_map(|i| i.error_message.clone().map(|e| (i.item_key, e)))
+                .collect()
+        };
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, first_job);
+        assert_eq!(
+            failed[0].1, single_detail,
+            "batch reason == single PATCH reason"
+        );
 
         // --- Cancel batch: every ACTIVE *and SUSPENDED* root instance is
         // cancelled (`spec/process-instances.yaml`: "only ACTIVE and SUSPENDED
