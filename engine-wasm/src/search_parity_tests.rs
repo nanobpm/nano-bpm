@@ -270,8 +270,8 @@ fn spec_supported_operators(s: &serde_yaml::Value) -> std::collections::BTreeSet
     out
 }
 
-/// Scalar filter properties that cannot take ANY accepted well-formed
-/// operand, each with the reason. Keep this empty unless genuinely needed.
+/// Scalar filter properties whose spec-declared operators cannot all take
+/// an accepted well-formed operand, each with the reason. Keep this empty unless genuinely needed.
 const UNEXERCISABLE_FILTERS: &[(&str, &str)] = &[];
 
 /// The `field` enum of a spec `*SearchQuerySortRequest`.
@@ -292,19 +292,33 @@ fn spec_operators() -> Vec<String> {
         let Some(schemas) = spec["components"]["schemas"].as_mapping() else {
             continue;
         };
-        for s in schemas.values() {
+        // Operators are declared inline OR inside composition parts
+        // (`AdvancedStringFilter` = `allOf` [BasicStringFilter, {$like}]), so
+        // walk `allOf`/`oneOf`/`anyOf` too — a top-level-only scan missed
+        // `$like` entirely (#1946).
+        fn walk(s: &serde_yaml::Value, ops: &mut std::collections::BTreeSet<String>) {
             if let Some(props) = s["properties"].as_mapping() {
-                for k in props.keys().filter_map(|k| k.as_str()) {
-                    if k.starts_with('$') {
-                        ops.insert(k.to_string());
-                    }
+                ops.extend(
+                    props
+                        .keys()
+                        .filter_map(|k| k.as_str())
+                        .filter(|k| k.starts_with('$'))
+                        .map(str::to_string),
+                );
+            }
+            for k in ["allOf", "oneOf", "anyOf"] {
+                for part in s[k].as_sequence().into_iter().flatten() {
+                    walk(part, ops);
                 }
             }
+        }
+        for s in schemas.values() {
+            walk(s, &mut ops);
         }
     }
     let ops: Vec<String> = ops.into_iter().collect();
     for required in [
-        "$eq", "$neq", "$exists", "$in", "$gt", "$gte", "$lt", "$lte",
+        "$eq", "$neq", "$exists", "$in", "$notIn", "$like", "$gt", "$gte", "$lt", "$lte",
     ] {
         assert!(
             ops.iter().any(|o| o == required),
@@ -461,23 +475,29 @@ fn check_filters(op: &Op) -> usize {
             .map(spec_supported_operators)
             .unwrap_or_default();
         let exempt = UNEXERCISABLE_FILTERS.iter().any(|(p, _)| *p == prop);
-        for o in &ops {
-            let mut ok = false;
+        // Every operand variant `operands` builds is well-formed for its
+        // operator (`$in` an array of the scalar operand, `$exists` a boolean,
+        // `$like` a string pattern), so for a DECLARED operator each one must
+        // be accepted: an accepted `$in: []` must not mask a rejected
+        // `$in: [v]`.
+        // Probe the spec-wide operator set plus anything this property
+        // declares, so a declared operator can never escape the probe set.
+        let probe_ops: std::collections::BTreeSet<&String> = ops.iter().chain(&supported).collect();
+        for o in probe_ops {
+            let declared = takes_operators && supported.contains(o) && !exempt;
             for operand in operands(o, &v) {
                 let body = with_base(wrap(json!({ o.as_str(): operand }))).to_string();
                 if compare(op, &body).is_some() {
                     accepted += 1;
-                    ok = true;
+                } else if declared {
+                    unexercised.push(format!("{prop}.{o} = {operand}"));
                 }
-            }
-            if takes_operators && supported.contains(o) && !ok && !exempt {
-                unexercised.push(format!("{prop}.{o}"));
             }
         }
     }
     assert!(
         unexercised.is_empty(),
-        "{}: no operator probe accepted for {unexercised:?}",
+        "{}: spec-declared operator probes rejected: {unexercised:?}",
         op.name
     );
     accepted
@@ -1162,4 +1182,42 @@ fn filter_guard_fails_when_both_surfaces_reject_a_tag_array_operand() {
         check_filters(&stub_op("business_key:1234"))
     }));
     assert!(r.is_err(), "guard passed despite rejected tags operand");
+}
+
+/// Runs the guard over surfaces rejecting bodies containing `needle`.
+fn guard_rejects(needle: &str) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_filters(&stub_op(needle))
+    }))
+    .is_err()
+}
+
+#[test]
+fn filter_guard_fails_when_both_surfaces_reject_any_declared_operator() {
+    // Every operator some UserTaskFilter property declares: rejecting it
+    // everywhere (both surfaces agree) must fail the guard.
+    let declared: std::collections::BTreeSet<String> = spec_properties("UserTaskFilter")
+        .iter()
+        .filter_map(|p| spec_property_schema("UserTaskFilter", p))
+        .flat_map(|s| spec_supported_operators(&s))
+        .collect();
+    for o in ["$eq", "$neq", "$exists", "$in", "$like", "$gte", "$lt"] {
+        assert!(declared.contains(o), "UserTaskFilter declares {o}");
+    }
+    for o in &declared {
+        assert!(
+            guard_rejects(&format!("\"{o}\"")),
+            "guard passed with {o} rejected"
+        );
+    }
+}
+
+#[test]
+fn filter_guard_fails_when_one_well_formed_operand_variant_is_rejected() {
+    // `$in: []` accepted must not mask a rejected non-empty `$in` list.
+    assert!(guard_rejects("\"$in\":[\""), "non-empty $in rejected");
+    // A rejected `$exists: false` is not masked by an accepted `true`.
+    assert!(guard_rejects("\"$exists\":false"), "$exists false rejected");
+    // A rejected `$like` wildcard pattern is not masked by an exact pattern.
+    assert!(guard_rejects("no-match*"), "$like pattern rejected");
 }
