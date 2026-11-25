@@ -474,8 +474,8 @@ impl RaftTransport for PeerTransport {
 /// (#1661). Single canonical mapping from log content to wire requirement.
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
-        FEATURE_CLUSTER_VARIABLES, FEATURE_REPLICATED_LENIENT_COMPLETION,
-        FEATURE_TERMINAL_DEADLINES,
+        FEATURE_CLUSTER_VARIABLES, FEATURE_MESSAGE_BUFFERING,
+        FEATURE_REPLICATED_LENIENT_COMPLETION, FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
     let RaftRpcRequest::AppendEntries(r) = req else {
@@ -499,6 +499,15 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
                 Command::CreateClusterVariable { .. }
                 | Command::UpdateClusterVariable { .. }
                 | Command::DeleteClusterVariable { .. } => FEATURE_CLUSTER_VARIABLES,
+                // #1874: a positive TTL buffers and a message id changes the
+                // command seed; a legacy peer would ignore both and diverge.
+                Command::CorrelateMessage {
+                    time_to_live,
+                    ref message_id,
+                    ..
+                } if time_to_live.is_some_and(|ttl| ttl > 0) || message_id.is_some() => {
+                    FEATURE_MESSAGE_BUFFERING
+                }
                 _ => continue,
             };
             if !required.contains(&feature) {
@@ -572,6 +581,31 @@ mod codec_tests {
                 required_features_for(&req(vec![entry(command)])),
                 vec![nano_falcon_protocol::cluster_join::FEATURE_CLUSTER_VARIABLES]
             );
+        }
+        // #1874: a buffering publication (positive TTL) or one carrying a
+        // message id requires message-buffering-v1; a plain one requires
+        // nothing (TTL 0 / None never buffers).
+        let publish = |time_to_live, message_id: Option<&str>| Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            variables: Default::default(),
+            business_id: None,
+            message_key: None,
+            time_to_live,
+            message_id: message_id.map(Into::into),
+        };
+        for command in [
+            publish(Some(1_000), None),
+            publish(None, Some("id")),
+            publish(Some(0), Some("id")),
+        ] {
+            assert_eq!(
+                required_features_for(&req(vec![entry(command)])),
+                vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_BUFFERING]
+            );
+        }
+        for command in [publish(None, None), publish(Some(0), None)] {
+            assert!(required_features_for(&req(vec![entry(command)])).is_empty());
         }
         // #1856 review: a stamped entry is never shipped to a peer that would
         // ignore the deadline map; an unstamped one requires nothing.
