@@ -2296,8 +2296,19 @@ fn user_task_state(s: &UserTaskState) -> String {
     .to_string()
 }
 
+#[cfg(target_arch = "wasm32")]
 fn js_err(msg: &str) -> JsValue {
     JsValue::from_str(msg)
+}
+
+/// Off wasm32 a `JsValue` cannot be materialised: `JsValue::from_str` calls a
+/// wasm-bindgen import that panics inside a non-unwinding function and aborts
+/// the whole host test process. Host callers (the server/wasm conformance
+/// suite, #1936) therefore see a rejection as an ordinary, catchable panic
+/// carrying the same message the browser would receive.
+#[cfg(not(target_arch = "wasm32"))]
+fn js_err(msg: &str) -> JsValue {
+    panic!("TestEngine rejected: {msg}")
 }
 
 fn to_json<T: Serialize>(v: &T) -> Result<String, JsValue> {

@@ -38,6 +38,8 @@ mod stub_impls;
 // Phase 2; full inline-test relocation is Phase 4).
 #[cfg(test)]
 mod peer_forward_tests;
+#[cfg(test)]
+mod wasm_conformance_tests;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

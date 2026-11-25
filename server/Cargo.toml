@@ -141,6 +141,9 @@ nano-server-raft = { path = "crates/nano-server-raft", features = ["test-hooks"]
 nano-falcon-protocol = { path = "crates/nano-falcon-protocol", features = ["test-hooks"] }
 # Paused (fake) time for the #1866 background re-drive tests.
 tokio = { version = "1", features = ["test-util"] }
+# The server/wasm conformance suite (#1936, src/wasm_conformance_tests.rs) runs the
+# same scenarios through the REST router and the in-browser `TestEngine`.
+nanobpmn-engine-wasm = { path = "../engine-wasm", features = ["read-model"] }
 
 # The self-contained single-node distribution: bundle the web console (cluster
 # console, BPMN modeler, process-instance explorer, embedded workers) into the

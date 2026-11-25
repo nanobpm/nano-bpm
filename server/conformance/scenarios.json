@@ -1,0 +1,209 @@
+{
+  "$comment": "Server/wasm conformance scenarios (#1936). Each step is a spec-shaped REST call: `op` is the OpenAPI operationId, `params` fills its path template, `body` is the request body exactly as a client sends it. `${name}` (a whole string) is replaced with a key captured by an earlier step; `capture` lists JSON pointers into the step's response, the first that resolves wins. `compare` is `body` (field-by-field after normalising volatile values) or `status` (accept/reject, and status/title on reject). Driven by server/src/wasm_conformance_tests.rs through the server's generated REST router and through engine-wasm's TestEngine.",
+  "scenarios": [
+    {
+      "name": "job-lifecycle",
+      "steps": [
+        { "id": "deploy", "op": "createDeployment", "resources": ["conformance-service.bpmn"], "compare": "status" },
+        {
+          "id": "create",
+          "op": "createProcessInstance",
+          "body": {
+            "processDefinitionId": "conformance-service",
+            "variables": { "orderId": "o-1", "amount": 42 },
+            "tags": ["conformance"],
+            "businessId": "biz-1"
+          },
+          "capture": { "pi": ["/processInstanceKey", "/created"] },
+          "compare": "body"
+        },
+        {
+          "id": "search-created",
+          "op": "searchProcessInstances",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "compare": "body"
+        },
+        {
+          "id": "activate",
+          "op": "activateJobs",
+          "body": { "type": "conformance-work", "maxJobsToActivate": 1, "timeout": 60000, "worker": "conformance", "requestTimeout": -1 },
+          "capture": { "job": ["/jobs/0/jobKey", "/0/key"] },
+          "compare": "body"
+        },
+        { "id": "complete", "op": "completeJob", "params": { "jobKey": "${job}" }, "body": { "variables": { "done": true } }, "compare": "status" },
+        {
+          "id": "search-variables",
+          "op": "searchVariables",
+          "body": { "filter": { "processInstanceKey": "${pi}" }, "sort": [{ "field": "name" }] },
+          "compare": "body"
+        },
+        {
+          "id": "search-completed",
+          "op": "searchProcessInstances",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "compare": "body"
+        }
+      ]
+    },
+    {
+      "name": "fail-with-backoff",
+      "steps": [
+        { "id": "deploy", "op": "createDeployment", "resources": ["conformance-service.bpmn"], "compare": "status" },
+        {
+          "id": "create",
+          "op": "createProcessInstance",
+          "body": { "processDefinitionId": "conformance-service", "variables": { "orderId": "o-2" } },
+          "capture": { "pi": ["/processInstanceKey", "/created"] },
+          "compare": "status"
+        },
+        {
+          "id": "activate",
+          "op": "activateJobs",
+          "body": { "type": "conformance-work", "maxJobsToActivate": 1, "timeout": 60000, "worker": "conformance", "requestTimeout": -1 },
+          "capture": { "job": ["/jobs/0/jobKey", "/0/key"] },
+          "compare": "status"
+        },
+        {
+          "id": "fail",
+          "op": "failJob",
+          "params": { "jobKey": "${job}" },
+          "body": { "retries": 2, "errorMessage": "boom", "retryBackOff": 60000 },
+          "compare": "status"
+        },
+        {
+          "id": "activate-during-backoff",
+          "op": "activateJobs",
+          "body": { "type": "conformance-work", "maxJobsToActivate": 1, "timeout": 60000, "worker": "conformance", "requestTimeout": -1 },
+          "compare": "body"
+        },
+        { "id": "update-retries", "op": "updateJob", "params": { "jobKey": "${job}" }, "body": { "changeset": { "retries": 5 } }, "compare": "status" },
+        { "id": "cancel", "op": "cancelProcessInstance", "params": { "processInstanceKey": "${pi}" }, "compare": "status" },
+        {
+          "id": "search-canceled",
+          "op": "searchProcessInstances",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "compare": "body"
+        }
+      ]
+    },
+    {
+      "name": "throw-error-and-user-task",
+      "steps": [
+        { "id": "deploy", "op": "createDeployment", "resources": ["conformance-service.bpmn"], "compare": "status" },
+        {
+          "id": "create",
+          "op": "createProcessInstance",
+          "body": { "processDefinitionId": "conformance-service", "variables": { "orderId": "o-3" } },
+          "capture": { "pi": ["/processInstanceKey", "/created"] },
+          "compare": "status"
+        },
+        {
+          "id": "activate",
+          "op": "activateJobs",
+          "body": { "type": "conformance-work", "maxJobsToActivate": 1, "timeout": 60000, "worker": "conformance", "requestTimeout": -1 },
+          "capture": { "job": ["/jobs/0/jobKey", "/0/key"] },
+          "compare": "status"
+        },
+        {
+          "id": "throw",
+          "op": "throwJobError",
+          "params": { "jobKey": "${job}" },
+          "body": { "errorCode": "BIZ", "errorMessage": "not payable", "variables": { "reason": "card-declined" } },
+          "compare": "status"
+        },
+        {
+          "id": "search-variables",
+          "op": "searchVariables",
+          "body": { "filter": { "processInstanceKey": "${pi}" }, "sort": [{ "field": "name" }] },
+          "compare": "body"
+        },
+        {
+          "id": "search-task",
+          "op": "searchUserTasks",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "capture": { "task": ["/items/0/userTaskKey"] },
+          "compare": "body"
+        },
+        { "id": "assign", "op": "assignUserTask", "params": { "userTaskKey": "${task}" }, "body": { "assignee": "alice" }, "compare": "status" },
+        { "id": "update", "op": "updateUserTask", "params": { "userTaskKey": "${task}" }, "body": { "changeset": { "priority": 80 } }, "compare": "status" },
+        {
+          "id": "search-assigned",
+          "op": "searchUserTasks",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "compare": "body"
+        },
+        { "id": "unassign", "op": "unassignUserTask", "params": { "userTaskKey": "${task}" }, "compare": "status" },
+        { "id": "complete-task", "op": "completeUserTask", "params": { "userTaskKey": "${task}" }, "body": { "variables": { "handled": true } }, "compare": "status" },
+        {
+          "id": "search-completed",
+          "op": "searchProcessInstances",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "compare": "body"
+        }
+      ]
+    },
+    {
+      "name": "message-signal-variables",
+      "steps": [
+        { "id": "deploy", "op": "createDeployment", "resources": ["conformance-events.bpmn"], "compare": "status" },
+        {
+          "id": "create",
+          "op": "createProcessInstance",
+          "body": { "processDefinitionId": "conformance-events", "variables": { "orderId": "o-7" } },
+          "capture": { "pi": ["/processInstanceKey", "/created"] },
+          "compare": "status"
+        },
+        {
+          "id": "correlate",
+          "op": "correlateMessage",
+          "body": { "name": "conformance-order", "correlationKey": "o-7", "variables": { "paid": true } },
+          "compare": "status"
+        },
+        { "id": "signal", "op": "broadcastSignal", "body": { "signalName": "conformance-go", "variables": { "go": 1 } }, "compare": "status" },
+        {
+          "id": "set-variables",
+          "op": "createElementInstanceVariables",
+          "params": { "elementInstanceKey": "${pi}" },
+          "body": { "variables": { "note": "checked" } },
+          "compare": "status"
+        },
+        {
+          "id": "search-variables",
+          "op": "searchVariables",
+          "body": { "filter": { "processInstanceKey": "${pi}" }, "sort": [{ "field": "name" }] },
+          "compare": "body"
+        },
+        {
+          "id": "search-task",
+          "op": "searchUserTasks",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "compare": "body"
+        },
+        {
+          "id": "search-active",
+          "op": "searchProcessInstances",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "compare": "body"
+        }
+      ]
+    },
+    {
+      "name": "errors",
+      "steps": [
+        {
+          "id": "complete-unknown-job",
+          "op": "completeJob",
+          "params": { "jobKey": "2251799813699999" },
+          "body": { "variables": {} },
+          "compare": "status"
+        },
+        {
+          "id": "create-unknown-process",
+          "op": "createProcessInstance",
+          "body": { "processDefinitionId": "conformance-missing" },
+          "compare": "status"
+        }
+      ]
+    }
+  ]
+}
