@@ -27,6 +27,7 @@ pub mod variable;
 
 pub use nanobpm_gateway_rest::{models, strict, types};
 pub use nanobpmn_read_model as readstore;
+pub use validator;
 
 /// Why a shared search pipeline failed.
 #[derive(Debug)]

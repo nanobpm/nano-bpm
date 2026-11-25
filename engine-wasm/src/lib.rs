@@ -28,10 +28,7 @@ use nanobpmn_engine_core::{
 /// links none of the read-model/SQLite deps and keeps its lean baseline size;
 /// everything it touches is `#[cfg(feature = "read-model")]`.
 #[cfg(feature = "read-model")]
-use nanobpmn_read_model::{
-    FormRow, ProcessInstanceRow, ReadStore, ResourceRow, RootResolver, UserTaskRow, VariableRow,
-    VARIABLE_VALUE_PREVIEW_LEN,
-};
+use nanobpmn_read_model::ReadStore;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -1246,97 +1243,66 @@ impl TestEngine {
 #[cfg(feature = "read-model")]
 #[wasm_bindgen]
 impl TestEngine {
-    /// The latest deployed form for `form_key`, as a `FormResult` JSON object
-    /// (`{ tenantId, formId, schema, version, formKey }`), or JSON `null` when no
-    /// form with that key exists. Mirrors `GET /forms/{formKey}`.
+    /// `getFormByKey` — mirrors `GET /forms/{formKey}`. Returns the generated
+    /// `FormResult` JSON, or JSON `null` where the gateway answers 404 (no such
+    /// form, or a key that is not a valid form key). Runs the shared
+    /// `nanobpmn_search::get` lookup the gateway serves.
     #[wasm_bindgen(js_name = getFormByKey)]
     pub fn get_form_by_key(&self, form_key: &str) -> Result<String, JsValue> {
-        let key = parse_key(form_key)?;
-        match self.read_model.form_by_key(key) {
-            Some(row) => to_json(&form_result(&row)),
-            None => Ok("null".to_string()),
-        }
+        self.get_form_by_key_json(form_key).map_err(|e| js_err(&e))
     }
 
-    /// The user tasks matching an optional `{ state? }` filter, as a
-    /// `UserTaskSearchQueryResult` JSON object (`{ items: [...], page: {...} }`).
-    /// The `state` filter (e.g. `"CREATED"`) is honoured through the read model,
-    /// not hardcoded. Mirrors `POST /user-tasks/search`.
-    #[wasm_bindgen(js_name = searchUserTasks)]
-    pub fn search_user_tasks(&self, filter_json: &str) -> Result<String, JsValue> {
-        let want = match parse_state_filter(filter_json, "state")? {
-            Some(s) => Some(user_task_state_from_rest(&s).ok_or_else(|| {
-                js_err(&format!(
-                    "filter `state` must be one of {}; got {s:?}",
-                    user_task_state_spellings()
-                ))
-            })?),
-            None => None,
-        };
-        // One resolver spans the whole search so tasks sharing a parent chain
-        // walk it once, mirroring `search_process_instances` (issues #977/#1095).
-        let roots = RootResolver::new(|k| self.read_model.process_instance(k));
-        let items: Vec<serde_json::Value> = self
-            .read_model
-            .user_tasks()
-            .iter()
-            .filter(|row| match want {
-                Some(w) => row.state == w,
-                None => true,
-            })
-            .map(|row| user_task_result(row, &roots))
-            .collect();
-        to_json(&search_result(items))
-    }
-
-    /// All process instances, as a `ProcessInstanceSearchQueryResult` JSON object
-    /// (`{ items: [...], page: {...} }`). The request body is shape-validated like
-    /// `POST /process-instances/search`, but filter/sort/page fields are not yet
-    /// honoured — every instance is returned. Do not rely on gateway-side
-    /// filtering through this method yet.
-    #[wasm_bindgen(js_name = searchProcessInstances)]
-    pub fn search_process_instances(&self, filter_json: &str) -> Result<String, JsValue> {
-        validate_search_filter_body(filter_json)?;
-        // One resolver spans the whole search so instances sharing a parent chain
-        // walk it once (issue #977 review: avoid O(rows × chain-depth) root walks).
-        let roots = RootResolver::new(|k| self.read_model.process_instance(k));
-        let items: Vec<serde_json::Value> = self
-            .read_model
-            .process_instances()
-            .iter()
-            .map(|row| process_instance_result(row, &roots))
-            .collect();
-        to_json(&search_result(items))
-    }
-
-    /// The generic resource for `resource_key`, as a `ResourceResult` JSON object,
-    /// or JSON `null` when no resource with that key exists. Mirrors
-    /// `GET /resources/{resourceKey}`.
+    /// `getResourceByKey` — mirrors `GET /resources/{resourceKey}`. Returns the
+    /// generated `ResourceResult` JSON, or JSON `null` where the gateway answers
+    /// 404.
     #[wasm_bindgen(js_name = getResourceByKey)]
     pub fn get_resource_by_key(&self, resource_key: &str) -> Result<String, JsValue> {
-        let key = parse_key(resource_key)?;
-        match self.read_model.resource_by_key(key) {
-            Some(row) => to_json(&resource_result(&row)),
-            None => Ok("null".to_string()),
-        }
+        self.get_resource_by_key_json(resource_key)
+            .map_err(|e| js_err(&e))
     }
 
-    /// All variables, as a `VariableSearchQueryResult` JSON object
-    /// (`{ items: [...], page: {...} }`). The request body is shape-validated like
-    /// `POST /variables/search`, but filter/sort/page fields are not yet honoured —
-    /// every variable is returned. Values longer than `VARIABLE_VALUE_PREVIEW_LEN`
-    /// are truncated with `isTruncated: true`; shorter values pass through intact
-    /// with `isTruncated: false`. There is no `truncateValues` opt-out yet.
+    /// `getAgentInstance` — mirrors `GET /agent-instances/{agentInstanceKey}`.
+    /// Returns the generated `AgentInstanceResult` JSON, JSON `null` where the
+    /// gateway answers 404, and throws where it answers 400 (a malformed key).
+    #[wasm_bindgen(js_name = getAgentInstance)]
+    pub fn get_agent_instance(&self, agent_instance_key: &str) -> Result<String, JsValue> {
+        self.get_agent_instance_json(agent_instance_key)
+            .map_err(|e| js_err(&e))
+    }
+
+    /// `searchUserTasks` — mirrors `POST /user-tasks/search`. `query_json` is
+    /// the spec's `UserTaskSearchQuery` (`{ filter?, sort?, page? }`; empty ⇒
+    /// no query), run through the SAME `nanobpmn_search` pipeline the gateway
+    /// serves (every filter field and operator, `$or`, variable filters, sort,
+    /// limit/cursor paging). Returns the generated `UserTaskSearchQueryResult`.
+    /// A property the spec does not define is rejected, never ignored.
+    #[wasm_bindgen(js_name = searchUserTasks)]
+    pub fn search_user_tasks(&self, query_json: &str) -> Result<String, JsValue> {
+        self.search_user_tasks_json(query_json)
+            .map_err(|e| js_err(&e))
+    }
+
+    /// `searchProcessInstances` — mirrors `POST /process-instances/search`:
+    /// the spec's `ProcessInstanceSearchQuery` through the shared pipeline,
+    /// returning the generated `ProcessInstanceSearchQueryResult`.
+    #[wasm_bindgen(js_name = searchProcessInstances)]
+    pub fn search_process_instances(&self, query_json: &str) -> Result<String, JsValue> {
+        self.search_process_instances_json(query_json)
+            .map_err(|e| js_err(&e))
+    }
+
+    /// `searchVariables` — mirrors `POST /variables/search`: the spec's
+    /// `VariableSearchQuery` through the shared pipeline, returning the
+    /// generated `VariableSearchQueryResult`. `truncate_values` is the
+    /// endpoint's `truncateValues` query parameter (default `true`).
     #[wasm_bindgen(js_name = searchVariables)]
-    pub fn search_variables(&self, filter_json: &str) -> Result<String, JsValue> {
-        validate_search_filter_body(filter_json)?;
-        let items: Vec<serde_json::Value> = self
-            .read_model
-            .variables()
-            .iter()
-            .map(variable_search_result)
-            .collect();
-        to_json(&search_result(items))
+    pub fn search_variables(
+        &self,
+        query_json: &str,
+        truncate_values: Option<bool>,
+    ) -> Result<String, JsValue> {
+        self.search_variables_json(query_json, truncate_values)
+            .map_err(|e| js_err(&e))
     }
 
     /// `searchAgentInstances` — mirrors `POST /agent-instances/search`.
@@ -1369,21 +1335,114 @@ impl TestEngine {
     }
 }
 
-/// The JS-free bodies of the migrated search methods (host-testable: a
-/// `JsValue` error cannot be constructed off wasm32).
+/// Serialise a shared-layer result (or report the operation's failure).
+#[cfg(feature = "read-model")]
+fn result_json<T: Serialize>(op: &str, value: &T) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|e| format!("{op}: {e}"))
+}
+
+/// Map a shared `get*` [`Lookup`](nanobpmn_search::get::Lookup) onto the WASM
+/// transport: 200 → the result JSON, 404 → JSON `null`, 400 → an error. One
+/// mapping for every `get*` method, so the 404-is-`null` contract cannot drift
+/// per method.
+#[cfg(feature = "read-model")]
+fn lookup_json<T: Serialize>(
+    op: &str,
+    lookup: nanobpmn_search::get::Lookup<T>,
+) -> Result<String, String> {
+    use nanobpmn_search::get::Lookup;
+    match lookup {
+        Lookup::Found(v) => result_json(op, &v),
+        Lookup::NotFound { .. } => Ok("null".to_string()),
+        Lookup::Invalid { detail, .. } => Err(format!("{op}: {detail}")),
+    }
+}
+
+/// Parse a request body into the generated `*SearchQuery` (strict, validated).
+#[cfg(feature = "read-model")]
+fn search_query<T>(op: &str, query_json: &str) -> Result<Option<T>, String>
+where
+    T: serde::de::DeserializeOwned + Serialize + nanobpmn_search::validator::Validate,
+{
+    nanobpmn_search::parse_search_query::<T>(query_json).map_err(|e| format!("{op}: {e}"))
+}
+
+/// The JS-free bodies of the read methods (host-testable: a `JsValue` error
+/// cannot be constructed off wasm32). Each is a thin layer: request JSON → the
+/// shared `nanobpmn_search` function → response JSON.
 #[cfg(feature = "read-model")]
 impl TestEngine {
+    fn get_form_by_key_json(&self, form_key: &str) -> Result<String, String> {
+        lookup_json(
+            "getFormByKey",
+            nanobpmn_search::get::get_form_by_key(&self.read_model, form_key),
+        )
+    }
+
+    fn get_resource_by_key_json(&self, resource_key: &str) -> Result<String, String> {
+        lookup_json(
+            "getResourceByKey",
+            nanobpmn_search::get::get_resource(&self.read_model, resource_key),
+        )
+    }
+
+    fn get_agent_instance_json(&self, agent_instance_key: &str) -> Result<String, String> {
+        let lookup = nanobpmn_search::get::get_agent_instance(agent_instance_key, |k| {
+            self.read_model.try_agent_instance(k)
+        })
+        .map_err(|e| format!("getAgentInstance: {e}"))?;
+        lookup_json("getAgentInstance", lookup)
+    }
+
+    fn search_user_tasks_json(&self, query_json: &str) -> Result<String, String> {
+        const OP: &str = "searchUserTasks";
+        let query = search_query::<nanobpmn_search::models::UserTaskSearchQuery>(OP, query_json)?;
+        result_json(
+            OP,
+            &nanobpmn_search::user_task::search_user_tasks(&self.read_model, query.as_ref()),
+        )
+    }
+
+    fn search_process_instances_json(&self, query_json: &str) -> Result<String, String> {
+        const OP: &str = "searchProcessInstances";
+        let query =
+            search_query::<nanobpmn_search::models::ProcessInstanceSearchQuery>(OP, query_json)?;
+        result_json(
+            OP,
+            &nanobpmn_search::process_instance::search_process_instances(
+                &self.read_model,
+                query.as_ref(),
+            ),
+        )
+    }
+
+    fn search_variables_json(
+        &self,
+        query_json: &str,
+        truncate_values: Option<bool>,
+    ) -> Result<String, String> {
+        const OP: &str = "searchVariables";
+        let query = search_query::<nanobpmn_search::models::VariableSearchQuery>(OP, query_json)?;
+        result_json(
+            OP,
+            &nanobpmn_search::variable::search_variables(
+                &self.read_model,
+                truncate_values.unwrap_or(true),
+                query.as_ref(),
+            ),
+        )
+    }
+
     fn search_agent_instances_json(&self, query_json: &str) -> Result<String, String> {
-        let query = nanobpmn_search::parse_search_query::<
-            nanobpmn_search::models::AgentInstanceSearchQuery,
-        >(query_json)
-        .map_err(|e| format!("searchAgentInstances: {e}"))?;
+        const OP: &str = "searchAgentInstances";
+        let query =
+            search_query::<nanobpmn_search::models::AgentInstanceSearchQuery>(OP, query_json)?;
         let result = nanobpmn_search::agent::search_agent_instances(query.as_ref(), || {
             self.read_model
                 .try_agent_instances(&nanobpmn_read_model::AgentInstanceFilter::default(), None)
         })
-        .map_err(|e| format!("searchAgentInstances: {e}"))?;
-        serde_json::to_string(&result).map_err(|e| format!("searchAgentInstances: {e}"))
+        .map_err(|e| format!("{OP}: {e}"))?;
+        result_json(OP, &result)
     }
 
     fn search_agent_instance_history_json(
@@ -1391,25 +1450,23 @@ impl TestEngine {
         agent_instance_key: &str,
         query_json: &str,
     ) -> Result<String, String> {
+        const OP: &str = "searchAgentInstanceHistory";
         let key = agent_instance_key
             .parse::<u64>()
             .ok()
             .filter(|k| *k > 0)
             .ok_or_else(|| {
-                format!(
-                    "searchAgentInstanceHistory: agent instance key {agent_instance_key:?} is not a valid key"
-                )
+                format!("{OP}: agent instance key {agent_instance_key:?} is not a valid key")
             })?;
-        let query = nanobpmn_search::parse_search_query::<
-            nanobpmn_search::models::AgentInstanceHistorySearchQuery,
-        >(query_json)
-        .map_err(|e| format!("searchAgentInstanceHistory: {e}"))?;
+        let query = search_query::<nanobpmn_search::models::AgentInstanceHistorySearchQuery>(
+            OP, query_json,
+        )?;
         let result =
             nanobpmn_search::agent::search_agent_instance_history(key, query.as_ref(), |filter| {
                 self.read_model.try_agent_history(filter, None)
             })
-            .map_err(|e| format!("searchAgentInstanceHistory: {e}"))?;
-        serde_json::to_string(&result).map_err(|e| format!("searchAgentInstanceHistory: {e}"))
+            .map_err(|e| format!("{OP}: {e}"))?;
+        result_json(OP, &result)
     }
 }
 
@@ -1447,294 +1504,6 @@ fn open_read_model() -> ReadStore {
     ReadStore::open(None).expect("open in-memory read model")
 }
 
-/// The REST string spelling of a [`UserTaskState`] (Camunda v2 enum), used to
-/// honour `searchUserTasks`' `state` filter through the read model.
-#[cfg(feature = "read-model")]
-fn user_task_state_rest(state: UserTaskState) -> &'static str {
-    match state {
-        UserTaskState::Created => "CREATED",
-        UserTaskState::Completed => "COMPLETED",
-        UserTaskState::Canceled => "CANCELED",
-    }
-}
-
-/// Every [`UserTaskState`] variant, in enum order. Single source of truth for the
-/// set of valid REST `state` filter spellings — each spelling is derived from
-/// [`user_task_state_rest`], so the two never drift. A variant added to the enum
-/// makes `user_task_state_rest`'s match fail to compile; the
-/// `all_user_task_states_is_exhaustive` test additionally asserts this list keeps
-/// enumerating them all.
-#[cfg(feature = "read-model")]
-const ALL_USER_TASK_STATES: [UserTaskState; 3] = [
-    UserTaskState::Created,
-    UserTaskState::Completed,
-    UserTaskState::Canceled,
-];
-
-/// Parse a REST `state` filter spelling (e.g. `"CREATED"`) back into a
-/// [`UserTaskState`], or `None` when it is not a valid enum spelling. The gateway
-/// rejects unknown `UserTaskStateEnum` spellings during request deserialization,
-/// so `searchUserTasks` does too rather than silently returning an empty set.
-#[cfg(feature = "read-model")]
-fn user_task_state_from_rest(s: &str) -> Option<UserTaskState> {
-    ALL_USER_TASK_STATES
-        .into_iter()
-        .find(|st| user_task_state_rest(*st) == s)
-}
-
-/// The comma-separated list of valid REST `state` spellings, for error messages.
-#[cfg(feature = "read-model")]
-fn user_task_state_spellings() -> String {
-    ALL_USER_TASK_STATES
-        .iter()
-        .map(|st| user_task_state_rest(*st))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Extract an optional string field (e.g. `state`) from a search filter argument.
-/// Empty/whitespace input, a missing field, or an explicit JSON `null` all yield
-/// `None` (no filter); a non-string value is rejected. The filter body must be a
-/// JSON object (or root `null`): a non-object root (`[]`, `"x"`, `42`, …) is
-/// rejected rather than silently treated as "no filter", matching the gateway's
-/// request parsing.
-///
-/// The field is looked up under a nested `filter` object when present
-/// (`{ "filter": { "state": … } }`, the canonical REST body shape for
-/// `UserTaskSearchQuery`) as well as at the top level (`{ "state": … }`, the
-/// convenience shorthand). A present-but-non-object `filter` is a malformed body
-/// and is rejected rather than silently ignored.
-#[cfg(feature = "read-model")]
-fn parse_state_filter(filter_json: &str, field: &str) -> Result<Option<String>, JsValue> {
-    parse_state_filter_inner(filter_json, field).map_err(|e| js_err(&e))
-}
-
-/// Shape-validate a `search*` filter body against the gateway's REST contract:
-/// accept empty/whitespace, JSON `null`, or a JSON object (with an optional nested
-/// `filter` object); reject a non-object root (`[]`, `"x"`, `42`, …) or a
-/// present-but-non-object `filter`, and reject syntactically invalid JSON. The
-/// `searchProcessInstances` / `searchVariables` methods don't filter on any field
-/// yet, but still call this so a malformed body is rejected exactly as the gateway
-/// rejects it at request deserialization, instead of being silently accepted.
-#[cfg(feature = "read-model")]
-fn validate_search_filter_body(filter_json: &str) -> Result<(), JsValue> {
-    validate_search_filter_body_inner(filter_json).map_err(|e| js_err(&e))
-}
-
-/// Pure core of [`validate_search_filter_body`] (host-testable: constructs no
-/// `JsValue`). Delegates to [`parse_state_filter_inner`] with a field that is
-/// never present, so the body-shape contract has a single implementation shared
-/// with the field-reading callers (`searchUserTasks`) and the two can't drift.
-#[cfg(feature = "read-model")]
-fn validate_search_filter_body_inner(filter_json: &str) -> Result<(), String> {
-    parse_state_filter_inner(filter_json, "\0__nano_validate_shape_only__").map(|_| ())
-}
-
-/// Select the map that actually carries filter fields, honouring the canonical
-/// REST envelope `{ "filter": { … } }` (matching the `*SearchQuery` request
-/// bodies) as well as the top-level `{ … }` shorthand. A present-but-non-object
-/// `filter` is malformed and is rejected. Shared by every search-filter parser
-/// (`searchUserTasks`, `searchAgentInstances`, `searchAgentInstanceHistory`) so
-/// the envelope contract has a single implementation and cannot drift.
-#[cfg(feature = "read-model")]
-fn rest_filter_target(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<&serde_json::Map<String, serde_json::Value>, String> {
-    match obj.get("filter") {
-        None | Some(serde_json::Value::Null) => Ok(obj),
-        Some(serde_json::Value::Object(nested)) => Ok(nested),
-        Some(_) => Err("the `filter` field must be a JSON object".to_string()),
-    }
-}
-
-/// Pure core of [`parse_state_filter`] (host-testable: constructs no `JsValue`).
-#[cfg(feature = "read-model")]
-fn parse_state_filter_inner(filter_json: &str, field: &str) -> Result<Option<String>, String> {
-    let t = filter_json.trim();
-    if t.is_empty() {
-        return Ok(None);
-    }
-    let json: serde_json::Value =
-        serde_json::from_str(t).map_err(|e| format!("invalid filter JSON: {e}"))?;
-    let obj = match &json {
-        serde_json::Value::Null => return Ok(None),
-        serde_json::Value::Object(map) => map,
-        _ => return Err("filter body must be a JSON object".to_string()),
-    };
-    let target = rest_filter_target(obj)?;
-    match target.get(field) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-        Some(_) => Err(format!("filter `{field}` must be a string")),
-    }
-}
-
-/// Wrap a list of result items in the Camunda search-query envelope
-/// `{ items, page: { totalItems, hasMoreTotalItems, startCursor, endCursor } }`.
-/// The in-browser engine returns every match in one page (no cursoring), so
-/// `totalItems == items.len()` and the cursors are null.
-#[cfg(feature = "read-model")]
-fn search_result(items: Vec<serde_json::Value>) -> serde_json::Value {
-    let total = items.len();
-    serde_json::json!({
-        "items": items,
-        "page": {
-            "totalItems": total,
-            "hasMoreTotalItems": false,
-            "startCursor": serde_json::Value::Null,
-            "endCursor": serde_json::Value::Null,
-        },
-    })
-}
-
-/// An ISO-8601 / RFC-3339 UTC timestamp (`YYYY-MM-DDThh:mm:ss.sssZ`) from epoch
-/// milliseconds, matching the `date-time` strings the gateway emits — computed
-/// without `chrono` to avoid pulling a date crate into the wasm engine.
-#[cfg(feature = "read-model")]
-fn iso8601_from_ms(ms: u64) -> String {
-    let secs = (ms / 1000) as i64;
-    let millis = ms % 1000;
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400);
-    let (hour, min, sec) = (
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60,
-    );
-    // days since 1970-01-01 -> civil (y, m, d), Howard Hinnant's algorithm.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
-}
-
-/// Serialise a [`FormRow`] as the gateway's `FormResult` JSON shape.
-#[cfg(feature = "read-model")]
-fn form_result(row: &FormRow) -> serde_json::Value {
-    serde_json::json!({
-        "tenantId": row.tenant_id,
-        "formId": row.form_id,
-        "schema": row.schema,
-        "version": row.version as i64,
-        "formKey": row.form_key.to_string(),
-    })
-}
-
-/// Serialise a [`ResourceRow`] as the gateway's `ResourceResult` JSON shape.
-#[cfg(feature = "read-model")]
-fn resource_result(row: &ResourceRow) -> serde_json::Value {
-    serde_json::json!({
-        "resourceName": row.resource_name,
-        "version": row.version,
-        "versionTag": row.version_tag,
-        "resourceId": row.resource_id,
-        "tenantId": row.tenant_id,
-        "resourceKey": row.resource_key.to_string(),
-    })
-}
-
-/// Serialise a [`ProcessInstanceRow`] as the gateway's `ProcessInstanceResult`
-/// JSON shape. The call-activity hierarchy (issue #977) is surfaced exactly as
-/// the gateway projects it: `parentProcessInstanceKey` / `parentElementInstanceKey`
-/// carry the engine-tracked linkage for a child spawned by a call activity (both
-/// null for a top-level instance), and `rootProcessInstanceKey` is resolved by
-/// walking the parent chain via `roots` (a per-search [`RootResolver`] memoising
-/// the whole walked chain, so a page of co-located descendants walks each parent
-/// once) to the top-level ancestor — a top-level instance reports its own key.
-/// Fields the engine does not retain (definition name, version tag) stay null.
-#[cfg(feature = "read-model")]
-fn process_instance_result(row: &ProcessInstanceRow, roots: &RootResolver) -> serde_json::Value {
-    let state = match row.state {
-        ProcessInstanceState::Active => "ACTIVE",
-        ProcessInstanceState::Suspended => "SUSPENDED",
-        ProcessInstanceState::Completed => "COMPLETED",
-        ProcessInstanceState::Terminated | ProcessInstanceState::Terminating => "TERMINATED",
-    };
-    let parent_process_instance_key = match row.parent_process_instance_key {
-        Some(k) => serde_json::Value::String(k.to_string()),
-        None => serde_json::Value::Null,
-    };
-    let parent_element_instance_key = match row.parent_element_instance_key {
-        Some(k) => serde_json::Value::String(k.to_string()),
-        None => serde_json::Value::Null,
-    };
-    // `suspendedDate` is always present (a required, nullable field): an ISO
-    // datetime while the instance is suspended, `null` otherwise. Derived from
-    // the same `suspended_date_ms` record the `state` projection reads.
-    let suspended_date = match row.suspended_date_ms {
-        Some(ms) => serde_json::Value::String(iso8601_from_ms(ms)),
-        None => serde_json::Value::Null,
-    };
-    serde_json::json!({
-        "processDefinitionId": row.process_definition_id,
-        "processDefinitionName": serde_json::Value::Null,
-        "processDefinitionVersion": row.version,
-        "processDefinitionVersionTag": serde_json::Value::Null,
-        "startDate": iso8601_from_ms(row.start_date_ms),
-        "endDate": serde_json::Value::Null,
-        "state": state,
-        "suspendedDate": suspended_date,
-        "hasIncident": row.has_incident,
-        "tenantId": "<default>",
-        "processInstanceKey": row.key.to_string(),
-        "processDefinitionKey": row.process_definition_key,
-        "parentProcessInstanceKey": parent_process_instance_key,
-        "parentElementInstanceKey": parent_element_instance_key,
-        "rootProcessInstanceKey": roots.root_of_row(row).to_string(),
-        "tags": row.tags,
-        "businessId": row.business_id,
-    })
-}
-
-/// Serialise a [`VariableRow`] as the gateway's `VariableSearchResult` JSON shape.
-/// Long values are truncated to [`VARIABLE_VALUE_PREVIEW_LEN`] (the shared
-/// canonical preview length, imported from `nanobpmn-read-model` so the gateway
-/// and TestEngine can't drift) on a char boundary and `isTruncated` is set,
-/// mirroring the gateway, whose `truncateValues` defaults to on. (A
-/// single-variable get returns the full untruncated value there and here.)
-#[cfg(feature = "read-model")]
-fn variable_search_result(v: &VariableRow) -> serde_json::Value {
-    let (value, is_truncated) = if v.value.len() > VARIABLE_VALUE_PREVIEW_LEN {
-        let mut end = VARIABLE_VALUE_PREVIEW_LEN;
-        while !v.value.is_char_boundary(end) {
-            end -= 1;
-        }
-        (v.value[..end].to_string(), true)
-    } else {
-        (v.value.clone(), false)
-    };
-    serde_json::json!({
-        "name": v.name,
-        "tenantId": "<default>",
-        "variableKey": v.key.to_string(),
-        "scopeKey": v.scope_key.to_string(),
-        "processInstanceKey": v.instance_key.to_string(),
-        "rootProcessInstanceKey": serde_json::Value::Null,
-        "value": value,
-        "isTruncated": is_truncated,
-    })
-}
-
-/// Coerce an optional user-task date (`followUpDate` / `dueDate`) to the JSON the
-/// gateway would emit: the string when it is a valid RFC-3339 `date-time`, else
-/// JSON `null`. Mirrors the gateway's `parse_date`, which parses these as
-/// `chrono::DateTime<Utc>` and coerces any unparseable value to `null` rather
-/// than forwarding an invalid date string to clients.
-#[cfg(feature = "read-model")]
-fn rfc3339_or_null(value: &Option<String>) -> serde_json::Value {
-    match value.as_deref() {
-        Some(s) if is_rfc3339_date_time(s) => serde_json::Value::String(s.to_string()),
-        _ => serde_json::Value::Null,
-    }
-}
-
 /// Number of days in `month` (1-12) of `year`, honouring the proleptic Gregorian
 /// leap-year rule chrono uses (divisible by 4, except centuries not divisible by
 /// 400). Callers must pass a `month` already validated into `1..=12`; any other
@@ -1751,139 +1520,6 @@ fn days_in_month(year: u32, month: u32) -> u32 {
         4 | 6 | 9 | 11 => 30,
         _ => 31,
     }
-}
-
-/// True when `s` is a valid RFC-3339 `date-time` — the shape
-/// `str::parse::<chrono::DateTime<Utc>>()` accepts on the gateway:
-/// `YYYY-MM-DDThh:mm:ss`, an optional `.fraction`, and a `Z`/`±hh:mm` offset.
-/// Component ranges are checked so out-of-range values (month 13, hour 25, …) are
-/// rejected the same way chrono rejects them, including the day against the
-/// actual length of the given month/year (so `2026-02-31` is rejected and leap
-/// days like `2024-02-29` are accepted). Validation only (no date crate).
-#[cfg(feature = "read-model")]
-fn is_rfc3339_date_time(s: &str) -> bool {
-    let b = s.as_bytes();
-    // Shortest valid form "1970-01-01T00:00:00Z" is 20 bytes.
-    if b.len() < 20 {
-        return false;
-    }
-    let digit = |c: u8| c.is_ascii_digit();
-    let num = |slice: &[u8]| -> u32 {
-        slice
-            .iter()
-            .fold(0u32, |acc, &c| acc * 10 + u32::from(c - b'0'))
-    };
-    let fixed = digit(b[0])
-        && digit(b[1])
-        && digit(b[2])
-        && digit(b[3])
-        && b[4] == b'-'
-        && digit(b[5])
-        && digit(b[6])
-        && b[7] == b'-'
-        && digit(b[8])
-        && digit(b[9])
-        && (b[10] == b'T' || b[10] == b't')
-        && digit(b[11])
-        && digit(b[12])
-        && b[13] == b':'
-        && digit(b[14])
-        && digit(b[15])
-        && b[16] == b':'
-        && digit(b[17])
-        && digit(b[18]);
-    if !fixed {
-        return false;
-    }
-    let year = num(&b[0..4]);
-    let month = num(&b[5..7]);
-    let day = num(&b[8..10]);
-    let hour = num(&b[11..13]);
-    let min = num(&b[14..16]);
-    let sec = num(&b[17..19]);
-    // `sec == 60` is intentionally accepted: chrono's `DateTime<Utc>` parse (the
-    // gateway's `parse_date`) accepts leap seconds at any hh:mm (e.g. `12:30:60Z`)
-    // and rejects `61`, so `sec > 60` mirrors it exactly. Do not tighten to `> 59`.
-    if !(1..=12).contains(&month)
-        || day < 1
-        || day > days_in_month(year, month)
-        || hour > 23
-        || min > 59
-        || sec > 60
-    {
-        return false;
-    }
-    let mut i = 19;
-    // Optional fractional seconds: a dot followed by at least one digit.
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        let start = i;
-        while i < b.len() && digit(b[i]) {
-            i += 1;
-        }
-        if i == start {
-            return false;
-        }
-    }
-    // Mandatory timezone: `Z`/`z` or a `±hh:mm` offset.
-    match b.get(i) {
-        Some(&c) if c == b'Z' || c == b'z' => i + 1 == b.len(),
-        Some(&c) if c == b'+' || c == b'-' => {
-            i + 6 == b.len()
-                && digit(b[i + 1])
-                && digit(b[i + 2])
-                && b[i + 3] == b':'
-                && digit(b[i + 4])
-                && digit(b[i + 5])
-                && num(&b[i + 1..i + 3]) <= 23
-                && num(&b[i + 4..i + 6]) <= 59
-        }
-        _ => false,
-    }
-}
-
-/// Serialise a [`UserTaskRow`] as the gateway's `UserTaskResult` JSON shape. The
-/// `state` is the Camunda v2 enum spelling; dates are ISO-8601 UTC; fields the
-/// engine does not retain (name, process name, completion date) are null;
-/// `priority` is clamped to `0..=100` exactly as the gateway does.
-///
-/// `rootProcessInstanceKey` (issue #1095) is resolved by walking the task's
-/// `processInstanceKey` up the call-activity parent chain via `roots` — the same
-/// [`RootResolver`] the process-instance projection uses (issue #977), so there
-/// is one canonical root-walk and no duplicate derivation. A top-level
-/// (self-rooted) task reports its own `processInstanceKey`.
-#[cfg(feature = "read-model")]
-fn user_task_result(task: &UserTaskRow, roots: &RootResolver) -> serde_json::Value {
-    // The owning instance's business id snapshotted at the task's creation
-    // (mirrors the gateway): a later assignment never enriches it.
-    let business_id = task.business_id.clone();
-    serde_json::json!({
-        "name": serde_json::Value::Null,
-        "state": user_task_state_rest(task.state),
-        "assignee": task.assignee,
-        "elementId": task.element_id,
-        "candidateGroups": task.candidate_groups,
-        "candidateUsers": task.candidate_users,
-        "processDefinitionId": task.process_definition_id,
-        "creationDate": iso8601_from_ms(task.created_at_ms),
-        "completionDate": serde_json::Value::Null,
-        "followUpDate": rfc3339_or_null(&task.follow_up_date),
-        "dueDate": rfc3339_or_null(&task.due_date),
-        "tenantId": "<default>",
-        "externalFormReference": task.external_form_reference,
-        "processDefinitionVersion": task.process_definition_version,
-        "customHeaders": serde_json::Map::new(),
-        "userTaskKey": task.key.to_string(),
-        "elementInstanceKey": task.element_instance_key.to_string(),
-        "processName": serde_json::Value::Null,
-        "processDefinitionKey": task.process_definition_key,
-        "processInstanceKey": task.instance_key.to_string(),
-        "rootProcessInstanceKey": roots.root_process_instance_key(task.instance_key).to_string(),
-        "formKey": task.form_key.map(|k| k.to_string()),
-        "priority": task.priority.clamp(0, 100),
-        "tags": Vec::<String>::new(),
-        "businessId": business_id,
-    })
 }
 
 impl Default for TestEngine {
@@ -4996,7 +4632,7 @@ mod read_channel_tests {
         let key = snap["userTasks"][0]["key"].as_str().unwrap().to_string();
 
         // An open task shows up under CREATED (state filtered via the read model)…
-        let created = parse(&eng.search_user_tasks(r#"{"state":"CREATED"}"#).unwrap());
+        let created = parse(&eng.search_user_tasks(r#"{"filter":{"state":"CREATED"}}"#).unwrap());
         assert_eq!(created["items"].as_array().unwrap().len(), 1);
         assert_eq!(created["items"][0]["elementId"], "review");
         assert_eq!(created["items"][0]["state"], "CREATED");
@@ -5004,7 +4640,7 @@ mod read_channel_tests {
         assert_eq!(created["page"]["totalItems"], 1);
 
         // …and NOT under COMPLETED.
-        let completed = parse(&eng.search_user_tasks(r#"{"state":"COMPLETED"}"#).unwrap());
+        let completed = parse(&eng.search_user_tasks(r#"{"filter":{"state":"COMPLETED"}}"#).unwrap());
         assert_eq!(completed["items"].as_array().unwrap().len(), 0);
 
         // No filter returns every task.
@@ -5022,13 +4658,13 @@ mod read_channel_tests {
         // After completion the task leaves the CREATED (open) set entirely.
         eng.complete_user_task(&key, r#"{"approved":true}"#)
             .unwrap();
-        let open = parse(&eng.search_user_tasks(r#"{"state":"CREATED"}"#).unwrap());
+        let open = parse(&eng.search_user_tasks(r#"{"filter":{"state":"CREATED"}}"#).unwrap());
         assert_eq!(
             open["items"].as_array().unwrap().len(),
             0,
             "a completed task is no longer CREATED"
         );
-        let done = parse(&eng.search_user_tasks(r#"{"state":"COMPLETED"}"#).unwrap());
+        let done = parse(&eng.search_user_tasks(r#"{"filter":{"state":"COMPLETED"}}"#).unwrap());
         assert_eq!(done["items"].as_array().unwrap().len(), 1);
     }
 
@@ -5118,7 +4754,7 @@ mod read_channel_tests {
             ),
             (
                 "VariableSearchResult",
-                first(parse(&eng.search_variables("").unwrap())),
+                first(parse(&eng.search_variables("", None).unwrap())),
             ),
             (
                 "FormResult",
@@ -5263,73 +4899,92 @@ mod read_channel_tests {
     }
 
     #[test]
-    fn state_filter_rejects_a_non_object_body() {
-        // A non-object JSON root must be rejected rather than silently broadening
-        // the query (which is what `json.get(field)` on a non-object would do).
-        for body in [r#"[]"#, r#""CREATED""#, r#"42"#, r#"true"#] {
-            let err = parse_state_filter_inner(body, "state").unwrap_err();
-            assert!(
-                err.contains("must be a JSON object"),
-                "body {body:?} should be rejected as non-object, got {err:?}"
-            );
-        }
-        // Root `null`, an empty body, and a missing field are all "no filter".
-        assert_eq!(parse_state_filter_inner("null", "state").unwrap(), None);
-        assert_eq!(parse_state_filter_inner("", "state").unwrap(), None);
-        assert_eq!(parse_state_filter_inner("{}", "state").unwrap(), None);
-        assert_eq!(
-            parse_state_filter_inner(r#"{"state":null}"#, "state").unwrap(),
-            None
-        );
-        // A well-formed object yields the value; a non-string value is rejected.
-        assert_eq!(
-            parse_state_filter_inner(r#"{"state":"CREATED"}"#, "state").unwrap(),
-            Some("CREATED".to_string())
-        );
-        assert!(parse_state_filter_inner(r#"{"state":42}"#, "state").is_err());
-        // Malformed JSON is rejected too.
-        assert!(parse_state_filter_inner(r#"{"state":"#, "state").is_err());
-    }
-
-    #[test]
-    fn search_instances_and_variables_reject_malformed_filter_bodies() {
-        // `searchProcessInstances` / `searchVariables` don't filter on any field,
-        // but they must still reject a malformed/non-object body exactly as the
-        // gateway rejects it at deserialization, rather than silently accepting it.
+    fn read_bodies_are_the_spec_search_query_models() {
+        // Every migrated search takes the spec's `*SearchQuery` verbatim: the
+        // no-query forms are accepted; a non-object root, a non-object `filter`,
+        // malformed JSON, an unknown property (the old top-level shorthand
+        // included) and an unknown enum spelling are rejected — never silently
+        // broadened to "no filter".
         let mut eng = TestEngine::new();
         eng.deploy(USER_TASK_XML).unwrap();
         eng.create_instance("p", "{}", None).unwrap();
 
-        // Well-formed "no filter" bodies (empty, root null, empty/nested object)
-        // are accepted by both surfaces.
         for body in ["", "  ", "null", "{}", r#"{"filter":{}}"#] {
-            assert!(
-                eng.search_process_instances(body).is_ok(),
-                "searchProcessInstances should accept {body:?}"
-            );
-            assert!(
-                eng.search_variables(body).is_ok(),
-                "searchVariables should accept {body:?}"
-            );
+            assert!(eng.search_user_tasks_json(body).is_ok(), "{body:?}");
+            assert!(eng.search_process_instances_json(body).is_ok(), "{body:?}");
+            assert!(eng.search_variables_json(body, None).is_ok(), "{body:?}");
         }
-
-        // A non-object root, a non-object nested `filter`, and syntactically
-        // invalid JSON are all rejected. Exercise the rejection through the shared
-        // host-testable validator the search methods call (the `search*` methods
-        // surface the error as a `JsValue`, which can't be constructed off-wasm).
         for body in [
             r#"[]"#,
             r#""x""#,
             r#"42"#,
             r#"true"#,
             r#"{"filter":[]}"#,
+            r#"{"filter":42}"#,
             r#"{"#,
+            r#"{"bogus":1}"#,
         ] {
-            assert!(
-                validate_search_filter_body_inner(body).is_err(),
-                "filter body {body:?} should be rejected"
-            );
+            assert!(eng.search_user_tasks_json(body).is_err(), "{body:?}");
+            assert!(eng.search_process_instances_json(body).is_err(), "{body:?}");
+            assert!(eng.search_variables_json(body, None).is_err(), "{body:?}");
         }
+        // The pre-#1898 top-level shorthand is not the spec shape: rejected.
+        assert!(eng.search_user_tasks_json(r#"{"state":"CREATED"}"#).is_err());
+        // An unknown `UserTaskStateEnum` spelling is a request error, exactly as
+        // the gateway rejects it at deserialization (case-sensitive).
+        for bad in ["FOO", "created", ""] {
+            let body = format!(r#"{{"filter":{{"state":"{bad}"}}}}"#);
+            assert!(eng.search_user_tasks_json(&body).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn variable_search_truncates_long_values_like_the_gateway() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        let long = "a".repeat(nanobpmn_read_model::VARIABLE_VALUE_PREVIEW_LEN + 50);
+        eng.create_instance("p", &format!(r#"{{"big":"{long}","small":"hi"}}"#), None)
+            .unwrap();
+        let by_name = |truncate: Option<bool>| {
+            let items = parse(&eng.search_variables_json("", truncate).unwrap())["items"].clone();
+            let pick = |n: &str| {
+                items
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["name"] == n)
+                    .unwrap()
+                    .clone()
+            };
+            (pick("big"), pick("small"))
+        };
+        // Default (`truncateValues` absent ⇒ true): the long value is cut to the
+        // shared preview length and flagged; the short one is untouched.
+        let (big, small) = by_name(None);
+        assert_eq!(big["isTruncated"], true);
+        assert!(
+            big["value"].as_str().unwrap().len() <= nanobpmn_read_model::VARIABLE_VALUE_PREVIEW_LEN
+        );
+        assert_eq!(small["isTruncated"], false);
+        assert_eq!(small["value"], "\"hi\"");
+        // `truncateValues: false` returns the full value.
+        let (big, _) = by_name(Some(false));
+        assert_eq!(big["isTruncated"], false);
+        assert_eq!(big["value"].as_str().unwrap().len(), long.len() + 2);
+    }
+
+    #[test]
+    fn get_operations_map_the_shared_lookup_onto_null_and_errors() {
+        // 404 ⇒ JSON `null` (absent or malformed form/resource key, absent agent
+        // instance); 400 ⇒ an error (malformed agent instance key).
+        let eng = TestEngine::new();
+        assert_eq!(eng.get_form_by_key_json("999999").unwrap(), "null");
+        assert_eq!(eng.get_form_by_key_json("not-a-key").unwrap(), "null");
+        assert_eq!(eng.get_resource_by_key_json("999999").unwrap(), "null");
+        assert_eq!(eng.get_resource_by_key_json("x").unwrap(), "null");
+        assert_eq!(eng.get_agent_instance_json("999999").unwrap(), "null");
+        assert!(eng.get_agent_instance_json("x").is_err());
+        assert!(eng.get_agent_instance_json("0").is_err());
     }
 
     const CA_CHILD_XML: &str = r#"
@@ -5577,7 +5232,7 @@ mod read_channel_tests {
             .map(|i| i["key"].as_str().unwrap().to_string())
             .expect("parent instance created");
 
-        let vars = parse(&eng.search_variables("").unwrap());
+        let vars = parse(&eng.search_variables("", None).unwrap());
         let items = vars["items"].as_array().expect("items array");
         let doubled = items.iter().find(|v| {
             v["name"] == "doubled" && v["processInstanceKey"] == serde_json::json!(parent_key)
@@ -5593,180 +5248,6 @@ mod read_channel_tests {
             "orderId=21 reached the child (propagateAllParentVariables default true) \
              and doubled=42 crossed back"
         );
-    }
-
-    #[test]
-    fn state_filter_honours_the_nested_rest_filter_shape() {
-        // The canonical REST body nests the filter under `filter`
-        // (`UserTaskSearchQuery`), so a caller pasting the real gateway body must
-        // filter, not silently broaden to "no filter".
-        assert_eq!(
-            parse_state_filter_inner(r#"{"filter":{"state":"CREATED"}}"#, "state").unwrap(),
-            Some("CREATED".to_string())
-        );
-        // Top-level shorthand still works.
-        assert_eq!(
-            parse_state_filter_inner(r#"{"state":"COMPLETED"}"#, "state").unwrap(),
-            Some("COMPLETED".to_string())
-        );
-        // An empty / null nested filter is "no filter", not an error.
-        assert_eq!(
-            parse_state_filter_inner(r#"{"filter":{}}"#, "state").unwrap(),
-            None
-        );
-        assert_eq!(
-            parse_state_filter_inner(r#"{"filter":null}"#, "state").unwrap(),
-            None
-        );
-        assert_eq!(
-            parse_state_filter_inner(r#"{"filter":{"state":null}}"#, "state").unwrap(),
-            None
-        );
-        // A non-string nested value is rejected, as at the top level.
-        assert!(parse_state_filter_inner(r#"{"filter":{"state":42}}"#, "state").is_err());
-        // A present-but-non-object `filter` is malformed, not "no filter".
-        for bad in [
-            r#"{"filter":[]}"#,
-            r#"{"filter":"CREATED"}"#,
-            r#"{"filter":42}"#,
-        ] {
-            let err = parse_state_filter_inner(bad, "state").unwrap_err();
-            assert!(
-                err.contains("`filter` field must be a JSON object"),
-                "body {bad:?} should be rejected as non-object filter, got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn variable_search_truncates_long_values_like_the_gateway() {
-        let row = |value: String| VariableRow {
-            key: 1,
-            instance_key: 2,
-            scope_key: 2,
-            name: "big".to_string(),
-            value,
-            process_definition_id: "p".to_string(),
-            process_definition_key: "3".to_string(),
-        };
-
-        // A short value passes through untouched, `isTruncated: false`.
-        let short = variable_search_result(&row("\"hi\"".to_string()));
-        assert_eq!(short["value"], "\"hi\"");
-        assert_eq!(short["isTruncated"], false);
-
-        // A value at the boundary is not truncated.
-        let at_limit = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN);
-        let boundary = variable_search_result(&row(at_limit.clone()));
-        assert_eq!(
-            boundary["value"].as_str().unwrap().len(),
-            VARIABLE_VALUE_PREVIEW_LEN
-        );
-        assert_eq!(boundary["isTruncated"], false);
-
-        // One byte over the limit is truncated to the preview length and flagged.
-        let over = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 1);
-        let truncated = variable_search_result(&row(over));
-        assert_eq!(
-            truncated["value"].as_str().unwrap().len(),
-            VARIABLE_VALUE_PREVIEW_LEN
-        );
-        assert_eq!(truncated["isTruncated"], true);
-
-        // Truncation lands on a char boundary (never splits a multi-byte char).
-        let multibyte = "é".repeat(VARIABLE_VALUE_PREVIEW_LEN); // each 'é' is 2 bytes
-        let cut = variable_search_result(&row(multibyte));
-        let out = cut["value"].as_str().unwrap();
-        assert!(out.len() <= VARIABLE_VALUE_PREVIEW_LEN);
-        assert!(out.is_char_boundary(out.len()));
-        assert_eq!(cut["isTruncated"], true);
-    }
-
-    #[test]
-    fn search_user_tasks_rejects_an_unknown_state_spelling() {
-        // The gateway rejects unknown `UserTaskStateEnum` spellings during request
-        // deserialization; `searchUserTasks` mirrors that instead of silently
-        // returning an empty set. The rejection is triggered by
-        // `user_task_state_from_rest` returning `None`, and the error message lists
-        // the valid spellings — tested at the pure layer because the wrapper's
-        // `JsValue` error cannot be inspected on the host target.
-        assert_eq!(user_task_state_from_rest("FOO"), None);
-        assert_eq!(
-            user_task_state_from_rest("created"),
-            None,
-            "spelling is case-sensitive"
-        );
-        assert_eq!(user_task_state_from_rest(""), None);
-        let spellings = user_task_state_spellings();
-        assert!(
-            spellings.contains("CREATED")
-                && spellings.contains("COMPLETED")
-                && spellings.contains("CANCELED"),
-            "the rejection message must list every valid spelling, got {spellings:?}"
-        );
-    }
-
-    #[test]
-    fn all_user_task_states_is_exhaustive() {
-        // `user_task_state_rest`'s match is compiler-forced exhaustive; this guards
-        // that `ALL_USER_TASK_STATES` keeps enumerating every variant so the derived
-        // set of valid REST spellings stays complete.
-        assert_eq!(ALL_USER_TASK_STATES.len(), 3);
-        for st in ALL_USER_TASK_STATES {
-            // Every listed variant round-trips through its REST spelling.
-            assert_eq!(
-                user_task_state_from_rest(user_task_state_rest(st)),
-                Some(st)
-            );
-        }
-        assert_eq!(user_task_state_from_rest("nope"), None);
-    }
-
-    #[test]
-    fn user_task_dates_are_validated_as_rfc3339() {
-        // Valid RFC-3339 date-times pass through unchanged.
-        for ok in [
-            "1970-01-01T00:00:00Z",
-            "2026-08-16T11:36:36.344Z",
-            "2026-08-16t11:36:36z",
-            "2026-01-01T00:00:00+13:00",
-            // Leap second: chrono accepts `:60`, so parity requires we accept it too.
-            "2026-12-31T23:59:60-05:30",
-            "2024-02-29T00:00:00Z",
-            "2000-02-29T00:00:00Z",
-        ] {
-            assert!(is_rfc3339_date_time(ok), "{ok:?} should be valid");
-            assert_eq!(
-                rfc3339_or_null(&Some(ok.to_string())),
-                serde_json::Value::String(ok.to_string())
-            );
-        }
-        // Invalid values (bare date, missing offset, out-of-range, garbage) become
-        // null — matching the gateway's `parse_date` coercion.
-        for bad in [
-            "2026-01-01",
-            "2026-08-16T11:36:36",
-            "2026-13-01T00:00:00Z",
-            "2026-01-01T25:00:00Z",
-            "2026-01-01T00:60:00Z",
-            "2026-01-01T00:00:00.Z",
-            "2026-01-01T00:00:00+24:00",
-            "2026-02-31T00:00:00Z",
-            "2026-02-29T00:00:00Z",
-            "2026-04-31T00:00:00Z",
-            "2100-02-29T00:00:00Z",
-            "2026-01-00T00:00:00Z",
-            "not-a-date",
-            "",
-        ] {
-            assert!(!is_rfc3339_date_time(bad), "{bad:?} should be invalid");
-            assert_eq!(
-                rfc3339_or_null(&Some(bad.to_string())),
-                serde_json::Value::Null
-            );
-        }
-        // Absent dates are null.
-        assert_eq!(rfc3339_or_null(&None), serde_json::Value::Null);
     }
 
     #[test]
@@ -6156,27 +5637,4 @@ mod read_channel_tests {
             .is_err());
     }
 
-    #[test]
-    fn rest_filter_target_unwraps_the_envelope_and_rejects_a_non_object_filter() {
-        let obj = |s: &str| match parse(s) {
-            J::Object(m) => m,
-            _ => unreachable!("test inputs are objects"),
-        };
-        // Top-level shorthand: the object itself carries the fields.
-        let top = obj(r#"{"state":"CREATED"}"#);
-        assert_eq!(rest_filter_target(&top).unwrap()["state"], "CREATED");
-        // Nested REST envelope: fields come from the `filter` object.
-        let nested = obj(r#"{"filter":{"state":"CREATED"}}"#);
-        assert_eq!(rest_filter_target(&nested).unwrap()["state"], "CREATED");
-        // A null `filter` falls back to the outer object (⇒ unfiltered).
-        let null = obj(r#"{"filter":null}"#);
-        assert!(rest_filter_target(&null).unwrap().get("state").is_none());
-        // A present-but-non-object `filter` is malformed and rejected.
-        for bad in [r#"{"filter":42}"#, r#"{"filter":[]}"#, r#"{"filter":"x"}"#] {
-            assert!(
-                rest_filter_target(&obj(bad)).is_err(),
-                "{bad} must be rejected"
-            );
-        }
-    }
 }
