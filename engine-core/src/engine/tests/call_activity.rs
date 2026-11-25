@@ -1912,8 +1912,8 @@ fn ended_call_activity_tree() -> (Engine, Key, Key, Vec<Event>) {
     (engine, parent, child, journal)
 }
 
-/// #1948 event-sourced deletion: the command resolves the ended tree into the
-/// event, and apply removes the parent, the call-activity child and every
+/// #1948 event-sourced deletion: the command journals the ended root, and
+/// apply resolves its resident tree and removes the parent, the call-activity child and every
 /// instance-scoped entity (jobs, incidents, timers, subscriptions, user
 /// tasks) from engine state — so a snapshot taken afterwards, and an engine
 /// restored from it, never carry the deleted history (no reseed resurrection),
@@ -1929,8 +1929,7 @@ fn delete_process_instance_history_removes_the_ended_tree_from_engine_state() {
     assert_eq!(
         events,
         vec![Event::ProcessInstanceHistoryDeleted {
-            instance_key: parent,
-            descendant_keys: vec![child],
+            instance_key: parent
         }]
     );
     journal.extend(events);
@@ -1966,8 +1965,7 @@ fn delete_process_instance_history_removes_the_ended_tree_from_engine_state() {
     assert_eq!(
         again,
         vec![Event::ProcessInstanceHistoryDeleted {
-            instance_key: parent,
-            descendant_keys: vec![],
+            instance_key: parent
         }]
     );
 
@@ -2013,21 +2011,34 @@ fn delete_process_instance_history_snapshot_plus_tail_converges() {
     }
 }
 
-/// A live descendant rejects the whole deletion, naming the live member.
+/// Replica determinism (#1948): residency of ended instances is replica-local
+/// (a follower evicts terminal shells at apply time, the leader only when its
+/// exporter catches up), so two replicas can apply the same deletion with
+/// different resident trees. They must still emit IDENTICAL events — a
+/// residency-derived event would trip the Raft divergence fail-stop — and each
+/// must remove whatever of the tree it still holds.
 #[test]
-fn delete_process_instance_history_rejects_a_tree_with_a_live_child() {
-    let (mut engine, parent, child, _) = ended_call_activity_tree();
-    // Force the child live in state (an ended root with a still-live child is
-    // the shape the tree validation must guard).
-    engine.state.instances.get_mut(&child).unwrap().state = ProcessInstanceState::Active;
-    let err = engine
-        .apply_command(Command::DeleteProcessInstanceHistory {
-            instance_key: parent,
-        })
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        EngineError::InstanceTransitionInvalid { instance_key, to: "DELETED", .. } if instance_key == child
-    ));
-    assert!(engine.instance(parent).is_some());
+fn delete_process_instance_history_events_do_not_depend_on_residency() {
+    let (mut leader, parent, child, _) = ended_call_activity_tree();
+    let (mut follower, parent_f, child_f, _) = ended_call_activity_tree();
+    assert_eq!((parent, child), (parent_f, child_f));
+    // Follower-side eviction schedules: the child alone, then nothing at all.
+    let (mut evicted_all, _, _, _) = ended_call_activity_tree();
+    evicted_all.evict_instances(&[child, parent]);
+    assert!(evicted_all.instance(parent).is_none());
+    follower.evict_instances(&[child]);
+    assert!(follower.instance(child).is_none());
+    let del = || Command::DeleteProcessInstanceHistory {
+        instance_key: parent,
+    };
+    let a = leader.apply_command(del()).unwrap();
+    let b = follower.apply_command(del()).unwrap();
+    let c = evicted_all.apply_command(del()).unwrap();
+    assert_eq!(a, b, "event must not depend on child residency");
+    assert_eq!(a, c, "event must not depend on root residency");
+    for engine in [&leader, &follower, &evicted_all] {
+        for key in [parent, child] {
+            assert!(engine.instance(key).is_none(), "{key} left resident");
+        }
+    }
 }

@@ -2766,53 +2766,42 @@ impl Engine {
             }
 
             Command::DeleteProcessInstanceHistory { instance_key } => {
-                // Only an ENDED instance tree's history may be deleted (Camunda
-                // 8.8). The tree (root + every resident call-activity descendant,
-                // transitively) is resolved HERE, at command processing, and
-                // journaled in the event, so apply, projection and replay all
-                // delete the same set. Any live member — active, suspended or
-                // terminating — rejects the whole command. An instance absent
-                // from engine state has ended (and been evicted) or never
-                // existed on this partition; the deletion is then an idempotent
-                // no-op for state it does not hold.
-                let mut tree = vec![instance_key];
-                let mut descendant_keys = Vec::new();
-                while let Some(k) = tree.pop() {
-                    if let Some(instance) = self.state.instances.get(&k) {
-                        match instance.state {
-                            ProcessInstanceState::Completed | ProcessInstanceState::Terminated => {}
-                            live => {
-                                return Err(EngineError::InstanceTransitionInvalid {
-                                    instance_key: k,
-                                    from: live.as_str(),
-                                    to: "DELETED",
-                                });
-                            }
-                        }
-                    }
-                    if let Some(children) = self.state.children_by_parent.get(&k) {
-                        for &child in children {
-                            descendant_keys.push(child);
-                            tree.push(child);
+                // Only an ENDED instance's history may be deleted (Camunda 8.8).
+                // The decision reads ONLY the root's own state: residency of
+                // ended instances is replica-local (followers evict terminal
+                // shells at apply time, the leader when its exporter catches
+                // up, cold spill independently), so anything derived from the
+                // resident tree would make replicas emit different events for
+                // the same log entry and trip the Raft divergence fail-stop.
+                // A live root is resident on every replica (live instances are
+                // never evicted; a spilled root is rehydrated as the command's
+                // target), and an ended root has ended its whole call-activity
+                // tree. An absent root has ended (and been evicted) or never
+                // existed on this partition: an idempotent deletion.
+                if let Some(instance) = self.state.instances.get(&instance_key) {
+                    match instance.state {
+                        ProcessInstanceState::Completed | ProcessInstanceState::Terminated => {}
+                        live => {
+                            return Err(EngineError::InstanceTransitionInvalid {
+                                instance_key,
+                                from: live.as_str(),
+                                to: "DELETED",
+                            });
                         }
                     }
                 }
-                descendant_keys.sort_unstable();
-                descendant_keys.dedup();
                 if self.track_dirty_vars {
-                    for key in std::iter::once(&instance_key).chain(&descendant_keys) {
-                        if self.state.instances.contains_key(key) {
-                            self.dirty_vars.remove(key);
-                            self.forgotten_vars.insert(*key);
+                    for key in self.state.resident_instance_tree(instance_key) {
+                        if !self.state.instances.contains_key(&key) {
+                            continue;
                         }
+                        self.dirty_vars.remove(&key);
+                        self.forgotten_vars.insert(key);
                     }
                 }
                 self.emit(
                     &mut log,
-                    Event::ProcessInstanceHistoryDeleted {
-                        instance_key,
-                        descendant_keys,
-                    },
+                    Event::ProcessInstanceHistoryDeleted { instance_key },
                 );
             }
 

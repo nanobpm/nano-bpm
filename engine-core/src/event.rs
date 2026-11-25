@@ -431,19 +431,14 @@ pub enum Event {
     /// instance removes it — with every descendant (call-activity child)
     /// instance and all their instance-scoped rows.
     ///
-    /// Event-sourced deletion: the engine resolves the ended instance tree
-    /// when it processes the command and journals it here, so every consumer
-    /// (engine apply, read-model projection, archive replay, reprojection)
-    /// deletes exactly the same set without re-deriving it. Engine apply
-    /// REMOVES the tree from engine state, so snapshots never carry it and a
-    /// reseed from engine state cannot resurrect it.
-    ProcessInstanceHistoryDeleted {
-        instance_key: Key,
-        /// Every resident descendant (call-activity child, transitively) of
-        /// `instance_key` at deletion time, in ascending key order.
-        #[cfg_attr(feature = "serde", serde(default))]
-        descendant_keys: Vec<Key>,
-    },
+    /// Event-sourced deletion: the event carries only the root key, because
+    /// which ended descendants are still resident is replica-local (eviction,
+    /// cold spill) and a journaled set would differ between replicas. Each
+    /// consumer resolves the tree from its own state: engine apply REMOVES the
+    /// root and every resident call-activity descendant (so snapshots never
+    /// carry them and a reseed cannot resurrect them); the read model walks
+    /// its parent edges across the live store and the archive.
+    ProcessInstanceHistoryDeleted { instance_key: Key },
 
     /// A cluster variable was created (#1657; Zeebe `ClusterVariableIntent.CREATED`)
     /// — or, for a distributed fan-out copy, upserted (an existing variable keeps

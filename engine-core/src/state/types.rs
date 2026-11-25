@@ -3192,6 +3192,22 @@ impl State {
             .retain(|_, s| !victims.contains(&s.instance_key));
     }
 
+    /// `root` plus every call-activity descendant reachable through
+    /// [`State::children_by_parent`], transitively. Residency is replica-local,
+    /// so the result must only drive local state effects, never an event.
+    pub fn resident_instance_tree(&self, root: Key) -> BTreeSet<Key> {
+        let mut tree = BTreeSet::new();
+        let mut stack = vec![root];
+        while let Some(k) = stack.pop() {
+            if tree.insert(k) {
+                if let Some(children) = self.children_by_parent.get(&k) {
+                    stack.extend(children.iter().copied());
+                }
+            }
+        }
+        tree
+    }
+
     /// Removes a process instance, unlinking it from its parent's entry in
     /// [`State::children_by_parent`]. Its own entry as a parent is kept: its
     /// children may stay resident (e.g. the parent alone was spilled to cold

@@ -149,16 +149,14 @@ pub(super) fn apply_resource(state: &mut State, event: &Event) {
             // instance rows. No core engine state to mutate.
         }
 
-        Event::ProcessInstanceHistoryDeleted {
-            instance_key,
-            descendant_keys,
-        } => {
-            // Event-sourced deletion (#1948): remove the ended tree from engine
-            // state so no snapshot carries it and a reseed from engine state
-            // cannot resurrect it. Idempotent for keys already absent.
-            let victims: std::collections::BTreeSet<_> = std::iter::once(*instance_key)
-                .chain(descendant_keys.iter().copied())
-                .collect();
+        Event::ProcessInstanceHistoryDeleted { instance_key } => {
+            // Event-sourced deletion (#1948): remove the ended tree — the root
+            // plus every call-activity descendant still RESIDENT on this
+            // replica — from engine state, so no snapshot carries it and a
+            // reseed from engine state cannot resurrect it. Residency is
+            // replica-local, so the tree is resolved here at apply (a local
+            // state effect), never journaled. Idempotent for absent keys.
+            let victims = state.resident_instance_tree(*instance_key);
             state.purge_instance_tree(&victims);
         }
 

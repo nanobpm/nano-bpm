@@ -6627,10 +6627,7 @@ mod tests {
         let empty_dir = temp_dir("readmodel-archive-reproject-1948-engine");
         let (engine, _recovery) =
             crate::journal::Journal::open_segmented(&empty_dir).expect("open empty engine");
-        let deleted = Event::ProcessInstanceHistoryDeleted {
-            instance_key: 999,
-            descendant_keys: Vec::new(),
-        };
+        let deleted = Event::ProcessInstanceHistoryDeleted { instance_key: 999 };
         catch_up_shard(&store, 100, &[&deleted], Some(engine.engine_state()))
             .expect("reprojection catch-up succeeds");
 

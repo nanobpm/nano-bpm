@@ -122,9 +122,10 @@ pub enum Command {
     /// turns into the removal of the instance, its element instances, variables,
     /// jobs, incidents, user tasks, subscriptions, decision instances and agent
     /// rows — and the same for every descendant (call-activity child) instance.
-    /// The engine resolves the ended tree (rejecting it if any member is still
-    /// live) into the event, and the event's apply removes that tree from
-    /// engine state, so snapshots and reseeds never resurrect it.
+    /// Only the root's state decides (an ended root has ended its tree), and the
+    /// event carries only the root, because ended-instance residency is
+    /// replica-local; the event's apply removes the root and every resident
+    /// descendant from engine state, so snapshots and reseeds never resurrect it.
     DeleteProcessInstanceHistory { instance_key: Key },
     /// Create a **cluster variable** (#1657; Zeebe `ClusterVariableIntent.CREATE`).
     /// `tenant_id` `None` is the global scope. Rejected with

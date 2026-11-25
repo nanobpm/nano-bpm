@@ -8854,16 +8854,12 @@ fn delete_process_instance_history_rejects_live_and_accepts_ended() {
     }
     assert_eq!(
         out_a[2].as_ref().unwrap(),
-        &vec![Event::ProcessInstanceHistoryDeleted {
-            instance_key: key,
-            descendant_keys: vec![]
-        }]
+        &vec![Event::ProcessInstanceHistoryDeleted { instance_key: key }]
     );
     assert_eq!(
         out_a[3].as_ref().unwrap(),
         &vec![Event::ProcessInstanceHistoryDeleted {
-            instance_key: 987_654_321,
-            descendant_keys: vec![]
+            instance_key: 987_654_321
         }]
     );
     // Event-sourced deletion: apply removed the ended instance from state.
