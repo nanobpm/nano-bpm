@@ -3312,12 +3312,20 @@ fn concurrent_same_type_jobs_complete_distinct_oldest_first() {
             "no rejection expected: {s}"
         );
     }
+    let id = |r: &J| {
+        let (e, p) = (&r["elementInstanceKey"], &r["processInstanceKey"]);
+        assert!(e.is_number() && p.is_number(), "job identity missing: {r}");
+        (e.clone(), p.clone())
+    };
+    assert_ne!(id(&created[0]), id(&created[1]), "two distinct jobs");
     assert_eq!(
-        done[0]["value"], created[0]["value"],
+        id(&done[0]),
+        id(&created[0]),
         "first completion targets the oldest job"
     );
     assert_eq!(
-        done[1]["value"], created[1]["value"],
+        id(&done[1]),
+        id(&created[1]),
         "second completion targets the other job"
     );
 }
