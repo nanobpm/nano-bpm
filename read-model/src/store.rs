@@ -844,43 +844,83 @@ fn shared_column_list(
 /// committing the projection batch, so a failure fails the batch (the cursor
 /// does not advance and the deletion is re-projected) rather than leaving a
 /// deleted instance restorable.
+/// The instance keys of every [`Event::ProcessInstanceHistoryDeleted`] in `events`.
+fn history_deletions<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<Key> {
+    events
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::ProcessInstanceHistoryDeleted { instance_key } => Some(*instance_key),
+            _ => None,
+        })
+        .collect()
+}
+
 fn delete_history_from_archive(
     conn: &Connection,
-    archive: &Path,
+    archive: Option<&Path>,
     keys: &[Key],
 ) -> rusqlite::Result<()> {
     if keys.is_empty() {
         return Ok(());
     }
-    attach_archive(conn, archive)?;
+    // #1948 review: resolve ONE descendant keyset across the live store AND the
+    // archive before removing either copy. Retention can prune an intermediate
+    // child from the live store (it then lives only in the archive) while its
+    // grandchildren / leftover rows remain live — a walk over either store alone
+    // misses part of the tree. The union walk is then used to clear both.
+    let archived = match archive {
+        Some(a) if a.exists() => {
+            attach_archive(conn, a)?;
+            true
+        }
+        _ => false,
+    };
     let result = (|| -> rusqlite::Result<()> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let body = (|| -> rusqlite::Result<()> {
+            let walk = if archived {
+                "WITH RECURSIVE edges(key, parent) AS ( \
+                   SELECT key, parent_process_instance_key FROM main.process_instances \
+                   UNION SELECT key, parent_process_instance_key \
+                     FROM terminal_archive.process_instances \
+                 ), tree(k) AS ( \
+                   SELECT ?1 \
+                   UNION SELECT e.key FROM edges e JOIN tree ON e.parent = tree.k \
+                 ) SELECT k FROM tree"
+            } else {
+                "WITH RECURSIVE tree(k) AS ( \
+                   SELECT ?1 \
+                   UNION SELECT p.key FROM main.process_instances p \
+                     JOIN tree ON p.parent_process_instance_key = tree.k \
+                 ) SELECT k FROM tree"
+            };
             for key in keys {
                 let tree: Vec<i64> = {
-                    let mut stmt = conn.prepare_cached(
-                        "WITH RECURSIVE tree(k) AS ( \
-                           SELECT ?1 \
-                           UNION SELECT p.key FROM terminal_archive.process_instances p \
-                             JOIN tree ON p.parent_process_instance_key = tree.k \
-                         ) SELECT k FROM tree",
-                    )?;
+                    let mut stmt = conn.prepare_cached(walk)?;
                     stmt.query_map(params![*key as i64], |r| r.get(0))?
                         .collect::<rusqlite::Result<_>>()?
                 };
                 for k in tree {
-                    for table in TERMINAL_ARCHIVE_DEP_TABLES {
+                    for (table, column) in PROCESS_INSTANCE_HISTORY_TABLES {
                         conn.execute(
-                            &format!(
-                                "DELETE FROM terminal_archive.{table} WHERE instance_key = ?1"
-                            ),
+                            &format!("DELETE FROM main.{table} WHERE {column} = ?1"),
                             params![k],
                         )?;
                     }
-                    conn.execute(
-                        "DELETE FROM terminal_archive.process_instances WHERE key = ?1",
-                        params![k],
-                    )?;
+                    if archived {
+                        for table in TERMINAL_ARCHIVE_DEP_TABLES {
+                            conn.execute(
+                                &format!(
+                                    "DELETE FROM terminal_archive.{table} WHERE instance_key = ?1"
+                                ),
+                                params![k],
+                            )?;
+                        }
+                        conn.execute(
+                            "DELETE FROM terminal_archive.process_instances WHERE key = ?1",
+                            params![k],
+                        )?;
+                    }
                 }
             }
             Ok(())
@@ -893,7 +933,9 @@ fn delete_history_from_archive(
             }
         }
     })();
-    let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
+    if archived {
+        let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
+    }
     result
 }
 
@@ -2397,15 +2439,9 @@ impl ReadStore {
         // BEFORE this batch commits, so a crash or failure can never advance the
         // cursor past a deletion the archive would later resurrect on
         // snapshot-gap recovery. Idempotent, so a re-projected batch is safe.
-        if let Some(archive) = &self.archive_path {
-            let deleted: Vec<Key> = events
-                .iter()
-                .filter_map(|e| match e {
-                    Event::ProcessInstanceHistoryDeleted { instance_key } => Some(*instance_key),
-                    _ => None,
-                })
-                .collect();
-            delete_history_from_archive(&conn, archive, &deleted)?;
+        if self.archive_path.is_some() {
+            let deleted = history_deletions(events.iter().copied());
+            delete_history_from_archive(&conn, self.archive_path.as_deref(), &deleted)?;
         }
         let tx = conn.transaction()?;
         let mut terminal_keys = Vec::new();
@@ -2530,6 +2566,26 @@ impl ReadStore {
                  audit archive (issue #831); newly-completing instances are still archived"
             );
         }
+    }
+
+    /// #1948 review: retracts the history of every instance deleted by a
+    /// [`Event::ProcessInstanceHistoryDeleted`] in `events` from BOTH the live
+    /// store and the durable terminal archive (one union descendant walk).
+    /// Recovery paths that advance the cursor over a surviving journal tail
+    /// WITHOUT exporting it (compacted-gap reprojection) must call this after
+    /// restoring the archive, or a committed-but-unexported deletion would leave
+    /// restored history searchable. Idempotent.
+    pub fn retract_deleted_history<'a>(
+        &self,
+        events: impl IntoIterator<Item = &'a Event>,
+    ) -> rusqlite::Result<()> {
+        let deleted = history_deletions(events);
+        if deleted.is_empty() {
+            return Ok(());
+        }
+        let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        delete_history_from_archive(&conn, self.archive_path.as_deref(), &deleted)
     }
 
     /// Replays the durable terminal-audit archive (issue #831) into this shard,
@@ -17720,6 +17776,99 @@ mod history_deletion_tests {
                 store.process_instance(30).is_some(),
                 "unrelated archived history must still be restored"
             );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn history_del_dir(tag: &str) -> std::path::PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpm-history-del-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #1948 review: retention pruned an intermediate child (it survives only in
+    /// the archive) while its root was live and its grandchild was retained.
+    /// Deleting the root must still clear the grandchild from the live store and
+    /// the whole tree from the archive.
+    #[test]
+    fn deletion_reaches_descendants_of_a_pruned_intermediate_child() {
+        let dir = history_del_dir("pruned");
+        let path = dir.join("read-model.sqlite");
+        {
+            let store = ReadStore::open(Some(&path)).unwrap();
+            let events = [
+                created(10, None),
+                created(20, Some(10)),
+                created(40, Some(20)),
+                Event::ProcessInstanceCompleted { instance_key: 40 },
+                Event::ProcessInstanceCompleted { instance_key: 20 },
+            ];
+            store.export(&events.iter().collect::<Vec<_>>()).unwrap();
+            // Keep only the newest terminal instance (40): the child 20 is pruned.
+            store.prune_terminal_instances(1, 0).unwrap();
+            assert!(store.process_instance(20).is_none(), "child not pruned");
+            assert!(store.process_instance(40).is_some());
+            store
+                .export(&[
+                    &Event::ProcessInstanceTerminated { instance_key: 10 },
+                    &Event::ProcessInstanceHistoryDeleted { instance_key: 10 },
+                ])
+                .unwrap();
+            assert!(store.process_instance(10).is_none());
+            assert!(
+                store.process_instance(40).is_none(),
+                "grandchild under a pruned child left behind"
+            );
+            store.reset().unwrap();
+            store.replay_terminal_archive().unwrap();
+            for k in [10, 20, 40] {
+                assert!(store.process_instance(k).is_none(), "{k} resurrected");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948 review: a deletion committed to the journal but not yet exported,
+    /// then compacted-gap recovery (reset + archive replay, cursor planted past
+    /// the tail). `retract_deleted_history` over the surviving tail must keep the
+    /// restored archive from resurrecting the deleted tree.
+    #[test]
+    fn retract_deleted_history_after_archive_replay() {
+        let dir = history_del_dir("unexported");
+        let path = dir.join("read-model.sqlite");
+        {
+            let store = ReadStore::open(Some(&path)).unwrap();
+            let events = [
+                created(10, None),
+                created(20, Some(10)),
+                created(30, None),
+                Event::ProcessInstanceCompleted { instance_key: 20 },
+                Event::ProcessInstanceTerminated { instance_key: 10 },
+                Event::ProcessInstanceCompleted { instance_key: 30 },
+            ];
+            store.export(&events.iter().collect::<Vec<_>>()).unwrap();
+            let tail = [Event::ProcessInstanceHistoryDeleted { instance_key: 10 }];
+            store.reset().unwrap();
+            store.replay_terminal_archive().unwrap();
+            assert!(store.process_instance(10).is_some());
+            store.retract_deleted_history(tail.iter()).unwrap();
+            assert!(store.process_instance(10).is_none());
+            assert!(store.process_instance(20).is_none());
+            assert!(store.process_instance(30).is_some());
+            store.reset().unwrap();
+            store.replay_terminal_archive().unwrap();
+            assert!(
+                store.process_instance(10).is_none(),
+                "archive still holds 10"
+            );
+            assert!(store.process_instance(30).is_some());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
