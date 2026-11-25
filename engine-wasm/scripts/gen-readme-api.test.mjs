@@ -93,11 +93,35 @@ test("parses only #[wasm_bindgen] impl blocks, with feature gating", () => {
 
 test("spec index takes the success response only, never an error schema", () => {
   const ops = parseSpec([["jobs.yaml", SPEC]]);
-  assert.equal(ops.get("completeJob").request, "JobCompletionRequest");
+  assert.deepEqual(ops.get("completeJob").request, { ref: "JobCompletionRequest" });
   assert.equal(ops.get("completeJob").response, null);
-  assert.equal(ops.get("getFormByKey").response, "FormResult");
+  assert.deepEqual(ops.get("getFormByKey").response, { ref: "FormResult" });
   assert.equal(ops.get("getFormByKey").method, "GET");
   assert.equal(ops.has("notAnOperation"), false);
+});
+
+test("an inline request schema is recorded, never collapsed into an absent body", () => {
+  const ops = parseSpec([["deployments.yaml", `paths:
+  /deployments:
+    post:
+      operationId: createDeployment
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+`]]);
+  assert.deepEqual(ops.get("createDeployment").request, { inline: "multipart/form-data" });
+  assert.deepEqual(ops.get("createDeployment").response, { inline: "application/json" });
+  const row = render([{ jsName: "createDeployment", kind: "method", params: [], returns: "void", summary: "", readModel: false }], ops);
+  assert.match(row, /inline `multipart\/form-data` schema/);
 });
 
 test("an alias to an unknown operationId fails loudly", () => {

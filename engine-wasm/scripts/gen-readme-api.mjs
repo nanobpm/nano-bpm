@@ -165,6 +165,7 @@ export function parseSpec(files) {
     let section = null;
     let seenSuccess = false;
     let prev = "";
+    let media = null;
     for (const line of lines) {
       const afterSchema = /^\s*schema:\s*$/.test(prev);
       prev = line;
@@ -190,10 +191,15 @@ export function parseSpec(files) {
       } else if (op && section && section !== "requestBody" && (m = /^ {8}"?(\d{3})"?:/.exec(line))) {
         section = m[1].startsWith("2") && !seenSuccess ? "success" : "other";
         if (m[1].startsWith("2")) seenSuccess = true;
-      } else if (op && afterSchema && (m = /\$ref:\s*['"]?([^'"\s]+)['"]?/.exec(line))) {
-        const name = m[1].split("/").pop();
-        if (section === "requestBody" && !op.request) op.request = name;
-        else if (section === "success" && !op.response) op.response = name;
+      } else if (op && !afterSchema && (m = /^\s+([\w.+-]+\/[\w.+*-]+):\s*$/.exec(line))) {
+        media = m[1];
+      } else if (op && afterSchema) {
+        // The line after `schema:` is either an immediate `$ref` or the first key of an inline
+        // schema. Both are a defined body: never collapse an inline one into "no schema".
+        m = /^\s*\$ref:\s*['"]?([^'"\s]+)['"]?/.exec(line);
+        const schema = m ? { ref: m[1].split("/").pop() } : { inline: media ?? "unknown" };
+        if (section === "requestBody" && !op.request) op.request = schema;
+        else if (section === "success" && !op.response) op.response = schema;
       }
     }
   }
@@ -230,9 +236,10 @@ export function render(methods, ops) {
       const call =
         m.kind === "constructor" ? `new TestEngine(${args})` : m.kind === "getter" ? `${m.jsName}` : `${m.jsName}(${args})`;
       const link = (f) => `[\`${op.operationId}\`](../spec/${f}) (\`${op.method} ${op.path}\`)`;
+      const schemaCell = (x) => (!x ? "—" : x.ref ? `\`${x.ref}\`` : `inline \`${x.inline}\` schema`);
       const cell = (s) => s.replace(/\|/g, "\\|");
       out.push(
-        `| \`${cell(call)}\` | ${m.kind === "getter" ? "property: " : ""}${cell(m.returns)} | ${op ? link(op.file) : "—"} | ${op?.request ? `\`${op.request}\`` : "—"} | ${op?.response ? `\`${op.response}\`` : "—"} | ${cell(m.summary)} |`,
+        `| \`${cell(call)}\` | ${m.kind === "getter" ? "property: " : ""}${cell(m.returns)} | ${op ? link(op.file) : "—"} | ${schemaCell(op?.request)} | ${schemaCell(op?.response)} | ${cell(m.summary)} |`,
       );
     }
   }
