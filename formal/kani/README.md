@@ -29,7 +29,7 @@ formal/kani/check.sh <harness>  # just that harness
 ```
 
 CI runs it in its own `kani (engine-core proofs)` job (same change gate as
-`formal (tlc)`, job timeout 25 minutes), one matrix leg per harness, each boxed to
+`formal (tlc)`, job timeout 25 minutes), one matrix leg per harness — currently only `parallel_join_fires_only_when_every_flow_taken` is CI-gated; `flow_arrivals_preserve_join_invariant` and `job_index_resync_keeps_lockstep` run locally only until https://github.com/nanobpm/nano-bpm/issues/1994 brings them into CI — each boxed to
 `KANI_HARNESS_TIMEOUT` seconds (default 420: a ~2 min cold build plus ~5 min of verification) and reporting its Kani
 `VERIFICATION:` line and wall time. If a harness outgrows the box, shrink its bound or
 replace it with a smaller transition rather than optimising the solver.
