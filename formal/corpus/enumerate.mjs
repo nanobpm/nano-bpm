@@ -854,7 +854,7 @@ export class Reference {
  * that ends with wait states still held is stuck (left to TLC / the nano-only
  * scenarios).
  */
-export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = false, follow = null } = {}) {
+export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = false, follow = null, maxSteps = Infinity } = {}) {
   const runs = []
   // Instance cancellation (#1673) is opt-in: with `cancel`, every settled
   // state after the first command may also end the run with a `cancel`.
@@ -870,6 +870,13 @@ export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = f
       return
     }
     const cmds = state.commands()
+    // A cyclic graph (the hand-written ExclusiveLoop) has unboundedly long
+    // runs: `maxSteps` unrolls it to a bound, keeping each run cut there as a
+    // settled PREFIX (a not-completed run) — still a behaviour to observe.
+    if (steps.length >= maxSteps) {
+      runs.push(runOf(state, steps))
+      return
+    }
     if (cancel && steps.length > 0 && cmds.length > 0) cmds.push({ op: 'cancel' })
     if (follow) {
       // Guided: only a run whose command signatures ARE `follow` can yield a

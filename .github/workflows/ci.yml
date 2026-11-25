@@ -983,6 +983,10 @@ jobs:
         run: node formal/parity/extensions.mjs
       - name: Trace parser tests
         run: node --test formal/tla/trace/*.test.mjs
+      - name: Zeebe exporter-trace validation runner tests (#1962)
+        # The runner's projection + TLC acceptance on fixed Zeebe-shaped traces;
+        # the live Zeebe run is zeebe-conformance-nightly.yml (not a PR gate).
+        run: node --test formal/traces/conformance/*.test.mjs
       - name: Generative Zeebe differential (#1521) — generator tests + budget drift guard
         # Regenerates every fixed-seed budget case and fails unless the
         # committed scenarios/g-* are byte-identical (the budget itself is gated

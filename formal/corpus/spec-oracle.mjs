@@ -56,34 +56,24 @@ import { diffObservations, emptyObservation } from "../parity/runtime/observatio
  *
  * EVENT-BASED GATEWAYS are projected to the SPEC's vocabulary: the engine
  * (and `Reference.apply()`) take every outgoing gateway flow — arm every catch,
- * withdraw the losers — while `ZeebeTokenFlow.CorrelateEvent` records only the
- * selected flow. So a `gateway->catch` count here is the number of correlation
- * steps that selected that flow, and the observation side is projected the same
- * way by `projectEventGateways` (a catch is selected iff its continuation is
- * taken). The raw withdrawal-inclusive record stays pinned by the scenario's
+ * withdraw the losers — while `ZeebeTokenFlow.CorrelateEvent` takes NONE: Zeebe
+ * activates the triggered catch event directly, writing no SEQUENCE_FLOW_TAKEN
+ * for a `gateway->catch` flow (pinned against real Zeebe exporter records by
+ * the #1962 trace validation). So `gateway->catch` flows are absent here, and
+ * the observation side is projected the same way by `projectEventGateways`.
+ * Which catch was selected still shows in the catch's continuation flow, so a
+ * backend that continues down a losing catch diverges. The raw
+ * withdrawal-inclusive record stays pinned by the scenario's
  * `expect.sequenceFlows`; the two oracles agree on every conforming trace.
  */
 export function referenceMilestones(graph, run) {
   const byId = Object.fromEntries(graph.edges.map((e) => [e.id, e]));
-  // ZeebeTokenFlow's CorrelateEvent records exactly the selected flow of each
-  // correlation step — counted PER STEP, so a gateway activated twice that
-  // selects each alternative once projects to 1/1, not the raw 2/2.
-  const selected = {};
-  for (const s of run.steps ?? []) {
-    if (s.op === "correlate") selected[s.flow] = (selected[s.flow] ?? 0) + 1;
-  }
   const sequenceFlows = {};
   for (const [fid, count] of Object.entries(run.takenFlows ?? {})) {
     const e = byId[fid];
     if (!e || graph.nodes[e.from] === "evt") continue;
     const key = `${e.from}->${e.to}`;
     sequenceFlows[key] = (sequenceFlows[key] ?? 0) + count;
-  }
-  for (const [fid, n] of Object.entries(selected)) {
-    const e = byId[fid];
-    if (!e || graph.nodes[e.from] !== "evt") continue;
-    const key = `${e.from}->${e.to}`;
-    sequenceFlows[key] = (sequenceFlows[key] ?? 0) + n;
   }
   return {
     completed: Boolean(run.completed),
@@ -97,25 +87,15 @@ export function referenceMilestones(graph, run) {
  * Project an observation's event-based-gateway flows onto the SPEC's
  * vocabulary. On the wire the engine takes EVERY `gateway->catch` flow (it arms
  * every catch, then withdraws the losers), which the scenario's
- * `expect.sequenceFlows` pins exactly. The spec records only the selected flow,
- * and a catch is selected exactly when its own continuation is taken (a
- * withdrawn loser never takes its outgoing flow). So each `gateway->catch`
- * count is DERIVED from the observation itself — the count of the catch's
- * outgoing flow — rather than read from the raw withdrawal-inclusive record.
- * Both oracles then agree on a conforming trace, while a backend that
- * continues down a losing catch still diverges from the spec projection.
+ * `expect.sequenceFlows` pins exactly. The spec — like Zeebe — takes none of
+ * them (see `referenceMilestones`), so they are dropped; the selection stays
+ * visible through each catch's own continuation flow.
  */
 export function projectEventGateways(graph, sequenceFlows) {
   const out = {};
   for (const [key, n] of Object.entries(sequenceFlows)) {
     const from = key.slice(0, key.indexOf("->"));
     if (graph.nodes[from] !== "evt") out[key] = n;
-  }
-  for (const e of graph.edges) {
-    if (graph.nodes[e.from] !== "evt") continue;
-    const cont = graph.edges.find((c) => c.from === e.to);
-    const n = cont ? (sequenceFlows[`${cont.from}->${cont.to}`] ?? 0) : 0;
-    if (n > 0) out[`${e.from}->${e.to}`] = n;
   }
   return out;
 }
