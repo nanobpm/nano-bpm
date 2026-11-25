@@ -434,6 +434,9 @@ pub enum ProcessInstanceStatePolicy {
     /// Process-instance batch operations: `state` is ignored and overridden to
     /// ACTIVE (`spec/process-instances.yaml:371-375`, `416-418`).
     ActiveOnly,
+    /// Process-instance cancellation batch: `state` is ignored and overridden to
+    /// ACTIVE or SUSPENDED (`spec/process-instances.yaml:443-445`).
+    LiveOnly,
 }
 
 /// One AND-group of a process-instance filter (the top-level fields, or one
@@ -526,6 +529,10 @@ impl ProcessInstanceMatcher {
             ProcessInstanceStatePolicy::ActiveOnly => {
                 matches!(inst.state, ProcessInstanceState::Active)
             }
+            ProcessInstanceStatePolicy::LiveOnly => matches!(
+                inst.state,
+                ProcessInstanceState::Active | ProcessInstanceState::Suspended
+            ),
         };
         let root_ok = match hierarchy {
             BatchHierarchyPolicy::HonourFilters => true,
@@ -653,7 +660,7 @@ pub fn match_process_instance_group(
             &process_instance_state_enum(inst.state).to_string(),
         ),
         // Overridden to ACTIVE by the caller; the supplied `state` is ignored.
-        ProcessInstanceStatePolicy::ActiveOnly => true,
+        ProcessInstanceStatePolicy::ActiveOnly | ProcessInstanceStatePolicy::LiveOnly => true,
     };
     // Call-activity hierarchy filters (C8 parity, #977): a bare parent key
     // enumerates direct children; `$exists:false` selects top-level instances.

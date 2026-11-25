@@ -27,6 +27,7 @@
   "BroadcastSignal.variables",
   "CancelInstance",
   "CancelInstance.instance_key",
+  "CancelInstance.terminate_suspended",
   "CloseMessageSubscription",
   "CloseMessageSubscription.delivery_key",
   "CloseMessageSubscription.element_id",

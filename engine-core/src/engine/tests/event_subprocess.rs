@@ -722,7 +722,7 @@ fn terminating_the_scope_disarms_event_subprocess_triggers() {
             let mut engine = Engine::new();
             let inst = start(&mut engine, esp_model(trig_of(t), false, embedded));
             engine
-                .apply_command(Command::CancelInstance { instance_key: inst })
+                .apply_command(Command::cancel_instance(inst))
                 .unwrap();
             assert_eq!(
                 armed(&engine, inst),
@@ -1968,7 +1968,7 @@ fn held_esp_payloads_are_dropped_when_the_container_finishes_or_the_instance_end
             // Containers still parked on their listener legitimately hold.
             assert!(held > 0, "listener-deferred starts hold their payload");
             engine
-                .apply_command(Command::CancelInstance { instance_key: inst })
+                .apply_command(Command::cancel_instance(inst))
                 .unwrap();
             assert!(
                 engine.state.instances[&inst].esp_held_payloads.is_empty(),

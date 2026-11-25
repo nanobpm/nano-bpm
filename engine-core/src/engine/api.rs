@@ -226,7 +226,7 @@ impl Engine {
         }
         let mut roots: Vec<Key> = Vec::new();
         match command {
-            Command::CancelInstance { instance_key }
+            Command::CancelInstance { instance_key, .. }
             | Command::ModifyInstance { instance_key, .. }
             | Command::MigrateInstance { instance_key, .. }
             | Command::CorrelateMessageSubscription { instance_key, .. } => {
