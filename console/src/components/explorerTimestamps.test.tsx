@@ -212,6 +212,15 @@ const RENDERED: Record<string, () => boolean> = {
     renderToStaticMarkup(
       createElement(InstanceTimes, { startedAt: 0, endedAt: S, fmt: tagFmt }),
     ).includes(`⟨${S}⟩`),
+  // The trace detail header renders InstanceTrace through InstanceTimes too.
+  "InstanceTrace.startedAt": () =>
+    renderToStaticMarkup(
+      createElement(InstanceTimes, { startedAt: S, fmt: tagFmt }),
+    ).includes(`⟨${S}⟩`),
+  "InstanceTrace.endedAt": () =>
+    renderToStaticMarkup(
+      createElement(InstanceTimes, { startedAt: 0, endedAt: S, fmt: tagFmt }),
+    ).includes(`⟨${S}⟩`),
   "TraceElement.enteredAt": () =>
     timeline(trace({ elements: [element({ enteredAt: S })] })).includes(
       `⟨${S}⟩`,
@@ -271,6 +280,7 @@ const NOT_DISPLAYED: Record<string, string> = {};
  * `fmtDuration`, outside this guard's scope). */
 const DURATIONS = new Set([
   "TraceSummary.durationMs",
+  "InstanceTrace.durationMs",
   "TraceElement.durationMs",
   "TraceJob.waitMs",
   "TraceJob.queueMs",
@@ -280,6 +290,7 @@ const DURATIONS = new Set([
 const GUARDED_TYPES = [
   "Instance",
   "TraceSummary",
+  "InstanceTrace",
   "TraceElement",
   "TraceJob",
   "TraceIncident",
