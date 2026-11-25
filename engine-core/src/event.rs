@@ -1519,24 +1519,28 @@ pub enum Event {
         variables: BTreeMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
-        /// Ack-paced buffered drain (#1874, Zeebe `CORRELATING`): when `Some`,
-        /// this delivery came from the message buffer to a subscription that
-        /// stays open, and the instance partition must answer with an
-        /// [`Event::MessageCorrelationAcknowledging`] routed back to this
-        /// (message) partition before the next buffered message is sent. The
-        /// applier marks the canonical subscription `awaiting_ack`. `None` on
-        /// every other correlation and on a pre-#1874 record (additive).
+        /// Ack-paced buffered delivery (#1949, Zeebe `CORRELATING`): when
+        /// `Some`, this delivery came from the message buffer (to a one-shot
+        /// or a persistent subscription alike), and the instance partition
+        /// must answer with an [`Event::MessageCorrelationAcknowledging`]
+        /// routed back to this (message) partition, which settles the
+        /// reservation. The applier marks the canonical subscription
+        /// `awaiting_ack`. `None` on every other correlation and on a
+        /// pre-#1949 record (additive).
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         ack_partition: Option<u64>,
     },
-    /// The instance partition's answer (#1874) to an ack-paced
-    /// [`Event::RemoteMessageCorrelation`]: `accepted` when the parked token
-    /// took the message, `false` when it was rejected (the scope ended, the
-    /// element no longer waits, or the instance is gone). A suspended instance
-    /// whose scope is alive answers `deferred` instead (see the field). The
+    /// The instance partition's answer (#1949) to an ack-paced
+    /// [`Event::RemoteMessageCorrelation`]. `consumed` says whether the token
+    /// actually took the message (an unconsumed reservation is released on
+    /// the message partition); `accepted` whether the subscription still
+    /// waits for more (consumed AND its persistent scope survived) — `false`
+    /// closes it there. A suspended instance whose scope is alive answers
+    /// `deferred` instead (see the field). Derived from durable state, so a
+    /// re-driven duplicate delivery is answered identically. The
     /// host routes it to `target_partition` (the message partition) as a
     /// [`crate::Command::AcknowledgeMessageCorrelation`]. `partition` is the
     /// emitting (instance) partition, recorded explicitly because the message
@@ -1546,6 +1550,8 @@ pub enum Event {
         message_key: Key,
         instance_key: Key,
         accepted: bool,
+        /// Whether the parked token took the message (see the variant doc).
+        consumed: bool,
         /// The instance is SUSPENDED but its subscription scope is alive
         /// (#1874): the message partition keeps the subscription open and the
         /// message buffered for it, instead of closing it. Additive.
@@ -1555,14 +1561,18 @@ pub enum Event {
         target_partition: u64,
     },
     /// The message partition applied an instance partition's acknowledgement
-    /// (#1874): clears the canonical subscription's `awaiting_ack`; a rejected
-    /// delivery also closes the subscription, so the untaken buffered messages
-    /// stay buffered for other subscriptions. `partition` is this (message)
+    /// (#1949): clears the canonical subscription's `awaiting_ack`; an
+    /// unconsumed delivery releases the message's reservation (it is
+    /// available again, to this instance too); a rejected delivery also
+    /// closes the subscription, so the untaken buffered messages stay
+    /// buffered for other subscriptions. `partition` is this (message)
     /// partition: the subscription key is foreign.
     MessageCorrelationAcknowledged {
         subscription_key: Key,
         message_key: Key,
         accepted: bool,
+        /// See [`Event::MessageCorrelationAcknowledging`]'s `consumed`.
+        consumed: bool,
         /// See [`Event::MessageCorrelationAcknowledging`]'s `deferred`.
         #[cfg_attr(feature = "serde", serde(default))]
         deferred: bool,

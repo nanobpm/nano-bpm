@@ -509,6 +509,46 @@ impl FailedOpensInner {
     }
 }
 
+/// The ack-paced buffered deliveries (#1949) a node's message partitions
+/// still await acks for, carried across background re-drive passes. The
+/// in-flight set itself is durable engine state
+/// (`Engine::pending_buffered_deliveries`), so it survives exhausted routing
+/// retries, a restart and a leader change; this only paces the re-drive: a
+/// delivery is re-sent once it was ALREADY in flight on the previous pass
+/// (at least one [`FAILED_OPEN_REDRIVE_INTERVAL`] old), so a delivery the
+/// original pump is still routing is not duplicated. A re-send is harmless
+/// anyway — it carries the original delivery key, the instance partition
+/// answers a duplicate with a re-ack, and a duplicate ack is a no-op.
+#[derive(Clone, Default)]
+pub(crate) struct StalledDeliveries {
+    previous: Arc<Mutex<HashSet<(u64, u64)>>>,
+}
+
+impl StalledDeliveries {
+    /// Of the deliveries in flight now, the ones also in flight on the
+    /// previous pass (by `(subscription_key, delivery_key)`); remembers `now`
+    /// for the next pass. Any other event is ignored.
+    pub(crate) fn due(&self, now: Vec<Event>) -> Vec<Event> {
+        let identity = |event: &Event| match event {
+            Event::RemoteMessageCorrelation {
+                subscription_key,
+                delivery_key,
+                ack_partition: Some(_),
+                ..
+            } => Some((*subscription_key, *delivery_key)),
+            _ => None,
+        };
+        let mut previous = self.previous.lock().unwrap_or_else(|e| e.into_inner());
+        let current: HashSet<(u64, u64)> = now.iter().filter_map(identity).collect();
+        let due = now
+            .into_iter()
+            .filter(|e| identity(e).is_some_and(|id| previous.contains(&id)))
+            .collect();
+        *previous = current;
+        due
+    }
+}
+
 impl Drop for PendingOpens {
     fn drop(&mut self) {
         let mut pending = self.gate.lock();

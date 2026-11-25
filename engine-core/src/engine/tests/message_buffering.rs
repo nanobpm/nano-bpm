@@ -759,6 +759,7 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
             subscription_key,
             message_key,
             accepted,
+            consumed,
             deferred,
             ..
         } => (
@@ -767,6 +768,7 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
                 subscription_key,
                 message_key,
                 accepted,
+                consumed,
                 deferred,
             },
         ),
@@ -977,22 +979,46 @@ fn remote_delivery_that_ends_the_scope_leaves_the_rest_buffered() {
     assert_eq!(rig.delivered_to(third), published_ni);
 }
 
-/// #1874: a remote INTERRUPTING subscription takes exactly one buffered
-/// message (no ack pacing: a one-shot subscription settles on delivery).
+/// #1949: a remote INTERRUPTING (one-shot) subscription takes exactly one
+/// buffered message. Its delivery is ack-paced too, so the message partition
+/// learns the token consumed it before the reservation is final.
 #[test]
 fn remote_interrupting_subscription_takes_exactly_one() {
     let (mut rig, order) = Rig::new(process_with_message_catch());
     let published = rig.publish_named_backlog("payment-received", &order, 3);
     let instance_key = rig.create("await-payment", &order, 2_000);
     assert_eq!(rig.delivered_to(instance_key), published[..1]);
-    assert!(rig.trace.iter().all(|e| !matches!(
-        e,
-        Event::RemoteMessageCorrelation {
-            ack_partition: Some(_),
-            ..
-        } | Event::MessageCorrelationAcknowledging { .. }
-    )));
     assert!(rig.instance.is_completed(instance_key));
+    let acks: Vec<_> = rig
+        .trace
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCorrelationAcknowledged {
+                accepted, consumed, ..
+            } => Some((*accepted, *consumed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acks, vec![(false, true)], "{:?}", rig.trace);
+    let subscription = rig
+        .message
+        .state()
+        .message_subscriptions
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(
+        subscription.state,
+        state::MessageSubscriptionState::Correlated
+    );
+    assert_eq!(subscription.awaiting_ack, None);
+    let buffered = &rig.message.state().buffered_messages;
+    assert!(buffered[&published[0]]
+        .correlated_instances
+        .contains(&instance_key));
+    assert!(published[1..]
+        .iter()
+        .all(|k| buffered[k].correlated_instances.is_empty()));
 }
 
 /// #1874: the ack-paced state is event-sourced — replaying the message
@@ -1036,6 +1062,7 @@ fn ack_paced_drain_replays_deterministically() {
                 subscription_key: sub,
                 message_key: 1,
                 accepted: true,
+                consumed: true,
                 deferred: false,
             },
             2_002,
@@ -1402,4 +1429,313 @@ fn consecutive_catches_over_a_matching_backlog_visit_linearly() {
         engine.buffer_scan_count.get()
     );
     assert!(engine.buffer_candidates.is_empty());
+}
+
+impl Rig {
+    /// Like [`Rig::run`], but every routed command `hold` selects is NOT
+    /// delivered (a lost or delayed send); the held ones are returned.
+    fn run_holding(
+        &mut self,
+        to_message: bool,
+        command: Command,
+        now: u64,
+        hold: &dyn Fn(&Command) -> bool,
+    ) -> Vec<(bool, Command)> {
+        let mut held = Vec::new();
+        let mut pending = std::collections::VecDeque::from([(to_message, command)]);
+        while let Some((to_message, command)) = pending.pop_front() {
+            let events = if to_message {
+                self.on_message(command, now)
+            } else {
+                self.instance.apply_command_at(command, now).unwrap()
+            };
+            for routed in events.iter().filter_map(routed) {
+                if hold(&routed.1) {
+                    held.push(routed);
+                } else {
+                    pending.push_back(routed);
+                }
+            }
+            self.trace.extend(events);
+        }
+        held
+    }
+
+    fn create_holding(
+        &mut self,
+        process: &str,
+        order: &str,
+        now: u64,
+        hold: &dyn Fn(&Command) -> bool,
+    ) -> (Key, Vec<(bool, Command)>) {
+        let before = self.trace.len();
+        let held = self.run_holding(
+            false,
+            Command::create_instance_with(process, vars(&[("orderId", Value::Str(order.into()))])),
+            now,
+            hold,
+        );
+        let instance_key = self.trace[before..]
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .expect("an instance was created");
+        (instance_key, held)
+    }
+
+    fn acks(&self) -> Vec<(bool, bool)> {
+        self.trace
+            .iter()
+            .filter_map(|e| match e {
+                Event::MessageCorrelationAcknowledged {
+                    accepted, consumed, ..
+                } => Some((*accepted, *consumed)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+fn is_delivery(command: &Command) -> bool {
+    matches!(command, Command::CorrelateMessageSubscription { .. })
+}
+
+fn is_ack(command: &Command) -> bool {
+    matches!(command, Command::AcknowledgeMessageCorrelation { .. })
+}
+
+/// The routed command a re-driven [`Engine::pending_buffered_deliveries`]
+/// event becomes.
+fn redrive(rig: &Rig) -> Vec<(bool, Command)> {
+    rig.message
+        .pending_buffered_deliveries()
+        .iter()
+        .filter_map(routed)
+        .collect()
+}
+
+/// An interrupting message boundary on a task, then a catch for the SAME
+/// message after it: a buffered delivery meant for the boundary that arrives
+/// after the task completed must not use the message up for the catch.
+fn boundary_then_catch_process() -> ProcessDefinition {
+    ProcessBuilder::new("bc")
+        .start_event("s")
+        .service_task("work", "work")
+        .message_boundary_event("b", "work", "m", "orderId")
+        .end_event("b_end")
+        .message_intermediate_catch_event("c", "m", "orderId")
+        .end_event("e")
+        .connect("s", "work")
+        .connect("work", "c")
+        .connect("c", "e")
+        .connect("b", "b_end")
+        .build()
+        .unwrap()
+}
+
+/// Copilot r4693719539 (#1949): consumption is confirmed by the instance
+/// partition, never assumed at send time. A boundary cancelled before its
+/// delayed delivery arrives answers `consumed: false`, the reservation is
+/// released, and a later catch in the SAME instance takes the message.
+#[test]
+fn delivery_to_a_cancelled_boundary_releases_the_message_for_a_later_catch() {
+    let (mut rig, order) = Rig::new(boundary_then_catch_process());
+    let published = rig.publish_backlog(&order, 1);
+    let (instance_key, held) = rig.create_holding("bc", &order, 2_000, &is_delivery);
+    assert_eq!(held.len(), 1, "the boundary's delivery is delayed");
+    // The task completes first: the boundary closes, the catch opens — and
+    // skips the message, which is still reserved for this instance.
+    let completed = complete_one(&mut rig.instance, "work");
+    for routed in completed.iter().filter_map(routed) {
+        rig.run(routed.0, routed.1, 2_100);
+    }
+    rig.trace.extend(completed);
+    assert!(!rig.instance.is_completed(instance_key));
+    // The delayed delivery lands on the cancelled boundary: not consumed.
+    for (to_message, command) in held {
+        rig.run(to_message, command, 2_200);
+    }
+    assert_eq!(rig.acks()[0], (false, false), "{:?}", rig.trace);
+    // Released, re-offered to the catch, consumed there.
+    assert_eq!(rig.acks()[1], (false, true), "{:?}", rig.trace);
+    assert!(rig.instance.is_completed(instance_key));
+    assert_eq!(
+        rig.delivered_to(instance_key),
+        vec![published[0], published[0]]
+    );
+    assert!(rig
+        .message
+        .state()
+        .message_subscriptions
+        .values()
+        .all(|s| s.awaiting_ack.is_none()));
+}
+
+fn event_gateway_two_messages() -> ProcessDefinition {
+    ProcessBuilder::new("gw")
+        .start_event("s")
+        .event_based_gateway("g")
+        .message_intermediate_catch_event("c1", "m1", "orderId")
+        .end_event("e1")
+        .message_intermediate_catch_event("c2", "m2", "orderId")
+        .end_event("e2")
+        .connect("s", "g")
+        .connect("g", "c1")
+        .connect("g", "c2")
+        .connect("c1", "e1")
+        .connect("c2", "e2")
+        .build()
+        .unwrap()
+}
+
+/// Copilot r4693719539 (#1949): a LOSING remote event-based-gateway catch
+/// (one-shot) is acked too, answers `consumed: false`, and its message is
+/// released — never left marked consumed by an instance that did not take it.
+#[test]
+fn losing_remote_event_gateway_catch_releases_its_message() {
+    let (mut rig, order) = Rig::new(event_gateway_two_messages());
+    let m1 = rig.publish_named_backlog("m1", &order, 1)[0];
+    let m2 = rig.publish_named_backlog("m2", &order, 1)[0];
+    let instance_key = rig.create("gw", &order, 2_000);
+    assert!(rig.instance.is_completed(instance_key));
+    // Both catches got a delivery; the first to land wins the gateway.
+    let delivered = rig.delivered_to(instance_key);
+    let mut both = delivered.clone();
+    both.sort_unstable();
+    assert_eq!(both, vec![m1, m2]);
+    let (winner, loser) = (delivered[0], delivered[1]);
+    assert_eq!(
+        rig.acks(),
+        vec![(false, true), (false, false)],
+        "{:?}",
+        rig.trace
+    );
+    let buffered = &rig.message.state().buffered_messages;
+    assert!(buffered[&winner]
+        .correlated_instances
+        .contains(&instance_key));
+    assert!(
+        buffered[&loser].correlated_instances.is_empty(),
+        "the losing catch's message is released"
+    );
+}
+
+/// Copilot r4693719423 (#1949): a delivery and an ack lost to exhausted
+/// routing retries never leave the subscription stuck. The in-flight delivery
+/// is durable state: it survives a restart / leader change (replay and
+/// snapshot), the host re-drives it from `pending_buffered_deliveries` with
+/// the SAME delivery key, the instance partition answers a duplicate with a
+/// re-ack (never a second token), and a duplicate ack is ignored.
+#[test]
+fn lost_delivery_and_lost_ack_are_redriven_across_a_restart() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 3);
+    // The first delivery is lost.
+    let (instance_key, lost) = rig.create_holding("ni", &order, 2_000, &is_delivery);
+    assert_eq!(lost.len(), 1);
+    assert_eq!(redrive(&rig), lost, "the re-drive rebuilds the exact send");
+
+    // Restart / leader change mid-flight: a replica rebuilt from the journal
+    // (and one restored from a snapshot) holds the same in-flight delivery.
+    let mut replayed = Engine::replay_partition(1, rig.message_journal.clone());
+    replayed.set_num_partitions(Rig::N);
+    assert_eq!(replayed.state(), rig.message.state());
+    assert_eq!(
+        replayed.pending_buffered_deliveries(),
+        rig.message.pending_buffered_deliveries()
+    );
+    #[cfg(feature = "serde")]
+    {
+        let json = serde_json::to_string(&rig.message.snapshot()).unwrap();
+        let restored = Engine::from_snapshot(serde_json::from_str(&json).unwrap());
+        assert_eq!(
+            restored.pending_buffered_deliveries(),
+            rig.message.pending_buffered_deliveries()
+        );
+    }
+    rig.message = replayed;
+
+    // Re-driven, it is delivered — but now its ACK is lost.
+    let mut lost_acks = Vec::new();
+    for (to_message, command) in redrive(&rig) {
+        lost_acks.extend(rig.run_holding(to_message, command, 3_000, &is_ack));
+    }
+    assert_eq!(lost_acks.len(), 1);
+    let tokens = |rig: &Rig| {
+        rig.trace
+            .iter()
+            .filter(|e| matches!(e, Event::MessageCorrelated { .. }))
+            .count()
+    };
+    assert_eq!(tokens(&rig), 1, "the re-driven delivery was applied");
+    // Still awaiting: the re-drive sends the same delivery again; the
+    // instance partition dedups it (no second token) and only re-acks.
+    let again = redrive(&rig);
+    assert_eq!(again.len(), 1);
+    for (to_message, command) in again {
+        rig.run(to_message, command, 3_100);
+    }
+    // A duplicate of the (lost, now superseded) ack is a no-op.
+    for (_, command) in lost_acks {
+        assert!(rig.on_message(command, 3_200).is_empty());
+    }
+    assert!(redrive(&rig).is_empty());
+    assert_eq!(tokens(&rig), 3, "each message spawns exactly one token");
+    let taken: Vec<Key> = rig
+        .trace
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCorrelated { message_key, .. } => Some(*message_key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(taken, published, "publish order: {:?}", rig.trace);
+    assert_eq!(rig.acks(), vec![(true, true); 3]);
+    assert!(rig.instance.state().instances.contains_key(&instance_key));
+}
+
+/// #1949: a reserved (in-flight) message outlives its TTL until the ack
+/// settles it — the instance may already have consumed it, and a re-drive
+/// needs its variables — and then expires on the next sweep.
+#[test]
+fn a_reserved_message_expires_only_after_its_ack() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    let published = rig.publish_backlog(&order, 1);
+    let deadline = rig.message.state().buffered_messages[&published[0]].deadline;
+    let (_, held) = rig.create_holding("ni", &order, 2_000, &is_delivery);
+    let swept = rig.on_message(Command::TriggerTimers { now: deadline + 1 }, deadline + 1);
+    assert!(!swept
+        .iter()
+        .any(|e| matches!(e, Event::MessageExpired { .. })));
+    assert_eq!(redrive(&rig).len(), 1);
+    for (to_message, command) in held {
+        rig.run(to_message, command, deadline + 2);
+    }
+    assert_eq!(rig.acks(), vec![(true, true)]);
+    let swept = rig.on_message(Command::TriggerTimers { now: deadline + 3 }, deadline + 3);
+    assert!(swept
+        .iter()
+        .any(|e| matches!(e, Event::MessageExpired { .. })));
+    assert!(rig.message.state().buffered_messages.is_empty());
+}
+
+/// Copilot r4693719494 (#1949): draining N buffered messages to a remote
+/// subscription through N ack commands visits O(N) buffer entries in total —
+/// each accepted ack resumes the scan right after the message it settled,
+/// instead of rescanning the already-delivered prefix.
+#[test]
+fn remote_ack_paced_drain_scans_linearly() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    const N: usize = 200;
+    let published = rig.publish_backlog(&order, N as u64);
+    rig.message.buffer_scan_count.set(0);
+    let instance_key = rig.create("ni", &order, 2_000);
+    assert_eq!(rig.delivered_to(instance_key), published);
+    let visits = rig.message.buffer_scan_count.get();
+    assert!(
+        visits <= 2 * N + 2,
+        "visits must be O(N), got {visits} for N = {N}"
+    );
 }

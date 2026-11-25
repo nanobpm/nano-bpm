@@ -1234,12 +1234,13 @@ fn routed_protocol_entries() -> Vec<Command> {
         .apply_command_at(close.clone(), T0 + 5)
         .expect("the routed close applies on the message partition");
 
-    // (6): a stale ack (#1874) — the one-shot catch was never ack-paced, so the
-    // message partition ignores it (the idempotent no-op path).
+    // (6): a stale ack (#1874) — the catch's subscription is not awaiting an
+    // ack, so the message partition ignores it (the idempotent no-op path).
     let ack = Command::AcknowledgeMessageCorrelation {
         subscription_key,
         message_key,
         accepted: true,
+        consumed: true,
         deferred: false,
     };
     let acked = message_partition

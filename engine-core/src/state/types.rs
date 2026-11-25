@@ -2053,18 +2053,32 @@ pub struct MessageSubscription {
         serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub correlated_message_keys: std::collections::BTreeSet<Key>,
-    /// The buffered `message_key` this (message-partition, canonical)
-    /// subscription delivered to a REMOTE instance and is awaiting the
-    /// instance partition's acknowledgement for (#1874, Zeebe `CORRELATING`).
-    /// While set, the buffered-message drain sends it nothing more; an
-    /// accepted [`crate::Event::MessageCorrelationAcknowledged`] clears it and
-    /// lets the next buffered message go, a rejected one closes the
-    /// subscription. Additive (`serde(default)`, omitted when `None`).
+    /// The buffered delivery this (message-partition, canonical) subscription
+    /// sent to a REMOTE instance and is awaiting the instance partition's
+    /// acknowledgement for (#1949, Zeebe `CORRELATING`): the in-flight
+    /// delivery and its reservation, event-sourced so they survive routing
+    /// failures, leader changes and restarts (the host re-drives it from
+    /// [`crate::Engine::pending_buffered_deliveries`]). While set, the
+    /// subscription takes nothing more and the reserved message never
+    /// expires; a [`crate::Event::MessageCorrelationAcknowledged`] settles
+    /// it. Additive (`serde(default)`, omitted when `None`).
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
-    pub awaiting_ack: Option<Key>,
+    pub awaiting_ack: Option<AwaitingAck>,
+}
+
+/// An in-flight buffered delivery awaiting its acknowledgement (#1949): see
+/// [`MessageSubscription::awaiting_ack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AwaitingAck {
+    /// The reserved buffered message.
+    pub message_key: Key,
+    /// The routed delivery's stable key: a re-driven send reuses it, so the
+    /// instance partition recognises the duplicate and only re-acks.
+    pub delivery_key: Key,
 }
 
 /// An open **signal** subscription holding a token on a signal catch element (or

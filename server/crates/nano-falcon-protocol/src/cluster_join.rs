@@ -96,9 +96,9 @@ pub const FEATURE_MESSAGE_BUFFERING: &str = "message-buffering-v1";
 /// and never ships a flagged entry to a peer that does not.
 pub const FEATURE_CANCEL_SUSPENDED_INSTANCE: &str = "cancel-suspended-instance-v1";
 
-/// Ack-paced buffered-message drain (#1874, Zeebe `CORRELATING`): this binary
-/// applies `Command::AcknowledgeMessageCorrelation` and honours
-/// `CorrelateMessageSubscription::ack_partition`. A pre-#1874 binary would drop
+/// Ack-paced buffered-message delivery (#1949, Zeebe `CORRELATING`): this
+/// binary applies `Command::AcknowledgeMessageCorrelation` and honours
+/// `CorrelateMessageSubscription::ack_partition`. A pre-#1949 binary would drop
 /// the field (never acking, stalling the drain) and reject the ack, so an
 /// entry carrying either never ships to a peer that does not advertise this.
 pub const FEATURE_MESSAGE_CORRELATION_ACK: &str = "message-correlation-ack-v1";

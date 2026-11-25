@@ -3898,6 +3898,9 @@ pub struct ServerImpl {
     /// Undelivered cross-partition subscription opens awaiting the
     /// background re-drive (#1866, see [`ServerImpl::spawn_failed_open_redrive`]).
     failed_opens: publication_gate::FailedOpens,
+    /// Ack-paced buffered deliveries seen in flight on the previous re-drive
+    /// pass (#1949, see [`ServerImpl::redrive_stalled_buffered_deliveries`]).
+    stalled_deliveries: publication_gate::StalledDeliveries,
     /// Test-only fault injection (#1866): panics the routing pump task.
     #[cfg(test)]
     fail_routing_pump_for_test: Arc<std::sync::atomic::AtomicBool>,
@@ -4556,6 +4559,7 @@ impl ServerImpl {
             #[cfg(test)]
             publication_gate_deadline_override: Arc::new(std::sync::Mutex::new(None)),
             failed_opens: publication_gate::FailedOpens::default(),
+            stalled_deliveries: publication_gate::StalledDeliveries::default(),
             #[cfg(test)]
             fail_routing_pump_for_test: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -12127,6 +12131,8 @@ impl ServerImpl {
     /// re-recorded by the pump, so attempts are unbounded. Entries are grouped
     /// by target partition and the groups run concurrently (serial within a
     /// group), so a stalled partition's backlog never delays a healthy one.
+    /// The same pass re-drives stalled ack-paced buffered deliveries (#1949,
+    /// [`Self::redrive_stalled_buffered_deliveries`]).
     async fn redrive_failed_opens(&self) {
         let num_partitions = self.engine.topology().num_partitions;
         let mut by_target: std::collections::BTreeMap<u64, Vec<(Event, Option<i64>)>> =
@@ -12154,6 +12160,42 @@ impl ServerImpl {
             if let Err(e) = group.await {
                 tracing::warn!("failed-open re-drive group failed: {e}");
             }
+        }
+        self.redrive_stalled_buffered_deliveries().await;
+    }
+
+    /// The ack-paced buffered deliveries (#1949) still awaiting their ack on
+    /// every partition this node writes (leads under Raft, owns otherwise),
+    /// rebuilt from durable engine state.
+    async fn in_flight_buffered_deliveries(&self) -> Vec<Event> {
+        let topology = self.engine.topology();
+        let mut in_flight = Vec::new();
+        for p in 0..topology.num_partitions {
+            if self.partition_write_node(p) != topology.node_id {
+                continue;
+            }
+            let Some(handle) = self.engine_handle_for(p) else {
+                continue;
+            };
+            if let Some(events) = handle
+                .try_with(|journal| journal.engine().pending_buffered_deliveries())
+                .await
+            {
+                in_flight.extend(events);
+            }
+        }
+        in_flight
+    }
+
+    /// Re-drives every buffered delivery still unacknowledged since the
+    /// previous pass (#1949, Copilot r4693719423): a delivery — or its ack —
+    /// lost to exhausted routing retries, a restart or a leader change would
+    /// otherwise leave the subscription awaiting an ack forever. The re-send
+    /// reuses the original delivery key, so it is idempotent end to end.
+    async fn redrive_stalled_buffered_deliveries(&self) {
+        let in_flight = self.in_flight_buffered_deliveries().await;
+        for event in self.stalled_deliveries.due(in_flight) {
+            self.drive_subscription_routing(vec![event], None).await;
         }
     }
 
@@ -12304,6 +12346,7 @@ impl ServerImpl {
                 subscription_key,
                 message_key,
                 accepted,
+                consumed,
                 deferred,
                 target_partition,
                 ..
@@ -12313,6 +12356,7 @@ impl ServerImpl {
                     subscription_key: *subscription_key,
                     message_key: *message_key,
                     accepted: *accepted,
+                    consumed: *consumed,
                     deferred: *deferred,
                 },
             )),
@@ -55240,6 +55284,120 @@ mod subscription_placement_tests {
             correlated,
             Some(instance),
             "after the re-drive a publish correlates"
+        );
+    }
+
+    /// #1949 (Copilot r4693719423): an ack-paced buffered delivery lost to
+    /// exhausted routing retries must not leave the subscription awaiting an
+    /// ack forever. The in-flight delivery is durable message-partition state;
+    /// the background re-drive re-sends it (same delivery key) once it has
+    /// been in flight for a full pass, and the instance completes.
+    #[tokio::test]
+    async fn lost_buffered_delivery_is_redriven_in_the_background() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let create_partition = server.engine.for_create().stats().partition;
+        let order = cross_partition_order(create_partition);
+        let num_partitions = server.engine.topology().num_partitions;
+        let message_partition =
+            nanobpmn_engine_core::subscription_partition(&order, num_partitions);
+        // A buffered message waits on the message partition (applied there
+        // directly: the REST publish does not carry a TTL yet).
+        let RoutedApply::Applied(buffered) = server
+            .apply_routed_command(
+                message_partition,
+                Command::CorrelateMessage {
+                    message_name: "payment-received".into(),
+                    correlation_key: order.clone(),
+                    variables: Default::default(),
+                    business_id: None,
+                    message_key: None,
+                    time_to_live: Some(3_600_000),
+                    message_id: None,
+                },
+                None,
+            )
+            .await
+        else {
+            panic!("the publish applies on the message partition");
+        };
+        assert!(
+            buffered
+                .iter()
+                .any(|e| matches!(e, Event::MessageBuffered { .. })),
+            "{buffered:?}"
+        );
+        // The open fails to route; deliver it by hand and DROP the buffered
+        // delivery it produces — a send lost to exhausted retries.
+        server
+            .fail_routing_pump_for_test
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let instance = create_await_payment_detached(&server, &order).await;
+        for _ in 0..100 {
+            if server.failed_opens.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let open = server.failed_opens.queued().pop().expect("the failed open");
+        server
+            .fail_routing_pump_for_test
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (target, command) =
+            ServerImpl::route_event(&open, num_partitions).expect("a routed open");
+        assert_eq!(target, message_partition);
+        let RoutedApply::Applied(produced) =
+            server.apply_routed_command(target, command, None).await
+        else {
+            panic!("the open applies on the message partition");
+        };
+        assert!(
+            produced.iter().any(|e| matches!(
+                e,
+                Event::RemoteMessageCorrelation {
+                    ack_partition: Some(_),
+                    ..
+                }
+            )),
+            "the open sends the buffered message: {produced:?}"
+        );
+        assert_eq!(server.in_flight_buffered_deliveries().await.len(), 1);
+
+        // A fresh in-flight delivery is not re-sent on the first pass…
+        server.redrive_stalled_buffered_deliveries().await;
+        let message_engine = server.engine_handle_for(message_partition).unwrap();
+        let instance_engine = server
+            .engine_handle_for(nanobpmn_engine_core::partition_of(instance))
+            .unwrap();
+        assert!(
+            !instance_engine
+                .with(move |journal| journal.engine().is_completed(instance))
+                .await
+        );
+        // …but one still unacknowledged on the next pass is, and settles.
+        server.redrive_stalled_buffered_deliveries().await;
+        assert!(
+            instance_engine
+                .with(move |journal| journal.engine().is_completed(instance))
+                .await,
+            "the re-driven delivery completed the instance"
+        );
+        assert!(server.in_flight_buffered_deliveries().await.is_empty());
+        assert!(
+            message_engine
+                .with(|journal| journal
+                    .engine()
+                    .state()
+                    .message_subscriptions
+                    .values()
+                    .all(|s| s.awaiting_ack.is_none()))
+                .await
         );
     }
 

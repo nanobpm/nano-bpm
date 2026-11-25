@@ -1,6 +1,7 @@
 [
   "AcknowledgeMessageCorrelation",
   "AcknowledgeMessageCorrelation.accepted",
+  "AcknowledgeMessageCorrelation.consumed",
   "AcknowledgeMessageCorrelation.deferred",
   "AcknowledgeMessageCorrelation.message_key",
   "AcknowledgeMessageCorrelation.subscription_key",
