@@ -1562,12 +1562,13 @@ fn multi_instance_subprocess_applies_its_own_output_mapping_before_collecting() 
         ])),
         "outputElement read the sub-process-mapped local `tag`"
     );
-    // The mapped local stays scoped to each child — it does NOT leak to the
-    // parent instance scope (only the outputCollection propagates).
+    // Zeebe merges each child's output mapping into the body WITH propagation
+    // (#1982): `tag` is held by no ancestor, so it is created at the process
+    // root and each later child updates it — the last completion wins.
     assert_eq!(
         engine.instance(key).unwrap().variables.get("tag"),
-        None,
-        "the MI-child output mapping must not propagate `tag` to the parent"
+        Some(&Value::Int(30)),
+        "the MI-child output mapping propagates `tag` to the process scope"
     );
 }
 
@@ -3034,4 +3035,77 @@ fn early_multi_instance_teardown_of_call_activity_children_scans_independently_o
         "call-activity MI teardown scans must not grow with child count: \
          N=4 {small} vs N=64 {large}"
     );
+}
+
+/// #1982 regression (fuzz signature `674af8b5c5f7`) — an MI child's own
+/// `zeebe:output` mapping (`result → o3`) is applied when the INNER instance
+/// completes and propagates to the process scope (Zeebe creates `o3` at the
+/// root), even though its source reads the per-child `outputElement` root.
+#[test]
+fn mi_child_output_mapping_propagates_to_process_scope() {
+    let def = ProcessBuilder::new("mi-out-map")
+        .start_event("start")
+        .service_task("mi3", "work")
+        .with_multi_instance(
+            "mi3",
+            crate::model::MultiInstance {
+                input_collection: "=[1]".to_string(),
+                input_element: None,
+                output_collection: Some("out3".to_string()),
+                output_element: Some("=result".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "mi3",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=result".to_string(),
+                    target: "o3".to_string(),
+                }],
+            },
+        )
+        .end_event("end")
+        .connect("start", "mi3")
+        .connect("mi3", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with("mi-out-map", vars(&[])))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let jobs = engine.activate_jobs("work", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1);
+
+    let evs = engine
+        .apply_command(Command::complete_job_with(
+            jobs[0].key,
+            vars(&[("result", Value::Int(85))]),
+        ))
+        .unwrap();
+    // `o3` is CREATED at the process (root) scope as the inner instance
+    // completes — before the child's slot is collected into `out3`.
+    let o3_at = evs.iter().position(|e| {
+        matches!(e, Event::VariablesUpdated { instance_key, variables }
+            if *instance_key == key && variables.get("o3") == Some(&Value::Int(85)))
+    });
+    let child_done_at = evs
+        .iter()
+        .position(|e| matches!(e, Event::MultiInstanceChildCompleted { .. }));
+    assert!(
+        matches!((o3_at, child_done_at), (Some(a), Some(b)) if a < b),
+        "o3 propagated to the root on child completion: {evs:#?}"
+    );
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, Event::VariablesUpdated { variables, .. }
+            if variables.get("out3") == Some(&Value::List(vec![Value::Int(85)])))),
+        "out3 still propagated on body completion: {evs:#?}"
+    );
+    assert!(engine.is_completed(key));
 }

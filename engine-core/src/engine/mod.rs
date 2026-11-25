@@ -11656,6 +11656,11 @@ impl Engine {
         // were already applied — and validated — by the caller.
         let validates_outputs =
             output_overlay.is_none() && !self.io_outputs(instance_key, &element_id).is_empty();
+        // The child's own mapped outputs, written through to the flow scope
+        // when the child completes (#1982): Zeebe applies an MI activity's
+        // `zeebe:output` per INNER instance, merging into the body with
+        // propagation (a name no ancestor holds is created at the root).
+        let mut child_output_updates: BTreeMap<String, Value> = BTreeMap::new();
         let post_view: Option<Arc<BTreeMap<String, Value>>> =
             if output_element.is_none() && completion_condition.is_none() && !validates_outputs {
                 None
@@ -11680,7 +11685,8 @@ impl Engine {
                             match self.eval_io_mappings_in(&visible, &outputs) {
                                 Ok(mapped) => {
                                     let mut vars = (*visible).clone();
-                                    vars.extend(mapped);
+                                    vars.extend(mapped.clone());
+                                    child_output_updates = mapped;
                                     Ok(vars)
                                 }
                                 Err(failure) => Err(failure),
@@ -11824,6 +11830,16 @@ impl Engine {
                 (Some(_), None) => unreachable!(),
             }
         };
+        if !child_output_updates.is_empty() {
+            let writes = self.propagated_updates(
+                instance_key,
+                body_key,
+                child_output_updates,
+                false,
+                &events,
+            );
+            events.extend(writes);
+        }
         events.push(Event::MultiInstanceChildCompleted {
             instance_key,
             body_key,
