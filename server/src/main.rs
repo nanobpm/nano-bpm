@@ -25375,15 +25375,15 @@ impl ServerImpl {
     /// **and** an unfiltered cancellation must not enqueue active call-activity
     /// children either.
     ///
-    /// The caller's `filter.state` is **always ignored and overridden to ACTIVE**:
-    /// every process-instance batch operation that consumes this matcher is
-    /// ACTIVE-only by contract — cancellation (only ACTIVE root instances are
-    /// cancellable, `spec/process-instances.yaml:371-375`) and incident-resolution
-    /// (only ACTIVE instances can have unresolved incidents,
-    /// `spec/process-instances.yaml:416-418`) both state "any given filters for
-    /// state … are ignored and overridden". Enforcing ACTIVE here (rather than
-    /// threading a per-call `state` policy) keeps the override in one place so a
-    /// caller cannot forget it and enqueue a COMPLETED/TERMINATED instance.
+    /// The caller's `filter.state` is **always ignored and overridden**: this
+    /// entry point applies the ACTIVE-only override every non-cancellation
+    /// batch uses (incident-resolution: only ACTIVE instances can have
+    /// unresolved incidents, `spec/process-instances.yaml:416-418`; migration /
+    /// modification), while cancellation calls
+    /// [`Self::batch_matched_process_instances_in`] with
+    /// [`ProcessInstanceStatePolicy::LiveOnly`] (ACTIVE and SUSPENDED roots,
+    /// `spec/process-instances.yaml:443-445`). Both overrides live in the
+    /// policy enum so a caller cannot enqueue a COMPLETED/TERMINATED instance.
     ///
     /// The `variables` filter is honoured exactly as
     /// `search_process_instances_impl` honours it: matched against the
@@ -25397,6 +25397,23 @@ impl ServerImpl {
         filter: &models::ProcessInstanceFilter,
         honour_hierarchy: BatchHierarchyPolicy,
     ) -> Vec<u64> {
+        self.batch_matched_process_instances_in(
+            filter,
+            ProcessInstanceStatePolicy::ActiveOnly,
+            honour_hierarchy,
+        )
+    }
+
+    /// [`Self::batch_matched_process_instances`] with an explicit state
+    /// override. Cancellation uses [`ProcessInstanceStatePolicy::LiveOnly`]
+    /// (ACTIVE and SUSPENDED roots, `spec/process-instances.yaml:443-445`);
+    /// every other batch keeps the ACTIVE-only override.
+    fn batch_matched_process_instances_in(
+        &self,
+        filter: &models::ProcessInstanceFilter,
+        state_policy: ProcessInstanceStatePolicy,
+        honour_hierarchy: BatchHierarchyPolicy,
+    ) -> Vec<u64> {
         // The same matcher `search_process_instances_impl` uses (one algebra,
         // including `$or` — #1293: an ignored `$or` here would silently broaden
         // a mutating batch), with the batch-specific state/hierarchy overrides.
@@ -25405,13 +25422,7 @@ impl ServerImpl {
             .store
             .process_instances()
             .into_iter()
-            .filter(|inst| {
-                matcher.matches(
-                    inst,
-                    ProcessInstanceStatePolicy::ActiveOnly,
-                    honour_hierarchy,
-                )
-            })
+            .filter(|inst| matcher.matches(inst, state_policy, honour_hierarchy))
             .map(|inst| inst.key)
             .collect();
         keys.sort_unstable();
@@ -25419,7 +25430,7 @@ impl ServerImpl {
     }
 
     /// `POST /v2/process-instances/cancellation` — mint a `CANCEL_PROCESS_INSTANCE`
-    /// batch operation over every ACTIVE root process instance matched by the
+    /// batch operation over every ACTIVE or SUSPENDED root process instance matched by the
     /// request filter and cancel each one (via the same
     /// [`Self::cancel_instance_core`] as the single-instance endpoint, #1863).
     async fn cancel_process_instances_batch_operation_impl(
@@ -25429,11 +25440,15 @@ impl ServerImpl {
         use apis::process_instance::CancelProcessInstancesBatchOperationResponse as Resp;
         let op_type = models::BatchOperationTypeEnum::CancelProcessInstance;
         // Cancellation ignores/overrides the supplied parent filters and targets
-        // only ACTIVE **root** instances (spec §371-375): the call-activity
+        // only ACTIVE/SUSPENDED **root** instances (spec §443-445): the call-activity
         // hierarchy filters must not scope this batch to a parent's children, and
         // an unfiltered request must not enqueue active call-activity children.
         let items = self
-            .batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::RootOnly)
+            .batch_matched_process_instances_in(
+                &body.filter,
+                ProcessInstanceStatePolicy::LiveOnly,
+                BatchHierarchyPolicy::RootOnly,
+            )
             .into_iter()
             .map(BatchItem::process_instance)
             .collect();
@@ -27072,6 +27087,9 @@ enum ProcessInstanceStatePolicy {
     /// Process-instance batch operations: `state` is ignored and overridden to
     /// ACTIVE (`spec/process-instances.yaml:371-375`, `416-418`).
     ActiveOnly,
+    /// Process-instance cancellation batch: `state` is ignored and overridden to
+    /// ACTIVE or SUSPENDED (`spec/process-instances.yaml:443-445`).
+    LiveOnly,
 }
 
 /// One AND-group of a process-instance filter (the top-level fields, or one
@@ -27164,6 +27182,10 @@ impl ProcessInstanceMatcher {
             ProcessInstanceStatePolicy::ActiveOnly => {
                 matches!(inst.state, ProcessInstanceState::Active)
             }
+            ProcessInstanceStatePolicy::LiveOnly => matches!(
+                inst.state,
+                ProcessInstanceState::Active | ProcessInstanceState::Suspended
+            ),
         };
         let root_ok = match hierarchy {
             BatchHierarchyPolicy::HonourFilters => true,
@@ -27291,7 +27313,7 @@ fn match_process_instance_group(
             &process_instance_state_enum(inst.state).to_string(),
         ),
         // Overridden to ACTIVE by the caller; the supplied `state` is ignored.
-        ProcessInstanceStatePolicy::ActiveOnly => true,
+        ProcessInstanceStatePolicy::ActiveOnly | ProcessInstanceStatePolicy::LiveOnly => true,
     };
     // Call-activity hierarchy filters (C8 parity, #977): a bare parent key
     // enumerates direct children; `$exists:false` selects top-level instances.
@@ -54751,7 +54773,21 @@ mod subscription_placement_tests {
         assert_eq!(timeout_state, models::BatchOperationStateEnum::Completed);
         assert_eq!(timeout_batch.operations_total_count, 2);
 
-        // --- Cancel batch: every ACTIVE root instance is cancelled. ---
+        // --- Cancel batch: every ACTIVE *and SUSPENDED* root instance is
+        // cancelled (`spec/process-instances.yaml`: "only ACTIVE and SUSPENDED
+        // root instances can be cancelled"). Suspend one first so a selected
+        // suspended root is proven to be cancelled, not silently skipped. ---
+        assert!(matches!(
+            server.suspend_instance_core(instances[1], None).await,
+            TransitionInstanceOutcome::Ok
+        ));
+        eventually("the second instance is suspended", || {
+            server
+                .store
+                .process_instance(instances[1])
+                .is_some_and(|i| i.state == ProcessInstanceState::Suspended)
+        })
+        .await;
         const CANCEL_REF: i64 = 0x0018_6303;
         let mut cancel_req = models::ProcessInstanceCancellationBatchOperationRequest::new(
             models::ProcessInstanceFilter::new(),

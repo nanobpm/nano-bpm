@@ -8746,3 +8746,27 @@ fn remote_message_correlation_routes_to_message_partition() {
     let legacy = remote(compose_key(1, 5), 0);
     assert_eq!(legacy.owning_partition(), 1);
 }
+
+/// `CancelInstance` accepts a SUSPENDED instance (Camunda parity,
+/// `spec/process-instances.yaml` cancellation: "only ACTIVE and SUSPENDED root
+/// instances can be cancelled"): its tokens are discarded and it terminates.
+#[test]
+fn cancel_of_a_suspended_instance_terminates_it() {
+    use crate::state::ProcessInstanceState;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    engine
+        .apply_command(Command::suspend_instance(key))
+        .unwrap();
+    engine.apply_command(Command::cancel_instance(key)).unwrap();
+    assert_eq!(
+        engine.instance(key).unwrap().state,
+        ProcessInstanceState::Terminated
+    );
+}
