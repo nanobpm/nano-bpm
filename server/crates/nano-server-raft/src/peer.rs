@@ -236,6 +236,20 @@ pub fn is_link_closed_result(r: &PeerResult) -> bool {
     r.status == 502 && matches!(&r.body, Some(Value::String(s)) if s == LINK_CLOSED_BODY)
 }
 
+/// The single choke point every awaited peer reply passes through (#1931):
+/// the synthetic link-closed reply (lane closed / retired mid-request) is a
+/// TRANSPORT failure, so it surfaces as `Err(PeerError::Closed)` — mapped by
+/// [`PeerError::http_status`] to a retryable 503 — never as an `Ok` 502 that
+/// forwarders would relay as a non-retryable 500/502. Non-idempotent callers
+/// still treat any `Err` after send as an ambiguous outcome (#1582).
+fn classify_reply(r: PeerResult) -> Result<PeerResult, PeerError> {
+    if is_link_closed_result(&r) {
+        Err(PeerError::Closed)
+    } else {
+        Ok(r)
+    }
+}
+
 impl PeerLink {
     /// Retires the APP lane only: aborts the app socket's writer and reader
     /// tasks (dropping queued app frames and closing that socket) and fails
@@ -624,7 +638,7 @@ impl PeerLink {
         }
 
         match tokio::time::timeout_at(deadline, rx).await {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok(result)) => classify_reply(result),
             Ok(Err(_)) => Err(PeerError::Closed),
             Err(_) => Err(PeerError::Timeout),
         }
@@ -2259,6 +2273,21 @@ mod tests {
             status: 503,
             body: Some(Value::String(LINK_CLOSED_BODY.into())),
         }));
+    }
+
+    /// #1931: a lane closing mid-request reaches callers as a retryable
+    /// transport error (503), not an `Ok` 502 that bypasses the mapping;
+    /// genuine peer replies (including a real 502) pass through untouched.
+    #[test]
+    fn link_closed_reply_surfaces_as_retryable_closed_error() {
+        let e = classify_reply(link_closed_result()).expect_err("link-closed is a transport error");
+        assert!(matches!(e, PeerError::Closed));
+        assert_eq!(e.http_status(), 503);
+        let real = PeerResult {
+            status: 502,
+            body: Some(Value::String("bad gateway".into())),
+        };
+        assert_eq!(classify_reply(real).map(|r| r.status).ok(), Some(502));
     }
 
     /// A partially-built link (first socket dialed, second failed/cancelled)
