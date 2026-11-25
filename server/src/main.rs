@@ -10485,7 +10485,11 @@ impl ServerImpl {
                     Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
                     Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
-                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
+                    // A migration is not deduplicated: re-applying mappings to
+                    // an already-migrated instance (e.g. `a→b, b→a`) can move
+                    // it again, so an unknown-outcome failure stays
+                    // non-retryable (#1931 review).
+                    Err(e) if e.write_http_status(false) == 503 => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
                 Err((503, m)) => Out::Unavailable(m),
@@ -43513,6 +43517,107 @@ mod clustered_startup_tests {
             .forward_complete_job_stream(owner, job_key, JobCompletion::default())
             .await;
         assert_eq!(status, 503, "stream complete: transport failure is 503");
+    }
+
+    /// #1931 review: a peer that ACCEPTS the link but closes it before replying
+    /// (an established connection failing post-send) must surface the job
+    /// forwards as a retryable 503 — exercising the post-connection `Err` arms,
+    /// not the connect-failure branch.
+    #[tokio::test]
+    async fn job_command_forward_post_connect_failure_is_retryable_503() {
+        use nano_falcon_protocol::cluster_join as cj;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+        let node0 = clustered_node(0);
+        node0
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("owner creates the demo instance");
+        let jobs = node0
+            .activate_for_stream("demo-work", "w", 10, 60_000, None)
+            .await;
+        let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
+
+        // A mute owner: completes the cluster handshake, then drops the socket
+        // as soon as a request frame arrives, without replying.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    #[allow(
+                        clippy::result_large_err,
+                        reason = "tungstenite's accept_hdr callback signature fixes the Err type"
+                    )]
+                    let callback = |req: &Request, mut resp: Response| {
+                        let parts = req.headers().get(cj::CLUSTER_PARTITIONS_HEADER).cloned();
+                        let headers = resp.headers_mut();
+                        if let Some(v) = parts {
+                            headers.insert(cj::CLUSTER_PARTITIONS_HEADER, v);
+                        }
+                        if let Ok(v) = HeaderValue::from_str(&cj::local_features_header()) {
+                            headers.insert(cj::CLUSTER_FEATURES_HEADER, v);
+                        }
+                        if let Ok(v) = HeaderValue::from_str(&cj::local_version_header()) {
+                            headers.insert(cj::CLUSTER_VERSION_HEADER, v);
+                        }
+                        Ok(resp)
+                    };
+                    if let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await
+                    {
+                        use futures_util::StreamExt as _;
+                        while let Some(Ok(m)) = ws.next().await {
+                            if m.is_text() || m.is_binary() {
+                                break; // drop the link mid-request
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![format!("http://{addr}"), "http://unused".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node1 = build_server_in_memory(journals, topology);
+        let owner = node1.remote_owner_of(job_key).expect("peer-owned job");
+
+        let complete = node1
+            .forward_complete_job(owner, job_key, JobCompletion::default())
+            .await;
+        assert!(
+            matches!(&complete, apis::job::CompleteJobResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503 && !p.detail.contains("unreachable")),
+            "complete: post-connect failure must be a retryable 503 from the established link, got {complete:?}"
+        );
+        let fail = node1
+            .forward_fail_job(owner, job_key, None, 0, String::new(), 0)
+            .await;
+        assert!(
+            matches!(&fail, apis::job::FailJobResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503 && !p.detail.contains("unreachable")),
+            "fail: post-connect failure must be a retryable 503, got {fail:?}"
+        );
+        let throw = node1
+            .forward_throw_error(owner, job_key, None, "E".into(), String::new(), None)
+            .await;
+        assert!(
+            matches!(&throw, apis::job::ThrowJobErrorResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503 && !p.detail.contains("unreachable")),
+            "throwError: post-connect failure must be a retryable 503, got {throw:?}"
+        );
+        let (status, _) = node1
+            .forward_complete_job_stream(owner, job_key, JobCompletion::default())
+            .await;
+        assert_eq!(status, 503, "stream complete: post-connect failure is 503");
     }
 
     #[tokio::test]
