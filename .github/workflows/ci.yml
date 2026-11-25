@@ -918,6 +918,32 @@ jobs:
       - name: 'Test (vitest: source map unit + headless DAP e2e)'
         run: npm test
 
+  kani:
+    name: kani (engine-core proofs)
+    runs-on: ubuntu-24.04
+    # Bounded model checking of the engine-core harnesses (#1960,
+    # formal/kani/README.md). Its own job with a hard job-level timeout so a
+    # harness that outgrows its bound can never hold the TLC job hostage; each
+    # harness is additionally boxed by check.sh (KANI_HARNESS_TIMEOUT).
+    needs: changes
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true' }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve pinned Kani version
+        id: kani
+        run: echo "version=$(sed -n 's/^KANI_VERSION="\(.*\)"$/\1/p' formal/kani/check.sh)" >> "$GITHUB_OUTPUT"
+      - name: Cache Kani toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-${{ steps.kani.outputs.version }}
+      - name: Kani proofs (one harness at a time, timed)
+        run: formal/kani/check.sh
+
   formal:
     name: formal (tlc)
     runs-on: ubuntu-24.04
@@ -940,19 +966,6 @@ jobs:
         with:
           path: ~/.cache/nanobpm-formal
           key: tla2tools-${{ steps.tla.outputs.version }}
-      - name: Cache Kani toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/cargo-kani
-            ~/.cargo/bin/kani
-            ~/.kani
-          key: kani-${{ hashFiles('formal/kani/check.sh') }}
-      - name: Kani proofs (engine-core code-level, #1960)
-        # Bounded model checking of engine-core harnesses (formal/kani/README.md).
-        # Time-boxed: a harness that outgrows the box must shrink its bounds.
-        timeout-minutes: 20
-        run: formal/kani/check.sh
       - name: Model-check
         # Keep every model's TLC log (with its -coverage statistics) for the
         # action-coverage gate below (#1248).

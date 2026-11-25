@@ -194,3 +194,44 @@ fn job_lease_lifecycle_keeps_indexes_in_lockstep() {
         }
     }
 }
+
+/// The parallel-diamond join (`P2` with incoming flows from `A` and `B`), as the
+/// pure guard `Engine::activate_join` applies to the Rust bookkeeping: tokens
+/// arrive over either flow in any order, and the join fires exactly when every
+/// incoming flow has been taken (`distinct_flows() >= incoming`). Firing
+/// consumes one token per flow and keeps the surplus (Tetris principle), so the
+/// join never fires more often than the scarcer flow delivered, and never
+/// before both flows delivered once.
+#[kani::proof]
+#[kani::unwind(4)]
+fn parallel_join_fires_only_when_every_flow_taken() {
+    const INCOMING: usize = 2;
+    let a = IncomingFlow {
+        from: "A".to_string(),
+        ordinal: 0,
+    };
+    let b = IncomingFlow {
+        from: "B".to_string(),
+        ordinal: 0,
+    };
+    let mut arrivals = FlowArrivals::default();
+    let (mut from_a, mut from_b, mut fired) = (0usize, 0usize, 0usize);
+    for _ in 0..STEPS {
+        if kani::any() {
+            arrivals.record(&a);
+            from_a += 1;
+        } else {
+            arrivals.record(&b);
+            from_b += 1;
+        }
+        if arrivals.distinct_flows() >= INCOMING {
+            arrivals.consume_one_each();
+            fired += 1;
+        }
+        assert!(fired == from_a.min(from_b), "fires once per full round");
+        assert!(arrivals.count(&a) == from_a - fired);
+        assert!(arrivals.count(&b) == from_b - fired);
+        assert!(arrivals.distinct_flows() < INCOMING, "a ready join never waits");
+        assert_join_invariant(&arrivals);
+    }
+}

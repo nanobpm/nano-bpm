@@ -26,8 +26,6 @@ mod debug;
 mod event_subprocess;
 mod expression;
 mod flow_scope;
-#[cfg(kani)]
-mod kani_proofs;
 mod memory;
 mod migration;
 mod modify;

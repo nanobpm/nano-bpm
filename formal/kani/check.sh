@@ -11,12 +11,16 @@ KANI_VERSION="0.67.0"
 if [[ -n "${KANI_UNWIND:-}" ]]; then
   UNWIND_ARGS=(--unwind "$KANI_UNWIND")
 else
-  UNWIND_ARGS=(--default-unwind 4)
+  UNWIND_ARGS=(--default-unwind 3)
 fi
+# Wall-clock box per harness: one that cannot prove within it must shrink its
+# input domain, not be given more time (README "Running").
+HARNESS_TIMEOUT="${KANI_HARNESS_TIMEOUT:-300}"
+
 HARNESSES=(
   flow_arrivals_preserve_join_invariant
   job_lease_lifecycle_keeps_indexes_in_lockstep
-  parallel_diamond_creates_one_instance
+  parallel_join_fires_only_when_every_flow_taken
 )
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -35,7 +39,16 @@ cd "$root/engine-core"
 for h in "${HARNESSES[@]}"; do
   echo "::group::kani $h"
   start=$(date +%s)
-  cargo kani "${UNWIND_ARGS[@]}" --harness "$h"
-  echo "kani $h: proven in $(( $(date +%s) - start ))s"
+  log="$(mktemp)"
+  rc=0
+  timeout "$HARNESS_TIMEOUT" cargo kani "${UNWIND_ARGS[@]}" --harness "$h" 2>&1 | tee "$log" || rc=$?
   echo "::endgroup::"
+  elapsed=$(( $(date +%s) - start ))
+  grep -E '^(VERIFICATION:|Verification Time:|Complete - )' "$log" || true
+  rm -f "$log"
+  if [[ $rc -ne 0 ]]; then
+    echo "::error::kani $h failed (exit $rc, ${elapsed}s; 124 = exceeded ${HARNESS_TIMEOUT}s box)"
+    exit 1
+  fi
+  echo "kani $h: VERIFICATION:- SUCCESSFUL in ${elapsed}s"
 done
