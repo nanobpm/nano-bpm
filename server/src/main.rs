@@ -10555,7 +10555,10 @@ impl ServerImpl {
                 {
                     Ok(r) if is_ok_status(r.status) => Out::Modified,
                     Ok(r) => Out::from_status(r.status, peer_detail(&r)),
-                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
+                    // A modification activates fresh element instances (no
+                    // dedup), so an unknown-outcome failure must stay
+                    // non-retryable (#1931 review).
+                    Err(e) if e.write_http_status(false) == 503 => Out::Unavailable(e.to_string()),
                     Err(e) => Out::Internal(e.to_string()),
                 },
                 Err((503, m)) => Out::Unavailable(m),
@@ -13284,7 +13287,7 @@ impl ServerImpl {
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_default(),
                 ),
-                Err(e) => (e.http_status(), e.to_string()),
+                Err(e) => (e.write_http_status(false), e.to_string()),
             },
             Err((s, m)) => (s, m),
         }
