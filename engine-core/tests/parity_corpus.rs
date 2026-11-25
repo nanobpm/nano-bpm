@@ -154,6 +154,8 @@ fn run_scenario(path: &Path) -> (Key, Vec<Event>) {
                 variables: v,
                 business_id: None,
                 message_key: None,
+                time_to_live: None,
+                message_id: None,
             }),
             "broadcastSignal" => run.apply(Command::BroadcastSignal {
                 signal_name: s("name"),

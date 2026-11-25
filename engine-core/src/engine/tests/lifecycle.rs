@@ -8234,6 +8234,8 @@ fn message_start_correlation_is_recorded() {
             variables: BTreeMap::new(),
             business_id: Some("biz-1".into()),
             message_key: None,
+            time_to_live: None,
+            message_id: None,
         })
         .unwrap();
     let message_key = events
