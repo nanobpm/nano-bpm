@@ -32,7 +32,10 @@ test("fmtClock does not construct a formatter per call", () => {
   fmtClock(0); // warm the shared formatter
   const Orig = Intl.DateTimeFormat;
   let constructed = 0;
-  const Spy = function (this: unknown, ...args: ConstructorParameters<typeof Orig>) {
+  const Spy = function (
+    this: unknown,
+    ...args: ConstructorParameters<typeof Orig>
+  ) {
     constructed++;
     return new Orig(...args);
   } as unknown as typeof Intl.DateTimeFormat;
@@ -40,7 +43,8 @@ test("fmtClock does not construct a formatter per call", () => {
   try {
     for (let i = 0; i < 100; i++) fmtClock(i * 60_000);
   } finally {
-    (Intl as { DateTimeFormat: typeof Intl.DateTimeFormat }).DateTimeFormat = Orig;
+    (Intl as { DateTimeFormat: typeof Intl.DateTimeFormat }).DateTimeFormat =
+      Orig;
   }
   assert.equal(constructed, 0);
 });
