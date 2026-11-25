@@ -169,6 +169,32 @@ fn spec_scalar_operand(s: &serde_yaml::Value) -> Option<J> {
     }
 }
 
+/// The `items` schema of an array-typed filter property schema `s`
+/// (following `$ref` / `allOf`); `None` for a non-array schema.
+fn spec_array_items(s: &serde_yaml::Value) -> Option<serde_yaml::Value> {
+    if s["type"].as_str() == Some("array") {
+        return Some(s["items"].clone());
+    }
+    if let Some(r) = s["$ref"].as_str() {
+        let target = r.rsplit('/').next().expect("ref target");
+        return spec_array_items(&schema(target));
+    }
+    s["allOf"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .find_map(spec_array_items)
+}
+
+/// Object-array filter properties with no scalar shorthand, each driven by
+/// [`check_array_filters`]. Any other non-scalar filter fails the guard.
+const ARRAY_FILTERS: &[&str] = &[
+    "$or",
+    "variables",
+    "processInstanceVariables",
+    "localVariables",
+];
+
 /// The schema of property `prop` of spec object schema `name` (following
 /// `allOf` / `$ref` like [`spec_properties`]).
 fn spec_property_schema(name: &str, prop: &str) -> Option<serde_yaml::Value> {
@@ -335,10 +361,23 @@ fn check_filters(op: &Op) -> usize {
         // The spec-derived well-formed operand; `None` = no scalar shorthand
         // (`$or`, variable joins — covered by `check_array_filters`).
         let prop_schema = spec_property_schema(op.filter_schema, &prop);
-        let Some(spec_operand) = prop_schema.as_ref().and_then(spec_scalar_operand) else {
+        // An array-typed property (`elementInstanceKeys`, `tags`) carries a
+        // LIST of scalar filter values: derive operand + operator admission
+        // from its `items` schema.
+        let item_schema = prop_schema.as_ref().and_then(spec_array_items);
+        let is_array = item_schema.is_some();
+        let elem_schema = item_schema.or(prop_schema);
+        let Some(spec_operand) = elem_schema.as_ref().and_then(spec_scalar_operand) else {
+            // No scalar shorthand: must be one of the object-array filters
+            // `check_array_filters` drives, never silently skipped.
+            assert!(
+                ARRAY_FILTERS.contains(&prop.as_str()),
+                "{}: filter {prop} is neither scalar nor covered by check_array_filters",
+                op.name
+            );
             continue;
         };
-        let takes_operators = prop_schema.as_ref().is_some_and(spec_accepts_operators);
+        let takes_operators = elem_schema.as_ref().is_some_and(spec_accepts_operators);
         // Whether the fixture carries a real value for the property (an empty
         // list, e.g. no `tags`, is as good as absent).
         let present = match &op.sample[&prop] {
@@ -351,9 +390,6 @@ fn check_filters(op: &Op) -> usize {
             J::Null => spec_operand,
             v => v.clone(),
         };
-        // An array-typed property (`elementInstanceKeys`) carries a LIST of
-        // per-element filter properties.
-        let is_array = op.sample[&prop].is_array();
         let wrap = |f: J| if is_array { json!([f]) } else { f };
         // Every request carries the op's baseline filter (e.g. history's
         // `commitStatus: PENDING`, without which every history query matches
@@ -1037,6 +1073,23 @@ fn spec_operands_are_well_formed_per_property_type() {
         "{key}"
     );
     assert_eq!(op("$or"), None);
+    // Scalar-array filters resolve their operand through `items`.
+    let item = |f: &str, p: &str| {
+        spec_property_schema(f, p)
+            .as_ref()
+            .and_then(spec_array_items)
+            .as_ref()
+            .and_then(spec_scalar_operand)
+    };
+    assert_eq!(
+        item("ProcessInstanceFilter", "tags"),
+        Some(json!("business_key:1234"))
+    );
+    assert_eq!(
+        item("UserTaskFilter", "tags"),
+        Some(json!("business_key:1234"))
+    );
+    assert!(item("AgentInstanceFilter", "elementInstanceKeys").is_some());
     let ops = |p: &str| {
         spec_property_schema("UserTaskFilter", p)
             .as_ref()
@@ -1056,4 +1109,14 @@ fn filter_guard_fails_when_both_surfaces_reject_a_well_formed_enum_operand() {
         check_filters(&stub_op("\"CREATING\""))
     }));
     assert!(r.is_err(), "guard passed despite rejected enum operand");
+}
+
+#[test]
+fn filter_guard_fails_when_both_surfaces_reject_a_tag_array_operand() {
+    // `tags` is a scalar-array filter: its shorthand must be probed (and
+    // accepted), not skipped as a non-scalar property.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_filters(&stub_op("business_key:1234"))
+    }));
+    assert!(r.is_err(), "guard passed despite rejected tags operand");
 }
