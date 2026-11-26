@@ -949,7 +949,7 @@ fn incident_fixture() -> (TestEngine, Vec<std::ops::Range<usize>>) {
         let res = eng.handle_request(
             "POST",
             "/v2/jobs/activation",
-            "{}",
+            r#"{"Content-Type":"application/json"}"#,
             &json!({ "type": "charge", "maxJobsToActivate": 1, "timeout": 60000, "worker": "w" })
                 .to_string(),
         );
@@ -974,12 +974,17 @@ fn incident_fixture() -> (TestEngine, Vec<std::ops::Range<usize>>) {
             let res = eng.handle_request(
                 "POST",
                 "/v2/jobs/activation",
-                "{}",
+                r#"{"Content-Type":"application/json"}"#,
                 &json!({ "type": "charge", "maxJobsToActivate": 1, "timeout": 60000, "worker": "w" })
                     .to_string(),
             );
             assert!(res.body.contains(&job), "{}", res.body);
-            let res = eng.handle_request("POST", &format!("/v2/jobs/{job}/completion"), "{}", "{}");
+            let res = eng.handle_request(
+                "POST",
+                &format!("/v2/jobs/{job}/completion"),
+                r#"{"Content-Type":"application/json"}"#,
+                "{}",
+            );
             assert_eq!(res.status, 204, "{}", res.body);
         }
         spans.push(start..eng.log.len());
