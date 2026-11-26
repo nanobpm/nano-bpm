@@ -6267,6 +6267,7 @@ fn project_event(
             accepted,
             consumed,
             deferred: false,
+            element_id: resolved_element_id,
             ..
         } => {
             let captured: Option<(i64, i64, String, String, String)> = tx
@@ -6290,7 +6291,10 @@ fn project_event(
                             message_key: *message_key,
                             host_key: *host_key as Key,
                             instance_key: *instance_key as Key,
-                            element_id,
+                            // The ack's resolved (post-migration) element
+                            // wins over the one captured at reservation
+                            // (#2037); a legacy ack carries none.
+                            element_id: resolved_element_id.as_ref().unwrap_or(element_id),
                             message_name,
                             correlation_key,
                         },
@@ -13480,6 +13484,8 @@ mod element_instance_tests {
                 consumed,
                 deferred,
                 partition: 0,
+                element_id: None,
+                process_definition_key: None,
             };
         // Deferred (suspended instance): still waiting, no history.
         store
@@ -13537,7 +13543,34 @@ mod element_instance_tests {
             consumed,
             deferred: false,
             partition: 0,
+            element_id: None,
+            process_definition_key: None,
         }
+    }
+
+    /// #2037: an instance migrated between the reservation and the
+    /// consumption — the history row names the element the ack resolved
+    /// (post-migration), not the one captured at reservation.
+    #[test]
+    fn paced_history_uses_the_acks_post_migration_element() {
+        let store = ReadStore::open(None).unwrap();
+        let mut ack = paced_ack(3301, 41, false, true);
+        if let Event::MessageCorrelationAcknowledged {
+            element_id,
+            process_definition_key,
+            ..
+        } = &mut ack
+        {
+            *element_id = Some("await-v2".to_string());
+            *process_definition_key = Some(7);
+        }
+        store
+            .export(&[&deploy(), &created(), &paced_sub_created(3301)])
+            .unwrap();
+        store.export(&[&paced_delivery(3301, 41), &ack]).unwrap();
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].element_id, "await-v2");
     }
 
     /// #1949 (Copilot r4701849028): a permanently rejected one-shot delivery

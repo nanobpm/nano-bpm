@@ -1607,6 +1607,27 @@ pub enum Event {
         /// Additive: `0` on a pre-receipt record (no receipt stored).
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
+        /// The RESOLVED consumption metadata (#2037): the element the
+        /// delivery was consumed at and the process definition the instance
+        /// runs, read from the instance partition's durable state when the
+        /// answer is derived — so an instance migrated between the message
+        /// partition's reservation and the consumption reports the
+        /// post-migration element and definition, not the stale ones the
+        /// delivery was routed with (Zeebe re-points the message-partition
+        /// subscription on migration). `None` when unresolvable and on a
+        /// pre-#2037 record (additive).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        element_id: Option<ElementId>,
+        /// See `element_id`: the instance's (post-migration) process
+        /// definition key. Additive.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        process_definition_key: Option<Key>,
     },
     /// The message partition applied an instance partition's acknowledgement
     /// (#1949): clears the canonical subscription's `awaiting_ack`; an
@@ -1625,6 +1646,20 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default))]
         deferred: bool,
         partition: u64,
+        /// See [`Event::MessageCorrelationAcknowledging`]'s `element_id`
+        /// (#2037): applying it re-points the canonical subscription.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        element_id: Option<ElementId>,
+        /// See [`Event::MessageCorrelationAcknowledging`]'s
+        /// `process_definition_key` (#2037). Additive.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        process_definition_key: Option<Key>,
     },
     /// A published message correlated to a process-level **message start
     /// event** and created instance `instance_key` (#1300; Zeebe records this as

@@ -40,6 +40,7 @@ ALL_HARNESSES=(
   job_index_resync_keeps_lockstep
   parallel_join_fires_only_when_every_flow_taken
   join_ready_kernel_total_and_exact
+  ack_outcome_kernel_is_consistent
 )
 # `--list` prints the canonical harness list (one per line) and exits; the
 # nightly workflow derives its matrix and failure report from it.

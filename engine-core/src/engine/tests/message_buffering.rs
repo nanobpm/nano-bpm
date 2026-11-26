@@ -873,6 +873,8 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
             consumed,
             deferred,
             delivery_key,
+            element_id,
+            process_definition_key,
             ..
         } => (
             true,
@@ -883,6 +885,8 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
                 accepted,
                 consumed,
                 deferred,
+                element_id,
+                process_definition_key,
             },
         ),
         _ => return None,
@@ -1187,6 +1191,8 @@ fn ack_paced_drain_replays_deterministically() {
                 accepted: true,
                 consumed: true,
                 deferred: false,
+                element_id: None,
+                process_definition_key: None,
             },
             2_002,
         )
@@ -3046,4 +3052,184 @@ fn a_close_before_the_deferred_ack_leaves_no_phantom_wait() {
     assert!(rig.instance.pending_resume_handshakes().is_empty());
     let second = rig.create("await-payment", &order, 3_000);
     assert_eq!(correlated(&rig, second), published, "{:?}", rig.trace);
+}
+
+/// #2037: an instance migrated BETWEEN the message partition's reservation of
+/// a buffered message (the in-flight ack-paced delivery) and the instance
+/// partition's consumption of it. The delivery itself still names the
+/// pre-migration catch (it was routed before the migration), but the
+/// durable receipt, the ack and the message partition's acknowledgement must
+/// carry the RESOLVED post-migration consumption metadata — the catch's new
+/// element id and the target process definition — exactly as Zeebe's
+/// message-partition subscription is re-pointed by `MessageSubscription
+/// MIGRATE` before it is `CORRELATED` (see the PR for the source citation).
+/// A re-driven duplicate is answered with the same metadata, and the message
+/// partition's canonical subscription is re-pointed at the migrated element.
+#[test]
+fn migration_between_reservation_and_consumption_acks_post_migration_metadata() {
+    let source = ProcessBuilder::new("await-payment")
+        .start_event("start")
+        .message_intermediate_catch_event("await", "payment-received", "orderId")
+        .end_event("end")
+        .connect("start", "await")
+        .connect("await", "end")
+        .build()
+        .unwrap();
+    let target = ProcessBuilder::new("await-payment")
+        .start_event("start")
+        .message_intermediate_catch_event("await-v2", "payment-received", "orderId")
+        .end_event("end")
+        .connect("start", "await-v2")
+        .connect("await-v2", "end")
+        .build()
+        .unwrap();
+    let (mut rig, order) = Rig::new(source);
+    let published = rig.publish_named_backlog("payment-received", &order, 1);
+    // Reserve: the buffered message is delivered to the (remote) catch, and
+    // the delivery is held in flight.
+    let (instance_key, held) = rig.create_holding("await-payment", &order, 2_000, &|c| {
+        matches!(c, Command::CorrelateMessageSubscription { .. })
+    });
+    assert_eq!(held.len(), 1, "exactly one delivery in flight: {held:?}");
+    let Command::CorrelateMessageSubscription { element_id, .. } = &held[0].1 else {
+        unreachable!()
+    };
+    assert_eq!(element_id, "await", "routed before the migration");
+    // Migrate while the reservation is in flight.
+    let deployed = rig.on_instance(Command::DeployProcess(target), 2_001);
+    let target_key = deployed
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .expect("target deployed");
+    rig.run(
+        false,
+        Command::MigrateInstance {
+            instance_key,
+            target_process_definition_key: target_key,
+            mapping_instructions: vec![("await".into(), "await-v2".into())],
+        },
+        2_002,
+    );
+    // Consume: the in-flight delivery arrives after the migration.
+    for (to_message, command) in held {
+        rig.run(to_message, command, 2_003);
+    }
+    let expected = (Some("await-v2".to_string()), Some(target_key));
+    let acking: Vec<_> = rig
+        .trace
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCorrelationAcknowledging {
+                element_id,
+                process_definition_key,
+                consumed,
+                ..
+            } => Some((*consumed, (element_id.clone(), *process_definition_key))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acking, vec![(true, expected.clone())], "{:?}", rig.trace);
+    let acked: Vec<_> = rig
+        .trace
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCorrelationAcknowledged {
+                element_id,
+                process_definition_key,
+                ..
+            } => Some((element_id.clone(), *process_definition_key)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acked, vec![expected.clone()]);
+    // The message partition's canonical subscription is re-pointed.
+    let canonical: Vec<_> = rig
+        .message
+        .state()
+        .message_subscriptions
+        .values()
+        .map(|s| s.element_id.clone())
+        .collect();
+    assert_eq!(canonical, vec!["await-v2".to_string()]);
+    // The consumed message stays taken by this instance.
+    assert!(rig
+        .message
+        .state()
+        .buffered_messages
+        .get(&published[0])
+        .is_none_or(|m| m.correlated_instances.contains(&instance_key)));
+    // Replay of both journals reproduces the live state.
+    let replayed = Engine::replay_partition(1, rig.message_journal.clone());
+    assert_eq!(replayed.state(), rig.message.state());
+    let replayed = Engine::replay_partition(0, rig.instance_journal.clone());
+    assert_eq!(replayed.state(), rig.instance.state());
+}
+
+/// #2037: a pinned receipt re-driven (lost ack) carries the same
+/// post-migration metadata as the original answer.
+#[test]
+fn a_redriven_receipt_carries_the_post_migration_metadata() {
+    let source = ProcessBuilder::new("await-payment")
+        .start_event("start")
+        .message_intermediate_catch_event("await", "payment-received", "orderId")
+        .end_event("end")
+        .connect("start", "await")
+        .connect("await", "end")
+        .build()
+        .unwrap();
+    let target = ProcessBuilder::new("await-payment")
+        .start_event("start")
+        .message_intermediate_catch_event("await-v2", "payment-received", "orderId")
+        .end_event("end")
+        .connect("start", "await-v2")
+        .connect("await-v2", "end")
+        .build()
+        .unwrap();
+    let (mut rig, order) = Rig::new(source);
+    rig.publish_named_backlog("payment-received", &order, 1);
+    let (instance_key, held) = rig.create_holding("await-payment", &order, 2_000, &|c| {
+        matches!(c, Command::CorrelateMessageSubscription { .. })
+    });
+    let deployed = rig.on_instance(Command::DeployProcess(target), 2_001);
+    let target_key = deployed
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .expect("target deployed");
+    rig.run(
+        false,
+        Command::MigrateInstance {
+            instance_key,
+            target_process_definition_key: target_key,
+            mapping_instructions: vec![("await".into(), "await-v2".into())],
+        },
+        2_002,
+    );
+    // Deliver, but drop the ack: the receipt stays pinned.
+    for (to_message, command) in held {
+        rig.run_holding(to_message, command, 2_003, &is_ack);
+    }
+    let redriven = rig.instance.pending_unsettled_receipts();
+    assert_eq!(redriven.len(), 1, "{redriven:?}");
+    let Event::MessageCorrelationAcknowledging {
+        element_id,
+        process_definition_key,
+        ..
+    } = &redriven[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(element_id.as_deref(), Some("await-v2"));
+    assert_eq!(*process_definition_key, Some(target_key));
 }

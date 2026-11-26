@@ -20,6 +20,7 @@ use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
+mod ack_outcome;
 mod agent_behavior;
 mod api;
 mod boundary;
@@ -5522,6 +5523,7 @@ impl Engine {
                             // The ORIGINAL answer, never one recomputed from
                             // the subscription's later state (#1949).
                             Some(receipt) => {
+                                let deferred = receipt.deferred;
                                 self.emit_receipt(&mut log, &ack, receipt);
                                 // A deferral answered while suspended whose
                                 // instance has since resumed: the message
@@ -5529,7 +5531,7 @@ impl Engine {
                                 // ack, then needs the resume handshake the
                                 // earlier resume could not complete (it found
                                 // the delivery still awaiting this ack).
-                                if receipt.deferred && !self.instance_is_suspended(instance_key) {
+                                if deferred && !self.instance_is_suspended(instance_key) {
                                     self.emit_subscription_resuming(&mut log, subscription_key);
                                 }
                             }
@@ -5624,6 +5626,8 @@ impl Engine {
                 accepted,
                 consumed,
                 deferred,
+                element_id,
+                process_definition_key,
             } => {
                 // Either way — applied now, or a duplicate / stale ack of a
                 // delivery no longer awaited — no re-drive of this delivery
@@ -5678,6 +5682,8 @@ impl Engine {
                         consumed,
                         deferred,
                         partition: self.partition_id,
+                        element_id,
+                        process_definition_key,
                     },
                 );
                 if consumed {
@@ -8093,6 +8099,10 @@ impl Engine {
                         partition: self.partition_id,
                         target_partition: self.partition_id,
                         delivery_key: ack.delivery_key,
+                        // A self-routed release: nothing was consumed, so
+                        // there is no resolved consumption metadata.
+                        element_id: None,
+                        process_definition_key: None,
                     });
                 };
                 Some(Event::RemoteMessageCorrelation {
@@ -8133,6 +8143,8 @@ impl Engine {
                     partition: self.partition_id,
                     target_partition: r.target_partition,
                     delivery_key,
+                    element_id: r.element_id,
+                    process_definition_key: r.process_definition_key,
                 },
             )
             .collect()
@@ -8319,24 +8331,39 @@ impl Engine {
     ///   its scope still waits.
     fn emit_correlation_ack(&mut self, log: &mut Vec<Event>, ack: PendingCorrelationAck) {
         let subscription = self.state.message_subscriptions.get(&ack.subscription_key);
-        let consumed = subscription.is_some_and(|s| {
-            if s.kind.stays_open_after_trigger() {
-                s.correlated_message_keys.contains(&ack.message_key)
-            } else {
-                s.state == state::MessageSubscriptionState::Correlated
-            }
-        });
-        let waiting =
-            subscription.is_some_and(|s| s.state == state::MessageSubscriptionState::Opening);
-        let accepted = consumed && waiting;
-        let deferred = !consumed && waiting && self.instance_is_suspended(ack.instance_key);
+        // Gather the durable facts; the decision is the pure kernel's.
+        let facts = ack_outcome::AckFacts {
+            subscription_present: subscription.is_some(),
+            stays_open: subscription.is_some_and(|s| s.kind.stays_open_after_trigger()),
+            message_recorded: subscription
+                .is_some_and(|s| s.correlated_message_keys.contains(&ack.message_key)),
+            correlated: subscription
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Correlated),
+            opening: subscription
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Opening),
+            instance_suspended: self.instance_is_suspended(ack.instance_key),
+        };
+        let outcome = ack_outcome::ack_outcome(facts);
+        // The RESOLVED consumption metadata (#2037), read from this
+        // partition's durable state now — after any migration that ran
+        // between the message partition's reservation and this consumption
+        // re-pointed the subscription and the instance.
+        let element_id = subscription.map(|s| s.element_id.clone());
+        let process_definition_key = self
+            .state
+            .instances
+            .get(&ack.instance_key)
+            .map(|i| i.process_definition_key)
+            .filter(|k| *k != 0);
         let receipt = state::CorrelationReceipt {
-            accepted,
-            consumed,
-            deferred,
+            accepted: outcome.accepted,
+            consumed: outcome.consumed,
+            deferred: outcome.deferred,
             message_key: ack.message_key,
             instance_key: ack.instance_key,
             target_partition: ack.target_partition,
+            element_id,
+            process_definition_key,
         };
         self.emit_receipt(log, &ack, receipt);
     }
@@ -8362,6 +8389,8 @@ impl Engine {
                 partition: self.partition_id,
                 target_partition: ack.target_partition,
                 delivery_key: ack.delivery_key,
+                element_id: receipt.element_id,
+                process_definition_key: receipt.process_definition_key,
             },
         );
     }

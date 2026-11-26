@@ -628,6 +628,20 @@ pub enum Command {
         /// subscription open and the message buffered (no next send).
         #[cfg_attr(feature = "serde", serde(default))]
         deferred: bool,
+        /// The resolved (post-migration) consumption metadata (#2037),
+        /// carried from [`crate::Event::MessageCorrelationAcknowledging`].
+        /// Additive: `None` from a pre-#2037 peer.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        element_id: Option<ElementId>,
+        /// See `element_id`. Additive.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        process_definition_key: Option<Key>,
     },
     /// The resume handshake (#1949), applied on the **message** partition
     /// (routed from [`crate::Event::MessageSubscriptionResuming`]): the
@@ -1363,6 +1377,8 @@ impl Command {
                 accepted,
                 consumed,
                 deferred,
+                element_id,
+                process_definition_key,
             } => {
                 h.key(*subscription_key);
                 h.key(*message_key);
@@ -1370,6 +1386,14 @@ impl Command {
                 h.str(if *accepted { "1" } else { "0" });
                 h.str(if *consumed { "1" } else { "0" });
                 h.str(if *deferred { "1" } else { "0" });
+                // #2037: only hashed when present, so a pre-#2037 command
+                // keeps its identity.
+                if let Some(element_id) = element_id {
+                    h.str(element_id);
+                }
+                if let Some(key) = process_definition_key {
+                    h.key(*key);
+                }
             }
             Command::SettleMessageCorrelationReceipt {
                 subscription_key,
