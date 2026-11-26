@@ -19687,9 +19687,6 @@ impl OwnedByInstance for state::Incident {
     }
 }
 
-/// The sorted set of root variable names a conditional event's FEEL `condition`
-/// references, used both to record the subscription's dependencies and to decide
-/// which variable changes re-evaluate it. Sorted for a deterministic event body.
 /// The dense, index-based view of a process graph the pure join guard
 /// ([`join_guard`]) decides over: the impure *collector* half of the guard.
 ///
@@ -19775,6 +19772,9 @@ impl<'a> JoinGraph<'a> {
     }
 }
 
+/// The sorted set of root variable names a conditional event's FEEL `condition`
+/// references, used both to record the subscription's dependencies and to decide
+/// which variable changes re-evaluate it. Sorted for a deterministic event body.
 fn sorted_referenced_vars(condition: &str) -> Vec<String> {
     // `referenced_variables` is a BTreeSet (#1662): already sorted.
     crate::feel::referenced_variables(condition)
