@@ -90,3 +90,38 @@ fn legacy_race_detector_names_instances_with_armed_races_only() {
         .legacy_event_gateway_race_instances()
         .is_empty());
 }
+
+/// Whole-instance teardown (a top-level completion — e.g. a terminate end — or
+/// a cancellation) bypasses per-gateway terminal events, so it must clear the
+/// gateway-owned subscriptions itself or they strand on the terminal shell.
+#[test]
+fn gateway_subscriptions_clear_on_whole_instance_teardown() {
+    for terminal in [
+        (|k| Event::ProcessInstanceCompleted { instance_key: k }) as fn(Key) -> Event,
+        |k| Event::ProcessInstanceTerminated { instance_key: k },
+    ] {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(gateway_race()))
+            .unwrap();
+        let inst =
+            create_instance_with_vars(&mut engine, "evt", vars(&[("key", Value::Str("k".into()))]));
+        let mut state = engine.state().clone();
+        crate::state::apply(
+            &mut state,
+            &Event::EventGatewaySubscriptionsOpened {
+                instance_key: inst,
+                gateway_element_instance_key: 9001,
+                gateway_element_id: "gw".to_string(),
+                catch_element_ids: vec!["onM1".to_string()],
+            },
+        );
+        assert!(!state.instances[&inst].gateway_subscriptions.is_empty());
+        crate::state::apply(&mut state, &terminal(inst));
+        assert!(
+            state.instances[&inst].gateway_subscriptions.is_empty(),
+            "teardown {:?} must clear gateway subscriptions",
+            terminal(inst)
+        );
+    }
+}

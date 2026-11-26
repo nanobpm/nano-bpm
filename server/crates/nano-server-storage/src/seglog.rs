@@ -1928,6 +1928,13 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     // unreadable event frame — both snapshot AND journal gone).
     sweep_unique_tmp(dir);
     let loaded = load_latest_snapshot_based(dir);
+    // #2003: an unmigratable typed load error (a legacy event-gateway race)
+    // carries operator guidance; surface it BEFORE the rebase floor, whose
+    // generic "re-seed" error would otherwise mask it.
+    let loaded = match loaded {
+        Err(e) if is_unmigratable_snapshot_error(&e) => return Err(e),
+        other => other,
+    };
     enforce_rebase_floor(
         dir,
         None,
@@ -3228,6 +3235,13 @@ pub fn recover_multi_scoped(
     let mut cold_backfill: Vec<(u64, (u64, Event))> = Vec::new();
     sweep_unique_tmp(dir);
     let loaded = load_multi_snapshot_based(dir);
+    // #2003: an unmigratable typed load error (a legacy event-gateway race)
+    // carries operator guidance; surface it BEFORE the rebase floor, whose
+    // generic "re-seed" error would otherwise mask it.
+    let loaded = match loaded {
+        Err(e) if is_unmigratable_snapshot_error(&e) => return Err(e),
+        other => other,
+    };
     for &p in owned {
         enforce_rebase_floor(
             dir,
@@ -6992,6 +7006,27 @@ mod tests {
             SnapshotLoadError::LegacyEventGatewayRace { .. }
         ));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #2003: with an adopted Raft rebase floor the snapshot cannot satisfy,
+    /// recovery must still surface the typed `LegacyEventGatewayRace` (with
+    /// its settle/cancel guidance), not the floor's generic "re-seed" error.
+    #[test]
+    fn legacy_race_refusal_precedes_rebase_floor() {
+        let dir = temp_dir("legacy-evt-race-floor");
+        let _ = journal_with_snapshot_at(&dir, "evt", 3);
+        write_rebase_floor(&dir, None, u64::MAX / 2).unwrap();
+        let Err(err) = crate::journal::Journal::open_segmented(&dir) else {
+            panic!("recovery must fail closed");
+        };
+        assert!(
+            matches!(
+                typed_err(&err),
+                SnapshotLoadError::LegacyEventGatewayRace { .. }
+            ),
+            "got {err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
