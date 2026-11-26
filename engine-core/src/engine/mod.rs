@@ -7219,6 +7219,23 @@ impl Engine {
                     PendingTimerFire::Timer(key) => self.fire_due_timer(log, &mut queue, key),
                     PendingTimerFire::Start(key) => self.fire_start_timer(log, &mut queue, key),
                 }
+                // The batch's last TRIGGER is written: guard the held-back
+                // inclusive-join arrivals again (#2018) AHEAD of this fire's
+                // downstream work, preserving Zeebe's first-in first-out order
+                // (each held-back ACTIVATE was queued before this fire's
+                // follow-ups), so a token still in transit from this fire is a
+                // live path to them rather than already consumed (r4703480366).
+                if self.pending_timer_fires.is_empty() {
+                    for d in self.deferred_join_arrivals.drain(..).rev() {
+                        queue.push_front(Step::Activate {
+                            instance_key: d.instance_key,
+                            element_id: d.element_id,
+                            scope: d.scope,
+                            via: d.via,
+                            race: None,
+                        });
+                    }
+                }
                 if log.len() > fired_from {
                     if let Drive::Pause = driver.after_step(&log[fired_from..]) {
                         return Some(Paused { queue, cursor });
@@ -7226,22 +7243,10 @@ impl Engine {
                 }
                 continue;
             }
-            // Every timer of the batch has fired: guard the held-back
-            // inclusive-join arrivals again (#2018).
-            if !self.deferred_join_arrivals.is_empty() {
-                queue.extend(
-                    self.deferred_join_arrivals
-                        .drain(..)
-                        .map(|d| Step::Activate {
-                            instance_key: d.instance_key,
-                            element_id: d.element_id,
-                            scope: d.scope,
-                            via: d.via,
-                            race: None,
-                        }),
-                );
-                continue;
-            }
+            debug_assert!(
+                self.deferred_join_arrivals.is_empty(),
+                "held-back join arrivals are re-queued with the batch's last fire (#2018)"
+            );
             self.debug_assert_join_bookkeeping_coherent(log);
             return None;
         }

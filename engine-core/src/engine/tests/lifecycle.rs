@@ -9156,3 +9156,56 @@ fn inclusive_join_fires_per_arrival_when_a_tick_fires_a_catch_and_a_boundary_ups
     let fired = engine.trigger_timers(60_000);
     assert_eq!(join_fire_count(&fired, "g2"), 2, "{fired:#?}");
 }
+
+/// #2018 review (r4703480366): three catches due in one tick — `w1` and `w2`
+/// both feed the join input `x -> g2`, `w3` reaches the other input through
+/// the longer chain `a -> b`. Zeebe writes all three TRIGGERs, then runs the
+/// follow-ups first-in first-out: `w1`'s and `w2`'s join guards both still
+/// see `w3`'s token in transit and park; `w3`'s arrival then consumes one
+/// token per input, and the surplus stays parked. A held-back arrival must be
+/// re-guarded in that order — ahead of the last fire's downstream work — not
+/// at full quiescence, where it would fire the join a second time.
+#[test]
+fn inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_work() {
+    let def = ProcessBuilder::new("inc-tick-three")
+        .start_event("s")
+        .inclusive_gateway("g1")
+        .timer_intermediate_catch_event("w1", 60_000)
+        .timer_intermediate_catch_event("w2", 60_000)
+        .timer_intermediate_catch_event("w3", 60_000)
+        .exclusive_gateway("x")
+        .exclusive_gateway("a")
+        .exclusive_gateway("b")
+        .inclusive_gateway("g2")
+        .end_event("e")
+        .connect("s", "g1")
+        // Connected last-first: the split activates `w3` first, so its timer
+        // is due last in the batch, as in the reviewed scenario.
+        .connect_when("g1", "w3", "true")
+        .connect_when("g1", "w2", "true")
+        .connect_when("g1", "w1", "true")
+        .connect("w1", "x")
+        .connect("w2", "x")
+        .connect("x", "g2")
+        .connect("w3", "a")
+        .connect("a", "b")
+        .connect("b", "g2")
+        .connect("g2", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command_at(Command::create_instance("inc-tick-three"), 0)
+        .unwrap();
+    let fired = engine.trigger_timers(60_000);
+    let order: Vec<&str> = fired
+        .iter()
+        .filter_map(|e| match e {
+            Event::TimerTriggered { element_id, .. } => Some(element_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order.last(), Some(&"w3"), "{fired:#?}");
+    assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
+}
