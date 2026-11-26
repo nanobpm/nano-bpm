@@ -7860,7 +7860,10 @@ impl SpillConfig {
         // incident inline — they are handed to the leader-propose channel the
         // replication layer wires (`set_orphan_sink`) so the leader re-proposes
         // them with a replicated timestamp.
-        journal.set_replicated_apply(raft_enabled());
+        // #2054: monotonic — never DOWNGRADE a journal a caller already marked
+        // replicated (e.g. a Raft replica built without `NANOBPMN_RAFT`), or
+        // spill setup would re-enable out-of-entry capability arming.
+        journal.set_replicated_apply(journal.replicated_apply() || raft_enabled());
         if let Some(cfg) = &self.var {
             match cfg {
                 VarSpillCfg::Budget(budget) => {
@@ -51125,6 +51128,12 @@ mod clustered_startup_tests {
         assert!(
             replica.with(|j| j.cold_spill_configured()).await,
             "configured spill => replica engine inherits the cold store"
+        );
+        // #2054: spill setup must not downgrade the replica's replicated-apply
+        // mark (SpillConfig::apply runs after replica_engine_for marks it).
+        assert!(
+            replica.with(|j| j.replicated_apply()).await,
+            "a replica engine with spill configured must still be a replicated-apply journal"
         );
     }
 
