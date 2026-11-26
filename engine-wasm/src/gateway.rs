@@ -330,6 +330,7 @@ fn form_decode(raw: &str) -> Result<String, Problem> {
             b'%' => {
                 let byte = bytes
                     .get(i + 1..i + 3)
+                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
                     .and_then(|h| std::str::from_utf8(h).ok())
                     .and_then(|h| u8::from_str_radix(h, 16).ok())
                     .ok_or_else(|| {

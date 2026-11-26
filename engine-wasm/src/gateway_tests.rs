@@ -654,7 +654,14 @@ fn query_parameters_are_form_decoded() {
         &json!({}),
     );
     assert_eq!(res.status, 400, "{}", res.body);
-    for bad in ["truncateValues=%6", "truncateValues=%zz", "%G1=x", "a=%ff"] {
+    for bad in [
+        "truncateValues=%6",
+        "truncateValues=%zz",
+        "%G1=x",
+        "a=%ff",
+        "truncateValues=%+fals",
+        "a=%-1",
+    ] {
         let res = call(
             &mut eng,
             "POST",
