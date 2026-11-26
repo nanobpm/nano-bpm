@@ -45,6 +45,10 @@ nanobpmn-search = { path = "../server/crates/nano-search", default-features = fa
 multer = { version = "3.1", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
+# The media-type parser axum's `Json` extractor uses for its 415 check (#2020):
+# the `handle()` driver applies the SAME rule so both transports accept exactly
+# the same `Content-Type`s.
+mime = { version = "0.3", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Builds the ProblemDetail-shaped JS `Error` engine rejections throw (#1937).
@@ -76,7 +80,7 @@ validator = "0.20"
 # `searchVariables`). Every field, import and method it adds is gated behind
 # `#[cfg(feature = "read-model")]`, so the feature-OFF build links no new
 # dependency and keeps its lean baseline size.
-read-model = ["dep:nanobpmn-read-model", "dep:nanobpmn-search", "dep:multer", "dep:bytes", "dep:futures-util"]
+read-model = ["dep:nanobpmn-read-model", "dep:nanobpmn-search", "dep:multer", "dep:bytes", "dep:futures-util", "dep:mime"]
 
 [profile.release]
 opt-level = "z"

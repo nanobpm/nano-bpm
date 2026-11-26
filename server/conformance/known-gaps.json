@@ -8,7 +8,7 @@
   "errors/create-unknown-process": {
     "issue": "https://github.com/nanobpm/nano-bpm/issues/1957",
     "diffs": [
-      "outcome: server Rejected { status: Some(400), title: Some(\"Process not found\") }, wasm Rejected { status: None, title: None }"
+      "outcome: server Rejected { status: Some(400), title: Some(\"INVALID_ARGUMENT\") }, wasm Rejected { status: None, title: None }"
     ]
   },
   "fail-with-backoff/activate-during-backoff": {
