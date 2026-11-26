@@ -234,3 +234,56 @@ fn replayed_legacy_journal_tail_is_detected() {
         );
     }
 }
+
+/// A gateway-triggered catch whose path leads to an inclusive join is an
+/// in-transit join source (#2004): when one signal triggers both the
+/// gateway's catch and a sibling branch's catch, the join must wait for the
+/// gateway branch instead of firing early and then again.
+#[test]
+fn inclusive_join_waits_for_a_gateway_triggered_catch() {
+    for gateway_first in [true, false] {
+        let mut b = ProcessBuilder::new("p")
+            .start_event("start")
+            .parallel_gateway("fork")
+            .event_based_gateway("gw")
+            .signal_intermediate_catch_event("onGw", "go")
+            .timer_intermediate_catch_event("onTimer", 60_000)
+            .signal_intermediate_catch_event("onSib", "go")
+            .inclusive_gateway("join")
+            .end_event("end")
+            .end_event("timerEnd")
+            .connect("start", "fork");
+        b = if gateway_first {
+            b.connect("fork", "gw").connect("fork", "onSib")
+        } else {
+            b.connect("fork", "onSib").connect("fork", "gw")
+        };
+        let def = b
+            .connect("gw", "onGw")
+            .connect("gw", "onTimer")
+            .connect("onTimer", "timerEnd")
+            .connect("onGw", "join")
+            .connect("onSib", "join")
+            .connect("join", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        deploy_for_migration(&mut engine, def);
+        let inst = create_instance_with_vars(&mut engine, "p", BTreeMap::new());
+        let events = engine.broadcast_signal("go", BTreeMap::new(), 0);
+        let join_completions = events
+            .iter()
+            .filter(
+                |e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id == "join"),
+            )
+            .count();
+        assert_eq!(
+            join_completions, 1,
+            "gateway_first={gateway_first}: {events:?}"
+        );
+        assert_eq!(
+            engine.instance(inst).unwrap().state,
+            ProcessInstanceState::Completed
+        );
+    }
+}

@@ -519,3 +519,49 @@ fn migration_onto_gateway_owned_catch_is_not_a_legacy_race() {
         "a migrated new-build instance must not be refused as a legacy race"
     );
 }
+
+/// A newly subscribed target catch evaluates its correlation key in the
+/// gateway's own scope (#2004), so a gateway input mapping shadows the
+/// instance-level variable of the same name.
+#[test]
+fn new_gateway_catch_correlates_with_gateway_scope_variables() {
+    let gw_io = |gw: &str, b: ProcessBuilder| {
+        b.with_io(
+            gw,
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=\"gw\"".to_string(),
+                    target: "orderId".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .build()
+        .unwrap()
+    };
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        gw_io("gw", race_builder("source", "", "reply")),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        gw_io("gw2", race_builder("target", "2", "reply")),
+    );
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "source",
+        vars(&[("orderId", Value::Str("inst".into()))]),
+    );
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("gw", "gw2"), ("onTimer", "onTimer2"), ("onSig", "onSig2")]),
+        ))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::correlate_message("reply", "gw"))
+        .unwrap();
+    assert_completed_via(&engine, inst, &events, "endMsg2");
+}
