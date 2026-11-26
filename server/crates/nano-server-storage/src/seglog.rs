@@ -1334,6 +1334,53 @@ pub enum SnapshotLoadError {
         /// Human-readable reason (which stage failed and why).
         reason: String,
     },
+    /// A pre-v4 snapshot holds in-flight LEGACY event-based gateway races
+    /// (#1676 catches armed by a completed gateway) that the v4 gateway-owned
+    /// subscription model (#1963 / #2003) cannot represent. FATAL and NOT
+    /// migrated by replay: the operator must let these instances settle (or
+    /// cancel them) on the previous release before upgrading. Never a silent
+    /// drop or rewind (#1065 / #1066).
+    LegacyEventGatewayRace {
+        /// The process instances carrying an armed legacy race (ascending).
+        instance_keys: Vec<u64>,
+    },
+}
+
+/// The first [`SNAPSHOT_FORMAT_VERSION`] whose state carries gateway-owned
+/// event-based gateway subscriptions (#2003). Older snapshots load unchanged
+/// unless they hold an in-flight legacy race.
+const GATEWAY_OWNED_SUBSCRIPTIONS_FORMAT_VERSION: u32 = 4;
+
+/// Refuses a pre-v4 snapshot that carries an armed legacy event-gateway race
+/// ([`SnapshotLoadError::LegacyEventGatewayRace`]); every other snapshot passes.
+fn refuse_legacy_event_gateway_races<'a>(
+    version: u32,
+    snaps: impl IntoIterator<Item = &'a EngineSnapshot>,
+) -> Result<(), SnapshotLoadError> {
+    if version >= GATEWAY_OWNED_SUBSCRIPTIONS_FORMAT_VERSION {
+        return Ok(());
+    }
+    let mut instance_keys: Vec<u64> = snaps
+        .into_iter()
+        .flat_map(|s| s.state.legacy_event_gateway_race_instances())
+        .collect();
+    instance_keys.sort_unstable();
+    instance_keys.dedup();
+    if instance_keys.is_empty() {
+        Ok(())
+    } else {
+        Err(SnapshotLoadError::LegacyEventGatewayRace { instance_keys })
+    }
+}
+
+/// `true` when `e` is a typed snapshot error that must fail closed instead of
+/// routing to the #1071 replay-migrator.
+fn is_unmigratable_snapshot_error(e: &io::Error) -> bool {
+    matches!(
+        e.get_ref()
+            .and_then(|r| r.downcast_ref::<SnapshotLoadError>()),
+        Some(SnapshotLoadError::LegacyEventGatewayRace { .. })
+    )
 }
 
 impl std::fmt::Display for SnapshotLoadError {
@@ -1347,6 +1394,14 @@ impl std::fmt::Display for SnapshotLoadError {
             SnapshotLoadError::Corrupt { reason } => {
                 write!(f, "snapshot present but unreadable: {reason}")
             }
+            SnapshotLoadError::LegacyEventGatewayRace { instance_keys } => write!(
+                f,
+                "snapshot holds in-flight legacy event-based gateway races in process \
+                 instances {instance_keys:?}, which this build (snapshot format v{}) cannot \
+                 represent; let them settle (or cancel them) on the previous release before \
+                 upgrading (fail-closed, no migration)",
+                SNAPSHOT_FORMAT_VERSION
+            ),
         }
     }
 }
@@ -1710,7 +1765,7 @@ fn load_latest_snapshot_based(
         }
         .into());
     }
-    if version == STREAMING_SNAPSHOT_FORMAT_VERSION {
+    if version >= STREAMING_SNAPSHOT_FORMAT_VERSION {
         // Read the v3 chunked stream back in ONE pass: the control frame hands
         // us the covered-event count and the control skeleton, then each
         // instance chunk is restored into it as it streams by — the whole
@@ -1744,6 +1799,7 @@ fn load_latest_snapshot_based(
         let (engine, covered) = acc.into_inner().ok_or_else(|| SnapshotLoadError::Corrupt {
             reason: "streaming snapshot had no control frame".to_string(),
         })?;
+        refuse_legacy_event_gateway_races(version, [&engine])?;
         return Ok(Some((engine, covered, base_id)));
     }
     // Legacy monolithic framing (v0 headerless, v1, v2).
@@ -1754,6 +1810,7 @@ fn load_latest_snapshot_based(
         serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
             reason: format!("snapshot payload deserialize failed: {e}"),
         })?;
+    refuse_legacy_event_gateway_races(version, [&snap.engine])?;
     Ok(Some((snap.engine, snap.covered_events, snap.base_id)))
 }
 
@@ -1871,6 +1928,13 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     // unreadable event frame — both snapshot AND journal gone).
     sweep_unique_tmp(dir);
     let loaded = load_latest_snapshot_based(dir);
+    // #2003: an unmigratable typed load error (a legacy event-gateway race)
+    // carries operator guidance; surface it BEFORE the rebase floor, whose
+    // generic "re-seed" error would otherwise mask it.
+    let loaded = match loaded {
+        Err(e) if is_unmigratable_snapshot_error(&e) => return Err(e),
+        other => other,
+    };
     enforce_rebase_floor(
         dir,
         None,
@@ -1973,10 +2037,13 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
             }
         },
         Err(e) => {
-            // A non-typed io error (a real read failure) just propagates.
-            if e.get_ref()
-                .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
-                .is_none()
+            // A non-typed io error (a real read failure) just propagates, as
+            // does an unmigratable typed one (#2003 legacy event-gateway race:
+            // replay must not paper over it).
+            if is_unmigratable_snapshot_error(&e)
+                || e.get_ref()
+                    .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
+                    .is_none()
             {
                 return Err(e);
             }
@@ -2943,7 +3010,7 @@ fn load_multi_snapshot_based(dir: &Path) -> io::Result<Option<(MultiEngines, Mul
         }
         .into());
     }
-    if version == STREAMING_SNAPSHOT_FORMAT_VERSION {
+    if version >= STREAMING_SNAPSHOT_FORMAT_VERSION {
         let (map, ids) =
             crate::snapstream::read_multi_streaming_snapshot_based(&path).map_err(|e| {
                 match e
@@ -2957,6 +3024,7 @@ fn load_multi_snapshot_based(dir: &Path) -> io::Result<Option<(MultiEngines, Mul
                     .into(),
                 }
             })?;
+        refuse_legacy_event_gateway_races(version, map.values().map(|(_, s)| s))?;
         let bases = map
             .iter()
             .map(|(p, (covered, _))| (*p, (*covered, ids.get(p).copied())))
@@ -2971,6 +3039,7 @@ fn load_multi_snapshot_based(dir: &Path) -> io::Result<Option<(MultiEngines, Mul
         serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
             reason: format!("multi-snapshot payload deserialize failed: {e}"),
         })?;
+    refuse_legacy_event_gateway_races(version, snap.entries.iter().map(|e| &e.engine))?;
     let bases = snap
         .entries
         .iter()
@@ -3166,6 +3235,13 @@ pub fn recover_multi_scoped(
     let mut cold_backfill: Vec<(u64, (u64, Event))> = Vec::new();
     sweep_unique_tmp(dir);
     let loaded = load_multi_snapshot_based(dir);
+    // #2003: an unmigratable typed load error (a legacy event-gateway race)
+    // carries operator guidance; surface it BEFORE the rebase floor, whose
+    // generic "re-seed" error would otherwise mask it.
+    let loaded = match loaded {
+        Err(e) if is_unmigratable_snapshot_error(&e) => return Err(e),
+        other => other,
+    };
     for &p in owned {
         enforce_rebase_floor(
             dir,
@@ -3231,9 +3307,10 @@ pub fn recover_multi_scoped(
             }
         }
         Err(e) => {
-            if e.get_ref()
-                .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
-                .is_none()
+            if is_unmigratable_snapshot_error(&e)
+                || e.get_ref()
+                    .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
+                    .is_none()
             {
                 return Err(e);
             }
@@ -4299,8 +4376,8 @@ mod tests {
         let mut lines = text.lines();
         let header = lines.next().expect("header line");
         assert!(
-            header.contains("\"format_version\":3"),
-            "v3 chunked framing header, got: {header}"
+            header.contains(&format!("\"format_version\":{SNAPSHOT_FORMAT_VERSION}")),
+            "chunked framing header at the current format version, got: {header}"
         );
         let control = lines.next().expect("control frame");
         assert!(
@@ -6844,6 +6921,163 @@ mod tests {
         out.push(b'\n');
         out.extend_from_slice(payload);
         fs::write(path, &out).expect("rewrite header");
+    }
+
+    /// Rewrites the snapshot envelope header at `path` to advertise
+    /// `format_version`, payload bytes untouched (an older-build snapshot).
+    fn set_snapshot_header_version(path: &Path, format_version: u32) {
+        let bytes = fs::read(path).expect("snapshot exists");
+        let nl = bytes.iter().position(|&b| b == b'\n').expect("header line");
+        let header = SnapshotHeader {
+            format_version,
+            incarnation: 1,
+            engine_fingerprint: "previous-build".into(),
+        };
+        let mut out = serde_json::to_vec(&header).unwrap();
+        out.push(b'\n');
+        out.extend_from_slice(&bytes[nl + 1..]);
+        fs::write(path, &out).expect("rewrite header");
+    }
+
+    /// start -> event-based gateway -> { M1 | M2 } -> end: creating an instance
+    /// arms a legacy (#1676) race under the current runtime.
+    fn event_gateway_race() -> nanobpmn_engine_core::ProcessDefinition {
+        ProcessBuilder::new("evt")
+            .start_event("start")
+            .event_based_gateway("gw")
+            .message_intermediate_catch_event("onM1", "M1", "=\"k\"")
+            .message_intermediate_catch_event("onM2", "M2", "=\"k\"")
+            .end_event("end")
+            .connect("start", "gw")
+            .connect("gw", "onM1")
+            .connect("gw", "onM2")
+            .connect("onM1", "end")
+            .connect("onM2", "end")
+            .build()
+            .expect("valid event-gateway process")
+    }
+
+    /// Writes a journal (deploy + one `process_id` instance), snapshots it, and
+    /// rewrites the snapshot header to `format_version`. Returns the instance key.
+    fn journal_with_snapshot_at(dir: &Path, process_id: &str, format_version: u32) -> u64 {
+        let (mut journal, _recovery) =
+            crate::journal::Journal::open_segmented(dir).expect("open segmented");
+        let _ = journal
+            .apply_synced(Command::DeployProcess(event_gateway_race()))
+            .unwrap();
+        let _ = journal
+            .apply_synced(Command::DeployProcess(demo()))
+            .unwrap();
+        let key = journal
+            .apply_synced(Command::create_instance(process_id))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+        write_snapshot(dir, snap, covered).expect("write snapshot");
+        set_snapshot_header_version(&snap_path(dir, covered), format_version);
+        key
+    }
+
+    /// #2003: a v3 snapshot holding an armed legacy event-gateway race is
+    /// refused with the typed `LegacyEventGatewayRace` naming the instance —
+    /// both by the loader and by recovery, which must NOT route it to the
+    /// replay-migrator (fail-closed, never a silent drop/rewind).
+    #[test]
+    fn v3_snapshot_with_legacy_event_gateway_race_fails_closed() {
+        let dir = temp_dir("legacy-evt-race");
+        let key = journal_with_snapshot_at(&dir, "evt", 3);
+
+        let err = load_latest_snapshot(&dir).expect_err("legacy race is fatal");
+        match typed_err(&err) {
+            SnapshotLoadError::LegacyEventGatewayRace { instance_keys } => {
+                assert_eq!(instance_keys, &vec![key]);
+            }
+            other => panic!("expected LegacyEventGatewayRace, got {other:?}"),
+        }
+        assert!(err.to_string().contains("legacy event-based gateway"));
+
+        let Err(err) = crate::journal::Journal::open_segmented(&dir) else {
+            panic!("recovery must fail closed, not migrate by replay");
+        };
+        assert!(matches!(
+            typed_err(&err),
+            SnapshotLoadError::LegacyEventGatewayRace { .. }
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #2003: with an adopted Raft rebase floor the snapshot cannot satisfy,
+    /// recovery must still surface the typed `LegacyEventGatewayRace` (with
+    /// its settle/cancel guidance), not the floor's generic "re-seed" error.
+    #[test]
+    fn legacy_race_refusal_precedes_rebase_floor() {
+        let dir = temp_dir("legacy-evt-race-floor");
+        let _ = journal_with_snapshot_at(&dir, "evt", 3);
+        write_rebase_floor(&dir, None, u64::MAX / 2).unwrap();
+        let Err(err) = crate::journal::Journal::open_segmented(&dir) else {
+            panic!("recovery must fail closed");
+        };
+        assert!(
+            matches!(
+                typed_err(&err),
+                SnapshotLoadError::LegacyEventGatewayRace { .. }
+            ),
+            "got {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #2003: a v3 snapshot WITHOUT an in-flight legacy race migrates — it
+    /// loads unchanged and recovery succeeds.
+    #[test]
+    fn v3_snapshot_without_legacy_race_migrates() {
+        let dir = temp_dir("v3-no-race");
+        let key = journal_with_snapshot_at(&dir, "demo", 3);
+
+        assert!(load_latest_snapshot(&dir).expect("v3 loads").is_some());
+        let (reopened, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("v3 recovers");
+        assert!(!recovery.fresh);
+        assert!(reopened.instance(key).is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #2003: a current-format (v4) snapshot is never refused, race or not.
+    #[test]
+    fn v4_snapshot_with_race_loads() {
+        let dir = temp_dir("v4-race");
+        let _ = journal_with_snapshot_at(&dir, "evt", SNAPSHOT_FORMAT_VERSION);
+        assert!(load_latest_snapshot(&dir).expect("v4 loads").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #2003 multi-partition loader: the same refusal applies to every entry.
+    #[test]
+    fn legacy_race_refusal_covers_every_multi_partition_entry() {
+        let mut racing = Engine::new();
+        racing
+            .apply_command(Command::DeployProcess(event_gateway_race()))
+            .unwrap();
+        let key = racing
+            .apply_command(Command::create_instance("evt"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        let racing = racing.snapshot();
+        let calm = demo_snapshot();
+        assert!(refuse_legacy_event_gateway_races(3, [&calm]).is_ok());
+        assert!(refuse_legacy_event_gateway_races(4, [&calm, &racing]).is_ok());
+        match refuse_legacy_event_gateway_races(3, [&calm, &racing]) {
+            Err(SnapshotLoadError::LegacyEventGatewayRace { instance_keys }) => {
+                assert_eq!(instance_keys, vec![key]);
+            }
+            other => panic!("expected LegacyEventGatewayRace, got {other:?}"),
+        }
     }
 
     /// [`bump_snapshot_header_to_future`] for the single-partition snapshot

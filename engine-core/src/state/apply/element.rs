@@ -79,6 +79,8 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 instance.gateway_routes.remove(element_instance_key);
                 // An armed catch leaves its event-based gateway race (#1676).
                 instance.races.remove(element_instance_key);
+                // A gateway's owned subscriptions (#2003) die with it.
+                instance.gateway_subscriptions.remove(element_instance_key);
                 // An event sub-process container's held start payload dies
                 // with the container (normal completion or interrupt teardown).
                 instance.esp_held_payloads.remove(element_instance_key);
@@ -98,6 +100,32 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 instance
                     .gateway_routes
                     .insert(*element_instance_key, flows.clone());
+            }
+        }
+
+        // Gateway-owned subscriptions (#2003): opened on the gateway's element
+        // instance, all deleted once one of them fires.
+        Event::EventGatewaySubscriptionsOpened {
+            instance_key,
+            gateway_element_instance_key,
+            catch_element_ids,
+            ..
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .gateway_subscriptions
+                    .insert(*gateway_element_instance_key, catch_element_ids.clone());
+            }
+        }
+        Event::EventGatewayTriggered {
+            instance_key,
+            gateway_element_instance_key,
+            ..
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .gateway_subscriptions
+                    .remove(gateway_element_instance_key);
             }
         }
 

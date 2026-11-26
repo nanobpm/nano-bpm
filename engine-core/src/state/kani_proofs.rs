@@ -1,5 +1,5 @@
 //! Kani proof harnesses for the state kernel (#1960): join token bookkeeping
-//! ([`FlowArrivals`]) and the job index maintainer. The first two prove over
+//! ([`FlowArrivals`]) and the job index maintainer. They prove over
 //! the bounded stand-ins in `kani_model` (#1994).
 //!
 //! Compiled only under `cargo kani` (`cfg(kani)`). See `formal/kani/README.md`
@@ -7,25 +7,9 @@
 
 use super::kani_model::{assert_job_index_lockstep, BoundedArrivals, JobIndexes};
 use super::*;
-use crate::model::IncomingFlow;
 
 /// Bound on the number of nondeterministic operations per harness.
 const STEPS: usize = 2;
-
-/// `TokenFlow.tla` join invariants restated over the Rust bookkeeping: every
-/// stored count is positive (a join token count is never negative, and a zero
-/// count is never kept), and the entries are strictly sorted by flow (one
-/// entry per flow, deterministic serialized form).
-fn assert_join_invariant(arrivals: &FlowArrivals) {
-    let mut prev: Option<&IncomingFlow> = None;
-    for (flow, count) in arrivals.iter() {
-        assert!(count > 0, "a stored join token count is positive");
-        if let Some(p) = prev {
-            assert!(p < flow, "join arrivals are strictly sorted by flow");
-        }
-        prev = Some(flow);
-    }
-}
 
 /// The join invariant over the stand-in: every stored count is positive and
 /// the entries are strictly sorted by flow.
@@ -147,40 +131,40 @@ fn job_index_resync_keeps_lockstep() {
 /// consumes one token per flow and keeps the surplus (Tetris principle), so the
 /// join never fires more often than the scarcer flow delivered, and never
 /// before both flows delivered once.
+///
+/// Proven over [`BoundedArrivals`] (#1994): over the heap-backed
+/// `FlowArrivals` with `String` flow ids this harness ran within seconds of the
+/// CI box and was killed during SSA conversion on a hosted runner.
+/// `kani_model::refinement` checks the stand-in agrees with `FlowArrivals`.
 #[kani::proof]
-#[kani::unwind(3)]
+#[kani::unwind(4)]
 #[kani::solver(cadical)]
 fn parallel_join_fires_only_when_every_flow_taken() {
     const INCOMING: usize = 2;
-    let a = IncomingFlow {
-        from: "A".to_string(),
-        ordinal: 0,
-    };
-    let b = IncomingFlow {
-        from: "B".to_string(),
-        ordinal: 0,
-    };
-    let mut arrivals = FlowArrivals::default();
+    const ARRIVALS: usize = 3;
+    let (a, b) = (0u8, 1u8);
+    let mut arrivals = BoundedArrivals::<INCOMING>::default();
     let (mut from_a, mut from_b, mut fired) = (0usize, 0usize, 0usize);
-    for _ in 0..STEPS {
+    for _ in 0..ARRIVALS {
         if kani::any() {
-            arrivals.record(&a);
+            arrivals.record(a);
             from_a += 1;
         } else {
-            arrivals.record(&b);
+            arrivals.record(b);
             from_b += 1;
         }
         if arrivals.distinct_flows() >= INCOMING {
             arrivals.consume_one_each();
+            kani::cover!(true, "join fires");
             fired += 1;
         }
         assert!(fired == from_a.min(from_b), "fires once per full round");
-        assert!(arrivals.count(&a) == from_a - fired);
-        assert!(arrivals.count(&b) == from_b - fired);
+        assert!(arrivals.count(a) == from_a - fired);
+        assert!(arrivals.count(b) == from_b - fired);
         assert!(
             arrivals.distinct_flows() < INCOMING,
             "a ready join never waits"
         );
-        assert_join_invariant(&arrivals);
+        assert_bounded_join_invariant(&arrivals);
     }
 }

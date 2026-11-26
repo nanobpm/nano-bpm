@@ -1223,6 +1223,19 @@ fn build_event_witnesses() -> Vec<Event> {
             element_id: "g".to_string(),
             flows: vec![0, 2],
         },
+        // #2003 gateway-owned subscription frames (not yet emitted by execution,
+        // so pinned here).
+        Event::EventGatewaySubscriptionsOpened {
+            instance_key: 1,
+            gateway_element_instance_key: 2,
+            gateway_element_id: "g".to_string(),
+            catch_element_ids: vec!["m1".to_string(), "t1".to_string()],
+        },
+        Event::EventGatewayTriggered {
+            instance_key: 1,
+            gateway_element_instance_key: 2,
+            catch_element_id: "m1".to_string(),
+        },
         Event::ProcessInstanceModified {
             instance_key: 1,
             activate_instructions: vec![ActivateElementInstruction {
