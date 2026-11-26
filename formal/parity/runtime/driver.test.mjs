@@ -885,7 +885,11 @@ test("CamundaBackend settled.ack delivers the message ONCE, via synchronous corr
   const { port } = server.address();
   try {
     const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
-    await backend.publishMessage({ instanceKeys: new Set() }, "M", "k", {}, { ack: true });
+    const handle = { instanceKeys: new Set() };
+    await backend.publishMessage(handle, "M", "k", {}, { ack: true });
+    // The acknowledged correlation's instance key is learned, so a later
+    // timeout can be verified and `reset()` can cancel it (#1988 review).
+    assert.deepEqual([...handle.instanceKeys], ["1"]);
     assert.equal(calls.filter((u) => u.endsWith("/messages/publication")).length, 0, "no buffered publication");
     assert.equal(calls.filter((u) => u.endsWith("/messages/correlation")).length, 1, "exactly one correlation");
   } finally {
@@ -918,7 +922,11 @@ test("CamundaBackend settled.ack waits for a delayed subscription: a 404 correla
   const { port } = server.address();
   try {
     const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
-    await backend.publishMessage({ instanceKeys: new Set() }, "M", "k", {}, { ack: true });
+    const handle = { instanceKeys: new Set() };
+    await backend.publishMessage(handle, "M", "k", {}, { ack: true });
+    // The acknowledged correlation's instance key is learned, so a later
+    // timeout can be verified and `reset()` can cancel it (#1988 review).
+    assert.deepEqual([...handle.instanceKeys], ["1"]);
     assert.equal(calls.filter((u) => u.endsWith("/messages/publication")).length, 0, "no buffered publication");
     assert.equal(calls.filter((u) => u.endsWith("/messages/correlation")).length, 3, "two not-ready 404s, then one delivery");
   } finally {
@@ -1031,4 +1039,92 @@ test("publishMessage with timeToLive/messageId publishes as given and asserts a 
     server.close();
     await once(server, "close");
   }
+});
+
+test("CamundaBackend verifies instance state after an awaitCompletion DEADLINE_EXCEEDED (#1988)", async () => {
+  // A correctly stuck instance (a token still parked on a task) never completes,
+  // so the awaitCompletion create ends in HTTP 504 DEADLINE_EXCEEDED. That is an
+  // OBSERVATION, not a backend error — but the deadline started before the
+  // steps ran, so the CURRENT instance state decides `completed`. Any OTHER
+  // create failure must still fail loudly, and a timeout with no learned key
+  // (uncancellable instance) is a cleanup failure.
+  let createStatus = 504;
+  let piState = "ACTIVE";
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      if (req.url.endsWith("/process-instances")) {
+        res.writeHead(createStatus, { "content-type": "application/problem+json" });
+        res.end(JSON.stringify({
+          type: "about:blank",
+          title: createStatus === 504 ? "DEADLINE_EXCEEDED" : "INTERNAL",
+          status: createStatus,
+          detail: "Expected to complete the process instance within the timeout",
+          instance: "/v2/process-instances",
+        }));
+        return;
+      }
+      if (req.method === "GET" && /\/process-instances\/42$/.test(req.url)) {
+        if (piState === null) {
+          res.writeHead(500);
+          res.end("{}");
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ processInstanceKey: "42", state: piState }));
+        return;
+      }
+      res.writeHead(204);
+      res.end();
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  const startKeyed = async (backend) => {
+    const h = await backend.start("P", {});
+    h.instanceKeys.add("42");
+    return h;
+  };
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const obs = await backend.observe(await startKeyed(backend));
+    assert.equal(obs.completed, false);
+    assert.deepEqual(obs.unobserved, ["variables"]);
+    // The differential then compares `completed` only: nano's variables of a
+    // still-running instance are not contradicted by an unread Camunda value.
+    const nanoObs = { ...emptyObservation(), completed: false, variables: { x: 1 } };
+    const diff = diffObservations(nanoObs, obs, new Set(["completed", "variables"]), backend.provides);
+    assert.deepEqual(diff.comparedFields, ["completed"]);
+    assert.equal(diff.ok, true);
+    // A completing nano run against the stuck Camunda instance still diverges.
+    assert.equal(diffObservations({ ...nanoObs, completed: true }, obs, backend.provides, backend.provides).ok, false);
+    // The final job completed AFTER the create deadline: the instance is done.
+    piState = "COMPLETED";
+    const done = await backend.observe(await startKeyed(backend));
+    assert.equal(done.completed, true);
+    assert.deepEqual(done.unobserved, ["variables"]);
+    // State unreadable or terminated: inconclusive must FAIL, never be a
+    // vacuous pass with no compared fields.
+    piState = null;
+    await assert.rejects(async () => backend.observe(await startKeyed(backend)), /inconclusive/);
+    piState = "TERMINATED";
+    await assert.rejects(async () => backend.observe(await startKeyed(backend)), /inconclusive/);
+    // No key learned (no job activated): uncancellable → cleanup failure.
+    await assert.rejects(async () => backend.observe(await backend.start("P", {})), BackendCleanupError);
+    createStatus = 500;
+    await assert.rejects(async () => backend.observe(await backend.start("P", {})), /HTTP 500/);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("checkExpectations skips fields the observation marks unobserved (#1988)", () => {
+  const obs = { ...emptyObservation(), completed: false, unobserved: ["variables"] };
+  const res = checkExpectations(obs, { completed: false, variables: { k: "v" } });
+  assert.deepEqual(res, { ok: true, mismatches: [] });
+  // An observed field still mismatches.
+  const res2 = checkExpectations({ ...obs, unobserved: [] }, { variables: { k: "v" } });
+  assert.equal(res2.ok, false);
 });

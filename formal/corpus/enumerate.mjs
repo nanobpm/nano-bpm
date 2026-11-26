@@ -795,15 +795,14 @@ export class Reference {
       // An interrupting message boundary (#1673): the attached task is
       // TERMINATED (its job cancelled, never completed) and the boundary event
       // completes, routing its outgoing flow.
-      // The message correlates EVERY open subscription of this boundary, so
-      // every waiting activation of the task is interrupted and each boundary
-      // activation routes its outgoing flow — not just one.
-      const count = next.waiting[cmd.task]
-      next.waiting[cmd.task] = 0
-      for (let i = 0; i < count; i++) {
-        next.complete(cmd.node)
-        next.take(next.out[cmd.node])
-      }
+      // One published message correlates AT MOST ONCE per process (#1988):
+      // Zeebe's MessageCorrelateBehavior.correlateToMessageEvents skips every
+      // further subscription of the same bpmnProcessId once one correlated. So
+      // a publish interrupts exactly ONE waiting activation of the task; any
+      // other activation stays parked on its own (still open) subscription.
+      next.waiting[cmd.task] -= 1
+      next.complete(cmd.node)
+      next.take(next.out[cmd.node])
       next.settle()
       return next
     }
