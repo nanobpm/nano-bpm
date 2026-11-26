@@ -178,6 +178,7 @@ jobs:
             # fixtures as evidence, so renaming one must re-run the guard.
             formal:
               - 'formal/**'
+              - 'engine-core/src/engine/join_guard.rs'  # extracted by formal/lean/Refinement/extract.sh (#2010)
               - 'processos/assets/bpmn/nano-moddle.json'  # canonical descriptor read by formal/parity/extensions.test.mjs (#1261)
               - 'engine-core/src/**'
               - 'engine-core/tests/**'
@@ -1127,6 +1128,25 @@ jobs:
         run: node --test formal/feel-scala/*.test.mjs
       - name: Lean build + FEEL differential fuzz (Lean, Rust, feel-scala)
         run: formal/lean/feel-diff.sh
+      # Aeneas refinement proof of the join guard (#2010): regenerate the Lean
+      # extraction of engine-core/src/engine/join_guard.rs with the pinned
+      # Charon/Aeneas (formal/lean/Refinement/extract.sh) and fail on any diff,
+      # then build the proof that the extracted `join_ready` equals
+      # `ZeebeJoinReady` for all graphs. A separate Lake package with its own
+      # Lean/Mathlib pin (the Aeneas library's), so its own cache.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/nanobpm-aeneas
+            formal/lean/Refinement/.lake
+          key: aeneas-${{ hashFiles('formal/lean/Refinement/extract.sh', 'formal/lean/Refinement/lean-toolchain', 'formal/lean/Refinement/lakefile.lean', 'formal/lean/Refinement/lake-manifest.json') }}
+      - name: Aeneas extraction drift check (join guard kernel)
+        run: formal/lean/Refinement/extract.sh --check
+      - name: Lean refinement proof (join_ready refines ZeebeJoinReady)
+        working-directory: formal/lean/Refinement
+        run: |
+          lake exe cache get
+          lake build
 
   # Two-backend runtime parity runner (#1260, slice 5 of #1240). DISTINCT from
   # the `formal` (tlc) job above and deliberately NON-REQUIRED: it is not in

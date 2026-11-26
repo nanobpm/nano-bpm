@@ -1048,3 +1048,216 @@ async fn multipart_deploy_fixtures_agree_between_server_and_wasm() {
         }
     }
 }
+
+/// #2020: REST parity between the native router and the wasm `handle()`
+/// driver on the request-level seams — the `Content-Type` check (415 before
+/// any mutation), `tenantId` handling, and error status + problem body. Every
+/// fixture in `conformance/rest-parity.json` is sent raw to BOTH transports,
+/// each on a fresh engine with `conformance-service.bpmn` deployed, and the
+/// answers must be identical (status, problem, compared body fields, and the
+/// resulting process-instance count). The engine-wasm suite runs the same file
+/// against `handle()` alone, so either side drifting fails.
+#[tokio::test]
+async fn rest_parity_fixtures_agree_between_server_and_wasm() {
+    let bpmn = resource("conformance-service.bpmn");
+    let raw: J = serde_json::from_str(&resource("rest-parity.json")).expect("fixtures");
+    let deploy_ct = "multipart/form-data; boundary=b";
+    let deploy_body = format!(
+        "--b\r\nContent-Disposition: form-data; name=\"resources\"; filename=\"svc.bpmn\"\r\n\r\n{bpmn}\r\n--b--\r\n"
+    );
+    let count_body = r#"{"filter":{}}"#;
+
+    /// One transport's answer: status, content type and raw body.
+    struct Res {
+        status: u16,
+        content_type: String,
+        body: String,
+    }
+    async fn native(
+        server: &ServerImpl,
+        method: &str,
+        path: &str,
+        ct: Option<&str>,
+        body: &str,
+    ) -> Res {
+        let app =
+            nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server.clone());
+        let mut req = Request::builder()
+            .method(Method::from_bytes(method.as_bytes()).expect("method"))
+            .uri(path)
+            .header("host", "localhost");
+        if let Some(ct) = ct {
+            req = req.header("content-type", ct);
+        }
+        let res = app
+            .oneshot(req.body(Body::from(body.to_string())).expect("request"))
+            .await
+            .expect("response");
+        let status = res.status().as_u16();
+        let content_type = res
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        Res {
+            status,
+            content_type,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        }
+    }
+    fn wasm(eng: &mut TestEngine, method: &str, path: &str, ct: Option<&str>, body: &str) -> Res {
+        let headers = ct.map_or(String::new(), |ct| {
+            json!({ "content-type": ct }).to_string()
+        });
+        let res: J = serde_json::from_str(&eng.handle(method, path, &headers, body)).expect("res");
+        Res {
+            status: u16::try_from(res["status"].as_u64().expect("status")).expect("u16"),
+            content_type: s(&res["headers"]["content-type"]),
+            body: s(&res["body"]),
+        }
+    }
+    let count = |r: &Res| -> u64 {
+        assert_eq!(r.status, 200, "instance count search: {}", r.body);
+        let v: J = serde_json::from_str(&r.body).expect("search json");
+        v["page"]["totalItems"].as_u64().expect("totalItems")
+    };
+
+    for f in raw["fixtures"].as_array().expect("fixtures array") {
+        let name = s(&f["name"]);
+        let method = s(&f["method"]);
+        let path = s(&f["path"]);
+        let ct = f["contentType"].as_str();
+        let body = s(&f["body"]).replace("{{BPMN}}", &bpmn);
+        let status = u16::try_from(f["status"].as_u64().expect("status")).expect("u16");
+
+        let server = ServerImpl::default();
+        let d = native(
+            &server,
+            "POST",
+            "/v2/deployments",
+            Some(deploy_ct),
+            &deploy_body,
+        )
+        .await;
+        assert_eq!(d.status, 200, "{name}: native setup deploy {}", d.body);
+        for (i, st) in f["setup"].as_array().into_iter().flatten().enumerate() {
+            let r = native(
+                &server,
+                &s(&st["method"]),
+                &s(&st["path"]),
+                st["contentType"].as_str(),
+                &s(&st["body"]),
+            )
+            .await;
+            assert_eq!(r.status, 200, "{name}: native setup step {i}: {}", r.body);
+        }
+        let n = native(&server, &method, &path, ct, &body).await;
+
+        let mut eng = TestEngine::new();
+        let d = wasm(
+            &mut eng,
+            "POST",
+            "/v2/deployments",
+            Some(deploy_ct),
+            &deploy_body,
+        );
+        assert_eq!(d.status, 200, "{name}: wasm setup deploy {}", d.body);
+        for (i, st) in f["setup"].as_array().into_iter().flatten().enumerate() {
+            let r = wasm(
+                &mut eng,
+                &s(&st["method"]),
+                &s(&st["path"]),
+                st["contentType"].as_str(),
+                &s(&st["body"]),
+            );
+            assert_eq!(r.status, 200, "{name}: wasm setup step {i}: {}", r.body);
+        }
+        let w = wasm(&mut eng, &method, &path, ct, &body);
+
+        assert_eq!(n.status, status, "{name}: native status, body {}", n.body);
+        assert_eq!(w.status, status, "{name}: wasm status, body {}", w.body);
+
+        if status >= 400 {
+            // Every wasm rejection is an RFC 9457 ProblemDetail.
+            assert_eq!(w.content_type, "application/problem+json", "{name}");
+            let wp: J = serde_json::from_str(&w.body).expect("wasm problem");
+            assert_eq!(wp["status"].as_u64(), Some(u64::from(status)), "{name}");
+            if n.content_type.contains("json") {
+                // Native answered a ProblemDetail: same title and detail.
+                let np: J = serde_json::from_str(&n.body)
+                    .unwrap_or_else(|e| panic!("{name}: native JSON error body: {e}"));
+                assert_eq!(
+                    wp["detail"], np["detail"],
+                    "{name}: problem detail (wasm vs native)"
+                );
+                match f.get("titleGap") {
+                    // A tracked native title that bypasses the shared
+                    // engine-core mapping: it must still differ exactly
+                    // as recorded, so the fix shrinks the fixture.
+                    Some(gap) => assert_eq!(
+                        (&np["title"], &wp["title"]),
+                        (&gap["native"], &gap["wasm"]),
+                        "{name}: titleGap ({}) changed — update the fixture",
+                        s(&gap["issue"])
+                    ),
+                    None => assert_eq!(
+                        wp["title"], np["title"],
+                        "{name}: problem title (wasm vs native)"
+                    ),
+                }
+            } else {
+                // A transport-level native rejection (axum extractor, plain
+                // text): fail closed — the wasm detail must carry the same
+                // text, unless the fixture records the exact gap.
+                match f.get("bodyGap") {
+                    Some(gap) => assert_eq!(
+                        (n.body.as_str(), s(&wp["detail"]).as_str()),
+                        (s(&gap["native"]).as_str(), s(&gap["wasm"]).as_str()),
+                        "{name}: bodyGap ({}) changed — update the fixture",
+                        s(&gap["issue"])
+                    ),
+                    None => assert_eq!(
+                        s(&wp["detail"]),
+                        n.body,
+                        "{name}: plain-text detail (wasm vs native)"
+                    ),
+                }
+            }
+        } else {
+            for pointer in f["compare"].as_array().expect("compare") {
+                let pointer = s(pointer);
+                let nv: J = serde_json::from_str(&n.body).expect("native json");
+                let wv: J = serde_json::from_str(&w.body).expect("wasm json");
+                assert_eq!(
+                    wv.pointer(&pointer),
+                    nv.pointer(&pointer),
+                    "{name}: {pointer} (wasm vs native)"
+                );
+                assert!(nv.pointer(&pointer).is_some(), "{name}: {pointer} absent");
+            }
+        }
+
+        let after = f["instancesAfter"].as_u64().expect("instancesAfter");
+        let nc = native(
+            &server,
+            "POST",
+            "/v2/process-instances/search",
+            Some("application/json"),
+            count_body,
+        )
+        .await;
+        let wc = wasm(
+            &mut eng,
+            "POST",
+            "/v2/process-instances/search",
+            Some("application/json"),
+            count_body,
+        );
+        assert_eq!(count(&nc), after, "{name}: native instances after");
+        assert_eq!(count(&wc), after, "{name}: wasm instances after");
+    }
+}

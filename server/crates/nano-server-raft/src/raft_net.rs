@@ -151,6 +151,14 @@ pub trait RaftTransport: Send + Sync + 'static {
     fn peer_supports<'a>(&'a self, _target: NodeId, _feature: &'static str) -> BoxFuture<'a, bool> {
         Box::pin(async { true })
     }
+    /// Whether EVERY cluster member — not only this Raft group's — is known
+    /// to support `feature` (#1949): the gate for behaviour whose effects
+    /// cross partitions (a remote delivery lands on another group, possibly
+    /// hosted by members outside this one). Unknown / unreachable answers
+    /// `false`. In-process transports route to this same binary: `true`.
+    fn cluster_supports<'a>(&'a self, _feature: &'static str) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
 }
 
 /// Feeds an inbound RPC into a local Raft instance and returns its response. The
@@ -465,6 +473,10 @@ impl RaftTransport for PeerTransport {
         })
     }
 
+    fn cluster_supports<'a>(&'a self, feature: &'static str) -> BoxFuture<'a, bool> {
+        Box::pin(async move { self.peers.all_peers_support(feature).await })
+    }
+
     fn peer_supports<'a>(&'a self, target: NodeId, feature: &'static str) -> BoxFuture<'a, bool> {
         Box::pin(async move { self.peers.peer_advertises(target as u32, feature).await })
     }
@@ -475,8 +487,8 @@ impl RaftTransport for PeerTransport {
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
         FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES, FEATURE_MESSAGE_BUFFERING,
-        FEATURE_PROCESS_INSTANCE_HISTORY_DELETION, FEATURE_REPLICATED_LENIENT_COMPLETION,
-        FEATURE_TERMINAL_DEADLINES,
+        FEATURE_MESSAGE_CORRELATION_ACK, FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
+        FEATURE_REPLICATED_LENIENT_COMPLETION, FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
     let RaftRpcRequest::AppendEntries(r) = req else {
@@ -494,6 +506,12 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
                 && !required.contains(&FEATURE_TERMINAL_DEADLINES)
             {
                 required.push(FEATURE_TERMINAL_DEADLINES);
+            }
+            // #1949: an entry the leader enabled ack-paced remote buffered
+            // delivery for would be applied local-only by a legacy peer.
+            if item.remote_buffered_delivery && !required.contains(&FEATURE_MESSAGE_CORRELATION_ACK)
+            {
+                required.push(FEATURE_MESSAGE_CORRELATION_ACK);
             }
             let feature = match item.command {
                 Command::SetLenientCompletion { .. } => FEATURE_REPLICATED_LENIENT_COMPLETION,
@@ -513,6 +531,14 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
                     terminate_suspended: true,
                     ..
                 } => FEATURE_CANCEL_SUSPENDED_INSTANCE,
+                Command::AcknowledgeMessageCorrelation { .. }
+                | Command::ResumeMessageSubscription { .. }
+                | Command::ConfirmMessageSubscriptionResume { .. }
+                | Command::SettleMessageCorrelationReceipt { .. }
+                | Command::CorrelateMessageSubscription {
+                    ack_partition: Some(_),
+                    ..
+                } => FEATURE_MESSAGE_CORRELATION_ACK,
                 Command::DeleteProcessInstanceHistory { .. } => {
                     FEATURE_PROCESS_INSTANCE_HISTORY_DELETION
                 }
@@ -545,6 +571,7 @@ mod codec_tests {
                     now: 0,
                     operation_reference: None,
                     terminal_deadlines: std::collections::BTreeMap::new(),
+                    remote_buffered_delivery: false,
                 },
             ])),
         };
@@ -615,6 +642,58 @@ mod codec_tests {
         for command in [publish(None, None), publish(Some(0), None)] {
             assert!(required_features_for(&req(vec![entry(command)])).is_empty());
         }
+        // #1874: the ack and an ack-paced correlation require the ack
+        // feature; an un-paced correlation requires nothing.
+        let correlate = |ack_partition| Command::CorrelateMessageSubscription {
+            subscription_key: 1,
+            message_key: 2,
+            instance_key: 3,
+            element_instance_key: 4,
+            element_id: "e".into(),
+            kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+            variables: Default::default(),
+            delivery_key: 5,
+            ack_partition,
+        };
+        for command in [
+            Command::AcknowledgeMessageCorrelation {
+                subscription_key: 1,
+                message_key: 2,
+                delivery_key: 5,
+                accepted: true,
+                consumed: true,
+                deferred: false,
+            },
+            Command::ResumeMessageSubscription {
+                subscription_key: 1,
+                generation: 1,
+            },
+            Command::ConfirmMessageSubscriptionResume {
+                subscription_key: 1,
+                generation: 1,
+            },
+            Command::SettleMessageCorrelationReceipt {
+                subscription_key: 1,
+                delivery_key: 5,
+            },
+            correlate(Some(0)),
+        ] {
+            assert_eq!(
+                required_features_for(&req(vec![entry(command)])),
+                vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK]
+            );
+        }
+        assert!(required_features_for(&req(vec![entry(correlate(None))])).is_empty());
+        // #1949: an entry stamped for remote buffered delivery never ships
+        // to a peer that would apply it local-only.
+        let mut remote = entry(Command::cancel_instance(1));
+        if let EntryPayload::Normal(batch) = &mut remote.payload {
+            batch.items[0].remote_buffered_delivery = true;
+        }
+        assert_eq!(
+            required_features_for(&req(vec![remote])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK]
+        );
         // #1856 review: a stamped entry is never shipped to a peer that would
         // ignore the deadline map; an unstamped one requires nothing.
         let mut stamped = entry(Command::cancel_instance(1));

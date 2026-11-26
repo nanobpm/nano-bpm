@@ -1187,6 +1187,7 @@ fn routed_protocol_entries() -> Vec<Command> {
                 kind,
                 variables,
                 delivery_key,
+                ack_partition,
             } => Some(Command::CorrelateMessageSubscription {
                 subscription_key: *subscription_key,
                 message_key: *message_key,
@@ -1196,6 +1197,7 @@ fn routed_protocol_entries() -> Vec<Command> {
                 kind: kind.clone(),
                 variables: variables.clone(),
                 delivery_key: *delivery_key,
+                ack_partition: *ack_partition,
             }),
             _ => None,
         })
@@ -1217,6 +1219,7 @@ fn routed_protocol_entries() -> Vec<Command> {
     // (5): the routed close lands on the message partition.
     let Command::CorrelateMessageSubscription {
         subscription_key,
+        message_key,
         instance_key,
         element_instance_key,
         element_id,
@@ -1236,7 +1239,61 @@ fn routed_protocol_entries() -> Vec<Command> {
         .apply_command_at(close.clone(), T0 + 5)
         .expect("the routed close applies on the message partition");
 
-    vec![opening, continuation, close]
+    // (6): a stale ack (#1874) — the catch's subscription is not awaiting an
+    // ack, so the message partition ignores it (the idempotent no-op path).
+    let ack = Command::AcknowledgeMessageCorrelation {
+        subscription_key,
+        message_key,
+        delivery_key: 0,
+        accepted: true,
+        consumed: true,
+        deferred: false,
+    };
+    let acked = message_partition
+        .apply_command_at(ack.clone(), T0 + 6)
+        .expect("a stale ack applies on the message partition");
+    assert!(acked.is_empty(), "a stale ack is a no-op: {acked:?}");
+
+    // (7): a resume handshake (#1949) for the now-closed subscription is a
+    // no-op too (only an open, non-awaiting subscription is re-offered).
+    let resume = Command::ResumeMessageSubscription {
+        subscription_key,
+        generation: 0,
+    };
+    let resumed = message_partition
+        .apply_command_at(resume.clone(), T0 + 7)
+        .expect("a resume handshake applies on the message partition");
+    assert!(resumed.is_empty(), "a stale resume is a no-op: {resumed:?}");
+
+    // (8): a stale resume confirmation (#1949) on the instance partition —
+    // the subscription is no longer awaiting a resume, so it is a no-op.
+    let confirm = Command::ConfirmMessageSubscriptionResume {
+        subscription_key,
+        generation: 0,
+    };
+    let confirmed = instance_partition
+        .apply_command_at(confirm.clone(), T0 + 8)
+        .expect("a resume confirmation applies on the instance partition");
+    assert!(
+        confirmed.is_empty(),
+        "a stale confirmation is a no-op: {confirmed:?}"
+    );
+
+    // (9): a stale receipt settlement (#1949) on the instance partition —
+    // no receipt is pinned for this delivery, so it is a no-op.
+    let settle = Command::SettleMessageCorrelationReceipt {
+        subscription_key,
+        delivery_key: 0,
+    };
+    let settled = instance_partition
+        .apply_command_at(settle.clone(), T0 + 9)
+        .expect("a receipt settlement applies on the instance partition");
+    assert!(
+        settled.is_empty(),
+        "a stale settlement is a no-op: {settled:?}"
+    );
+
+    vec![opening, continuation, close, ack, resume, confirm, settle]
 }
 
 /// The [`Command::kind`] of every corpus entry (coverage evidence).

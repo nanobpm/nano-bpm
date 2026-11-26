@@ -6,7 +6,9 @@ use nanobpmn_engine_core::EngineError;
 use nanobpmn_search::models;
 use serde_json::{json, Value as J};
 
-use super::gateway::{HttpResponse, INJECTED_FAULT, ROUTES};
+use super::gateway::{
+    BodyKind, HttpResponse, INJECTED_FAULT, ROUTES, UNSUPPORTED_MEDIA_TYPE_DETAIL,
+};
 use super::TestEngine;
 
 /// Every vendored spec document, read from disk so a newly vendored file is
@@ -29,8 +31,9 @@ fn spec_documents() -> Vec<(String, serde_yaml::Value)> {
     docs
 }
 
-/// `(METHOD, path, operationId, success status)` for every spec operation.
-fn spec_operations() -> Vec<(String, String, String, u16)> {
+/// `(METHOD, path, operationId, success status, request body)` for every
+/// spec operation.
+fn spec_operations() -> Vec<(String, String, String, u16, BodyKind)> {
     let mut ops = Vec::new();
     for (_, doc) in spec_documents() {
         let Some(paths) = doc.get("paths").and_then(|p| p.as_mapping()) else {
@@ -58,11 +61,36 @@ fn spec_operations() -> Vec<(String, String, String, u16)> {
                     })
                     .find(|c| (200..300).contains(c))
                     .expect("operation has a 2xx response");
-                ops.push((method, path.clone(), op_id.to_string(), status));
+                ops.push((
+                    method,
+                    path.clone(),
+                    op_id.to_string(),
+                    status,
+                    body_kind(op),
+                ));
             }
         }
     }
     ops
+}
+
+/// The request body an operation declares: absent, multipart, or JSON that is
+/// `required` or not — the distinction that picks the native extractor.
+fn body_kind(op: &serde_yaml::Value) -> BodyKind {
+    let Some(rb) = op.get("requestBody") else {
+        return BodyKind::None;
+    };
+    let multipart = rb
+        .get("content")
+        .and_then(|c| c.as_mapping())
+        .is_some_and(|c| c.keys().any(|k| k.as_str() == Some("multipart/form-data")));
+    if multipart {
+        BodyKind::Multipart
+    } else if rb.get("required").and_then(serde_yaml::Value::as_bool) == Some(true) {
+        BodyKind::RequiredJson
+    } else {
+        BodyKind::OptionalJson
+    }
 }
 
 /// Drift guard: every served route IS a spec operation — same operationId,
@@ -75,12 +103,12 @@ fn routes_match_the_spec() {
     for r in ROUTES {
         let found = spec
             .iter()
-            .find(|(_, _, id, _)| id == r.operation_id)
+            .find(|(_, _, id, _, _)| id == r.operation_id)
             .unwrap_or_else(|| panic!("route {} is not a spec operation", r.operation_id));
         assert_eq!(
-            (found.0.as_str(), found.1.as_str(), found.3),
-            (r.method, r.path, r.status),
-            "route {} drifted from the spec (method, path, success status)",
+            (found.0.as_str(), found.1.as_str(), found.3, found.4),
+            (r.method, r.path, r.status, r.body),
+            "route {} drifted from the spec (method, path, success status, request body)",
             r.operation_id
         );
     }
@@ -124,7 +152,8 @@ const BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </bpmn:definitions>"#;
 
 fn call(eng: &mut TestEngine, method: &str, path: &str, body: &J) -> HttpResponse {
-    eng.handle_request(method, path, "", &body.to_string())
+    let headers = json!({ "Content-Type": "application/json" }).to_string();
+    eng.handle_request(method, path, &headers, &body.to_string())
 }
 
 fn json_body(res: &HttpResponse) -> J {
@@ -842,4 +871,146 @@ fn activation_long_poll_returns_immediately_and_repolls_on_virtual_clock() {
     );
     assert!(res.status < 300, "{}", res.body);
     assert_eq!(poll(&mut eng), Some(1));
+}
+
+/// #2020: a JSON-bodied operation with an unsupported `Content-Type` is a 415
+/// BEFORE any mutation — the instance is not created — exactly as the native
+/// gateway's `Json` / `OptionalJson` extractors answer.
+#[test]
+fn unsupported_media_type_is_rejected_before_any_mutation() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    let body = json!({ "processDefinitionId": "order" }).to_string();
+    for ct in [
+        None,
+        Some("text/plain"),
+        Some("application/xml"),
+        Some("json"),
+    ] {
+        let headers = match ct {
+            Some(ct) => json!({ "Content-Type": ct }).to_string(),
+            None => String::new(),
+        };
+        let res = eng.handle_request("POST", "/v2/process-instances", &headers, &body);
+        assert_eq!(res.status, 415, "{ct:?}: {}", res.body);
+        assert_eq!(
+            res.headers.get("content-type").map(String::as_str),
+            Some("application/problem+json")
+        );
+        let p = json_body(&res);
+        assert_eq!(p["status"], json!(415));
+        assert_eq!(p["detail"], json!(UNSUPPORTED_MEDIA_TYPE_DETAIL));
+    }
+    let search = call(&mut eng, "POST", "/v2/process-instances/search", &json!({}));
+    assert_eq!(
+        json_body(&search)["page"]["totalItems"],
+        json!(0),
+        "nothing ran"
+    );
+
+    // `application/*+json` and parameters are accepted, as by axum.
+    for ct in [
+        "application/vnd.nano+json",
+        "application/json; charset=utf-8",
+    ] {
+        let headers = json!({ "content-type": ct }).to_string();
+        let res = eng.handle_request("POST", "/v2/process-instances", &headers, &body);
+        assert_eq!(res.status, 200, "{ct}: {}", res.body);
+    }
+}
+
+/// #2020: an OPTIONAL body that is empty needs no `Content-Type`; a non-empty
+/// one does. A body-less operation never inspects it.
+#[test]
+fn optional_and_absent_bodies_follow_the_native_media_type_rule() {
+    let mut eng = TestEngine::new();
+    let res = eng.handle_request("POST", "/v2/jobs/1/completion", "", "");
+    assert_ne!(res.status, 415, "empty optional body: {}", res.body);
+    let res = eng.handle_request("POST", "/v2/jobs/1/completion", "", "{}");
+    assert_eq!(res.status, 415, "non-empty optional body: {}", res.body);
+    let res = eng.handle_request("POST", "/v2/user-tasks/search", "", "{}");
+    assert_eq!(res.status, 415, "search body: {}", res.body);
+    let res = eng.handle_request("DELETE", "/v2/user-tasks/1/assignee", "", "");
+    assert_ne!(res.status, 415, "no body: {}", res.body);
+    // A required body is checked even when empty.
+    let res = eng.handle_request("PUT", "/v2/clock", "", "");
+    assert_eq!(res.status, 415, "required body: {}", res.body);
+}
+
+/// #2020: the multipart `tenantId` part is echoed in the deployment result,
+/// as the native gateway does (a blank one falls back to `<default>`).
+#[test]
+fn deployment_echoes_the_multipart_tenant_id() {
+    for (part, want) in [("acme", "acme"), ("  ", "<default>")] {
+        let mut eng = TestEngine::new();
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"tenantId\"\r\n\r\n{part}\r\n--b\r\nContent-Disposition: form-data; name=\"resources\"; filename=\"order.bpmn\"\r\n\r\n{BPMN}\r\n--b--\r\n"
+        );
+        let headers = json!({ "Content-Type": "multipart/form-data; boundary=b" });
+        let res = eng.handle_request("POST", "/v2/deployments", &headers.to_string(), &body);
+        assert_eq!(res.status, 200, "{}", res.body);
+        let v = json_body(&res);
+        assert_eq!(v["tenantId"], json!(want));
+        assert_eq!(
+            v["deployments"][0]["processDefinition"]["tenantId"],
+            json!(want)
+        );
+    }
+}
+
+/// #2020: the shared REST parity fixtures (`server/conformance/rest-parity.json`,
+/// also run against the native gateway by
+/// `server/src/wasm_conformance_tests.rs`, which compares the two answers)
+/// produce the expected status and process-instance count through `handle()`.
+#[test]
+fn rest_parity_fixtures_match_the_native_gateway_expectations() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../server/conformance");
+    let bpmn = std::fs::read_to_string(format!("{dir}/conformance-service.bpmn")).unwrap();
+    let raw: J =
+        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/rest-parity.json")).unwrap())
+            .unwrap();
+    let deploy_headers = json!({ "content-type": "multipart/form-data; boundary=b" }).to_string();
+    let deploy_body = format!(
+        "--b\r\nContent-Disposition: form-data; name=\"resources\"; filename=\"svc.bpmn\"\r\n\r\n{bpmn}\r\n--b--\r\n"
+    );
+    for f in raw["fixtures"].as_array().unwrap() {
+        let name = f["name"].as_str().unwrap();
+        let mut eng = TestEngine::new();
+        let d = eng.handle_request("POST", "/v2/deployments", &deploy_headers, &deploy_body);
+        assert_eq!(d.status, 200, "{name}: setup {}", d.body);
+        for (i, st) in f["setup"].as_array().into_iter().flatten().enumerate() {
+            let h = st["contentType"].as_str().map_or(String::new(), |ct| {
+                json!({ "content-type": ct }).to_string()
+            });
+            let r = eng.handle_request(
+                st["method"].as_str().unwrap(),
+                st["path"].as_str().unwrap(),
+                &h,
+                st["body"].as_str().unwrap(),
+            );
+            assert_eq!(r.status, 200, "{name}: setup step {i}: {}", r.body);
+        }
+        let headers = f["contentType"].as_str().map_or(String::new(), |ct| {
+            json!({ "content-type": ct }).to_string()
+        });
+        let body = f["body"].as_str().unwrap().replace("{{BPMN}}", &bpmn);
+        let res = eng.handle_request(
+            f["method"].as_str().unwrap(),
+            f["path"].as_str().unwrap(),
+            &headers,
+            &body,
+        );
+        assert_eq!(
+            Some(u64::from(res.status)),
+            f["status"].as_u64(),
+            "{name}: {}",
+            res.body
+        );
+        let count = call(&mut eng, "POST", "/v2/process-instances/search", &json!({}));
+        assert_eq!(
+            json_body(&count)["page"]["totalItems"],
+            f["instancesAfter"],
+            "{name}: instances after"
+        );
+    }
 }

@@ -231,7 +231,13 @@ impl ColdIndex {
                 }
             }
             Command::ModifyInstance { instance_key, .. }
-            | Command::MigrateInstance { instance_key, .. } => {
+            | Command::MigrateInstance { instance_key, .. }
+            // A routed message delivery (#1874/#1949) advances a token of
+            // this instance and derives its ack from the instance's
+            // subscription record: page it in first, or the delivery would be
+            // answered "not consumed" against a subscription that is merely
+            // on disk.
+            | Command::CorrelateMessageSubscription { instance_key, .. } => {
                 // Modify/migrate address a single instance (activating/terminating its
                 // element instances); page it in before the command applies.
                 if self.contains(*instance_key) {
@@ -528,6 +534,12 @@ mod tests {
             state: MessageSubscriptionState::Open,
             kind: MessageSubscriptionKind::IntermediateCatch,
             correlated_message_keys: Default::default(),
+            awaiting_ack: None,
+            rescan_from: None,
+            resume_pending: false,
+            resume_generation: 0,
+            deferred: false,
+            last_answered_delivery: 0,
         });
         snap.timers.push(Timer {
             key: 320,
@@ -555,6 +567,28 @@ mod tests {
         assert!(idx.instances_due(10_000).is_empty());
         assert!(!idx.has_due_timers(10_000));
         assert!(!idx.contains(300));
+    }
+
+    /// #1949: a routed buffered delivery to a cold-spilled instance pages it
+    /// in before applying, so its receipt is derived from the real
+    /// subscription record rather than an absent one.
+    #[test]
+    fn routes_a_routed_message_delivery_to_its_cold_instance() {
+        let mut idx = ColdIndex::default();
+        idx.insert(&snapshot_with_job(400, 401, "work"));
+        let deliver = |instance_key| Command::CorrelateMessageSubscription {
+            subscription_key: 410,
+            message_key: 411,
+            instance_key,
+            element_instance_key: 0,
+            element_id: "m".into(),
+            kind: MessageSubscriptionKind::IntermediateCatch,
+            variables: Default::default(),
+            delivery_key: 412,
+            ack_partition: Some(1),
+        };
+        assert_eq!(idx.command_targets(&deliver(400)), vec![400]);
+        assert!(idx.command_targets(&deliver(999)).is_empty(), "not cold");
     }
 
     #[test]
