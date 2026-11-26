@@ -4241,6 +4241,13 @@ impl Journal {
         self.engine.set_remote_buffered_delivery(enabled);
     }
 
+    /// Sets, for the NEXT applied command, the replicated
+    /// `message-correlation-ack-v2` envelope bit (#2037; see
+    /// [`Engine::set_message_correlation_ack_v2`]).
+    pub fn set_message_correlation_ack_v2(&mut self, enabled: bool) {
+        self.engine.set_message_correlation_ack_v2(enabled);
+    }
+
     /// Sets the pre-cutover LEGACY lenient-completion host flag (#1661, ADR 0066
     /// "Rolling upgrade"; see `Engine::set_legacy_lenient_completion`). Set
     /// identically on every node from the activation policy at startup; kept

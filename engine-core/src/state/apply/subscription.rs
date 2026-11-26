@@ -317,6 +317,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             accepted,
             consumed,
             deferred,
+            element_id,
             ..
         } => {
             let still_buffered = state.buffered_messages.contains_key(message_key);
@@ -326,6 +327,13 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     .is_some_and(|a| a.message_key == *message_key)
                 {
                     subscription.awaiting_ack = None;
+                    // Re-point the canonical subscription at the element the
+                    // delivery was actually consumed at (#2037): the instance
+                    // may have migrated since the reservation. A legacy ack
+                    // carries none and leaves it as is.
+                    if let Some(element_id) = element_id {
+                        subscription.element_id.clone_from(element_id);
+                    }
                     let instance_key = subscription.instance_key;
                     if *deferred {
                         if subscription.state == MessageSubscriptionState::Correlated {
@@ -384,6 +392,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             message_key,
             instance_key,
             target_partition,
+            element_id,
             ..
         } => {
             // Answering a paced delivery is capability use on the RECEIVING
@@ -405,6 +414,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                         message_key: *message_key,
                         instance_key: *instance_key,
                         target_partition: *target_partition,
+                        element_id: element_id.clone(),
                     },
                 );
             if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
@@ -458,6 +468,9 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
         }
         Event::RemoteBufferedDeliveryActivated { .. } => {
             state.remote_buffered_delivery_latched = true;
+        }
+        Event::MessageCorrelationAckV2Activated { .. } => {
+            state.message_correlation_ack_v2_latched = true;
         }
 
         Event::MessageStartSubscriptionCreated {

@@ -4104,6 +4104,8 @@ impl ServerImpl {
             // entry, the non-Raft tick via `remote_buffered_delivery_gate`. A
             // single node has no other binary to disagree with.
             journal.set_remote_buffered_delivery(topology.is_single_node());
+            // The same gate for the v2 ack output (#2037).
+            journal.set_message_correlation_ack_v2(topology.is_single_node());
         }
         // The deployment partition (id 0) is the only one that seeds the demo
         // process and owns the message-/timer-start subscriptions. In a clustered
@@ -12569,6 +12571,7 @@ impl ServerImpl {
                 deferred,
                 target_partition,
                 delivery_key,
+                element_id,
                 ..
             } => Some((
                 *target_partition,
@@ -12579,6 +12582,7 @@ impl ServerImpl {
                     accepted: *accepted,
                     consumed: *consumed,
                     deferred: *deferred,
+                    element_id: element_id.clone(),
                 },
             )),
             // The resume handshake (#1949) goes to the subscription's message
@@ -22037,7 +22041,9 @@ impl ServerImpl {
     /// buffered a message (sticky across expiry, compaction and restart), and
     /// `message-correlation-ack-v1` (#1949) once any hosted partition has EVER
     /// sent an ack-paced remote buffered delivery (its snapshot carries the
-    /// in-flight `awaiting_ack` state a legacy peer would drop).
+    /// in-flight `awaiting_ack` state a legacy peer would drop), and
+    /// `message-correlation-ack-v2` (#2037) once any hosted partition has
+    /// recorded the v2 latch (its log then carries v2 ack output).
     ///
     /// `None` = UNKNOWN: some partition's engine actor is dead or did not answer
     /// within [`ENGINE_HEALTH_PROBE_BOUND`]. The probe is bounded and uses
@@ -22049,7 +22055,8 @@ impl ServerImpl {
     async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
         use nano_falcon_protocol::cluster_join::{
             FEATURE_CLUSTER_VARIABLES as CV, FEATURE_MESSAGE_BUFFERING as MB,
-            FEATURE_MESSAGE_CORRELATION_ACK as MCA, FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
+            FEATURE_MESSAGE_CORRELATION_ACK as MCA, FEATURE_MESSAGE_CORRELATION_ACK_V2 as MCA2,
+            FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
         };
         // A single node never replicates its log to anyone, so its local state
         // places no requirement on a peer.
@@ -22058,7 +22065,7 @@ impl ServerImpl {
         }
         // Every feature the recovered/replicated state can depend on, each
         // with its one-way state predicate (sticky once observed).
-        const FEATURES: [&str; 4] = [LC, CV, MB, MCA];
+        const FEATURES: [&str; 5] = [LC, CV, MB, MCA, MCA2];
         let mut required: Vec<&'static str> = FEATURES
             .into_iter()
             .filter(|f| self.peers.requires_feature(f))
@@ -22084,6 +22091,7 @@ impl ServerImpl {
                         engine.cluster_variables_ever_used(),
                         engine.message_buffering_ever_used(),
                         engine.message_correlation_ack_required(),
+                        engine.message_correlation_ack_v2_required(),
                     ]
                 }),
             )
@@ -27599,10 +27607,24 @@ async fn remote_buffered_delivery_gate(
     topology: &cluster::Topology,
     peers: &peer::PeerSet,
 ) -> bool {
-    topology.is_single_node()
-        || peers
-            .all_peers_support(nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK)
-            .await
+    cluster_feature_gate(
+        topology,
+        peers,
+        nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
+    )
+    .await
+}
+
+/// The non-Raft cluster-wide rolling-upgrade gate for `feature` (ADR 0066):
+/// on only when EVERY other cluster member is known to advertise it (an
+/// unreachable or unknown member fails closed). A single node is trivially
+/// on. Shared by the #1949 and #2037 (`message-correlation-ack-v2`) gates.
+async fn cluster_feature_gate(
+    topology: &cluster::Topology,
+    peers: &peer::PeerSet,
+    feature: &'static str,
+) -> bool {
+    topology.is_single_node() || peers.all_peers_support(feature).await
 }
 
 fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now: u64) {
@@ -32227,13 +32249,21 @@ async fn main() {
                         &tick_server.peers,
                     )
                     .await;
+                    let ack_v2 = cluster_feature_gate(
+                        tick_server.engine.topology(),
+                        &tick_server.peers,
+                        nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
+                    )
+                    .await;
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
                             // Without Raft this journal is the partition's only
                             // replica: reconcile the lenient flag directly (#1661).
                             reconcile_lenient_completion_local(journal, lenient, now);
-                            // The cluster-wide #1949 capability gate (ADR 0066).
+                            // The cluster-wide #1949 / #2037 capability gates
+                            // (ADR 0066).
                             journal.set_remote_buffered_delivery(remote_delivery);
+                            journal.set_message_correlation_ack_v2(ack_v2);
                             let (fired, commit) = journal.trigger_timers(now);
                             // Fire-and-forget tick: nothing reads disk after it and
                             // follow-ups are re-derived from engine state (#1855).
@@ -34200,6 +34230,36 @@ mod clustered_startup_tests {
         );
         assert!(
             journal.engine().message_correlation_ack_ever_used(),
+            "precondition"
+        );
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(!server.peers.requires_feature(F), "precondition");
+        let _transport = server.raft_transport_for_start().await;
+        assert!(server.peers.requires_feature(F));
+        assert_eq!(server.required_cluster_features().await, Some(vec![F]));
+    }
+
+    /// #2037: a node whose recovered state recorded the
+    /// `message-correlation-ack-v2` latch must require v2 from every peer
+    /// after restart/compaction — its log carries v2 ack output.
+    #[tokio::test]
+    async fn raft_start_requires_message_correlation_ack_v2_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2 as F;
+        let journal = Journal::in_memory_from_events(
+            0,
+            vec![Event::MessageCorrelationAckV2Activated { partition: 0 }],
+        );
+        assert!(
+            journal.engine().message_correlation_ack_v2_required(),
             "precondition"
         );
         let topology = cluster::Topology {
@@ -46400,12 +46460,14 @@ mod clustered_startup_tests {
         // A featureless (pre-#1661) binary is now refused at join. The
         // upgrade also opened the cluster-wide #1949 gate, so the entries
         // committed since carry ack-paced remote delivery and require that
-        // capability too (one-way, like lenience).
+        // capability too (one-way, like lenience) — and likewise latched the
+        // #2037 v2 ack output, so v2 is required as well.
         assert_eq!(
             n0.required_cluster_features().await,
             Some(vec![
                 F,
-                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK
+                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
+                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
             ])
         );
         assert!(

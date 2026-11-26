@@ -20,10 +20,12 @@ use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
+mod ack_outcome;
 mod agent_behavior;
 mod api;
 mod boundary;
 mod call_activity;
+pub(crate) mod completion_step;
 mod debug;
 mod event_subprocess;
 mod expression;
@@ -373,6 +375,11 @@ pub struct Engine {
     /// as last passed to [`Engine::set_remote_buffered_delivery`]. Drives the
     /// one-time [`Event::RemoteBufferedDeliveryActivated`] record.
     remote_buffered_delivery_envelope: bool,
+    /// The CURRENT replicated envelope's `message-correlation-ack-v2` bit
+    /// (#2037), as last passed to [`Engine::set_message_correlation_ack_v2`].
+    /// Drives the one-time [`Event::MessageCorrelationAckV2Activated`]
+    /// record; the v2 ack output itself is gated on the durable latch only.
+    message_correlation_ack_v2_envelope: bool,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -821,6 +828,7 @@ impl Engine {
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
             remote_buffered_delivery_envelope: false,
+            message_correlation_ack_v2_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
@@ -927,6 +935,38 @@ impl Engine {
     /// log/snapshot depends on `message-correlation-ack-v1` once `true`.
     pub fn message_correlation_ack_ever_used(&self) -> bool {
         self.state.message_correlation_ack_used
+    }
+
+    /// Sets the replicated envelope's `message-correlation-ack-v2` bit
+    /// (#2037): `true` only once EVERY cluster member advertises v2. A
+    /// replicated host MUST set it from the replicated command envelope
+    /// before every apply, never from local knowledge.
+    ///
+    /// One-way latch, exactly like v1 (#1949): the first command that applies
+    /// under an enabling envelope records
+    /// [`Event::MessageCorrelationAckV2Activated`], and from then on the ack
+    /// output carries the resolved (post-migration) consumption element. A
+    /// later `false` is ignored. Before the latch the legacy v1 ack output is
+    /// emitted unchanged, so mixed-version clusters, replay of pre-v2
+    /// journals and the wasm `TestEngine` keep working.
+    pub fn set_message_correlation_ack_v2(&mut self, enabled: bool) {
+        self.message_correlation_ack_v2_envelope = enabled;
+    }
+
+    /// Records the one-time v2 activation latch (#2037).
+    fn emit_message_correlation_ack_v2_activation(&mut self, log: &mut Vec<Event>) {
+        if self.message_correlation_ack_v2_envelope
+            && !self.state.message_correlation_ack_v2_latched
+        {
+            let partition = self.partition_id;
+            self.emit(log, Event::MessageCorrelationAckV2Activated { partition });
+        }
+    }
+
+    /// Whether this partition's retained log/snapshot depends on
+    /// `message-correlation-ack-v2` (#2037): the v2 latch is recorded. One-way.
+    pub fn message_correlation_ack_v2_required(&self) -> bool {
+        self.state.message_correlation_ack_v2_latched
     }
 
     /// The worker a terminal job event attributes (#963): the replicated
@@ -1088,6 +1128,7 @@ impl Engine {
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
             remote_buffered_delivery_envelope: false,
+            message_correlation_ack_v2_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,
@@ -2750,6 +2791,9 @@ impl Engine {
     /// acknowledging it — the debug/normal-apply parity contract.
     fn finish_drained_command(&mut self, log: &mut Vec<Event>) {
         self.cascade_cancel_children(log, 0);
+        // The v2 latch (#2037) is recorded BEFORE the owed ack, so the first
+        // command applied under a v2 envelope already answers in v2.
+        self.emit_message_correlation_ack_v2_activation(log);
         self.emit_pending_correlation_ack(log);
         self.emit_remote_buffered_delivery_activation(log);
         self.remote_backlog_scan_pending = false;
@@ -5509,6 +5553,7 @@ impl Engine {
                             // The ORIGINAL answer, never one recomputed from
                             // the subscription's later state (#1949).
                             Some(receipt) => {
+                                let deferred = receipt.deferred;
                                 self.emit_receipt(&mut log, &ack, receipt);
                                 // A deferral answered while suspended whose
                                 // instance has since resumed: the message
@@ -5516,7 +5561,7 @@ impl Engine {
                                 // ack, then needs the resume handshake the
                                 // earlier resume could not complete (it found
                                 // the delivery still awaiting this ack).
-                                if receipt.deferred && !self.instance_is_suspended(instance_key) {
+                                if deferred && !self.instance_is_suspended(instance_key) {
                                     self.emit_subscription_resuming(&mut log, subscription_key);
                                 }
                             }
@@ -5611,6 +5656,7 @@ impl Engine {
                 accepted,
                 consumed,
                 deferred,
+                element_id,
             } => {
                 // Either way — applied now, or a duplicate / stale ack of a
                 // delivery no longer awaited — no re-drive of this delivery
@@ -5665,6 +5711,7 @@ impl Engine {
                         consumed,
                         deferred,
                         partition: self.partition_id,
+                        element_id,
                     },
                 );
                 if consumed {
@@ -8030,6 +8077,9 @@ impl Engine {
                         partition: self.partition_id,
                         target_partition: self.partition_id,
                         delivery_key: ack.delivery_key,
+                        // A self-routed release: nothing was consumed, so
+                        // there is no resolved consumption metadata.
+                        element_id: None,
                     });
                 };
                 Some(Event::RemoteMessageCorrelation {
@@ -8070,6 +8120,7 @@ impl Engine {
                     partition: self.partition_id,
                     target_partition: r.target_partition,
                     delivery_key,
+                    element_id: r.element_id,
                 },
             )
             .collect()
@@ -8256,24 +8307,38 @@ impl Engine {
     ///   its scope still waits.
     fn emit_correlation_ack(&mut self, log: &mut Vec<Event>, ack: PendingCorrelationAck) {
         let subscription = self.state.message_subscriptions.get(&ack.subscription_key);
-        let consumed = subscription.is_some_and(|s| {
-            if s.kind.stays_open_after_trigger() {
-                s.correlated_message_keys.contains(&ack.message_key)
-            } else {
-                s.state == state::MessageSubscriptionState::Correlated
-            }
-        });
-        let waiting =
-            subscription.is_some_and(|s| s.state == state::MessageSubscriptionState::Opening);
-        let accepted = consumed && waiting;
-        let deferred = !consumed && waiting && self.instance_is_suspended(ack.instance_key);
+        // Gather the durable facts; the decision is the pure kernel's.
+        let facts = ack_outcome::AckFacts {
+            subscription_present: subscription.is_some(),
+            stays_open: subscription.is_some_and(|s| s.kind.stays_open_after_trigger()),
+            message_recorded: subscription
+                .is_some_and(|s| s.correlated_message_keys.contains(&ack.message_key)),
+            correlated: subscription
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Correlated),
+            opening: subscription
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Opening),
+            instance_suspended: self.instance_is_suspended(ack.instance_key),
+        };
+        let outcome = ack_outcome::ack_outcome(facts);
+        // The RESOLVED consumption element (#2037), read from this
+        // partition's durable state now — after any migration that ran
+        // between the message partition's reservation and this consumption
+        // re-pointed the subscription. v2 output only (#2037): before the
+        // cluster-wide `message-correlation-ack-v2` latch the legacy v1 ack
+        // is emitted unchanged, so no member lacking v2 receives it.
+        let element_id = if self.state.message_correlation_ack_v2_latched {
+            subscription.map(|s| s.element_id.clone())
+        } else {
+            None
+        };
         let receipt = state::CorrelationReceipt {
-            accepted,
-            consumed,
-            deferred,
+            accepted: outcome.accepted,
+            consumed: outcome.consumed,
+            deferred: outcome.deferred,
             message_key: ack.message_key,
             instance_key: ack.instance_key,
             target_partition: ack.target_partition,
+            element_id,
         };
         self.emit_receipt(log, &ack, receipt);
     }
@@ -8299,6 +8364,7 @@ impl Engine {
                 partition: self.partition_id,
                 target_partition: ack.target_partition,
                 delivery_key: ack.delivery_key,
+                element_id: receipt.element_id,
             },
         );
     }
@@ -9629,13 +9695,20 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         // A parallel or inclusive gateway with more than one incoming flow is a
         // join: its activation is guarded instead of running per arrival.
-        if let Some(join) = self.join_kind(instance_key, &element_id) {
-            return self.activate_join(instance_key, element_id, scope, via, join, pending);
-        }
+        let join = self.join_kind(instance_key, &element_id);
+        let tag_race = match completion_step::activation_route(join.is_some(), race.is_some()) {
+            completion_step::ActivationRoute::Join => match join {
+                Some(join) => {
+                    return self.activate_join(instance_key, element_id, scope, via, join, pending)
+                }
+                None => false,
+            },
+            completion_step::ActivationRoute::Activate { tag_race } => tag_race,
+        };
         let element_instance_key = self.mint_key();
         let (mut events, followups) =
             self.activate_with_key(instance_key, element_id, scope, element_instance_key);
-        if race.is_some() {
+        if tag_race {
             // Tag the catch with the gateway activation that armed it (#1676).
             for event in &mut events {
                 if let Event::ElementActivating {
@@ -16174,101 +16247,17 @@ impl Engine {
             return (events, Vec::new());
         }
 
-        // Compensation routing (inline, listener-free path). A completing
-        // compensation handler routes back to the throw event waiting on it (its
-        // `ElementCompleted` was emitted inline above); a completing compensable
-        // activity records a compensation subscription before its outgoing flow.
-        // The match is by the handler's element-INSTANCE key (#897), with the
-        // element-id lookup only for waits replayed from pre-#897 journals.
-        if let Some(throw_eik) = self
-            .pending_compensation_handler_by_instance(instance_key, element_instance_key)
-            .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
-        {
-            let (resume_events, resume_followups) = self.resume_compensation_throw(
-                instance_key,
-                &element_id,
-                throw_eik,
-                element_instance_key,
-            );
-            events.extend(resume_events);
-            return (events, resume_followups);
-        }
-        // #901: compensation registration (explicit boundary subscription, or
-        // a sub-process's scope subscription, and nothing at all for undo work
-        // inside a pending handler) has one canonical home.
-        events.extend(self.completion_compensation_subscriptions(
+        // Compensation routing, compensation registration, link / escalation /
+        // error handoffs and the outgoing flows: decided by the shared
+        // completion kernel (inline, listener-free path).
+        self.route_completion(
+            completion_step::Phase::Inline,
             instance_key,
             element_instance_key,
-            &element_id,
+            element_id,
             scope,
-        ));
-
-        // A link intermediate *throw* event has no outgoing sequence flow: it
-        // hands its token to the matching link *catch* event (same link name,
-        // same scope), activating it directly. Without this the throw completes
-        // into the empty outgoing loop below and the token silently vanishes
-        // (#1157). Mirrors the deferred `finalize_completion` handoff for the
-        // end-listener path.
-        if let Some(ElementKind::LinkIntermediateThrowEvent { link_name }) =
-            self.element_kind(instance_key, &element_id)
-        {
-            let mut followups = Vec::new();
-            if let Some(catch_id) = self.resolve_link_catch(instance_key, &element_id, &link_name) {
-                followups.push(Step::Activate {
-                    instance_key,
-                    element_id: catch_id,
-                    scope,
-                    via: None,
-                    race: None,
-                });
-            }
-            return (events, followups);
-        }
-
-        // An escalation throw event (`escalationEventDefinition` on an
-        // intermediate throw or end event, #1173): raise the named escalation
-        // and continue. Mirrors the deferred `finalize_completion` handoff for
-        // the end-listener path — escalation is non-critical, so the throw's own
-        // token always routes onward / drains regardless of whether it is caught.
-        if let Some(ElementKind::EscalationThrowEvent { escalation_code }) =
-            self.element_kind(instance_key, &element_id)
-        {
-            return self.raise_escalation_from_throw(
-                instance_key,
-                element_instance_key,
-                element_id,
-                scope,
-                escalation_code,
-                events,
-            );
-        }
-
-        // An error end event (`errorEventDefinition` on an `endEvent`, #1592):
-        // throw the BPMN error exactly like a worker `ThrowJobError` — the catch
-        // walk is shared (`find_error_catch`, Zeebe `CatchEventAnalyzer` parity).
-        // Mirrors the deferred `finalize_completion` handoff for the end-listener
-        // path.
-        if let Some(ElementKind::ErrorEndEvent { error_code }) =
-            self.element_kind(instance_key, &element_id)
-        {
-            return self.throw_error_from_end_event(
-                instance_key,
-                element_instance_key,
-                element_id,
-                scope,
-                error_code,
-                events,
-            );
-        }
-
-        let mut followups = Vec::new();
-        for (taken, step) in
-            self.take_completion_flows(instance_key, element_instance_key, &element_id, scope)
-        {
-            events.extend(taken);
-            followups.push(step);
-        }
-        (events, followups)
+            events,
+        )
     }
 
     /// Whether `element_id` is a SPLIT gateway — an exclusive gateway, or an
@@ -16622,93 +16611,141 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        // A compensation handler completing routes back to the compensation
-        // throw event waiting on it, not along (non-existent) outgoing flows.
-        // The match is by the handler's element-INSTANCE key (#897), with the
-        // element-id lookup only for waits replayed from pre-#897 journals.
-        if let Some(throw_eik) = self
-            .pending_compensation_handler_by_instance(instance_key, element_instance_key)
-            .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
-        {
-            return self.finalize_compensation_handler(
-                instance_key,
-                element_instance_key,
-                element_id,
-                throw_eik,
-            );
-        }
-        let mut events = vec![Event::ElementCompleted {
+        let events = vec![Event::ElementCompleted {
             instance_key,
             element_instance_key,
             element_id: element_id.clone(),
         }];
-        let mut followups = Vec::new();
-        // A link intermediate *throw* event has no outgoing sequence flow: on
-        // completion it hands its token to the matching link *catch* event (same
-        // link name, same scope), activating it directly. Without this the throw
-        // completes into the pass-through outgoing loop below, finds no flow, and
-        // the token silently vanishes (#1157).
-        if let Some(ElementKind::LinkIntermediateThrowEvent { link_name }) =
-            self.element_kind(instance_key, &element_id)
-        {
-            if let Some(catch_id) = self.resolve_link_catch(instance_key, &element_id, &link_name) {
-                followups.push(Step::Activate {
-                    instance_key,
-                    element_id: catch_id,
-                    scope,
-                    via: None,
-                    race: None,
-                });
-            }
-            return (events, followups);
+        self.route_completion(
+            completion_step::Phase::Deferred,
+            instance_key,
+            element_instance_key,
+            element_id,
+            scope,
+            events,
+        )
+    }
+
+    /// The single collector for a completion's routing, shared by the inline
+    /// tail of [`complete`](Self::complete) and the deferred
+    /// [`finalize_completion`](Self::finalize_completion): it gathers the
+    /// inputs, and [`completion_step::completion_plan`] decides (#2049).
+    /// `events` already carries the element's `ElementCompleted`.
+    ///
+    /// - A completing compensation handler routes back to the throw event
+    ///   waiting on it (matched by element-INSTANCE key, #897, with the
+    ///   element-id lookup only for waits replayed from pre-#897 journals).
+    /// - A link throw hands its token to the matching link catch (#1157).
+    /// - An escalation throw raises its escalation (#1173); an error end event
+    ///   throws its BPMN error (#1592).
+    /// - Anything else takes its outgoing flows (racing, for an event-based
+    ///   gateway).
+    fn route_completion(
+        &mut self,
+        phase: completion_step::Phase,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+        mut events: Vec<Event>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        use completion_step::{CompletionKind, CompletionRoute};
+        let handler = self
+            .pending_compensation_handler_by_instance(instance_key, element_instance_key)
+            .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope));
+        let element = self.element_kind(instance_key, &element_id);
+        let kind = match &element {
+            Some(ElementKind::LinkIntermediateThrowEvent { .. }) => CompletionKind::LinkThrow,
+            Some(ElementKind::EscalationThrowEvent { .. }) => CompletionKind::EscalationThrow,
+            Some(ElementKind::ErrorEndEvent { .. }) => CompletionKind::ErrorEnd,
+            Some(ElementKind::EventBasedGateway) => CompletionKind::EventBasedGateway,
+            _ => CompletionKind::Other,
+        };
+        let plan = completion_step::completion_plan(phase, handler.is_some(), kind);
+        if plan.register_compensation {
+            // #901: compensation registration has one canonical home.
+            events.extend(self.completion_compensation_subscriptions(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                scope,
+            ));
         }
-        // An escalation throw event (`escalationEventDefinition` on an
-        // intermediate throw or end event, #1173): raise the named escalation,
-        // then continue. Escalation is non-critical, so the throw's own token
-        // always routes onward / drains regardless of whether it was caught.
-        if let Some(ElementKind::EscalationThrowEvent { escalation_code }) =
-            self.element_kind(instance_key, &element_id)
-        {
-            return self.raise_escalation_from_throw(
+        let mut followups = Vec::new();
+        match (plan.route, handler, element) {
+            (CompletionRoute::CompensationHandler, Some(throw_eik), _) => match phase {
+                completion_step::Phase::Inline => {
+                    let (resume_events, resume_followups) = self.resume_compensation_throw(
+                        instance_key,
+                        &element_id,
+                        throw_eik,
+                        element_instance_key,
+                    );
+                    events.extend(resume_events);
+                    (events, resume_followups)
+                }
+                completion_step::Phase::Deferred => self.finalize_compensation_handler(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    throw_eik,
+                ),
+            },
+            (
+                CompletionRoute::LinkHandoff,
+                _,
+                Some(ElementKind::LinkIntermediateThrowEvent { link_name }),
+            ) => {
+                if let Some(catch_id) =
+                    self.resolve_link_catch(instance_key, &element_id, &link_name)
+                {
+                    followups.push(Step::Activate {
+                        instance_key,
+                        element_id: catch_id,
+                        scope,
+                        via: None,
+                        race: None,
+                    });
+                }
+                (events, followups)
+            }
+            (
+                CompletionRoute::RaiseEscalation,
+                _,
+                Some(ElementKind::EscalationThrowEvent { escalation_code }),
+            ) => self.raise_escalation_from_throw(
                 instance_key,
                 element_instance_key,
                 element_id,
                 scope,
                 escalation_code,
                 events,
-            );
+            ),
+            (CompletionRoute::ThrowError, _, Some(ElementKind::ErrorEndEvent { error_code })) => {
+                self.throw_error_from_end_event(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    scope,
+                    error_code,
+                    events,
+                )
+            }
+            (route, _, _) => {
+                // `TakeFlows` (the only route whose payload the collector does
+                // not need to re-read; the others always match above).
+                let race = matches!(route, CompletionRoute::TakeFlows { race: true })
+                    .then_some(element_instance_key);
+                for (taken, mut step) in self.take_all_flows(instance_key, &element_id, scope) {
+                    if let Step::Activate { race: slot, .. } = &mut step {
+                        *slot = race;
+                    }
+                    events.extend(taken);
+                    followups.push(step);
+                }
+                (events, followups)
+            }
         }
-        // An error end event (`errorEventDefinition` on an `endEvent`, #1592):
-        // throw the BPMN error exactly like a worker `ThrowJobError` — the catch
-        // walk is shared (`find_error_catch`, Zeebe `CatchEventAnalyzer` parity).
-        if let Some(ElementKind::ErrorEndEvent { error_code }) =
-            self.element_kind(instance_key, &element_id)
-        {
-            return self.throw_error_from_end_event(
-                instance_key,
-                element_instance_key,
-                element_id,
-                scope,
-                error_code,
-                events,
-            );
-        }
-        // #901: compensation registration (explicit boundary subscription, or
-        // a sub-process's scope subscription, and nothing at all for undo work
-        // inside a pending handler) has one canonical home.
-        events.extend(self.completion_compensation_subscriptions(
-            instance_key,
-            element_instance_key,
-            &element_id,
-            scope,
-        ));
-        for (taken, step) in
-            self.take_completion_flows(instance_key, element_instance_key, &element_id, scope)
-        {
-            events.extend(taken);
-            followups.push(step);
-        }
-        (events, followups)
     }
 
     /// Raises the escalation of a just-completed
@@ -16739,86 +16776,80 @@ impl Engine {
         mut events: Vec<Event>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut followups = Vec::new();
-        let caught = match self.find_escalation_catch(instance_key, scope, &escalation_code) {
-            // Caught by an escalation event sub-process (#1555).
-            Some(boundary::ThrowCatch::EventSubProcess {
-                scope_eik,
-                esp_id,
-                interrupting,
-            }) => {
-                if interrupting {
-                    // The throw's flow is NOT taken. The interrupt runs as a
-                    // queued step, after this throw's completion is applied, so
-                    // the teardown sees exactly the scope's other work.
-                    followups.push(Step::TriggerEventSubProcess {
-                        instance_key,
-                        scope: scope_eik,
-                        esp_element_id: esp_id,
-                    });
-                } else {
-                    // Non-interrupting: the throw continues and the event
-                    // sub-process runs concurrently in its host scope.
-                    for (taken, step) in self.take_all_flows(instance_key, &throw_element_id, scope)
-                    {
-                        events.extend(taken);
-                        followups.push(step);
-                    }
-                    followups.push(Step::Activate {
-                        instance_key,
-                        element_id: esp_id,
-                        scope: scope_eik,
-                        via: None,
-                        race: None,
-                    });
+        use completion_step::{BoundaryHost, EscalationAction, EscalationCatch};
+        let found = self.find_escalation_catch(instance_key, scope, &escalation_code);
+        let catch = match &found {
+            None => EscalationCatch::Uncaught,
+            Some(boundary::ThrowCatch::EventSubProcess { interrupting, .. }) => {
+                EscalationCatch::EventSubProcess {
+                    interrupting: *interrupting,
                 }
-                return (events, followups);
             }
-            Some(boundary::ThrowCatch::Boundary {
-                boundary_id,
-                caught_eik,
-                caught_element_id,
-                interrupting,
-            }) => Some((boundary_id, caught_eik, caught_element_id, interrupting)),
-            None => None,
+            Some(boundary::ThrowCatch::Boundary { interrupting, .. }) => {
+                EscalationCatch::Boundary {
+                    interrupting: *interrupting,
+                }
+            }
         };
-        // Build the throw's outgoing flows up front (owned) so routing does not
-        // hold an immutable borrow of `self` across the teardown mutation.
-        let outgoing_flows = self.take_all_flows(instance_key, &throw_element_id, scope);
-        let take_throw_outgoing = |events: &mut Vec<Event>, followups: &mut Vec<Step>| {
-            for (taken, step) in outgoing_flows {
+        let plan = completion_step::escalation_plan(catch);
+        if plan.take_throw_flows {
+            for (taken, step) in self.take_all_flows(instance_key, &throw_element_id, scope) {
                 events.extend(taken);
                 followups.push(step);
             }
-        };
-        match caught {
-            // Uncaught: ignore the escalation (no incident) and pass through.
-            None => {
-                take_throw_outgoing(&mut events, &mut followups);
+        }
+        match (plan.action, found) {
+            (
+                EscalationAction::TriggerEventSubProcess,
+                Some(boundary::ThrowCatch::EventSubProcess {
+                    scope_eik, esp_id, ..
+                }),
+            ) => {
+                // The throw's flow is NOT taken. The interrupt runs as a
+                // queued step, after this throw's completion is applied, so
+                // the teardown sees exactly the scope's other work.
+                followups.push(Step::TriggerEventSubProcess {
+                    instance_key,
+                    scope: scope_eik,
+                    esp_element_id: esp_id,
+                });
             }
-            Some((boundary_id, caught_eik, caught_element_id, false)) => {
-                // Non-interrupting: the throw continues AND a parallel token is
-                // spawned by activating the boundary in the caught activity's
-                // own (enclosing) scope.
-                //
-                // If the caught activity is a multi-instance CHILD, the boundary
-                // is armed on the loop's BODY, not the individual child — so the
-                // parallel token must be spawned in the BODY's enclosing scope.
-                // `scope_of(caught_eik)` for an MI child is the MI body itself,
-                // which would activate the handler INSIDE the loop body (the
-                // wrong level). Mirror the interrupting branch's child→body
-                // redirection before taking `scope_of` so both branches arm the
-                // boundary at the same scope (#1173, the #1170 MI class).
-                take_throw_outgoing(&mut events, &mut followups);
+            (
+                EscalationAction::ActivateEventSubProcess,
+                Some(boundary::ThrowCatch::EventSubProcess {
+                    scope_eik, esp_id, ..
+                }),
+            ) => {
+                // Non-interrupting: the throw continued above and the event
+                // sub-process runs concurrently in its host scope (#1555).
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: esp_id,
+                    scope: scope_eik,
+                    via: None,
+                    race: None,
+                });
+            }
+            (
+                EscalationAction::ActivateBoundary,
+                Some(boundary::ThrowCatch::Boundary {
+                    boundary_id,
+                    caught_eik,
+                    ..
+                }),
+            ) => {
+                // Non-interrupting: the throw continued above AND a parallel
+                // token is spawned by activating the boundary in the caught
+                // activity's own (enclosing) scope. A multi-instance CHILD's
+                // boundary is armed on the loop's BODY, so the token spawns in
+                // the BODY's enclosing scope, not inside the loop body
+                // (#1173, the #1170 MI class).
                 let child_scope = self.scope_of(instance_key, caught_eik);
-                let caught_is_mi_child = self
-                    .state
-                    .instances
-                    .get(&instance_key)
-                    .is_some_and(|i| i.multi_instances.contains_key(&child_scope));
-                let boundary_armed_eik = if caught_is_mi_child {
-                    child_scope
-                } else {
-                    caught_eik
+                let boundary_armed_eik = match completion_step::boundary_host(
+                    self.is_mi_body(instance_key, child_scope),
+                ) {
+                    BoundaryHost::MultiInstanceBody => child_scope,
+                    BoundaryHost::CaughtActivity => caught_eik,
                 };
                 let boundary_scope = self.scope_of(instance_key, boundary_armed_eik);
                 followups.push(Step::Activate {
@@ -16828,9 +16859,16 @@ impl Engine {
                     via: None,
                     race: None,
                 });
-                let _ = caught_element_id;
             }
-            Some((boundary_id, caught_eik, caught_element_id, true)) => {
+            (
+                EscalationAction::InterruptAndActivateBoundary,
+                Some(boundary::ThrowCatch::Boundary {
+                    boundary_id,
+                    caught_eik,
+                    caught_element_id,
+                    ..
+                }),
+            ) => {
                 // Interrupting: tear the caught sub-process scope down (its
                 // descendants, but not the throw itself — its `ElementCompleted`
                 // is already in `events`), complete the caught activity, and run
@@ -16839,24 +16877,19 @@ impl Engine {
                 // If the caught activity is a multi-instance CHILD, the boundary
                 // is armed on the loop's BODY, so interrupting it must tear down
                 // the WHOLE loop — every sibling child and the body's runtime
-                // record — not the single child the throw happened to fire from.
-                // Redirect the teardown to the MI body (its element id equals the
-                // child's, since each child is an instance of the same activity);
-                // otherwise sibling children and the body's `MultiInstanceState`
-                // survive and hang the instance (#1173, the #1170 MI class).
+                // record — not the single child the throw happened to fire from
+                // (#1173, the #1170 MI class).
                 let child_scope = self.scope_of(instance_key, caught_eik);
-                let caught_is_mi_child = self
-                    .state
-                    .instances
-                    .get(&instance_key)
-                    .is_some_and(|i| i.multi_instances.contains_key(&child_scope));
-                let (torn_eik, torn_element_id) = if caught_is_mi_child {
-                    let body_element_id = self
-                        .element_id_of_instance(instance_key, child_scope)
-                        .unwrap_or_else(|| caught_element_id.clone());
-                    (child_scope, body_element_id)
-                } else {
-                    (caught_eik, caught_element_id)
+                let (torn_eik, torn_element_id) = match completion_step::boundary_host(
+                    self.is_mi_body(instance_key, child_scope),
+                ) {
+                    BoundaryHost::MultiInstanceBody => {
+                        let body_element_id = self
+                            .element_id_of_instance(instance_key, child_scope)
+                            .unwrap_or_else(|| caught_element_id.clone());
+                        (child_scope, body_element_id)
+                    }
+                    BoundaryHost::CaughtActivity => (caught_eik, caught_element_id),
                 };
                 let boundary_scope = self.scope_of(instance_key, torn_eik);
                 // TERMINATING before the inner scope's teardown, TERMINATED
@@ -16911,8 +16944,20 @@ impl Engine {
                     race: None,
                 });
             }
+            // Uncaught: escalation is non-critical — no incident, the throw
+            // passed through above. (The kernel pairs every other action with
+            // its catch shape, so no other combination is reachable.)
+            _ => {}
         }
         (events, followups)
+    }
+
+    /// Whether `eik` is a multi-instance body of `instance_key`.
+    fn is_mi_body(&self, instance_key: Key, eik: Key) -> bool {
+        self.state
+            .instances
+            .get(&instance_key)
+            .is_some_and(|i| i.multi_instances.contains_key(&eik))
     }
 
     /// Resolves an `UNHANDLED_ERROR` incident on an error end event by re-running
@@ -18747,34 +18792,6 @@ impl Engine {
                 race: None,
             },
         )
-    }
-
-    /// The outgoing flows a completing flow-node element instance takes
-    /// ([`Engine::take_all_flows`]) — the one implementation shared by
-    /// `complete` and `finalize_completion`. An event-based gateway arms its
-    /// targets as ONE deferred-choice race identified by the gateway's element
-    /// instance (#1676), so each activation it queues carries that `race`: a
-    /// second activation of the same gateway in the same scope arms a separate
-    /// race and never withdraws (or is withdrawn by) the first.
-    fn take_completion_flows(
-        &self,
-        instance_key: Key,
-        element_instance_key: Key,
-        element_id: &str,
-        scope: Key,
-    ) -> Vec<(Vec<Event>, Step)> {
-        let race = matches!(
-            self.element_kind(instance_key, element_id),
-            Some(ElementKind::EventBasedGateway)
-        )
-        .then_some(element_instance_key);
-        let mut flows = self.take_all_flows(instance_key, element_id, scope);
-        for (_, step) in &mut flows {
-            if let Step::Activate { race: slot, .. } = step {
-                *slot = race;
-            }
-        }
-        flows
     }
 
     /// [`Engine::take_flow`] for every outgoing flow of `from`, in execution

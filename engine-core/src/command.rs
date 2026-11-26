@@ -628,6 +628,14 @@ pub enum Command {
         /// subscription open and the message buffered (no next send).
         #[cfg_attr(feature = "serde", serde(default))]
         deferred: bool,
+        /// The resolved (post-migration) consumption element (#2037),
+        /// carried from [`crate::Event::MessageCorrelationAcknowledging`].
+        /// Additive: `None` from a pre-#2037 peer.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        element_id: Option<ElementId>,
     },
     /// The resume handshake (#1949), applied on the **message** partition
     /// (routed from [`crate::Event::MessageSubscriptionResuming`]): the
@@ -1363,6 +1371,7 @@ impl Command {
                 accepted,
                 consumed,
                 deferred,
+                element_id,
             } => {
                 h.key(*subscription_key);
                 h.key(*message_key);
@@ -1370,6 +1379,11 @@ impl Command {
                 h.str(if *accepted { "1" } else { "0" });
                 h.str(if *consumed { "1" } else { "0" });
                 h.str(if *deferred { "1" } else { "0" });
+                // #2037: only hashed when present, so a pre-#2037 command
+                // keeps its identity.
+                if let Some(element_id) = element_id {
+                    h.str(element_id);
+                }
             }
             Command::SettleMessageCorrelationReceipt {
                 subscription_key,
@@ -1638,6 +1652,11 @@ impl Command {
             Command::QuarantineOffheapOrphan {
                 stamp: Some(stamp), ..
             } => stamp.element_id.len() as u64 + stamp.reason.len() as u64,
+            // #2037 review: the acknowledgement carries the resolved element
+            // id, an unbounded string the batcher must see.
+            Command::AcknowledgeMessageCorrelation { element_id, .. } => {
+                element_id.as_ref().map_or(0, |id| id.len() as u64)
+            }
             _ => 0,
         };
         BASE + payload
@@ -2208,6 +2227,22 @@ mod kind_tests {
 
     // #1657 review: cluster-variable create/update (incl. distributed fan-out
     // copies) and delete must count their payload, not the fixed base.
+    #[test]
+    fn approx_bytes_counts_acknowledgement_element_id() {
+        let ack = |element_id: Option<ElementId>| Command::AcknowledgeMessageCorrelation {
+            subscription_key: 1,
+            message_key: 2,
+            delivery_key: 3,
+            accepted: true,
+            consumed: true,
+            deferred: false,
+            element_id,
+        };
+        let bare = ack(None).approx_bytes();
+        let heavy = ack(Some(ElementId::from("e".repeat(50_000)))).approx_bytes();
+        assert!(heavy >= bare + 50_000, "heavy={heavy} bare={bare}");
+    }
+
     #[test]
     fn approx_bytes_counts_cluster_variable_payloads() {
         use std::collections::BTreeMap;
