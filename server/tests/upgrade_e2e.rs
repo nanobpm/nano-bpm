@@ -533,34 +533,50 @@ fn log_heads(c: &Cluster) -> Vec<Vec<u64>> {
 }
 
 /// After a post-latch restart from snapshot + journal, member `id`'s
-/// replicated log must be a prefix of the longest peer log (the leader's),
-/// comparing the WHOLE `payload.Normal` per index — items plus the batch
-/// fields `digest` and `digest_cutover` — and must have caught up to the
-/// entries proposed since it rejoined. Polled: the follower appends
-/// asynchronously after the create was acknowledged by a quorum.
+/// replicated log must agree with the most advanced peer log (the leader's)
+/// at every Raft log index both hold on disk, comparing the WHOLE
+/// `payload.Normal` per index (items plus `digest` / `digest_cutover`), and
+/// must have caught up to the leader's head. Compared BY LOG INDEX, not by
+/// vector position, so members whose on-disk logs start at different indices
+/// (log purge) still align. Polled: a just-restarted (possibly ex-leader)
+/// member may briefly hold an uncommitted tail entry the new leader is about
+/// to overwrite, so a mismatch is retried and only reported on timeout.
 fn assert_restarted_matches_prefix(c: &Cluster, id: usize) {
+    use std::collections::BTreeMap;
     for p in 0..PARTITIONS {
-        wait_for(
-            &format!("node {id}'s partition {p} log to match the leader prefix"),
-            Duration::from_secs(60),
-            || {
-                let logs: Vec<Vec<(u64, serde_json::Value)>> =
-                    c.members.iter().map(|m| raft_batches(&m.data, p)).collect();
-                let leader = logs.iter().max_by_key(|l| l.len()).unwrap();
-                let mine = &logs[id];
-                if mine.len() < leader.len() {
-                    return false;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last;
+        loop {
+            let logs: Vec<BTreeMap<u64, serde_json::Value>> = c
+                .members
+                .iter()
+                .map(|m| raft_batches(&m.data, p).into_iter().collect())
+                .collect();
+            let head = |l: &BTreeMap<u64, serde_json::Value>| {
+                l.keys().next_back().copied().unwrap_or_default()
+            };
+            let leader = logs.iter().max_by_key(|l| head(l)).unwrap();
+            let mine = &logs[id];
+            let mismatch = mine
+                .iter()
+                .find(|(i, b)| leader.get(*i).is_some_and(|l| l != *b));
+            match mismatch {
+                Some((i, b)) => {
+                    last = format!("mismatch at index {i}: {b:?} vs leader {:?}", leader.get(i))
                 }
-                if let Some((a, b)) = mine.iter().zip(leader.iter()).find(|(a, b)| a != b) {
-                    panic!(
-                        "partition {p}: restarted node {id} disagrees with the leader prefix: \
-                         {a:?} vs {b:?}"
-                    );
+                None if head(mine) < head(leader) => {
+                    last = format!("behind: head {} < leader {}", head(mine), head(leader))
                 }
-                true
-            },
-            c,
-        );
+                None => break,
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "partition {p}: restarted node {id} never matched the leader log: {last}\n{}",
+                    tail(&c.all_logs())
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 }
 
@@ -733,7 +749,9 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
         c.kill(id);
         c.start(id, Bin::New);
         wait_ready(&c, id);
-        keys.extend(create_instances(&c, (id + 1) % NODES, 2));
+        // Creates round-robin over partitions, so at least PARTITIONS of them
+        // are needed for every partition to log a fresh digest claim.
+        keys.extend(create_instances(&c, (id + 1) % NODES, PARTITIONS as usize));
         assert_visible_everywhere(&mut c, &keys);
         assert_restarted_matches_prefix(&c, id);
         assert_fresh_digest_claims(&c, &before, id);
