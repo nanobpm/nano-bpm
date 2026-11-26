@@ -267,6 +267,13 @@
       "trackedIn": 1960
     },
     {
+      "file": "engine-core/src/engine/completion_step.rs",
+      "pred": "kani",
+      "count": 1,
+      "reason": "gates the completion-step Kani harnesses (engine/completion_step/kani_proofs.rs), which reference the `kani` crate that only `cargo kani` injects; plain cargo clippy cannot compile them. They are compiled and checked by the non-gating nightly `.github/workflows/kani-nightly.yml` (formal/kani/check.sh).",
+      "trackedIn": 1960
+    },
+    {
       "file": "engine-core/src/engine/join_guard.rs",
       "pred": "kani",
       "count": 1,
