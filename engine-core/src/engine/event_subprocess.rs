@@ -695,6 +695,25 @@ impl Engine {
                 return;
             }
         }
+        // A gateway-owned subscription (#2004): stage the payload for the
+        // gateway's trigger record (#2047 review). Still merged below.
+        if matches!(kind, state::MessageSubscriptionKind::IntermediateCatch)
+            && self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.active.get(&element_instance_key))
+                .is_some_and(|id| {
+                    matches!(
+                        self.element_kind(instance_key, id),
+                        Some(ElementKind::EventBasedGateway)
+                    )
+                })
+        {
+            self.gateway_trigger_payloads
+                .entry((instance_key, element_instance_key))
+                .or_insert_with(|| variables.clone());
+        }
         let flow_scope = self.event_payload_scope(instance_key, element_instance_key, kind);
         // A boundary event's payload is created LOCAL to the boundary instance
         // when it activates later in this drain (#1535); see

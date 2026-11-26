@@ -51,6 +51,7 @@ fn gateway_subscriptions_open_then_clear_on_trigger_and_on_gateway_end() {
             gateway_element_instance_key: 9001,
             catch_element_id: "onM1".to_string(),
             catch_element_instance_key: 9010,
+            variables: Default::default(),
         },
     );
     assert!(!state.instances[&inst]
@@ -311,6 +312,7 @@ fn event_gateway_records_count_every_owned_key_in_max_key() {
         gateway_element_instance_key: 20,
         catch_element_id: "onM1".into(),
         catch_element_instance_key: 30,
+        variables: Default::default(),
     };
     assert_eq!(triggered.max_key(), 30);
     let triggered_gw_high = Event::EventGatewayTriggered {
@@ -318,6 +320,7 @@ fn event_gateway_records_count_every_owned_key_in_max_key() {
         gateway_element_instance_key: 40,
         catch_element_id: "onM1".into(),
         catch_element_instance_key: 0,
+        variables: Default::default(),
     };
     assert_eq!(triggered_gw_high.max_key(), 40);
     let opened = Event::EventGatewaySubscriptionsOpened {

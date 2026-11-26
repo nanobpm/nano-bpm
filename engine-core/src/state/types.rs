@@ -118,6 +118,13 @@ pub enum ProcessInstanceState {
 pub struct GatewayTrigger {
     pub catch_element_id: ElementId,
     pub catch_element_instance_key: Key,
+    /// The winning event's payload (#2047 review), overlaid on the catch's
+    /// output-mapping context. Additive (`serde(default)`).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub variables: BTreeMap<String, crate::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3247,6 +3254,9 @@ impl State {
         let Some(def) = self.definition_for(i) else {
             return false;
         };
+        if Self::has_raceless_legacy_catch(&def.definition, i) {
+            return true;
+        }
         i.active.iter().any(|(eik, id)| {
             *eik != except
                 && !i.gateway_subscriptions.contains_key(eik)
@@ -3255,6 +3265,37 @@ impl State {
                     .element(id)
                     .is_some_and(|e| matches!(e.kind, crate::model::ElementKind::EventBasedGateway))
         })
+    }
+
+    /// Whether `instance` holds a RACE-LESS legacy gateway catch (#2047
+    /// review): an active intermediate catch owned by an event-based gateway
+    /// (the one race-membership definition, `event_gateway_race_index`) that
+    /// carries no `races` entry and is not a catch the new runtime activated
+    /// from a recorded trigger. A pre-#1676 snapshot arms gateway catches
+    /// without race tags; on completion such a catch withdraws its siblings
+    /// by element id + scope, so the new runtime must not latch while one
+    /// remains.
+    fn has_raceless_legacy_catch(
+        def: &crate::model::ProcessDefinition,
+        instance: &ProcessInstance,
+    ) -> bool {
+        let triggered = |eik: &Key| {
+            instance
+                .gateway_triggers
+                .values()
+                .any(|t| t.catch_element_instance_key == *eik)
+        };
+        let candidates: Vec<&str> = instance
+            .active
+            .iter()
+            .filter(|(eik, _)| !instance.races.contains_key(eik) && !triggered(eik))
+            .map(|(_, id)| id.as_str())
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        let index = crate::engine::event_gateway_race_index(def);
+        candidates.iter().any(|id| index.owner_of(id).is_some())
     }
 
     /// The legacy race state a loader must REFUSE (#2004): every legacy race

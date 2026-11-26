@@ -299,3 +299,40 @@ fn legacy_cutover_blockers_are_never_cold_spilled() {
         .contains(&paused));
     assert!(engine.snapshot_instance(paused).is_none());
 }
+
+/// A pre-#1676 snapshot arms gateway catches WITHOUT race tags (#2047
+/// review). Such a race-less legacy catch still blocks the cutover and is
+/// pinned against cold spill, so a new-runtime winner never coexists with a
+/// legacy catch whose scope-only withdrawal could cancel it.
+#[test]
+fn raceless_legacy_catch_blocks_the_latch_and_cold_spill() {
+    let (mut engine, _) = engine_with(false);
+    let (legacy, _) = create(&mut engine);
+    // Strip the race tags, as a pre-#1676 snapshot carries none.
+    engine
+        .state
+        .instances
+        .get_mut(&legacy)
+        .unwrap()
+        .races
+        .clear();
+    assert!(engine
+        .state
+        .legacy_event_gateway_race_instances()
+        .is_empty());
+    let instance = engine.state.instances[&legacy].clone();
+    assert!(engine.state.is_legacy_event_gateway_blocker(&instance));
+    assert!(engine.state.legacy_event_gateway_in_flight(0));
+    assert!(!engine
+        .cold_spillable_instances(usize::MAX)
+        .contains(&legacy));
+
+    engine.set_event_gateway_runtime(true);
+    let (_, events) = create(&mut engine);
+    assert_eq!(
+        latches(&events),
+        0,
+        "no latch while a race-less catch is armed"
+    );
+    assert!(!engine.event_gateway_runtime_latched());
+}

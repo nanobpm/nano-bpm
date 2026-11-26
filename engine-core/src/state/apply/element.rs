@@ -129,6 +129,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             gateway_element_instance_key,
             catch_element_id,
             catch_element_instance_key,
+            variables,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance
@@ -139,6 +140,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                     GatewayTrigger {
                         catch_element_id: catch_element_id.clone(),
                         catch_element_instance_key: *catch_element_instance_key,
+                        variables: variables.clone(),
                     },
                 );
             }

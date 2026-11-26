@@ -327,6 +327,11 @@ pub struct Engine {
     /// would hand the whole payload to the first activation and leave the rest
     /// reading a missing (or, for output-mapped boundaries, stale) payload.
     boundary_payloads: BTreeMap<(Key, Key, String), VecDeque<BTreeMap<String, Value>>>,
+    /// A fired gateway-owned subscription's payload (#2047 review), keyed by
+    /// `(instance, gateway element instance)`, staged by `merge_event_payload`
+    /// and consumed by `trigger_event_gateway` later in the same drain, which
+    /// records it on `EventGatewayTriggered`.
+    gateway_trigger_payloads: BTreeMap<(Key, Key), BTreeMap<String, Value>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -850,6 +855,7 @@ impl Engine {
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
+            gateway_trigger_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
@@ -1194,6 +1200,7 @@ impl Engine {
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
+            gateway_trigger_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
@@ -2948,6 +2955,7 @@ impl Engine {
         self.torn_down_scopes.clear();
         self.esp_start_payloads.clear();
         self.boundary_payloads.clear();
+        self.gateway_trigger_payloads.clear();
         self.pending_timer_fires.clear();
         self.buffer_scan_from = 0;
         self.buffer_requeue.clear();
@@ -5440,6 +5448,11 @@ impl Engine {
                     .map(|s| s.key)
                     .collect();
                 matched.sort_unstable();
+                // Gateway-owned subscriptions (#2004): one broadcast may match
+                // several catches of ONE waiting event-based gateway. The first
+                // (lowest subscription key) wins; the others stay open and are
+                // deleted by the gateway's trigger, never recorded as correlated.
+                let mut claimed_gateways: BTreeSet<(Key, Key)> = BTreeSet::new();
 
                 for subscription_key in matched {
                     // An earlier boundary correlation in this batch may have
@@ -5454,6 +5467,17 @@ impl Engine {
                     let element_instance_key = subscription.element_instance_key;
                     let element_id = subscription.element_id.clone();
                     let kind = subscription.kind.clone();
+                    if self
+                        .event_gateway_trigger_target(
+                            instance_key,
+                            element_instance_key,
+                            &element_id,
+                        )
+                        .is_some()
+                        && !claimed_gateways.insert((instance_key, element_instance_key))
+                    {
+                        continue;
+                    }
                     self.advance_signal_correlated_token(
                         &mut log,
                         &mut queue,
@@ -7932,6 +7956,11 @@ impl Engine {
             .map(|s| s.key)
             .collect();
         candidates.sort_unstable();
+        // Gateway-owned subscriptions (#2004): several conditions of ONE waiting
+        // event-based gateway may become true together. The first (lowest
+        // subscription key) wins; the others stay open and are deleted by the
+        // gateway's trigger, never recorded as triggered.
+        let mut claimed_gateways: BTreeSet<(Key, Key)> = BTreeSet::new();
 
         for key in candidates {
             // A prior fire in this batch may have interrupted the activity and
@@ -7952,6 +7981,13 @@ impl Engine {
             // root), never the root alone (#1335, Zeebe parity).
             let vars = self.variables_for_element(instance_key, element_instance_key);
             if !matches!(crate::feel::eval_bool(&condition, &vars), Ok(true)) {
+                continue;
+            }
+            if self
+                .event_gateway_trigger_target(instance_key, element_instance_key, &element_id)
+                .is_some()
+                && !claimed_gateways.insert((instance_key, element_instance_key))
+            {
                 continue;
             }
             self.emit(
@@ -16293,7 +16329,18 @@ impl Engine {
         let output_updates = if outputs.is_empty() {
             BTreeMap::new()
         } else {
-            let visible = self.variables_for_element(instance_key, element_instance_key);
+            let mut visible = self.variables_for_element(instance_key, element_instance_key);
+            // A gateway-triggered catch reads its winning event's payload as
+            // recorded at the trigger (#2047 review), not whatever the scope
+            // holds now.
+            if let Some(payload) = self
+                .triggered_catch_payload(instance_key, element_instance_key)
+                .filter(|p| !p.is_empty())
+            {
+                let mut vars = (*visible).clone();
+                vars.extend(payload.clone());
+                visible = std::sync::Arc::new(vars);
+            }
             let eval = match &script_update {
                 // The script result event is not applied to state until this
                 // step returns, so overlay it onto the eval context by hand.
@@ -17514,6 +17561,10 @@ impl Engine {
                     && sibling_ids.contains(&eid.as_str())
                     && self.scope_of(instance_key, **eik) == scope
                     && race.is_none_or(|r| instance.races.get(eik) == Some(&r))
+                    // Never withdraw a catch the new runtime activated from a
+                    // recorded gateway trigger (#2047 review): it is no member
+                    // of any legacy race.
+                    && !self.is_triggered_catch(instance_key, **eik)
             })
             .map(|(eik, eid)| (*eik, eid.clone()))
             .collect();
@@ -17606,10 +17657,22 @@ impl Engine {
     /// gateway's recorded trigger (#2004): its event already occurred, so it
     /// completes instead of subscribing.
     fn is_triggered_catch(&self, instance_key: Key, element_instance_key: Key) -> bool {
-        self.state.instances.get(&instance_key).is_some_and(|i| {
+        self.triggered_catch_payload(instance_key, element_instance_key)
+            .is_some()
+    }
+
+    /// The recorded trigger payload of a catch the gateway-owned trigger path
+    /// activated (#2004, #2047 review), or `None` for any other element.
+    fn triggered_catch_payload(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> Option<&BTreeMap<String, Value>> {
+        self.state.instances.get(&instance_key).and_then(|i| {
             i.gateway_triggers
                 .values()
-                .any(|t| t.catch_element_instance_key == element_instance_key)
+                .find(|t| t.catch_element_instance_key == element_instance_key)
+                .map(|t| &t.variables)
         })
     }
 
@@ -17666,11 +17729,16 @@ impl Engine {
             return (Vec::new(), Vec::new());
         }
         let catch_element_instance_key = self.mint_key();
+        let variables = self
+            .gateway_trigger_payloads
+            .remove(&(instance_key, gateway_eik))
+            .unwrap_or_default();
         let mut events = vec![Event::EventGatewayTriggered {
             instance_key,
             gateway_element_instance_key: gateway_eik,
             catch_element_id: catch_id,
             catch_element_instance_key,
+            variables,
         }];
         events.extend(self.cancel_all_timers_on(gateway_eik));
         events.extend(self.cancel_all_subscriptions_on(gateway_eik));

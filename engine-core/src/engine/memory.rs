@@ -133,6 +133,7 @@ impl Engine {
             torn_down_scopes: std::collections::BTreeSet::new(),
             esp_start_payloads: std::collections::BTreeMap::new(),
             boundary_payloads: std::collections::BTreeMap::new(),
+            gateway_trigger_payloads: std::collections::BTreeMap::new(),
             pending_timer_fires: std::collections::VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: std::collections::VecDeque::new(),

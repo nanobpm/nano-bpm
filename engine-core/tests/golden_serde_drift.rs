@@ -1317,6 +1317,7 @@ fn build_event_witnesses() -> Vec<Event> {
             gateway_element_instance_key: 2,
             catch_element_id: "m1".to_string(),
             catch_element_instance_key: 3,
+            variables: BTreeMap::from([("payload".to_string(), Value::Int(21))]),
         },
         Event::ProcessInstanceModified {
             instance_key: 1,

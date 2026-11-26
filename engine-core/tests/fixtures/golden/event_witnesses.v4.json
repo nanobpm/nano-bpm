@@ -231,7 +231,12 @@
       "catch_element_id": "m1",
       "catch_element_instance_key": 3,
       "gateway_element_instance_key": 2,
-      "instance_key": 1
+      "instance_key": 1,
+      "variables": {
+        "payload": {
+          "Int": 21
+        }
+      }
     }
   },
   {

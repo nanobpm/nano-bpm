@@ -371,3 +371,178 @@ fn snapshot_restore_and_replay_agree_around_the_latch() {
         assert_eq!(replayed.state(), run.engine.state(), "{label}");
     }
 }
+
+/// A latched gateway whose two catches are `a` and `b`, built by `catch`,
+/// both leading to `hold`.
+fn two_catches(catch: fn(ProcessBuilder, &str) -> ProcessBuilder) -> ProcessDefinition {
+    let builder = ProcessBuilder::new("cc")
+        .start_event("start")
+        .event_based_gateway("gw");
+    let builder = catch(catch(builder, "onA"), "onB");
+    builder
+        .service_task("hold", "hold")
+        .end_event("end")
+        .connect("start", "gw")
+        .connect("gw", "onA")
+        .connect("gw", "onB")
+        .connect("onA", "hold")
+        .connect("onB", "hold")
+        .connect("hold", "end")
+        .build()
+        .unwrap()
+}
+
+/// Asserts one trigger, one catch activation, and no open subscription left
+/// on the gateway, and returns the winner.
+fn assert_single_winner(run: &Journaled, inst: Key, events: &[Event]) -> String {
+    let won = triggers(events);
+    assert_eq!(won.len(), 1, "exactly one trigger: {events:#?}");
+    assert_eq!(catch_activations(events), won, "only the winner activates");
+    assert!(
+        !run.engine
+            .state()
+            .signal_subscriptions
+            .values()
+            .any(|s| s.instance_key == inst
+                && s.state == crate::state::MessageSubscriptionState::Open),
+        "the loser's signal subscription is cancelled"
+    );
+    won[0].clone()
+}
+
+/// One signal broadcast matching BOTH catches of one gateway (#2047 review)
+/// records exactly one `SignalCorrelated`; the loser's subscription is
+/// cancelled, never recorded as a successful correlation.
+#[test]
+fn one_broadcast_matching_two_gateway_catches_correlates_once() {
+    let mut run = Journaled::new(
+        two_catches(|b, id| b.signal_intermediate_catch_event(id, "go")),
+        true,
+    );
+    let inst = run.create("cc", 1_000);
+    let events = run.apply(
+        Command::BroadcastSignal {
+            signal_name: "go".into(),
+            variables: BTreeMap::new(),
+        },
+        2_000,
+    );
+    let correlated = events
+        .iter()
+        .filter(|e| matches!(e, Event::SignalCorrelated { .. }))
+        .count();
+    assert_eq!(correlated, 1, "one winning correlation: {events:#?}");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::SignalSubscriptionCanceled { .. })));
+    assert_eq!(assert_single_winner(&run, inst, &events), "onA");
+    assert!(holding(&run.engine, inst));
+    assert_eq!(
+        Engine::replay(run.journal.clone()).state(),
+        run.engine.state()
+    );
+}
+
+/// Two gateway catch conditions becoming true together (#2047 review)
+/// record exactly one `ConditionalTriggered`; the loser is cancelled.
+#[test]
+fn two_gateway_conditions_true_together_trigger_once() {
+    let mut run = Journaled::new(
+        two_catches(|b, id| b.conditional_intermediate_catch_event(id, "=x > 0")),
+        true,
+    );
+    let inst = run.create("cc", 1_000);
+    let events = run.apply(
+        Command::set_variables(inst, BTreeMap::from([("x".to_string(), Value::Int(1))])),
+        2_000,
+    );
+    let fired = events
+        .iter()
+        .filter(|e| matches!(e, Event::ConditionalTriggered { .. }))
+        .count();
+    assert_eq!(fired, 1, "one winning trigger: {events:#?}");
+    let won = triggers(&events);
+    assert_eq!(won, vec!["onA".to_string()]);
+    assert_eq!(catch_activations(&events), won);
+    assert!(
+        !run.engine
+            .state()
+            .conditional_subscriptions
+            .values()
+            .any(|s| s.instance_key == inst
+                && s.state == crate::state::MessageSubscriptionState::Open)
+    );
+    assert!(holding(&run.engine, inst));
+    assert_eq!(
+        Engine::replay(run.journal.clone()).state(),
+        run.engine.state()
+    );
+}
+
+/// The winning payload is snapshotted at the trigger (#2047 review): a
+/// variable update while the gateway waits on its `end` listener does not
+/// change what the catch's output mapping reads — live, after snapshot
+/// restore, and after journal replay.
+#[cfg(feature = "serde")]
+#[test]
+fn winning_payload_is_snapshotted_across_an_intervening_update() {
+    let def = ProcessBuilder::new("mm")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "M1", "=key")
+        .message_intermediate_catch_event("onM2", "M2", "=key")
+        .with_io(
+            "onM1",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=payload * 2".to_string(),
+                    target: "doubled".to_string(),
+                }],
+            },
+        )
+        .service_task("hold", "hold")
+        .end_event("end")
+        .connect("start", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "hold")
+        .connect("onM2", "hold")
+        .connect("hold", "end")
+        .with_listeners("gw", Vec::new(), vec![el(ListenerEventType::End, "audit")])
+        .build()
+        .unwrap();
+    let mut run = Journaled::new(def, true);
+    let inst = run.create("mm", 1_000);
+    run.apply(publish("M1", "k", 21, 0), 2_000);
+    assert_eq!(run.engine.instance(inst).unwrap().gateway_triggers.len(), 1);
+    run.apply(
+        Command::set_variables(
+            inst,
+            BTreeMap::from([("payload".to_string(), Value::Int(99))]),
+        ),
+        2_500,
+    );
+    let json = serde_json::to_string(&run.engine.snapshot()).unwrap();
+    let mut restored = Engine::from_snapshot(serde_json::from_str(&json).unwrap());
+    let mut replayed = Engine::replay(run.journal.clone());
+    let job = run.engine.activate_jobs("audit", "W", 10, 1_000, 3_000);
+    restored.activate_jobs("audit", "W", 10, 1_000, 3_000);
+    replayed.activate_jobs("audit", "W", 10, 1_000, 3_000);
+    let done = Command::complete_job(job[0].key);
+    run.apply(done.clone(), 4_000);
+    restored.apply_command_at(done.clone(), 4_000).unwrap();
+    replayed.apply_command_at(done, 4_000).unwrap();
+    for (label, engine) in [
+        ("live", &run.engine),
+        ("restored", &restored),
+        ("replayed", &replayed),
+    ] {
+        assert!(holding(engine, inst), "{label}");
+        assert_eq!(
+            engine.instance(inst).unwrap().variables.get("doubled"),
+            Some(&Value::Int(42)),
+            "{label}: the output reads the payload recorded at the trigger"
+        );
+    }
+}

@@ -683,6 +683,15 @@ pub enum Event {
         /// before #2004, which no build ever emitted).
         #[cfg_attr(feature = "serde", serde(default))]
         catch_element_instance_key: Key,
+        /// The winning event's payload (#2047 review), snapshotted at the
+        /// trigger so the catch's output mappings read it even when a
+        /// variable changes while the gateway completes (e.g. on an `end`
+        /// listener). Additive and written only when non-empty.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "BTreeMap::is_empty")
+        )]
+        variables: BTreeMap<String, Value>,
     },
 
     /// A token moved along a sequence flow from one element to another.
