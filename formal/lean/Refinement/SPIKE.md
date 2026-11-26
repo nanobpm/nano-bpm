@@ -88,7 +88,7 @@ pub fn join_ready(g: &JoinGraph, kind: JoinKind, join: usize,
 ```
 
 `Engine::has_active_path_to` keeps computing the live-source set (scope
-filtering, #1989 doomed-boundary substitution, in-transit `Step::Activate`s)
+filtering, in-transit `Step::Activate`s)
 and the index mapping, then delegates. A `proptest` equivalence test pins the
 old string-based BFS to the new index-based one during the transition, so the
 refactor is behaviour-preserving by test before it is by proof.
