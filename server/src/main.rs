@@ -4104,6 +4104,10 @@ impl ServerImpl {
             // entry, the non-Raft tick via `remote_buffered_delivery_gate`. A
             // single node has no other binary to disagree with.
             journal.set_remote_buffered_delivery(topology.is_single_node());
+            // Same gate shape for the event-gateway runtime latch (#2004): a
+            // multi-node node keeps the legacy #1676 race until every member
+            // is known to advertise `event-gateway-runtime-v1`.
+            journal.set_event_gateway_runtime(topology.is_single_node());
         }
         // The deployment partition (id 0) is the only one that seeds the demo
         // process and owns the message-/timer-start subscriptions. In a clustered
@@ -27599,10 +27603,36 @@ async fn remote_buffered_delivery_gate(
     topology: &cluster::Topology,
     peers: &peer::PeerSet,
 ) -> bool {
-    topology.is_single_node()
-        || peers
-            .all_peers_support(nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK)
-            .await
+    cluster_capability_gate(
+        topology,
+        peers,
+        nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
+    )
+    .await
+}
+
+/// The non-Raft cluster-wide rolling-upgrade gate for the event-gateway
+/// runtime latch (#2004, ADR 0066): on only when EVERY other cluster member is
+/// known to advertise `event-gateway-runtime-v1`. A single node is trivially
+/// on.
+async fn event_gateway_runtime_gate(topology: &cluster::Topology, peers: &peer::PeerSet) -> bool {
+    cluster_capability_gate(
+        topology,
+        peers,
+        nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME,
+    )
+    .await
+}
+
+/// The ONE non-Raft capability gate: a single node is trivially on; otherwise
+/// every other member must be known to advertise `feature` (an unreachable or
+/// unknown member fails closed).
+async fn cluster_capability_gate(
+    topology: &cluster::Topology,
+    peers: &peer::PeerSet,
+    feature: &'static str,
+) -> bool {
+    topology.is_single_node() || peers.all_peers_support(feature).await
 }
 
 fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now: u64) {
@@ -32227,6 +32257,11 @@ async fn main() {
                         &tick_server.peers,
                     )
                     .await;
+                    let gateway_runtime = event_gateway_runtime_gate(
+                        tick_server.engine.topology(),
+                        &tick_server.peers,
+                    )
+                    .await;
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
                             // Without Raft this journal is the partition's only
@@ -32234,6 +32269,8 @@ async fn main() {
                             reconcile_lenient_completion_local(journal, lenient, now);
                             // The cluster-wide #1949 capability gate (ADR 0066).
                             journal.set_remote_buffered_delivery(remote_delivery);
+                            // The cluster-wide #2004 capability gate.
+                            journal.set_event_gateway_runtime(gateway_runtime);
                             let (fired, commit) = journal.trigger_timers(now);
                             // Fire-and-forget tick: nothing reads disk after it and
                             // follow-ups are re-derived from engine state (#1855).
@@ -34166,6 +34203,7 @@ mod clustered_startup_tests {
         };
         let peers = peer::PeerSet::new(multi.clone());
         assert!(!remote_buffered_delivery_gate(&multi, &peers).await);
+        assert!(!event_gateway_runtime_gate(&multi, &peers).await);
         let single = cluster::Topology {
             node_id: 0,
             peers: vec!["http://127.0.0.1:1".to_string()],
@@ -34174,6 +34212,7 @@ mod clustered_startup_tests {
         };
         let peers = peer::PeerSet::new(single.clone());
         assert!(remote_buffered_delivery_gate(&single, &peers).await);
+        assert!(event_gateway_runtime_gate(&single, &peers).await);
     }
 
     /// #1949: a node whose recovered state has EVER sent an ack-paced remote

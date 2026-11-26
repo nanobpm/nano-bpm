@@ -487,7 +487,8 @@ impl RaftTransport for PeerTransport {
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
         FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES, FEATURE_MESSAGE_BUFFERING,
-        FEATURE_MESSAGE_CORRELATION_ACK, FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
+        FEATURE_EVENT_GATEWAY_RUNTIME, FEATURE_MESSAGE_CORRELATION_ACK,
+        FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
         FEATURE_REPLICATED_LENIENT_COMPLETION, FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
@@ -512,6 +513,11 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
             if item.remote_buffered_delivery && !required.contains(&FEATURE_MESSAGE_CORRELATION_ACK)
             {
                 required.push(FEATURE_MESSAGE_CORRELATION_ACK);
+            }
+            // #2004: an entry that may latch the event-gateway runtime would
+            // run the legacy race on a pre-#2004 peer.
+            if item.event_gateway_runtime && !required.contains(&FEATURE_EVENT_GATEWAY_RUNTIME) {
+                required.push(FEATURE_EVENT_GATEWAY_RUNTIME);
             }
             let feature = match item.command {
                 Command::SetLenientCompletion { .. } => FEATURE_REPLICATED_LENIENT_COMPLETION,
@@ -572,6 +578,7 @@ mod codec_tests {
                     operation_reference: None,
                     terminal_deadlines: std::collections::BTreeMap::new(),
                     remote_buffered_delivery: false,
+                    event_gateway_runtime: false,
                 },
             ])),
         };
@@ -693,6 +700,16 @@ mod codec_tests {
         assert_eq!(
             required_features_for(&req(vec![remote])),
             vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK]
+        );
+        // #2004: an entry that may latch the event-gateway runtime never
+        // ships to a peer that would run the legacy race instead.
+        let mut gateway = entry(Command::cancel_instance(1));
+        if let EntryPayload::Normal(batch) = &mut gateway.payload {
+            batch.items[0].event_gateway_runtime = true;
+        }
+        assert_eq!(
+            required_features_for(&req(vec![gateway])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME]
         );
         // #1856 review: a stamped entry is never shipped to a peer that would
         // ignore the deadline map; an unstamped one requires nothing.

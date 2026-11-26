@@ -4241,6 +4241,15 @@ impl Journal {
         self.engine.set_remote_buffered_delivery(enabled);
     }
 
+    /// Sets, for the NEXT applied command, whether every cluster member
+    /// advertises `event-gateway-runtime-v1` (#2004; see
+    /// [`Engine::set_event_gateway_runtime`]): the first event-based gateway
+    /// activation it enables records the replicated latch. The Raft apply loop
+    /// sets it from each replicated command's envelope before applying it.
+    pub fn set_event_gateway_runtime(&mut self, enabled: bool) {
+        self.engine.set_event_gateway_runtime(enabled);
+    }
+
     /// Sets the pre-cutover LEGACY lenient-completion host flag (#1661, ADR 0066
     /// "Rolling upgrade"; see `Engine::set_legacy_lenient_completion`). Set
     /// identically on every node from the activation policy at startup; kept

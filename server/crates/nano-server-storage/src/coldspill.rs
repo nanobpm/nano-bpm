@@ -422,7 +422,6 @@ mod tests {
             races: BTreeMap::new(),
             gateway_subscriptions: BTreeMap::new(),
             gateway_triggers: BTreeMap::new(),
-            event_gateway_owned: false,
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: BTreeMap::new(),

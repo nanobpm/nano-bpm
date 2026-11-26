@@ -35,6 +35,8 @@ mod mi_child_lifecycle;
 mod migration;
 mod migration_compensation;
 mod migration_event_gateway;
+mod migration_event_gateway_legacy;
+mod event_gateway_runtime_latch;
 mod migration_mi_adhoc;
 mod migration_scopes;
 mod modify_moves;

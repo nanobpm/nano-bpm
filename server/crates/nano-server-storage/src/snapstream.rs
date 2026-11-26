@@ -1543,9 +1543,16 @@ mod tests {
         let instance = legacy.state.instances.get_mut(&key).unwrap();
         instance.active.clear();
         instance.gateway_subscriptions.clear();
-        instance.event_gateway_owned = false;
         instance.active.insert(9101, "onM1".to_string());
         instance.active.insert(9102, "onM2".to_string());
+        instance.races.insert(9101, 9100);
+        instance.races.insert(9102, 9100);
+        // Before the `event-gateway-runtime-v1` latch (#2004) the legacy
+        // runtime owns the race: it loads.
+        legacy.state.event_gateway_runtime_latched = false;
+        let pre_latch = serde_json::to_vec(&legacy).unwrap();
+        assert!(read_streaming_engine_snapshot_from(&pre_latch[..]).is_ok());
+        legacy.state.event_gateway_runtime_latched = true;
         let body = serde_json::to_vec(&legacy).unwrap();
         let err = read_streaming_engine_snapshot_from(&body[..]).expect_err("legacy race");
         match err

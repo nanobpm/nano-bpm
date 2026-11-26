@@ -812,7 +812,20 @@ impl Engine {
         let active_snapshot = active.clone();
         for (eik, source_id) in active {
             let Some(target_id) = mapped.get(&source_id).cloned() else {
-                // Every unmapped active element was rejected before planning.
+                // An unmapped host still active here is a withdrawn LEGACY race
+                // member (#1554 / #1676; every other unmapped host was
+                // rejected): its withdrawal cancels the triggers, the
+                // migration fact reports them deleted.
+                for armed in armed_by_host.remove(&eik).unwrap_or_default() {
+                    if let Some(trigger) = armed.report {
+                        plan.subscriptions.push(MigratedSubscription {
+                            element_instance_key: eik,
+                            element_id: armed.catch_id,
+                            action: SubscriptionMigrationAction::Deleted,
+                            trigger,
+                        });
+                    }
+                }
                 continue;
             };
             if source

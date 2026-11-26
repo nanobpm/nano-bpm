@@ -1334,28 +1334,26 @@ pub enum SnapshotLoadError {
         /// Human-readable reason (which stage failed and why).
         reason: String,
     },
-    /// A snapshot (or replayed journal) holds in-flight LEGACY event-based
-    /// gateway races
-    /// (#1676 catches armed by a completed gateway) that the v4 gateway-owned
-    /// subscription model (#1963 / #2003) cannot represent. FATAL and NOT
-    /// migrated by replay: the operator must let these instances settle (or
-    /// cancel them) on the previous release before upgrading. Never a silent
-    /// drop or rewind (#1065 / #1066).
+    /// A snapshot (or replayed journal) that has recorded the
+    /// `event-gateway-runtime-v1` latch (#2004) still holds in-flight LEGACY
+    /// event-based gateway races (#1676 catches armed by a completed
+    /// gateway). The engine latches only once no legacy race is left, so this
+    /// state was not written by a well-formed log. FATAL and NOT migrated by
+    /// replay. Never a silent drop or rewind (#1065 / #1066). Legacy races
+    /// BEFORE the latch load and settle under the legacy runtime.
     LegacyEventGatewayRace {
         /// The process instances carrying an armed legacy race (ascending).
         instance_keys: Vec<u64>,
     },
 }
 
-/// Refuses engine state that carries an armed LEGACY event-gateway race
-/// ([`SnapshotLoadError::LegacyEventGatewayRace`], #2003/#2004); every other
-/// state passes. Applied at EVERY snapshot format version — a v4 snapshot
-/// written before the #2004 cutover can still carry a #1676 race — because the
-/// detector itself is exact for this build: `races` is written only by the
-/// legacy runtime, and its structural fallback (a gateway-owned active catch)
-/// fires only for instances lacking the #2004 format marker
-/// (`ProcessInstance::event_gateway_owned`). The ONE refusal shared by the
-/// local snapshot loaders, the Raft snapshot reader
+/// Refuses engine state that has recorded the `event-gateway-runtime-v1`
+/// latch yet still carries an armed LEGACY event-gateway race
+/// ([`SnapshotLoadError::LegacyEventGatewayRace`], #2004 —
+/// `State::refused_legacy_event_gateway_race_instances`); every other state
+/// passes, including legacy races before the latch, which the legacy runtime
+/// still owns. Applied at EVERY snapshot format version. The ONE refusal
+/// shared by the local snapshot loaders, the Raft snapshot reader
 /// ([`crate::snapstream::read_streaming_engine_snapshot_from`]) and the
 /// post-replay check ([`refuse_legacy_races_after_replay`]).
 pub(crate) fn refuse_legacy_event_gateway_races<'a>(
@@ -1364,7 +1362,7 @@ pub(crate) fn refuse_legacy_event_gateway_races<'a>(
     legacy_race_refusal(
         snaps
             .into_iter()
-            .flat_map(|s| s.state.legacy_event_gateway_race_instances()),
+            .flat_map(|s| s.state.refused_legacy_event_gateway_race_instances()),
     )
 }
 
@@ -1377,7 +1375,7 @@ fn refuse_legacy_races_after_replay<'a>(
     legacy_race_refusal(
         engines
             .into_iter()
-            .flat_map(|e| e.state().legacy_event_gateway_race_instances()),
+            .flat_map(|e| e.state().refused_legacy_event_gateway_race_instances()),
     )
     .map_err(io::Error::other)
 }
@@ -6999,24 +6997,23 @@ mod tests {
             .expect("valid event-gateway process")
     }
 
-    /// Rewrites `key`'s `evt` instance as a legacy build left it mid-race: the
-    /// gateway completed, both catches active, no #2004 format marker; with
-    /// `races` the #1676 membership too (absent before #1676 persisted it).
-    fn forge_legacy_race(snap: &mut EngineSnapshot, key: u64, races: bool) {
+    /// Rewrites `key`'s `evt` instance as the legacy runtime left it mid-race:
+    /// the gateway completed, both catches active with their #1676 `races`
+    /// membership. `latched` also records the `event-gateway-runtime-v1`
+    /// latch (#2004), which a well-formed log never does with a race left.
+    fn forge_legacy_race(snap: &mut EngineSnapshot, key: u64, latched: bool) {
+        snap.state.event_gateway_runtime_latched = latched;
         let instance = snap.state.instances.get_mut(&key).expect("evt instance");
         instance.active.clear();
         instance.gateway_subscriptions.clear();
-        instance.event_gateway_owned = false;
         instance.active.insert(9101, "onM1".to_string());
         instance.active.insert(9102, "onM2".to_string());
-        if races {
-            instance.races.insert(9101, 9100);
-            instance.races.insert(9102, 9100);
-        }
+        instance.races.insert(9101, 9100);
+        instance.races.insert(9102, 9100);
     }
 
     /// An engine snapshot with one `evt` instance, forged into a legacy race
-    /// when `legacy` is `Some(races)`. Returns it with the instance key.
+    /// when `legacy` is `Some(latched)`. Returns it with the instance key.
     fn evt_snapshot(legacy: Option<bool>) -> (EngineSnapshot, u64) {
         let mut engine = Engine::new();
         engine
@@ -7029,15 +7026,16 @@ mod tests {
             .find_map(|e| e.instance_key())
             .unwrap();
         let mut snap = engine.snapshot();
-        if let Some(races) = legacy {
-            forge_legacy_race(&mut snap, key, races);
+        if let Some(latched) = legacy {
+            forge_legacy_race(&mut snap, key, latched);
         }
         (snap, key)
     }
 
     /// Writes a journal (deploy + one `process_id` instance), snapshots it, and
     /// rewrites the snapshot header to `format_version`. Returns the instance
-    /// key. An `evt` instance is forged into a legacy race carrying `races`.
+    /// key. An `evt` instance is forged into a legacy race on a LATCHED
+    /// partition (refused).
     fn journal_with_snapshot_at(dir: &Path, process_id: &str, format_version: u32) -> u64 {
         journal_with_snapshot_forged(dir, process_id, format_version, Some(true))
     }
@@ -7065,16 +7063,16 @@ mod tests {
             .find_map(|e| e.instance_key())
             .unwrap();
         let (mut snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
-        if let (Some(races), "evt") = (legacy, process_id) {
-            forge_legacy_race(&mut snap, key, races);
+        if let (Some(latched), "evt") = (legacy, process_id) {
+            forge_legacy_race(&mut snap, key, latched);
         }
         write_snapshot(dir, snap, covered).expect("write snapshot");
         set_snapshot_header_version(&snap_path(dir, covered), format_version);
         key
     }
 
-    /// #2003: a v3 snapshot holding an armed legacy event-gateway race is
-    /// refused with the typed `LegacyEventGatewayRace` naming the instance —
+    /// #2004: a v3 snapshot that recorded the runtime latch yet holds an armed
+    /// legacy event-gateway race is refused with the typed `LegacyEventGatewayRace` naming the instance —
     /// both by the loader and by recovery, which must NOT route it to the
     /// replay-migrator (fail-closed, never a silent drop/rewind).
     #[test]
@@ -7139,25 +7137,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// #2004 deferred item 1: a pre-#1676 snapshot has no `races` field, yet
-    /// its unmarked instance resting on gateway-owned catches is still a
-    /// legacy race and is refused.
+    /// #2004 (Option B): before the `event-gateway-runtime-v1` latch the
+    /// legacy runtime still owns its races, so a snapshot holding one loads
+    /// and recovers at every format version — a mixed-version cluster keeps
+    /// the legacy semantics until the latch.
     #[test]
-    fn races_less_legacy_snapshot_fails_closed() {
-        let dir = temp_dir("legacy-evt-race-no-races");
-        let key = journal_with_snapshot_forged(&dir, "evt", 3, Some(false));
-        let err = load_latest_snapshot(&dir).expect_err("legacy race is fatal");
-        match typed_err(&err) {
-            SnapshotLoadError::LegacyEventGatewayRace { instance_keys } => {
-                assert_eq!(instance_keys, &vec![key]);
-            }
-            other => panic!("expected LegacyEventGatewayRace, got {other:?}"),
+    fn pre_latch_legacy_race_snapshot_loads() {
+        for version in [3, SNAPSHOT_FORMAT_VERSION] {
+            let dir = temp_dir("legacy-evt-race-pre-latch");
+            let key = journal_with_snapshot_forged(&dir, "evt", version, Some(false));
+            assert!(load_latest_snapshot(&dir).expect("loads").is_some());
+            let (reopened, _) = crate::journal::Journal::open_segmented(&dir).expect("recovers");
+            assert!(reopened.instance(key).is_some());
+            let _ = fs::remove_dir_all(&dir);
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 
-    /// #2004: a current-format snapshot written by a pre-cutover build can
-    /// still carry a #1676 race, so the refusal is not version-gated.
+    /// #2004: the latched refusal is not version-gated.
     #[test]
     fn current_format_snapshot_with_legacy_race_fails_closed() {
         let dir = temp_dir("v4-race");
@@ -7188,7 +7184,7 @@ mod tests {
     #[test]
     fn legacy_race_refusal_covers_every_multi_partition_entry() {
         let (racing, key) = evt_snapshot(Some(true));
-        let (racing_no_field, key2) = evt_snapshot(Some(false));
+        let (racing_pre_latch, _) = evt_snapshot(Some(false));
         let (waiting, _) = evt_snapshot(None);
         let calm = demo_snapshot();
         assert!(refuse_legacy_event_gateway_races([&calm, &waiting]).is_ok());
@@ -7198,8 +7194,7 @@ mod tests {
             }
             other => panic!("expected LegacyEventGatewayRace, got {other:?}"),
         }
-        assert!(refuse_legacy_event_gateway_races([&racing_no_field]).is_err());
-        let _ = key2;
+        assert!(refuse_legacy_event_gateway_races([&racing_pre_latch]).is_ok());
     }
 
     /// #2004 deferred item 3: a race armed by replayed journal events (a
@@ -7207,9 +7202,11 @@ mod tests {
     /// refused by the post-replay check, with the same typed error.
     #[test]
     fn post_replay_check_refuses_a_legacy_race() {
-        let (racing, key) = evt_snapshot(Some(false));
+        let (racing, key) = evt_snapshot(Some(true));
         let (waiting, _) = evt_snapshot(None);
+        let (pre_latch, _) = evt_snapshot(Some(false));
         assert!(refuse_legacy_races_after_replay([&Engine::from_snapshot(waiting)]).is_ok());
+        assert!(refuse_legacy_races_after_replay([&Engine::from_snapshot(pre_latch)]).is_ok());
         let err = refuse_legacy_races_after_replay([&Engine::from_snapshot(racing)])
             .expect_err("legacy race is fatal");
         match typed_err(&err) {

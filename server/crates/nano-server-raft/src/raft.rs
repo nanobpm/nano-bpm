@@ -126,6 +126,15 @@ pub struct ReplicatedCommand {
     /// pre-#1949 entry was applied with), omitted when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub remote_buffered_delivery: bool,
+    /// Whether every member advertises
+    /// [`FEATURE_EVENT_GATEWAY_RUNTIME`](nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME)
+    /// (#2004), decided once by the proposing leader and applied identically
+    /// on every replica: the first event-based gateway activation it enables
+    /// records the replicated `event-gateway-runtime-v1` latch, before which
+    /// the legacy #1676 race runs everywhere. Additive: absent decodes as
+    /// `false` (the legacy behaviour), omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub event_gateway_runtime: bool,
 }
 
 /// Serialized-size estimate of one `terminal_deadlines` entry: a JSON
@@ -138,6 +147,9 @@ const TERMINAL_DEADLINES_FIELD_BYTES: u64 = 24;
 
 /// Serialized size of `,"remote_buffered_delivery":true` (#1949).
 const REMOTE_BUFFERED_DELIVERY_FIELD_BYTES: u64 = 32;
+
+/// Serialized size of `,"event_gateway_runtime":true` (#2004).
+const EVENT_GATEWAY_RUNTIME_FIELD_BYTES: u64 = 29;
 
 impl ReplicatedCommand {
     /// Approximate serialized size of the whole replicated item — the command
@@ -154,7 +166,12 @@ impl ReplicatedCommand {
         } else {
             0
         };
-        self.command.approx_bytes() + stamps + remote
+        let gateway = if self.event_gateway_runtime {
+            EVENT_GATEWAY_RUNTIME_FIELD_BYTES
+        } else {
+            0
+        };
+        self.command.approx_bytes() + stamps + remote + gateway
     }
 
     /// Drops the envelope deadline stamps (#1856 review): emitted only while
@@ -199,6 +216,13 @@ impl ReplicatedCommand {
     fn enable_remote_buffered_delivery(&mut self) {
         self.remote_buffered_delivery = true;
     }
+
+    /// Enables the #2004 event-gateway runtime for this command: called by
+    /// the propose batcher only once every member advertises
+    /// [`FEATURE_EVENT_GATEWAY_RUNTIME`](nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME).
+    fn enable_event_gateway_runtime(&mut self) {
+        self.event_gateway_runtime = true;
+    }
 }
 
 /// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
@@ -213,6 +237,8 @@ struct ReplicatedCommandWire {
     terminal_deadlines: std::collections::BTreeMap<nanobpmn_engine_core::Key, u64>,
     #[serde(default)]
     remote_buffered_delivery: bool,
+    #[serde(default)]
+    event_gateway_runtime: bool,
 }
 
 /// A [`Command`] plus any legacy (pre-#1556) `operation_reference` that was
@@ -253,6 +279,7 @@ impl From<ReplicatedCommandWire> for ReplicatedCommand {
             operation_reference: wire.operation_reference.or(wire.command.nested_reference),
             terminal_deadlines: wire.terminal_deadlines,
             remote_buffered_delivery: wire.remote_buffered_delivery,
+            event_gateway_runtime: wire.event_gateway_runtime,
         }
     }
 }
@@ -266,6 +293,7 @@ impl ReplicatedCommand {
             operation_reference: None,
             terminal_deadlines: std::collections::BTreeMap::new(),
             remote_buffered_delivery: false,
+            event_gateway_runtime: false,
         }
     }
 }
@@ -2706,12 +2734,17 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 operation_reference,
                                 terminal_deadlines,
                                 remote_buffered_delivery,
+                                event_gateway_runtime,
                             } in batch.items
                             {
                                 // The leader's replicated rolling-upgrade
                                 // decision (#1949), re-armed before EVERY
                                 // apply so no command inherits another's.
                                 journal.set_remote_buffered_delivery(remote_buffered_delivery);
+                                // #2004: the leader's replicated decision
+                                // whether this command may latch the
+                                // event-gateway runtime.
+                                journal.set_event_gateway_runtime(event_gateway_runtime);
                                 // Per-command actor profiling (off unless
                                 // NANOBPM_CMD_PROFILE): time + allocated-byte
                                 // delta by command kind, on the engine thread.
@@ -3688,6 +3721,27 @@ impl Batcher {
                         .iter_mut()
                         .for_each(ReplicatedCommand::enable_remote_buffered_delivery);
                 }
+                // Rolling-upgrade gate for the event-gateway runtime (#2004):
+                // a pre-#2004 member runs the legacy race, so the leader lets
+                // a command record the `event-gateway-runtime-v1` latch — in
+                // the entry, for every replica — only once every member, of
+                // this group and of the cluster, advertises the capability.
+                if all_members_support(
+                    &raft,
+                    transport.as_ref(),
+                    nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME,
+                )
+                .await
+                    && transport
+                        .cluster_supports(
+                            nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME,
+                        )
+                        .await
+                {
+                    items
+                        .iter_mut()
+                        .for_each(ReplicatedCommand::enable_event_gateway_runtime);
+                }
                 // Carry this (leader) replica's latest chain digest so
                 // followers can compare at that index (#1664).
                 // Rolling-upgrade gate (#1664 / #1661): stamp only while
@@ -3813,6 +3867,8 @@ impl Batcher {
                 terminal_deadlines,
                 // Decided by the batcher at proposal time (#1949).
                 remote_buffered_delivery: false,
+                // Decided by the batcher at proposal time (#2004).
+                event_gateway_runtime: false,
             },
             resp,
         })
@@ -5309,6 +5365,30 @@ mod tests {
         let stamped_json = serde_json::to_string(&stamped).unwrap();
         let decoded: ReplicatedCommand = serde_json::from_str(&stamped_json).unwrap();
         assert!(decoded.remote_buffered_delivery);
+        let extra = (stamped_json.len() - plain_json.len()) as u64;
+        assert!(
+            stamped.approx_bytes() - plain.approx_bytes() >= extra,
+            "estimate undercounts the stamp ({extra} bytes)"
+        );
+    }
+
+    /// #2004: the event-gateway-runtime stamp is additive on the wire — an
+    /// unstamped (or pre-#2004) entry carries no field and decodes as the
+    /// legacy `false`; a stamped one round-trips, and the size estimate never
+    /// undercounts it.
+    #[test]
+    fn replicated_command_event_gateway_runtime_is_additive_on_the_wire() {
+        let plain = ReplicatedCommand::new(Command::cancel_instance(42), 10);
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(!plain_json.contains("event_gateway_runtime"), "{plain_json}");
+        let decoded_plain: ReplicatedCommand = serde_json::from_str(&plain_json).unwrap();
+        assert!(!decoded_plain.event_gateway_runtime);
+
+        let mut stamped = plain.clone();
+        stamped.enable_event_gateway_runtime();
+        let stamped_json = serde_json::to_string(&stamped).unwrap();
+        let decoded: ReplicatedCommand = serde_json::from_str(&stamped_json).unwrap();
+        assert!(decoded.event_gateway_runtime);
         let extra = (stamped_json.len() - plain_json.len()) as u64;
         assert!(
             stamped.approx_bytes() - plain.approx_bytes() >= extra,
@@ -9836,6 +9916,125 @@ mod tests {
             remote_open_on_group(cluster, all_new).await,
             vec![(true, true); 3],
             "an all-new group delivers ack-paced on every replica"
+        );
+    }
+
+    /// Boots a 3-voter p0 group (node 0 leader) over `transport`, deploys an
+    /// event-based gateway racing two timers and starts an instance on it.
+    /// Returns, per replica (after the applied-index barrier), whether the
+    /// `event-gateway-runtime-v1` latch is recorded and how many instances
+    /// run the legacy #1676 race (#2004).
+    async fn event_gateway_runtime_on_group(
+        cluster: crate::raft_net::LocalCluster,
+        transport: Arc<dyn RaftTransport>,
+    ) -> Vec<(bool, usize)> {
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                transport.clone(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await
+        );
+        let def = nanobpmn_engine_core::ProcessBuilder::new("evt")
+            .start_event("start")
+            .event_based_gateway("gw")
+            .timer_intermediate_catch_event("t1", 5_000)
+            .timer_intermediate_catch_event("t2", 9_000)
+            .end_event("e1")
+            .end_event("e2")
+            .connect("start", "gw")
+            .connect("gw", "t1")
+            .connect("gw", "t2")
+            .connect("t1", "e1")
+            .connect("t2", "e2")
+            .build()
+            .expect("valid event-gateway process");
+        parts[0]
+            .propose(Command::DeployProcess(def), 1_000)
+            .await
+            .expect("deploy");
+        parts[0]
+            .propose(Command::create_instance("evt"), 2_000)
+            .await
+            .expect("create");
+        // A later entry so every replica has applied past the create.
+        parts[0]
+            .propose(deploy_command(), 3_000)
+            .await
+            .expect("deploy");
+        wait_all_applied(&parts).await;
+        let mut seen = Vec::new();
+        for p in &parts {
+            seen.push(
+                p.sm_engine()
+                    .with(move |j| {
+                        let state = j.engine().state();
+                        (
+                            state.event_gateway_runtime_latched,
+                            state.legacy_event_gateway_race_instances().len(),
+                        )
+                    })
+                    .await,
+            );
+        }
+        for p in parts {
+            p.raft.shutdown().await.ok();
+        }
+        seen
+    }
+
+    /// #2004 rolling-upgrade gate: while one member does not advertise
+    /// `event-gateway-runtime-v1`, every replica keeps the legacy race and
+    /// none records the latch; once every member advertises it, every replica
+    /// records the latch and runs the gateway-owned path, identically.
+    #[tokio::test]
+    async fn event_gateway_runtime_is_gated_on_every_member_advertising() {
+        use crate::raft_net::LocalCluster;
+        let cluster = LocalCluster::default();
+        let mixed: Arc<dyn RaftTransport> = Arc::new(MixedVersion {
+            inner: cluster.clone(),
+            legacy: 1,
+        });
+        assert_eq!(
+            event_gateway_runtime_on_group(cluster, mixed).await,
+            vec![(false, 1); 3],
+            "a mixed group keeps the legacy race on every replica"
+        );
+
+        let cluster = LocalCluster::default();
+        let all_new: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+        assert_eq!(
+            event_gateway_runtime_on_group(cluster, all_new).await,
+            vec![(true, 0); 3],
+            "an all-new group latches on every replica"
+        );
+
+        let cluster = LocalCluster::default();
+        let elsewhere: Arc<dyn RaftTransport> = Arc::new(LegacyElsewhere {
+            inner: cluster.clone(),
+        });
+        assert_eq!(
+            event_gateway_runtime_on_group(cluster, elsewhere).await,
+            vec![(false, 1); 3],
+            "a legacy member elsewhere in the cluster keeps the legacy race"
         );
     }
 

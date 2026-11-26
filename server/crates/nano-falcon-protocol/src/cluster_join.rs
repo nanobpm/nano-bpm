@@ -103,6 +103,15 @@ pub const FEATURE_CANCEL_SUSPENDED_INSTANCE: &str = "cancel-suspended-instance-v
 /// entry carrying either never ships to a peer that does not advertise this.
 pub const FEATURE_MESSAGE_CORRELATION_ACK: &str = "message-correlation-ack-v1";
 
+/// Event-based gateway runtime (#2004): this binary completes an event-based
+/// gateway only when one of its own subscriptions triggers, activating just
+/// the winning catch, and records the `EventGatewayRuntimeActivated` latch.
+/// A pre-#2004 binary runs the #1676 sibling-withdrawal race instead, so the
+/// leader enables the new runtime — in the entry, for every replica — only
+/// while every member advertises this, and an entry carrying it never ships
+/// to a peer that does not.
+pub const FEATURE_EVENT_GATEWAY_RUNTIME: &str = "event-gateway-runtime-v1";
+
 /// Process-instance history deletion (#1948): this binary decodes and applies
 /// `Command::DeleteProcessInstanceHistory` / `Event::ProcessInstanceHistoryDeleted`.
 /// An older binary cannot decode either, so a gateway proposes the command only
@@ -123,6 +132,7 @@ pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_CANCEL_SUSPENDED_INSTANCE,
     FEATURE_MESSAGE_CORRELATION_ACK,
     FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
+    FEATURE_EVENT_GATEWAY_RUNTIME,
 ];
 
 /// The [`CLUSTER_FEATURES_HEADER`] value this binary advertises.
