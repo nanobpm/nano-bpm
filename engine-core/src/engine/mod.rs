@@ -961,7 +961,10 @@ impl Engine {
             && self.state.legacy_event_gateway_race_instances().is_empty()
         {
             let partition = self.partition_id;
-            return (true, Some(Event::EventGatewayRuntimeActivated { partition }));
+            return (
+                true,
+                Some(Event::EventGatewayRuntimeActivated { partition }),
+            );
         }
         (false, None)
     }
@@ -9311,7 +9314,14 @@ impl Engine {
                 scope,
                 via,
                 race,
-            } => self.activate_legacy_race_member(instance_key, element_id, scope, via, race, pending),
+            } => self.activate_legacy_race_member(
+                instance_key,
+                element_id,
+                scope,
+                via,
+                race,
+                pending,
+            ),
             Step::Complete {
                 instance_key,
                 element_instance_key,
@@ -19120,7 +19130,9 @@ impl Engine {
                     // the same scope races independently.
                     self.take_all_flows(instance_key, element_id, scope)
                         .into_iter()
-                        .map(|(events, step)| (events, Self::legacy_race_member(step, element_instance_key)))
+                        .map(|(events, step)| {
+                            (events, Self::legacy_race_member(step, element_instance_key))
+                        })
                         .collect()
                 });
         }
@@ -21422,7 +21434,6 @@ impl<'a> EventGatewayRaceIndex<'a> {
         }
         members
     }
-
 }
 
 /// Indexes every catch element's owning event-based gateway in one traversal

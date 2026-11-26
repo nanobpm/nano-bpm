@@ -170,7 +170,9 @@ fn legacy_race_state_after_the_latch_is_refused() {
     journal.push(Event::EventGatewayRuntimeActivated { partition: 0 });
     let replayed = Engine::replay(journal);
     assert_eq!(
-        replayed.state().refused_legacy_event_gateway_race_instances(),
+        replayed
+            .state()
+            .refused_legacy_event_gateway_race_instances(),
         vec![inst]
     );
 }

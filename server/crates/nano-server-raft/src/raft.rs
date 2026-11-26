@@ -5380,7 +5380,10 @@ mod tests {
     fn replicated_command_event_gateway_runtime_is_additive_on_the_wire() {
         let plain = ReplicatedCommand::new(Command::cancel_instance(42), 10);
         let plain_json = serde_json::to_string(&plain).unwrap();
-        assert!(!plain_json.contains("event_gateway_runtime"), "{plain_json}");
+        assert!(
+            !plain_json.contains("event_gateway_runtime"),
+            "{plain_json}"
+        );
         let decoded_plain: ReplicatedCommand = serde_json::from_str(&plain_json).unwrap();
         assert!(!decoded_plain.event_gateway_runtime);
 

@@ -81,7 +81,10 @@ fn gateway_owned_runtime_arms_no_legacy_race() {
     let inst =
         create_instance_with_vars(&mut engine, "evt", vars(&[("key", Value::Str("k".into()))]));
     let instance = &engine.state().instances[&inst];
-    assert!(engine.event_gateway_runtime_latched(), "the runtime latch is recorded");
+    assert!(
+        engine.event_gateway_runtime_latched(),
+        "the runtime latch is recorded"
+    );
     assert!(instance.races.is_empty());
     assert!(engine
         .state()
@@ -126,13 +129,20 @@ fn legacy_race_detector_names_races_and_refuses_them_only_once_latched() {
     let (state, inst) = legacy_race_state(true, false);
     assert_eq!(state.legacy_event_gateway_race_instances(), vec![inst]);
     // Before the latch the legacy runtime still owns it: loadable.
-    assert!(state.refused_legacy_event_gateway_race_instances().is_empty());
+    assert!(state
+        .refused_legacy_event_gateway_race_instances()
+        .is_empty());
     // Once latched, legacy race state is refused.
     let (state, inst) = legacy_race_state(true, true);
-    assert_eq!(state.refused_legacy_event_gateway_race_instances(), vec![inst]);
+    assert_eq!(
+        state.refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
     // No `races` membership: nothing to refuse either way.
     let (state, _) = legacy_race_state(false, true);
-    assert!(state.refused_legacy_event_gateway_race_instances().is_empty());
+    assert!(state
+        .refused_legacy_event_gateway_race_instances()
+        .is_empty());
 }
 
 #[test]
@@ -143,7 +153,10 @@ fn latched_refusal_survives_serde() {
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
         assert!(back.event_gateway_runtime_latched);
-        assert_eq!(back.refused_legacy_event_gateway_race_instances(), vec![inst]);
+        assert_eq!(
+            back.refused_legacy_event_gateway_race_instances(),
+            vec![inst]
+        );
         // A pre-latch snapshot serializes without the field and loads unlatched.
         let (state, _) = legacy_race_state(true, false);
         let json = serde_json::to_string(&state).unwrap();
