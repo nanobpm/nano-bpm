@@ -796,7 +796,7 @@ impl Engine {
     /// the instance's payload being cleared). The value after the batch is
     /// then not known here, so the caller must keep the write rather than
     /// risk dropping a restoring one.
-    fn value_in_scope<'a>(
+    pub(super) fn value_in_scope<'a>(
         instance: &'a crate::state::ProcessInstance,
         pending: &'a [crate::Event],
         scope: Key,
