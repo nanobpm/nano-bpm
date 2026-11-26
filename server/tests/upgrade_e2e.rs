@@ -628,14 +628,25 @@ fn assert_restarted_matches_prefix(c: &Cluster, id: usize) {
                     if other == id {
                         continue;
                     }
-                    if let Some((i, b)) = logs[id]
-                        .iter()
-                        .find(|(i, b)| theirs.get(*i).is_some_and(|t| t != *b))
-                    {
+                    // Require a NON-EMPTY shared committed interval: from the
+                    // later of the two retained-log starts (purge boundary) up
+                    // to the floor, both logs must cover the SAME indices with
+                    // equal payloads. Disjoint or empty logs keep polling.
+                    let (Some(a), Some(b)) = (logs[id].keys().next(), theirs.keys().next()) else {
+                        last = format!("node {id} or node {other} holds no committed batch");
+                        return None;
+                    };
+                    let lo = *a.max(b);
+                    let mine_iv: Vec<_> = logs[id].range(lo..).collect();
+                    let their_iv: Vec<_> = theirs.range(lo..).collect();
+                    if mine_iv.is_empty() {
+                        last = format!("no shared committed interval with node {other}");
+                        return None;
+                    }
+                    if mine_iv != their_iv {
                         panic!(
-                            "partition {p}: restarted node {id} disagrees with node {other} at \
-                             committed index {i}: {b:?} vs {:?}\n{}",
-                            theirs.get(i),
+                            "partition {p}: restarted node {id} disagrees with node {other} over \
+                             committed interval [{lo}, {floor}]: {mine_iv:?} vs {their_iv:?}\n{}",
                             tail(&c.all_logs())
                         );
                     }
