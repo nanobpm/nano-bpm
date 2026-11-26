@@ -83,7 +83,7 @@ queue_rules:
 # PR skips all seven code checks; a Rust-only PR skips both console jobs). A skipped
 # check never reports `success`, so — matching the authoritative merge-protocol
 # in AGENTS.md ("required-when-run, skip-tolerant": acceptedConclusions
-# `["success", "skipped"]` for all thirteen) — each is accepted as success OR
+# `["success", "skipped"]` for all fourteen) — each is accepted as success OR
 # skipped. Required job names must not start with @: Mergify interprets
 # @scope/name as an app-qualified check, so an npm-scoped job name matches the
 # wrong publisher even when its actual GitHub Actions result is successful
@@ -140,6 +140,12 @@ merge_protections:
       - or:
           - check-success=formal (tlc)
           - check-skipped=formal (tlc)
+      # Nano half of the parity-corpus coverage ratchet (#1247). Promoted to a
+      # required gate by #1977 after #1944 merged with it red and turned main
+      # red. Change-gated on the `paritycoverage` filter, so accept skipped too.
+      - or:
+          - check-success=parity-coverage (nano llvm-cov)
+          - check-skipped=parity-coverage (nano llvm-cov)
       # Determinism CI (ADR 0066 slice 6, #1665): seed/restart/profile/platform
       # digest matrix + previous-release replay. Change-gated on `code`.
       - or:
