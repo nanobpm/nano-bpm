@@ -1267,7 +1267,7 @@ fn deployment_meta(kind: &str, value: serde_json::Value) -> serde_json::Value {
 /// pre-check both derive from this, so they cannot drift.
 pub(crate) enum PartKind {
     /// A process part; `Some` carries the already-parsed `.xml` definitions.
-    Process(Option<Vec<nanobpmn_engine_core::model::ProcessDefinition>>),
+    Process(Option<Vec<nanobpmn_engine_core::ProcessDefinition>>),
     Decision,
     Form,
     Generic,

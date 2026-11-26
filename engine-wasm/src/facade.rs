@@ -962,18 +962,38 @@ mod facade_guard_tests {
     fn exports() -> Vec<Export> {
         let mut out = Vec::new();
         for (file, src) in SOURCES {
+            out.extend(exports_in(file, src));
+        }
+        out
+    }
+
+    /// The `pub fn`s of every `#[wasm_bindgen] impl TestEngine` block in `src`.
+    /// The block's outer attributes are collected as a set, in any order, so an
+    /// attribute between `#[wasm_bindgen]` and the `impl` cannot hide a block.
+    fn exports_in(file: &str, src: &str) -> Vec<Export> {
+        let mut out = Vec::new();
+        {
             let lines: Vec<&str> = src.lines().collect();
             let mut i = 0;
             while i < lines.len() {
-                if !(lines[i] == "impl TestEngine {" && i > 0 && lines[i - 1] == "#[wasm_bindgen]")
-                {
+                if lines[i] != "impl TestEngine {" {
                     i += 1;
                     continue;
                 }
-                let cfg = if i >= 2 { lines[i - 2] } else { "" };
-                let build = if cfg == "#[cfg(not(feature = \"read-model\"))]" {
+                let mut outer = Vec::new();
+                let mut k = i;
+                while k > 0 && lines[k - 1].starts_with("#[") {
+                    k -= 1;
+                    outer.push(lines[k]);
+                }
+                if !outer.iter().any(|a| a.starts_with("#[wasm_bindgen")) {
+                    i += 1;
+                    continue;
+                }
+                let has = |a: &str| outer.contains(&a);
+                let build = if has("#[cfg(not(feature = \"read-model\"))]") {
                     Build::Lean
-                } else if cfg == "#[cfg(feature = \"read-model\")]" || *file == "facade.rs" {
+                } else if has("#[cfg(feature = \"read-model\")]") || file == "facade.rs" {
                     Build::ReadModel
                 } else {
                     Build::Both
@@ -1024,6 +1044,25 @@ mod facade_guard_tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn export_scan_finds_impl_blocks_whatever_the_attribute_order() {
+        let fixtures = [
+            "#[wasm_bindgen]\n#[cfg(feature = \"read-model\")]\nimpl TestEngine {\n    pub fn sneaky(&self) {\n    }\n}\n",
+            "#[cfg(feature = \"read-model\")]\n#[wasm_bindgen]\nimpl TestEngine {\n    pub fn sneaky(&self) {\n    }\n}\n",
+            "#[wasm_bindgen]\n#[cfg(not(feature = \"read-model\"))]\n#[allow(dead_code)]\nimpl TestEngine {\n    pub fn sneaky(&self) {\n    }\n}\n",
+        ];
+        let builds = [Build::ReadModel, Build::ReadModel, Build::Lean];
+        for (src, build) in fixtures.iter().zip(builds) {
+            let e = exports_in("lib.rs", src);
+            assert_eq!(e.len(), 1, "missed export in:\n{src}");
+            assert_eq!(e[0].js, "sneaky");
+            assert_eq!(e[0].build, build);
+        }
+        // A non-exported impl block is not an export.
+        let plain = "#[cfg(test)]\nimpl TestEngine {\n    pub fn hidden(&self) {\n    }\n}\n";
+        assert!(exports_in("lib.rs", plain).is_empty());
     }
 
     fn facade(js: &str) -> Option<&'static Facade> {
