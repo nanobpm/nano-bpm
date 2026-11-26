@@ -13,6 +13,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use join_guard::JoinKind;
+
 use crate::command::{Command, JobAttribution};
 use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
@@ -26,6 +28,7 @@ mod debug;
 mod event_subprocess;
 mod expression;
 mod flow_scope;
+pub(crate) mod join_guard;
 mod memory;
 mod migration;
 mod modify;
@@ -425,14 +428,6 @@ enum AdHocPostTool {
     Defer { fulfilled_event: Option<Box<Event>> },
     /// The completion condition did not trigger — continue normally.
     Continue,
-}
-
-/// The two synchronising joins: a parallel or inclusive gateway with more than
-/// one incoming flow ([`Engine::activate_join`]).
-#[derive(Clone, Copy)]
-enum JoinKind {
-    Parallel,
-    Inclusive,
 }
 
 /// A unit of internal work in the processing loop — one transition of the BPMN
@@ -18226,21 +18221,21 @@ impl Engine {
         }
         let arrivals = self.join_arrivals(instance_key, scope, &element_id);
         let taken = arrivals.distinct_flows() + unidentified;
-        let all_taken = taken >= self.incoming_count(instance_key, &element_id);
-        let accepted = match join {
-            JoinKind::Parallel => all_taken,
-            JoinKind::Inclusive => {
-                all_taken
-                    || (taken > 0
-                        && !self.has_active_path_to(
-                            instance_key,
-                            &element_id,
-                            scope,
-                            &arrivals,
-                            pending,
-                            BatchDueView::Live,
-                        ))
-            }
+        let accepted = match join_guard::join_decision(
+            join,
+            taken,
+            self.incoming_count(instance_key, &element_id),
+        ) {
+            join_guard::JoinDecision::Accept => true,
+            join_guard::JoinDecision::Reject => false,
+            join_guard::JoinDecision::AcceptUnlessActivePath => !self.has_active_path_to(
+                instance_key,
+                &element_id,
+                scope,
+                &arrivals,
+                pending,
+                BatchDueView::Live,
+            ),
         };
 
         let open = self.join_eik(instance_key, scope, &element_id);
@@ -18424,9 +18419,19 @@ impl Engine {
             }
             _ => None,
         });
-        active
-            .chain(in_transit)
-            .any(|source| path_reaches_join(process, source, join, taken))
+        // Fast path: no live or in-transit source means nothing can still
+        // reach the join, so skip building the dense graph.
+        let mut sources = active.chain(in_transit).peekable();
+        if sources.peek().is_none() {
+            return false;
+        }
+        let Some(graph) = JoinGraph::collect(process, join, taken) else {
+            return false;
+        };
+        let live: Vec<usize> = sources
+            .filter_map(|source| graph.index_of(source))
+            .collect();
+        join_guard::has_active_path(&graph.succ, &live, graph.join, &graph.taken)
     }
 
     /// The element instances of `instance_key` a timer still due in the
@@ -19685,60 +19690,94 @@ impl OwnedByInstance for state::Incident {
     }
 }
 
+/// The dense, index-based view of a process graph the pure join guard
+/// ([`join_guard`]) decides over: the impure *collector* half of the guard.
+///
+/// Nodes are the process's elements in id order. `succ[n]` holds, for element
+/// `n`, its outgoing sequence flows (each with its own flow index into
+/// `taken`) and an edge to every boundary event attached to it; a link throw
+/// has instead only edges to its same-named catches in the same scope
+/// ([`join_guard::NO_FLOW`] for both non-flow edges). `taken[f]` is the number
+/// of tokens waiting on flow `f` into the join (`0` for every other flow).
+struct JoinGraph<'a> {
+    ids: Vec<&'a str>,
+    succ: Vec<Vec<(usize, usize)>>,
+    taken: Vec<u32>,
+    join: usize,
+}
+
+impl<'a> JoinGraph<'a> {
+    /// The view of `process` for a guard at `join` with `arrivals` counted;
+    /// `None` when `join` is not an element of `process`.
+    fn collect(
+        process: &'a crate::model::ProcessDefinition,
+        join: &str,
+        arrivals: &state::FlowArrivals,
+    ) -> Option<Self> {
+        let ids: Vec<&'a str> = process.elements.keys().map(String::as_str).collect();
+        let index_of = |id: &str| ids.binary_search(&id).ok();
+        let join_index = index_of(join)?;
+        let mut succ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ids.len()];
+        let mut taken = Vec::new();
+        let mut catches: Vec<(&str, Option<&str>, usize)> = Vec::new();
+        for (node, element) in process.elements.values().enumerate() {
+            if let ElementKind::LinkIntermediateCatchEvent { link_name } = &element.kind {
+                catches.push((link_name.as_str(), element.parent.as_deref(), node));
+            }
+            if let Some(host) = element.kind.attached_to().and_then(index_of) {
+                succ[host].push((node, join_guard::NO_FLOW));
+            }
+        }
+        for (node, element) in process.elements.values().enumerate() {
+            if let ElementKind::LinkIntermediateThrowEvent { link_name } = &element.kind {
+                // A link throw hands its token to its catches only: no flows,
+                // no boundary events.
+                succ[node] = catches
+                    .iter()
+                    .filter(|(name, parent, _)| {
+                        *name == link_name.as_str() && *parent == element.parent.as_deref()
+                    })
+                    .map(|(_, _, catch)| (*catch, join_guard::NO_FLOW))
+                    .collect();
+                continue;
+            }
+            let mut flows = Vec::with_capacity(element.outgoing.len());
+            for (index, flow) in element.outgoing.iter().enumerate() {
+                let Some(target) = index_of(&flow.to) else {
+                    continue;
+                };
+                let tokens = if target == join_index {
+                    process
+                        .incoming_flow(&element.id, index)
+                        .map_or(0, |(_, incoming)| arrivals.count(&incoming))
+                } else {
+                    0
+                };
+                flows.push((target, taken.len()));
+                taken.push(u32::try_from(tokens).unwrap_or(u32::MAX));
+            }
+            // Flows first, then boundary edges (order is irrelevant to the
+            // decision).
+            flows.append(&mut succ[node]);
+            succ[node] = flows;
+        }
+        Some(Self {
+            ids,
+            succ,
+            taken,
+            join: join_index,
+        })
+    }
+
+    /// The node index of element `id`, if it is one.
+    fn index_of(&self, id: &str) -> Option<usize> {
+        self.ids.binary_search(&id).ok()
+    }
+}
+
 /// The sorted set of root variable names a conditional event's FEEL `condition`
 /// references, used both to record the subscription's dependencies and to decide
 /// which variable changes re-evaluate it. Sorted for a deterministic event body.
-/// The breadth-first search of Zeebe's `BpmnInclusiveGatewayBehavior`: can a
-/// token at `source` reach `join`? It follows outgoing sequence flows, the
-/// boundary events attached to an element, and a link throw's same-named catch
-/// in the same scope. It skips the join's incoming flows already in `taken`, so
-/// a path that ends on a taken flow does not hold the join.
-fn path_reaches_join(
-    process: &crate::model::ProcessDefinition,
-    source: &str,
-    join: &str,
-    taken: &state::FlowArrivals,
-) -> bool {
-    let mut visited: BTreeSet<&str> = BTreeSet::new();
-    let mut to_visit: VecDeque<&str> = VecDeque::from([source]);
-    while let Some(node) = to_visit.pop_front() {
-        if node == join {
-            return true;
-        }
-        if !visited.insert(node) {
-            continue;
-        }
-        let Some(element) = process.element(node) else {
-            continue;
-        };
-        if let ElementKind::LinkIntermediateThrowEvent { link_name } = &element.kind {
-            to_visit.extend(process.elements.values().filter_map(|other| {
-                matches!(&other.kind, ElementKind::LinkIntermediateCatchEvent { link_name: name }
-                    if name == link_name && other.parent == element.parent)
-                .then_some(other.id.as_str())
-            }));
-            continue;
-        }
-        for (index, flow) in element.outgoing.iter().enumerate() {
-            let taken_into_join = flow.to == join
-                && process
-                    .incoming_flow(node, index)
-                    .is_some_and(|(_, incoming)| taken.count(&incoming) > 0);
-            if !taken_into_join {
-                to_visit.push_back(flow.to.as_str());
-            }
-        }
-        to_visit.extend(process.elements.values().filter_map(|other| {
-            other
-                .kind
-                .attached_to()
-                .is_some_and(|host| host == node)
-                .then_some(other.id.as_str())
-        }));
-    }
-    false
-}
-
 fn sorted_referenced_vars(condition: &str) -> Vec<String> {
     // `referenced_variables` is a BTreeSet (#1662): already sorted.
     crate::feel::referenced_variables(condition)

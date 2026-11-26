@@ -251,6 +251,20 @@
       "count": 1,
       "reason": "gates the Kani proof harnesses (kani_proofs.rs), which reference the `kani` crate that only `cargo kani` injects; plain cargo clippy cannot compile them. They are compiled and checked by the non-gating nightly `.github/workflows/kani-nightly.yml` (formal/kani/check.sh).",
       "trackedIn": 1960
+    },
+    {
+      "file": "engine-core/src/engine/join_guard.rs",
+      "pred": "kani",
+      "count": 1,
+      "reason": "gates the join guard Kani harnesses (engine/join_guard/kani_proofs.rs), which reference the `kani` crate that only `cargo kani` injects; plain cargo clippy cannot compile them. They are compiled and checked by the non-gating nightly `.github/workflows/kani-nightly.yml` (formal/kani/check.sh).",
+      "trackedIn": 1960
+    },
+    {
+      "file": "engine-core/src/engine/join_guard.rs",
+      "pred": "not(any(test, kani))",
+      "count": 2,
+      "reason": "cfg_attr(expect(dead_code)) on the proven `join_ready` composition and `distinct_taken`: the items themselves are linted by every engine-core entry; only the expect attribute is conditional, and the predicate is unknown to the evaluator solely because of the cargo-kani-only `kani` atom.",
+      "trackedIn": 2010
     }
   ]
 }
