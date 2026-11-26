@@ -342,6 +342,10 @@ impl TestEngine {
     /// (no tool activated). `variables_json` merges instance variables exactly
     /// like `completeJob` — e.g. the agent's final
     /// decision when it signals `completionConditionFulfilled`.
+    ///
+    /// @deprecated Use `handle("POST", "/jobs/{jobKey}/completion", …)` — the REST
+    /// route this duplicates. Kept because the in-browser route still rejects a
+    /// job `result` (`activateElements`), which this method supports.
     #[wasm_bindgen(js_name = completeAgentJob)]
     pub fn complete_agent_job(
         &mut self,
@@ -596,6 +600,10 @@ impl TestEngine {
     /// `dueDate` / `followUpDate` (ISO-8601 string, or `null`/`""` to clear),
     /// `priority` (0..=100). Only present keys are changed. The task must be in
     /// the `Created` state. Returns the snapshot.
+    ///
+    /// @deprecated Use `handle("PATCH", "/user-tasks/{userTaskKey}", …)` — the REST
+    /// route this duplicates. Kept because the route cannot clear a date (a REST
+    /// `null` preserves it), which this changeset (`null`/`""`) supports.
     #[wasm_bindgen(js_name = updateUserTask)]
     pub fn update_user_task(
         &mut self,

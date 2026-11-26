@@ -1260,6 +1260,17 @@ fn deployment_meta(kind: &str, value: serde_json::Value) -> serde_json::Value {
     m
 }
 
+/// Whether `create_deployment` registers the part `filename`/`content` as a
+/// generic resource (not a process, decision or form) — its dispatch order:
+/// `.bpmn`, BPMN-parseable `.xml`, `.dmn`, `.form`, else generic.
+pub(crate) fn is_generic_resource(filename: &str, content: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    !(lower.ends_with(".bpmn")
+        || lower.ends_with(".dmn")
+        || lower.ends_with(".form")
+        || (lower.ends_with(".xml") && parse_bpmn(content).is_ok()))
+}
+
 impl TestEngine {
     /// `POST /deployments` (multipart) → `DeploymentResult`. Every resource is
     /// registered by ONE `DeployBundle` command, so co-deployed resources share

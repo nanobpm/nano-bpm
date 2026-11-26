@@ -724,7 +724,11 @@ fn agent_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         name: "searchAgentInstances",
         filter_schema: "AgentInstanceFilter",
         sort_schema: "AgentInstanceSearchQuerySortRequest",
-        wasm: Box::new(|b| eng.borrow_mut().search_agent_instances_json(b)),
+        wasm: Box::new(|b| {
+            eng.borrow_mut()
+                .search_agent_instances_json(b)
+                .map_err(|e| e.to_string())
+        }),
         server: Box::new(|b| {
             let body = server_body::<models::AgentInstanceSearchQuery>(b)?;
             let r = nanobpmn_search::agent::search_agent_instances(body.as_ref(), || {
@@ -757,6 +761,7 @@ fn agent_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         wasm: Box::new(|b| {
             eng.borrow_mut()
                 .search_agent_instance_history_json(&history_key, b)
+                .map_err(|e| e.to_string())
         }),
         server: Box::new(|b| {
             let body = server_body::<models::AgentInstanceHistorySearchQuery>(b)?;
@@ -867,7 +872,11 @@ fn core_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         name: "searchUserTasks",
         filter_schema: "UserTaskFilter",
         sort_schema: "UserTaskSearchQuerySortRequest",
-        wasm: Box::new(|b| eng.borrow_mut().search_user_tasks_json(b)),
+        wasm: Box::new(|b| {
+            eng.borrow_mut()
+                .search_user_tasks_json(b)
+                .map_err(|e| e.to_string())
+        }),
         server: Box::new(|b| {
             let body = server_body::<models::UserTaskSearchQuery>(b)?;
             let r = nanobpmn_search::user_task::search_user_tasks(src, body.as_ref());
@@ -880,7 +889,11 @@ fn core_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         name: "searchProcessInstances",
         filter_schema: "ProcessInstanceFilter",
         sort_schema: "ProcessInstanceSearchQuerySortRequest",
-        wasm: Box::new(|b| eng.borrow_mut().search_process_instances_json(b)),
+        wasm: Box::new(|b| {
+            eng.borrow_mut()
+                .search_process_instances_json(b)
+                .map_err(|e| e.to_string())
+        }),
         server: Box::new(|b| {
             let body = server_body::<models::ProcessInstanceSearchQuery>(b)?;
             let r = nanobpmn_search::process_instance::search_process_instances(src, body.as_ref());
@@ -901,7 +914,11 @@ fn core_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         },
         filter_schema: "VariableFilter",
         sort_schema: "VariableSearchQuerySortRequest",
-        wasm: Box::new(move |b| eng.borrow_mut().search_variables_json(b, Some(truncate))),
+        wasm: Box::new(move |b| {
+            eng.borrow_mut()
+                .search_variables_json(b, Some(truncate))
+                .map_err(|e| e.to_string())
+        }),
         server: Box::new(move |b| {
             let body = server_body::<models::VariableSearchQuery>(b)?;
             let r = nanobpmn_search::variable::search_variables(var_src, truncate, body.as_ref());
@@ -1033,7 +1050,11 @@ fn incident_search_matches_the_server_for_every_spec_operator_sort_and_page() {
         name: "searchIncidents",
         filter_schema: "IncidentFilter",
         sort_schema: "IncidentSearchQuerySortRequest",
-        wasm: Box::new(|b| eng.borrow_mut().search_incidents_json(b)),
+        wasm: Box::new(|b| {
+            eng.borrow_mut()
+                .search_incidents_json(b)
+                .map_err(|e| e.to_string())
+        }),
         server: Box::new(|b| {
             let body = server_body::<models::IncidentSearchQuery>(b)?;
             let r = nanobpmn_search::incident::search_incidents(src, body.as_ref());
@@ -1121,21 +1142,23 @@ fn get_operations_match_the_server_for_found_missing_and_malformed_keys() {
     for k in probes(&form_key) {
         check(
             &format!("getFormByKey({k:?})"),
-            eng.get_form_by_key_json(&k),
+            eng.get_form_by_key_json(&k).map_err(|e| e.to_string()),
             server_lookup(nanobpmn_search::get::get_form_by_key(&src, &k)),
         );
     }
     for k in probes(&resource_key) {
         check(
             &format!("getResource({k:?})"),
-            eng.get_resource_by_key_json(&k),
+            eng.get_resource_by_key_json(&k).map_err(|e| e.to_string()),
             server_lookup(nanobpmn_search::get::get_resource(&src, &k)),
         );
     }
     for k in probes(&agent_key) {
         check(
             &format!("getAgentInstance({k:?})"),
-            agent_eng.get_agent_instance_json(&k),
+            agent_eng
+                .get_agent_instance_json(&k)
+                .map_err(|e| e.to_string()),
             nanobpmn_search::get::get_agent_instance(&k, |key| agent_rm.try_agent_instance(key))
                 .map_err(|e| e.to_string())
                 .and_then(server_lookup),

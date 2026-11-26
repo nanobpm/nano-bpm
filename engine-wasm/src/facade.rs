@@ -19,6 +19,7 @@
 //! wasm-bindgen sources and the routes from [`ROUTES`](crate::gateway::ROUTES),
 //! so a new hand-written method that duplicates a route cannot appear.
 
+use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{form_id_of, ProblemKind};
 use serde_json::{json, Value as J};
 use wasm_bindgen::prelude::*;
@@ -35,6 +36,11 @@ pub(crate) enum Facade {
     /// Not a wrapper: either no route serves it, or (the `reason` says which)
     /// its positional semantics are not expressible through the route.
     Kept(&'static str),
+    /// Kept as a direct-command implementation although `handle()` serves
+    /// the route `(method, path template)`, because the route cannot express
+    /// the positional semantics (`reason`). It must be `@deprecated` naming
+    /// `handle("<method>", "<path>", …)` (#2046's deprecation fallback).
+    Deprecated(&'static str, &'static str, &'static str),
 }
 
 #[cfg(test)]
@@ -126,14 +132,18 @@ pub(crate) const FACADE: &[(&str, Facade)] = &[
     // --- kept: the route cannot express the positional semantics ------------
     (
         "updateUserTask",
-        Facade::Kept(
+        Facade::Deprecated(
+            "PATCH",
+            "/user-tasks/{userTaskKey}",
             "PATCH /user-tasks/{userTaskKey} cannot clear a date (REST null preserves it), \
              which the positional changeset (`null`/\"\" clears) supports",
         ),
     ),
     (
         "completeAgentJob",
-        Facade::Kept(
+        Facade::Deprecated(
+            "POST",
+            "/jobs/{jobKey}/completion",
             "POST /jobs/{jobKey}/completion rejects a job `result` (activateElements) \
              in the in-browser engine",
         ),
@@ -192,6 +202,51 @@ impl Rejection {
             .any(|k| k.title() == self.title && k.retryable());
         problem_err(context, self.status, &self.title, &self.detail, retryable)
     }
+}
+
+/// Why a read helper failed: a malformed positional argument (no request was
+/// made), or a non-404 `handle()` rejection, kept structured so the JS error
+/// carries `status`/`title`/`detail`/`nonRetryable` like a write's.
+#[derive(Debug)]
+pub(crate) enum ReadError {
+    Arg(String),
+    Rejected(String, Rejection),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::Arg(m) => f.write_str(m),
+            ReadError::Rejected(op, r) => write!(f, "{op}: {}", r.detail),
+        }
+    }
+}
+
+impl From<String> for ReadError {
+    fn from(m: String) -> Self {
+        ReadError::Arg(m)
+    }
+}
+
+impl ReadError {
+    fn into_js(self) -> JsValue {
+        match self {
+            ReadError::Arg(m) => js_err(&m),
+            ReadError::Rejected(op, r) => r.into_js(&op),
+        }
+    }
+}
+
+/// Whether `deploy` sends `xml` as a DMN resource: BPMN wins whenever it
+/// parses as BPMN (so a BPMN document that merely mentions the DMN namespace
+/// stays BPMN), DMN when it parses as DMN; for a document neither parser
+/// accepts, the namespace picks which parser's error is reported — the same
+/// order the lean `deploy` uses.
+pub(crate) fn deploy_as_dmn(xml: &str) -> bool {
+    if parse_bpmn(xml).is_ok() {
+        return false;
+    }
+    nanobpmn_engine_core::dmn::parse_dmn(xml).is_ok() || resource_looks_like_dmn(xml)
 }
 
 /// The `multipart/form-data` boundary the deploy wrappers frame their one
@@ -327,20 +382,22 @@ impl TestEngine {
     }
 
     /// A read through `handle()` (host-testable): the REST body, JSON `null`
-    /// for a 404, or `"<op>: <detail>"` for any other rejection.
+    /// for a 404, or the structured [`ReadError::Rejected`] for any other
+    /// rejection (thrown to JS as the same ProblemDetail-shaped error writes
+    /// throw).
     pub(crate) fn read_route(
         &mut self,
         op: &str,
         method: &str,
         path: &str,
         body: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, ReadError> {
         let body = if body.trim().is_empty() { "" } else { body };
         let ct = (!body.is_empty()).then_some("application/json");
         match self.call_route(method, path, ct, body) {
             Ok(b) => Ok(b),
             Err(r) if r.status == 404 => Ok("null".to_string()),
-            Err(r) => Err(format!("{op}: {}", r.detail)),
+            Err(r) => Err(ReadError::Rejected(op.to_string(), r)),
         }
     }
 
@@ -387,17 +444,17 @@ impl TestEngine {
 // The read helpers the host tests drive (a `JsValue` cannot be built off
 // wasm32); the exported read methods below are these plus the JS error.
 impl TestEngine {
-    pub(crate) fn get_form_by_key_json(&mut self, form_key: &str) -> Result<String, String> {
+    pub(crate) fn get_form_by_key_json(&mut self, form_key: &str) -> Result<String, ReadError> {
         let k = path_key("getFormByKey", form_key)?;
         self.read_route("getFormByKey", "GET", &format!("/forms/{k}"), "")
     }
 
-    pub(crate) fn get_resource_by_key_json(&mut self, key: &str) -> Result<String, String> {
+    pub(crate) fn get_resource_by_key_json(&mut self, key: &str) -> Result<String, ReadError> {
         let k = path_key("getResourceByKey", key)?;
         self.read_route("getResourceByKey", "GET", &format!("/resources/{k}"), "")
     }
 
-    pub(crate) fn get_agent_instance_json(&mut self, key: &str) -> Result<String, String> {
+    pub(crate) fn get_agent_instance_json(&mut self, key: &str) -> Result<String, ReadError> {
         let k = path_key("getAgentInstance", key)?;
         self.read_route(
             "getAgentInstance",
@@ -407,11 +464,14 @@ impl TestEngine {
         )
     }
 
-    pub(crate) fn search_user_tasks_json(&mut self, query: &str) -> Result<String, String> {
+    pub(crate) fn search_user_tasks_json(&mut self, query: &str) -> Result<String, ReadError> {
         self.read_route("searchUserTasks", "POST", "/user-tasks/search", query)
     }
 
-    pub(crate) fn search_process_instances_json(&mut self, query: &str) -> Result<String, String> {
+    pub(crate) fn search_process_instances_json(
+        &mut self,
+        query: &str,
+    ) -> Result<String, ReadError> {
         self.read_route(
             "searchProcessInstances",
             "POST",
@@ -420,7 +480,7 @@ impl TestEngine {
         )
     }
 
-    pub(crate) fn search_incidents_json(&mut self, query: &str) -> Result<String, String> {
+    pub(crate) fn search_incidents_json(&mut self, query: &str) -> Result<String, ReadError> {
         self.read_route("searchIncidents", "POST", "/incidents/search", query)
     }
 
@@ -428,7 +488,7 @@ impl TestEngine {
         &mut self,
         query: &str,
         truncate_values: Option<bool>,
-    ) -> Result<String, String> {
+    ) -> Result<String, ReadError> {
         let path = format!(
             "/variables/search?truncateValues={}",
             truncate_values.unwrap_or(true)
@@ -436,7 +496,7 @@ impl TestEngine {
         self.read_route("searchVariables", "POST", &path, query)
     }
 
-    pub(crate) fn search_agent_instances_json(&mut self, query: &str) -> Result<String, String> {
+    pub(crate) fn search_agent_instances_json(&mut self, query: &str) -> Result<String, ReadError> {
         self.read_route(
             "searchAgentInstances",
             "POST",
@@ -449,7 +509,7 @@ impl TestEngine {
         &mut self,
         key: &str,
         query: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, ReadError> {
         let k = path_key("searchAgentInstanceHistory", key)?;
         self.read_route(
             "searchAgentInstanceHistory",
@@ -468,7 +528,7 @@ impl TestEngine {
     /// `{ "processIds": [...], "snapshot": {...} }`; a DMN resource (one that
     /// declares the DMN namespace) returns the `deployDecision` shape.
     pub fn deploy(&mut self, xml: &str) -> Result<String, JsValue> {
-        let dmn = resource_looks_like_dmn(xml);
+        let dmn = deploy_as_dmn(xml);
         let file = if dmn { "resource.dmn" } else { "resource.bpmn" };
         let result = self.deploy_route(file, xml)?;
         if dmn {
@@ -524,6 +584,12 @@ impl TestEngine {
         resource_name: &str,
         content: &str,
     ) -> Result<String, JsValue> {
+        if !crate::gateway::is_generic_resource(resource_name, content) {
+            return Err(js_err(&format!(
+                "deploy error: {resource_name:?} would deploy as a process, decision or \
+                 form, not a generic resource; use deploy/deployDecision/deployForm"
+            )));
+        }
         let result = self.deploy_route(resource_name, content)?;
         let r = deployed(&result, "resource")
             .next()
@@ -636,8 +702,9 @@ impl TestEngine {
         lease_token: Option<String>,
     ) -> Result<String, JsValue> {
         let key = parse_key(job_key)?;
+        let variables = vars(variables_json)?;
         self.activate_unless_leased(key, lease_token.is_none())?;
-        let req = json!({ "variables": vars(variables_json)?, "jobLeaseToken": lease_token });
+        let req = json!({ "variables": variables, "jobLeaseToken": lease_token });
         let path = format!("/jobs/{key}/completion");
         self.write_route("complete error", "POST", &path, Some(&req))?;
         self.snapshot_json(None)
@@ -765,7 +832,8 @@ impl TestEngine {
     /// `GET /forms/{formKey}`: the `FormResult` JSON, or `null` on 404.
     #[wasm_bindgen(js_name = getFormByKey)]
     pub fn get_form_by_key(&mut self, form_key: &str) -> Result<String, JsValue> {
-        self.get_form_by_key_json(form_key).map_err(|e| js_err(&e))
+        self.get_form_by_key_json(form_key)
+            .map_err(ReadError::into_js)
     }
 
     /// `GET /resources/{resourceKey}`: the `ResourceResult` JSON, or `null` on
@@ -773,7 +841,7 @@ impl TestEngine {
     #[wasm_bindgen(js_name = getResourceByKey)]
     pub fn get_resource_by_key(&mut self, resource_key: &str) -> Result<String, JsValue> {
         self.get_resource_by_key_json(resource_key)
-            .map_err(|e| js_err(&e))
+            .map_err(ReadError::into_js)
     }
 
     /// `GET /agent-instances/{agentInstanceKey}`: the `AgentInstanceResult`
@@ -781,7 +849,7 @@ impl TestEngine {
     #[wasm_bindgen(js_name = getAgentInstance)]
     pub fn get_agent_instance(&mut self, agent_instance_key: &str) -> Result<String, JsValue> {
         self.get_agent_instance_json(agent_instance_key)
-            .map_err(|e| js_err(&e))
+            .map_err(ReadError::into_js)
     }
 
     /// `POST /user-tasks/search`: `query_json` is the spec's
@@ -790,7 +858,7 @@ impl TestEngine {
     #[wasm_bindgen(js_name = searchUserTasks)]
     pub fn search_user_tasks(&mut self, query_json: &str) -> Result<String, JsValue> {
         self.search_user_tasks_json(query_json)
-            .map_err(|e| js_err(&e))
+            .map_err(ReadError::into_js)
     }
 
     /// `POST /process-instances/search`: returns the
@@ -798,14 +866,14 @@ impl TestEngine {
     #[wasm_bindgen(js_name = searchProcessInstances)]
     pub fn search_process_instances(&mut self, query_json: &str) -> Result<String, JsValue> {
         self.search_process_instances_json(query_json)
-            .map_err(|e| js_err(&e))
+            .map_err(ReadError::into_js)
     }
 
     /// `POST /incidents/search`: returns the `IncidentSearchQueryResult`.
     #[wasm_bindgen(js_name = searchIncidents)]
     pub fn search_incidents(&mut self, query_json: &str) -> Result<String, JsValue> {
         self.search_incidents_json(query_json)
-            .map_err(|e| js_err(&e))
+            .map_err(ReadError::into_js)
     }
 
     /// `POST /variables/search?truncateValues=…` (default `true`): returns the
@@ -817,7 +885,7 @@ impl TestEngine {
         truncate_values: Option<bool>,
     ) -> Result<String, JsValue> {
         self.search_variables_json(query_json, truncate_values)
-            .map_err(|e| js_err(&e))
+            .map_err(ReadError::into_js)
     }
 
     /// `POST /agent-instances/search`: returns the
@@ -825,7 +893,7 @@ impl TestEngine {
     #[wasm_bindgen(js_name = searchAgentInstances)]
     pub fn search_agent_instances(&mut self, query_json: &str) -> Result<String, JsValue> {
         self.search_agent_instances_json(query_json)
-            .map_err(|e| js_err(&e))
+            .map_err(ReadError::into_js)
     }
 
     /// `POST /agent-instances/{agentInstanceKey}/history/search`: returns the
@@ -837,7 +905,7 @@ impl TestEngine {
         query_json: &str,
     ) -> Result<String, JsValue> {
         self.search_agent_instance_history_json(agent_instance_key, query_json)
-            .map_err(|e| js_err(&e))
+            .map_err(ReadError::into_js)
     }
 
     /// `handle` — the transport-free REST driver (#992): serve one Camunda v2
@@ -979,6 +1047,10 @@ mod facade_guard_tests {
     /// facade's `*_route` helpers (directly or via a `*_json` read helper) and
     /// applies no engine command itself.
     fn is_wrapper(body: &str) -> bool {
+        is_wrapper_with(body, helper_body)
+    }
+
+    fn is_wrapper_with(body: &str, helper_body: impl Fn(&str) -> String) -> bool {
         let routes = |b: &str| {
             b.contains("self.write_route(")
                 || b.contains("self.deploy_route(")
@@ -989,8 +1061,25 @@ mod facade_guard_tests {
             .skip(1)
             .filter_map(|s| s.split('(').next())
             .filter(|n| n.ends_with("_json"))
-            .any(|n| routes(&helper_body(n)));
-        (routes(body) || delegated) && !body.contains("Command::") && !body.contains("self.apply(")
+            .map(helper_body)
+            .collect::<Vec<_>>();
+        let applies = |b: &str| b.contains("Command::") || b.contains("self.apply(");
+        (routes(body) || delegated.iter().any(|h| routes(h)))
+            && !applies(body)
+            && !delegated.iter().any(|h| applies(h))
+    }
+
+    #[test]
+    fn wrapper_guard_rejects_a_command_applied_inside_a_delegated_helper() {
+        // `get_form_by_key_json` routes; a body delegating to it is a wrapper…
+        assert!(is_wrapper("self.get_form_by_key_json(k)"));
+        // …but a helper that both routes and applies a command is not.
+        assert!(!is_wrapper_with("self.evil_json(k)", |_| {
+            "self.read_route(x); self.apply(Command::Reset)".to_string()
+        }));
+        assert!(!is_wrapper_with("self.evil_json(k)", |_| {
+            "self.read_route(x); Command::Reset".to_string()
+        }));
     }
 
     #[test]
@@ -1031,8 +1120,20 @@ mod facade_guard_tests {
                      delegate to handle() (or applies a Command itself)",
                     e.js
                 )),
-                Some(Facade::Kept(reason)) if reason.trim().is_empty() => {
+                Some(Facade::Kept(reason) | Facade::Deprecated(_, _, reason))
+                    if reason.trim().is_empty() =>
+                {
                     problems.push(format!("`{}` is kept without a reason", e.js))
+                }
+                Some(Facade::Deprecated(method, path, _))
+                    if !(e.docs.contains("@deprecated")
+                        && e.docs.contains(&format!("handle(\"{method}\", \"{path}\""))) =>
+                {
+                    problems.push(format!(
+                        "`{}` duplicates {method} {path} but is not `@deprecated` naming \
+                         handle(\"{method}\", \"{path}\", …)",
+                        e.js
+                    ))
                 }
                 _ => {}
             }
@@ -1054,7 +1155,7 @@ mod facade_guard_tests {
     #[test]
     fn every_wrapper_names_a_served_route_and_every_matching_route_is_decided() {
         for (js, f) in FACADE {
-            if let Facade::Route(method, path) = f {
+            if let Facade::Route(method, path) | Facade::Deprecated(method, path, _) = f {
                 assert!(
                     ROUTES
                         .iter()
@@ -1120,7 +1221,8 @@ mod facade_guard_tests {
     reason = "test-only module (feature-gated, so the clippy.toml test exemptions do not apply)"
 )]
 mod request_framing_tests {
-    use super::{multipart_one, path_key, BOUNDARY};
+    use super::{body_json, deploy_as_dmn, deployed, multipart_one, path_key, ReadError, BOUNDARY};
+    use crate::{resource_looks_like_dmn, TestEngine};
 
     #[test]
     fn multipart_rejects_header_breaking_filenames() {
@@ -1144,6 +1246,86 @@ mod request_framing_tests {
         assert!(!content.contains(boundary));
         assert!(body.contains(&content));
         assert!(body.ends_with(&format!("\r\n--{boundary}--\r\n")));
+    }
+
+    const MINI_BPMN: &str = r#"<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:dmn="https://www.omg.org/spec/DMN/20191111/MODEL/" id="d">
+  <process id="p" isExecutable="true">
+    <documentation>see https://www.omg.org/spec/DMN/</documentation>
+    <startEvent id="s"/><endEvent id="e"/>
+    <sequenceFlow id="f" sourceRef="s" targetRef="e"/>
+  </process>
+</definitions>"#;
+
+    #[test]
+    fn deploy_classifies_by_parse_not_by_dmn_substring() {
+        // A BPMN document that merely mentions the DMN namespace stays BPMN.
+        assert!(resource_looks_like_dmn(MINI_BPMN));
+        assert!(!deploy_as_dmn(MINI_BPMN));
+        let mut eng = TestEngine::new();
+        let ids = deployed_ids(&mut eng, MINI_BPMN);
+        assert_eq!(ids, vec!["p".to_string()]);
+        // A real DMN document still routes to DMN; an unparseable one reports
+        // the error of the format its namespace names.
+        assert!(deploy_as_dmn(
+            r#"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="x" />"#
+        ));
+        assert!(!deploy_as_dmn("<definitions/>"));
+    }
+
+    fn deployed_ids(eng: &mut TestEngine, xml: &str) -> Vec<String> {
+        let file = if deploy_as_dmn(xml) {
+            "r.dmn"
+        } else {
+            "r.bpmn"
+        };
+        let (ct, body) = multipart_one(file, xml).unwrap();
+        let res = body_json(
+            &eng.call_route("POST", "/deployments", Some(&ct), &body)
+                .unwrap(),
+        );
+        deployed(&res, "processDefinition")
+            .map(|p| p["processDefinitionId"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn deploy_resource_precheck_matches_the_route_dispatch() {
+        for (name, content) in [
+            ("a.bpmn", ""),
+            ("A.BPMN", ""),
+            ("a.dmn", ""),
+            ("f.form", r#"{"id":"f"}"#),
+            ("p.xml", MINI_BPMN),
+        ] {
+            assert!(
+                !crate::gateway::is_generic_resource(name, content),
+                "{name}"
+            );
+        }
+        for (name, content) in [("a.txt", "x"), ("c.xml", "<config/>"), ("s.json", "{}")] {
+            assert!(crate::gateway::is_generic_resource(name, content), "{name}");
+        }
+    }
+
+    #[test]
+    fn read_rejections_stay_structured() {
+        let mut eng = TestEngine::new();
+        let err = eng
+            .search_user_tasks_json(r#"{"filter":{"nope":1}}"#)
+            .unwrap_err();
+        match &err {
+            ReadError::Rejected(op, r) => {
+                assert_eq!(op, "searchUserTasks");
+                assert_eq!(r.status, 400, "{r:?}");
+                assert!(!r.title.is_empty());
+            }
+            other => panic!("expected a structured rejection, got {other:?}"),
+        }
+        assert!(err.to_string().starts_with("searchUserTasks: "));
+        assert!(matches!(
+            eng.get_form_by_key_json("").unwrap_err(),
+            ReadError::Arg(_)
+        ));
     }
 
     #[test]
