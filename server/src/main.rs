@@ -8635,8 +8635,12 @@ impl ServerImpl {
             Ok(fields) => fields,
             Err((code, detail)) => {
                 return Ok(if code == 400 {
+                    // The shared engine-core mapping's title (#1937, #2020):
+                    // INVALID_ARGUMENT is the only 400 class, so the title is
+                    // derived from it, never a per-endpoint literal that
+                    // mislabels every 400 (and drifts from the wasm driver).
                     Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Process not found",
+                        nanobpmn_engine_core::ProblemKind::InvalidArgument.title(),
                         code,
                         detail,
                     ))

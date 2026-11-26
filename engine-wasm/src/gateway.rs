@@ -74,7 +74,26 @@ pub(crate) struct Route {
     pub operation_id: &'static str,
     /// The spec's success status for the operation.
     pub status: u16,
+    /// The spec's request body, which decides the `Content-Type` check.
+    pub body: BodyKind,
     pub op: Op,
+}
+
+/// The request body an operation takes, as the spec declares it (checked by
+/// the `routes_match_the_spec` drift guard). It selects the native gateway's
+/// extractor and therefore its `Content-Type` rule (#2020):
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyKind {
+    /// No request body: the content type is never inspected.
+    None,
+    /// `requestBody` not `required` (`OptionalJson`): an empty body is "no
+    /// body"; a non-empty one needs a JSON content type.
+    OptionalJson,
+    /// `required: true` JSON (`Json<T>`): a JSON content type is always needed.
+    RequiredJson,
+    /// `multipart/form-data` (`Multipart`): the boundary is checked by the
+    /// multipart parser itself (400 when missing).
+    Multipart,
 }
 
 const fn route(
@@ -82,6 +101,7 @@ const fn route(
     path: &'static str,
     operation_id: &'static str,
     status: u16,
+    body: BodyKind,
     op: Op,
 ) -> Route {
     Route {
@@ -89,6 +109,7 @@ const fn route(
         path,
         operation_id,
         status,
+        body,
         op,
     }
 }
@@ -100,6 +121,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/deployments",
         "createDeployment",
         200,
+        BodyKind::Multipart,
         Op::CreateDeployment,
     ),
     route(
@@ -107,6 +129,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/process-instances",
         "createProcessInstance",
         200,
+        BodyKind::RequiredJson,
         Op::CreateProcessInstance,
     ),
     route(
@@ -114,6 +137,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/process-instances/{processInstanceKey}/cancellation",
         "cancelProcessInstance",
         204,
+        BodyKind::OptionalJson,
         Op::CancelProcessInstance,
     ),
     route(
@@ -121,6 +145,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/jobs/activation",
         "activateJobs",
         200,
+        BodyKind::RequiredJson,
         Op::ActivateJobs,
     ),
     route(
@@ -128,6 +153,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/jobs/{jobKey}/completion",
         "completeJob",
         204,
+        BodyKind::OptionalJson,
         Op::CompleteJob,
     ),
     route(
@@ -135,6 +161,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/jobs/{jobKey}/failure",
         "failJob",
         204,
+        BodyKind::OptionalJson,
         Op::FailJob,
     ),
     route(
@@ -142,6 +169,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/jobs/{jobKey}/error",
         "throwJobError",
         204,
+        BodyKind::RequiredJson,
         Op::ThrowJobError,
     ),
     route(
@@ -149,6 +177,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/element-instances/{elementInstanceKey}/variables",
         "createElementInstanceVariables",
         204,
+        BodyKind::RequiredJson,
         Op::CreateElementInstanceVariables,
     ),
     route(
@@ -156,6 +185,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/signals/broadcast",
         "broadcastSignal",
         200,
+        BodyKind::RequiredJson,
         Op::BroadcastSignal,
     ),
     route(
@@ -163,6 +193,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/user-tasks/{userTaskKey}/completion",
         "completeUserTask",
         204,
+        BodyKind::OptionalJson,
         Op::CompleteUserTask,
     ),
     route(
@@ -170,6 +201,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/user-tasks/{userTaskKey}/assignment",
         "assignUserTask",
         204,
+        BodyKind::RequiredJson,
         Op::AssignUserTask,
     ),
     route(
@@ -177,6 +209,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/user-tasks/{userTaskKey}/assignee",
         "unassignUserTask",
         204,
+        BodyKind::None,
         Op::UnassignUserTask,
     ),
     route(
@@ -184,14 +217,23 @@ pub(crate) const ROUTES: &[Route] = &[
         "/user-tasks/{userTaskKey}",
         "updateUserTask",
         204,
+        BodyKind::OptionalJson,
         Op::UpdateUserTask,
     ),
-    route("PUT", "/clock", "pinClock", 204, Op::PinClock),
+    route(
+        "PUT",
+        "/clock",
+        "pinClock",
+        204,
+        BodyKind::RequiredJson,
+        Op::PinClock,
+    ),
     route(
         "GET",
         "/forms/{formKey}",
         "getFormByKey",
         200,
+        BodyKind::None,
         Op::GetFormByKey,
     ),
     route(
@@ -199,6 +241,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/resources/{resourceKey}",
         "getResource",
         200,
+        BodyKind::None,
         Op::GetResource,
     ),
     route(
@@ -206,6 +249,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/agent-instances/{agentInstanceKey}",
         "getAgentInstance",
         200,
+        BodyKind::None,
         Op::GetAgentInstance,
     ),
     route(
@@ -213,6 +257,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/user-tasks/search",
         "searchUserTasks",
         200,
+        BodyKind::OptionalJson,
         Op::SearchUserTasks,
     ),
     route(
@@ -220,6 +265,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/process-instances/search",
         "searchProcessInstances",
         200,
+        BodyKind::OptionalJson,
         Op::SearchProcessInstances,
     ),
     route(
@@ -227,6 +273,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/variables/search",
         "searchVariables",
         200,
+        BodyKind::OptionalJson,
         Op::SearchVariables,
     ),
     route(
@@ -234,6 +281,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/agent-instances/search",
         "searchAgentInstances",
         200,
+        BodyKind::OptionalJson,
         Op::SearchAgentInstances,
     ),
     route(
@@ -241,6 +289,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/agent-instances/{agentInstanceKey}/history/search",
         "searchAgentInstanceHistory",
         200,
+        BodyKind::OptionalJson,
         Op::SearchAgentInstanceHistory,
     ),
 ];
@@ -424,6 +473,46 @@ fn resolve(method: &str, path: &str) -> Result<(&'static Route, Vec<String>), Pr
     ))
 }
 
+/// The detail of the native gateway's 415 — axum's `Json` rejection text,
+/// verbatim, so both transports explain it identically (#2020).
+pub(crate) const UNSUPPORTED_MEDIA_TYPE_DETAIL: &str =
+    "Expected request with `Content-Type: application/json`";
+
+/// The native gateway's `Content-Type` rule for a route's body (#2020),
+/// applied before dispatch so a rejected request executes nothing. A JSON body
+/// needs `application/json` or an `application/*+json` type — axum's `Json`
+/// extractor rule, evaluated with the same `mime` parser; an optional body that
+/// is empty skips the check, exactly as `OptionalJson` does.
+fn media_type(
+    kind: BodyKind,
+    headers: &BTreeMap<String, String>,
+    raw: &str,
+) -> Result<(), Problem> {
+    let needs_json = match kind {
+        BodyKind::None | BodyKind::Multipart => false,
+        BodyKind::OptionalJson => !raw.is_empty(),
+        BodyKind::RequiredJson => true,
+    };
+    if !needs_json || is_json_content_type(header(headers, "content-type")) {
+        return Ok(());
+    }
+    Err(Problem {
+        status: 415,
+        title: "UNSUPPORTED_MEDIA_TYPE".to_string(),
+        detail: UNSUPPORTED_MEDIA_TYPE_DETAIL.to_string(),
+    })
+}
+
+/// axum's `json_content_type`: `application/json` or `application/*+json`.
+fn is_json_content_type(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|ct| ct.parse::<mime::Mime>().ok())
+        .is_some_and(|m| {
+            m.type_() == "application"
+                && (m.subtype() == "json" || m.suffix().is_some_and(|s| s == "json"))
+        })
+}
+
 /// Case-insensitive header lookup over the request's header map.
 fn header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
     headers
@@ -577,6 +666,9 @@ impl TestEngine {
         let outcome = t.query.and_then(|query| {
             let headers = parse_headers(headers_json)?;
             let (route, params) = resolve(method, t.path)?;
+            // Before ANY dispatch: a mutation with an unsupported media type
+            // must not execute (native answers 415 from its body extractor).
+            media_type(route.body, &headers, body)?;
             self.dispatch(route.op, &params, &query, &headers, body)
                 .map(|b| (route.status, b))
         });
@@ -1062,6 +1154,14 @@ impl TestEngine {
     }
 }
 
+/// A parsed `multipart/form-data` deployment: its resources and tenant.
+struct Upload {
+    parts: Vec<Part>,
+    /// The `tenantId` part (trimmed; blank ⇒ the default tenant), echoed in
+    /// the response exactly as the native gateway does (#2020).
+    tenant_id: String,
+}
+
 /// One resource part of a `multipart/form-data` deployment.
 struct Part {
     filename: String,
@@ -1071,11 +1171,11 @@ struct Part {
 /// Parse a `multipart/form-data` deployment body exactly as the native
 /// gateway's `create_deployment_impl` does: the boundary via
 /// `multer::parse_boundary` (axum's `Multipart` extractor), the parts via
-/// `multer` itself, `tenantId` skipped, every other part a resource named by
+/// `multer` itself, `tenantId` taken as the tenant, every other part a resource named by
 /// its filename or `resource-<n>.bpmn` when it has none. Sharing the parser
 /// (rather than re-implementing it) is what keeps the two transports from
 /// drifting; `server/conformance/multipart-deploy.json` pins the parity.
-fn multipart(headers: &BTreeMap<String, String>, raw: &str) -> Result<Vec<Part>, Problem> {
+fn multipart(headers: &BTreeMap<String, String>, raw: &str) -> Result<Upload, Problem> {
     let boundary = header(headers, "content-type")
         .and_then(|ct| multer::parse_boundary(ct).ok())
         .ok_or_else(|| {
@@ -1090,11 +1190,18 @@ fn multipart(headers: &BTreeMap<String, String>, raw: &str) -> Result<Vec<Part>,
     let malformed =
         |e: multer::Error| Problem::invalid(format!("Malformed multipart request: {e}."));
     let mut parts = Vec::new();
+    let mut tenant_id = nanobpmn_engine_core::DEFAULT_TENANT.to_string();
     while let Some(field) = poll_ready(form.next_field())?.map_err(malformed)? {
         let name = field.name().unwrap_or_default().to_string();
         let file_name = field.file_name().map(str::to_string);
         let data = poll_ready(field.bytes())?.map_err(malformed)?;
         if name == "tenantId" {
+            if let Ok(text) = std::str::from_utf8(&data) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    tenant_id = text.to_string();
+                }
+            }
             continue;
         }
         let content = String::from_utf8(data.to_vec())
@@ -1107,7 +1214,7 @@ fn multipart(headers: &BTreeMap<String, String>, raw: &str) -> Result<Vec<Part>,
             "At least one deployment resource is required.",
         ));
     }
-    Ok(parts)
+    Ok(Upload { parts, tenant_id })
 }
 
 /// Drive a `multer` future to completion. The whole body is one ready
@@ -1142,7 +1249,7 @@ impl TestEngine {
     /// registered by ONE `DeployBundle` command, so co-deployed resources share
     /// one deployment key (#1193), as on the gateway.
     fn create_deployment(&mut self, headers: &BTreeMap<String, String>, raw: &str) -> Handled {
-        let parts = multipart(headers, raw)?;
+        let Upload { parts, tenant_id } = multipart(headers, raw)?;
         let mut bundle = DeploymentBundle::default();
         // (resource name, deployed id) for the response.
         let mut processes: Vec<(String, String)> = Vec::new();
@@ -1210,7 +1317,7 @@ impl TestEngine {
         // redeploy emits no definition event but still reports the existing
         // identity (native parity).
         let state = self.engine.state();
-        let tenant = nanobpmn_engine_core::DEFAULT_TENANT;
+        let tenant = tenant_id.as_str();
         let missing = |what: &str| {
             Problem::internal(format!("createDeployment: {what} not found after deploy"))
         };
