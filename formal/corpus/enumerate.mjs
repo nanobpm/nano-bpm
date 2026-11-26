@@ -475,6 +475,7 @@ export class Reference {
         for (const e of inn[n]) this.joinTokens[n][e.id] = 0
       }
     }
+    this.settleChoice = Object.create(null)
     this.settle()
   }
 
@@ -491,6 +492,7 @@ export class Reference {
     c.activations = { ...this.activations }
     c.timers = Object.fromEntries(Object.entries(this.timers).map(([k, v]) => [k, v.map((t) => ({ ...t }))]))
     c.pendingFires = [...this.pendingFires]
+    c.settleChoice = { ...this.settleChoice }
     c.route = Object.fromEntries(Object.entries(this.route).map(([k, v]) => [k, [...v]]))
     c.joinTokens = Object.fromEntries(Object.entries(this.joinTokens).map(([j, a]) => [j, { ...a }]))
     return c
@@ -603,7 +605,10 @@ export class Reference {
     // it drains here — a pure split reached by two parallel tokens routes both
     // the same way. Per-activation routing is only expressible across a command
     // (a wait state re-reads the variable). Cache the choice for this drain.
-    const settleChoice = Object.create(null)
+    // The cache lives on the state (cloned, reset only by `apply`) so that a
+    // decision pause + `decide` resume inside ONE command keeps it (#2024):
+    // otherwise exploration re-decides a gateway that replay reuses.
+    const settleChoice = this.settleChoice
     for (;;) {
       if (!this.queue.length) {
         // Quiescent: fire the tick's next TRIGGER, if any (#2024).
@@ -771,6 +776,7 @@ export class Reference {
 
   apply (cmd) {
     const next = this.clone()
+    next.settleChoice = Object.create(null) // a new command re-reads route variables
     // Instance cancellation (#1673): every token is discarded, every timer and
     // subscription withdrawn, and the instance is terminated — it never
     // completes. Nothing drains afterwards.
