@@ -13,9 +13,13 @@
 //! Input: one [`Guard`] per outgoing flow, **in execution order** (reverse
 //! document order). Outputs are positions into that slice.
 //!
-//! Conditions are pure FEEL, so evaluating all of them up front (the collector)
-//! and scanning in order here selects exactly what the old lazy loop did: a
-//! condition that errors after the first holding one is never looked at.
+//! Conditions are **not** side-effect free: FEEL's `random number()` and
+//! `uuid()` advance the shared command random stream, so evaluating a
+//! condition the lazy loop would have skipped changes downstream values. The
+//! collector (`gather_route_guards`) therefore evaluates only the prefix the
+//! old loop reached: it stops at the first error for either gateway, and, for
+//! exclusive routing, at the first holding condition. The guard slice passed
+//! here is that evaluated prefix, and the kernels decide exactly over it.
 
 /// What the collector learned about one outgoing flow.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
