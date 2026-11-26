@@ -7237,28 +7237,33 @@ impl Engine {
                 // it fire once per arrival instead of once (r4703550889). The
                 // Zeebe-faithful batch restructure is tracked in
                 // https://github.com/nanobpm/nano-bpm/issues/2024.
-                let still_due: BTreeSet<Key> = self
-                    .pending_timer_fires
-                    .iter()
-                    .filter_map(|fire| match fire {
-                        PendingTimerFire::Timer(key) => self.state.timers.get(key),
-                        PendingTimerFire::Start(_) => None,
-                    })
-                    .map(|t| t.instance_key)
-                    .collect();
-                let (held, released): (VecDeque<_>, VecDeque<_>) = self
-                    .deferred_join_arrivals
-                    .drain(..)
-                    .partition(|d| still_due.contains(&d.instance_key));
-                self.deferred_join_arrivals = held;
-                for d in released.into_iter().rev() {
-                    queue.push_front(Step::Activate {
-                        instance_key: d.instance_key,
-                        element_id: d.element_id,
-                        scope: d.scope,
-                        via: d.via,
-                        race: None,
-                    });
+                // No held-back arrivals (the common case, e.g. a timer
+                // backlog with no inclusive join): skip the scan of the
+                // remaining batch so an N-timer tick stays linear (r4703759191).
+                if !self.deferred_join_arrivals.is_empty() {
+                    let still_due: BTreeSet<Key> = self
+                        .pending_timer_fires
+                        .iter()
+                        .filter_map(|fire| match fire {
+                            PendingTimerFire::Timer(key) => self.state.timers.get(key),
+                            PendingTimerFire::Start(_) => None,
+                        })
+                        .map(|t| t.instance_key)
+                        .collect();
+                    let (held, released): (VecDeque<_>, VecDeque<_>) = self
+                        .deferred_join_arrivals
+                        .drain(..)
+                        .partition(|d| still_due.contains(&d.instance_key));
+                    self.deferred_join_arrivals = held;
+                    for d in released.into_iter().rev() {
+                        queue.push_front(Step::Activate {
+                            instance_key: d.instance_key,
+                            element_id: d.element_id,
+                            scope: d.scope,
+                            via: d.via,
+                            race: None,
+                        });
+                    }
                 }
                 if log.len() > fired_from {
                     if let Drive::Pause = driver.after_step(&log[fired_from..]) {
