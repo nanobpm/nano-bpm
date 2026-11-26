@@ -1296,6 +1296,7 @@
         "compensation_waits": {},
         "created_at": 1700000000018,
         "esp_held_payloads": {},
+        "event_gateway_owned": true,
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],

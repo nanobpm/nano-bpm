@@ -481,3 +481,41 @@ fn migration_keeps_each_gateway_activation_independent() {
         ProcessInstanceState::Completed
     );
 }
+
+/// A new-build instance resting on a plain message catch, migrated onto a
+/// target where that catch is gateway-owned, must carry the format marker:
+/// otherwise the legacy-race loader refuses it on the next restart (#2004).
+#[test]
+fn migration_onto_gateway_owned_catch_is_not_a_legacy_race() {
+    let mut engine = Engine::new();
+    let source = ProcessBuilder::new("plain")
+        .start_event("start")
+        .message_intermediate_catch_event("onMsg", "reply", "=orderId")
+        .end_event("end")
+        .connect("start", "onMsg")
+        .connect("onMsg", "end")
+        .build()
+        .unwrap();
+    deploy_for_migration(&mut engine, source);
+    let target_key = deploy_for_migration(&mut engine, race("target", "2", "reply"));
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "plain",
+        vars(&[("orderId", Value::Str("o1".into()))]),
+    );
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("onMsg", "onMsg2")]),
+        ))
+        .unwrap();
+    assert_eq!(active_ids(&engine, inst), vec!["onMsg2".to_string()]);
+    assert!(
+        engine
+            .state()
+            .legacy_event_gateway_race_instances()
+            .is_empty(),
+        "a migrated new-build instance must not be refused as a legacy race"
+    );
+}

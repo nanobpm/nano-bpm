@@ -170,6 +170,17 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
                 }
             }
         }
+        // #2004: migration (like modification) stamps the
+        // `event_gateway_owned` format marker on replay; archived snapshots
+        // predate the field and load it `false`. Derive the set from the journal.
+        let migrated_instances: std::collections::BTreeSet<Key> = journal
+            .iter()
+            .filter_map(|event| match event {
+                Event::ProcessInstanceMigrated { instance_key, .. }
+                | Event::ProcessInstanceModified { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .collect();
         let replayed = Engine::replay_partition(expected.partition_id, journal.clone());
         // Load the archived snapshot the way a host does (`from_snapshot`), so
         // its load-time normalizations apply — e.g. legacy element-keyed join
@@ -247,6 +258,9 @@ fn archived_format_journals_remain_replayable_after_version_bumps() {
         for (key, instance) in expected_state.instances.iter_mut() {
             if let Some(epoch) = terminal_epoch_by_instance.get(key) {
                 instance.terminated_epoch = *epoch;
+            }
+            if migrated_instances.contains(key) {
+                instance.event_gateway_owned = true;
             }
         }
         assert_eq!(

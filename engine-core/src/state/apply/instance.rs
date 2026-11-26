@@ -493,6 +493,12 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             compensation_migrated,
             ..
         } => {
+            // Migration can land a catch on a target where it is gateway-owned
+            // under this build's model: mark the instance (#2004), as for
+            // modification, so the legacy-race refusal does not brick reload.
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.event_gateway_owned = true;
+            }
             let remap: BTreeMap<&str, &str> = element_mappings
                 .iter()
                 .map(|(s, t)| (s.as_str(), t.as_str()))

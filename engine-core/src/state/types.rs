@@ -1028,7 +1028,7 @@ pub struct ProcessInstance {
     pub gateway_triggers: BTreeMap<Key, GatewayTrigger>,
     /// Explicit format marker (#2004): `true` once this instance has run under
     /// the gateway-owned subscription model (it opened an event-based
-    /// gateway's subscriptions, or was modified, under this build). A legacy
+    /// gateway's subscriptions, or was modified or migrated, under this build). A legacy
     /// snapshot or journal never sets it, so an unmarked instance resting on
     /// an active gateway-owned catch is a legacy race the loader refuses
     /// ([`State::legacy_event_gateway_race_instances`]) even when it predates
