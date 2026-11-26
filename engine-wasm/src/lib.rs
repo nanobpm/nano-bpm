@@ -14,14 +14,19 @@
 
 use std::collections::BTreeMap;
 
+/// Used only by the lean build's direct-`Command` positional methods; the
+/// `read-model` build routes those through `handle()` (#2046).
+#[cfg(not(feature = "read-model"))]
 use nanobpmn_engine_core::{
-    bpmn::parse_bpmn, form_id_of, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult,
-    AgentDefinition, AgentHistoryContent, AgentHistoryContentType, AgentHistoryRole,
-    AgentHistoryTurn, AgentInstanceLimits, AgentInstanceMetricsDelta, AgentInstanceStatus,
-    AgentTool, BreakCondition, Command, DebugSession, Engine, Event, FormResource, GenericResource,
-    IncidentKind, IncidentState, JobActivationOptions, JobState, MessageSubscriptionKind,
-    MessageSubscriptionState, ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState,
-    Value,
+    bpmn::parse_bpmn, form_id_of, FormResource, GenericResource, JobActivationOptions,
+};
+use nanobpmn_engine_core::{
+    ActivateElementInstruction, AdHocActivateElement, AdHocJobResult, AgentDefinition,
+    AgentHistoryContent, AgentHistoryContentType, AgentHistoryRole, AgentHistoryTurn,
+    AgentInstanceLimits, AgentInstanceMetricsDelta, AgentInstanceStatus, AgentTool, BreakCondition,
+    Command, DebugSession, Engine, Event, IncidentKind, IncidentState, JobState,
+    MessageSubscriptionKind, MessageSubscriptionState, ProcessInstanceState, TimerState,
+    UserTaskChangeset, UserTaskState, Value,
 };
 /// The shared read-model surface, compiled with its in-memory wasm SQLite
 /// backend. Behind the off-by-default `read-model` feature so the baseline engine
@@ -70,6 +75,11 @@ mod surface_parity;
 /// lean baseline build does not carry it.
 #[cfg(feature = "read-model")]
 mod gateway;
+
+/// The positional `TestEngine` methods as thin `handle()` wrappers, and the
+/// export classification the facade guard enforces (#2046).
+#[cfg(feature = "read-model")]
+mod facade;
 #[cfg(all(test, feature = "read-model"))]
 #[allow(
     clippy::unwrap_used,
@@ -180,114 +190,6 @@ impl TestEngine {
         }
     }
 
-    /// Parse and deploy a BPMN **or** DMN resource — the one entry point accepts
-    /// both (issue #1158). A BPMN process resource deploys as before and returns
-    /// `{ "processIds": [...], "snapshot": {...} }`. A DMN decision resource (no
-    /// `<process>` element) is routed to decision deployment and returns the same
-    /// shape as the `deployDecision` method
-    /// (`{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`),
-    /// so a `zeebe:calledDecision` on a business rule task can finally resolve.
-    /// On failure it throws a JS error carrying the parse/deploy message for the
-    /// format the document most resembles.
-    pub fn deploy(&mut self, xml: &str) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        // Try BPMN first (the common case). A DMN document carries no BPMN
-        // `<process>`, so it fails the BPMN parse and falls back to the DMN
-        // parser — no fragile up-front content sniffing on the happy path.
-        match parse_bpmn(xml) {
-            Ok(defs) => {
-                let ids: Vec<String> = defs.iter().map(|d| d.id.clone()).collect();
-                self.apply(Command::DeployResources(defs))
-                    .map_err(|e| engine_err("deploy error", &e))?;
-                let snapshot = self.snapshot_value(None);
-                to_json(&serde_json::json!({
-                    "processIds": ids,
-                    "snapshot": snapshot,
-                }))
-            }
-            Err(bpmn_err) => match nanobpmn_engine_core::dmn::parse_dmn(xml) {
-                Ok(drg) => to_json(&self.deploy_decision_drg(drg)?),
-                // Neither parser accepted it: report the error for the format the
-                // document most resembles (a DMN-namespaced doc gets the DMN
-                // error), so the message is actionable rather than misleading.
-                Err(dmn_err) => {
-                    if resource_looks_like_dmn(xml) {
-                        Err(js_err(&format!("parse error: {dmn_err}")))
-                    } else {
-                        Err(js_err(&format!("parse error: {bpmn_err}")))
-                    }
-                }
-            },
-        }
-    }
-
-    /// Parse and deploy a DMN decision-requirements resource explicitly. Registers
-    /// every `<decision>` it contains (by id) so a business rule task's
-    /// `zeebe:calledDecision` resolves and `evaluateDecision` can run it. Returns a
-    /// JSON object
-    /// `{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`
-    /// on success, or throws a JS error carrying the parse/deploy failure message.
-    #[wasm_bindgen(js_name = deployDecision)]
-    pub fn deploy_decision(&mut self, xml: &str) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let drg = nanobpmn_engine_core::dmn::parse_dmn(xml)
-            .map_err(|e| js_err(&format!("parse error: {e}")))?;
-        to_json(&self.deploy_decision_drg(drg)?)
-    }
-
-    /// Register a parsed DRG as a decision deployment and build the response
-    /// object. Shared by [`Self::deploy`] (DMN auto-route) and
-    /// [`Self::deploy_decision`]. Resolves the assigned identities from post-apply
-    /// state rather than the emitted events, so an idempotent redeploy of the
-    /// identical latest DRG (which emits no `DecisionDeployed` event) still returns
-    /// the existing identity (native parity — the server builds responses from
-    /// resolved state, not events).
-    fn deploy_decision_drg(
-        &mut self,
-        drg: nanobpmn_engine_core::dmn::DecisionRequirementsGraph,
-    ) -> Result<serde_json::Value, JsValue> {
-        let drg_id = drg.id.clone();
-        self.apply(Command::DeployDecisionRequirements(vec![drg]))
-            .map_err(|e| engine_err("deploy error", &e))?;
-        let (drg_key, version, decisions) = {
-            let state = self.engine.state();
-            let deployed = state.decision_requirements.get(&drg_id).ok_or_else(|| {
-                js_err("deploy error: decision requirements not found after deploy")
-            })?;
-            let decisions: Vec<serde_json::Value> = deployed
-                .drg
-                .decisions
-                .iter()
-                .map(|d| {
-                    // Every <decision> in a successfully-deployed DRG must be
-                    // registered; a missing identity is a deploy bug, so fail
-                    // loudly rather than silently emitting null key/version.
-                    let identity = state.decisions.get(&d.id).ok_or_else(|| {
-                        js_err(&format!(
-                            "deploy error: decision '{}' was not registered after deploy",
-                            d.id
-                        ))
-                    })?;
-                    Ok(serde_json::json!({
-                        "decisionId": d.id,
-                        "decisionName": d.name,
-                        "decisionKey": identity.key.to_string(),
-                        "version": identity.version,
-                    }))
-                })
-                .collect::<Result<Vec<_>, JsValue>>()?;
-            (deployed.key, deployed.version, decisions)
-        };
-        let snapshot = self.snapshot_value(None);
-        Ok(serde_json::json!({
-            "decisionRequirementsId": drg_id,
-            "decisionRequirementsKey": drg_key.to_string(),
-            "version": version,
-            "decisions": decisions,
-            "snapshot": snapshot,
-        }))
-    }
-
     /// Evaluate a deployed decision by id against the given variables — the
     /// standalone counterpart to a business rule task's in-line evaluation (the
     /// engine's `EvaluateDecision` command, exactly as the gateway runs it). The
@@ -314,140 +216,6 @@ impl TestEngine {
                 DecisionEvalError::Evaluation(msg) => js_err(&msg),
             })?;
         to_json(&result)
-    }
-
-    /// Deploy a single `form-js` `.form` resource (the verbatim form-js JSON
-    /// document). Mirrors the native deploy decomposition, which registers a
-    /// `.form` resource as a [`Command::DeployForms`] (stored, not executed) so
-    /// `getFormByKey` can serve its schema. The form-js document's `id` is the
-    /// form identifier used for versioning/lookup — a body without a non-empty
-    /// string `id` is a client error (native parity). The deploy resource name is
-    /// derived as `<id>.form`.
-    ///
-    /// Returns a JSON object
-    /// `{ "formKey": "...", "formId": "...", "version": N, "resourceName": "...", "snapshot": {...} }`
-    /// on success, or throws a JS error carrying the parse/deploy failure message.
-    #[wasm_bindgen(js_name = deployForm)]
-    pub fn deploy_form(&mut self, schema: &str) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let id = form_id_of(schema).ok_or_else(|| {
-            js_err(
-                "invalid form: not a valid form-js document (expected a JSON object \
-                 with a non-empty string \"id\")",
-            )
-        })?;
-        let resource_name = format!("{id}.form");
-        self.apply(Command::DeployForms(vec![FormResource {
-            id: id.clone(),
-            resource_name: resource_name.clone(),
-            schema: schema.to_string(),
-            // The form-js document's optional `versionTag` is matched by a
-            // `versionTag`-bound user-task form (#1193).
-            version_tag: nanobpmn_engine_core::form_version_tag_of(schema),
-        }]))
-        .map_err(|e| engine_err("deploy error", &e))?;
-        // Resolve from post-apply state rather than the emitted events: an
-        // idempotent redeploy of the identical latest form emits no
-        // `FormDeployed` event, but the deploy still succeeds and must return
-        // the existing identity (native parity — the server builds responses
-        // from resolved state, not events).
-        let (form_key, version) = self
-            .engine
-            .state()
-            .forms
-            .get(&id)
-            .map(|f| (f.key, f.version))
-            .ok_or_else(|| js_err("deploy error: form not found after deploy"))?;
-        let snapshot = self.snapshot_value(None);
-        to_json(&serde_json::json!({
-            "formKey": form_key.to_string(),
-            "formId": id,
-            "version": version,
-            "resourceName": resource_name,
-            "snapshot": snapshot,
-        }))
-    }
-
-    /// Deploy a single generic resource (any deployed file that is not a
-    /// BPMN/DMN/form — e.g. a Markdown agent prompt) under `resource_name` with
-    /// the given verbatim `content`. Mirrors the native deploy decomposition,
-    /// which registers such a file as a [`Command::DeployGenericResources`]
-    /// (stored, not executed) so `getResourceByKey` can serve its content. The
-    /// `resource_id` is the filename (`resource_name`), matching Zeebe's default
-    /// resource transformer.
-    ///
-    /// Returns a JSON object
-    /// `{ "resourceKey": "...", "resourceId": "...", "version": N, "resourceName": "...", "snapshot": {...} }`
-    /// on success, or throws a JS error carrying the deploy failure message.
-    #[wasm_bindgen(js_name = deployResource)]
-    pub fn deploy_resource(
-        &mut self,
-        resource_name: &str,
-        content: &str,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        self.apply(Command::DeployGenericResources(vec![GenericResource {
-            resource_id: resource_name.to_string(),
-            resource_name: resource_name.to_string(),
-            content: content.to_string(),
-            // The wasm deploy entry point carries no `versionTag` metadata
-            // yet, so a generic resource deploys untagged (#1193 wires the
-            // engine-side tag storage a future parameter populates).
-            version_tag: None,
-        }]))
-        .map_err(|e| engine_err("deploy error", &e))?;
-        // Resolve from post-apply state rather than the emitted events: an
-        // idempotent redeploy of the identical latest resource emits no
-        // `GenericResourceDeployed` event, but the deploy still succeeds as a
-        // no-op and must return the existing identity (native parity — the
-        // server builds responses from resolved state, not events).
-        let (resource_key, version) = self
-            .engine
-            .state()
-            .resources
-            .get(resource_name)
-            .map(|r| (r.key, r.version))
-            .ok_or_else(|| js_err("deploy error: resource not found after deploy"))?;
-        let snapshot = self.snapshot_value(None);
-        to_json(&serde_json::json!({
-            "resourceKey": resource_key.to_string(),
-            "resourceId": resource_name,
-            "version": version,
-            "resourceName": resource_name,
-            "snapshot": snapshot,
-        }))
-    }
-
-    /// Start a new instance of `process_id`, seeding it with the given variables
-    /// (a JSON object string; pass `"{}"` or `""` for none). `version` selects a
-    /// specific process **version** number (Zeebe by-id semantics); pass
-    /// `undefined`/`null` (or a non-positive value) for the latest version.
-    /// Returns the post-run [`Snapshot`] with a top-level `created` field holding
-    /// the new instance key.
-    #[wasm_bindgen(js_name = createInstance)]
-    pub fn create_instance(
-        &mut self,
-        process_id: &str,
-        variables_json: &str,
-        version: Option<i32>,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let variables = parse_vars(variables_json)?;
-        let events = self
-            .apply(Command::CreateInstance {
-                process_id: process_id.to_string(),
-                variables,
-                tags: Vec::new(),
-                business_id: None,
-                process_definition_key: None,
-                version,
-            })
-            .map_err(|e| engine_err("create error", &e))?;
-        let created = events.iter().find_map(|e| match e {
-            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
-            _ => None,
-        });
-        to_json(&self.snapshot_value(created))
     }
 
     /// Begin a **debug** run of a `CreateInstance` command: deploy first (as
@@ -555,35 +323,6 @@ impl TestEngine {
         self.debug_now = 0;
     }
 
-    /// Complete a waiting job by key, merging `variables_json` (a JSON object
-    /// string) into the instance. The job is activated first if it has not been
-    /// already, so the UI can complete a freshly-created job directly.
-    #[wasm_bindgen(js_name = completeJob)]
-    pub fn complete_job(
-        &mut self,
-        job_key: &str,
-        variables_json: &str,
-        lease_token: Option<String>,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let key = parse_key(job_key)?;
-        let variables = parse_vars(variables_json)?;
-        if lease_token.is_none() {
-            self.ensure_activated(key)?;
-        }
-        self.apply(Command::CompleteJob {
-            job_key: key,
-            attribution: None,
-            lease_token,
-            variables,
-            adhoc_result: None,
-            task_listener_result: None,
-            business_id: None,
-        })
-        .map_err(|e| engine_err("complete error", &e))?;
-        to_json(&self.snapshot_value(None))
-    }
-
     /// Complete an ad-hoc sub-process **agent** job — the container's
     /// JOB_WORKER job (Camunda's agentic `aiagent-job-worker`) — carrying the
     /// agent's activate-element instructions so the engine runs the selected
@@ -603,6 +342,10 @@ impl TestEngine {
     /// (no tool activated). `variables_json` merges instance variables exactly
     /// like `completeJob` — e.g. the agent's final
     /// decision when it signals `completionConditionFulfilled`.
+    ///
+    /// @deprecated Use `handle("POST", "/jobs/{jobKey}/completion", …)` — the REST
+    /// route this duplicates. Kept because the in-browser route still rejects a
+    /// job `result` (`activateElements`), which this method supports.
     #[wasm_bindgen(js_name = completeAgentJob)]
     pub fn complete_agent_job(
         &mut self,
@@ -628,33 +371,6 @@ impl TestEngine {
             business_id: None,
         })
         .map_err(|e| engine_err("complete agent job error", &e))?;
-        to_json(&self.snapshot_value(None))
-    }
-
-    /// Fail a waiting job by key with the given remaining `retries` and message.
-    /// With no retries left this raises an incident (visible in the snapshot).
-    #[wasm_bindgen(js_name = failJob)]
-    pub fn fail_job(
-        &mut self,
-        job_key: &str,
-        retries: i32,
-        message: &str,
-        lease_token: Option<String>,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let key = parse_key(job_key)?;
-        if lease_token.is_none() {
-            self.ensure_activated(key)?;
-        }
-        self.apply(Command::FailJob {
-            job_key: key,
-            attribution: None,
-            lease_token,
-            retries,
-            error_message: message.to_string(),
-            retry_back_off: 0,
-        })
-        .map_err(|e| engine_err("fail error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -770,111 +486,6 @@ impl TestEngine {
         to_json(&self.snapshot_value(None))
     }
 
-    /// Activate up to `max_jobs` `Created` jobs of `job_type`, locking them to
-    /// `worker` until `now + timeout_ms`. Returns a JSON array of activated jobs
-    /// (key, type, instance/element, retries, variables) for the dispatch loop to
-    /// hand to worker handlers. The host owns the wall clock via `tickNow`.
-    #[wasm_bindgen(js_name = activateJobs)]
-    pub fn activate_jobs(
-        &mut self,
-        job_type: &str,
-        max_jobs: u32,
-        timeout_ms: f64,
-        worker: &str,
-        with_lease: Option<bool>,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let now = self.now;
-        let timeout = if timeout_ms.is_finite() && timeout_ms > 0.0 {
-            timeout_ms as u64
-        } else {
-            30_000
-        };
-        let events = self
-            .apply(Command::activate_jobs_with_options(
-                job_type,
-                worker,
-                (max_jobs.max(1)) as usize,
-                timeout,
-                now,
-                JobActivationOptions {
-                    with_lease: with_lease.unwrap_or(false),
-                    ..Default::default()
-                },
-            ))
-            .map_err(|e| engine_err("activate error", &e))?;
-        // Derive the returned job keys from the `JobActivated` events *this*
-        // call emitted — not by scanning all `Activated` jobs, which would also
-        // surface jobs locked by earlier `activateJobs` calls and could exceed
-        // `max_jobs`. Each is then projected through the engine's canonical
-        // `ActivatedJob` snapshot so the console TestEngine surfaces the same
-        // Zeebe field set as the server/FFI paths (custom headers,
-        // process-definition identity, tags, priority).
-        let keys: Vec<_> = events
-            .iter()
-            .filter_map(|ev| match ev {
-                Event::JobActivated { job_key, .. } => Some(*job_key),
-                _ => None,
-            })
-            .collect();
-        let out: Vec<serde_json::Value> = keys
-            .iter()
-            .filter_map(|k| self.engine.activated_job(*k))
-            .map(|j| {
-                serde_json::json!({
-                    "key": j.key.to_string(),
-                    "type": j.job_type,
-                    "instanceKey": j.instance_key.to_string(),
-                    "elementInstanceKey": j.element_instance_key.to_string(),
-                    "elementId": j.element_id,
-                    "bpmnProcessId": j.bpmn_process_id,
-                    "processDefinitionKey": j.process_definition_key.to_string(),
-                    "processDefinitionVersion": j.process_definition_version,
-                    "worker": j.worker,
-                    "retries": j.retries,
-                    "deadline": j.deadline,
-                    "priority": j.priority,
-                    "customHeaders": j.custom_headers,
-                    "tags": j.tags,
-                    "businessId": j.business_id,
-                    "variables": vars_to_json(&j.variables),
-                    "jobLeaseToken": j.lease_token,
-                })
-            })
-            .collect();
-        to_json(&serde_json::Value::Array(out))
-    }
-
-    /// Throw a BPMN business error from a waiting job by key. If the job's
-    /// activity has a matching error boundary/event-subprocess catch it is
-    /// interrupted and the error-handling path runs; otherwise an incident is
-    /// raised. The job is activated first if needed, so the UI can throw an
-    /// error directly from a freshly-created job. Returns the snapshot.
-    #[wasm_bindgen(js_name = throwError)]
-    pub fn throw_error(
-        &mut self,
-        job_key: &str,
-        error_code: &str,
-        error_message: &str,
-        lease_token: Option<String>,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let key = parse_key(job_key)?;
-        if lease_token.is_none() {
-            self.ensure_activated(key)?;
-        }
-        self.apply(Command::ThrowJobError {
-            job_key: key,
-            attribution: None,
-            error_code: error_code.to_string(),
-            error_message: error_message.to_string(),
-            variables: BTreeMap::new(),
-            lease_token,
-        })
-        .map_err(|e| engine_err("throw error", &e))?;
-        to_json(&self.snapshot_value(None))
-    }
-
     /// Set a job's remaining retries by key. Used to recover a job parked on a
     /// no-retries incident before resolving that incident; does not by itself
     /// unblock the job. Returns the snapshot.
@@ -925,61 +536,6 @@ impl TestEngine {
         let key = parse_key(incident_key)?;
         self.apply(Command::ResolveIncident { incident_key: key })
             .map_err(|e| engine_err("resolve incident error", &e))?;
-        to_json(&self.snapshot_value(None))
-    }
-
-    /// Merge variables into a scope (a process-instance key or an element-instance
-    /// key). When `local` is true the values are written strictly into the target
-    /// scope; otherwise they propagate upward to the nearest ancestor scope that
-    /// defines each name (Zeebe `SetVariables` semantics). Returns the snapshot.
-    #[wasm_bindgen(js_name = setVariables)]
-    pub fn set_variables(
-        &mut self,
-        scope_key: &str,
-        variables_json: &str,
-        local: bool,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let key = parse_key(scope_key)?;
-        let variables = parse_vars(variables_json)?;
-        self.apply(Command::SetVariables {
-            scope_key: key,
-            variables,
-            local,
-        })
-        .map_err(|e| engine_err("set variables error", &e))?;
-        to_json(&self.snapshot_value(None))
-    }
-
-    /// Broadcast a signal by name to **every** open subscription that matches,
-    /// across all instances, merging `variables_json` into each correlated
-    /// instance. Signals correlate by name only and are not buffered. Returns
-    /// the snapshot.
-    #[wasm_bindgen(js_name = broadcastSignal)]
-    pub fn broadcast_signal(
-        &mut self,
-        signal_name: &str,
-        variables_json: &str,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let variables = parse_vars(variables_json)?;
-        self.apply(Command::BroadcastSignal {
-            signal_name: signal_name.to_string(),
-            variables,
-        })
-        .map_err(|e| engine_err("broadcast signal error", &e))?;
-        to_json(&self.snapshot_value(None))
-    }
-
-    /// Cancel (terminate) a running process instance by key. Every token is
-    /// discarded, pending jobs are canceled, and the instance transitions to
-    /// `Terminated`. Returns the snapshot.
-    #[wasm_bindgen(js_name = cancelInstance)]
-    pub fn cancel_instance(&mut self, instance_key: &str) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let key = parse_key(instance_key)?;
-        self.apply(Command::cancel_instance_including_suspended(key))
-            .map_err(|e| engine_err("cancel instance error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1039,63 +595,15 @@ impl TestEngine {
         to_json(&self.snapshot_value(None))
     }
 
-    /// Complete a waiting user task by key, merging `variables_json` into the
-    /// instance before the parked token resumes. The task must be in the
-    /// `Created` state. Returns the snapshot.
-    #[wasm_bindgen(js_name = completeUserTask)]
-    pub fn complete_user_task(
-        &mut self,
-        user_task_key: &str,
-        variables_json: &str,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let key = parse_key(user_task_key)?;
-        let variables = parse_vars(variables_json)?;
-        self.apply(Command::CompleteUserTask {
-            user_task_key: key,
-            variables,
-        })
-        .map_err(|e| engine_err("complete user task error", &e))?;
-        to_json(&self.snapshot_value(None))
-    }
-
-    /// Assign a user task to `assignee`. When `allow_override` is false and the
-    /// task already has an assignee the command is rejected (it must be
-    /// unassigned first). Returns the snapshot.
-    #[wasm_bindgen(js_name = assignUserTask)]
-    pub fn assign_user_task(
-        &mut self,
-        user_task_key: &str,
-        assignee: &str,
-        allow_override: bool,
-    ) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let key = parse_key(user_task_key)?;
-        self.apply(Command::AssignUserTask {
-            user_task_key: key,
-            assignee: assignee.to_string(),
-            allow_override,
-        })
-        .map_err(|e| engine_err("assign user task error", &e))?;
-        to_json(&self.snapshot_value(None))
-    }
-
-    /// Clear a user task's assignee. The task must be in the `Created` state.
-    /// Returns the snapshot.
-    #[wasm_bindgen(js_name = unassignUserTask)]
-    pub fn unassign_user_task(&mut self, user_task_key: &str) -> Result<String, JsValue> {
-        self.guard_paused()?;
-        let key = parse_key(user_task_key)?;
-        self.apply(Command::UnassignUserTask { user_task_key: key })
-            .map_err(|e| engine_err("unassign user task error", &e))?;
-        to_json(&self.snapshot_value(None))
-    }
-
     /// Update a user task's attributes from a JSON changeset object. Recognised
     /// keys (all optional): `candidateGroups` / `candidateUsers` (string arrays),
     /// `dueDate` / `followUpDate` (ISO-8601 string, or `null`/`""` to clear),
     /// `priority` (0..=100). Only present keys are changed. The task must be in
     /// the `Created` state. Returns the snapshot.
+    ///
+    /// @deprecated Use `handle("PATCH", "/user-tasks/{userTaskKey}", …)` — the REST
+    /// route this duplicates. Kept because the route cannot clear a date (a REST
+    /// `null` preserves it), which this changeset (`null`/`""`) supports.
     #[wasm_bindgen(js_name = updateUserTask)]
     pub fn update_user_task(
         &mut self,
@@ -1297,275 +805,582 @@ impl TestEngine {
     }
 }
 
-/// The REST read channel: the gateway's read-side queries served from the SAME
-/// shared `nanobpmn-read-model` projection the server uses, so downstream
-/// consumers (e.g. the console/testkit) can drop their bespoke shadow stores and
-/// read forms, user tasks, process instances, resources and variables straight
-/// off the in-browser test engine. Every method delegates to the in-memory
-/// [`ReadStore`] and serialises the read-model `*Row` types into the same JSON
-/// shapes the Camunda v2 REST surface returns.
-///
-/// Behind the off-by-default `read-model` feature — the baseline engine build
-/// links none of the read-model/SQLite deps and keeps its lean baseline size.
-#[cfg(feature = "read-model")]
+/// The lean (default, no `read-model`) build's positional methods that have a
+/// `handle()` route (#2046). The lean build does not link the REST driver, so
+/// they keep their direct-`Command` implementations here, each `@deprecated`
+/// in favour of the route it names. The `read-model` build replaces this whole
+/// block with thin `handle()` wrappers (`facade.rs`).
+#[cfg(not(feature = "read-model"))]
 #[wasm_bindgen]
 impl TestEngine {
-    /// `getFormByKey` — mirrors `GET /forms/{formKey}`. Returns the generated
-    /// `FormResult` JSON, or JSON `null` where the gateway answers 404 (no such
-    /// form, or a key that is not a valid form key). Runs the shared
-    /// `nanobpmn_search::get` lookup the gateway serves.
-    #[wasm_bindgen(js_name = getFormByKey)]
-    pub fn get_form_by_key(&self, form_key: &str) -> Result<String, JsValue> {
-        self.get_form_by_key_json(form_key).map_err(|e| js_err(&e))
+    /// Parse and deploy a BPMN **or** DMN resource — the one entry point accepts
+    /// both (issue #1158). A BPMN process resource deploys as before and returns
+    /// `{ "processIds": [...], "snapshot": {...} }`. A DMN decision resource (no
+    /// `<process>` element) is routed to decision deployment and returns the same
+    /// shape as the `deployDecision` method
+    /// (`{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`),
+    /// so a `zeebe:calledDecision` on a business rule task can finally resolve.
+    /// On failure it throws a JS error carrying the parse/deploy message for the
+    /// format the document most resembles.
+    ///
+    /// @deprecated Use `handle("POST", "/deployments", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    pub fn deploy(&mut self, xml: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        // Try BPMN first (the common case). A DMN document carries no BPMN
+        // `<process>`, so it fails the BPMN parse and falls back to the DMN
+        // parser — no fragile up-front content sniffing on the happy path.
+        match parse_bpmn(xml) {
+            Ok(defs) => {
+                let ids: Vec<String> = defs.iter().map(|d| d.id.clone()).collect();
+                self.apply(Command::DeployResources(defs))
+                    .map_err(|e| engine_err("deploy error", &e))?;
+                let snapshot = self.snapshot_value(None);
+                to_json(&serde_json::json!({
+                    "processIds": ids,
+                    "snapshot": snapshot,
+                }))
+            }
+            Err(bpmn_err) => match nanobpmn_engine_core::dmn::parse_dmn(xml) {
+                Ok(drg) => to_json(&self.deploy_decision_drg(drg)?),
+                // Neither parser accepted it: report the error for the format the
+                // document most resembles (a DMN-namespaced doc gets the DMN
+                // error), so the message is actionable rather than misleading.
+                Err(dmn_err) => {
+                    if resource_looks_like_dmn(xml) {
+                        Err(js_err(&format!("parse error: {dmn_err}")))
+                    } else {
+                        Err(js_err(&format!("parse error: {bpmn_err}")))
+                    }
+                }
+            },
+        }
     }
 
-    /// `getResourceByKey` — mirrors `GET /resources/{resourceKey}`. Returns the
-    /// generated `ResourceResult` JSON, or JSON `null` where the gateway answers
-    /// 404.
-    #[wasm_bindgen(js_name = getResourceByKey)]
-    pub fn get_resource_by_key(&self, resource_key: &str) -> Result<String, JsValue> {
-        self.get_resource_by_key_json(resource_key)
-            .map_err(|e| js_err(&e))
+    /// Parse and deploy a DMN decision-requirements resource explicitly. Registers
+    /// every `<decision>` it contains (by id) so a business rule task's
+    /// `zeebe:calledDecision` resolves and `evaluateDecision` can run it. Returns a
+    /// JSON object
+    /// `{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`
+    /// on success, or throws a JS error carrying the parse/deploy failure message.
+    ///
+    /// @deprecated Use `handle("POST", "/deployments", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = deployDecision)]
+    pub fn deploy_decision(&mut self, xml: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(xml)
+            .map_err(|e| js_err(&format!("parse error: {e}")))?;
+        to_json(&self.deploy_decision_drg(drg)?)
     }
 
-    /// `getAgentInstance` — mirrors `GET /agent-instances/{agentInstanceKey}`.
-    /// Returns the generated `AgentInstanceResult` JSON, JSON `null` where the
-    /// gateway answers 404, and throws where it answers 400 (a malformed key).
-    #[wasm_bindgen(js_name = getAgentInstance)]
-    pub fn get_agent_instance(&self, agent_instance_key: &str) -> Result<String, JsValue> {
-        self.get_agent_instance_json(agent_instance_key)
-            .map_err(|e| js_err(&e))
-    }
-
-    /// `searchUserTasks` — mirrors `POST /user-tasks/search`. `query_json` is
-    /// the spec's `UserTaskSearchQuery` (`{ filter?, sort?, page? }`; empty ⇒
-    /// no query), run through the SAME `nanobpmn_search` pipeline the gateway
-    /// serves (every filter field and operator, `$or`, variable filters, sort,
-    /// limit/cursor paging). Returns the generated `UserTaskSearchQueryResult`.
-    /// A property the spec does not define is rejected, never ignored.
-    #[wasm_bindgen(js_name = searchUserTasks)]
-    pub fn search_user_tasks(&self, query_json: &str) -> Result<String, JsValue> {
-        self.search_user_tasks_json(query_json)
-            .map_err(|e| js_err(&e))
-    }
-
-    /// `searchProcessInstances` — mirrors `POST /process-instances/search`:
-    /// the spec's `ProcessInstanceSearchQuery` through the shared pipeline,
-    /// returning the generated `ProcessInstanceSearchQueryResult`.
-    #[wasm_bindgen(js_name = searchProcessInstances)]
-    pub fn search_process_instances(&self, query_json: &str) -> Result<String, JsValue> {
-        self.search_process_instances_json(query_json)
-            .map_err(|e| js_err(&e))
-    }
-
-    /// `searchIncidents` — mirrors `POST /incidents/search`: the spec's
-    /// `IncidentSearchQuery` through the shared pipeline (the server's filter,
-    /// sort and page algebra), returning the generated
-    /// `IncidentSearchQueryResult`.
-    #[wasm_bindgen(js_name = searchIncidents)]
-    pub fn search_incidents(&self, query_json: &str) -> Result<String, JsValue> {
-        self.search_incidents_json(query_json)
-            .map_err(|e| js_err(&e))
-    }
-
-    /// `searchVariables` — mirrors `POST /variables/search`: the spec's
-    /// `VariableSearchQuery` through the shared pipeline, returning the
-    /// generated `VariableSearchQueryResult`. `truncate_values` is the
-    /// endpoint's `truncateValues` query parameter (default `true`).
-    #[wasm_bindgen(js_name = searchVariables)]
-    pub fn search_variables(
-        &self,
-        query_json: &str,
-        truncate_values: Option<bool>,
-    ) -> Result<String, JsValue> {
-        self.search_variables_json(query_json, truncate_values)
-            .map_err(|e| js_err(&e))
-    }
-
-    /// `handle` — the transport-free REST driver (#992): serve one Camunda v2
-    /// REST request as the gateway would. `method` is the HTTP method, `path`
-    /// the request target (with or without the `/v2` prefix; a query string is
-    /// honoured), `headers_json` a JSON object of header name → value (empty ⇒
-    /// none; `content-type` carries a multipart deployment's boundary) and
-    /// `body` the request body. Returns `{ "status", "headers", "body" }` as
-    /// JSON; never throws — a rejection is an RFC 9457 ProblemDetail response
-    /// whose status/title/detail come from the shared engine-error mapping.
-    pub fn handle(&mut self, method: &str, path: &str, headers_json: &str, body: &str) -> String {
-        let res = self.handle_request(method, path, headers_json, body);
-        serde_json::to_string(&res).unwrap_or_default()
-    }
-
-    /// `searchAgentInstances` — mirrors `POST /agent-instances/search`.
-    /// `query_json` is the spec's `AgentInstanceSearchQuery` (`{ filter?, sort?,
-    /// page? }`; empty ⇒ no query), parsed into the generated model and run
-    /// through the SAME `nanobpmn_search` pipeline the gateway serves (every
-    /// filter operator, sort, limit/cursor paging). Returns the generated
-    /// `AgentInstanceSearchQueryResult` as JSON. A property the spec does not
-    /// define is rejected, never silently ignored.
-    #[wasm_bindgen(js_name = searchAgentInstances)]
-    pub fn search_agent_instances(&self, query_json: &str) -> Result<String, JsValue> {
-        self.search_agent_instances_json(query_json)
-            .map_err(|e| js_err(&e))
-    }
-
-    /// `searchAgentInstanceHistory` — mirrors
-    /// `POST /agent-instances/{agentInstanceKey}/history/search`. `query_json`
-    /// is the spec's `AgentInstanceHistorySearchQuery`, run through the shared
-    /// `nanobpmn_search` pipeline (COMMITTED-only unless `commitStatus` asks
-    /// otherwise; every filter operator, sort, limit/cursor paging). Returns the
-    /// generated `AgentInstanceHistorySearchQueryResult` as JSON.
-    #[wasm_bindgen(js_name = searchAgentInstanceHistory)]
-    pub fn search_agent_instance_history(
-        &self,
-        agent_instance_key: &str,
-        query_json: &str,
-    ) -> Result<String, JsValue> {
-        self.search_agent_instance_history_json(agent_instance_key, query_json)
-            .map_err(|e| js_err(&e))
-    }
-}
-
-/// Serialise a shared-layer result (or report the operation's failure).
-#[cfg(feature = "read-model")]
-fn result_json<T: Serialize>(op: &str, value: &T) -> Result<String, String> {
-    serde_json::to_string(value).map_err(|e| format!("{op}: {e}"))
-}
-
-/// Map a shared `get*` [`Lookup`](nanobpmn_search::get::Lookup) onto the WASM
-/// transport: 200 → the result JSON, 404 → JSON `null`, 400 → an error. One
-/// mapping for every `get*` method, so the 404-is-`null` contract cannot drift
-/// per method.
-#[cfg(feature = "read-model")]
-fn lookup_json<T: Serialize>(
-    op: &str,
-    lookup: nanobpmn_search::get::Lookup<T>,
-) -> Result<String, String> {
-    use nanobpmn_search::get::Lookup;
-    match lookup {
-        Lookup::Found(v) => result_json(op, &v),
-        Lookup::NotFound { .. } => Ok("null".to_string()),
-        Lookup::Invalid { detail, .. } => Err(format!("{op}: {detail}")),
-    }
-}
-
-/// Parse a request body into the generated `*SearchQuery` (strict, validated).
-#[cfg(feature = "read-model")]
-fn search_query<T>(op: &str, query_json: &str) -> Result<Option<T>, String>
-where
-    T: serde::de::DeserializeOwned + Serialize + nanobpmn_search::validator::Validate,
-{
-    nanobpmn_search::parse_search_query::<T>(query_json).map_err(|e| format!("{op}: {e}"))
-}
-
-/// The JS-free bodies of the read methods (host-testable: a `JsValue` error
-/// cannot be constructed off wasm32). Each is a thin layer: request JSON → the
-/// shared `nanobpmn_search` function → response JSON.
-#[cfg(feature = "read-model")]
-impl TestEngine {
-    fn get_form_by_key_json(&self, form_key: &str) -> Result<String, String> {
-        lookup_json(
-            "getFormByKey",
-            nanobpmn_search::get::get_form_by_key(&self.read_model, form_key),
-        )
-    }
-
-    fn get_resource_by_key_json(&self, resource_key: &str) -> Result<String, String> {
-        lookup_json(
-            "getResourceByKey",
-            nanobpmn_search::get::get_resource(&self.read_model, resource_key),
-        )
-    }
-
-    fn get_agent_instance_json(&self, agent_instance_key: &str) -> Result<String, String> {
-        let lookup = nanobpmn_search::get::get_agent_instance(agent_instance_key, |k| {
-            self.read_model.try_agent_instance(k)
-        })
-        .map_err(|e| format!("getAgentInstance: {e}"))?;
-        lookup_json("getAgentInstance", lookup)
-    }
-
-    fn search_user_tasks_json(&self, query_json: &str) -> Result<String, String> {
-        const OP: &str = "searchUserTasks";
-        let query = search_query::<nanobpmn_search::models::UserTaskSearchQuery>(OP, query_json)?;
-        result_json(
-            OP,
-            &nanobpmn_search::user_task::search_user_tasks(&self.read_model, query.as_ref()),
-        )
-    }
-
-    fn search_process_instances_json(&self, query_json: &str) -> Result<String, String> {
-        const OP: &str = "searchProcessInstances";
-        let query =
-            search_query::<nanobpmn_search::models::ProcessInstanceSearchQuery>(OP, query_json)?;
-        result_json(
-            OP,
-            &nanobpmn_search::process_instance::search_process_instances(
-                &self.read_model,
-                query.as_ref(),
-            ),
-        )
-    }
-
-    fn search_incidents_json(&self, query_json: &str) -> Result<String, String> {
-        const OP: &str = "searchIncidents";
-        let query = search_query::<nanobpmn_search::models::IncidentSearchQuery>(OP, query_json)?;
-        result_json(
-            OP,
-            &nanobpmn_search::incident::search_incidents(&self.read_model, query.as_ref()),
-        )
-    }
-
-    fn search_variables_json(
-        &self,
-        query_json: &str,
-        truncate_values: Option<bool>,
-    ) -> Result<String, String> {
-        const OP: &str = "searchVariables";
-        let query = search_query::<nanobpmn_search::models::VariableSearchQuery>(OP, query_json)?;
-        result_json(
-            OP,
-            &nanobpmn_search::variable::search_variables(
-                &self.read_model,
-                truncate_values.unwrap_or(true),
-                query.as_ref(),
-            ),
-        )
-    }
-
-    fn search_agent_instances_json(&self, query_json: &str) -> Result<String, String> {
-        const OP: &str = "searchAgentInstances";
-        let query =
-            search_query::<nanobpmn_search::models::AgentInstanceSearchQuery>(OP, query_json)?;
-        let result = nanobpmn_search::agent::search_agent_instances(query.as_ref(), || {
-            self.read_model
-                .try_agent_instances(&nanobpmn_read_model::AgentInstanceFilter::default(), None)
-        })
-        .map_err(|e| format!("{OP}: {e}"))?;
-        result_json(OP, &result)
-    }
-
-    fn search_agent_instance_history_json(
-        &self,
-        agent_instance_key: &str,
-        query_json: &str,
-    ) -> Result<String, String> {
-        const OP: &str = "searchAgentInstanceHistory";
-        let key = agent_instance_key
-            .parse::<u64>()
-            .ok()
-            .filter(|k| *k > 0)
-            .ok_or_else(|| {
-                format!("{OP}: agent instance key {agent_instance_key:?} is not a valid key")
+    /// Register a parsed DRG as a decision deployment and build the response
+    /// object. Shared by [`Self::deploy`] (DMN auto-route) and
+    /// [`Self::deploy_decision`]. Resolves the assigned identities from post-apply
+    /// state rather than the emitted events, so an idempotent redeploy of the
+    /// identical latest DRG (which emits no `DecisionDeployed` event) still returns
+    /// the existing identity (native parity — the server builds responses from
+    /// resolved state, not events).
+    fn deploy_decision_drg(
+        &mut self,
+        drg: nanobpmn_engine_core::dmn::DecisionRequirementsGraph,
+    ) -> Result<serde_json::Value, JsValue> {
+        let drg_id = drg.id.clone();
+        self.apply(Command::DeployDecisionRequirements(vec![drg]))
+            .map_err(|e| engine_err("deploy error", &e))?;
+        let (drg_key, version, decisions) = {
+            let state = self.engine.state();
+            let deployed = state.decision_requirements.get(&drg_id).ok_or_else(|| {
+                js_err("deploy error: decision requirements not found after deploy")
             })?;
-        let query = search_query::<nanobpmn_search::models::AgentInstanceHistorySearchQuery>(
-            OP, query_json,
-        )?;
-        let result =
-            nanobpmn_search::agent::search_agent_instance_history(key, query.as_ref(), |filter| {
-                self.read_model.try_agent_history(filter, None)
+            let decisions: Vec<serde_json::Value> = deployed
+                .drg
+                .decisions
+                .iter()
+                .map(|d| {
+                    // Every <decision> in a successfully-deployed DRG must be
+                    // registered; a missing identity is a deploy bug, so fail
+                    // loudly rather than silently emitting null key/version.
+                    let identity = state.decisions.get(&d.id).ok_or_else(|| {
+                        js_err(&format!(
+                            "deploy error: decision '{}' was not registered after deploy",
+                            d.id
+                        ))
+                    })?;
+                    Ok(serde_json::json!({
+                        "decisionId": d.id,
+                        "decisionName": d.name,
+                        "decisionKey": identity.key.to_string(),
+                        "version": identity.version,
+                    }))
+                })
+                .collect::<Result<Vec<_>, JsValue>>()?;
+            (deployed.key, deployed.version, decisions)
+        };
+        let snapshot = self.snapshot_value(None);
+        Ok(serde_json::json!({
+            "decisionRequirementsId": drg_id,
+            "decisionRequirementsKey": drg_key.to_string(),
+            "version": version,
+            "decisions": decisions,
+            "snapshot": snapshot,
+        }))
+    }
+
+    /// Deploy a single `form-js` `.form` resource (the verbatim form-js JSON
+    /// document). Mirrors the native deploy decomposition, which registers a
+    /// `.form` resource as a [`Command::DeployForms`] (stored, not executed) so
+    /// `getFormByKey` can serve its schema. The form-js document's `id` is the
+    /// form identifier used for versioning/lookup — a body without a non-empty
+    /// string `id` is a client error (native parity). The deploy resource name is
+    /// derived as `<id>.form`.
+    ///
+    /// Returns a JSON object
+    /// `{ "formKey": "...", "formId": "...", "version": N, "resourceName": "...", "snapshot": {...} }`
+    /// on success, or throws a JS error carrying the parse/deploy failure message.
+    ///
+    /// @deprecated Use `handle("POST", "/deployments", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = deployForm)]
+    pub fn deploy_form(&mut self, schema: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let id = form_id_of(schema).ok_or_else(|| {
+            js_err(
+                "invalid form: not a valid form-js document (expected a JSON object \
+                 with a non-empty string \"id\")",
+            )
+        })?;
+        let resource_name = format!("{id}.form");
+        self.apply(Command::DeployForms(vec![FormResource {
+            id: id.clone(),
+            resource_name: resource_name.clone(),
+            schema: schema.to_string(),
+            // The form-js document's optional `versionTag` is matched by a
+            // `versionTag`-bound user-task form (#1193).
+            version_tag: nanobpmn_engine_core::form_version_tag_of(schema),
+        }]))
+        .map_err(|e| engine_err("deploy error", &e))?;
+        // Resolve from post-apply state rather than the emitted events: an
+        // idempotent redeploy of the identical latest form emits no
+        // `FormDeployed` event, but the deploy still succeeds and must return
+        // the existing identity (native parity — the server builds responses
+        // from resolved state, not events).
+        let (form_key, version) = self
+            .engine
+            .state()
+            .forms
+            .get(&id)
+            .map(|f| (f.key, f.version))
+            .ok_or_else(|| js_err("deploy error: form not found after deploy"))?;
+        let snapshot = self.snapshot_value(None);
+        to_json(&serde_json::json!({
+            "formKey": form_key.to_string(),
+            "formId": id,
+            "version": version,
+            "resourceName": resource_name,
+            "snapshot": snapshot,
+        }))
+    }
+
+    /// Deploy a single generic resource (any deployed file that is not a
+    /// BPMN/DMN/form — e.g. a Markdown agent prompt) under `resource_name` with
+    /// the given verbatim `content`. Mirrors the native deploy decomposition,
+    /// which registers such a file as a [`Command::DeployGenericResources`]
+    /// (stored, not executed) so `getResourceByKey` can serve its content. The
+    /// `resource_id` is the filename (`resource_name`), matching Zeebe's default
+    /// resource transformer.
+    ///
+    /// Returns a JSON object
+    /// `{ "resourceKey": "...", "resourceId": "...", "version": N, "resourceName": "...", "snapshot": {...} }`
+    /// on success, or throws a JS error carrying the deploy failure message.
+    ///
+    /// @deprecated Use `handle("POST", "/deployments", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = deployResource)]
+    pub fn deploy_resource(
+        &mut self,
+        resource_name: &str,
+        content: &str,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        self.apply(Command::DeployGenericResources(vec![GenericResource {
+            resource_id: resource_name.to_string(),
+            resource_name: resource_name.to_string(),
+            content: content.to_string(),
+            // The wasm deploy entry point carries no `versionTag` metadata
+            // yet, so a generic resource deploys untagged (#1193 wires the
+            // engine-side tag storage a future parameter populates).
+            version_tag: None,
+        }]))
+        .map_err(|e| engine_err("deploy error", &e))?;
+        // Resolve from post-apply state rather than the emitted events: an
+        // idempotent redeploy of the identical latest resource emits no
+        // `GenericResourceDeployed` event, but the deploy still succeeds as a
+        // no-op and must return the existing identity (native parity — the
+        // server builds responses from resolved state, not events).
+        let (resource_key, version) = self
+            .engine
+            .state()
+            .resources
+            .get(resource_name)
+            .map(|r| (r.key, r.version))
+            .ok_or_else(|| js_err("deploy error: resource not found after deploy"))?;
+        let snapshot = self.snapshot_value(None);
+        to_json(&serde_json::json!({
+            "resourceKey": resource_key.to_string(),
+            "resourceId": resource_name,
+            "version": version,
+            "resourceName": resource_name,
+            "snapshot": snapshot,
+        }))
+    }
+
+    /// Start a new instance of `process_id`, seeding it with the given variables
+    /// (a JSON object string; pass `"{}"` or `""` for none). `version` selects a
+    /// specific process **version** number (Zeebe by-id semantics); pass
+    /// `undefined`/`null` (or a non-positive value) for the latest version.
+    /// Returns the post-run [`Snapshot`] with a top-level `created` field holding
+    /// the new instance key.
+    ///
+    /// @deprecated Use `handle("POST", "/process-instances", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = createInstance)]
+    pub fn create_instance(
+        &mut self,
+        process_id: &str,
+        variables_json: &str,
+        version: Option<i32>,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let variables = parse_vars(variables_json)?;
+        let events = self
+            .apply(Command::CreateInstance {
+                process_id: process_id.to_string(),
+                variables,
+                tags: Vec::new(),
+                business_id: None,
+                process_definition_key: None,
+                version,
             })
-            .map_err(|e| format!("{OP}: {e}"))?;
-        result_json(OP, &result)
+            .map_err(|e| engine_err("create error", &e))?;
+        let created = events.iter().find_map(|e| match e {
+            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        });
+        to_json(&self.snapshot_value(created))
+    }
+
+    /// Complete a waiting job by key, merging `variables_json` (a JSON object
+    /// string) into the instance. The job is activated first if it has not been
+    /// already, so the UI can complete a freshly-created job directly.
+    ///
+    /// @deprecated Use `handle("POST", "/jobs/{jobKey}/completion", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = completeJob)]
+    pub fn complete_job(
+        &mut self,
+        job_key: &str,
+        variables_json: &str,
+        lease_token: Option<String>,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(job_key)?;
+        let variables = parse_vars(variables_json)?;
+        if lease_token.is_none() {
+            self.ensure_activated(key)?;
+        }
+        self.apply(Command::CompleteJob {
+            job_key: key,
+            attribution: None,
+            lease_token,
+            variables,
+            adhoc_result: None,
+            task_listener_result: None,
+            business_id: None,
+        })
+        .map_err(|e| engine_err("complete error", &e))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Fail a waiting job by key with the given remaining `retries` and message.
+    /// With no retries left this raises an incident (visible in the snapshot).
+    ///
+    /// @deprecated Use `handle("POST", "/jobs/{jobKey}/failure", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = failJob)]
+    pub fn fail_job(
+        &mut self,
+        job_key: &str,
+        retries: i32,
+        message: &str,
+        lease_token: Option<String>,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(job_key)?;
+        if lease_token.is_none() {
+            self.ensure_activated(key)?;
+        }
+        self.apply(Command::FailJob {
+            job_key: key,
+            attribution: None,
+            lease_token,
+            retries,
+            error_message: message.to_string(),
+            retry_back_off: 0,
+        })
+        .map_err(|e| engine_err("fail error", &e))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Activate up to `max_jobs` `Created` jobs of `job_type`, locking them to
+    /// `worker` until `now + timeout_ms`. Returns a JSON array of activated jobs
+    /// (key, type, instance/element, retries, variables) for the dispatch loop to
+    /// hand to worker handlers. The host owns the wall clock via `tickNow`.
+    ///
+    /// @deprecated Use `handle("POST", "/jobs/activation", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = activateJobs)]
+    pub fn activate_jobs(
+        &mut self,
+        job_type: &str,
+        max_jobs: u32,
+        timeout_ms: f64,
+        worker: &str,
+        with_lease: Option<bool>,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let now = self.now;
+        let timeout = if timeout_ms.is_finite() && timeout_ms > 0.0 {
+            timeout_ms as u64
+        } else {
+            30_000
+        };
+        let events = self
+            .apply(Command::activate_jobs_with_options(
+                job_type,
+                worker,
+                (max_jobs.max(1)) as usize,
+                timeout,
+                now,
+                JobActivationOptions {
+                    with_lease: with_lease.unwrap_or(false),
+                    ..Default::default()
+                },
+            ))
+            .map_err(|e| engine_err("activate error", &e))?;
+        // Derive the returned job keys from the `JobActivated` events *this*
+        // call emitted — not by scanning all `Activated` jobs, which would also
+        // surface jobs locked by earlier `activateJobs` calls and could exceed
+        // `max_jobs`. Each is then projected through the engine's canonical
+        // `ActivatedJob` snapshot so the console TestEngine surfaces the same
+        // Zeebe field set as the server/FFI paths (custom headers,
+        // process-definition identity, tags, priority).
+        let keys: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::JobActivated { job_key, .. } => Some(*job_key),
+                _ => None,
+            })
+            .collect();
+        let out: Vec<serde_json::Value> = keys
+            .iter()
+            .filter_map(|k| self.engine.activated_job(*k))
+            .map(|j| {
+                serde_json::json!({
+                    "key": j.key.to_string(),
+                    "type": j.job_type,
+                    "instanceKey": j.instance_key.to_string(),
+                    "elementInstanceKey": j.element_instance_key.to_string(),
+                    "elementId": j.element_id,
+                    "bpmnProcessId": j.bpmn_process_id,
+                    "processDefinitionKey": j.process_definition_key.to_string(),
+                    "processDefinitionVersion": j.process_definition_version,
+                    "worker": j.worker,
+                    "retries": j.retries,
+                    "deadline": j.deadline,
+                    "priority": j.priority,
+                    "customHeaders": j.custom_headers,
+                    "tags": j.tags,
+                    "businessId": j.business_id,
+                    "variables": vars_to_json(&j.variables),
+                    "jobLeaseToken": j.lease_token,
+                })
+            })
+            .collect();
+        to_json(&serde_json::Value::Array(out))
+    }
+
+    /// Throw a BPMN business error from a waiting job by key. If the job's
+    /// activity has a matching error boundary/event-subprocess catch it is
+    /// interrupted and the error-handling path runs; otherwise an incident is
+    /// raised. The job is activated first if needed, so the UI can throw an
+    /// error directly from a freshly-created job. Returns the snapshot.
+    ///
+    /// @deprecated Use `handle("POST", "/jobs/{jobKey}/error", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = throwError)]
+    pub fn throw_error(
+        &mut self,
+        job_key: &str,
+        error_code: &str,
+        error_message: &str,
+        lease_token: Option<String>,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(job_key)?;
+        if lease_token.is_none() {
+            self.ensure_activated(key)?;
+        }
+        self.apply(Command::ThrowJobError {
+            job_key: key,
+            attribution: None,
+            error_code: error_code.to_string(),
+            error_message: error_message.to_string(),
+            variables: BTreeMap::new(),
+            lease_token,
+        })
+        .map_err(|e| engine_err("throw error", &e))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Merge variables into a scope (a process-instance key or an element-instance
+    /// key). When `local` is true the values are written strictly into the target
+    /// scope; otherwise they propagate upward to the nearest ancestor scope that
+    /// defines each name (Zeebe `SetVariables` semantics). Returns the snapshot.
+    ///
+    /// @deprecated Use `handle("PUT", "/element-instances/{elementInstanceKey}/variables", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = setVariables)]
+    pub fn set_variables(
+        &mut self,
+        scope_key: &str,
+        variables_json: &str,
+        local: bool,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(scope_key)?;
+        let variables = parse_vars(variables_json)?;
+        self.apply(Command::SetVariables {
+            scope_key: key,
+            variables,
+            local,
+        })
+        .map_err(|e| engine_err("set variables error", &e))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Broadcast a signal by name to **every** open subscription that matches,
+    /// across all instances, merging `variables_json` into each correlated
+    /// instance. Signals correlate by name only and are not buffered. Returns
+    /// the snapshot.
+    ///
+    /// @deprecated Use `handle("POST", "/signals/broadcast", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = broadcastSignal)]
+    pub fn broadcast_signal(
+        &mut self,
+        signal_name: &str,
+        variables_json: &str,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let variables = parse_vars(variables_json)?;
+        self.apply(Command::BroadcastSignal {
+            signal_name: signal_name.to_string(),
+            variables,
+        })
+        .map_err(|e| engine_err("broadcast signal error", &e))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Cancel (terminate) a running process instance by key. Every token is
+    /// discarded, pending jobs are canceled, and the instance transitions to
+    /// `Terminated`. Returns the snapshot.
+    ///
+    /// @deprecated Use `handle("POST", "/process-instances/{processInstanceKey}/cancellation", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = cancelInstance)]
+    pub fn cancel_instance(&mut self, instance_key: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(instance_key)?;
+        self.apply(Command::cancel_instance_including_suspended(key))
+            .map_err(|e| engine_err("cancel instance error", &e))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Complete a waiting user task by key, merging `variables_json` into the
+    /// instance before the parked token resumes. The task must be in the
+    /// `Created` state. Returns the snapshot.
+    ///
+    /// @deprecated Use `handle("POST", "/user-tasks/{userTaskKey}/completion", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = completeUserTask)]
+    pub fn complete_user_task(
+        &mut self,
+        user_task_key: &str,
+        variables_json: &str,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(user_task_key)?;
+        let variables = parse_vars(variables_json)?;
+        self.apply(Command::CompleteUserTask {
+            user_task_key: key,
+            variables,
+        })
+        .map_err(|e| engine_err("complete user task error", &e))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Assign a user task to `assignee`. When `allow_override` is false and the
+    /// task already has an assignee the command is rejected (it must be
+    /// unassigned first). Returns the snapshot.
+    ///
+    /// @deprecated Use `handle("POST", "/user-tasks/{userTaskKey}/assignment", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = assignUserTask)]
+    pub fn assign_user_task(
+        &mut self,
+        user_task_key: &str,
+        assignee: &str,
+        allow_override: bool,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(user_task_key)?;
+        self.apply(Command::AssignUserTask {
+            user_task_key: key,
+            assignee: assignee.to_string(),
+            allow_override,
+        })
+        .map_err(|e| engine_err("assign user task error", &e))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Clear a user task's assignee. The task must be in the `Created` state.
+    /// Returns the snapshot.
+    ///
+    /// @deprecated Use `handle("DELETE", "/user-tasks/{userTaskKey}/assignee", …)` — the REST route this
+    /// method duplicates (served by the `readmodel` build's `handle()`, which
+    /// already routes this method through it — #2046).
+    #[wasm_bindgen(js_name = unassignUserTask)]
+    pub fn unassign_user_task(&mut self, user_task_key: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(user_task_key)?;
+        self.apply(Command::UnassignUserTask { user_task_key: key })
+            .map_err(|e| engine_err("unassign user task error", &e))?;
+        to_json(&self.snapshot_value(None))
     }
 }
 
@@ -2409,27 +2224,32 @@ fn user_task_state(s: &UserTaskState) -> String {
 /// [`nanobpmn_engine_core::EngineError::problem`] — so the wasm surface and the
 /// REST gateway cannot drift.
 #[cfg(target_arch = "wasm32")]
-fn engine_err(context: &str, e: &nanobpmn_engine_core::EngineError) -> JsValue {
-    let p = e.problem();
-    let err = js_sys::Error::new(&format!("{context}: {}", p.detail));
+fn problem_err(context: &str, status: u16, title: &str, detail: &str, retryable: bool) -> JsValue {
+    let err = js_sys::Error::new(&format!("{context}: {detail}"));
     let obj: &JsValue = err.as_ref();
     // `Reflect::set` on a fresh, extensible `Error` object cannot fail.
-    let _ = js_sys::Reflect::set(obj, &"status".into(), &JsValue::from(p.status));
-    let _ = js_sys::Reflect::set(obj, &"title".into(), &JsValue::from_str(p.title));
-    let _ = js_sys::Reflect::set(obj, &"detail".into(), &JsValue::from_str(&p.detail));
-    let _ = js_sys::Reflect::set(obj, &"nonRetryable".into(), &JsValue::from(!p.retryable));
+    let _ = js_sys::Reflect::set(obj, &"status".into(), &JsValue::from(status));
+    let _ = js_sys::Reflect::set(obj, &"title".into(), &JsValue::from_str(title));
+    let _ = js_sys::Reflect::set(obj, &"detail".into(), &JsValue::from_str(detail));
+    let _ = js_sys::Reflect::set(obj, &"nonRetryable".into(), &JsValue::from(!retryable));
     err.into()
 }
 
 /// Off wasm32 (host tests): the same catchable panic as [`js_err`], with the
 /// shared ProblemDetail fields appended so host callers can assert on them.
 #[cfg(not(target_arch = "wasm32"))]
+fn problem_err(context: &str, status: u16, title: &str, detail: &str, retryable: bool) -> JsValue {
+    js_err(&format!(
+        "{context}: {detail} [status={status} title={title} nonRetryable={}]",
+        !retryable
+    ))
+}
+
+/// An engine rejection as a ProblemDetail-shaped error ([`problem_err`]), its
+/// fields taken from the shared [`EngineError::problem`](nanobpmn_engine_core::EngineError::problem) mapping.
 fn engine_err(context: &str, e: &nanobpmn_engine_core::EngineError) -> JsValue {
     let p = e.problem();
-    js_err(&format!(
-        "{context}: {} [status={} title={} nonRetryable={}]",
-        p.detail, p.status, p.title, !p.retryable
-    ))
+    problem_err(context, p.status, p.title, &p.detail, p.retryable)
 }
 
 /// Why `evaluate_decision_json` failed: a typed engine rejection (thrown with
@@ -4792,15 +4612,18 @@ mod read_channel_tests {
     #[test]
     fn form_id_of_requires_a_non_empty_string_id() {
         assert_eq!(
-            form_id_of(r#"{"id":"greeting","components":[]}"#),
+            nanobpmn_engine_core::form_id_of(r#"{"id":"greeting","components":[]}"#),
             Some("greeting".to_string())
         );
         // A body without a string `id`, an empty id, or non-JSON is rejected
         // (native parity: Zeebe requires a form id).
-        assert_eq!(form_id_of(r#"{"components":[]}"#), None);
-        assert_eq!(form_id_of(r#"{"id":""}"#), None);
-        assert_eq!(form_id_of(r#"{"id":42}"#), None);
-        assert_eq!(form_id_of("not json"), None);
+        assert_eq!(
+            nanobpmn_engine_core::form_id_of(r#"{"components":[]}"#),
+            None
+        );
+        assert_eq!(nanobpmn_engine_core::form_id_of(r#"{"id":""}"#), None);
+        assert_eq!(nanobpmn_engine_core::form_id_of(r#"{"id":42}"#), None);
+        assert_eq!(nanobpmn_engine_core::form_id_of("not json"), None);
     }
 
     #[test]
@@ -5185,7 +5008,7 @@ mod read_channel_tests {
         let long = "a".repeat(nanobpmn_read_model::VARIABLE_VALUE_PREVIEW_LEN + 50);
         eng.create_instance("p", &format!(r#"{{"big":"{long}","small":"hi"}}"#), None)
             .unwrap();
-        let by_name = |truncate: Option<bool>| {
+        let mut by_name = |truncate: Option<bool>| {
             let items = parse(&eng.search_variables_json("", truncate).unwrap())["items"].clone();
             let pick = |n: &str| {
                 items
@@ -5217,7 +5040,7 @@ mod read_channel_tests {
     fn get_operations_map_the_shared_lookup_onto_null_and_errors() {
         // 404 ⇒ JSON `null` (absent or malformed form/resource key, absent agent
         // instance); 400 ⇒ an error (malformed agent instance key).
-        let eng = TestEngine::new();
+        let mut eng = TestEngine::new();
         assert_eq!(eng.get_form_by_key_json("999999").unwrap(), "null");
         assert_eq!(eng.get_form_by_key_json("not-a-key").unwrap(), "null");
         assert_eq!(eng.get_resource_by_key_json("999999").unwrap(), "null");
@@ -5624,7 +5447,7 @@ mod read_channel_tests {
     }
 
     /// The instance's current `tools` array via the read channel.
-    fn instance_tools(eng: &TestEngine, key: &str) -> Vec<J> {
+    fn instance_tools(eng: &mut TestEngine, key: &str) -> Vec<J> {
         let inst = parse(
             &eng.search_agent_instances(&format!(r#"{{"filter":{{"agentInstanceKey":"{key}"}}}}"#))
                 .unwrap(),
@@ -5650,7 +5473,7 @@ mod read_channel_tests {
         eng.update_agent_instance(&key, &request.to_string())
             .unwrap();
         assert!(
-            instance_tools(&eng, &key).is_empty(),
+            instance_tools(&mut eng, &key).is_empty(),
             "uncommitted tools are pending"
         );
         eng.complete_job(
@@ -5659,7 +5482,7 @@ mod read_channel_tests {
             Some(minted["jobLease"].as_str().unwrap().to_owned()),
         )
         .unwrap();
-        assert_eq!(instance_tools(&eng, &key)[0]["name"], "search");
+        assert_eq!(instance_tools(&mut eng, &key)[0]["name"], "search");
     }
 
     // The request-level `jobKey`/`jobLease` must be attributed to every appended
@@ -5819,7 +5642,7 @@ mod read_channel_tests {
         let minted = mint_agent_instance(&mut eng);
         let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
 
-        let count = |body: &str| {
+        let mut count = |body: &str| {
             parse(&eng.search_agent_instances(body).unwrap())["items"]
                 .as_array()
                 .unwrap()
@@ -5862,7 +5685,7 @@ mod read_channel_tests {
         });
         eng.update_agent_instance(&key, &req.to_string()).unwrap();
 
-        let has_assistant = |body: &str| {
+        let mut has_assistant = |body: &str| {
             parse(&eng.search_agent_instance_history(&key, body).unwrap())["items"]
                 .as_array()
                 .unwrap()
