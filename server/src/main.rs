@@ -22052,8 +22052,9 @@ impl ServerImpl {
     /// on `None`; best-effort syncs simply retry on the next tick.
     async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
         use nano_falcon_protocol::cluster_join::{
-            FEATURE_CLUSTER_VARIABLES as CV, FEATURE_MESSAGE_BUFFERING as MB,
-            FEATURE_MESSAGE_CORRELATION_ACK as MCA, FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
+            FEATURE_CLUSTER_VARIABLES as CV, FEATURE_EVENT_GATEWAY_RUNTIME as EGR,
+            FEATURE_MESSAGE_BUFFERING as MB, FEATURE_MESSAGE_CORRELATION_ACK as MCA,
+            FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
         };
         // A single node never replicates its log to anyone, so its local state
         // places no requirement on a peer.
@@ -22062,7 +22063,7 @@ impl ServerImpl {
         }
         // Every feature the recovered/replicated state can depend on, each
         // with its one-way state predicate (sticky once observed).
-        const FEATURES: [&str; 4] = [LC, CV, MB, MCA];
+        const FEATURES: [&str; 5] = [LC, CV, MB, MCA, EGR];
         let mut required: Vec<&'static str> = FEATURES
             .into_iter()
             .filter(|f| self.peers.requires_feature(f))
@@ -22088,6 +22089,7 @@ impl ServerImpl {
                         engine.cluster_variables_ever_used(),
                         engine.message_buffering_ever_used(),
                         engine.message_correlation_ack_required(),
+                        engine.event_gateway_runtime_latched(),
                     ]
                 }),
             )
@@ -34168,6 +34170,60 @@ mod clustered_startup_tests {
             .blocking_wait();
         assert!(
             journal.engine().message_buffering_ever_used(),
+            "precondition"
+        );
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(!server.peers.requires_feature(F), "precondition");
+        let _transport = server.raft_transport_for_start().await;
+        assert!(server.peers.requires_feature(F));
+        assert_eq!(server.required_cluster_features().await, Some(vec![F]));
+    }
+
+    /// #2047 review: a partition whose recovered (e.g. snapshot-only) state
+    /// carries the `event-gateway-runtime-v1` latch holds gateway-owned state
+    /// a legacy peer cannot run, so the shared scan must require the feature
+    /// before transport start — not only the AppendEntries capability check.
+    #[tokio::test]
+    async fn raft_start_requires_event_gateway_runtime_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME as F;
+        let mut journal = Journal::in_memory();
+        journal.set_event_gateway_runtime(true);
+        let def = ProcessBuilder::new("evt")
+            .start_event("start")
+            .event_based_gateway("gw")
+            .message_intermediate_catch_event("onM1", "M1", "=key")
+            .message_intermediate_catch_event("onM2", "M2", "=key")
+            .end_event("end")
+            .connect("start", "gw")
+            .connect("gw", "onM1")
+            .connect("gw", "onM2")
+            .connect("onM1", "end")
+            .connect("onM2", "end")
+            .build()
+            .expect("def");
+        journal
+            .apply_command_at(Command::DeployProcess(def), 1)
+            .expect("deploy")
+            .1
+            .blocking_wait();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("key".to_string(), Value::Str("k".into()));
+        journal
+            .apply_command_at(Command::create_instance_with("evt", vars), 2)
+            .expect("create")
+            .1
+            .blocking_wait();
+        assert!(
+            journal.engine().event_gateway_runtime_latched(),
             "precondition"
         );
         let topology = cluster::Topology {

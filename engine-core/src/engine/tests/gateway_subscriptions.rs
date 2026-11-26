@@ -298,3 +298,33 @@ fn inclusive_join_waits_for_a_gateway_triggered_catch() {
         );
     }
 }
+
+/// #2047 review: `EventGatewayTriggered` MINTS the catch's element instance
+/// key, and when the catch's activation never follows (its scope is
+/// terminated first) that record is the only carrier of the key. Replay
+/// restores the key allocator from `Event::max_key`, so every gateway-owned
+/// key field must count, or a replayed engine re-issues a live key.
+#[test]
+fn event_gateway_records_count_every_owned_key_in_max_key() {
+    let triggered = Event::EventGatewayTriggered {
+        instance_key: 10,
+        gateway_element_instance_key: 20,
+        catch_element_id: "onM1".into(),
+        catch_element_instance_key: 30,
+    };
+    assert_eq!(triggered.max_key(), 30);
+    let triggered_gw_high = Event::EventGatewayTriggered {
+        instance_key: 10,
+        gateway_element_instance_key: 40,
+        catch_element_id: "onM1".into(),
+        catch_element_instance_key: 0,
+    };
+    assert_eq!(triggered_gw_high.max_key(), 40);
+    let opened = Event::EventGatewaySubscriptionsOpened {
+        instance_key: 10,
+        gateway_element_instance_key: 50,
+        gateway_element_id: "gw".into(),
+        catch_element_ids: vec!["onM1".into()],
+    };
+    assert_eq!(opened.max_key(), 50);
+}

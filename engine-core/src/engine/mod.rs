@@ -950,15 +950,17 @@ impl Engine {
     /// and, on the first new-runtime activation, returns the latch record to
     /// journal ahead of it. Latched → new path. Not latched → the new path
     /// (latching now) only when the envelope enables the capability AND no
-    /// legacy race state is left on the partition, so a latched log never
-    /// holds legacy race state (which a latched load refuses). Otherwise the
+    /// legacy race state is left on the partition and no other legacy gateway
+    /// is still in flight (it would arm a race on completion), so a latched
+    /// log never holds legacy race state (which a latched load refuses). Otherwise the
     /// legacy #1676 race path, exactly as before the capability existed.
-    fn event_gateway_runtime_decision(&self) -> (bool, Option<Event>) {
+    fn event_gateway_runtime_decision(&self, activating: Key) -> (bool, Option<Event>) {
         if self.state.event_gateway_runtime_latched {
             return (true, None);
         }
         if self.event_gateway_runtime_envelope
             && self.state.legacy_event_gateway_race_instances().is_empty()
+            && !self.state.legacy_event_gateway_in_flight(activating)
         {
             let partition = self.partition_id;
             return (
@@ -11256,7 +11258,9 @@ impl Engine {
             // Before the `event-gateway-runtime-v1` latch the gateway is the
             // LEGACY #1676 pass-through: it completes at once and arms every
             // target catch as a race (`take_completion_flows`).
-            Some(ElementKind::EventBasedGateway) if !self.event_gateway_runtime_decision().0 => {
+            Some(ElementKind::EventBasedGateway)
+                if !self.event_gateway_runtime_decision(element_instance_key).0 =>
+            {
                 followups.push(Step::Complete {
                     instance_key,
                     element_instance_key,
@@ -11264,7 +11268,7 @@ impl Engine {
                 });
             }
             Some(ElementKind::EventBasedGateway) => {
-                events.extend(self.event_gateway_runtime_decision().1);
+                events.extend(self.event_gateway_runtime_decision(element_instance_key).1);
                 let (opened, already_true) = self.open_event_gateway_subscriptions(
                     instance_key,
                     element_instance_key,

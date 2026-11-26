@@ -176,3 +176,63 @@ fn legacy_race_state_after_the_latch_is_refused() {
         vec![inst]
     );
 }
+
+/// #2047 review: a pre-latch (legacy) gateway paused on its `end` listener has
+/// no `races` entry yet, but completing the listener arms its catches as a
+/// legacy race. Recording the latch meanwhile would leave a latched partition
+/// holding legacy race state, which the next restart refuses. The latch must
+/// wait until no legacy gateway is still in flight.
+#[test]
+fn latch_waits_for_a_legacy_gateway_paused_on_its_end_listener() {
+    let listened = ProcessBuilder::new("evtl")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "M1", "=key")
+        .message_intermediate_catch_event("onM2", "M2", "=key")
+        .end_event("end1")
+        .end_event("end2")
+        .connect("start", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "end1")
+        .connect("onM2", "end2")
+        .with_listeners("gw", Vec::new(), vec![el(ListenerEventType::End, "gw-end")])
+        .build()
+        .unwrap();
+    let (mut engine, _) = engine_with(false);
+    engine
+        .apply_command(Command::DeployProcess(listened))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "evtl",
+            vars(&[("key", Value::Str("k".into()))]),
+        ))
+        .unwrap();
+    assert!(
+        engine.pending_jobs().iter().any(|j| j.job_type == "gw-end"),
+        "the legacy gateway parks on its end listener"
+    );
+
+    // Every member now advertises the capability, but the parked legacy
+    // gateway can still arm a race: no cutover yet.
+    engine.set_event_gateway_runtime(true);
+    let (_, events) = create(&mut engine);
+    assert_eq!(
+        latches(&events),
+        0,
+        "no latch while a legacy gateway is in flight"
+    );
+    assert!(!engine.event_gateway_runtime_latched());
+
+    // Draining the listener arms the legacy race on an unlatched partition.
+    complete_one(&mut engine, "gw-end");
+    assert!(!engine.event_gateway_runtime_latched());
+    assert!(
+        engine
+            .state
+            .refused_legacy_event_gateway_race_instances()
+            .is_empty(),
+        "an unlatched partition never refuses its legacy races"
+    );
+}

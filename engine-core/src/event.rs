@@ -2841,6 +2841,22 @@ impl Event {
                 element_instance_key,
                 ..
             } => m = m.max(*element_instance_key),
+            Event::EventGatewaySubscriptionsOpened {
+                gateway_element_instance_key,
+                ..
+            } => m = m.max(*gateway_element_instance_key),
+            // The catch key is MINTED here (#2004): if the catch's activation
+            // never follows (scope terminated first), only this record
+            // carries it, so replay must still advance the allocator past it.
+            Event::EventGatewayTriggered {
+                gateway_element_instance_key,
+                catch_element_instance_key,
+                ..
+            } => {
+                m = m
+                    .max(*gateway_element_instance_key)
+                    .max(*catch_element_instance_key)
+            }
             Event::JobCreated {
                 job_key,
                 element_instance_key,

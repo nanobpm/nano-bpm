@@ -3202,6 +3202,28 @@ impl State {
             .collect()
     }
 
+    /// Whether a LEGACY event-based gateway other than `except` is still in
+    /// flight (#2004, #2047 review): an active element instance of an
+    /// event-based gateway that owns no gateway-owned subscriptions. Such a
+    /// gateway was activated under the legacy #1676 pass-through and has not
+    /// finished yet (paused on an `end` listener, a completion incident, …);
+    /// once it completes it arms its catches as a race, so the runtime latch
+    /// must not be recorded while one exists.
+    pub fn legacy_event_gateway_in_flight(&self, except: Key) -> bool {
+        self.instances.values().any(|i| {
+            let Some(def) = self.definition_for(i) else {
+                return false;
+            };
+            i.active.iter().any(|(eik, id)| {
+                *eik != except
+                    && !i.gateway_subscriptions.contains_key(eik)
+                    && def.definition.element(id).is_some_and(|e| {
+                        matches!(e.kind, crate::model::ElementKind::EventBasedGateway)
+                    })
+            })
+        })
+    }
+
     /// The legacy race state a loader must REFUSE (#2004): every legacy race
     /// ([`Self::legacy_event_gateway_race_instances`]) once the
     /// `event-gateway-runtime-v1` latch is recorded, none before it. Before

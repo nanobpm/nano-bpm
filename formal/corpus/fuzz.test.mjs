@@ -404,3 +404,21 @@ test('fileIssue skips a committed case issue GitHub reports closed', () => {
   const { gh: gh2 } = fakeGh([], [1700, 1990])
   assert.equal(fileIssue(c, gh2, committed), '#9001')
 })
+
+test('committed corpus: every expected correlationKey is the scenario\'s own input correlationKey', () => {
+  // A regenerated expectation must keep the case's actual input correlation
+  // key (#2047 review): a key minted for a fresh execution namespace (e.g.
+  // `<graph>-o0`) makes every faithful replay fail the variables comparison.
+  const corpus = JSON.parse(fs.readFileSync(new URL('./fuzz-corpus.json', import.meta.url), 'utf8'))
+  const bad = []
+  const walk = (o) => {
+    if (!o || typeof o !== 'object') return
+    const exp = o.expect?.variables
+    if (exp && o.variables && 'correlationKey' in exp && exp.correlationKey !== o.variables.correlationKey) {
+      bad.push(`${o.name}: expect ${exp.correlationKey} != input ${o.variables.correlationKey}`)
+    }
+    for (const v of Object.values(o)) walk(v)
+  }
+  walk(corpus)
+  assert.deepEqual(bad, [])
+})
