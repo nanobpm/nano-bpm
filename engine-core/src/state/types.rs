@@ -989,6 +989,21 @@ pub struct ProcessInstance {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub races: BTreeMap<Key, Key>,
+    /// Gateway-owned event subscriptions (#1963 slice i, #2003): event-based
+    /// gateway element instance -> the target catch element ids it holds a
+    /// subscription for, in outgoing-flow (document) order. This is the Zeebe
+    /// model (`EventBasedGatewayProcessor.onActivate` subscribes the GATEWAY's
+    /// element instance to each catch's event, tagged with the catch element
+    /// id). Inserted by [`crate::Event::EventGatewaySubscriptionsOpened`],
+    /// removed when the gateway is triggered
+    /// ([`crate::Event::EventGatewayTriggered`]) or completes/terminates.
+    /// Not yet driven by execution (the legacy race machinery still runs).
+    /// `serde(default)` and omitted when empty.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub gateway_subscriptions: BTreeMap<Key, Vec<ElementId>>,
     /// Keys of incidents currently **active** on this instance (parked tokens).
     /// The full records live in [`State::incidents`] and are retained after
     /// resolution; resolving an incident removes its key from this active index
@@ -2860,6 +2875,20 @@ impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
 }
 
 impl State {
+    /// Instances carrying an armed LEGACY event-based gateway race (#1676
+    /// `races` membership): catches activated by an already-completed gateway.
+    /// The gateway-owned subscription model (#1963, #2003) cannot represent
+    /// these, so a pre-v4 snapshot holding any is refused on load
+    /// (`LegacyEventGatewayRace`) rather than silently dropped or rewound.
+    /// Ascending, deduplicated.
+    pub fn legacy_event_gateway_race_instances(&self) -> Vec<Key> {
+        self.instances
+            .iter()
+            .filter(|(_, i)| !i.races.is_empty())
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
     /// The settlement half of the live `VariablesLostQuarantined` fold
     /// (#1608): record `episode` as `instance_key`'s settled loss episode.
     /// The ONE canonical derivation of `settled_orphan_episodes`, shared by

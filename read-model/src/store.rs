@@ -7680,6 +7680,9 @@ fn project_event(
         | Event::ElementCompleting { .. }
         | Event::ElementTerminating { .. }
         | Event::GatewayRouteSelected { .. }
+        // Gateway-owned subscription bookkeeping (#2003): not yet emitted.
+        | Event::EventGatewaySubscriptionsOpened { .. }
+        | Event::EventGatewayTriggered { .. }
         | Event::MessagePublished { .. }
         // Engine-internal message buffer (#1874): the correlation records
         // that follow carry everything the read model projects.
@@ -8995,6 +8998,7 @@ mod writability_tests {
             activating: Default::default(),
             gateway_routes: Default::default(),
             races: Default::default(),
+            gateway_subscriptions: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),
@@ -9500,6 +9504,7 @@ mod definition_xml_tests {
             activating: Default::default(),
             gateway_routes: Default::default(),
             races: Default::default(),
+            gateway_subscriptions: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),
@@ -9768,6 +9773,7 @@ mod definition_xml_tests {
             activating: Default::default(),
             gateway_routes: Default::default(),
             races: Default::default(),
+            gateway_subscriptions: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),

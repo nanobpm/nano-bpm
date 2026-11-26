@@ -145,6 +145,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 activating: Default::default(),
                 gateway_routes: BTreeMap::new(),
                 races: BTreeMap::new(),
+                gateway_subscriptions: BTreeMap::new(),
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),

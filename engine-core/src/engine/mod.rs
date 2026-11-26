@@ -106,7 +106,13 @@ struct Paused {
 /// (and headerless version-0) snapshots still load under this build, and a
 /// pre-v3 build fails a v3 file closed as `FormatMismatch` (then migrates it by
 /// replay, #1071).
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+/// Version `4` adds gateway-owned event-based gateway subscriptions
+/// (`ProcessInstance::gateway_subscriptions`, #1963 / #2003). The payload is
+/// additive, so v3 snapshots migrate unchanged — EXCEPT one holding an in-flight
+/// legacy event-gateway race (`State::legacy_event_gateway_race_instances`),
+/// which the loader refuses with a typed `LegacyEventGatewayRace` error naming
+/// the instances (settle or cancel them on the previous release first).
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
 /// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
 /// plus the scalar generator and clock metadata required to resume operation
 /// identically. Produced by [`Engine::snapshot`] and consumed by
@@ -19694,6 +19700,7 @@ mod decompose_scaling {
                 activating: Default::default(),
                 gateway_routes: BTreeMap::new(),
                 races: BTreeMap::new(),
+                gateway_subscriptions: BTreeMap::new(),
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),
