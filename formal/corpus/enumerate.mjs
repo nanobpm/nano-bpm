@@ -453,8 +453,16 @@ export class Reference {
     // armed activation (a node reached twice holds two timers). A `timer` catch
     // arms on activation; an interrupting timer boundary arms when its task
     // activates. The virtual clock advances one tick per `tick` command.
+    // Each entry is `{ due, seq }`: `seq` is the arming order (Zeebe's timer
+    // key order), which fixes the order the TRIGGERs of one tick fire in.
     this.clock = 0
+    this.timerSeq = 0
     this.timers = Object.create(null)
+    // The TRIGGERs of the current tick still to fire, in firing order (#2024).
+    // `settle` fires the next one only once the previous one's follow-ups have
+    // drained, as Zeebe's ProcessingStateMachine drains each command's
+    // follow-ups before it reads the next TRIGGER from the log.
+    this.pendingFires = []
     // Per-gateway count of activations already routed: the next choice of `n`
     // is `route[routeVariable(n)][activations[n]]` (padded with its last entry).
     this.activations = Object.create(null)
@@ -481,7 +489,8 @@ export class Reference {
     c.takenFlows = { ...this.takenFlows }
     c.joinsFired = { ...this.joinsFired }
     c.activations = { ...this.activations }
-    c.timers = Object.fromEntries(Object.entries(this.timers).map(([k, v]) => [k, [...v]]))
+    c.timers = Object.fromEntries(Object.entries(this.timers).map(([k, v]) => [k, v.map((t) => ({ ...t }))]))
+    c.pendingFires = [...this.pendingFires]
     c.route = Object.fromEntries(Object.entries(this.route).map(([k, v]) => [k, [...v]]))
     c.joinTokens = Object.fromEntries(Object.entries(this.joinTokens).map(([j, a]) => [j, { ...a }]))
     return c
@@ -595,7 +604,13 @@ export class Reference {
     // the same way. Per-activation routing is only expressible across a command
     // (a wait state re-reads the variable). Cache the choice for this drain.
     const settleChoice = Object.create(null)
-    while (this.queue.length) {
+    for (;;) {
+      if (!this.queue.length) {
+        // Quiescent: fire the tick's next TRIGGER, if any (#2024).
+        if (!this.pendingFires.length) break
+        this.fireTimer(this.pendingFires.shift())
+        continue
+      }
       const f = this.queue[0]
       const n = this.target(f)
       // A queued activation of a diverging gateway whose choice is not yet
@@ -612,7 +627,7 @@ export class Reference {
           // its timer is due one tick after the task activates. (A message
           // boundary opens a subscription instead — no clock state.)
           for (const [bd, task] of Object.entries(this.graph.boundaryOf ?? {})) {
-            if (task === n && this.kind(bd) === 'btimer') (this.timers[bd] ??= []).push(this.clock + 1)
+            if (task === n && this.kind(bd) === 'btimer') (this.timers[bd] ??= []).push({ due: this.clock + 1, seq: this.timerSeq++ })
           }
         }
       } else if (kind === 'timer') {
@@ -620,7 +635,7 @@ export class Reference {
         // `tick` command once its timer is due. Every generated timer is due
         // after exactly one tick (the scenario drives the clock).
         this.waiting[n] += 1
-        ;(this.timers[n] ??= []).push(this.clock + 1)
+        ;(this.timers[n] ??= []).push({ due: this.clock + 1, seq: this.timerSeq++ })
       } else if (kind === 'sub') {
         // Entering an embedded sub-process (#1673): the container rests as a
         // wait state while its inner flow runs — activate its inner start event
@@ -674,6 +689,16 @@ export class Reference {
     if (!live) this.completed = true
   }
 
+  /** Fire one due timer: a catch completes, a boundary terminates its task. */
+  fireTimer (n) {
+    const task = this.attachedTo(n)
+    // An interrupting timer boundary TERMINATES its task (its job is
+    // cancelled, the task never completes); a timer catch completes.
+    this.waiting[task ?? n] -= 1
+    this.complete(n)
+    this.take(this.out[n])
+  }
+
   /** The commands possible in this settled state. */
   commands () {
     if (this.completed || this.cancelled) return []
@@ -696,7 +721,7 @@ export class Reference {
     // The clock advances only while some armed timer is not yet due (#1673):
     // the `tick` that makes a `timer` catch / timer boundary fireable. A tick
     // that would release nothing is never offered, so the walk stays finite.
-    if (Object.values(this.timers).some((dues) => dues.some((due) => due > this.clock))) cmds.push({ op: 'tick' })
+    if (Object.values(this.timers).some((dues) => dues.some((t) => t.due > this.clock))) cmds.push({ op: 'tick' })
     return cmds
   }
 
@@ -770,24 +795,22 @@ export class Reference {
       return next
     }
     // A clock tick (#1673): advance the virtual clock and fire EVERY timer it
-    // makes due, atomically — exactly as the engine's advanceTime releases due
-    // timers within the one command, so no other command can interleave
-    // between a timer becoming due and its firing.
+    // makes due within the one command, so no other command can interleave
+    // between a timer becoming due and its firing. The TRIGGERs fire one at a
+    // time in arming (timer key) order, each drained before the next (#2024):
+    // Zeebe's DueDateTimerCheckScheduler writes one TIMER TRIGGER per due timer
+    // and ProcessingStateMachine.batchProcessing drains each command's
+    // follow-ups before it processes the next command read from the log.
     if (cmd.op === 'tick') {
       next.clock += 1
-      for (const n of Object.keys(next.timers).sort()) {
-        const due = next.timers[n].filter((d) => d <= next.clock)
-        next.timers[n] = next.timers[n].filter((d) => d > next.clock)
+      const fires = []
+      for (const n of Object.keys(next.timers)) {
+        for (const t of next.timers[n]) if (t.due <= next.clock) fires.push({ node: n, ...t })
+        next.timers[n] = next.timers[n].filter((t) => t.due > next.clock)
         if (next.timers[n].length === 0) delete next.timers[n]
-        const task = next.attachedTo(n)
-        for (let i = 0; i < due.length; i++) {
-          // An interrupting timer boundary TERMINATES its task (its job is
-          // cancelled, the task never completes); a timer catch completes.
-          next.waiting[task ?? n] -= 1
-          next.complete(n)
-          next.take(next.out[n])
-        }
       }
+      fires.sort((a, b) => a.due - b.due || a.seq - b.seq)
+      next.pendingFires = fires.map((f) => f.node)
       next.settle()
       return next
     }

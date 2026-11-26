@@ -8894,15 +8894,22 @@ fn delete_process_instance_history_rejects_live_and_accepts_ended() {
     assert_eq!(next(&mut live), next(&mut replayed));
 }
 
-/// #1989 (fuzz #1795/#1796): two tokens reach `t2`, which has an interrupting
-/// timer boundary `b2`; `t2 -> join` and `b2 -> join` are the inclusive join's
-/// two incoming flows. One tick fires BOTH boundary timers. Zeebe writes both
-/// TRIGGERs before the join's ACTIVATE commands run, so neither arrival sees a
-/// live `t2`: each is accepted and the join activates twice (Camunda and the
-/// spec oracle agree). Nano used to evaluate the first arrival while the second
-/// `t2` was still live, park it, then fire once and strand the surplus.
+/// #1989 (fuzz #1795/#1796), re-judged by #2024: two tokens reach `t2`, which
+/// has an interrupting timer boundary `b2`; `t2 -> join` and `b2 -> join` are
+/// the inclusive join's two incoming flows. One tick fires BOTH boundary
+/// timers. The first `b2` arrival still sees the second `t2` live (it reaches
+/// the join over `t2 -> join`), so it is rejected; the second arrival finds no
+/// live path and fires the join ONCE, leaving the surplus `b2 -> join` token.
+/// Zeebe drains each TIMER TRIGGER's follow-ups before it processes the next
+/// TRIGGER of the batch (`ProcessingStateMachine.batchProcessing`,
+/// zeebe/stream-platform/.../ProcessingStateMachine.java L421-476) and guards
+/// an inclusive join only when its `ACTIVATE_ELEMENT` is processed
+/// (`ProcessInstanceStateTransitionGuard.canActivateInclusiveGateway`, L284-331;
+/// reachability in `BpmnInclusiveGatewayBehavior` L35-149, which follows an
+/// activity's boundary events, L144-147). A rejected ACTIVATE is never
+/// re-evaluated (#2024).
 #[test]
-fn inclusive_join_fires_per_arrival_when_one_tick_interrupts_every_live_path() {
+fn inclusive_join_fires_once_when_one_tick_interrupts_every_live_path() {
     let def = ProcessBuilder::new("inc-tick")
         .start_event("s")
         .inclusive_gateway("fork")
@@ -8935,8 +8942,8 @@ fn inclusive_join_fires_per_arrival_when_one_tick_interrupts_every_live_path() {
     let first = engine.trigger_timers(60_000);
     assert_eq!(
         join_fire_count(&first, "join"),
-        2,
-        "each interrupted token activates the join: {first:#?}"
+        1,
+        "the first arrival is held by the live `t2`: {first:#?}"
     );
     assert_eq!(
         first
@@ -8945,20 +8952,31 @@ fn inclusive_join_fires_per_arrival_when_one_tick_interrupts_every_live_path() {
                 |e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "t1")
             )
             .count(),
-        2
+        1
     );
     engine.trigger_timers(120_000);
-    assert!(engine.is_completed(instance_key));
+    assert!(
+        !engine.is_completed(instance_key),
+        "the surplus join token strands, as in Zeebe"
+    );
 }
 
-/// #1989 (fuzz #1813/#1814), the same class through a timer CATCH: one tick
-/// fires the catch `w` (lower key, fired first) and the interrupting boundary
-/// `b` of `t`. Both continue through `merge -> join`; `t`'s own path to the
-/// join is doomed by its due boundary timer, so the first arrival must not
-/// wait for it. The join activates once per arrival and the instance
-/// completes.
+/// #1989 (fuzz #1813/#1814), re-judged by #2024: one tick fires the catch `w`
+/// (lower key, fired first) and the interrupting boundary `b` of `t`. Both
+/// continue through `merge -> join`. `w`'s arrival is guarded while `t` is
+/// still live (its own TRIGGER is not processed yet) and is rejected; `b`'s
+/// arrival then finds no live path and fires the join once. The surplus
+/// `merge -> join` token strands, so the instance does not complete.
+/// Zeebe drains each TIMER TRIGGER's follow-ups before it processes the next
+/// TRIGGER of the batch (`ProcessingStateMachine.batchProcessing`,
+/// zeebe/stream-platform/.../ProcessingStateMachine.java L421-476) and guards
+/// an inclusive join only when its `ACTIVATE_ELEMENT` is processed
+/// (`ProcessInstanceStateTransitionGuard.canActivateInclusiveGateway`, L284-331;
+/// reachability in `BpmnInclusiveGatewayBehavior` L35-149, which follows an
+/// activity's boundary events, L144-147). A rejected ACTIVATE is never
+/// re-evaluated (#2024).
 #[test]
-fn inclusive_join_ignores_a_path_doomed_by_a_boundary_timer_due_in_the_same_tick() {
+fn inclusive_join_waits_for_a_path_whose_boundary_timer_fires_later_in_the_same_tick() {
     let def = ProcessBuilder::new("inc-doomed")
         .start_event("s")
         .parallel_gateway("fork")
@@ -8988,12 +9006,11 @@ fn inclusive_join_ignores_a_path_doomed_by_a_boundary_timer_due_in_the_same_tick
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
 
     let fired = engine.trigger_timers(5_000);
-    assert_eq!(join_fire_count(&fired, "join"), 2, "{fired:#?}");
-    assert!(engine.is_completed(instance_key));
+    assert_eq!(join_fire_count(&fired, "join"), 1, "{fired:#?}");
+    assert!(!engine.is_completed(instance_key));
 }
 
-/// The doomed-path rule (#1989) only covers boundary timers due in the SAME
-/// batch: a `t` whose boundary is not yet due still holds the join.
+/// A `t` whose boundary is not yet due still holds the join.
 #[test]
 fn inclusive_join_still_waits_for_a_path_whose_boundary_timer_is_not_due() {
     let def = ProcessBuilder::new("inc-not-due")
@@ -9028,13 +9045,21 @@ fn inclusive_join_still_waits_for_a_path_whose_boundary_timer_is_not_due() {
     );
 }
 
-/// #1989 review: with two interrupting boundary timers due in the same tick,
-/// the FIRST in queue order fires and cancels its sibling, so `t`'s doomed
-/// path must continue from that one. `b1` (created first) leads elsewhere;
-/// `b2` (cancelled by `b1`) leads to the join. Mapping `t` to `b2` would make
-/// `w`'s arrival wait forever for a token that never comes.
+/// #1989 review, re-judged by #2024: `w`, `b1` and `b2` are due in the same
+/// tick. `w` fires first; its arrival sees `t` live, and `t` reaches the join
+/// through its boundary `b2`, so the arrival is rejected. `b1` then
+/// interrupts `t` (cancelling `b2`) and leads elsewhere. Nothing guards the
+/// join again, so it never fires and the instance stays active, as in Zeebe.
+/// Zeebe drains each TIMER TRIGGER's follow-ups before it processes the next
+/// TRIGGER of the batch (`ProcessingStateMachine.batchProcessing`,
+/// zeebe/stream-platform/.../ProcessingStateMachine.java L421-476) and guards
+/// an inclusive join only when its `ACTIVATE_ELEMENT` is processed
+/// (`ProcessInstanceStateTransitionGuard.canActivateInclusiveGateway`, L284-331;
+/// reachability in `BpmnInclusiveGatewayBehavior` L35-149, which follows an
+/// activity's boundary events, L144-147). A rejected ACTIVATE is never
+/// re-evaluated (#2024).
 #[test]
-fn inclusive_join_doomed_path_uses_the_first_due_boundary_timer() {
+fn inclusive_join_is_not_reguarded_when_a_later_boundary_removes_the_live_path() {
     let def = ProcessBuilder::new("inc-doomed-first")
         .start_event("s")
         .parallel_gateway("fork")
@@ -9065,17 +9090,17 @@ fn inclusive_join_doomed_path_uses_the_first_due_boundary_timer() {
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
     let fired = engine.trigger_timers(5_000);
-    assert_eq!(join_fire_count(&fired, "join"), 1, "{fired:#?}");
-    assert!(engine.is_completed(instance_key));
+    assert_eq!(join_fire_count(&fired, "join"), 0, "{fired:#?}");
+    assert!(!engine.is_completed(instance_key));
 }
 
 /// #1989 review: a NON-interrupting boundary `b1` due before the interrupting
-/// `b2` of the same activity still fires (queue order) and spawns its token
-/// before `b2` tears `t` down, so `t`'s doomed path must keep `b1` as a
-/// source. `w` and `b1` both reach the join, `b2` leads elsewhere: the join
-/// must synchronize `w` with `b1` and fire once, not once per arrival.
+/// `b2` of the same activity fires first (timer-key order) and spawns its
+/// token before `b2` tears `t` down. `w` and `b1` both reach the join, `b2`
+/// leads elsewhere: `w`'s arrival waits for the live `t` (reachable through
+/// `b1`), `b1`'s arrival takes the second input and the join fires once.
 #[test]
-fn inclusive_join_doomed_path_keeps_prior_non_interrupting_boundaries() {
+fn inclusive_join_synchronizes_a_catch_with_a_prior_non_interrupting_boundary() {
     let def = ProcessBuilder::new("inc-doomed-mixed")
         .start_event("s")
         .parallel_gateway("fork")
@@ -9110,18 +9135,25 @@ fn inclusive_join_doomed_path_keeps_prior_non_interrupting_boundaries() {
     assert!(engine.is_completed(instance_key));
 }
 
-/// #2018 (fuzz Gen_2d18f93dc0, the #1989 cases): one tick fires the timer
+/// Fuzz Gen_2d18f93dc0 (#2018), re-judged by #2024: one tick fires the timer
 /// catch `w1` AND the interrupting boundary `b1` of `t1`; both tokens route
 /// through the exclusive `g3` into the inclusive join `g2`, which `g3` could
-/// otherwise also reach over `t3 -> g4`. Zeebe writes both TRIGGERs (each
-/// completing its catch/boundary and queueing its `g3` activation) before
-/// either `g3` activation runs, so both tokens take `g3 -> g2` before the join
-/// guard evaluates: no live path remains, and the join activates once per
-/// arrival (the spec oracle and the committed fuzz expectation agree). Nano
-/// drained `w1`'s token into the join while `b1`'s token was still upstream
-/// of `g3`, parked it, then fired once and stranded the surplus.
+/// otherwise also reach over `t3 -> g4`. The first arrival is guarded while
+/// the other timer's element is still live (it reaches `g2` over
+/// `g3 -> t3 -> g4`) and is rejected; the second fires the join ONCE. Live
+/// Camunda 8.10.11 agrees: the parity scenario
+/// `formal/parity/runtime/corpus/inclusive-join-timer-tick-per-trigger` (this
+/// shape, counting the join's firings) observes one firing.
+/// Zeebe drains each TIMER TRIGGER's follow-ups before it processes the next
+/// TRIGGER of the batch (`ProcessingStateMachine.batchProcessing`,
+/// zeebe/stream-platform/.../ProcessingStateMachine.java L421-476) and guards
+/// an inclusive join only when its `ACTIVATE_ELEMENT` is processed
+/// (`ProcessInstanceStateTransitionGuard.canActivateInclusiveGateway`, L284-331;
+/// reachability in `BpmnInclusiveGatewayBehavior` L35-149, which follows an
+/// activity's boundary events, L144-147). A rejected ACTIVATE is never
+/// re-evaluated (#2024).
 #[test]
-fn inclusive_join_fires_per_arrival_when_a_tick_fires_a_catch_and_a_boundary_upstream_of_a_split() {
+fn inclusive_join_fires_once_when_a_tick_fires_a_catch_and_a_boundary_upstream_of_a_split() {
     let def = ProcessBuilder::new("inc-tick-xor")
         .start_event("s")
         .inclusive_gateway("g1")
@@ -9154,19 +9186,17 @@ fn inclusive_join_fires_per_arrival_when_a_tick_fires_a_catch_and_a_boundary_ups
         .apply_command_at(Command::create_instance("inc-tick-xor"), 0)
         .unwrap();
     let fired = engine.trigger_timers(60_000);
-    assert_eq!(join_fire_count(&fired, "g2"), 2, "{fired:#?}");
+    assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
 }
 
 /// #2018 review (r4703480366): three catches due in one tick — `w1` and `w2`
 /// both feed the join input `x -> g2`, `w3` reaches the other input through
-/// the longer chain `a -> b`. Zeebe writes all three TRIGGERs, then runs the
-/// follow-ups first-in first-out: `w1`'s and `w2`'s join guards both still
-/// see `w3`'s token in transit and park; `w3`'s arrival then consumes one
-/// token per input, and the surplus stays parked. A held-back arrival must be
-/// re-guarded in that order — ahead of the last fire's downstream work — not
-/// at full quiescence, where it would fire the join a second time.
+/// the longer chain `a -> b`. Each TRIGGER is drained before the next (#2024):
+/// `w1`'s and `w2`'s arrivals are guarded while `w3` is still live and are
+/// rejected; `w3`'s arrival consumes one token per input, and the surplus
+/// stays parked. The join fires exactly once.
 #[test]
-fn inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_work() {
+fn inclusive_join_fires_once_when_three_catches_fire_in_one_tick() {
     let def = ProcessBuilder::new("inc-tick-three")
         .start_event("s")
         .inclusive_gateway("g1")
@@ -9211,7 +9241,7 @@ fn inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_wor
 }
 
 /// The three-catch scenario of
-/// [`inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_work`],
+/// [`inclusive_join_fires_once_when_three_catches_fire_in_one_tick`],
 /// parameterised over what `x`'s and `b`'s inputs are fed by.
 fn three_way_tick_def(id: &str, last_is_boundary: bool) -> crate::model::ProcessDefinition {
     let mut builder = ProcessBuilder::new(id)
@@ -9253,10 +9283,9 @@ fn three_way_tick_def(id: &str, last_is_boundary: bool) -> crate::model::Process
 }
 
 /// #2018 review (r4703550842): a timer of ANOTHER instance due last in the
-/// same batch must not delay the re-guard of this instance's held-back
-/// arrivals past its own last fire's downstream work.
+/// same batch does not change how often this instance's join fires.
 #[test]
-fn inclusive_join_reguard_is_not_delayed_by_another_instances_later_timer() {
+fn inclusive_join_fires_once_when_another_instances_timer_fires_last() {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(three_way_tick_def(
@@ -9292,7 +9321,7 @@ fn inclusive_join_reguard_is_not_delayed_by_another_instances_later_timer() {
 }
 
 /// #2024 (r4703550889): the three-way tick of
-/// [`inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_work`]
+/// [`inclusive_join_fires_once_when_three_catches_fire_in_one_tick`]
 /// with `w3` an interrupting boundary of `t3` (due last in the batch) feeding
 /// `a -> b -> g2`. The join must fire exactly once.
 #[test]
@@ -9316,5 +9345,171 @@ fn inclusive_join_fires_once_when_an_interrupting_boundary_fires_last_in_the_bat
         })
         .collect();
     assert_eq!(order.last(), Some(&"t3"), "{order:?}");
+    assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
+}
+
+/// The three-catch tick of [`three_way_tick_def`] with an extra catch `z`,
+/// due LAST in the batch, on a parallel branch of the same instance. `z` ends
+/// in `ze` (or, with `terminate`, a terminate end event that cancels the
+/// instance once the join has fired).
+fn three_way_tick_with_trailing_catch(
+    id: &str,
+    terminate: bool,
+) -> crate::model::ProcessDefinition {
+    let mut builder = ProcessBuilder::new(id)
+        .start_event("s")
+        .inclusive_gateway("g1")
+        .timer_intermediate_catch_event("w1", 60_000)
+        .timer_intermediate_catch_event("w2", 60_000)
+        .timer_intermediate_catch_event("w3", 60_000)
+        .timer_intermediate_catch_event("z", 60_000)
+        .exclusive_gateway("x")
+        .exclusive_gateway("a")
+        .exclusive_gateway("b")
+        .inclusive_gateway("g2")
+        .end_event("e");
+    builder = if terminate {
+        builder.terminate_end_event("ze")
+    } else {
+        builder.end_event("ze")
+    };
+    builder
+        .connect("s", "g1")
+        // Connected last-first: `z` is activated first, so it is due last.
+        .connect_when("g1", "z", "true")
+        .connect_when("g1", "w3", "true")
+        .connect_when("g1", "w2", "true")
+        .connect_when("g1", "w1", "true")
+        .connect("w1", "x")
+        .connect("w2", "x")
+        .connect("x", "g2")
+        .connect("w3", "a")
+        .connect("a", "b")
+        .connect("b", "g2")
+        .connect("z", "ze")
+        .connect("g2", "e")
+        .build()
+        .unwrap()
+}
+
+fn timer_order(events: &[Event]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::TimerTriggered { element_id, .. } => Some(element_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// #2024 scope (from the #2019 review): a later catch `z` of the SAME
+/// instance, due after `w3` and unrelated to the join, does not change how
+/// often the join fires: each TRIGGER is drained before the next, so the join
+/// has fired once before `z` fires.
+#[test]
+fn inclusive_join_fires_once_when_a_same_instance_catch_fires_last() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(three_way_tick_with_trailing_catch(
+            "inc-tick-z",
+            false,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("inc-tick-z"), 0)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let fired = engine.trigger_timers(60_000);
+    assert_eq!(timer_order(&fired).last(), Some(&"z"), "{fired:#?}");
+    assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
+    assert!(
+        !engine.is_completed(instance_key),
+        "the surplus `x -> g2` token stays parked"
+    );
+}
+
+/// #2024 scope (Copilot closer-look on #2019): a cancellation in the same
+/// batch. `z`, due last, reaches a terminate end event: the join fires once
+/// (before `z`'s TRIGGER is processed) and the terminate then ends the
+/// instance, surplus token included.
+#[test]
+fn inclusive_join_fires_once_before_a_terminate_end_in_the_same_tick() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(three_way_tick_with_trailing_catch(
+            "inc-tick-terminate",
+            true,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("inc-tick-terminate"), 0)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let fired = engine.trigger_timers(60_000);
+    assert_eq!(timer_order(&fired).last(), Some(&"z"), "{fired:#?}");
+    assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
+    assert!(engine.is_completed(instance_key), "{fired:#?}");
+}
+
+/// #2024 scope (Copilot closer-look on #2019): the three-catch tick inside an
+/// embedded sub-process, with a sibling-scope catch `y` (outside the
+/// sub-process, on a parallel branch) in the same batch. The join is guarded
+/// within its own flow scope, so it fires exactly once.
+#[test]
+fn inclusive_join_in_a_subprocess_fires_once_with_a_sibling_scope_timer() {
+    let def = ProcessBuilder::new("inc-tick-sub")
+        .start_event("s")
+        .parallel_gateway("pf")
+        .timer_intermediate_catch_event("y", 60_000)
+        .end_event("ye")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .inclusive_gateway("g1")
+        .timer_intermediate_catch_event("w1", 60_000)
+        .timer_intermediate_catch_event("w2", 60_000)
+        .timer_intermediate_catch_event("w3", 60_000)
+        .exclusive_gateway("x")
+        .exclusive_gateway("a")
+        .exclusive_gateway("b")
+        .inclusive_gateway("g2")
+        .end_event("se")
+        .contained_in("ss", "sub")
+        .contained_in("g1", "sub")
+        .contained_in("w1", "sub")
+        .contained_in("w2", "sub")
+        .contained_in("w3", "sub")
+        .contained_in("x", "sub")
+        .contained_in("a", "sub")
+        .contained_in("b", "sub")
+        .contained_in("g2", "sub")
+        .contained_in("se", "sub")
+        .end_event("e")
+        .connect("s", "pf")
+        .connect("pf", "sub")
+        .connect("pf", "y")
+        .connect("y", "ye")
+        .connect("ss", "g1")
+        .connect_when("g1", "w3", "true")
+        .connect_when("g1", "w2", "true")
+        .connect_when("g1", "w1", "true")
+        .connect("w1", "x")
+        .connect("w2", "x")
+        .connect("x", "g2")
+        .connect("w3", "a")
+        .connect("a", "b")
+        .connect("b", "g2")
+        .connect("g2", "se")
+        .connect("sub", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command_at(Command::create_instance("inc-tick-sub"), 0)
+        .unwrap();
+    let fired = engine.trigger_timers(60_000);
+    let order = timer_order(&fired);
+    assert_eq!(order.len(), 4, "{order:?}");
+    assert!(order.contains(&"y"), "{order:?}");
     assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
 }

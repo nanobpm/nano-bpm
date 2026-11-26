@@ -21,9 +21,9 @@ CI anti-drift gate are tracked in #2010.
 ## Blockers, construct by construct
 
 1. **Receiver is the whole `Engine`.** `has_active_path_to(&self, …)` reads
-   `self.state.instances`, `self.pending_timer_fires`, `self.state.timers`,
-   `scope_of`, `process_of_instance` and calls
-   `doomed_by_due_boundary_timers`. `Engine` (`engine-core/src/engine/mod.rs`)
+   `self.state.instances`, `scope_of` and `process_of_instance` (the
+   timer-batch `doomed_by_due_boundary_timers` view it used to call was
+   removed by #2024). `Engine` (`engine-core/src/engine/mod.rs`)
    holds in-memory state and scratch data (no journal, no trait objects), but
    the `&self` receiver still drags the full transitive type closure of
    `State` (instances, timers, deployed definitions, FEEL values) into Charon.
