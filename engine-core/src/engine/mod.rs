@@ -18419,11 +18419,16 @@ impl Engine {
             }
             _ => None,
         });
+        // Fast path: no live or in-transit source means nothing can still
+        // reach the join, so skip building the dense graph.
+        let mut sources = active.chain(in_transit).peekable();
+        if sources.peek().is_none() {
+            return false;
+        }
         let Some(graph) = JoinGraph::collect(process, join, taken) else {
             return false;
         };
-        let live: Vec<usize> = active
-            .chain(in_transit)
+        let live: Vec<usize> = sources
             .filter_map(|source| graph.index_of(source))
             .collect();
         join_guard::has_active_path(&graph.succ, &live, graph.join, &graph.taken)
