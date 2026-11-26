@@ -130,7 +130,8 @@ struct PendingCorrelationAck {
 /// additive, so v3 snapshots migrate unchanged — EXCEPT one holding an in-flight
 /// legacy event-gateway race (`State::legacy_event_gateway_race_instances`),
 /// which the loader refuses with a typed `LegacyEventGatewayRace` error naming
-/// the instances (settle or cancel them on the previous release first).
+/// the instances (settle or cancel them on the previous release first). See
+/// `docs/adr/0067-event-gateway-runtime-latch.md` for the replay contract.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
 /// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
 /// plus the scalar generator and clock metadata required to resume operation

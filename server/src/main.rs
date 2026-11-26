@@ -27622,7 +27622,7 @@ async fn remote_buffered_delivery_gate(
 }
 
 /// The non-Raft cluster-wide rolling-upgrade gate for the event-gateway
-/// runtime latch (#2004, ADR 0066): on only when EVERY other cluster member is
+/// runtime latch (#2004, ADR 0066, ADR 0067): on only when EVERY other cluster member is
 /// known to advertise `event-gateway-runtime-v1`. A single node is trivially
 /// on.
 async fn event_gateway_runtime_gate(topology: &cluster::Topology, peers: &peer::PeerSet) -> bool {

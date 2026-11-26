@@ -112,14 +112,18 @@ pub enum ProcessInstanceState {
 /// Kept sorted by flow with no zero counts, so its serialized form is
 /// deterministic.
 /// An event-based gateway's recorded trigger (#2004): the catch whose event
-/// fired and the element instance key its direct activation uses.
+/// fired and the element instance key its direct activation uses. See
+/// `docs/adr/0067-event-gateway-runtime-latch.md` for the arbitration and
+/// pre-/post-latch replay contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GatewayTrigger {
     pub catch_element_id: ElementId,
     pub catch_element_instance_key: Key,
-    /// The winning event's payload (#2047 review), overlaid on the catch's
-    /// output-mapping context. Additive (`serde(default)`).
+    /// The winning event's payload (#2047 review), snapshotted at trigger
+    /// time and written LOCAL to the catch element instance when it
+    /// activates; its listeners, output mappings and propagation read it
+    /// from there. Additive (`serde(default)`). Replay contract: ADR 0067.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "BTreeMap::is_empty")

@@ -671,8 +671,12 @@ pub enum Event {
     /// A gateway-owned subscription fired (#1963, #2004): the gateway
     /// recorded its event trigger for `catch_element_id` and every other
     /// subscription it owns is deleted (Zeebe `EventTrigger` on the gateway's
-    /// event scope; first trigger wins). The gateway then completes and
-    /// activates the catch directly under `catch_element_instance_key`.
+    /// event scope; first trigger in log order wins, arbitrated per batch;
+    /// losing catches are cancelled with no trigger record). The gateway then
+    /// completes and activates the catch directly under
+    /// `catch_element_instance_key`. Replay contract (legacy before the
+    /// `event-gateway-runtime-v1` latch, new runtime after):
+    /// `docs/adr/0067-event-gateway-runtime-latch.md`.
     EventGatewayTriggered {
         instance_key: Key,
         gateway_element_instance_key: Key,
@@ -684,9 +688,10 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default))]
         catch_element_instance_key: Key,
         /// The winning event's payload (#2047 review), snapshotted at the
-        /// trigger so the catch's output mappings read it even when a
-        /// variable changes while the gateway completes (e.g. on an `end`
-        /// listener). Additive and written only when non-empty.
+        /// trigger and written LOCAL to the catch element instance when it
+        /// activates, so its listeners, output mappings and propagation read
+        /// it even when a variable changes while the gateway completes (e.g.
+        /// on an `end` listener). Additive and written only when non-empty.
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "BTreeMap::is_empty")
