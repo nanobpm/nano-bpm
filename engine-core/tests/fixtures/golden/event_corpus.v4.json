@@ -5261,187 +5261,85 @@
     }
   },
   {
-    "ElementActivating": {
-      "element_id": "gw",
-      "element_instance_key": 136,
-      "instance_key": 130,
-      "scope": 0
-    }
-  },
-  {
-    "ElementActivated": {
-      "element_id": "gw",
-      "element_instance_key": 136,
-      "instance_key": 130,
-      "scope": 0
-    }
-  },
-  {
-    "ElementCompleting": {
-      "element_id": "gw",
-      "element_instance_key": 135,
+    "EventGatewaySubscriptionsOpened": {
+      "catch_element_ids": [
+        "onM1",
+        "onM2"
+      ],
+      "gateway_element_id": "gw",
+      "gateway_element_instance_key": 135,
       "instance_key": 130
-    }
-  },
-  {
-    "ElementCompleted": {
-      "element_id": "gw",
-      "element_instance_key": 135,
-      "instance_key": 130
-    }
-  },
-  {
-    "SequenceFlowTaken": {
-      "from": "gw",
-      "instance_key": 130,
-      "to": "onM2"
-    }
-  },
-  {
-    "SequenceFlowTaken": {
-      "from": "gw",
-      "instance_key": 130,
-      "to": "onM1"
-    }
-  },
-  {
-    "ElementCompleting": {
-      "element_id": "gw",
-      "element_instance_key": 136,
-      "instance_key": 130
-    }
-  },
-  {
-    "ElementCompleted": {
-      "element_id": "gw",
-      "element_instance_key": 136,
-      "instance_key": 130
-    }
-  },
-  {
-    "SequenceFlowTaken": {
-      "from": "gw",
-      "instance_key": 130,
-      "to": "onM2"
-    }
-  },
-  {
-    "SequenceFlowTaken": {
-      "from": "gw",
-      "instance_key": 130,
-      "to": "onM1"
-    }
-  },
-  {
-    "ElementActivating": {
-      "element_id": "onM2",
-      "element_instance_key": 137,
-      "instance_key": 130,
-      "race": 135,
-      "scope": 0
-    }
-  },
-  {
-    "ElementActivated": {
-      "element_id": "onM2",
-      "element_instance_key": 137,
-      "instance_key": 130,
-      "scope": 0
-    }
-  },
-  {
-    "MessageSubscriptionCreated": {
-      "correlation_key": "k",
-      "element_id": "onM2",
-      "element_instance_key": 137,
-      "instance_key": 130,
-      "kind": "IntermediateCatch",
-      "message_name": "M2",
-      "subscription_key": 138
-    }
-  },
-  {
-    "ElementActivating": {
-      "element_id": "onM1",
-      "element_instance_key": 139,
-      "instance_key": 130,
-      "race": 135,
-      "scope": 0
-    }
-  },
-  {
-    "ElementActivated": {
-      "element_id": "onM1",
-      "element_instance_key": 139,
-      "instance_key": 130,
-      "scope": 0
     }
   },
   {
     "MessageSubscriptionCreated": {
       "correlation_key": "k",
       "element_id": "onM1",
-      "element_instance_key": 139,
+      "element_instance_key": 135,
       "instance_key": 130,
       "kind": "IntermediateCatch",
       "message_name": "M1",
+      "subscription_key": 136
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "k",
+      "element_id": "onM2",
+      "element_instance_key": 135,
+      "instance_key": 130,
+      "kind": "IntermediateCatch",
+      "message_name": "M2",
+      "subscription_key": 137
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "gw",
+      "element_instance_key": 138,
+      "instance_key": 130,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "gw",
+      "element_instance_key": 138,
+      "instance_key": 130,
+      "scope": 0
+    }
+  },
+  {
+    "EventGatewaySubscriptionsOpened": {
+      "catch_element_ids": [
+        "onM1",
+        "onM2"
+      ],
+      "gateway_element_id": "gw",
+      "gateway_element_instance_key": 138,
+      "instance_key": 130
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "k",
+      "element_id": "onM1",
+      "element_instance_key": 138,
+      "instance_key": 130,
+      "kind": "IntermediateCatch",
+      "message_name": "M1",
+      "subscription_key": 139
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "k",
+      "element_id": "onM2",
+      "element_instance_key": 138,
+      "instance_key": 130,
+      "kind": "IntermediateCatch",
+      "message_name": "M2",
       "subscription_key": 140
-    }
-  },
-  {
-    "ElementActivating": {
-      "element_id": "onM2",
-      "element_instance_key": 141,
-      "instance_key": 130,
-      "race": 136,
-      "scope": 0
-    }
-  },
-  {
-    "ElementActivated": {
-      "element_id": "onM2",
-      "element_instance_key": 141,
-      "instance_key": 130,
-      "scope": 0
-    }
-  },
-  {
-    "MessageSubscriptionCreated": {
-      "correlation_key": "k",
-      "element_id": "onM2",
-      "element_instance_key": 141,
-      "instance_key": 130,
-      "kind": "IntermediateCatch",
-      "message_name": "M2",
-      "subscription_key": 142
-    }
-  },
-  {
-    "ElementActivating": {
-      "element_id": "onM1",
-      "element_instance_key": 143,
-      "instance_key": 130,
-      "race": 136,
-      "scope": 0
-    }
-  },
-  {
-    "ElementActivated": {
-      "element_id": "onM1",
-      "element_instance_key": 143,
-      "instance_key": 130,
-      "scope": 0
-    }
-  },
-  {
-    "MessageSubscriptionCreated": {
-      "correlation_key": "k",
-      "element_id": "onM1",
-      "element_instance_key": 143,
-      "instance_key": 130,
-      "kind": "IntermediateCatch",
-      "message_name": "M1",
-      "subscription_key": 144
     }
   }
 ]

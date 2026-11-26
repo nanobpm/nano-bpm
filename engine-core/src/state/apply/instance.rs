@@ -146,6 +146,8 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 gateway_routes: BTreeMap::new(),
                 races: BTreeMap::new(),
                 gateway_subscriptions: BTreeMap::new(),
+                gateway_triggers: BTreeMap::new(),
+                event_gateway_owned: false,
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),
@@ -420,6 +422,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // #2003: gateway-owned subscriptions likewise outlive no
                 // whole-instance teardown.
                 instance.gateway_subscriptions.clear();
+                instance.gateway_triggers.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();
@@ -462,7 +465,14 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
 
         // An audit record: the modification's state change is carried by the
         // activation / termination events that follow it.
-        Event::ProcessInstanceModified { .. } => {}
+        // Modification may activate a gateway-owned catch directly under the
+        // gateway-owned subscription model: mark the instance (#2004) so the
+        // legacy-race refusal does not mistake that catch for a legacy race.
+        Event::ProcessInstanceModified { instance_key, .. } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.event_gateway_owned = true;
+            }
+        }
 
         Event::ProcessInstanceBusinessIdAssigned {
             instance_key,
@@ -536,6 +546,33 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                         mi.completion_condition = spec.completion_condition.clone();
                         mi.cancel_remaining_instances = spec.cancel_remaining_instances;
                     }
+                }
+                // Event-based gateways (#2004): a triggered catch follows the
+                // mapping; a waiting gateway's subscription set is re-derived
+                // from the target gateway (the command handler has already
+                // deleted the unmapped catches' subscriptions and opened the
+                // new ones).
+                for trigger in instance.gateway_triggers.values_mut() {
+                    remap_id(&mut trigger.catch_element_id);
+                }
+                let gateway_ids: Vec<(Key, ElementId)> = instance
+                    .gateway_subscriptions
+                    .keys()
+                    .filter_map(|eik| instance.active.get(eik).map(|id| (*eik, id.clone())))
+                    .collect();
+                for (eik, gateway_id) in gateway_ids {
+                    let mut target_gateway_id = gateway_id;
+                    remap_id(&mut target_gateway_id);
+                    let catches: Vec<ElementId> = target_def
+                        .as_ref()
+                        .map(|d| {
+                            d.event_gateway_targets(&target_gateway_id)
+                                .into_iter()
+                                .map(|c| c.id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    instance.gateway_subscriptions.insert(eik, catches);
                 }
                 for adhoc in instance.adhoc_instances.values_mut() {
                     remap_id(&mut adhoc.element_id);
@@ -830,6 +867,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // #2003: gateway-owned subscriptions likewise outlive no
                 // whole-instance teardown.
                 instance.gateway_subscriptions.clear();
+                instance.gateway_triggers.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();

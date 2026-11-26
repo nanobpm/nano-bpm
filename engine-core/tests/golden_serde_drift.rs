@@ -1000,13 +1000,13 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("create cluster variable"),
     );
 
-    // Event-based-gateway race witness (#1676): two activations of ONE gateway
-    // (a fork both of whose branches pass the merge) arm two independent
-    // races, so the journal pins the additive `ElementActivating.race` field
-    // non-default and the snapshot pins the persisted `races` membership
-    // (catch element instance -> arming gateway activation) non-empty. Left
-    // waiting on its messages: no job, so the one-job-per-instance
-    // determinism contract holds.
+    // Event-based gateway witness (#1676, #2004): two activations of ONE
+    // gateway (a fork both of whose branches pass the merge) wait
+    // independently, so the snapshot pins the gateway-owned
+    // `gateway_subscriptions` (gateway element instance -> catch ids)
+    // non-empty. Left waiting on its messages: no job, so the
+    // one-job-per-instance determinism contract holds. The legacy
+    // `ElementActivating.race` shape is pinned by the event witnesses.
     let twins: ProcessDefinition = ProcessBuilder::new("twins")
         .start_event("start")
         .parallel_gateway("fork")
@@ -1035,20 +1035,13 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     let twin_created = engine
         .apply_command_at(Command::create_instance_with("twins", twin_vars), T0 + 29)
         .expect("create twins instance");
-    // The witness must actually arm two races (four catches, two per gateway
-    // activation) carrying a non-default `race` — otherwise the golden would
-    // pin an empty/default shape and the drift guard would stay green if the
-    // field were dropped or renamed.
+    // The witness must actually leave two gateways waiting — otherwise the
+    // golden would pin an empty/default shape and the drift guard would stay
+    // green if the field were dropped or renamed.
     let twin_inst = twin_created
         .iter()
         .find_map(|e| e.instance_key())
         .expect("twins instance key");
-    assert!(
-        twin_created
-            .iter()
-            .any(|e| matches!(e, Event::ElementActivating { race: Some(_), .. })),
-        "the twins scenario must journal a non-default ElementActivating.race"
-    );
     journal.extend(twin_created);
     assert_eq!(
         engine
@@ -1056,9 +1049,9 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .state
             .instances
             .get(&twin_inst)
-            .map(|i| i.races.len()),
-        Some(4),
-        "the twins snapshot must persist four armed race memberships"
+            .map(|i| i.gateway_subscriptions.len()),
+        Some(2),
+        "the twins snapshot must persist two gateways' subscriptions"
     );
 
     let snapshot = engine.snapshot();
@@ -1235,6 +1228,16 @@ fn build_event_witnesses() -> Vec<Event> {
         },
         // #2003 gateway-owned subscription frames (not yet emitted by execution,
         // so pinned here).
+        // A legacy (#1676) journal record: a catch armed by a completed
+        // gateway. Never emitted since #2004, but old journals carry it and
+        // must still decode (and are then refused as a legacy race).
+        Event::ElementActivating {
+            instance_key: 1,
+            element_instance_key: 3,
+            element_id: "m1".to_string(),
+            scope: 0,
+            race: Some(2),
+        },
         Event::EventGatewaySubscriptionsOpened {
             instance_key: 1,
             gateway_element_instance_key: 2,
@@ -1245,6 +1248,7 @@ fn build_event_witnesses() -> Vec<Event> {
             instance_key: 1,
             gateway_element_instance_key: 2,
             catch_element_id: "m1".to_string(),
+            catch_element_instance_key: 3,
         },
         Event::ProcessInstanceModified {
             instance_key: 1,

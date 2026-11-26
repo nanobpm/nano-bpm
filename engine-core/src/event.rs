@@ -584,13 +584,11 @@ pub enum Event {
         /// `ElementActivated`, which records the scope.
         #[cfg_attr(feature = "serde", serde(default))]
         scope: Key,
-        /// The event-based gateway element instance whose deferred choice armed
-        /// this (catch) element instance, `None` for every other activation
-        /// (#1676). Siblings of a race winner are withdrawn only within the same
-        /// race, so two activations of one gateway in one scope race
-        /// independently. Additive: `serde(default)` and omitted when `None`, so
-        /// older journals decode unchanged and other activations serialize
-        /// byte-identically.
+        /// LEGACY (#1676, retired by #2004): the event-based gateway element
+        /// instance whose deferred choice armed this (catch) element instance.
+        /// This build never emits it (`None`); it is kept so old journals
+        /// decode, and a replayed `Some` lands in `ProcessInstance::races`,
+        /// which the loader refuses as an in-flight legacy race.
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
@@ -660,8 +658,7 @@ pub enum Event {
     /// An event-based gateway opened its gateway-owned subscriptions (#1963
     /// slice i, #2003): one per outgoing catch target, owned by the gateway's
     /// element instance and tagged with the target catch element id (Zeebe
-    /// `EventBasedGatewayProcessor.onActivate`). Additive; not yet emitted by
-    /// execution.
+    /// `EventBasedGatewayProcessor.onActivate`).
     EventGatewaySubscriptionsOpened {
         instance_key: Key,
         /// The owning event-based gateway's element instance key.
@@ -671,16 +668,21 @@ pub enum Event {
         catch_element_ids: Vec<ElementId>,
     },
 
-    /// A gateway-owned subscription fired (#1963 slice i, #2003): the gateway
+    /// A gateway-owned subscription fired (#1963, #2004): the gateway
     /// recorded its event trigger for `catch_element_id` and every other
     /// subscription it owns is deleted (Zeebe `EventTrigger` on the gateway's
-    /// event scope; first trigger wins). Additive; not yet emitted by
-    /// execution.
+    /// event scope; first trigger wins). The gateway then completes and
+    /// activates the catch directly under `catch_element_instance_key`.
     EventGatewayTriggered {
         instance_key: Key,
         gateway_element_instance_key: Key,
         /// The catch element whose event fired.
         catch_element_id: ElementId,
+        /// The element instance key minted for the triggered catch's direct
+        /// activation. Additive (`serde(default)`; `0` on a record written
+        /// before #2004, which no build ever emitted).
+        #[cfg_attr(feature = "serde", serde(default))]
+        catch_element_instance_key: Key,
     },
 
     /// A token moved along a sequence flow from one element to another.

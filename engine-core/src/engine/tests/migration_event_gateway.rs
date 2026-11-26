@@ -1,5 +1,6 @@
-//! Migration of an instance resting at an event-based gateway together with its
-//! armed catch events (#1554, Zeebe `ProcessInstanceMigrationMigrateProcessor`).
+//! Migration of an instance resting at an event-based gateway together with the
+//! subscriptions it owns (#1554, #2004, Zeebe
+//! `ProcessInstanceMigrationMigrateProcessor`).
 use super::*;
 
 fn pairs(p: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -83,23 +84,40 @@ fn assert_completed_via(engine: &Engine, inst: Key, events: &[Event], end: &str)
     );
 }
 
+/// The gateway rests as an active element owning one subscription per catch
+/// (#2004): no catch is an active element until the gateway is triggered.
 #[test]
-fn migrated_event_gateway_race_is_won_by_target_timer() {
+fn migrated_event_gateway_waits_with_its_target_subscriptions() {
+    let (engine, inst) = migrated_instance("reply", full_mapping());
+    assert_eq!(active_ids(&engine, inst), ["gw2"]);
+    let instance = engine.instance(inst).unwrap();
+    let subs: Vec<&Vec<String>> = instance.gateway_subscriptions.values().collect();
+    assert_eq!(
+        subs,
+        [&vec![
+            "onTimer2".to_string(),
+            "onMsg2".to_string(),
+            "onSig2".to_string()
+        ]]
+    );
+}
+
+#[test]
+fn migrated_event_gateway_is_triggered_by_target_timer() {
     let (mut engine, inst) = migrated_instance("reply", full_mapping());
-    assert_eq!(active_ids(&engine, inst), ["onMsg2", "onSig2", "onTimer2"]);
     let events = engine.trigger_timers(6_000);
     assert_completed_via(&engine, inst, &events, "endTimer2");
 }
 
 #[test]
-fn migrated_event_gateway_race_is_won_by_target_message() {
+fn migrated_event_gateway_is_triggered_by_target_message() {
     // The target renames the message: the subscription is re-created.
     let (mut engine, inst) = migrated_instance("settled", full_mapping());
     let events = engine
         .apply_command(Command::correlate_message("settled", "o1"))
         .unwrap();
     assert_completed_via(&engine, inst, &events, "endMsg2");
-    // The losing timer was withdrawn and never fires.
+    // The other subscriptions were deleted by the trigger and never fire.
     assert!(!engine
         .trigger_timers(60_000)
         .iter()
@@ -107,34 +125,56 @@ fn migrated_event_gateway_race_is_won_by_target_message() {
 }
 
 #[test]
-fn migrated_event_gateway_race_is_won_by_target_signal() {
+fn migrated_event_gateway_is_triggered_by_target_signal() {
     let (mut engine, inst) = migrated_instance("reply", full_mapping());
     let events = engine.broadcast_signal("go", BTreeMap::new(), 0);
     assert_completed_via(&engine, inst, &events, "endSig2");
 }
 
+/// Zeebe deletes the subscription of an unmapped catch event of the gateway
+/// and opens one for a target catch event with no mapped source.
 #[test]
-fn migration_withdraws_an_unmapped_race_member() {
-    // Zeebe deletes the subscription of an unmapped catch event of the gateway.
-    let (mut engine, inst) = migrated_instance(
-        "reply",
-        pairs(&[("onTimer", "onTimer2"), ("onSig", "onSig2")]),
+fn migration_replaces_an_unmapped_catch_subscription() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, race("source", "", "reply"));
+    let target_key = deploy_for_migration(&mut engine, race("target", "2", "reply"));
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "source",
+        vars(&[("orderId", Value::Str("o1".into()))]),
     );
-    assert_eq!(active_ids(&engine, inst), ["onSig2", "onTimer2"]);
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("gw", "gw2"), ("onTimer", "onTimer2"), ("onSig", "onSig2")]),
+        ))
+        .unwrap();
+    let subs = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceMigrated { subscriptions, .. } => Some(subscriptions),
+            _ => None,
+        })
+        .unwrap();
     assert!(
-        !engine
-            .state()
-            .message_subscriptions
-            .values()
-            .any(|s| s.instance_key == inst && s.state == state::MessageSubscriptionState::Open),
-        "the unmapped message catch's subscription is deleted"
+        subs.iter().any(|s| s.element_id == "onMsg"
+            && s.action == crate::event::SubscriptionMigrationAction::Deleted),
+        "{subs:?}"
     );
-    let events = engine.broadcast_signal("go", BTreeMap::new(), 0);
-    assert_completed_via(&engine, inst, &events, "endSig2");
+    assert!(
+        subs.iter().any(|s| s.element_id == "onMsg2"
+            && s.action == crate::event::SubscriptionMigrationAction::Created),
+        "{subs:?}"
+    );
+    let events = engine
+        .apply_command(Command::correlate_message("reply", "o1"))
+        .unwrap();
+    assert_completed_via(&engine, inst, &events, "endMsg2");
 }
 
 #[test]
-fn migration_rejects_race_with_no_mapped_member() {
+fn migration_rejects_an_unmapped_waiting_gateway() {
     let mut engine = Engine::new();
     deploy_for_migration(&mut engine, race("source", "", "reply"));
     let target_key = deploy_for_migration(&mut engine, race("target", "2", "reply"));
@@ -147,11 +187,11 @@ fn migration_rejects_race_with_no_mapped_member() {
         .apply_command(Command::migrate_instance(
             inst,
             target_key,
-            pairs(&[("gw", "gw2")]),
+            pairs(&[("onTimer", "onTimer2")]),
         ))
         .unwrap_err();
     assert!(
-        matches!(err, EngineError::UnmappedActiveElement { .. }),
+        matches!(&err, EngineError::UnmappedActiveElement { element_id, .. } if element_id == "gw"),
         "{err:?}"
     );
 }
@@ -174,7 +214,7 @@ fn two_timer_race(id: &str) -> ProcessDefinition {
 }
 
 #[test]
-fn migration_rejects_race_members_merged_onto_one_target() {
+fn migration_rejects_gateway_catches_merged_onto_one_target() {
     let mut engine = Engine::new();
     deploy_for_migration(&mut engine, two_timer_race("source"));
     let target_key = deploy_for_migration(&mut engine, two_timer_race("target"));
@@ -183,7 +223,7 @@ fn migration_rejects_race_members_merged_onto_one_target() {
         .apply_command(Command::migrate_instance(
             inst,
             target_key,
-            pairs(&[("t1", "t1"), ("t2", "t1")]),
+            pairs(&[("gw", "gw"), ("t1", "t1"), ("t2", "t1")]),
         ))
         .unwrap_err();
     match err {
@@ -203,326 +243,76 @@ fn migration_rejects_race_members_merged_onto_one_target() {
 }
 
 #[test]
-fn migration_rejects_race_member_detached_from_the_target_gateway() {
-    // The target timer is a plain catch, not a member of any gateway race.
+fn migration_rejects_gateway_catch_detached_from_the_target_gateway() {
+    // The target timer is a plain catch, not a catch event of the gateway.
+    let target = ProcessBuilder::new("target")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .timer_intermediate_catch_event("t1", 5_000)
+        .timer_intermediate_catch_event("t", 5_000)
+        .end_event("e")
+        .connect("start", "gw")
+        .connect("gw", "t1")
+        .connect("t1", "e")
+        .connect("t", "e")
+        .build()
+        .unwrap();
     let mut engine = Engine::new();
     deploy_for_migration(&mut engine, two_timer_race("source"));
-    let target_key = deploy_for_migration(
-        &mut engine,
-        ProcessBuilder::new("target")
-            .start_event("start")
-            .timer_intermediate_catch_event("t", 5_000)
-            .end_event("e")
-            .connect("start", "t")
-            .connect("t", "e")
-            .build()
-            .unwrap(),
-    );
+    let target_key = deploy_for_migration(&mut engine, target);
     let inst = create_instance_key(&mut engine, "source");
     let err = engine
         .apply_command(Command::migrate_instance(
             inst,
             target_key,
-            pairs(&[("t1", "t")]),
+            pairs(&[("gw", "gw"), ("t2", "t")]),
         ))
         .unwrap_err();
     assert!(
         matches!(&err, EngineError::MigrationCatchEventDetached { element_id, catch_event_id, .. }
-            if element_id == "gw" && catch_event_id == "t1"),
+            if element_id == "gw" && catch_event_id == "t2"),
         "{err:?}"
     );
 }
 
+/// A triggered gateway whose catch is parked on a start-listener job is past
+/// the gateway: the catch is an ordinary active element and migrates as one.
 #[test]
-fn migration_rejects_race_members_split_across_target_gateways() {
-    let target = ProcessBuilder::new("target")
-        .start_event("start")
-        .parallel_gateway("fork")
-        .event_based_gateway("gwA")
-        .event_based_gateway("gwB")
-        .timer_intermediate_catch_event("a", 5_000)
-        .timer_intermediate_catch_event("b", 9_000)
-        .end_event("ea")
-        .end_event("eb")
-        .connect("start", "fork")
-        .connect("fork", "gwA")
-        .connect("fork", "gwB")
-        .connect("gwA", "a")
-        .connect("gwB", "b")
-        .connect("a", "ea")
-        .connect("b", "eb")
+fn migration_of_a_triggered_catch_parked_on_its_start_listener() {
+    let mut engine = Engine::new();
+    let source = race_builder("source", "", "reply")
+        .with_listeners(
+            "onMsg",
+            vec![el(ListenerEventType::Start, "audit")],
+            Vec::new(),
+        )
         .build()
         .unwrap();
-    let mut engine = Engine::new();
-    deploy_for_migration(&mut engine, two_timer_race("source"));
-    let target_key = deploy_for_migration(&mut engine, target);
-    let inst = create_instance_key(&mut engine, "source");
-    let err = engine
-        .apply_command(Command::migrate_instance(
-            inst,
-            target_key,
-            pairs(&[("t1", "a"), ("t2", "b")]),
-        ))
-        .unwrap_err();
-    assert!(
-        matches!(err, EngineError::MigrationCatchEventDetached { .. }),
-        "{err:?}"
-    );
-}
-
-/// Copilot #1564: a withdrawn race member parked on its start-listener job
-/// must have that job cancelled, not left live on the completed catch.
-#[test]
-fn migration_withdrawal_cancels_a_parked_start_listener_job() {
-    let mut engine = Engine::new();
-    deploy_for_migration(
-        &mut engine,
-        race_builder("source", "", "reply")
-            .with_listeners(
-                "onMsg",
-                vec![el(ListenerEventType::Start, "audit")],
-                Vec::new(),
-            )
-            .build()
-            .unwrap(),
-    );
+    deploy_for_migration(&mut engine, source);
     let target_key = deploy_for_migration(&mut engine, race("target", "2", "reply"));
     let inst = create_instance_with_vars(
         &mut engine,
         "source",
         vars(&[("orderId", Value::Str("o1".into()))]),
     );
+    engine
+        .apply_command(Command::correlate_message("reply", "o1"))
+        .unwrap();
+    assert_eq!(active_ids(&engine, inst), ["onMsg"]);
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("onMsg", "onMsg2")]),
+        ))
+        .unwrap();
+    assert_eq!(active_ids(&engine, inst), ["onMsg2"]);
+    let job = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    assert_eq!(job.len(), 1);
     let events = engine
-        .apply_command(Command::migrate_instance(
-            inst,
-            target_key,
-            pairs(&[("onTimer", "onTimer2"), ("onSig", "onSig2")]),
-        ))
+        .apply_command(Command::complete_job(job[0].key))
         .unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, Event::JobCanceled { .. })),
-        "the parked listener job is cancelled"
-    );
-    assert!(engine.activate_jobs("audit", "W", 10, 1_000, 0).is_empty());
-    let events = engine.broadcast_signal("go", BTreeMap::new(), 0);
-    assert_completed_via(&engine, inst, &events, "endSig2");
-}
-
-/// start -> fork -> {gwA -> a1|a2, gwB -> b1|b2}: two independent races.
-fn two_races(id: &str) -> ProcessDefinition {
-    ProcessBuilder::new(id)
-        .start_event("start")
-        .parallel_gateway("fork")
-        .event_based_gateway("gwA")
-        .event_based_gateway("gwB")
-        .timer_intermediate_catch_event("a1", 5_000)
-        .timer_intermediate_catch_event("a2", 9_000)
-        .timer_intermediate_catch_event("b1", 5_000)
-        .timer_intermediate_catch_event("b2", 9_000)
-        .end_event("ea1")
-        .end_event("ea2")
-        .end_event("eb1")
-        .end_event("eb2")
-        .connect("start", "fork")
-        .connect("fork", "gwA")
-        .connect("fork", "gwB")
-        .connect("gwA", "a1")
-        .connect("gwA", "a2")
-        .connect("gwB", "b1")
-        .connect("gwB", "b2")
-        .connect("a1", "ea1")
-        .connect("a2", "ea2")
-        .connect("b1", "eb1")
-        .connect("b2", "eb2")
-        .build()
-        .unwrap()
-}
-
-/// Copilot #1564: two independent source races in one scope must not collapse
-/// onto one target gateway, or a win in one would withdraw the other.
-#[test]
-fn migration_rejects_two_source_races_merged_onto_one_target_gateway() {
-    let target = ProcessBuilder::new("target")
-        .start_event("start")
-        .event_based_gateway("gw")
-        .timer_intermediate_catch_event("x1", 5_000)
-        .timer_intermediate_catch_event("x2", 9_000)
-        .end_event("e1")
-        .end_event("e2")
-        .connect("start", "gw")
-        .connect("gw", "x1")
-        .connect("gw", "x2")
-        .connect("x1", "e1")
-        .connect("x2", "e2")
-        .build()
-        .unwrap();
-    let mut engine = Engine::new();
-    deploy_for_migration(&mut engine, two_races("source"));
-    let target_key = deploy_for_migration(&mut engine, target);
-    let inst = create_instance_key(&mut engine, "source");
-    let err = engine
-        .apply_command(Command::migrate_instance(
-            inst,
-            target_key,
-            pairs(&[("a1", "x1"), ("b1", "x2")]),
-        ))
-        .unwrap_err();
-    assert!(
-        matches!(err, EngineError::UnsupportedMigration { .. }),
-        "{err:?}"
-    );
-    assert_eq!(engine.instance(inst).unwrap().process_id, "source");
-}
-
-/// Copilot #1564: the same race live in two token scopes (as a race inside
-/// two live sub-process scopes would be) is two races, so a one-to-one mapping
-/// must not be mistaken for a merge, and each scope's unmapped member is
-/// withdrawn. Driven through the race check directly: no migratable process
-/// shape yet holds one gateway live in two scopes.
-#[test]
-fn migration_race_check_treats_each_scope_as_its_own_race() {
-    let source = two_timer_race("source");
-    let target = two_timer_race("target");
-    let mapped: BTreeMap<String, String> = pairs(&[("t1", "t1")]).into_iter().collect();
-    let active = vec![
-        (10, "t1".to_string()),
-        (11, "t2".to_string()),
-        (20, "t1".to_string()),
-        (21, "t2".to_string()),
-    ];
-    let mut withdrawn = Engine::check_migrated_event_gateway_races(
-        1,
-        &source,
-        &target,
-        &mapped,
-        &active,
-        |eik| eik / 10,
-        // No persisted race identity in this fixture: every catch falls back
-        // to the element-id + scope grouping.
-        |_| None,
-    )
-    .unwrap();
-    withdrawn.sort();
-    assert_eq!(withdrawn, [(11, "t2".to_string()), (21, "t2".to_string())]);
-}
-
-/// Copilot #1564: a standalone catch mapped into a target race must not merge
-/// with a live source race landing on the same target gateway in its scope.
-#[test]
-fn migration_race_check_rejects_standalone_catch_joining_a_target_race() {
-    let source = ProcessBuilder::new("source")
-        .start_event("start")
-        .parallel_gateway("fork")
-        .event_based_gateway("gwA")
-        .timer_intermediate_catch_event("a1", 5_000)
-        .timer_intermediate_catch_event("a2", 9_000)
-        .timer_intermediate_catch_event("s", 7_000)
-        .end_event("ea1")
-        .end_event("ea2")
-        .end_event("es")
-        .connect("start", "fork")
-        .connect("fork", "gwA")
-        .connect("fork", "s")
-        .connect("gwA", "a1")
-        .connect("gwA", "a2")
-        .connect("a1", "ea1")
-        .connect("a2", "ea2")
-        .connect("s", "es")
-        .build()
-        .unwrap();
-    let target = two_timer_race("target");
-    let mapped: BTreeMap<String, String> =
-        pairs(&[("a1", "t1"), ("s", "t2")]).into_iter().collect();
-    let active = vec![
-        (10, "a1".to_string()),
-        (11, "a2".to_string()),
-        (12, "s".to_string()),
-    ];
-    let err = Engine::check_migrated_event_gateway_races(
-        1,
-        &source,
-        &target,
-        &mapped,
-        &active,
-        |_| 1,
-        |_| None,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, EngineError::UnsupportedMigration { .. }),
-        "{err:?}"
-    );
-}
-
-/// Copilot #1564: two gateways paused before arming (start listener) mapped
-/// onto one target gateway in one scope would arm one merged race.
-#[test]
-fn migration_race_check_rejects_paused_gateways_merged_onto_one_target() {
-    let source = two_races("source");
-    let target = two_timer_race("target");
-    let mapped: BTreeMap<String, String> =
-        pairs(&[("gwA", "gw"), ("gwB", "gw")]).into_iter().collect();
-    let active = vec![(10, "gwA".to_string()), (11, "gwB".to_string())];
-    let err = Engine::check_migrated_event_gateway_races(
-        1,
-        &source,
-        &target,
-        &mapped,
-        &active,
-        |_| 1,
-        |_| None,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, EngineError::UnsupportedMigration { .. }),
-        "{err:?}"
-    );
-    // In separate scopes they are separate races.
-    Engine::check_migrated_event_gateway_races(
-        1,
-        &source,
-        &target,
-        &mapped,
-        &active,
-        |k| k,
-        |_| None,
-    )
-    .unwrap();
-}
-
-/// Copilot #1564: the migration fact reports a withdrawn member's
-/// subscription as deleted.
-#[test]
-fn migration_reports_withdrawn_member_subscription_deleted() {
-    let mut engine = Engine::new();
-    deploy_for_migration(&mut engine, race("source", "", "reply"));
-    let target_key = deploy_for_migration(&mut engine, race("target", "2", "reply"));
-    let inst = create_instance_with_vars(
-        &mut engine,
-        "source",
-        vars(&[("orderId", Value::Str("o1".into()))]),
-    );
-    let events = engine
-        .apply_command(Command::migrate_instance(
-            inst,
-            target_key,
-            pairs(&[("onTimer", "onTimer2"), ("onSig", "onSig2")]),
-        ))
-        .unwrap();
-    let subs = events
-        .iter()
-        .find_map(|e| match e {
-            Event::ProcessInstanceMigrated { subscriptions, .. } => Some(subscriptions),
-            _ => None,
-        })
-        .unwrap();
-    assert!(
-        subs.iter().any(|s| s.element_id == "onMsg"
-            && s.action == crate::event::SubscriptionMigrationAction::Deleted),
-        "{subs:?}"
-    );
+    assert_completed_via(&engine, inst, &events, "endMsg2");
 }
 
 /// Copilot #1564: the indexed race lookup must agree with the naive per-catch
@@ -568,10 +358,8 @@ fn race_index_matches_naive_scan() {
     // flows owns no race.
     assert!(index.owner_of("shared").is_none());
     assert!(index.owner_of("onTimer").is_some_and(|o| o.id == "gw"));
-    assert!(index.members_of(def.element("gw2").unwrap()).is_empty());
-    let mut members = index.members_of(def.element("gw").unwrap());
-    members.sort_unstable();
-    assert_eq!(members, ["onMsg", "onSig", "onTimer"]);
+    assert!(index.owner_of("onMsg").is_some_and(|o| o.id == "gw"));
+    assert!(index.owner_of("onSig").is_some_and(|o| o.id == "gw"));
 }
 
 /// Copilot #1564: a catch routed into by two event-based gateways where one
@@ -597,9 +385,7 @@ fn race_index_marks_catch_ambiguous_when_one_claimant_is_ineligible() {
     assert!(index.owner_of("contested").is_none());
     // The eligible gateway's own unambiguous members are unaffected.
     assert!(index.owner_of("onTimer").is_some_and(|o| o.id == "gw"));
-    let mut members = index.members_of(def.element("gw").unwrap());
-    members.sort_unstable();
-    assert_eq!(members, ["onMsg", "onSig", "onTimer"]);
+    assert!(index.owner_of("onMsg").is_some_and(|o| o.id == "gw"));
 }
 
 /// Copilot #1564: a gateway with two incoming flows (concurrent activations
@@ -623,17 +409,14 @@ fn race_index_excludes_private_catch_of_gateway_with_two_incoming_flows() {
     assert_eq!(def.incoming_count("private"), 1);
     let index = event_gateway_race_index(&def);
     assert!(index.owner_of("private").is_none());
-    assert!(index.members_of(def.element("gw2").unwrap()).is_empty());
     assert!(index.owner_of("onTimer").is_some_and(|o| o.id == "gw"));
 }
 
 /// start -> fork(and) => merge(xor) -> gw(event-based) -> { onM1 | onM2 } -> end
 ///
-/// Two activations of ONE gateway race independently in the root scope
-/// (#1676); `sfx` renames every element so a migration maps the race onto new
-/// ids. The persisted per-activation race membership must follow the mapping:
-/// a winner of one migrated race withdraws only ITS OWN sibling, never the
-/// other race's.
+/// Two activations of ONE gateway wait independently in the root scope; `sfx`
+/// renames every element so a migration maps both onto new ids. Each gateway
+/// owns its own subscriptions, so one message triggers exactly one of them.
 fn twin_gateway_race(id: &str, sfx: &str) -> ProcessDefinition {
     let e = |n: &str| format!("{n}{sfx}");
     ProcessBuilder::new(id)
@@ -657,7 +440,7 @@ fn twin_gateway_race(id: &str, sfx: &str) -> ProcessDefinition {
 }
 
 #[test]
-fn migration_rekeys_persisted_race_membership_per_activation() {
+fn migration_keeps_each_gateway_activation_independent() {
     let mut engine = Engine::new();
     deploy_for_migration(&mut engine, twin_gateway_race("source", ""));
     let target_key = deploy_for_migration(&mut engine, twin_gateway_race("target", "2"));
@@ -666,61 +449,32 @@ fn migration_rekeys_persisted_race_membership_per_activation() {
         "source",
         vars(&[("key", Value::Str("k".into()))]),
     );
-    // Two races armed: four catches, two per gateway activation.
-    assert_eq!(engine.instance(inst).unwrap().races.len(), 4);
+    assert_eq!(
+        engine.instance(inst).unwrap().gateway_subscriptions.len(),
+        2
+    );
 
     engine
         .apply_command(Command::migrate_instance(
             inst,
             target_key,
-            pairs(&[
-                ("start", "start2"),
-                ("fork", "fork2"),
-                ("merge", "merge2"),
-                ("gw", "gw2"),
-                ("onM1", "onM12"),
-                ("onM2", "onM22"),
-                ("end", "end2"),
-            ]),
+            pairs(&[("gw", "gw2"), ("onM1", "onM12"), ("onM2", "onM22")]),
         ))
         .unwrap();
+    assert_eq!(active_ids(&engine, inst), ["gw2", "gw2"]);
 
-    // The persisted membership survived the mapping: still two DISTINCT races
-    // (the two gateway activations), each with two members. The identity is
-    // the arming gateway activation's element-instance key — an opaque
-    // per-activation value the runtime compares for equality, not a live
-    // `active` lookup (the gateway completes as it arms its catches).
-    let races = &engine.instance(inst).unwrap().races;
-    assert_eq!(
-        races.len(),
-        4,
-        "every armed catch keeps its race: {races:?}"
-    );
-    let distinct: BTreeSet<Key> = races.values().copied().collect();
-    assert_eq!(
-        distinct.len(),
-        2,
-        "two independent races survive the migration: {races:?}"
-    );
-
-    // A winner of one migrated race withdraws only its own sibling: the other
-    // race still runs and can be won by the second message.
     let first = engine
         .apply_command(Command::correlate_message("M1", "k"))
         .unwrap();
-    assert_eq!(completions(&first, "onM12"), 1, "M1 wins one migrated race");
-    assert_eq!(
-        completions(&first, "onM22"),
-        1,
-        "only the winning race's sibling is withdrawn"
-    );
+    assert_eq!(completions(&first, "onM12"), 1, "M1 triggers one gateway");
+    assert_eq!(completions(&first, "onM22"), 0, "no catch is withdrawn");
     let second = engine
         .apply_command(Command::correlate_message("M2", "k"))
         .unwrap();
     assert_eq!(
         completions(&second, "onM22"),
         1,
-        "the surviving race is still winnable after migration"
+        "the other gateway still waits after migration"
     );
     assert_eq!(
         engine.instance(inst).unwrap().state,

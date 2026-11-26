@@ -271,9 +271,10 @@ impl Engine {
     }
 
     /// Zeebe catch-event preconditions for one active element `source_id`
-    /// mapped onto `target_id`: every mapped boundary of the source must target
-    /// a boundary attached to `target_id` (stay attached), and no two may
-    /// target the same catch event (no merging).
+    /// mapped onto `target_id`: every mapped boundary of the source (or, for an
+    /// event-based gateway, every mapped catch event it subscribes to) must
+    /// target a boundary attached to `target_id` (a catch event of the target
+    /// gateway), and no two may target the same catch event (no merging).
     pub(crate) fn check_migrated_catch_events(
         instance_key: Key,
         source: &ProcessDefinition,
@@ -282,12 +283,17 @@ impl Engine {
         source_id: &str,
         target_id: &str,
     ) -> Result<(), EngineError> {
+        // An event-based gateway's catch events are its subscription targets
+        // (#2004, Zeebe migrates the gateway's subscriptions with it): each
+        // mapped one must stay a target of the target gateway.
         let mut boundaries: Vec<&Element> = source
             .elements
             .values()
             .filter(|e| e.kind.attached_to() == Some(source_id))
+            .chain(source.event_gateway_targets(source_id))
             .collect();
         boundaries.sort_by(|a, b| a.id.cmp(&b.id));
+        let target_gateway_targets = target.event_gateway_targets(target_id);
         let mut by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for b in boundaries {
             let Some(tb) = mapped.get(&b.id) else {
@@ -296,7 +302,8 @@ impl Engine {
             let attached = target
                 .element(tb)
                 .and_then(|e| e.kind.attached_to())
-                .is_some_and(|a| a == target_id);
+                .is_some_and(|a| a == target_id)
+                || target_gateway_targets.iter().any(|t| t.id == *tb);
             if !attached {
                 return Err(EngineError::MigrationCatchEventDetached {
                     instance_key,
@@ -319,201 +326,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Event-based gateway race preconditions (#1554, Zeebe migrates an active
-    /// event-based gateway together with its armed catch events). The engine
-    /// models the gateway as a pass-through whose catch events are each an
-    /// active element instance, so a resting race is a set of active catch
-    /// events sharing one owning gateway ([`event_gateway_race_index`] — the
-    /// same race definition the runtime withdrawal uses). Per source race:
-    ///
-    /// * every mapped member must be a race member of one target event-based
-    ///   gateway — the mapped target of the source gateway when that is mapped
-    ///   — otherwise [`EngineError::MigrationCatchEventDetached`];
-    /// * no two members may map onto the same target catch event
-    ///   ([`EngineError::MigrationCatchEventsMerged`]);
-    /// * an unmapped member is withdrawn (its subscriptions deleted, as Zeebe
-    ///   deletes an unmapped catch event's subscription) provided at least one
-    ///   sibling is mapped; a race with no mapped member is left for the
-    ///   unmapped-active-element rejection.
-    ///
-    /// A race is identified by its owning gateway **and** its token scope
-    /// (`scope_of`), exactly as the runtime withdrawal scopes a race, so two
-    /// live subprocess scopes resting at the same gateway are two races —
-    /// refined by the PERSISTED race identity (`race_of`, #1676), so two
-    /// activations of ONE gateway in one scope are two races, not one. Two
-    /// distinct source races in one scope must not land on the same target
-    /// gateway: the runtime would then treat them as one race and a win in
-    /// either would withdraw the other's catches
-    /// ([`EngineError::UnsupportedMigration`]).
-    ///
-    /// Returns the active `(element instance key, element id)`s to withdraw.
-    pub(crate) fn check_migrated_event_gateway_races(
-        instance_key: Key,
-        source: &ProcessDefinition,
-        target: &ProcessDefinition,
-        mapped: &BTreeMap<String, String>,
-        active: &[(Key, String)],
-        scope_of: impl Fn(Key) -> Key,
-        race_of: impl Fn(Key) -> Option<Key>,
-    ) -> Result<Vec<(Key, String)>, EngineError> {
-        // One indexed pass per definition, shared by every ownership lookup in
-        // this check (O(V + E) each, not a full rescan per active element).
-        let source_races = event_gateway_race_index(source);
-        let target_races = event_gateway_race_index(target);
-        // A race groups by its PERSISTED identity (#1676) — the arming gateway
-        // activation's element instance — so two activations of one gateway in
-        // one scope stay two races (the pre-#1676 element-id + scope grouping
-        // would merge them and reject their migration as a false merge).
-        // Catches armed before races were journaled carry no identity and fall
-        // back to the element-id + scope grouping (identity 0).
-        type RaceMembers<'a> = BTreeMap<(Key, Key, &'a str), Vec<(Key, &'a str)>>;
-        let mut races: RaceMembers = BTreeMap::new();
-        for (eik, eid) in active {
-            if let Some(owner) = source_races.owner_of(eid) {
-                races
-                    .entry((
-                        race_of(*eik).unwrap_or(0),
-                        scope_of(*eik),
-                        owner.id.as_str(),
-                    ))
-                    .or_default()
-                    .push((*eik, eid.as_str()));
-            }
-        }
-        // A target race (scope, target gateway) is claimed by the SOURCE
-        // gateway ELEMENT ids whose races land on it. Two races sharing one
-        // source gateway id are necessarily two activations of one gateway
-        // (#1676 — the runtime arms a catch only on a single-incoming-flow
-        // gateway, so each activation races independently) and stay
-        // independent after the mapping, so they may share the target gateway.
-        // Two DISTINCT source races (different gateway ids) landing on one
-        // target gateway would merge into one runtime race, so that collides.
-        let mut race_claims: BTreeMap<(Key, String), String> = BTreeMap::new();
-        let mut naked_claims: BTreeMap<(Key, String), String> = BTreeMap::new();
-        let merged = |origin: &str, other: &str, tg: &str| EngineError::UnsupportedMigration {
-            instance_key,
-            element_id: origin.to_string(),
-            reason: format!(
-                "`{other}` and `{origin}` in one scope would merge into the \
-                 single target event-based gateway race `{tg}`"
-            ),
-        };
-        let claim_race = |race_claims: &mut BTreeMap<(Key, String), String>,
-                          naked_claims: &BTreeMap<(Key, String), String>,
-                          scope: Key,
-                          gateway: &str,
-                          tg: String|
-         -> Result<(), EngineError> {
-            // Reject only when a DIFFERENT source gateway element already
-            // claimed this target race; a repeat by the same gateway id is a
-            // twin activation (#1676), which stays an independent race.
-            if let Some(other) = race_claims.get(&(scope, tg.clone())) {
-                if other != gateway {
-                    return Err(merged(gateway, other, &tg));
-                }
-            }
-            if let Some(other) = naked_claims.get(&(scope, tg.clone())) {
-                return Err(merged(gateway, other, &tg));
-            }
-            race_claims.insert((scope, tg), gateway.to_string());
-            Ok(())
-        };
-        let claim_naked = |race_claims: &BTreeMap<(Key, String), String>,
-                           naked_claims: &mut BTreeMap<(Key, String), String>,
-                           scope: Key,
-                           tg: String,
-                           origin: &str|
-         -> Result<(), EngineError> {
-            if let Some(other) = naked_claims.get(&(scope, tg.clone())) {
-                return Err(merged(origin, other, &tg));
-            }
-            if let Some(other) = race_claims.get(&(scope, tg.clone())) {
-                return Err(merged(origin, &other.clone(), &tg));
-            }
-            naked_claims.insert((scope, tg), origin.to_string());
-            Ok(())
-        };
-        let mut withdraw = Vec::new();
-        for ((_race, scope, gateway), members) in races {
-            let mapped_members: Vec<(&str, &String)> = members
-                .iter()
-                .filter_map(|(_, eid)| mapped.get(*eid).map(|t| (*eid, t)))
-                .collect();
-            let Some((_, first_target)) = mapped_members.first() else {
-                continue;
-            };
-            let target_gateway = mapped
-                .get(gateway)
-                .cloned()
-                .or_else(|| target_races.owner_of(first_target).map(|o| o.id.clone()));
-            let mut by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-            for (src, tgt) in &mapped_members {
-                let owner = target_races.owner_of(tgt).map(|o| o.id.as_str());
-                if owner.is_none() || owner != target_gateway.as_deref() {
-                    return Err(EngineError::MigrationCatchEventDetached {
-                        instance_key,
-                        element_id: gateway.to_string(),
-                        target_element_id: target_gateway
-                            .clone()
-                            .unwrap_or_else(|| gateway.to_string()),
-                        catch_event_id: src.to_string(),
-                        target_catch_event_id: tgt.to_string(),
-                    });
-                }
-                by_target
-                    .entry(tgt.as_str())
-                    .or_default()
-                    .push(src.to_string());
-            }
-            if let Some((tgt, mut sources)) = by_target.into_iter().find(|(_, s)| s.len() > 1) {
-                sources.sort();
-                return Err(EngineError::MigrationCatchEventsMerged {
-                    instance_key,
-                    element_id: gateway.to_string(),
-                    target_catch_event_id: tgt.to_string(),
-                    source_catch_event_ids: sources,
-                });
-            }
-            if let Some(tg) = target_gateway {
-                claim_race(&mut race_claims, &naked_claims, scope, gateway, tg)?;
-            }
-            withdraw.extend(
-                members
-                    .iter()
-                    .filter(|(_, eid)| !mapped.contains_key(*eid))
-                    .map(|(k, eid)| (*k, eid.to_string())),
-            );
-        }
-        // Live origins outside any source race that still land in a target
-        // race: a gateway paused before arming its catches (start listener /
-        // incident) mapped onto a target gateway, or a standalone catch mapped
-        // onto a target race member.
-        for (eik, eid) in active {
-            if source_races.owner_of(eid).is_some() {
-                continue;
-            }
-            let Some(tgt) = mapped.get(eid) else {
-                continue;
-            };
-            let source_is_gateway = matches!(
-                source.element(eid).map(|e| &e.kind),
-                Some(ElementKind::EventBasedGateway)
-            );
-            let tg = if source_is_gateway {
-                target
-                    .element(tgt)
-                    .filter(|e| matches!(e.kind, ElementKind::EventBasedGateway))
-                    .map(|e| e.id.clone())
-            } else {
-                target_races.owner_of(tgt).map(|o| o.id.clone())
-            };
-            if let Some(tg) = tg {
-                claim_naked(&race_claims, &mut naked_claims, scope_of(*eik), tg, eid)?;
-            }
-        }
-        Ok(withdraw)
-    }
-
     /// Every armed trigger resting on any of `hosts` (element-instance key ->
     /// host element id), grouped by host and sorted by key. One pass over each
     /// partition-wide trigger table per migration, not one per active element.
@@ -524,9 +336,9 @@ impl Engine {
     ) -> BTreeMap<Key, Vec<ArmedTrigger>> {
         let mut by_host: BTreeMap<Key, Vec<ArmedTrigger>> = BTreeMap::new();
         for t in self.state.timers.values() {
-            let Some(host_element_id) = hosts.get(&t.element_instance_key) else {
+            if !hosts.contains_key(&t.element_instance_key) {
                 continue;
-            };
+            }
             if t.state != state::TimerState::Created {
                 continue;
             }
@@ -537,7 +349,10 @@ impl Engine {
                 state::TimerKind::NonInterruptingBoundary {
                     boundary_element_id,
                 } => (boundary_element_id.clone(), Some(false)),
-                state::TimerKind::IntermediateCatch => (host_element_id.clone(), None),
+                // An intermediate catch's trigger names its catch element: the
+                // host itself, or a catch an event-based gateway host
+                // subscribes to (#2004).
+                state::TimerKind::IntermediateCatch => (t.element_id.clone(), None),
                 // An event sub-process trigger rests on its scope, not on a
                 // token; it is not a per-element trigger to re-map here.
                 state::TimerKind::EventSubProcess { .. } => continue,
@@ -565,26 +380,26 @@ impl Engine {
                     }),
                 });
         }
-        let catch_of = |kind: &state::MessageSubscriptionKind, host_element_id: &ElementId| {
+        let catch_of = |kind: &state::MessageSubscriptionKind, catch_element_id: &ElementId| {
             match boundary_id_of(kind) {
                 Some((id, interrupting)) => Some((id, Some(interrupting))),
                 None if *kind == state::MessageSubscriptionKind::IntermediateCatch => {
-                    Some((host_element_id.clone(), None))
+                    Some((catch_element_id.clone(), None))
                 }
                 None => None,
             }
         };
         for s in self.state.message_subscriptions.values() {
-            let Some(host_element_id) = hosts.get(&s.element_instance_key) else {
+            if !hosts.contains_key(&s.element_instance_key) {
                 continue;
-            };
+            }
             if !matches!(
                 s.state,
                 state::MessageSubscriptionState::Open | state::MessageSubscriptionState::Opening
             ) {
                 continue;
             }
-            let Some((catch_id, interrupting)) = catch_of(&s.kind, host_element_id) else {
+            let Some((catch_id, interrupting)) = catch_of(&s.kind, &s.element_id) else {
                 continue;
             };
             by_host
@@ -607,13 +422,13 @@ impl Engine {
                 });
         }
         for s in self.state.signal_subscriptions.values() {
-            let Some(host_element_id) = hosts.get(&s.element_instance_key) else {
+            if !hosts.contains_key(&s.element_instance_key) {
                 continue;
-            };
+            }
             if s.state != state::MessageSubscriptionState::Open {
                 continue;
             }
-            let Some((catch_id, interrupting)) = catch_of(&s.kind, host_element_id) else {
+            let Some((catch_id, interrupting)) = catch_of(&s.kind, &s.element_id) else {
                 continue;
             };
             by_host
@@ -637,13 +452,13 @@ impl Engine {
                 });
         }
         for s in self.state.conditional_subscriptions.values() {
-            let Some(host_element_id) = hosts.get(&s.element_instance_key) else {
+            if !hosts.contains_key(&s.element_instance_key) {
                 continue;
-            };
+            }
             if s.state != state::MessageSubscriptionState::Open {
                 continue;
             }
-            let Some((catch_id, interrupting)) = catch_of(&s.kind, host_element_id) else {
+            let Some((catch_id, interrupting)) = catch_of(&s.kind, &s.element_id) else {
                 continue;
             };
             by_host
@@ -800,19 +615,7 @@ impl Engine {
         let active_snapshot = active.clone();
         for (eik, source_id) in active {
             let Some(target_id) = mapped.get(&source_id).cloned() else {
-                // An unmapped host still active here is a withdrawn race member
-                // (#1554; every other unmapped host was rejected): its withdrawal
-                // cancels the triggers, the migration fact reports them deleted.
-                for armed in armed_by_host.remove(&eik).unwrap_or_default() {
-                    if let Some(trigger) = armed.report {
-                        plan.subscriptions.push(MigratedSubscription {
-                            element_instance_key: eik,
-                            element_id: armed.catch_id,
-                            action: SubscriptionMigrationAction::Deleted,
-                            trigger,
-                        });
-                    }
-                }
+                // Every unmapped active element was rejected before planning.
                 continue;
             };
             if source
@@ -871,6 +674,12 @@ impl Engine {
             let mut covered: Vec<ElementId> = Self::armable_boundaries(source, &source_id)
                 .iter()
                 .filter_map(|b| mapped.get(&b.id).cloned())
+                .chain(
+                    source
+                        .event_gateway_targets(&source_id)
+                        .into_iter()
+                        .filter_map(|c| mapped.get(&c.id).cloned()),
+                )
                 .collect();
             for armed in armed_by_host.remove(&eik).unwrap_or_default() {
                 let vars = if armed.interrupting.is_some() {
@@ -957,6 +766,30 @@ impl Engine {
             // here would leave triggers outliving the host.
             if not_armable.contains(&eik) {
                 continue;
+            }
+            // An event-based gateway's target catch events with no mapped
+            // source catch are newly subscribed, on the gateway (#2004).
+            let new_catches: Vec<Element> = target
+                .event_gateway_targets(&target_id)
+                .into_iter()
+                .filter(|c| !covered.contains(&c.id))
+                .cloned()
+                .collect();
+            for catch in new_catches {
+                for event in self
+                    .arm_catch_event(instance_key, eik, &boundary_vars, &catch)
+                    .map_err(fail)?
+                {
+                    if let Some(trigger) = Self::report_of(&event) {
+                        plan.subscriptions.push(MigratedSubscription {
+                            element_instance_key: eik,
+                            element_id: catch.id.clone(),
+                            action: SubscriptionMigrationAction::Created,
+                            trigger,
+                        });
+                    }
+                    plan.after.push(event);
+                }
             }
             // Target boundaries with no mapped source boundary are newly armed.
             for boundary in Self::armable_boundaries(target, &target_id) {

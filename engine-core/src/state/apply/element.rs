@@ -81,6 +81,13 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 instance.races.remove(element_instance_key);
                 // A gateway's owned subscriptions (#2003) die with it.
                 instance.gateway_subscriptions.remove(element_instance_key);
+                // A triggered catch consumed its gateway's trigger (#2004); a
+                // gateway terminated before activating its catch drops it.
+                let terminated = matches!(event, Event::ElementTerminated { .. });
+                instance.gateway_triggers.retain(|gateway, trigger| {
+                    trigger.catch_element_instance_key != *element_instance_key
+                        && !(terminated && gateway == element_instance_key)
+                });
                 // An event sub-process container's held start payload dies
                 // with the container (normal completion or interrupt teardown).
                 instance.esp_held_payloads.remove(element_instance_key);
@@ -112,6 +119,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             ..
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.event_gateway_owned = true;
                 instance
                     .gateway_subscriptions
                     .insert(*gateway_element_instance_key, catch_element_ids.clone());
@@ -120,12 +128,20 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
         Event::EventGatewayTriggered {
             instance_key,
             gateway_element_instance_key,
-            ..
+            catch_element_id,
+            catch_element_instance_key,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance
                     .gateway_subscriptions
                     .remove(gateway_element_instance_key);
+                instance.gateway_triggers.insert(
+                    *gateway_element_instance_key,
+                    GatewayTrigger {
+                        catch_element_id: catch_element_id.clone(),
+                        catch_element_instance_key: *catch_element_instance_key,
+                    },
+                );
             }
         }
 

@@ -1856,6 +1856,38 @@ impl ProcessDefinition {
         self.elements.get(id)
     }
 
+    /// The catch events an event-based gateway `gateway_id` subscribes to
+    /// (#2004, Zeebe `ExecutableEventBasedGateway#getEvents`): its outgoing
+    /// flows' intermediate-catch targets, deduplicated, in outgoing-flow
+    /// (document) order. Empty when `gateway_id` is not an event-based
+    /// gateway. The one derivation shared by activation, migration and the
+    /// migration applier.
+    pub fn event_gateway_targets(&self, gateway_id: &str) -> Vec<&Element> {
+        let mut targets: Vec<&Element> = Vec::new();
+        let Some(gateway) = self
+            .element(gateway_id)
+            .filter(|g| matches!(g.kind, ElementKind::EventBasedGateway))
+        else {
+            return targets;
+        };
+        for flow in &gateway.outgoing {
+            let Some(target) = self.element(&flow.to) else {
+                continue;
+            };
+            let is_catch = matches!(
+                target.kind,
+                ElementKind::TimerIntermediateCatchEvent { .. }
+                    | ElementKind::MessageIntermediateCatchEvent { .. }
+                    | ElementKind::SignalIntermediateCatchEvent { .. }
+                    | ElementKind::ConditionalIntermediateCatchEvent { .. }
+            );
+            if is_catch && !targets.iter().any(|t| t.id == target.id) {
+                targets.push(target);
+            }
+        }
+        targets
+    }
+
     /// Number of sequence flows across the whole process that target `id`. Used
     /// to detect parallel-gateway joins.
     pub fn incoming_count(&self, id: &str) -> usize {

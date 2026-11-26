@@ -50,9 +50,12 @@ fn gateway_subscriptions_open_then_clear_on_trigger_and_on_gateway_end() {
             instance_key: inst,
             gateway_element_instance_key: 9001,
             catch_element_id: "onM1".to_string(),
+            catch_element_instance_key: 9010,
         },
     );
-    assert!(state.instances[&inst].gateway_subscriptions.is_empty());
+    assert!(!state.instances[&inst]
+        .gateway_subscriptions
+        .contains_key(&9001));
 
     // Terminating the gateway unsubscribes everything it owns.
     crate::state::apply(&mut state, &opened(9002));
@@ -64,24 +67,26 @@ fn gateway_subscriptions_open_then_clear_on_trigger_and_on_gateway_end() {
             element_id: "gw".to_string(),
         },
     );
-    assert!(state.instances[&inst].gateway_subscriptions.is_empty());
+    assert!(!state.instances[&inst]
+        .gateway_subscriptions
+        .contains_key(&9002));
 }
 
 #[test]
-fn legacy_race_detector_names_instances_with_armed_races_only() {
+fn gateway_owned_runtime_arms_no_legacy_race() {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(gateway_race()))
         .unwrap();
-    // The legacy runtime (still active in this slice) arms a #1676 race.
     let inst =
         create_instance_with_vars(&mut engine, "evt", vars(&[("key", Value::Str("k".into()))]));
-    assert_eq!(
-        engine.state().legacy_event_gateway_race_instances(),
-        vec![inst]
-    );
-
-    // Once the race settles, nothing is in flight.
+    let instance = &engine.state().instances[&inst];
+    assert!(instance.event_gateway_owned, "the format marker is set");
+    assert!(instance.races.is_empty());
+    assert!(engine
+        .state()
+        .legacy_event_gateway_race_instances()
+        .is_empty());
     engine
         .apply_command(Command::correlate_message("M1", "k"))
         .unwrap();
@@ -89,6 +94,63 @@ fn legacy_race_detector_names_instances_with_armed_races_only() {
         .state()
         .legacy_event_gateway_race_instances()
         .is_empty());
+}
+
+/// An instance resting on a legacy race: the gateway is gone and its catches
+/// are active element instances. Built by hand, since this build never arms
+/// one.
+fn legacy_race_state(races: bool, marked: bool) -> (State, Key) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(gateway_race()))
+        .unwrap();
+    let inst =
+        create_instance_with_vars(&mut engine, "evt", vars(&[("key", Value::Str("k".into()))]));
+    let mut state = engine.state().clone();
+    let instance = state.instances.get_mut(&inst).unwrap();
+    instance.active.clear();
+    instance.gateway_subscriptions.clear();
+    instance.active.insert(9101, "onM1".to_string());
+    instance.active.insert(9102, "onM2".to_string());
+    if races {
+        instance.races.insert(9101, 9100);
+        instance.races.insert(9102, 9100);
+    }
+    instance.event_gateway_owned = marked;
+    (state, inst)
+}
+
+#[test]
+fn legacy_race_detector_names_races_with_or_without_the_races_field() {
+    // A #1676 race carries `races` membership.
+    let (state, inst) = legacy_race_state(true, false);
+    assert_eq!(state.legacy_event_gateway_race_instances(), vec![inst]);
+    // A pre-#1676 race has no `races` field: the unmarked instance's
+    // gateway-owned active catches give it away.
+    let (state, inst) = legacy_race_state(false, false);
+    assert_eq!(state.legacy_event_gateway_race_instances(), vec![inst]);
+    // `races` membership is legacy-only, so it is refused even when marked.
+    let (state, inst) = legacy_race_state(true, true);
+    assert_eq!(state.legacy_event_gateway_race_instances(), vec![inst]);
+    // A marked instance resting on a gateway catch got there under this build
+    // (e.g. by modification): not a legacy race.
+    let (state, _) = legacy_race_state(false, true);
+    assert!(state.legacy_event_gateway_race_instances().is_empty());
+}
+
+#[test]
+fn legacy_race_detector_survives_serde_of_a_races_less_instance() {
+    #[cfg(feature = "serde")]
+    {
+        let (state, inst) = legacy_race_state(false, false);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            !json.contains("event_gateway_owned"),
+            "an unmarked instance serializes like a legacy one"
+        );
+        let back: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.legacy_event_gateway_race_instances(), vec![inst]);
+    }
 }
 
 /// Whole-instance teardown (a top-level completion — e.g. a terminate end — or
@@ -122,6 +184,53 @@ fn gateway_subscriptions_clear_on_whole_instance_teardown() {
             state.instances[&inst].gateway_subscriptions.is_empty(),
             "teardown {:?} must clear gateway subscriptions",
             terminal(inst)
+        );
+    }
+}
+
+/// #2004 deferred item 3: a legacy journal tail — a catch armed by a completed
+/// gateway (`ElementActivating.race`, no gateway-owned subscriptions) —
+/// replays into state the post-replay refusal names.
+#[test]
+fn replayed_legacy_journal_tail_is_detected() {
+    let mut engine = Engine::new();
+    let mut journal = engine
+        .apply_command(Command::DeployProcess(gateway_race()))
+        .unwrap();
+    // A stand-in for an instance created by a legacy build that never
+    // reached the gateway yet (the gateway-opening events are dropped).
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "evt",
+            vars(&[("key", Value::Str("k".into()))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    journal.extend(
+        created
+            .into_iter()
+            .filter(|e| !matches!(e, Event::EventGatewaySubscriptionsOpened { .. })),
+    );
+    assert!(Engine::replay(journal.clone())
+        .state()
+        .legacy_event_gateway_race_instances()
+        .is_empty());
+
+    for race in [Some(9100), None] {
+        let mut tail = journal.clone();
+        tail.push(Event::ElementActivating {
+            instance_key: inst,
+            element_instance_key: 9101,
+            element_id: "onM1".to_string(),
+            scope: 0,
+            race,
+        });
+        assert_eq!(
+            Engine::replay(tail)
+                .state()
+                .legacy_event_gateway_race_instances(),
+            vec![inst],
+            "race {race:?}"
         );
     }
 }

@@ -111,6 +111,15 @@ pub enum ProcessInstanceState {
 ///
 /// Kept sorted by flow with no zero counts, so its serialized form is
 /// deterministic.
+/// An event-based gateway's recorded trigger (#2004): the catch whose event
+/// fired and the element instance key its direct activation uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GatewayTrigger {
+    pub catch_element_id: ElementId,
+    pub catch_element_instance_key: Key,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FlowArrivals(Vec<(IncomingFlow, usize)>);
@@ -997,13 +1006,38 @@ pub struct ProcessInstance {
     /// id). Inserted by [`crate::Event::EventGatewaySubscriptionsOpened`],
     /// removed when the gateway is triggered
     /// ([`crate::Event::EventGatewayTriggered`]) or completes/terminates.
-    /// Not yet driven by execution (the legacy race machinery still runs).
     /// `serde(default)` and omitted when empty.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub gateway_subscriptions: BTreeMap<Key, Vec<ElementId>>,
+    /// The recorded event trigger of an event-based gateway (#2004): gateway
+    /// element instance -> the catch whose event fired (Zeebe's `EventTrigger`
+    /// on the gateway's event scope). Inserted by
+    /// [`crate::Event::EventGatewayTriggered`]; the gateway's completion
+    /// activates exactly that catch under the journaled key, and the catch,
+    /// seeing its trigger here, completes instead of subscribing again. The
+    /// entry dies when the catch completes/terminates, or when the gateway
+    /// terminates before activating it. `serde(default)` and omitted when
+    /// empty.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub gateway_triggers: BTreeMap<Key, GatewayTrigger>,
+    /// Explicit format marker (#2004): `true` once this instance has run under
+    /// the gateway-owned subscription model (it opened an event-based
+    /// gateway's subscriptions, or was modified, under this build). A legacy
+    /// snapshot or journal never sets it, so an unmarked instance resting on
+    /// an active gateway-owned catch is a legacy race the loader refuses
+    /// ([`State::legacy_event_gateway_race_instances`]) even when it predates
+    /// the #1676 `races` field.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub event_gateway_owned: bool,
     /// Keys of incidents currently **active** on this instance (parked tokens).
     /// The full records live in [`State::incidents`] and are retained after
     /// resolution; resolving an incident removes its key from this active index
@@ -3163,12 +3197,36 @@ impl State {
     /// these, so a pre-v4 snapshot holding any is refused on load
     /// (`LegacyEventGatewayRace`) rather than silently dropped or rewound.
     /// Ascending, deduplicated.
+    ///
+    /// Two signals, either suffices: a #1676 `races` membership (written only
+    /// by the legacy runtime), or — for state written before #1676 persisted
+    /// `races` — an UNMARKED instance (no
+    /// [`ProcessInstance::event_gateway_owned`] format marker) with an active
+    /// catch whose unambiguous owner is an event-based gateway
+    /// (`event_gateway_race_index`, resolved against the instance's pinned
+    /// definition). Run after snapshot load AND after journal replay, so a
+    /// race armed by tail events is refused too.
     pub fn legacy_event_gateway_race_instances(&self) -> Vec<Key> {
         self.instances
             .iter()
-            .filter(|(_, i)| !i.races.is_empty())
+            .filter(|(_, i)| !i.races.is_empty() || self.has_unmarked_gateway_catch(i))
             .map(|(k, _)| *k)
             .collect()
+    }
+
+    /// Whether unmarked (legacy) instance `i` rests on an active catch armed by
+    /// an event-based gateway (see [`Self::legacy_event_gateway_race_instances`]).
+    fn has_unmarked_gateway_catch(&self, i: &ProcessInstance) -> bool {
+        if i.event_gateway_owned {
+            return false;
+        }
+        let Some(def) = self.process_by_key(i.process_definition_key) else {
+            return false;
+        };
+        let index = crate::engine::event_gateway_race_index(&def.definition);
+        i.active
+            .values()
+            .any(|element_id| index.owner_of(element_id).is_some())
     }
 
     /// The settlement half of the live `VariablesLostQuarantined` fold

@@ -1,5 +1,5 @@
 {
-  "next_local": 144,
+  "next_local": 140,
   "now": 1700000000029,
   "num_partitions": 1,
   "partition_id": 0,
@@ -841,10 +841,8 @@
       "130": {
         "activating": [],
         "active": {
-          "137": "onM2",
-          "139": "onM1",
-          "141": "onM2",
-          "143": "onM1"
+          "135": "gw",
+          "138": "gw"
         },
         "adhoc_instances": {},
         "agent_history": {},
@@ -854,7 +852,18 @@
         "compensation_waits": {},
         "created_at": 1700000000029,
         "esp_held_payloads": {},
+        "event_gateway_owned": true,
         "gateway_routes": {},
+        "gateway_subscriptions": {
+          "135": [
+            "onM1",
+            "onM2"
+          ],
+          "138": [
+            "onM1",
+            "onM2"
+          ]
+        },
         "incidents": [],
         "join_counts": [],
         "join_flow_arrivals": [],
@@ -866,12 +875,6 @@
         "parked_joins": [],
         "process_definition_key": 129,
         "process_id": "twins",
-        "races": {
-          "137": 135,
-          "139": 135,
-          "141": 136,
-          "143": 136
-        },
         "scope_parents": {},
         "scope_variables": {},
         "scopes": {},
@@ -1766,47 +1769,47 @@
         "resume_generation": 0,
         "state": "Open"
       },
-      "138": {
+      "136": {
+        "correlation_key": "k",
+        "element_id": "onM1",
+        "element_instance_key": 135,
+        "instance_key": 130,
+        "key": 136,
+        "kind": "IntermediateCatch",
+        "message_name": "M1",
+        "resume_generation": 0,
+        "state": "Open"
+      },
+      "137": {
         "correlation_key": "k",
         "element_id": "onM2",
-        "element_instance_key": 137,
+        "element_instance_key": 135,
         "instance_key": 130,
-        "key": 138,
+        "key": 137,
         "kind": "IntermediateCatch",
         "message_name": "M2",
+        "resume_generation": 0,
+        "state": "Open"
+      },
+      "139": {
+        "correlation_key": "k",
+        "element_id": "onM1",
+        "element_instance_key": 138,
+        "instance_key": 130,
+        "key": 139,
+        "kind": "IntermediateCatch",
+        "message_name": "M1",
         "resume_generation": 0,
         "state": "Open"
       },
       "140": {
         "correlation_key": "k",
-        "element_id": "onM1",
-        "element_instance_key": 139,
+        "element_id": "onM2",
+        "element_instance_key": 138,
         "instance_key": 130,
         "key": 140,
         "kind": "IntermediateCatch",
-        "message_name": "M1",
-        "resume_generation": 0,
-        "state": "Open"
-      },
-      "142": {
-        "correlation_key": "k",
-        "element_id": "onM2",
-        "element_instance_key": 141,
-        "instance_key": 130,
-        "key": 142,
-        "kind": "IntermediateCatch",
         "message_name": "M2",
-        "resume_generation": 0,
-        "state": "Open"
-      },
-      "144": {
-        "correlation_key": "k",
-        "element_id": "onM1",
-        "element_instance_key": 143,
-        "instance_key": 130,
-        "key": 144,
-        "kind": "IntermediateCatch",
-        "message_name": "M1",
         "resume_generation": 0,
         "state": "Open"
       }
