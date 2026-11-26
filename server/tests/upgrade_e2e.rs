@@ -532,46 +532,122 @@ fn log_heads(c: &Cluster) -> Vec<Vec<u64>> {
         .collect()
 }
 
-/// After a post-latch restart from snapshot + journal, member `id`'s
-/// replicated log must agree with the most advanced peer log (the leader's)
-/// at every Raft log index both hold on disk, comparing the WHOLE
-/// `payload.Normal` per index (items plus `digest` / `digest_cutover`), and
-/// must have caught up to the leader's head. Compared BY LOG INDEX, not by
-/// vector position, so members whose on-disk logs start at different indices
-/// (log purge) still align. Polled: a just-restarted (possibly ex-leader)
-/// member may briefly hold an uncommitted tail entry the new leader is about
-/// to overwrite, so a mismatch is retried and only reported on timeout.
+/// One member's `/debug/raft` view: per partition, `(leader, applied)` —
+/// the member's current leader (-1 if unknown) and its locally applied index
+/// (-1 if none). `None` while the member does not answer.
+fn raft_status(c: &Cluster, id: usize) -> Option<Vec<(i128, i128)>> {
+    let (code, body) = request(c.port(id), "GET", "/debug/raft", None)?;
+    if code != 200 {
+        return None;
+    }
+    let mut out = vec![(-1i128, -1i128); PARTITIONS as usize];
+    for line in body.lines() {
+        let field = |k: &str| {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+                .and_then(|v| v.parse::<i128>().ok())
+        };
+        let (Some(p), Some(leader), Some(applied)) =
+            (field("partition"), field("leader"), field("applied"))
+        else {
+            continue;
+        };
+        if let Some(slot) = usize::try_from(p).ok().and_then(|p| out.get_mut(p)) {
+            *slot = (leader, applied);
+        }
+    }
+    Some(out)
+}
+
+/// Per partition, the lowest applied index over every member: every entry at
+/// or below it is committed (applied implies committed) and held, applied, by
+/// ALL members. `None` while any member does not answer.
+fn committed_floor(c: &Cluster) -> Option<Vec<i128>> {
+    let all: Option<Vec<Vec<(i128, i128)>>> = (0..NODES).map(|id| raft_status(c, id)).collect();
+    let all = all?;
+    Some(
+        (0..PARTITIONS as usize)
+            .map(|p| all.iter().map(|s| s[p].1).min().unwrap_or(-1))
+            .collect(),
+    )
+}
+
+/// After a post-latch restart from snapshot + journal, member `id` must have
+/// caught up and agree with EVERY peer over the committed prefix. Per
+/// partition: the actual leader is resolved through `/debug/raft` (agreed by
+/// the restarted member and the leader itself) and its applied index captured
+/// as the target; the restarted member must locally APPLY up to that target,
+/// and its on-disk log must equal every peer's — whole `payload.Normal` per
+/// index (items plus `digest` / `digest_cutover`), compared BY LOG INDEX so a
+/// purged log prefix still aligns — at every index up to the committed floor
+/// (lowest applied index across members). Comparing against all peers (never
+/// a "longest log" pick, which could be the restarted member itself) and only
+/// over committed entries (an ex-leader's uncommitted tail is excluded by
+/// construction) makes the check neither vacuous nor timing-dependent; it is
+/// polled only to let replication and apply catch up.
 fn assert_restarted_matches_prefix(c: &Cluster, id: usize) {
     use std::collections::BTreeMap;
-    for p in 0..PARTITIONS {
+    for p in 0..PARTITIONS as usize {
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut last;
+        let mut target: Option<i128> = None;
+        let mut last = String::from("no /debug/raft answer yet");
         loop {
-            let logs: Vec<BTreeMap<u64, serde_json::Value>> = c
-                .members
-                .iter()
-                .map(|m| raft_batches(&m.data, p).into_iter().collect())
-                .collect();
-            let head = |l: &BTreeMap<u64, serde_json::Value>| {
-                l.keys().next_back().copied().unwrap_or_default()
-            };
-            let leader = logs.iter().max_by_key(|l| head(l)).unwrap();
-            let mine = &logs[id];
-            let mismatch = mine
-                .iter()
-                .find(|(i, b)| leader.get(*i).is_some_and(|l| l != *b));
-            match mismatch {
-                Some((i, b)) => {
-                    last = format!("mismatch at index {i}: {b:?} vs leader {:?}", leader.get(i))
+            let done = (|| {
+                let mine = raft_status(c, id)?[p];
+                if target.is_none() {
+                    let leader = usize::try_from(mine.0).ok().filter(|l| *l < NODES)?;
+                    let theirs = raft_status(c, leader)?[p];
+                    if theirs.0 != mine.0 {
+                        last = format!("leader disagreement: {} vs {}", mine.0, theirs.0);
+                        return None;
+                    }
+                    target = Some(theirs.1);
                 }
-                None if head(mine) < head(leader) => {
-                    last = format!("behind: head {} < leader {}", head(mine), head(leader))
+                let want = target?;
+                if mine.1 < want {
+                    last = format!("applied {} < leader's applied {want}", mine.1);
+                    return None;
                 }
-                None => break,
+                let floor = committed_floor(c)?[p];
+                if floor < want {
+                    last = format!("committed floor {floor} < target {want}");
+                    return None;
+                }
+                let floor = u64::try_from(floor).ok()?;
+                let logs: Vec<BTreeMap<u64, serde_json::Value>> = c
+                    .members
+                    .iter()
+                    .map(|m| {
+                        raft_batches(&m.data, p as u64)
+                            .into_iter()
+                            .filter(|(i, _)| *i <= floor)
+                            .collect()
+                    })
+                    .collect();
+                for (other, theirs) in logs.iter().enumerate() {
+                    if other == id {
+                        continue;
+                    }
+                    if let Some((i, b)) = logs[id]
+                        .iter()
+                        .find(|(i, b)| theirs.get(*i).is_some_and(|t| t != *b))
+                    {
+                        panic!(
+                            "partition {p}: restarted node {id} disagrees with node {other} at \
+                             committed index {i}: {b:?} vs {:?}\n{}",
+                            theirs.get(i),
+                            tail(&c.all_logs())
+                        );
+                    }
+                }
+                Some(())
+            })();
+            if done.is_some() {
+                break;
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "partition {p}: restarted node {id} never matched the leader log: {last}\n{}",
+                    "partition {p}: restarted node {id} never caught up with the leader: {last}\n{}",
                     tail(&c.all_logs())
                 );
             }
@@ -580,32 +656,71 @@ fn assert_restarted_matches_prefix(c: &Cluster, id: usize) {
     }
 }
 
-/// Post-restart digest claims keep verifying: on every partition, every member
-/// logged a NEW `digest` claim beyond its pre-restart head `before`, and every
-/// member's claim at each such index agrees with every other member's.
-fn assert_fresh_digest_claims(c: &Cluster, before: &[Vec<u64>], restarted: usize) {
-    for p in 0..PARTITIONS {
+/// Post-restart digest claims keep verifying, on every partition and member:
+/// each member holds a NEW `digest` claim beyond its pre-restart head
+/// `before` that it has locally APPLIED (index at or below its own
+/// `/debug/raft` applied index — a stored-but-unapplied claim proves
+/// nothing), and claims agree across members at every committed index.
+/// Creates may land on fewer than all partitions while leadership recovers,
+/// so coverage is polled, driving bounded extra traffic, before it fails; a
+/// disagreement fails at once.
+fn assert_fresh_digest_claims(
+    c: &Cluster,
+    before: &[Vec<u64>],
+    restarted: usize,
+    keys: &mut Vec<String>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut round = 0usize;
+    loop {
+        match fresh_digest_gap(c, before, restarted) {
+            None => return,
+            Some(gap) if Instant::now() >= deadline => panic!(
+                "after node {restarted}'s post-latch restart: {gap} (divergence check vacuous)\n{}",
+                tail(&c.all_logs())
+            ),
+            Some(_) => {
+                round += 1;
+                keys.extend(create_instances(
+                    c,
+                    (restarted + round) % NODES,
+                    PARTITIONS as usize,
+                ));
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+/// The first missing fresh, locally applied claim (`None` = full coverage).
+/// Panics on a claim disagreement at a committed index.
+fn fresh_digest_gap(c: &Cluster, before: &[Vec<u64>], restarted: usize) -> Option<String> {
+    let status: Vec<Vec<(i128, i128)>> = match (0..NODES).map(|id| raft_status(c, id)).collect() {
+        Some(s) => s,
+        None => return Some("a member did not answer /debug/raft".into()),
+    };
+    for p in 0..PARTITIONS as usize {
+        let applied: Vec<u64> = status
+            .iter()
+            .map(|s| u64::try_from(s[p].1).unwrap_or(0))
+            .collect();
+        let floor = applied.iter().copied().min().unwrap_or(0);
         let claims: Vec<std::collections::BTreeMap<u64, serde_json::Value>> = c
             .members
             .iter()
             .enumerate()
             .map(|(id, m)| {
-                let head = before[id][p as usize];
-                raft_batches(&m.data, p)
+                let head = before[id][p];
+                raft_batches(&m.data, p as u64)
                     .into_iter()
-                    .filter(|(i, b)| *i > head && !b["digest"].is_null())
+                    .filter(|(i, b)| *i > head && *i <= applied[id] && !b["digest"].is_null())
                     .map(|(i, b)| (i, b["digest"].clone()))
                     .collect()
             })
             .collect();
         for (id, mine) in claims.iter().enumerate() {
-            assert!(
-                !mine.is_empty(),
-                "partition {p}: node {id} logged no digest claim after node {restarted}'s \
-                 post-latch restart (divergence check vacuous)"
-            );
             for (other, theirs) in claims.iter().enumerate() {
-                for (i, d) in mine {
+                for (i, d) in mine.range(..=floor) {
                     if let Some(t) = theirs.get(i) {
                         assert_eq!(
                             d, t,
@@ -616,7 +731,14 @@ fn assert_fresh_digest_claims(c: &Cluster, before: &[Vec<u64>], restarted: usize
                 }
             }
         }
+        if let Some(id) = claims.iter().position(|m| m.is_empty()) {
+            return Some(format!(
+                "partition {p}: node {id} has no locally applied digest claim past its \
+                 pre-restart head"
+            ));
+        }
     }
+    None
 }
 
 /// The latch's ordering contract over every member's Raft log, per partition:
@@ -749,12 +871,12 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
         c.kill(id);
         c.start(id, Bin::New);
         wait_ready(&c, id);
-        // Creates round-robin over partitions, so at least PARTITIONS of them
-        // are needed for every partition to log a fresh digest claim.
+        // Drive traffic; `assert_fresh_digest_claims` adds bounded extra
+        // creates until every partition and member holds a fresh claim.
         keys.extend(create_instances(&c, (id + 1) % NODES, PARTITIONS as usize));
-        assert_visible_everywhere(&mut c, &keys);
         assert_restarted_matches_prefix(&c, id);
-        assert_fresh_digest_claims(&c, &before, id);
+        assert_fresh_digest_claims(&c, &before, id, &mut keys);
+        assert_visible_everywhere(&mut c, &keys);
         c.assert_no_divergence(&format!("after post-latch recovery of node {id}"));
     }
 
