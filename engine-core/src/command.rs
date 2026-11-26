@@ -1652,6 +1652,11 @@ impl Command {
             Command::QuarantineOffheapOrphan {
                 stamp: Some(stamp), ..
             } => stamp.element_id.len() as u64 + stamp.reason.len() as u64,
+            // #2037 review: the acknowledgement carries the resolved element
+            // id, an unbounded string the batcher must see.
+            Command::AcknowledgeMessageCorrelation { element_id, .. } => {
+                element_id.as_ref().map_or(0, |id| id.len() as u64)
+            }
             _ => 0,
         };
         BASE + payload
@@ -2222,6 +2227,22 @@ mod kind_tests {
 
     // #1657 review: cluster-variable create/update (incl. distributed fan-out
     // copies) and delete must count their payload, not the fixed base.
+    #[test]
+    fn approx_bytes_counts_acknowledgement_element_id() {
+        let ack = |element_id: Option<ElementId>| Command::AcknowledgeMessageCorrelation {
+            subscription_key: 1,
+            message_key: 2,
+            delivery_key: 3,
+            accepted: true,
+            consumed: true,
+            deferred: false,
+            element_id,
+        };
+        let bare = ack(None).approx_bytes();
+        let heavy = ack(Some(ElementId::from("e".repeat(50_000)))).approx_bytes();
+        assert!(heavy >= bare + 50_000, "heavy={heavy} bare={bare}");
+    }
+
     #[test]
     fn approx_bytes_counts_cluster_variable_payloads() {
         use std::collections::BTreeMap;
