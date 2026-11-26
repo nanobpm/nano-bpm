@@ -28,6 +28,65 @@ We do not tolerate warnings, errors, or test failures in this project.
 
 There are no pre-existing failures or warnings, and you will not allow any to enter the codebase. Thank you.
 
+## Write Provable Code
+
+We prove engine semantics at the code level, not only on the TLA+ model: Kani
+(bounded model checking, `formal/kani/`) and Aeneas (Rust → Lean refinement
+proofs against Zeebe, `formal/lean/Refinement/`). A proof is only tractable if
+the code was shaped for it. The engine's stateful methods are not: they take
+`&self`/`&mut self` on the whole `Engine`, use B-tree collections and use
+string-keyed lookups. Kani runs out of memory on them or never finishes building
+the formula, and Aeneas cannot extract them (see `formal/lean/Refinement/SPIKE.md`
+and `formal/kani/README.md`). So when you add or change engine **decision logic**
+in `engine-core` (gateway and join readiness, token and flow bookkeeping,
+activate/complete/finalize step decisions, job state and index transitions,
+scope and boundary decisions):
+
+- **Separate deciding from gathering.** Split the logic into an *impure
+  collector*, which reads `Engine`/`State`, resolves ids and filters scopes, and a
+  *pure kernel*, which takes plain inputs and returns a decision or the steps and
+  events to emit. The kernel never takes `Engine`, `State`, `&self` or
+  `&mut self`, and does no I/O, clock reads, randomness or logging. The engine
+  method gathers the inputs and calls the kernel. Reference shape: the
+  `join_guard.rs` proposal in `SPIKE.md`.
+- **Kernel inputs are small, dense and borrowed.** Use `usize` indices into
+  slices (`&[T]`, `&[Vec<(usize, usize)>]`), `Vec<bool>` visited sets, integer
+  counts and fieldless enums. Do not use `BTreeMap`/`BTreeSet`/`VecDeque`/
+  `HashMap`, owned `String`s or string-keyed lookups. Build the index mapping in
+  the collector.
+- **Keep the kernel in the subset Aeneas extracts.** Safe Rust only: no
+  `unsafe`, no interior mutability, no trait objects, no generics beyond what is
+  needed. Loops are explicit indexed `while`/`for` loops over slices, with a
+  visible bound. Avoid long closure and iterator-adaptor chains. Kernels go in
+  small dependency-free modules (one decision per module, e.g.
+  `engine-core/src/engine/join_guard.rs`) so the tools can be pointed at the
+  module alone.
+- **Make kernels total.** No `panic!`, `unwrap`/`expect`, unchecked indexing
+  or unchecked arithmetic. Return `Option`/`Result` or saturate, so Kani's
+  no-panic and no-overflow checks pass by construction.
+- **Pin the refactor with a test before the proof exists.** When you extract a
+  kernel from existing code, add an equivalence test (a `proptest`, or an
+  exhaustive test up to a bound) that runs the old path and the kernel over the
+  same inputs. The existing engine tests, the golden replay corpus and the TLA+
+  trace validation must stay green, so the refactor is behaviour-preserving by
+  test first.
+- **Add or extend a harness for the kernel.** Put the Kani harness in a
+  `cfg(kani)` module, with a `cover!` so the property cannot pass vacuously.
+  Keep bounds small enough to fit a GitHub-hosted runner with headroom, record
+  the harness in `formal/kani/README.md` (property, bound, cost), and run it with
+  `formal/kani/check.sh <harness>`. Kani runs nightly and does not gate merges.
+  A harness that only passes sometimes is a defect in the harness bound.
+- **If proofs need a stand-in type** (a fixed-size array in place of a
+  production collection), keep it out of production and tie it to production
+  with a refinement test that runs both through every operation sequence up
+  to a bound (see `engine-core/src/state/kani_model.rs`). Prefer making the
+  kernel itself provable: a stand-in is a second implementation, and so a
+  possible drift surface.
+
+Do not count the work as done if a proof needs the whole engine, or needs an
+unwind bound sized to the full command path. Factor the code until the proof is
+small.
+
 ## Formatting: pinned nightly rustfmt (never bare `cargo fmt`)
 
 The canonical Rust style relies on **unstable** rustfmt options — `rustfmt.toml`
