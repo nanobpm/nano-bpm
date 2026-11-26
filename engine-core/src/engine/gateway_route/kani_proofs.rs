@@ -41,6 +41,12 @@ fn gateway_route_exclusive_total_and_sound() {
                 if g[j] == Guard::Holds || (j < i && g[j] == Guard::Errors) {
                     assert!(g[i] == Guard::Holds && j >= i);
                 }
+                // A fallback (non-holding) take scanned the whole slice, so
+                // no condition anywhere errored. (A holding take stops the
+                // scan, so a later `Errors` is legitimately never looked at.)
+                if g[i] != Guard::Holds {
+                    assert!(g[j] != Guard::Errors);
+                }
                 j += 1;
             }
             // The default is taken only when nothing else could be.

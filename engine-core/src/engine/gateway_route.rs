@@ -71,10 +71,12 @@ pub fn select_exclusive(guards: &[Guard]) -> Route {
 }
 
 /// Inclusive gateway: marks in `selected` every unconditional or holding flow,
-/// or only the default flow when none is. `selected` must be at least as long
-/// as `guards` (a shorter mask is never written past its end). Returns
-/// `Take(count)` with the number of marked flows (never 0), or the failure; on
-/// failure the mask's contents are unspecified.
+/// or only the default flow when none is. Callers pass a `selected` mask at
+/// least as long as `guards`; a shorter mask is tolerated for totality (it is
+/// never written past its end) but then only its prefix is marked. The
+/// returned `Take(count)` always counts the selected flows over all of
+/// `guards` (never 0), regardless of mask length. On failure the mask's
+/// contents are unspecified.
 pub fn select_inclusive(guards: &[Guard], selected: &mut [bool]) -> Route {
     let mut default_flow: Option<usize> = None;
     let mut count: usize = 0;
