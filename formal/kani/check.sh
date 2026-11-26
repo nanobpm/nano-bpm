@@ -48,6 +48,8 @@ ALL_HARNESSES=(
   gateway_route_inclusive_total_and_sound
   completion_plan_total_and_sound
   escalation_plan_total_and_sound
+  token_flow_invariants_preserved
+  token_flow_inclusive_join_invariants_preserved
 )
 # `--list` prints the canonical harness list (one per line) and exits; the
 # nightly workflow derives its matrix and failure report from it.
