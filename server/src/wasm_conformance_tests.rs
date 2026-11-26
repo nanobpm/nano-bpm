@@ -1139,6 +1139,17 @@ async fn rest_parity_fixtures_agree_between_server_and_wasm() {
         )
         .await;
         assert_eq!(d.status, 200, "{name}: native setup deploy {}", d.body);
+        for (i, st) in f["setup"].as_array().into_iter().flatten().enumerate() {
+            let r = native(
+                &server,
+                &s(&st["method"]),
+                &s(&st["path"]),
+                st["contentType"].as_str(),
+                &s(&st["body"]),
+            )
+            .await;
+            assert_eq!(r.status, 200, "{name}: native setup step {i}: {}", r.body);
+        }
         let n = native(&server, &method, &path, ct, &body).await;
 
         let mut eng = TestEngine::new();
@@ -1150,6 +1161,16 @@ async fn rest_parity_fixtures_agree_between_server_and_wasm() {
             &deploy_body,
         );
         assert_eq!(d.status, 200, "{name}: wasm setup deploy {}", d.body);
+        for (i, st) in f["setup"].as_array().into_iter().flatten().enumerate() {
+            let r = wasm(
+                &mut eng,
+                &s(&st["method"]),
+                &s(&st["path"]),
+                st["contentType"].as_str(),
+                &s(&st["body"]),
+            );
+            assert_eq!(r.status, 200, "{name}: wasm setup step {i}: {}", r.body);
+        }
         let w = wasm(&mut eng, &method, &path, ct, &body);
 
         assert_eq!(n.status, status, "{name}: native status, body {}", n.body);

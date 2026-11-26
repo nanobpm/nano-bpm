@@ -905,6 +905,18 @@ fn rest_parity_fixtures_match_the_native_gateway_expectations() {
         let mut eng = TestEngine::new();
         let d = eng.handle_request("POST", "/v2/deployments", &deploy_headers, &deploy_body);
         assert_eq!(d.status, 200, "{name}: setup {}", d.body);
+        for (i, st) in f["setup"].as_array().into_iter().flatten().enumerate() {
+            let h = st["contentType"].as_str().map_or(String::new(), |ct| {
+                json!({ "content-type": ct }).to_string()
+            });
+            let r = eng.handle_request(
+                st["method"].as_str().unwrap(),
+                st["path"].as_str().unwrap(),
+                &h,
+                st["body"].as_str().unwrap(),
+            );
+            assert_eq!(r.status, 200, "{name}: setup step {i}: {}", r.body);
+        }
         let headers = f["contentType"].as_str().map_or(String::new(), |ct| {
             json!({ "content-type": ct }).to_string()
         });

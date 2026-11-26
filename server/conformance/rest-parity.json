@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared REST parity fixtures (#2020). Every fixture is sent to BOTH the native gateway router (server/src/wasm_conformance_tests.rs) and the engine-wasm handle() driver (engine-wasm/src/gateway_tests.rs), each on a fresh engine with conformance-service.bpmn (process `conformance-service`) deployed first. Both must answer `status`; a rejection must carry the same problem (native ProblemDetail title/detail, or for a non-JSON native body its text as the wasm detail); `compare` lists JSON pointers whose success-body values must be identical; `instancesAfter` is the process-instance count afterwards (a rejected mutation executes nothing). `contentType: null` sends no Content-Type header. {{BPMN}} is conformance-service.bpmn. `titleGap` records a tracked native title that bypasses the shared engine-core problem mapping; it must reproduce exactly and may only be removed.",
+  "_comment": "Shared REST parity fixtures (#2020). Every fixture is sent to BOTH the native gateway router (server/src/wasm_conformance_tests.rs) and the engine-wasm handle() driver (engine-wasm/src/gateway_tests.rs), each on a fresh engine with conformance-service.bpmn (process `conformance-service`) deployed first. Both must answer `status`; a rejection must carry the same problem (native ProblemDetail title/detail, or for a non-JSON native body its text as the wasm detail); `compare` lists JSON pointers whose success-body values must be identical; `instancesAfter` is the process-instance count afterwards (a rejected mutation executes nothing). `setup` (optional) lists requests run on both sides after the deploy, each expected to answer 200. `contentType: null` sends no Content-Type header. {{BPMN}} is conformance-service.bpmn. `titleGap` records a tracked native title that bypasses the shared engine-core problem mapping; it must reproduce exactly and may only be removed.",
   "fixtures": [
     {
       "name": "create-instance-missing-content-type",
@@ -125,13 +125,45 @@
     },
     {
       "name": "activate-jobs-tenant-ids",
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/v2/process-instances",
+          "contentType": "application/json",
+          "body": "{\"processDefinitionId\":\"conformance-service\"}"
+        }
+      ],
       "method": "POST",
       "path": "/v2/jobs/activation",
       "contentType": "application/json",
       "body": "{\"type\":\"conformance-work\",\"maxJobsToActivate\":1,\"timeout\":1000,\"tenantIds\":[\"<default>\"],\"requestTimeout\":-1}",
       "status": 200,
-      "instancesAfter": 0,
-      "compare": []
+      "instancesAfter": 1,
+      "compare": [
+        "/jobs/0/tenantId",
+        "/jobs/0/type"
+      ]
+    },
+    {
+      "name": "activate-jobs-foreign-tenant-ids",
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/v2/process-instances",
+          "contentType": "application/json",
+          "body": "{\"processDefinitionId\":\"conformance-service\"}"
+        }
+      ],
+      "method": "POST",
+      "path": "/v2/jobs/activation",
+      "contentType": "application/json",
+      "body": "{\"type\":\"conformance-work\",\"maxJobsToActivate\":1,\"timeout\":1000,\"tenantIds\":[\"other\"],\"requestTimeout\":-1}",
+      "status": 200,
+      "instancesAfter": 1,
+      "compare": [
+        "/jobs/0/tenantId",
+        "/jobs/0/type"
+      ]
     },
     {
       "name": "broadcast-signal-text-plain",
