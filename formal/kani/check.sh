@@ -60,6 +60,8 @@ else
 fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=formal/kani/oom.sh
+source "$here/oom.sh"
 root="$(cd "$here/../.." && pwd)"
 # Linux-only by design: the hard cap needs /proc/meminfo and util-linux setsid
 # (memguard.sh). Fail closed rather than run a harness with no memory cap.
@@ -97,6 +99,11 @@ for h in "${HARNESSES[@]}"; do
     timeout "$HARNESS_TIMEOUT" "${timer[@]}" cargo kani "${UNWIND_ARGS[@]}" --harness "$h" 2>&1 | tee "$log" || rc=$?
   sampled_kb="$(cat "$peakfile" 2>/dev/null || echo 0)"
   rm -f "$peakfile"
+  # A kernel-limit refusal (RLIMIT_DATA -> ENOMEM) exits with the tool's own
+  # status, not 125; its allocator diagnostic makes it a memory failure too.
+  if [[ $rc -ne 0 && $rc -ne 124 && $rc -ne 125 ]] && alloc_oom_in "$log"; then
+    rc=125
+  fi
   if [[ $rc -eq 125 ]]; then
     echo "::endgroup::"
     echo "::error::kani $h killed at peak RSS $((sampled_kb / 1024)) MiB: over the hard cap of ${MAX_RSS_PCT}% of host memory ($((cap_kb / 1024)) MiB); shrink the bound"

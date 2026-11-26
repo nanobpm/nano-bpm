@@ -67,6 +67,10 @@ Each harness is boxed by `check.sh`:
   own process group, samples the group's total RSS every second and kills it
   the moment it crosses the cap, failing the leg cleanly with a
   `memory` record (`kani <harness> killed at peak RSS …: over the hard cap`).
+  An allocation the kernel limit refuses exits with the tool's own status, so
+  `check.sh` also records `memory` when the output carries an allocator OOM
+  diagnostic (CBMC `Out of memory`, `std::bad_alloc`, …; the one definition is
+  `formal/kani/oom.sh`, exercised by the self-check).
   A post-exit check alone could never fire on a harness that exhausts memory,
   because the OOM killer takes the runner down first and nothing is reported.
   Peak RSS (exact via `/usr/bin/time -v` when installed, else the sample) is

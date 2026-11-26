@@ -6,6 +6,8 @@
 # Kani workflow before any harness, so a broken guard is reported, not silent.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=formal/kani/oom.sh
+source "$here/oom.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -34,6 +36,13 @@ peak="$(cat "$tmp/peak")"
 rc=0
 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- python3 -c 'a = bytearray(2 << 30); a[::4096] = b"x" * len(a[::4096])' 2>"$tmp/err" || rc=$?
 [[ $rc -ne 0 ]] || { echo "selftest: 2 GiB burst under a 256 MiB cap succeeded" >&2; exit 1; }
+# check.sh must classify this refusal as a memory failure, not a plain error.
+alloc_oom_in "$tmp/err" || { echo "selftest: burst refusal not recognised as allocator OOM" >&2; cat "$tmp/err" >&2; exit 1; }
+for msg in 'Out of memory' 'memory allocation of 1048576 bytes failed' 'terminate called after throwing an instance of '"'"'std::bad_alloc'"'"; do
+  echo "$msg" > "$tmp/oom"; alloc_oom_in "$tmp/oom" || { echo "selftest: '$msg' not recognised as allocator OOM" >&2; exit 1; }
+done
+echo 'error[E0425]: cannot find value' > "$tmp/oom"
+! alloc_oom_in "$tmp/oom" || { echo "selftest: ordinary error misread as allocator OOM" >&2; exit 1; }
 burst="$(cat "$tmp/peak")"
 (( burst <= 256 * 1024 )) || { echo "selftest: burst reached ${burst} kB, above the cap" >&2; exit 1; }
 
