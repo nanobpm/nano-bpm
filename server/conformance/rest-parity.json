@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared REST parity fixtures (#2020). Every fixture is sent to BOTH the native gateway router (server/src/wasm_conformance_tests.rs) and the engine-wasm handle() driver (engine-wasm/src/gateway_tests.rs), each on a fresh engine with conformance-service.bpmn (process `conformance-service`) deployed first. Both must answer `status`; a rejection must carry the same problem (native ProblemDetail title/detail, or for a non-JSON native body its text as the wasm detail); `compare` lists JSON pointers whose success-body values must be identical; `instancesAfter` is the process-instance count afterwards (a rejected mutation executes nothing). `setup` (optional) lists requests run on both sides after the deploy, each expected to answer 200. `contentType: null` sends no Content-Type header. {{BPMN}} is conformance-service.bpmn. `titleGap` records a tracked native title that bypasses the shared engine-core problem mapping; it must reproduce exactly and may only be removed.",
+  "_comment": "Shared REST parity fixtures (#2020). Every fixture is sent to BOTH the native gateway router (server/src/wasm_conformance_tests.rs) and the engine-wasm handle() driver (engine-wasm/src/gateway_tests.rs), each on a fresh engine with conformance-service.bpmn (process `conformance-service`) deployed first. Both must answer `status`; a rejection must carry the same problem (native ProblemDetail title/detail, or for a non-JSON native body its text as the wasm detail); `compare` lists JSON pointers whose success-body values must be identical; `instancesAfter` is the process-instance count afterwards (a rejected mutation executes nothing). `setup` (optional) lists requests run on both sides after the deploy, each expected to answer 200. `contentType: null` sends no Content-Type header. {{BPMN}} is conformance-service.bpmn. `titleGap` records a tracked native title that bypasses the shared engine-core problem mapping; it must reproduce exactly and may only be removed. A non-JSON native rejection must equal the wasm detail verbatim unless `bodyGap` records the exact tracked native text / wasm detail pair (same rule).",
   "fixtures": [
     {
       "name": "create-instance-missing-content-type",
@@ -86,7 +86,12 @@
       "body": "{",
       "status": 400,
       "instancesAfter": 0,
-      "compare": []
+      "compare": [],
+      "bodyGap": {
+        "issue": "https://github.com/nanobpm/nano-bpm/issues/2034",
+        "native": "Failed to parse the request body as JSON: EOF while parsing an object at line 1 column 1",
+        "wasm": "invalid request body: EOF while parsing an object at line 1 column 1"
+      }
     },
     {
       "name": "complete-job-empty-body-no-content-type",
@@ -216,7 +221,12 @@
       "body": "{}",
       "status": 400,
       "instancesAfter": 0,
-      "compare": []
+      "compare": [],
+      "bodyGap": {
+        "issue": "https://github.com/nanobpm/nano-bpm/issues/2034",
+        "native": "Invalid `boundary` for `multipart/form-data` request",
+        "wasm": "createDeployment: expected a multipart/form-data body with a boundary"
+      }
     }
   ]
 }

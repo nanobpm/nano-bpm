@@ -1181,40 +1181,46 @@ async fn rest_parity_fixtures_agree_between_server_and_wasm() {
             assert_eq!(w.content_type, "application/problem+json", "{name}");
             let wp: J = serde_json::from_str(&w.body).expect("wasm problem");
             assert_eq!(wp["status"].as_u64(), Some(u64::from(status)), "{name}");
-            match serde_json::from_str::<J>(&n.body) {
+            if n.content_type.contains("json") {
                 // Native answered a ProblemDetail: same title and detail.
-                Ok(np) if n.content_type.contains("json") => {
-                    assert_eq!(
-                        wp["detail"], np["detail"],
-                        "{name}: problem detail (wasm vs native)"
-                    );
-                    match f.get("titleGap") {
-                        // A tracked native title that bypasses the shared
-                        // engine-core mapping: it must still differ exactly
-                        // as recorded, so the fix shrinks the fixture.
-                        Some(gap) => assert_eq!(
-                            (&np["title"], &wp["title"]),
-                            (&gap["native"], &gap["wasm"]),
-                            "{name}: titleGap ({}) changed — update the fixture",
-                            s(&gap["issue"])
-                        ),
-                        None => assert_eq!(
-                            wp["title"], np["title"],
-                            "{name}: problem title (wasm vs native)"
-                        ),
-                    }
+                let np: J = serde_json::from_str(&n.body)
+                    .unwrap_or_else(|e| panic!("{name}: native JSON error body: {e}"));
+                assert_eq!(
+                    wp["detail"], np["detail"],
+                    "{name}: problem detail (wasm vs native)"
+                );
+                match f.get("titleGap") {
+                    // A tracked native title that bypasses the shared
+                    // engine-core mapping: it must still differ exactly
+                    // as recorded, so the fix shrinks the fixture.
+                    Some(gap) => assert_eq!(
+                        (&np["title"], &wp["title"]),
+                        (&gap["native"], &gap["wasm"]),
+                        "{name}: titleGap ({}) changed — update the fixture",
+                        s(&gap["issue"])
+                    ),
+                    None => assert_eq!(
+                        wp["title"], np["title"],
+                        "{name}: problem title (wasm vs native)"
+                    ),
                 }
+            } else {
                 // A transport-level native rejection (axum extractor, plain
-                // text): the wasm problem's detail carries the same text —
-                // asserted where the text is stable (the 415).
-                _ if status == 415 => {
-                    assert_eq!(
+                // text): fail closed — the wasm detail must carry the same
+                // text, unless the fixture records the exact gap.
+                match f.get("bodyGap") {
+                    Some(gap) => assert_eq!(
+                        (n.body.as_str(), s(&wp["detail"]).as_str()),
+                        (s(&gap["native"]).as_str(), s(&gap["wasm"]).as_str()),
+                        "{name}: bodyGap ({}) changed — update the fixture",
+                        s(&gap["issue"])
+                    ),
+                    None => assert_eq!(
                         s(&wp["detail"]),
                         n.body,
-                        "{name}: 415 detail (wasm vs native)"
-                    );
+                        "{name}: plain-text detail (wasm vs native)"
+                    ),
                 }
-                _ => {}
             }
         } else {
             for pointer in f["compare"].as_array().expect("compare") {
