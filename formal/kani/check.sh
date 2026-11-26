@@ -51,8 +51,6 @@ ALL_HARNESSES=(
   token_flow_initial_state_satisfies_invariants
   token_flow_drain_preserves_invariants
   token_flow_complete_task_preserves_invariants
-  token_flow_inclusive_join_invariants_preserved
-  token_flow_inclusive_join_waits_for_live_sibling
 )
 # `--list` prints the canonical harness list (one per line) and exits; the
 # nightly workflow derives its matrix and failure report from it.

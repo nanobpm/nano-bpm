@@ -21,8 +21,10 @@
 //! Compiled only for tests and Kani: it is a model, not an engine path, so it
 //! cannot drift production behaviour. The unit tests (`token_flow/tests.rs`)
 //! run it over many random graphs and step sequences; the Kani harnesses
-//! (`token_flow/kani_proofs.rs`) prove the invariants for every graph and step
-//! sequence within a small bound.
+//! (`token_flow/kani_proofs.rs`) prove them inductively — the initial state
+//! satisfies them and one step from any bounded state satisfying them
+//! preserves them — with the inclusive join's active-path search as an oracle
+//! (see [`active_path`]).
 
 use super::completion_step::{self, ActivationRoute, CompletionKind, CompletionRoute, Phase};
 use super::gateway_route::{self, Guard, Route};
@@ -225,11 +227,13 @@ fn complete_and_route(graph: &Graph, s: &mut TokenState, slot: usize, guards: &[
 }
 
 /// Capacity of the live-source list: one per instance slot and per flow.
+#[cfg(not(kani))]
 const LIVE: usize = SLOTS + FLOWS;
 
 /// The live sources of `has_active_path` — active instances and the targets
 /// of queued activations — in a fixed-capacity array (no `Vec` growth for
 /// Kani to model); returns the array and its length.
+#[cfg(not(kani))]
 fn live_sources(graph: &Graph, s: &TokenState) -> ([usize; LIVE], usize) {
     let mut live = [0usize; LIVE];
     let mut n = 0;
@@ -274,24 +278,40 @@ fn join_fires(graph: &Graph, s: &TokenState, j: usize) -> bool {
     match join_guard::join_decision(kind, taken, count) {
         JoinDecision::Accept => true,
         JoinDecision::Reject => false,
-        JoinDecision::AcceptUnlessActivePath => {
-            // `has_active_path` takes the engine's adjacency (`&[Vec<_>]`).
-            // Each list is pre-sized to `FLOWS`, so building it never
-            // reallocates (no growth path for Kani to explore).
-            let mut succ: [Vec<(usize, usize)>; NODES] = [
-                Vec::with_capacity(FLOWS),
-                Vec::with_capacity(FLOWS),
-                Vec::with_capacity(FLOWS),
-            ];
-            let mut g = 0;
-            while g < FLOWS {
-                succ[graph.src[g]].push((graph.tgt[g], g));
-                g += 1;
-            }
-            let (live, n) = live_sources(graph, s);
-            !join_guard::has_active_path(&succ, &live[..n], j, &s.arrivals)
-        }
+        JoinDecision::AcceptUnlessActivePath => !active_path(graph, s, j),
     }
+}
+
+/// `has_active_path` over the machine's live sources: can a live token still
+/// reach one of `j`'s untaken incoming flows?
+#[cfg(not(kani))]
+fn active_path(graph: &Graph, s: &TokenState, j: usize) -> bool {
+    // `has_active_path` takes the engine's adjacency (`&[Vec<_>]`).
+    let mut succ: [Vec<(usize, usize)>; NODES] = [
+        Vec::with_capacity(FLOWS),
+        Vec::with_capacity(FLOWS),
+        Vec::with_capacity(FLOWS),
+    ];
+    let mut g = 0;
+    while g < FLOWS {
+        succ[graph.src[g]].push((graph.tgt[g], g));
+        g += 1;
+    }
+    let (live, n) = live_sources(graph, s);
+    join_guard::has_active_path(&succ, &live[..n], j, &s.arrivals)
+}
+
+/// Under Kani the active-path search is an unconstrained oracle: a sound
+/// over-approximation, since the token invariants must hold whichever way the
+/// inclusive join decides. The search itself is proved against its
+/// specification by `inclusive_join_ready_iff_no_active_path` /
+/// `join_ready_kernel_total_and_exact` (`join_guard/kani_proofs.rs`), and the
+/// machine runs the real kernel in the unit tests. Keeping the kernel's BFS
+/// (and its `Vec` queue) out of these formulas is what lets them fit the CI
+/// box (#2050).
+#[cfg(kani)]
+fn active_path(_graph: &Graph, _s: &TokenState, _j: usize) -> bool {
+    kani::any()
 }
 
 /// Applies one action; on `Err` the state is unchanged.
