@@ -282,6 +282,7 @@ pub(crate) const ROUTES: &[Route] = &[
         "/incidents/search",
         "searchIncidents",
         200,
+        BodyKind::OptionalJson,
         Op::SearchIncidents,
     ),
     route(
