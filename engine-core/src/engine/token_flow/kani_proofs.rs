@@ -3,12 +3,15 @@
 //!
 //! Compiled only under `cargo kani` (`cfg(kani)`). See `formal/kani/README.md`.
 //!
-//! The invariants are proved *inductively*, one transition per harness, so no
+//! The invariants are proved one transition per harness, so no
 //! harness unrolls a multi-step run: the initial state satisfies them
 //! (`token_flow_initial_state_satisfies_invariants`), and from **any** bounded
 //! state that satisfies them one drain
 //! (`token_flow_drain_preserves_invariants`) or one task completion
-//! (`token_flow_complete_task_preserves_invariants`) preserves them. The
+//! (`token_flow_complete_task_preserves_invariants`) preserves them. This is
+//! single-step preservation from bounded pre-states only: the bounded domain
+//! is not closed under transitions (a step can exceed the per-flow count
+//! bound), so it is not a closed induction over every run. The
 //! inclusive join's active-path search is an oracle here (see
 //! `token_flow::active_path`); the search is proved in `join_guard`.
 

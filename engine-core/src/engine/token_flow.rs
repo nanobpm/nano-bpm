@@ -21,9 +21,10 @@
 //! Compiled only for tests and Kani: it is a model, not an engine path, so it
 //! cannot drift production behaviour. The unit tests (`token_flow/tests.rs`)
 //! run it over many random graphs and step sequences; the Kani harnesses
-//! (`token_flow/kani_proofs.rs`) prove them inductively — the initial state
-//! satisfies them and one step from any bounded state satisfying them
-//! preserves them — with the inclusive join's active-path search as an oracle
+//! (`token_flow/kani_proofs.rs`) prove the base case and single-step
+//! preservation from any bounded pre-state satisfying them (the bounded
+//! domain is not closed under transitions, so this is not a closed induction
+//! over every run) — with the inclusive join's active-path search as an oracle
 //! (see [`active_path`]).
 
 use super::completion_step::{self, ActivationRoute, CompletionKind, CompletionRoute, Phase};
