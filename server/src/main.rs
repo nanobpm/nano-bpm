@@ -55776,18 +55776,32 @@ mod subscription_placement_tests {
             .engine_handle_for(nanobpmn_engine_core::partition_of(instance))
             .unwrap();
         assert!(
-            !instance_engine
-                .with(move |journal| journal.engine().is_completed(instance))
-                .await
+            instance_engine
+                .with(move |journal| journal
+                    .engine()
+                    .instance(instance)
+                    .is_some_and(|i| i.state == ProcessInstanceState::Active))
+                .await,
+            "the instance still waits after the first pass"
         );
         // …but one still unacknowledged on the next pass is, and settles.
         server.redrive_stalled_buffered_deliveries().await;
-        assert!(
-            instance_engine
-                .with(move |journal| journal.engine().is_completed(instance))
-                .await,
-            "the re-driven delivery completed the instance"
-        );
+        // Observe completion through the read model, not hot engine state: once
+        // the instance completes and its receipt settles, the owner evicts the
+        // terminal instance from the engine, where `is_completed` then reads
+        // `false` for an instance that DID complete.
+        let mut completed = false;
+        for _ in 0..500 {
+            completed = server
+                .store
+                .process_instance(instance)
+                .is_some_and(|r| r.state == ProcessInstanceState::Completed);
+            if completed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(completed, "the re-driven delivery completed the instance");
         assert!(server.in_flight_buffered_deliveries().await.is_empty());
         assert!(
             message_engine
