@@ -1940,6 +1940,12 @@ impl Journal {
         self.replicated_apply = replicated;
     }
 
+    /// Whether this journal is marked as applied under replicated (Raft)
+    /// state-machine application (see [`set_replicated_apply`](Self::set_replicated_apply)).
+    pub fn replicated_apply(&self) -> bool {
+        self.replicated_apply
+    }
+
     /// Wires the engine-actor → Raft-leader propose channel (#1447). Called by
     /// the replication layer when this journal drives a Raft state machine.
     pub fn set_orphan_sink(&mut self, sink: Arc<dyn OrphanSink>) {

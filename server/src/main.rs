@@ -4066,6 +4066,11 @@ impl ServerImpl {
         // activation is leader-local and so needs the digest to cover failover).
         let lease_digest = activation_policy.broadcasts_lease_digest();
         for journal in journals.iter_mut() {
+            // #2054: mark a Raft journal replicated BEFORE any envelope setter or
+            // local command (demo seed, lenient reconcile) runs, independently of
+            // the optional spill / lean-snapshot setup, so the capability
+            // envelopes can only ever be armed inside a Raft entry.
+            journal.set_replicated_apply(raft_enabled());
             journal.set_num_partitions(topology.num_partitions);
             // Leader-local activation (any policy that can lock leader-only) needs
             // lenient completion: a completion for a job whose (unreplicated) lock
@@ -22187,6 +22192,9 @@ impl ServerImpl {
             return None;
         };
         let mut journal = Journal::in_memory_partition(p);
+        // #2054: a replica engine only ever exists under Raft, so it is always a
+        // replicated-apply journal — regardless of whether spill is configured.
+        journal.set_replicated_apply(true);
         journal.set_num_partitions(self.engine.topology().num_partitions);
         // The REPLICATED lenient flag is not configured here (#1661): this
         // replica learns it from the Raft log / snapshot at exactly the index
@@ -51095,6 +51103,13 @@ mod clustered_startup_tests {
         assert!(
             !bare.with(|j| j.cold_spill_configured()).await,
             "no spill configured => replica has no cold store"
+        );
+        // #2054: even without spill, a replica is a replicated-apply journal, so
+        // its capability envelopes can only be armed inside a Raft entry (the
+        // journal-level refusal is pinned in nano-server-storage's tests).
+        assert!(
+            bare.with(|j| j.replicated_apply()).await,
+            "a replica engine without spill must still be a replicated-apply journal"
         );
 
         // Configure spill (in-memory store) as startup would, then a freshly
