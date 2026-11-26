@@ -26,6 +26,9 @@
 # OUTDIR/bin/<tag>/nanobpm-gateway-rest-server is reused when present, so CI
 # caches OUTDIR/bin keyed by the tag.
 set -euo pipefail
+# Command substitutions ($(cmd_build_old ...)) run with errexit OFF unless this
+# is set: without it a failed build could fall through and cache a stale binary.
+shopt -s inherit_errexit
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_NAME=nanobpm-gateway-rest-server

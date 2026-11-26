@@ -69,12 +69,16 @@ impl Bin {
     }
 }
 
-fn reserve_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Reserve `n` distinct free ports. Every listener stays bound until all `n`
+/// are allocated, so the OS cannot hand the same port out twice.
+fn reserve_ports(n: usize) -> Vec<u16> {
+    let listeners: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())
+        .collect();
+    listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect()
 }
 
 /// One cluster member's fixed identity (port, data dir, log file) across
@@ -108,7 +112,7 @@ impl Cluster {
                 std::process::id()
             ));
         std::fs::create_dir_all(&root).unwrap();
-        let ports: Vec<u16> = (0..NODES).map(|_| reserve_port()).collect();
+        let ports = reserve_ports(NODES);
         let nodes = ports
             .iter()
             .map(|p| format!("http://127.0.0.1:{p}"))
