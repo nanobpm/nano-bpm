@@ -60,7 +60,10 @@ Each harness is boxed by `check.sh`:
 - **Memory (hard cap, #2040):** `KANI_MAX_RSS_PCT` (default 60) percent of
   host memory is enforced *while the harness runs*: `formal/kani/memguard.sh`
   first sets a kernel-backed `RLIMIT_DATA` of the cap on every process (so a
-  burst allocation fails in the kernel, between samples), then runs it in its
+  burst allocation fails in the kernel, between samples) and, where a
+  transient systemd scope can be created (user manager or passwordless
+  `sudo`), an aggregate cgroup `MemoryMax` of cap + 25% with no swap, so
+  concurrent sub-cap bursts cannot sum past it either; then it runs it in its
   own process group, samples the group's total RSS every second and kills it
   the moment it crosses the cap, failing the leg cleanly with a
   `memory` record (`kani <harness> killed at peak RSS …: over the hard cap`).
@@ -71,7 +74,8 @@ Each harness is boxed by `check.sh`:
   and a harness over the cap **fails even if it proved**.
   `formal/kani/memguard-selftest.sh` (run in every leg before the harness)
   proves both layers: a slow tree-wide overrun is killed by the sampler, and a
-  single 2 GiB burst is refused by the kernel limit.
+  single 2 GiB burst is refused by the kernel limit, and (when scoped) four
+  concurrent 200 MiB bursts are stopped by the cgroup limit.
 
 The per-run cost is in each leg's job summary. A harness that passes on one run
 and is killed on the next is a defect in the harness bound, not a flaky test:

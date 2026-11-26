@@ -21,7 +21,7 @@ time.sleep(30)'
 tree="for i in 1 2 3 4; do python3 -c '$hog' & done; wait"
 
 rc=0
-"$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c "$tree" 2>"$tmp/err" || rc=$?
+MEMGUARD_INTERVAL=0.1 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c "$tree" 2>"$tmp/err" || rc=$?
 [[ $rc -eq 125 ]] || { echo "selftest: oversized workload exited $rc, want 125" >&2; cat "$tmp/err" >&2; exit 1; }
 grep -q 'memguard: .* exceeded cap 256 MiB' "$tmp/err" || { echo "selftest: no cap message" >&2; cat "$tmp/err" >&2; exit 1; }
 peak="$(cat "$tmp/peak")"
@@ -34,6 +34,20 @@ rc=0
 [[ $rc -ne 0 ]] || { echo "selftest: 2 GiB burst under a 256 MiB cap succeeded" >&2; exit 1; }
 burst="$(cat "$tmp/peak")"
 (( burst <= 256 * 1024 )) || { echo "selftest: burst reached ${burst} kB, above the cap" >&2; exit 1; }
+
+# Concurrent sub-cap bursts: four processes each touch 200 MiB at once (each
+# inside RLIMIT_DATA) for ~800 MiB in total, faster than one sample. Only the
+# aggregate cgroup limit can stop this; it must end non-zero with a bounded
+# peak. Skipped (with a notice) where no transient scope can be created.
+if grep -q 'no transient cgroup scope' "$tmp/err"; then
+  echo "selftest: no cgroup scope on this host; concurrent-burst check skipped" >&2
+else
+  conc='import time
+a = bytearray(200 << 20); a[::4096] = b"x" * len(a[::4096]); time.sleep(3)'
+  rc=0
+  MEMGUARD_INTERVAL=5 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c "rc=0; for i in 1 2 3 4; do python3 -c '$conc' & p=\"\$p \$!\"; done; for q in \$p; do wait \$q || rc=1; done; exit \$rc" 2>"$tmp/err" || rc=$?
+  [[ $rc -ne 0 ]] || { echo "selftest: concurrent ~800 MiB burst under a 256 MiB cap succeeded" >&2; cat "$tmp/err" >&2; exit 1; }
+fi
 
 rc=0
 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c 'exit 7' || rc=$?
