@@ -202,6 +202,9 @@ test('corpusProblems: a frozen scenario must still be a current-Reference behavi
   assert.ok(rederive(ok), 'a freshly recorded case re-derives')
   const staleExpect = { ...ok, scenario: { ...ok.scenario, expect: { ...ok.scenario.expect, completed: !ok.scenario.expect.completed } } }
   assert.match(corpusProblems([staleExpect])[0], /frozen "expect" is stale/)
+  // A stale frozen `run` feeds the spec oracle a non-Reference behaviour (#2004).
+  const staleRun = { ...ok, scenario: { ...ok.scenario, run: { ...ok.scenario.run, completed: !ok.scenario.run.completed } } }
+  assert.match(corpusProblems([staleRun])[0], /frozen "run" is stale/)
   const unreachable = { ...ok, scenario: { ...ok.scenario, steps: [...ok.scenario.steps, { op: 'completeOneJob', jobType: 'NoSuchTask' }] } }
   assert.match(corpusProblems([unreachable])[0], /no longer a behaviour of the current Reference/)
 })

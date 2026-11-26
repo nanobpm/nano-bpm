@@ -46543,12 +46543,14 @@ mod clustered_startup_tests {
         // upgrade also opened the cluster-wide #1949 gate, so the entries
         // committed since carry ack-paced remote delivery and require that
         // capability too (one-way, like lenience) — and likewise latched the
-        // #2037 v2 ack output, so v2 is required as well.
+        // #2037 v2 ack output and the #2004 event-gateway runtime, so both
+        // are required as well.
         assert_eq!(
             n0.required_cluster_features().await,
             Some(vec![
                 F,
                 nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
+                nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME,
                 nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
             ])
         );
