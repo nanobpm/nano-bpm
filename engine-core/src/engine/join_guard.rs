@@ -2,8 +2,7 @@
 //! parallel or inclusive join over a dense, index-based graph view.
 //!
 //! This module is the *decision* half of the join guard; the *gathering* half
-//! (live-source set, scope filtering, the #1989 doomed-boundary substitution,
-//! in-transit activations, the id → index mapping) stays in
+//! (live-source set, scope filtering, in-transit activations, the id → index mapping) stays in
 //! [`Engine::has_active_path_to`](super::Engine) and `activate_join`. Keep this
 //! module dependency-free and in the subset Aeneas extracts (see AGENTS.md,
 //! "Write Provable Code"): it is the only input of the Charon/Aeneas extraction

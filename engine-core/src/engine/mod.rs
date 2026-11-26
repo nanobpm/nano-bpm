@@ -334,12 +334,6 @@ pub struct Engine {
     /// before the next, mirroring Zeebe's one-TRIGGER-command-per-timer
     /// processing. Per-command scratch: cleared by every `plan_command_at`.
     pending_timer_fires: VecDeque<PendingTimerFire>,
-    /// Inclusive-join arrivals of the current `TriggerTimers` batch held back
-    /// only by elements a still-pending timer of the batch fires on (#2018).
-    /// The fixpoint loop re-runs each once every timer of the batch has fired,
-    /// as Zeebe runs the join's ACTIVATE after all the batch's TRIGGERs.
-    /// Per-command scratch: cleared by every `plan_command_at`.
-    deferred_join_arrivals: VecDeque<DeferredJoinArrival>,
     /// Log index from which the fixpoint loop still has to look for freshly
     /// opened message subscriptions that may correlate a **buffered** message
     /// (#1874). Per-command scratch: reset by every `plan_command_at`.
@@ -387,26 +381,6 @@ pub struct Engine {
     /// its key into the new window. Keeps an N-timer batch linear instead of
     /// rescanning the growing prefix after every fire. Per-command scratch.
     sweep_from: usize,
-}
-
-/// An inclusive-join arrival held back until its `TriggerTimers` batch has
-/// fired (#2018); re-run as a [`Step::Activate`] over the same flow.
-#[derive(Clone, Debug)]
-struct DeferredJoinArrival {
-    instance_key: Key,
-    element_id: String,
-    scope: Key,
-    via: Option<IncomingFlow>,
-}
-
-/// Which state an inclusive join's live-path guard reads (#2018).
-#[derive(Clone, Copy, Debug)]
-enum BatchDueView {
-    /// The engine's current state.
-    Live,
-    /// As if every timer still due in the current `TriggerTimers` batch had
-    /// fired: the elements those fires end are no longer live sources.
-    AfterBatch,
 }
 
 /// One due timer awaiting its fire in a `TriggerTimers` batch (#1712).
@@ -840,7 +814,6 @@ impl Engine {
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
-            deferred_join_arrivals: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
             pending_correlation_ack: None,
@@ -1108,7 +1081,6 @@ impl Engine {
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
-            deferred_join_arrivals: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
             pending_correlation_ack: None,
@@ -2859,7 +2831,6 @@ impl Engine {
         self.esp_start_payloads.clear();
         self.boundary_payloads.clear();
         self.pending_timer_fires.clear();
-        self.deferred_join_arrivals.clear();
         self.buffer_scan_from = 0;
         self.buffer_requeue.clear();
         self.pending_correlation_ack = None;
@@ -7662,52 +7633,6 @@ impl Engine {
                     PendingTimerFire::Timer(key) => self.fire_due_timer(log, &mut queue, key),
                     PendingTimerFire::Start(key) => self.fire_start_timer(log, &mut queue, key),
                 }
-                // The batch's last TRIGGER is written: guard the held-back
-                // inclusive-join arrivals again (#2018) AHEAD of this fire's
-                // downstream work, preserving Zeebe's first-in first-out order
-                // (each held-back ACTIVATE was queued before this fire's
-                // follow-ups), so a token still in transit from this fire is a
-                // live path to them rather than already consumed (r4703480366).
-                // Released per instance: once no timer of the batch still due
-                // targets an arrival's instance, the `AfterBatch` view it was
-                // held back under is the live state, so an unrelated later
-                // timer (another instance's, a process-start timer) must not
-                // delay it past this fire's downstream work (r4703550842).
-                // Known divergence (deferred): when an interrupting boundary
-                // fires LAST in the batch, its host is already removed and the
-                // queued boundary activation (`via: None`) is invisible to
-                // `has_active_path_to`, so a boundary feeding the join can let
-                // it fire once per arrival instead of once (r4703550889). The
-                // Zeebe-faithful batch restructure is tracked in
-                // https://github.com/nanobpm/nano-bpm/issues/2024.
-                // No held-back arrivals (the common case, e.g. a timer
-                // backlog with no inclusive join): skip the scan of the
-                // remaining batch so an N-timer tick stays linear (r4703759191).
-                if !self.deferred_join_arrivals.is_empty() {
-                    let still_due: BTreeSet<Key> = self
-                        .pending_timer_fires
-                        .iter()
-                        .filter_map(|fire| match fire {
-                            PendingTimerFire::Timer(key) => self.state.timers.get(key),
-                            PendingTimerFire::Start(_) => None,
-                        })
-                        .map(|t| t.instance_key)
-                        .collect();
-                    let (held, released): (VecDeque<_>, VecDeque<_>) = self
-                        .deferred_join_arrivals
-                        .drain(..)
-                        .partition(|d| still_due.contains(&d.instance_key));
-                    self.deferred_join_arrivals = held;
-                    for d in released.into_iter().rev() {
-                        queue.push_front(Step::Activate {
-                            instance_key: d.instance_key,
-                            element_id: d.element_id,
-                            scope: d.scope,
-                            via: d.via,
-                            race: None,
-                        });
-                    }
-                }
                 if log.len() > fired_from {
                     if let Drive::Pause = driver.after_step(&log[fired_from..]) {
                         return Some(Paused { queue, cursor });
@@ -7715,10 +7640,6 @@ impl Engine {
                 }
                 continue;
             }
-            debug_assert!(
-                self.deferred_join_arrivals.is_empty(),
-                "held-back join arrivals are re-queued with the batch's last fire (#2018)"
-            );
             self.debug_assert_join_bookkeeping_coherent(log);
             return None;
         }
@@ -18951,46 +18872,15 @@ impl Engine {
         ) {
             join_guard::JoinDecision::Accept => true,
             join_guard::JoinDecision::Reject => false,
-            join_guard::JoinDecision::AcceptUnlessActivePath => !self.has_active_path_to(
-                instance_key,
-                &element_id,
-                scope,
-                &arrivals,
-                pending,
-                BatchDueView::Live,
-            ),
+            join_guard::JoinDecision::AcceptUnlessActivePath => {
+                !self.has_active_path_to(instance_key, &element_id, scope, &arrivals, pending)
+            }
         };
 
         let open = self.join_eik(instance_key, scope, &element_id);
         if !accepted {
             if taken > 0 && open.is_none() {
                 self.open_join(instance_key, &element_id, scope, &mut events);
-            }
-            // #2018: Zeebe writes every TRIGGER of a timer batch before the
-            // join's ACTIVATE commands run, so an inclusive arrival held back
-            // ONLY by elements a still-pending timer of this batch fires on
-            // (a due catch, an activity a due interrupting boundary dooms) is
-            // guarded again once the batch has fired, against the state those
-            // fires leave — rather than parked against tokens Zeebe never sees.
-            if matches!(join, JoinKind::Inclusive)
-                && taken > 0
-                && via.is_some()
-                && !self.pending_timer_fires.is_empty()
-                && !self.has_active_path_to(
-                    instance_key,
-                    &element_id,
-                    scope,
-                    &arrivals,
-                    pending,
-                    BatchDueView::AfterBatch,
-                )
-            {
-                self.deferred_join_arrivals.push_back(DeferredJoinArrival {
-                    instance_key,
-                    element_id,
-                    scope,
-                    via,
-                });
             }
             return (events, Vec::new());
         }
@@ -19099,7 +18989,6 @@ impl Engine {
         scope: Key,
         taken: &state::FlowArrivals,
         pending: &VecDeque<Step>,
-        batch: BatchDueView,
     ) -> bool {
         let (Some(process), Some(instance)) = (
             self.process_of_instance(instance_key),
@@ -19107,29 +18996,11 @@ impl Engine {
         ) else {
             return false;
         };
-        // In the `AfterBatch` view (#2018) every element a timer still due in
-        // the current batch will fire on — a due timer catch, an activity an
-        // interrupting boundary timer dooms — is gone, together with the
-        // tokens its fire spawns: those TRIGGERs precede the join's ACTIVATE.
-        let gone: BTreeSet<Key> = match batch {
-            BatchDueView::Live => BTreeSet::new(),
-            BatchDueView::AfterBatch => self.fired_by_due_timers(instance_key),
-        };
-        // An activity whose interrupting boundary timer is due in the current
-        // `TriggerTimers` batch is already doomed (#1989): Zeebe's guard for an
-        // arrival caused by an earlier timer of the batch sees it torn down
-        // (both TRIGGERs precede the join's ACTIVATE), so its token can only
-        // continue from the boundary event, never over the activity's own flow.
-        let doomed = self.doomed_by_due_boundary_timers(instance_key);
         let active = instance
             .active
             .iter()
             .filter(|(eik, id)| id.as_str() != join && self.scope_of(instance_key, **eik) == scope)
-            .filter(|(eik, _)| !gone.contains(*eik))
-            .flat_map(|(eik, id)| match doomed.get(eik) {
-                Some(sources) => sources.clone(),
-                None => vec![id.as_str()],
-            });
+            .map(|(_, id)| id.as_str());
         let in_transit = pending.iter().filter_map(|step| match step {
             Step::Activate {
                 instance_key: key,
@@ -19155,74 +19026,6 @@ impl Engine {
             .filter_map(|source| graph.index_of(source))
             .collect();
         join_guard::has_active_path(&graph.succ, &live, graph.join, &graph.taken)
-    }
-
-    /// The element instances of `instance_key` a timer still due in the
-    /// current `TriggerTimers` batch ends when it fires (#2018): a timer catch
-    /// completes, an activity is torn down by an interrupting boundary (the
-    /// activities of [`Engine::doomed_by_due_boundary_timers`]).
-    fn fired_by_due_timers(&self, instance_key: Key) -> BTreeSet<Key> {
-        let mut gone: BTreeSet<Key> = self
-            .doomed_by_due_boundary_timers(instance_key)
-            .into_keys()
-            .collect();
-        gone.extend(
-            self.pending_timer_fires
-                .iter()
-                .filter_map(|fire| match fire {
-                    PendingTimerFire::Timer(key) => self.state.timers.get(key),
-                    PendingTimerFire::Start(_) => None,
-                })
-                .filter(|t| {
-                    t.instance_key == instance_key
-                        && t.state == state::TimerState::Created
-                        && matches!(t.kind, state::TimerKind::IntermediateCatch)
-                })
-                .map(|t| t.element_instance_key),
-        );
-        gone
-    }
-
-    /// The activities of `instance_key` an interrupting boundary timer still
-    /// due in the current `TriggerTimers` batch will tear down, each mapped to
-    /// the boundary events its tokens continue from (#1989): the non-interrupting
-    /// boundaries due before the first due interrupting one (queue order; they
-    /// fire and spawn a token first), then that interrupting boundary. Later
-    /// boundaries of the activity are cancelled by it and never fire.
-    fn doomed_by_due_boundary_timers(&self, instance_key: Key) -> BTreeMap<Key, Vec<&str>> {
-        let mut prior: BTreeMap<Key, Vec<&str>> = BTreeMap::new();
-        let mut doomed: BTreeMap<Key, Vec<&str>> = BTreeMap::new();
-        let due = self
-            .pending_timer_fires
-            .iter()
-            .filter_map(|fire| match fire {
-                PendingTimerFire::Timer(key) => self.state.timers.get(key),
-                PendingTimerFire::Start(_) => None,
-            })
-            .filter(|t| t.instance_key == instance_key && t.state == state::TimerState::Created);
-        for t in due {
-            let eik = t.element_instance_key;
-            if doomed.contains_key(&eik) {
-                continue;
-            }
-            match &t.kind {
-                state::TimerKind::NonInterruptingBoundary {
-                    boundary_element_id,
-                } => prior
-                    .entry(eik)
-                    .or_default()
-                    .push(boundary_element_id.as_str()),
-                state::TimerKind::InterruptingBoundary {
-                    boundary_element_id,
-                } => {
-                    let mut sources = prior.remove(&eik).unwrap_or_default();
-                    sources.push(boundary_element_id.as_str());
-                    doomed.insert(eik, sources);
-                }
-                _ => {}
-            }
-        }
-        doomed
     }
 
     /// A join fires: [`Event::ParallelJoinFired`] consumes one token per incoming

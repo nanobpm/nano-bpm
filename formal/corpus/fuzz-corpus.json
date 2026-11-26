@@ -3111,10 +3111,10 @@
           }
         ],
         "expect": {
-          "completed": true,
+          "completed": false,
           "jobsCreated": {
             "T2": 2,
-            "T1": 2
+            "T1": 1
           },
           "variables": {},
           "completedElements": {
@@ -3122,17 +3122,17 @@
             "G1": 1,
             "G3": 2,
             "B2": 2,
-            "G2": 2,
-            "B1": 2,
-            "E": 2
+            "G2": 1,
+            "B1": 1,
+            "E": 1
           },
           "sequenceFlows": {
             "S->G1": 1,
             "G1->G3": 2,
             "G3->T2": 2,
             "B2->G2": 2,
-            "G2->T1": 2,
-            "B1->E": 2
+            "G2->T1": 1,
+            "B1->E": 1
           }
         },
         "run": {
@@ -3152,20 +3152,20 @@
               ]
             ]
           },
-          "completed": true,
+          "completed": false,
           "cancelled": false,
           "jobsCreated": {
             "T2": 2,
-            "T1": 2
+            "T1": 1
           },
           "completedElements": {
             "S": 1,
             "G1": 1,
             "G3": 2,
             "B2": 2,
-            "G2": 2,
-            "B1": 2,
-            "E": 2
+            "G2": 1,
+            "B1": 1,
+            "E": 1
           },
           "takenFlows": {
             "f1": 1,
@@ -3173,11 +3173,11 @@
             "f2": 1,
             "f7": 2,
             "f9": 2,
-            "f4": 2,
-            "f6": 2
+            "f4": 1,
+            "f6": 1
           },
           "joinsFired": {
-            "G2": 2
+            "G2": 1
           }
         },
         "backends": [
@@ -3311,10 +3311,10 @@
           }
         ],
         "expect": {
-          "completed": true,
+          "completed": false,
           "jobsCreated": {
             "T2": 2,
-            "T1": 2
+            "T1": 1
           },
           "variables": {},
           "completedElements": {
@@ -3322,17 +3322,17 @@
             "G1": 1,
             "G3": 2,
             "B2": 2,
-            "G2": 2,
-            "B1": 2,
-            "E": 2
+            "G2": 1,
+            "B1": 1,
+            "E": 1
           },
           "sequenceFlows": {
             "S->G1": 1,
             "G1->G3": 2,
             "G3->T2": 2,
             "B2->G2": 2,
-            "G2->T1": 2,
-            "B1->E": 2
+            "G2->T1": 1,
+            "B1->E": 1
           }
         },
         "run": {
@@ -3352,20 +3352,20 @@
               ]
             ]
           },
-          "completed": true,
+          "completed": false,
           "cancelled": false,
           "jobsCreated": {
             "T2": 2,
-            "T1": 2
+            "T1": 1
           },
           "completedElements": {
             "S": 1,
             "G1": 1,
             "G3": 2,
             "B2": 2,
-            "G2": 2,
-            "B1": 2,
-            "E": 2
+            "G2": 1,
+            "B1": 1,
+            "E": 1
           },
           "takenFlows": {
             "f1": 1,
@@ -3373,11 +3373,11 @@
             "f2": 1,
             "f7": 2,
             "f9": 2,
-            "f4": 2,
-            "f6": 2
+            "f4": 1,
+            "f6": 1
           },
           "joinsFired": {
-            "G2": 2
+            "G2": 1
           }
         },
         "backends": [
@@ -3504,18 +3504,13 @@
           {
             "op": "completeOneJob",
             "jobType": "T2"
-          },
-          {
-            "op": "publishMessage",
-            "name": "Gen_2d18f93dc0_B2",
-            "correlationKey": "Gen_2d18f93dc0-shrinkr18x43-o64"
           }
         ],
         "expect": {
-          "completed": true,
+          "completed": false,
           "jobsCreated": {
             "T1": 1,
-            "T2": 2
+            "T2": 1
           },
           "variables": {
             "correlationKey": "Gen_2d18f93dc0-shrinkr18x43-o64"
@@ -3523,24 +3518,22 @@
           "completedElements": {
             "S": 1,
             "G1": 1,
-            "B1": 1,
             "W1": 1,
             "G3": 2,
-            "G2": 2,
+            "B1": 1,
+            "G2": 1,
             "T2": 1,
-            "E": 2,
-            "B2": 1
+            "E": 1
           },
           "sequenceFlows": {
             "S->G1": 1,
             "G1->W1": 1,
             "G1->T1": 1,
-            "B1->G3": 1,
             "W1->G3": 1,
             "G3->G2": 2,
-            "G2->T2": 2,
-            "T2->E": 1,
-            "B2->E": 1
+            "B1->G3": 1,
+            "G2->T2": 1,
+            "T2->E": 1
           }
         },
         "run": {
@@ -3551,11 +3544,6 @@
             {
               "op": "complete",
               "node": "T2"
-            },
-            {
-              "op": "correlateBoundary",
-              "node": "B2",
-              "task": "T2"
             }
           ],
           "route": {
@@ -3571,36 +3559,34 @@
               ]
             ]
           },
-          "completed": true,
+          "completed": false,
           "cancelled": false,
           "jobsCreated": {
             "T1": 1,
-            "T2": 2
+            "T2": 1
           },
           "completedElements": {
             "S": 1,
             "G1": 1,
-            "B1": 1,
             "W1": 1,
             "G3": 2,
-            "G2": 2,
+            "B1": 1,
+            "G2": 1,
             "T2": 1,
-            "E": 2,
-            "B2": 1
+            "E": 1
           },
           "takenFlows": {
             "f1": 1,
             "f5": 1,
             "f2": 1,
-            "f4": 1,
             "f6": 1,
             "f10": 2,
-            "f7": 2,
-            "f8": 1,
-            "f9": 1
+            "f4": 1,
+            "f7": 1,
+            "f8": 1
           },
           "joinsFired": {
-            "G2": 2
+            "G2": 1
           }
         },
         "backends": [
@@ -3756,18 +3742,13 @@
           {
             "op": "completeOneJob",
             "jobType": "T2"
-          },
-          {
-            "op": "publishMessage",
-            "name": "Gen_2d18f93dc0_B2",
-            "correlationKey": "Gen_2d18f93dc0-shrinkr18x82-o64"
           }
         ],
         "expect": {
-          "completed": true,
+          "completed": false,
           "jobsCreated": {
             "T1": 1,
-            "T2": 2
+            "T2": 1
           },
           "variables": {
             "correlationKey": "Gen_2d18f93dc0-shrinkr18x82-o64"
@@ -3775,24 +3756,22 @@
           "completedElements": {
             "S": 1,
             "G1": 1,
-            "B1": 1,
             "W1": 1,
             "G3": 2,
-            "G2": 2,
+            "B1": 1,
+            "G2": 1,
             "T2": 1,
-            "E": 2,
-            "B2": 1
+            "E": 1
           },
           "sequenceFlows": {
             "S->G1": 1,
             "G1->W1": 1,
             "G1->T1": 1,
-            "B1->G3": 1,
             "W1->G3": 1,
             "G3->G2": 2,
-            "G2->T2": 2,
-            "T2->E": 1,
-            "B2->E": 1
+            "B1->G3": 1,
+            "G2->T2": 1,
+            "T2->E": 1
           }
         },
         "run": {
@@ -3803,11 +3782,6 @@
             {
               "op": "complete",
               "node": "T2"
-            },
-            {
-              "op": "correlateBoundary",
-              "node": "B2",
-              "task": "T2"
             }
           ],
           "route": {
@@ -3823,36 +3797,34 @@
               ]
             ]
           },
-          "completed": true,
+          "completed": false,
           "cancelled": false,
           "jobsCreated": {
             "T1": 1,
-            "T2": 2
+            "T2": 1
           },
           "completedElements": {
             "S": 1,
             "G1": 1,
-            "B1": 1,
             "W1": 1,
             "G3": 2,
-            "G2": 2,
+            "B1": 1,
+            "G2": 1,
             "T2": 1,
-            "E": 2,
-            "B2": 1
+            "E": 1
           },
           "takenFlows": {
             "f1": 1,
             "f5": 1,
             "f2": 1,
-            "f4": 1,
             "f6": 1,
             "f10": 2,
-            "f7": 2,
-            "f8": 1,
-            "f9": 1
+            "f4": 1,
+            "f7": 1,
+            "f8": 1
           },
           "joinsFired": {
-            "G2": 2
+            "G2": 1
           }
         },
         "backends": [

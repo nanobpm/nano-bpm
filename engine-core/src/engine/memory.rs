@@ -134,7 +134,6 @@ impl Engine {
             esp_start_payloads: std::collections::BTreeMap::new(),
             boundary_payloads: std::collections::BTreeMap::new(),
             pending_timer_fires: std::collections::VecDeque::new(),
-            deferred_join_arrivals: std::collections::VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: std::collections::VecDeque::new(),
             pending_correlation_ack: None,
