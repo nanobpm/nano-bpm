@@ -8,7 +8,7 @@
 //! module dependency-free and in the subset Aeneas extracts (see AGENTS.md,
 //! "Write Provable Code"): it is the only input of the Charon/Aeneas extraction
 //! `formal/lean/Refinement/Extracted/` and of the Lean proof
-//! `formal/lean/Refinement/Refinement/Proof.lean`. `formal/lean/Refinement/extract.sh`
+//! `formal/lean/Refinement/Proof.lean`. `formal/lean/Refinement/extract.sh`
 //! regenerates the extraction and CI fails on any diff, so every change here
 //! re-runs the proof.
 //!
@@ -159,7 +159,7 @@ pub fn has_active_path(
 
 /// How many of the join's `incoming` flows hold a token.
 #[cfg_attr(
-    not(test),
+    not(any(test, kani)),
     expect(
         dead_code,
         reason = "part of the proven `join_ready` composition (formal/lean/Refinement)"
@@ -190,7 +190,7 @@ pub fn distinct_taken(incoming: &[usize], taken: &[u32]) -> usize {
 /// when needed — so it builds the graph view only for inclusive joins; this
 /// composition is the statement the Lean proof is about.
 #[cfg_attr(
-    not(test),
+    not(any(test, kani)),
     expect(
         dead_code,
         reason = "the proven composition (formal/lean/Refinement); the engine calls its halves"
@@ -213,5 +213,7 @@ pub fn join_ready(
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs;
 #[cfg(test)]
 mod tests;
