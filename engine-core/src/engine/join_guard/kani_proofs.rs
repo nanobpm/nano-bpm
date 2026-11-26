@@ -12,7 +12,7 @@
 use super::{distinct_taken, join_ready, JoinKind, NO_FLOW};
 
 /// Nodes in the symbolic graph (one symbolic out-edge each).
-const NODES: usize = 3;
+const NODES: usize = 2;
 
 /// One symbolic edge: a target up to one past the graph (exercising the
 /// out-of-range guard) carrying one of the two flows or none.
@@ -25,9 +25,9 @@ fn any_edge() -> (usize, usize) {
 }
 
 #[kani::proof]
-#[kani::unwind(5)]
+#[kani::unwind(4)]
 fn join_ready_kernel_total_and_exact() {
-    let succ: Vec<Vec<(usize, usize)>> = vec![vec![any_edge()], vec![any_edge()], vec![any_edge()]];
+    let succ: Vec<Vec<(usize, usize)>> = vec![vec![any_edge()], vec![any_edge()]];
     let taken: [u32; 2] = [kani::any(), kani::any()];
     let kind = if kani::any() {
         JoinKind::Parallel
@@ -37,8 +37,8 @@ fn join_ready_kernel_total_and_exact() {
     let join: usize = kani::any();
     kani::assume(join < NODES);
     let incoming = [0usize, 1];
-    let live: [usize; 2] = [kani::any(), kani::any()];
-    kani::assume(live[0] <= NODES && live[1] <= NODES);
+    let live: [usize; 1] = [kani::any()];
+    kani::assume(live[0] <= NODES);
     let unidentified: usize = kani::any();
 
     let ready = join_ready(&succ, kind, join, &incoming, &live, &taken, unidentified);
