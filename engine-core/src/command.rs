@@ -593,6 +593,76 @@ pub enum Command {
         /// (whose `Opening` record stays open) from spawning a second token.
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
+        /// Ack-paced buffered drain (#1874): when `Some`, answer with an
+        /// [`crate::Event::MessageCorrelationAcknowledging`] routed to this
+        /// (message) partition, accepted or rejected. Carried from the routing
+        /// [`crate::Event::RemoteMessageCorrelation`]. `None` = no ack (legacy).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        ack_partition: Option<u64>,
+    },
+    /// The instance partition's acknowledgement (#1949) of an ack-paced
+    /// buffered delivery, applied on the **message** partition (routed from
+    /// [`crate::Event::MessageCorrelationAcknowledging`]). Accepted, with the
+    /// subscription still open: the next buffered message is sent. Rejected:
+    /// the subscription closes and the remaining messages stay buffered. Not
+    /// `consumed`: the message's reservation is released.
+    /// **Idempotent** — ignored unless the subscription is awaiting exactly
+    /// this delivery (`message_key` AND `delivery_key`), so a duplicate or a
+    /// stale ack of an earlier delivery of the same message is a no-op.
+    AcknowledgeMessageCorrelation {
+        subscription_key: Key,
+        message_key: Key,
+        /// The acknowledged delivery's key (#1949): the same message may be
+        /// re-reserved for this subscription after a deferral, so the message
+        /// key alone cannot tell a delayed ack of the old delivery from the
+        /// ack of the current one.
+        #[cfg_attr(feature = "serde", serde(default))]
+        delivery_key: Key,
+        accepted: bool,
+        /// Whether the instance's token took the message.
+        consumed: bool,
+        /// The instance is suspended with its scope alive: keep the
+        /// subscription open and the message buffered (no next send).
+        #[cfg_attr(feature = "serde", serde(default))]
+        deferred: bool,
+    },
+    /// The resume handshake (#1949), applied on the **message** partition
+    /// (routed from [`crate::Event::MessageSubscriptionResuming`]): the
+    /// subscription's instance was resumed, so an open subscription not
+    /// awaiting an ack is offered its buffered backlog again (a delivery it
+    /// deferred while the instance was suspended). Idempotent: anything else
+    /// is a no-op.
+    ResumeMessageSubscription {
+        subscription_key: Key,
+        /// The handshake generation to echo in the confirmation. Additive.
+        #[cfg_attr(feature = "serde", serde(default))]
+        generation: u64,
+    },
+    /// The message partition's confirmation of a resume handshake (#1949),
+    /// applied on the **instance** partition (routed from
+    /// [`crate::Event::MessageSubscriptionResumed`]): clears the `Opening`
+    /// record's `resume_pending` so the host stops re-driving the handshake.
+    /// Idempotent: a no-op unless the record is still pending.
+    ConfirmMessageSubscriptionResume {
+        subscription_key: Key,
+        /// Only a confirmation of the record's CURRENT generation clears it.
+        /// Additive.
+        #[cfg_attr(feature = "serde", serde(default))]
+        generation: u64,
+    },
+    /// The message partition's confirmation (#1949), applied on the
+    /// **instance** partition (routed from
+    /// [`crate::Event::MessageCorrelationSettled`]), that it applied — or no
+    /// longer awaits — the ack of `delivery_key`: no re-drive of that
+    /// delivery can change its reservation any more, so the instance
+    /// partition unpins the delivery's receipt. Idempotent: a no-op unless
+    /// the receipt is still pinned.
+    SettleMessageCorrelationReceipt {
+        subscription_key: Key,
+        delivery_key: Key,
     },
     /// Close a canonical subscription on the message partition because the
     /// instance disarmed it (the guarded activity left the flow, the instance was
@@ -1286,6 +1356,39 @@ impl Command {
                 h.key(*message_key);
                 h.key(*element_instance_key);
             }
+            Command::AcknowledgeMessageCorrelation {
+                subscription_key,
+                message_key,
+                delivery_key,
+                accepted,
+                consumed,
+                deferred,
+            } => {
+                h.key(*subscription_key);
+                h.key(*message_key);
+                h.key(*delivery_key);
+                h.str(if *accepted { "1" } else { "0" });
+                h.str(if *consumed { "1" } else { "0" });
+                h.str(if *deferred { "1" } else { "0" });
+            }
+            Command::SettleMessageCorrelationReceipt {
+                subscription_key,
+                delivery_key,
+            } => {
+                h.key(*subscription_key);
+                h.key(*delivery_key);
+            }
+            Command::ResumeMessageSubscription {
+                subscription_key,
+                generation,
+            }
+            | Command::ConfirmMessageSubscriptionResume {
+                subscription_key,
+                generation,
+            } => {
+                h.key(*subscription_key);
+                h.key(*generation);
+            }
             Command::CancelInstance {
                 instance_key,
                 terminate_suspended,
@@ -1389,6 +1492,10 @@ impl Command {
             Command::OpenMessageSubscription { .. } => "open_message_subscription",
             Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
+            Command::AcknowledgeMessageCorrelation { .. } => "acknowledge_message_correlation",
+            Command::ResumeMessageSubscription { .. } => "resume_message_subscription",
+            Command::ConfirmMessageSubscriptionResume { .. } => "confirm_subscription_resume",
+            Command::SettleMessageCorrelationReceipt { .. } => "settle_correlation_receipt",
             Command::CancelInstance { .. } => "cancel_instance",
             Command::SuspendInstance { .. } => "suspend_instance",
             Command::ResumeInstance { .. } => "resume_instance",

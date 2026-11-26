@@ -136,6 +136,10 @@ impl Engine {
             pending_timer_fires: std::collections::VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: std::collections::VecDeque::new(),
+            pending_correlation_ack: None,
+            remote_buffered_delivery: true,
+            remote_backlog_scan_pending: false,
+            remote_buffered_delivery_envelope: false,
             buffer_candidates: std::collections::BTreeMap::new(),
             sweep_from: 0,
             raft_applied: snapshot.raft_applied,
@@ -841,6 +845,18 @@ impl Engine {
     pub fn snapshot_instance(&mut self, key: Key) -> Option<state::InstanceSnapshot> {
         let instance = self.state.instances.get(&key)?;
         if instance.state != ProcessInstanceState::Active || instance.variables_spilled {
+            return None;
+        }
+        // An owed resume handshake (#1949) is re-driven from the RESIDENT
+        // subscription scan (`pending_resume_handshakes`); cold-spilling it
+        // would hide that recovery intent until a later rehydrate, stranding
+        // the message partition's backlog. Keep it resident until confirmed.
+        if self
+            .state
+            .message_subscriptions
+            .values()
+            .any(|s| s.instance_key == key && s.resume_pending)
+        {
             return None;
         }
 

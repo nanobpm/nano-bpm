@@ -1,0 +1,232 @@
+{
+  "_comment": "Shared REST parity fixtures (#2020). Every fixture is sent to BOTH the native gateway router (server/src/wasm_conformance_tests.rs) and the engine-wasm handle() driver (engine-wasm/src/gateway_tests.rs), each on a fresh engine with conformance-service.bpmn (process `conformance-service`) deployed first. Both must answer `status`; a rejection must carry the same problem (native ProblemDetail title/detail, or for a non-JSON native body its text as the wasm detail); `compare` lists JSON pointers whose success-body values must be identical; `instancesAfter` is the process-instance count afterwards (a rejected mutation executes nothing). `setup` (optional) lists requests run on both sides after the deploy, each expected to answer 200. `contentType: null` sends no Content-Type header. {{BPMN}} is conformance-service.bpmn. `titleGap` records a tracked native title that bypasses the shared engine-core problem mapping; it must reproduce exactly and may only be removed. A non-JSON native rejection must equal the wasm detail verbatim unless `bodyGap` records the exact tracked native text / wasm detail pair (same rule).",
+  "fixtures": [
+    {
+      "name": "create-instance-missing-content-type",
+      "method": "POST",
+      "path": "/v2/process-instances",
+      "contentType": null,
+      "body": "{\"processDefinitionId\":\"conformance-service\"}",
+      "status": 415,
+      "instancesAfter": 0,
+      "compare": []
+    },
+    {
+      "name": "create-instance-text-plain",
+      "method": "POST",
+      "path": "/v2/process-instances",
+      "contentType": "text/plain",
+      "body": "{\"processDefinitionId\":\"conformance-service\"}",
+      "status": 415,
+      "instancesAfter": 0,
+      "compare": []
+    },
+    {
+      "name": "create-instance-json-suffix",
+      "method": "POST",
+      "path": "/v2/process-instances",
+      "contentType": "application/vnd.nano+json",
+      "body": "{\"processDefinitionId\":\"conformance-service\"}",
+      "status": 200,
+      "instancesAfter": 1,
+      "compare": [
+        "/tenantId",
+        "/processDefinitionId"
+      ]
+    },
+    {
+      "name": "create-instance-json-charset",
+      "method": "POST",
+      "path": "/v2/process-instances",
+      "contentType": "application/json; charset=utf-8",
+      "body": "{\"processDefinitionId\":\"conformance-service\"}",
+      "status": 200,
+      "instancesAfter": 1,
+      "compare": []
+    },
+    {
+      "name": "create-instance-default-tenant",
+      "method": "POST",
+      "path": "/v2/process-instances",
+      "contentType": "application/json",
+      "body": "{\"processDefinitionId\":\"conformance-service\",\"tenantId\":\"<default>\"}",
+      "status": 200,
+      "instancesAfter": 1,
+      "compare": [
+        "/tenantId"
+      ]
+    },
+    {
+      "name": "create-instance-foreign-tenant",
+      "method": "POST",
+      "path": "/v2/process-instances",
+      "contentType": "application/json",
+      "body": "{\"processDefinitionId\":\"conformance-service\",\"tenantId\":\"acme\"}",
+      "status": 200,
+      "instancesAfter": 1,
+      "compare": [
+        "/tenantId"
+      ]
+    },
+    {
+      "name": "create-instance-unknown-process",
+      "method": "POST",
+      "path": "/v2/process-instances",
+      "contentType": "application/json",
+      "body": "{\"processDefinitionId\":\"nope\"}",
+      "status": 400,
+      "instancesAfter": 0,
+      "compare": []
+    },
+    {
+      "name": "create-instance-malformed-json",
+      "method": "POST",
+      "path": "/v2/process-instances",
+      "contentType": "application/json",
+      "body": "{",
+      "status": 400,
+      "instancesAfter": 0,
+      "compare": [],
+      "bodyGap": {
+        "issue": "https://github.com/nanobpm/nano-bpm/issues/2034",
+        "native": "Failed to parse the request body as JSON: EOF while parsing an object at line 1 column 1",
+        "wasm": "invalid request body: EOF while parsing an object at line 1 column 1"
+      }
+    },
+    {
+      "name": "complete-job-empty-body-no-content-type",
+      "method": "POST",
+      "path": "/v2/jobs/1/completion",
+      "contentType": null,
+      "body": "",
+      "status": 404,
+      "instancesAfter": 0,
+      "compare": [],
+      "titleGap": {
+        "issue": "https://github.com/nanobpm/nano-bpm/issues/2026",
+        "native": "Job not found",
+        "wasm": "NOT_FOUND"
+      }
+    },
+    {
+      "name": "complete-job-body-text-plain",
+      "method": "POST",
+      "path": "/v2/jobs/1/completion",
+      "contentType": "text/plain",
+      "body": "{}",
+      "status": 415,
+      "instancesAfter": 0,
+      "compare": []
+    },
+    {
+      "name": "activate-jobs-text-plain",
+      "method": "POST",
+      "path": "/v2/jobs/activation",
+      "contentType": "text/plain",
+      "body": "{\"type\":\"conformance-work\",\"maxJobsToActivate\":1,\"timeout\":1000}",
+      "status": 415,
+      "instancesAfter": 0,
+      "compare": []
+    },
+    {
+      "name": "activate-jobs-tenant-ids",
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/v2/process-instances",
+          "contentType": "application/json",
+          "body": "{\"processDefinitionId\":\"conformance-service\"}"
+        }
+      ],
+      "method": "POST",
+      "path": "/v2/jobs/activation",
+      "contentType": "application/json",
+      "body": "{\"type\":\"conformance-work\",\"maxJobsToActivate\":1,\"timeout\":1000,\"tenantIds\":[\"<default>\"],\"requestTimeout\":-1}",
+      "status": 200,
+      "instancesAfter": 1,
+      "compare": [
+        "/jobs/0/tenantId",
+        "/jobs/0/type"
+      ]
+    },
+    {
+      "name": "activate-jobs-foreign-tenant-ids",
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/v2/process-instances",
+          "contentType": "application/json",
+          "body": "{\"processDefinitionId\":\"conformance-service\"}"
+        }
+      ],
+      "method": "POST",
+      "path": "/v2/jobs/activation",
+      "contentType": "application/json",
+      "body": "{\"type\":\"conformance-work\",\"maxJobsToActivate\":1,\"timeout\":1000,\"tenantIds\":[\"other\"],\"requestTimeout\":-1}",
+      "status": 200,
+      "instancesAfter": 1,
+      "compare": [
+        "/jobs/0/tenantId",
+        "/jobs/0/type"
+      ]
+    },
+    {
+      "name": "broadcast-signal-text-plain",
+      "method": "POST",
+      "path": "/v2/signals/broadcast",
+      "contentType": "text/plain",
+      "body": "{\"signalName\":\"s\"}",
+      "status": 415,
+      "instancesAfter": 0,
+      "compare": []
+    },
+    {
+      "name": "pin-clock-missing-content-type",
+      "method": "PUT",
+      "path": "/v2/clock",
+      "contentType": null,
+      "body": "{\"timestamp\":1}",
+      "status": 415,
+      "instancesAfter": 0,
+      "compare": []
+    },
+    {
+      "name": "search-instances-text-plain",
+      "method": "POST",
+      "path": "/v2/process-instances/search",
+      "contentType": "text/plain",
+      "body": "{}",
+      "status": 415,
+      "instancesAfter": 0,
+      "compare": []
+    },
+    {
+      "name": "deploy-tenant-id",
+      "method": "POST",
+      "path": "/v2/deployments",
+      "contentType": "multipart/form-data; boundary=b",
+      "body": "--b\r\nContent-Disposition: form-data; name=\"tenantId\"\r\n\r\nacme\r\n--b\r\nContent-Disposition: form-data; name=\"resources\"; filename=\"svc.bpmn\"\r\n\r\n{{BPMN}}\r\n--b--\r\n",
+      "status": 200,
+      "instancesAfter": 0,
+      "compare": [
+        "/tenantId",
+        "/deployments/0/processDefinition/tenantId"
+      ]
+    },
+    {
+      "name": "deploy-json-content-type",
+      "method": "POST",
+      "path": "/v2/deployments",
+      "contentType": "application/json",
+      "body": "{}",
+      "status": 400,
+      "instancesAfter": 0,
+      "compare": [],
+      "bodyGap": {
+        "issue": "https://github.com/nanobpm/nano-bpm/issues/2034",
+        "native": "Invalid `boundary` for `multipart/form-data` request",
+        "wasm": "createDeployment: expected a multipart/form-data body with a boundary"
+      }
+    }
+  ]
+}

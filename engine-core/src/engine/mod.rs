@@ -13,6 +13,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use join_guard::JoinKind;
+
 use crate::command::{Command, JobAttribution};
 use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
@@ -26,6 +28,7 @@ mod debug;
 mod event_subprocess;
 mod expression;
 mod flow_scope;
+pub(crate) mod join_guard;
 mod memory;
 mod migration;
 mod modify;
@@ -70,6 +73,16 @@ impl StepDriver for RunToCompletion {
 struct Paused {
     queue: VecDeque<Step>,
     cursor: usize,
+}
+
+/// See [`Engine::emit_pending_correlation_ack`] (#1874).
+#[derive(Debug, Clone)]
+struct PendingCorrelationAck {
+    subscription_key: Key,
+    message_key: Key,
+    instance_key: Key,
+    target_partition: u64,
+    delivery_key: Key,
 }
 
 /// The version of the serialized snapshot/event **payload** shape (the
@@ -337,6 +350,28 @@ pub struct Engine {
     /// O(k + M), never O(k*M). Per-command scratch; reset whenever a
     /// message is buffered.
     pub(crate) buffer_candidates: BTreeMap<(Key, String, String), (u64, Key)>,
+    /// The ack an ack-paced `CorrelateMessageSubscription` owes the message
+    /// partition (#1874), emitted once the command has fully drained so
+    /// `accepted` reflects whether the scope survived the delivery. Per-command
+    /// scratch.
+    pending_correlation_ack: Option<PendingCorrelationAck>,
+    /// Whether a buffered message may be delivered to a subscription whose
+    /// instance lives on ANOTHER partition (ack-paced, #1949). `true` for a
+    /// standalone engine. A replicated host sets it per command from the
+    /// replicated envelope (decided by the proposing leader), so every replica
+    /// applies the same choice: `false` keeps the pre-#1949 local-only
+    /// behaviour while any member of the group cannot apply ack-paced
+    /// delivery (rolling upgrade). Not snapshotted: re-set before each apply.
+    remote_buffered_delivery: bool,
+    /// Set when this apply's envelope turned remote buffered delivery ON for
+    /// the first time (#1949): the next command seeds a backlog scan of every
+    /// open remote subscription that opened while the gate was closed.
+    /// Per-command scratch, consumed by `plan_command_at`.
+    remote_backlog_scan_pending: bool,
+    /// The CURRENT replicated envelope's remote-buffered-delivery bit (#1949),
+    /// as last passed to [`Engine::set_remote_buffered_delivery`]. Drives the
+    /// one-time [`Event::RemoteBufferedDeliveryActivated`] record.
+    remote_buffered_delivery_envelope: bool,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -399,14 +434,6 @@ enum AdHocPostTool {
     Defer { fulfilled_event: Option<Box<Event>> },
     /// The completion condition did not trigger — continue normally.
     Continue,
-}
-
-/// The two synchronising joins: a parallel or inclusive gateway with more than
-/// one incoming flow ([`Engine::activate_join`]).
-#[derive(Clone, Copy)]
-enum JoinKind {
-    Parallel,
-    Inclusive,
 }
 
 /// A unit of internal work in the processing loop — one transition of the BPMN
@@ -789,6 +816,10 @@ impl Engine {
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
+            pending_correlation_ack: None,
+            remote_buffered_delivery: true,
+            remote_backlog_scan_pending: false,
+            remote_buffered_delivery_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
@@ -826,6 +857,75 @@ impl Engine {
     /// of the cluster.
     pub fn set_num_partitions(&mut self, num_partitions: u64) {
         self.num_partitions = num_partitions.max(1);
+    }
+
+    /// Enables or disables ack-paced delivery of buffered messages to remote
+    /// instances (#1949; see the field docs). A replicated host MUST set this
+    /// from the replicated command envelope before every apply, never from
+    /// local knowledge, so all replicas agree.
+    ///
+    /// One-way latch (#1949): once enabled — or once this partition has ever
+    /// sent an ack-paced delivery — a later `false` (e.g. a peer transiently
+    /// unreachable, so the cluster-wide capability probe fails) is ignored.
+    /// Turning delivery back off mid-flight would strand deferred deliveries
+    /// (the resume handshake would be skipped) and stop remote buffered
+    /// delivery cluster-wide during an ordinary tolerated outage.
+    ///
+    /// The latch lives in durable state, set only by applying
+    /// [`Event::RemoteBufferedDeliveryActivated`]: the first command that
+    /// applies successfully under an enabling envelope records it, so BOTH a
+    /// snapshot and journal replay restore the latch (a replica recovered
+    /// from either agrees with one that applied the envelope live). On the
+    /// first enabling envelope before the latch is recorded, every open remote
+    /// subscription is offered its backlog on the next apply, so one that opened while the
+    /// gate was closed does not wait for a new publication.
+    pub fn set_remote_buffered_delivery(&mut self, enabled: bool) {
+        self.remote_buffered_delivery_envelope = enabled;
+        self.remote_buffered_delivery = enabled || self.remote_buffered_delivery_active();
+        // The scan edge is derived from DURABLE state only (Copilot
+        // r4700605219): an enabling envelope before the latch is journaled.
+        // Never from the in-memory gate flag, whose default differs between a
+        // live engine and one restored from a pre-activation snapshot.
+        if enabled && !self.state.remote_buffered_delivery_latched {
+            self.remote_backlog_scan_pending = true;
+        }
+    }
+
+    /// Records the one-way activation latch (#1949) in the event log the
+    /// first time a command applies under an enabling envelope.
+    fn emit_remote_buffered_delivery_activation(&mut self, log: &mut Vec<Event>) {
+        if self.remote_buffered_delivery_envelope && !self.state.remote_buffered_delivery_latched {
+            let partition = self.partition_id;
+            self.emit(log, Event::RemoteBufferedDeliveryActivated { partition });
+        }
+    }
+
+    /// Whether this partition's retained log/snapshot depends on
+    /// `message-correlation-ack-v1` (#1949): the activation latch is recorded
+    /// (later disabled envelopes are ignored, so a legacy peer would diverge)
+    /// or an ack-paced delivery was ever sent. One-way.
+    pub fn message_correlation_ack_required(&self) -> bool {
+        self.remote_buffered_delivery_active()
+    }
+
+    /// The effective gate: the envelope's setting OR the durable decision,
+    /// re-derived at every use so capability usage recorded by an apply
+    /// mid-envelope (e.g. this partition answering a paced delivery, Copilot
+    /// r4702895398) opens the gate at once, not only at the next envelope.
+    fn remote_buffered_delivery_gate(&self) -> bool {
+        self.remote_buffered_delivery || self.remote_buffered_delivery_active()
+    }
+
+    /// The durable gate decision: latched on, or ack-paced delivery used.
+    fn remote_buffered_delivery_active(&self) -> bool {
+        self.state.remote_buffered_delivery_latched || self.message_correlation_ack_ever_used()
+    }
+
+    /// Whether this partition has EVER sent an ack-paced remote buffered
+    /// delivery (#1949). One-way and snapshotted, so the retained
+    /// log/snapshot depends on `message-correlation-ack-v1` once `true`.
+    pub fn message_correlation_ack_ever_used(&self) -> bool {
+        self.state.message_correlation_ack_used
     }
 
     /// The worker a terminal job event attributes (#963): the replicated
@@ -983,6 +1083,10 @@ impl Engine {
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
+            pending_correlation_ack: None,
+            remote_buffered_delivery: true,
+            remote_backlog_scan_pending: false,
+            remote_buffered_delivery_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,
@@ -2631,6 +2735,9 @@ impl Engine {
                 .map(|(mut log, queue)| {
                     self.run(&mut log, queue);
                     self.cascade_cancel_children(&mut log, 0);
+                    self.emit_pending_correlation_ack(&mut log);
+                    self.emit_remote_buffered_delivery_activation(&mut log);
+                    self.remote_backlog_scan_pending = false;
                     // Every engine test exercises the parent -> children index the
                     // cascade reads (#1827): a write path that bypassed it fails here.
                     #[cfg(test)]
@@ -2645,6 +2752,7 @@ impl Engine {
         // retains no candidate queues (#1874).
         self.buffer_candidates.clear();
         self.buffer_requeue.clear();
+        self.pending_correlation_ack = None;
         result
     }
 
@@ -2710,8 +2818,27 @@ impl Engine {
         self.pending_timer_fires.clear();
         self.buffer_scan_from = 0;
         self.buffer_requeue.clear();
+        self.pending_correlation_ack = None;
         self.buffer_candidates.clear();
         self.sweep_from = 0;
+        // The gate just opened (#1949): offer every open REMOTE subscription
+        // that opened while it was closed its backlog on this command's
+        // quiescent pass (the flag is cleared once the command applies).
+        if self.remote_backlog_scan_pending {
+            let partition_id = self.partition_id;
+            let remote_open: Vec<Key> = self
+                .state
+                .message_subscriptions
+                .values()
+                .filter(|s| {
+                    s.state == state::MessageSubscriptionState::Open
+                        && s.awaiting_ack.is_none()
+                        && state::partition_of(s.instance_key) != partition_id
+                })
+                .map(|s| s.key)
+                .collect();
+            self.buffer_requeue.extend(remote_open);
+        }
         // Per-command terminal-deadline stamp (#1494): set from THIS command
         // only, merged with any envelope stamps armed by
         // `apply_command_events` (#1570). The job's own `JobAttribution`
@@ -3726,13 +3853,27 @@ impl Engine {
                 // Expire buffered messages past their deadline (#1874, Zeebe
                 // `MessageTimeToLiveChecker` → `MessageIntent.EXPIRE`),
                 // deterministic by message key.
-                let expired: Vec<Key> = self
+                let mut expired: Vec<Key> = self
                     .state
                     .buffered_messages
                     .values()
                     .filter(|m| !m.is_live_at(now))
                     .map(|m| m.key)
                     .collect();
+                // A message reserved by an in-flight remote delivery (#1949)
+                // outlives its deadline until the ack settles it: the instance
+                // may already have consumed it, and the re-drive of a lost
+                // delivery needs its variables. It expires on the first sweep
+                // after the settlement.
+                if !expired.is_empty() {
+                    let reserved: BTreeSet<Key> = self
+                        .state
+                        .message_subscriptions
+                        .values()
+                        .filter_map(|s| s.awaiting_ack.map(|a| a.message_key))
+                        .collect();
+                    expired.retain(|k| !reserved.contains(k));
+                }
                 for message_key in expired {
                     self.emit(
                         &mut log,
@@ -4981,6 +5122,18 @@ impl Engine {
                     if correlated_instances.contains(&instance_key) {
                         continue;
                     }
+                    // Zeebe `CORRELATING` (#1874): a subscription awaiting the
+                    // instance partition's ack for a buffered delivery takes
+                    // nothing now; a TTL message stays buffered for it, so it
+                    // is delivered in publish order once the ack arrives.
+                    //
+                    // A one-shot re-opened by a deferral (#1949) likewise
+                    // takes nothing until the resume handshake: an unpaced
+                    // delivery would settle it while the suspended instance
+                    // drops the message, stranding the deferred backlog.
+                    if subscription.awaiting_ack.is_some() || subscription.deferred {
+                        continue;
+                    }
                     let element_instance_key = subscription.element_instance_key;
                     let element_id = subscription.element_id.clone();
                     let kind = subscription.kind.clone();
@@ -5033,6 +5186,7 @@ impl Engine {
                                 kind,
                                 variables: variables.clone(),
                                 delivery_key,
+                                ack_partition: None,
                             },
                         );
                     }
@@ -5313,6 +5467,7 @@ impl Engine {
                 kind,
                 variables,
                 delivery_key,
+                ack_partition,
             } => {
                 // At-least-once ⇒ exactly-once (#1497): a re-delivered
                 // continuation whose `delivery_key` this partition already
@@ -5322,6 +5477,36 @@ impl Engine {
                 // so the state check below alone would re-fire it — from
                 // spawning a second token after a lost ack.
                 if delivery_key != 0 && self.state.routed_deliveries.contains(delivery_key) {
+                    // A re-driven ack-paced delivery (#1949: the first ack, or
+                    // the delivery's reply, was lost) is answered again, from
+                    // durable state, so the message partition's in-flight
+                    // delivery settles exactly as it would have.
+                    if let Some(target_partition) = ack_partition {
+                        let ack = PendingCorrelationAck {
+                            subscription_key,
+                            message_key,
+                            instance_key,
+                            target_partition,
+                            delivery_key,
+                        };
+                        match self.state.routed_deliveries.receipt(delivery_key) {
+                            // The ORIGINAL answer, never one recomputed from
+                            // the subscription's later state (#1949).
+                            Some(receipt) => {
+                                self.emit_receipt(&mut log, &ack, receipt);
+                                // A deferral answered while suspended whose
+                                // instance has since resumed: the message
+                                // partition re-opens the subscription on this
+                                // ack, then needs the resume handshake the
+                                // earlier resume could not complete (it found
+                                // the delivery still awaiting this ack).
+                                if receipt.deferred && !self.instance_is_suspended(instance_key) {
+                                    self.emit_subscription_resuming(&mut log, subscription_key);
+                                }
+                            }
+                            None => self.emit_correlation_ack(&mut log, ack),
+                        }
+                    }
                     return Ok((log, queue));
                 }
                 // Advance only while the local record is still `Opening` (a parked
@@ -5335,7 +5520,10 @@ impl Engine {
                 // gated jobs and timers): the routed correlation is *dropped*. The
                 // message model is unbuffered, so a dropped correlation does not
                 // re-correlate on resume — drop-on-suspend is the documented
-                // suspension semantics for messages.
+                // suspension semantics for messages. An ack-paced buffered
+                // delivery is the exception: it is *deferred* (see
+                // `emit_pending_correlation_ack`), so the message stays
+                // buffered and the persistent subscription stays open (#1874).
                 //
                 // A persistent subscription (non-interrupting boundary / event
                 // sub-process) never settles, so it instead dedupes on delivery
@@ -5375,6 +5563,18 @@ impl Engine {
                         &variables,
                     );
                 }
+                // Ack-paced buffered drain (#1874, Zeebe `CORRELATING`): answer
+                // the message partition once this command has drained (see
+                // `emit_pending_correlation_ack`).
+                if let Some(target_partition) = ack_partition {
+                    self.pending_correlation_ack = Some(PendingCorrelationAck {
+                        subscription_key,
+                        message_key,
+                        instance_key,
+                        target_partition,
+                        delivery_key,
+                    });
+                }
                 if delivery_key != 0 {
                     self.emit(
                         &mut log,
@@ -5385,6 +5585,221 @@ impl Engine {
                             close_tombstone: false,
                         },
                     );
+                }
+            }
+
+            Command::AcknowledgeMessageCorrelation {
+                subscription_key,
+                message_key,
+                delivery_key,
+                accepted,
+                consumed,
+                deferred,
+            } => {
+                // Either way — applied now, or a duplicate / stale ack of a
+                // delivery no longer awaited — no re-drive of this delivery
+                // can change its reservation any more, so the instance
+                // partition may unpin its receipt (#1949). Emitted for a
+                // duplicate too: that is how a lost settlement is re-driven.
+                if delivery_key != 0 {
+                    self.emit(
+                        &mut log,
+                        Event::MessageCorrelationSettled {
+                            subscription_key,
+                            delivery_key,
+                            partition: self.partition_id,
+                        },
+                    );
+                }
+                // Idempotent: only the exact delivery this subscription awaits
+                // (message AND delivery key) is acknowledged; a duplicate or a
+                // delayed ack of an earlier delivery of the same message is a
+                // no-op (#1949).
+                let Some(subscription) = self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .filter(|s| {
+                        s.awaiting_ack.is_some_and(|a| {
+                            a.message_key == message_key && a.delivery_key == delivery_key
+                        })
+                    })
+                else {
+                    return Ok((log, queue));
+                };
+                let instance_key = subscription.instance_key;
+                let index_key = (
+                    subscription.message_name.clone(),
+                    subscription.correlation_key.clone(),
+                );
+                // A reservation released while this subscription awaited its
+                // own ack (#1949): read before the ack's apply clears it.
+                let rescan_from = subscription.rescan_from;
+                // The reserved message is gone (the self-routed release of an
+                // orphaned reservation, see `pending_buffered_deliveries`):
+                // the subscription is offered its backlog again even though
+                // the release keeps it open like a deferral.
+                let orphaned = !self.state.buffered_messages.contains_key(&message_key);
+                self.emit(
+                    &mut log,
+                    Event::MessageCorrelationAcknowledged {
+                        subscription_key,
+                        message_key,
+                        accepted,
+                        consumed,
+                        deferred,
+                        partition: self.partition_id,
+                    },
+                );
+                if consumed {
+                    // Resume this instance's candidate scan right after the
+                    // message just consumed (#1949): every earlier entry was
+                    // ineligible when it was chosen, so draining N buffered
+                    // messages through ack commands visits O(N) entries in
+                    // total, not O(N^2).
+                    //
+                    // An entry released earlier while this subscription
+                    // awaited its ack was skipped by every scan since, so
+                    // the cursor then resumes just BEFORE it instead (#1949).
+                    if let Some(seq) = self
+                        .state
+                        .buffered_messages
+                        .get(&message_key)
+                        .map(|m| m.seq)
+                    {
+                        let consumed_entry = (seq, message_key);
+                        let cursor = match rescan_from {
+                            Some(floor) if floor < consumed_entry => self
+                                .state
+                                .buffered_by_correlation
+                                .get(&index_key)
+                                .and_then(|set| set.range(..floor).next_back().copied()),
+                            _ => Some(consumed_entry),
+                        };
+                        let cursor_key = (instance_key, index_key.0, index_key.1);
+                        match cursor {
+                            Some(c) => {
+                                self.buffer_candidates.insert(cursor_key, c);
+                            }
+                            None => {
+                                self.buffer_candidates.remove(&cursor_key);
+                            }
+                        }
+                    }
+                } else if !deferred {
+                    // The reservation was released: the message is available
+                    // again, so every OTHER open subscription of this instance
+                    // on the same (name, correlation key) — which skipped it
+                    // while it was reserved — gets another turn.
+                    let others: Vec<Key> = self
+                        .state
+                        .message_subscriptions
+                        .values()
+                        .filter(|s| {
+                            s.key != subscription_key
+                                && s.instance_key == instance_key
+                                && s.state == state::MessageSubscriptionState::Open
+                                && s.message_name == index_key.0
+                                && s.correlation_key == index_key.1
+                        })
+                        .map(|s| s.key)
+                        .collect();
+                    self.buffer_requeue.extend(others);
+                }
+                // A deferral releases the message too, but the WHOLE instance
+                // is suspended: a sibling would bounce off it just the same,
+                // ping-ponging deliveries without progress (#1949). The resume
+                // handshake re-offers every subscription of the instance.
+                // Still open (accepted, scope alive): offer it the next
+                // buffered message on this command's quiescent pass. A
+                // deferred (suspended) subscription is not re-offered: it
+                // would bounce off the suspended instance again.
+                if (!deferred || orphaned)
+                    && self
+                        .state
+                        .message_subscriptions
+                        .get(&subscription_key)
+                        .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
+                {
+                    self.buffer_requeue.push_back(subscription_key);
+                }
+            }
+
+            Command::ResumeMessageSubscription {
+                subscription_key,
+                generation,
+            } => {
+                // The resume handshake (#1949): re-offer the backlog to an
+                // open subscription with nothing in flight. A settled
+                // (closed / unknown) subscription is a no-op: its instance
+                // record already left `Opening` via the routed close or
+                // correlation, so nothing is owed.
+                let Some(s) = self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .filter(|s| s.state == state::MessageSubscriptionState::Open)
+                else {
+                    return Ok((log, queue));
+                };
+                // A delivery still awaits its ack (e.g. the original deferred
+                // ack is delayed): do NOT confirm. That ack may clear
+                // `awaiting_ack` without re-offering anything, so the instance
+                // partition must keep re-driving the handshake until it lands
+                // on a subscription with nothing in flight.
+                if s.awaiting_ack.is_some() {
+                    return Ok((log, queue));
+                }
+                self.buffer_requeue.push_back(subscription_key);
+                // Confirm (whatever the backlog holds): from here this
+                // partition's own durable state re-drives any re-offered
+                // delivery, so the instance partition must stop re-driving
+                // the handshake — an empty backlog would otherwise never
+                // clear its `resume_pending`.
+                let event = Event::MessageSubscriptionResumed {
+                    subscription_key,
+                    instance_key: s.instance_key,
+                    partition: self.partition_id,
+                    generation,
+                };
+                self.emit(&mut log, event);
+            }
+
+            Command::SettleMessageCorrelationReceipt {
+                subscription_key,
+                delivery_key,
+            } => {
+                // Only a still-pinned receipt is settled: a duplicate
+                // settlement is a no-op.
+                if self.state.routed_deliveries.receipt(delivery_key).is_some() {
+                    self.emit(
+                        &mut log,
+                        Event::MessageCorrelationReceiptSettled {
+                            subscription_key,
+                            delivery_key,
+                        },
+                    );
+                }
+            }
+
+            Command::ConfirmMessageSubscriptionResume {
+                subscription_key,
+                generation,
+            } => {
+                // Only the CURRENT generation's confirmation counts: a delayed
+                // confirmation of an older resume is a no-op.
+                if let Some(s) = self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .filter(|s| s.resume_pending && s.resume_generation == generation)
+                {
+                    let event = Event::MessageSubscriptionResumeConfirmed {
+                        subscription_key,
+                        instance_key: s.instance_key,
+                        generation,
+                    };
+                    self.emit(&mut log, event);
                 }
             }
 
@@ -5403,14 +5818,20 @@ impl Engine {
                 }
                 // Disarm the canonical subscription because the instance partition
                 // tore down the waiting element. Idempotent: only an open
-                // subscription is cancelled.
-                let open = matches!(
-                    self.state
-                        .message_subscriptions
-                        .get(&subscription_key)
-                        .map(|s| s.state),
-                    Some(state::MessageSubscriptionState::Open)
-                );
+                // subscription is cancelled — or a one-shot RESERVED by an
+                // ack-paced delivery still in flight (#1949): its reservation
+                // marked it `Correlated`, but a deferred answer would re-open
+                // it into a phantom wait. Cancelling keeps `awaiting_ack`, so
+                // the late ack still settles (and releases) the delivery.
+                let open = self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .is_some_and(|s| match s.state {
+                        state::MessageSubscriptionState::Open => true,
+                        state::MessageSubscriptionState::Correlated => s.awaiting_ack.is_some(),
+                        _ => false,
+                    });
                 if open {
                     self.emit(
                         &mut log,
@@ -5730,6 +6151,7 @@ impl Engine {
                     Some(instance) => match instance.state {
                         ProcessInstanceState::Suspended => {
                             self.emit(&mut log, Event::ProcessInstanceResumed { instance_key });
+                            self.reoffer_buffered_after_resume(&mut log, instance_key);
                         }
                         ProcessInstanceState::Active => {
                             // Already active — no-op.
@@ -7556,11 +7978,133 @@ impl Engine {
         self.state.buffered_messages.get(&found?)
     }
 
+    /// Every buffered delivery this (message) partition has in flight to a
+    /// remote instance and not yet seen acknowledged (#1949), rebuilt from
+    /// durable state as the exact [`Event::RemoteMessageCorrelation`] that
+    /// was first routed (same `delivery_key`). The host re-drives these
+    /// periodically and after a restart or leader change, so a send — or an
+    /// ack — lost to exhausted routing retries can never leave a
+    /// subscription stuck awaiting it. Re-delivery is safe: the instance
+    /// partition dedups on the delivery key and only re-sends its ack, and
+    /// the ack is idempotent here. Ordered by subscription key.
+    pub fn pending_buffered_deliveries(&self) -> Vec<Event> {
+        self.state
+            .message_subscriptions
+            .values()
+            .filter_map(|s| {
+                let ack = s.awaiting_ack?;
+                // A reserved message never expires while in flight, but a
+                // reservation must never depend on that for liveness: if the
+                // message is gone by ANY path, the delivery cannot be re-sent,
+                // so the subscription would await an ack forever (#1949). It is
+                // released instead, by an explicit ack this partition routes to
+                // ITSELF: not consumed, subscription kept (a one-shot one is
+                // re-opened) and offered its backlog again. Should the
+                // instance in fact have taken the lost delivery, the next
+                // offer is answered "not consumed, not waiting", which releases
+                // that message and closes the subscription.
+                let Some(message) = self.state.buffered_messages.get(&ack.message_key) else {
+                    return Some(Event::MessageCorrelationAcknowledging {
+                        subscription_key: s.key,
+                        message_key: ack.message_key,
+                        instance_key: s.instance_key,
+                        accepted: true,
+                        consumed: false,
+                        deferred: true,
+                        partition: self.partition_id,
+                        target_partition: self.partition_id,
+                        delivery_key: ack.delivery_key,
+                    });
+                };
+                Some(Event::RemoteMessageCorrelation {
+                    subscription_key: s.key,
+                    message_key: ack.message_key,
+                    instance_key: s.instance_key,
+                    element_instance_key: s.element_instance_key,
+                    element_id: s.element_id.clone(),
+                    kind: s.kind.clone(),
+                    variables: message.variables.clone(),
+                    delivery_key: ack.delivery_key,
+                    ack_partition: Some(self.partition_id),
+                })
+            })
+            .collect()
+    }
+
+    /// The answers this (instance) partition gave to ack-paced deliveries
+    /// whose settlement it has not yet seen (#1949): every pinned receipt,
+    /// rebuilt as the exact [`Event::MessageCorrelationAcknowledging`] that
+    /// answered it. The host re-drives these, so a lost ack — or a lost
+    /// [`Event::MessageCorrelationSettled`] — can never pin a receipt
+    /// forever: the message partition applies the first ack it still awaits
+    /// and answers every ack (duplicate or not) with a settlement. Ordered
+    /// by applied order.
+    pub fn pending_unsettled_receipts(&self) -> Vec<Event> {
+        self.state
+            .routed_deliveries
+            .unsettled_receipts()
+            .map(
+                |(delivery_key, subscription_key, r)| Event::MessageCorrelationAcknowledging {
+                    subscription_key,
+                    message_key: r.message_key,
+                    instance_key: r.instance_key,
+                    accepted: r.accepted,
+                    consumed: r.consumed,
+                    deferred: r.deferred,
+                    partition: self.partition_id,
+                    target_partition: r.target_partition,
+                    delivery_key,
+                },
+            )
+            .collect()
+    }
+
+    /// The resume handshakes this (instance) partition still owes a message
+    /// partition (#1949): every cross-partition `Opening` subscription whose
+    /// last buffered delivery was answered DEFERRED (`resume_pending`) and
+    /// whose instance is no longer suspended. Rebuilt from durable state as
+    /// the exact [`Event::MessageSubscriptionResuming`] the resume emits, so
+    /// the host can re-drive a handshake lost to exhausted routing retries or
+    /// a stop between `ResumeInstance` committing and its routing. Re-driving
+    /// is idempotent on the message partition. The flag clears once the
+    /// message partition confirms the handshake
+    /// ([`Event::MessageSubscriptionResumed`]) or a later delivery to the
+    /// subscription is answered without deferral. Empty while
+    /// remote buffered delivery is off. Ordered by subscription key.
+    pub fn pending_resume_handshakes(&self) -> Vec<Event> {
+        if !self.remote_buffered_delivery_gate() {
+            return Vec::new();
+        }
+        self.state
+            .message_subscriptions
+            .values()
+            .filter(|s| {
+                s.resume_pending
+                    && s.state == state::MessageSubscriptionState::Opening
+                    && state::subscription_partition(&s.correlation_key, self.num_partitions)
+                        != self.partition_id
+                    && self
+                        .state
+                        .instances
+                        .get(&s.instance_key)
+                        .is_some_and(|i| i.state == ProcessInstanceState::Active)
+            })
+            .map(|s| Event::MessageSubscriptionResuming {
+                subscription_key: s.key,
+                instance_key: s.instance_key,
+                correlation_key: s.correlation_key.clone(),
+                generation: s.resume_generation,
+            })
+            .collect()
+    }
+
     /// One subscription's turn at the buffer (see
     /// [`Self::correlate_buffered_messages`]). Returns `true` when a LOCAL
     /// correlation advanced a token (the caller must drain before going on);
     /// a still-open local subscription is requeued for the next message. A
-    /// remote subscription never takes a buffered message (#1949).
+    /// remote subscription gets at most ONE delivery per turn (Zeebe
+    /// `CORRELATING`, #1874): a one-shot kind settles; a kind that stays open
+    /// awaits the instance partition's ack before the next message.
     fn correlate_one_buffered(
         &mut self,
         log: &mut Vec<Event>,
@@ -7580,15 +8124,6 @@ impl Engine {
         let element_instance_key = subscription.element_instance_key;
         let element_id = subscription.element_id.clone();
         let kind = subscription.kind.clone();
-        // LOCAL-ONLY buffered correlation (#1874): a subscription whose
-        // instance lives on ANOTHER partition never takes a buffered
-        // message — no partial or one-shot remote drain. The message stays
-        // buffered until a local subscription takes it or its TTL expires.
-        // Ack-paced remote delivery is tracked in
-        // https://github.com/nanobpm/nano-bpm/issues/1949.
-        if state::partition_of(instance_key) != self.partition_id {
-            return false;
-        }
         // A buffered message must never reach a child whose ancestor has
         // already ended (e.g. a top-level terminate end raced a call
         // activity): the pending cascade will terminate it, and a
@@ -7596,17 +8131,32 @@ impl Engine {
         if self.has_ended_ancestor(instance_key) {
             return false;
         }
+        // Zeebe `CORRELATING`: one buffered delivery in flight per
+        // remote subscription until the instance partition acks it. A
+        // one-shot re-opened by a deferral waits for the resume handshake
+        // (#1949), which clears `deferred` before its re-offer runs.
+        if subscription.awaiting_ack.is_some() || subscription.deferred {
+            return false;
+        }
+        let local = state::partition_of(instance_key) == self.partition_id;
+        // Rolling-upgrade gate (#1949): until every replica can apply
+        // ack-paced delivery, a remote subscription takes nothing (the
+        // pre-#1949 local-only behaviour) — the message stays buffered.
+        if !local && !self.remote_buffered_delivery_gate() {
+            return false;
+        }
         let Some(message) = self.next_buffered_candidate(subscription_key, now) else {
             return false;
         };
         let message_key = message.key;
         let variables = message.variables.clone();
-        if self.instance_is_suspended(instance_key)
-            || self
-                .state
-                .instances
-                .get(&instance_key)
-                .is_none_or(|i| i.state != ProcessInstanceState::Active)
+        if local
+            && (self.instance_is_suspended(instance_key)
+                || self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .is_none_or(|i| i.state != ProcessInstanceState::Active))
         {
             return false;
         }
@@ -7619,26 +8169,174 @@ impl Engine {
                 instance_key,
             },
         );
-        self.advance_correlated_token(
-            log,
-            queue,
-            subscription_key,
-            message_key,
-            instance_key,
-            element_instance_key,
-            element_id,
-            kind,
-            &variables,
-        );
-        if self
-            .state
-            .message_subscriptions
-            .get(&subscription_key)
-            .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
-        {
-            self.buffer_requeue.push_back(subscription_key);
+        if local {
+            self.advance_correlated_token(
+                log,
+                queue,
+                subscription_key,
+                message_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind,
+                &variables,
+            );
+            if self
+                .state
+                .message_subscriptions
+                .get(&subscription_key)
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Open)
+            {
+                self.buffer_requeue.push_back(subscription_key);
+            }
+            return true;
         }
-        true
+        let delivery_key = self.mint_key();
+        self.emit(
+            log,
+            Event::RemoteMessageCorrelation {
+                subscription_key,
+                message_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind,
+                variables,
+                delivery_key,
+                ack_partition: Some(self.partition_id),
+            },
+        );
+        // A remote delivery advances nothing here, so there is nothing to
+        // drain. Every buffered remote delivery — one-shot or persistent —
+        // is ack-paced (#1949): the reservation stays in flight until the
+        // instance partition says whether the token consumed it, and a
+        // persistent subscription gets the next message only once it does.
+        false
+    }
+
+    /// Emits the ack an ack-paced `CorrelateMessageSubscription` owes the
+    /// message partition (#1874, Zeebe `CORRELATING`), after the command has
+    /// fully drained. Accepted = the token took the message AND the
+    /// subscription still waits for more (its scope survived); otherwise the
+    /// message partition stops this subscription and the backlog stays
+    /// buffered for others.
+    fn emit_pending_correlation_ack(&mut self, log: &mut Vec<Event>) {
+        if let Some(ack) = self.pending_correlation_ack.take() {
+            self.emit_correlation_ack(log, ack);
+        }
+    }
+
+    /// The single canonical derivation of an ack-paced delivery's answer
+    /// (#1949), from the instance partition's DURABLE subscription record —
+    /// so a first delivery and any re-driven duplicate are answered
+    /// identically:
+    ///
+    /// - `consumed`: the token took this message — a persistent subscription
+    ///   recorded it in `correlated_message_keys`; a one-shot one settled
+    ///   (`Correlated`), which only this delivery can have done because the
+    ///   message partition sends a one-shot subscription exactly one.
+    /// - `accepted`: consumed AND the subscription still waits (`Opening`).
+    /// - `deferred`: not consumed because the instance is suspended while
+    ///   its scope still waits.
+    fn emit_correlation_ack(&mut self, log: &mut Vec<Event>, ack: PendingCorrelationAck) {
+        let subscription = self.state.message_subscriptions.get(&ack.subscription_key);
+        let consumed = subscription.is_some_and(|s| {
+            if s.kind.stays_open_after_trigger() {
+                s.correlated_message_keys.contains(&ack.message_key)
+            } else {
+                s.state == state::MessageSubscriptionState::Correlated
+            }
+        });
+        let waiting =
+            subscription.is_some_and(|s| s.state == state::MessageSubscriptionState::Opening);
+        let accepted = consumed && waiting;
+        let deferred = !consumed && waiting && self.instance_is_suspended(ack.instance_key);
+        let receipt = state::CorrelationReceipt {
+            accepted,
+            consumed,
+            deferred,
+            message_key: ack.message_key,
+            instance_key: ack.instance_key,
+            target_partition: ack.target_partition,
+        };
+        self.emit_receipt(log, &ack, receipt);
+    }
+
+    /// Emits `receipt` as the answer to `ack`'s delivery. Applying it records
+    /// the receipt durably under the delivery key (first write wins), so
+    /// every later duplicate is answered with this same outcome (#1949).
+    fn emit_receipt(
+        &mut self,
+        log: &mut Vec<Event>,
+        ack: &PendingCorrelationAck,
+        receipt: state::CorrelationReceipt,
+    ) {
+        self.emit(
+            log,
+            Event::MessageCorrelationAcknowledging {
+                subscription_key: ack.subscription_key,
+                message_key: ack.message_key,
+                instance_key: ack.instance_key,
+                accepted: receipt.accepted,
+                consumed: receipt.consumed,
+                deferred: receipt.deferred,
+                partition: self.partition_id,
+                target_partition: ack.target_partition,
+                delivery_key: ack.delivery_key,
+            },
+        );
+    }
+
+    /// The resume handshake (#1949): a resumed instance's subscriptions are
+    /// offered their buffered backlog again — a delivery deferred while it
+    /// was suspended would otherwise wait for the next publication. A LOCAL
+    /// canonical subscription is requeued for this command's quiescent pass;
+    /// a cross-partition one is announced to its message partition with an
+    /// [`Event::MessageSubscriptionResuming`] (only while remote buffered
+    /// delivery is enabled: a legacy peer does not know the command, and
+    /// without remote delivery nothing was deferred). Ordered by
+    /// subscription key.
+    fn reoffer_buffered_after_resume(&mut self, log: &mut Vec<Event>, instance_key: Key) {
+        let mut remote = Vec::new();
+        for s in self.state.message_subscriptions.values() {
+            if s.instance_key != instance_key {
+                continue;
+            }
+            match s.state {
+                state::MessageSubscriptionState::Open => self.buffer_requeue.push_back(s.key),
+                state::MessageSubscriptionState::Opening
+                    if self.remote_buffered_delivery_gate()
+                        && state::subscription_partition(
+                            &s.correlation_key,
+                            self.num_partitions,
+                        ) != self.partition_id =>
+                {
+                    remote.push(s.key);
+                }
+                _ => {}
+            }
+        }
+        for subscription_key in remote {
+            self.emit_subscription_resuming(log, subscription_key);
+        }
+    }
+
+    /// Emits the [`Event::MessageSubscriptionResuming`] handshake for the
+    /// (instance-partition) `Opening` record `subscription_key`.
+    fn emit_subscription_resuming(&mut self, log: &mut Vec<Event>, subscription_key: Key) {
+        let Some(s) = self.state.message_subscriptions.get(&subscription_key) else {
+            return;
+        };
+        if s.state != state::MessageSubscriptionState::Opening {
+            return;
+        }
+        let event = Event::MessageSubscriptionResuming {
+            subscription_key,
+            instance_key: s.instance_key,
+            correlation_key: s.correlation_key.clone(),
+            generation: s.resume_generation,
+        };
+        self.emit(log, event);
     }
 
     /// Records a correlation against a subscription whose **instance lives on this
@@ -18147,19 +18845,15 @@ impl Engine {
         }
         let arrivals = self.join_arrivals(instance_key, scope, &element_id);
         let taken = arrivals.distinct_flows() + unidentified;
-        let all_taken = taken >= self.incoming_count(instance_key, &element_id);
-        let accepted = match join {
-            JoinKind::Parallel => all_taken,
-            JoinKind::Inclusive => {
-                all_taken
-                    || (taken > 0
-                        && !self.has_active_path_to(
-                            instance_key,
-                            &element_id,
-                            scope,
-                            &arrivals,
-                            pending,
-                        ))
+        let accepted = match join_guard::join_decision(
+            join,
+            taken,
+            self.incoming_count(instance_key, &element_id),
+        ) {
+            join_guard::JoinDecision::Accept => true,
+            join_guard::JoinDecision::Reject => false,
+            join_guard::JoinDecision::AcceptUnlessActivePath => {
+                !self.has_active_path_to(instance_key, &element_id, scope, &arrivals, pending)
             }
         };
 
@@ -18299,9 +18993,19 @@ impl Engine {
             }
             _ => None,
         });
-        active
-            .chain(in_transit)
-            .any(|source| path_reaches_join(process, source, join, taken))
+        // Fast path: no live or in-transit source means nothing can still
+        // reach the join, so skip building the dense graph.
+        let mut sources = active.chain(in_transit).peekable();
+        if sources.peek().is_none() {
+            return false;
+        }
+        let Some(graph) = JoinGraph::collect(process, join, taken) else {
+            return false;
+        };
+        let live: Vec<usize> = sources
+            .filter_map(|source| graph.index_of(source))
+            .collect();
+        join_guard::has_active_path(&graph.succ, &live, graph.join, &graph.taken)
     }
 
     /// A join fires: [`Event::ParallelJoinFired`] consumes one token per incoming
@@ -19492,60 +20196,94 @@ impl OwnedByInstance for state::Incident {
     }
 }
 
+/// The dense, index-based view of a process graph the pure join guard
+/// ([`join_guard`]) decides over: the impure *collector* half of the guard.
+///
+/// Nodes are the process's elements in id order. `succ[n]` holds, for element
+/// `n`, its outgoing sequence flows (each with its own flow index into
+/// `taken`) and an edge to every boundary event attached to it; a link throw
+/// has instead only edges to its same-named catches in the same scope
+/// ([`join_guard::NO_FLOW`] for both non-flow edges). `taken[f]` is the number
+/// of tokens waiting on flow `f` into the join (`0` for every other flow).
+struct JoinGraph<'a> {
+    ids: Vec<&'a str>,
+    succ: Vec<Vec<(usize, usize)>>,
+    taken: Vec<u32>,
+    join: usize,
+}
+
+impl<'a> JoinGraph<'a> {
+    /// The view of `process` for a guard at `join` with `arrivals` counted;
+    /// `None` when `join` is not an element of `process`.
+    fn collect(
+        process: &'a crate::model::ProcessDefinition,
+        join: &str,
+        arrivals: &state::FlowArrivals,
+    ) -> Option<Self> {
+        let ids: Vec<&'a str> = process.elements.keys().map(String::as_str).collect();
+        let index_of = |id: &str| ids.binary_search(&id).ok();
+        let join_index = index_of(join)?;
+        let mut succ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ids.len()];
+        let mut taken = Vec::new();
+        let mut catches: Vec<(&str, Option<&str>, usize)> = Vec::new();
+        for (node, element) in process.elements.values().enumerate() {
+            if let ElementKind::LinkIntermediateCatchEvent { link_name } = &element.kind {
+                catches.push((link_name.as_str(), element.parent.as_deref(), node));
+            }
+            if let Some(host) = element.kind.attached_to().and_then(index_of) {
+                succ[host].push((node, join_guard::NO_FLOW));
+            }
+        }
+        for (node, element) in process.elements.values().enumerate() {
+            if let ElementKind::LinkIntermediateThrowEvent { link_name } = &element.kind {
+                // A link throw hands its token to its catches only: no flows,
+                // no boundary events.
+                succ[node] = catches
+                    .iter()
+                    .filter(|(name, parent, _)| {
+                        *name == link_name.as_str() && *parent == element.parent.as_deref()
+                    })
+                    .map(|(_, _, catch)| (*catch, join_guard::NO_FLOW))
+                    .collect();
+                continue;
+            }
+            let mut flows = Vec::with_capacity(element.outgoing.len());
+            for (index, flow) in element.outgoing.iter().enumerate() {
+                let Some(target) = index_of(&flow.to) else {
+                    continue;
+                };
+                let tokens = if target == join_index {
+                    process
+                        .incoming_flow(&element.id, index)
+                        .map_or(0, |(_, incoming)| arrivals.count(&incoming))
+                } else {
+                    0
+                };
+                flows.push((target, taken.len()));
+                taken.push(u32::try_from(tokens).unwrap_or(u32::MAX));
+            }
+            // Flows first, then boundary edges (order is irrelevant to the
+            // decision).
+            flows.append(&mut succ[node]);
+            succ[node] = flows;
+        }
+        Some(Self {
+            ids,
+            succ,
+            taken,
+            join: join_index,
+        })
+    }
+
+    /// The node index of element `id`, if it is one.
+    fn index_of(&self, id: &str) -> Option<usize> {
+        self.ids.binary_search(&id).ok()
+    }
+}
+
 /// The sorted set of root variable names a conditional event's FEEL `condition`
 /// references, used both to record the subscription's dependencies and to decide
 /// which variable changes re-evaluate it. Sorted for a deterministic event body.
-/// The breadth-first search of Zeebe's `BpmnInclusiveGatewayBehavior`: can a
-/// token at `source` reach `join`? It follows outgoing sequence flows, the
-/// boundary events attached to an element, and a link throw's same-named catch
-/// in the same scope. It skips the join's incoming flows already in `taken`, so
-/// a path that ends on a taken flow does not hold the join.
-fn path_reaches_join(
-    process: &crate::model::ProcessDefinition,
-    source: &str,
-    join: &str,
-    taken: &state::FlowArrivals,
-) -> bool {
-    let mut visited: BTreeSet<&str> = BTreeSet::new();
-    let mut to_visit: VecDeque<&str> = VecDeque::from([source]);
-    while let Some(node) = to_visit.pop_front() {
-        if node == join {
-            return true;
-        }
-        if !visited.insert(node) {
-            continue;
-        }
-        let Some(element) = process.element(node) else {
-            continue;
-        };
-        if let ElementKind::LinkIntermediateThrowEvent { link_name } = &element.kind {
-            to_visit.extend(process.elements.values().filter_map(|other| {
-                matches!(&other.kind, ElementKind::LinkIntermediateCatchEvent { link_name: name }
-                    if name == link_name && other.parent == element.parent)
-                .then_some(other.id.as_str())
-            }));
-            continue;
-        }
-        for (index, flow) in element.outgoing.iter().enumerate() {
-            let taken_into_join = flow.to == join
-                && process
-                    .incoming_flow(node, index)
-                    .is_some_and(|(_, incoming)| taken.count(&incoming) > 0);
-            if !taken_into_join {
-                to_visit.push_back(flow.to.as_str());
-            }
-        }
-        to_visit.extend(process.elements.values().filter_map(|other| {
-            other
-                .kind
-                .attached_to()
-                .is_some_and(|host| host == node)
-                .then_some(other.id.as_str())
-        }));
-    }
-    false
-}
-
 fn sorted_referenced_vars(condition: &str) -> Vec<String> {
     // `referenced_variables` is a BTreeSet (#1662): already sorted.
     crate::feel::referenced_variables(condition)

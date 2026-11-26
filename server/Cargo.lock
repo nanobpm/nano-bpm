@@ -1668,6 +1668,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "js-sys",
+ "mime",
  "multer",
  "nanobpmn-engine-core",
  "nanobpmn-read-model",

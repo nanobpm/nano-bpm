@@ -1763,6 +1763,7 @@
           }
         },
         "message_name": "esp-msg",
+        "resume_generation": 0,
         "state": "Open"
       },
       "138": {
@@ -1773,6 +1774,7 @@
         "key": 138,
         "kind": "IntermediateCatch",
         "message_name": "M2",
+        "resume_generation": 0,
         "state": "Open"
       },
       "140": {
@@ -1783,6 +1785,7 @@
         "key": 140,
         "kind": "IntermediateCatch",
         "message_name": "M1",
+        "resume_generation": 0,
         "state": "Open"
       },
       "142": {
@@ -1793,6 +1796,7 @@
         "key": 142,
         "kind": "IntermediateCatch",
         "message_name": "M2",
+        "resume_generation": 0,
         "state": "Open"
       },
       "144": {
@@ -1803,6 +1807,7 @@
         "key": 144,
         "kind": "IntermediateCatch",
         "message_name": "M1",
+        "resume_generation": 0,
         "state": "Open"
       }
     },
