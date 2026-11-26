@@ -18228,16 +18228,14 @@ impl Engine {
         ) {
             join_guard::JoinDecision::Accept => true,
             join_guard::JoinDecision::Reject => false,
-            join_guard::JoinDecision::AcceptUnlessActivePath => {
-                !self.has_active_path_to(
-                    instance_key,
-                    &element_id,
-                    scope,
-                    &arrivals,
-                    pending,
-                    BatchDueView::Live,
-                )
-            }
+            join_guard::JoinDecision::AcceptUnlessActivePath => !self.has_active_path_to(
+                instance_key,
+                &element_id,
+                scope,
+                &arrivals,
+                pending,
+                BatchDueView::Live,
+            ),
         };
 
         let open = self.join_eik(instance_key, scope, &element_id);
