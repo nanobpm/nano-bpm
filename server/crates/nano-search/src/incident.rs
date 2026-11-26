@@ -124,10 +124,10 @@ pub fn incident_result(incident: &readstore::IncidentRow) -> models::IncidentRes
 
 /// The incident filter predicate. Every declared `IncidentFilter` field is
 /// matched: the process-definition identity is denormalized onto the row at
-/// projection time (no cross-entity lookup), and single-tenant Nano stores no
-/// tenant on incidents, so `tenantId` matches against an absent value — value
-/// operators exclude the row (honest, never silently widening the search) while
-/// `$exists: false` still matches.
+/// projection time (no cross-entity lookup), and `tenantId` matches the
+/// `<default>` the result projects (single-tenant Nano), exactly as the
+/// process-instance and user-task filters do — filtering on a value the result
+/// reports must find the row (#994 parity guard).
 pub fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilter) -> bool {
     query::match_basic_string(&f.incident_key, &inc.key.to_string())
         && query::match_process_instance_key(&f.process_instance_key, &inc.instance_key.to_string())
@@ -149,7 +149,7 @@ pub fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentF
         && query::match_string(&f.element_id, &inc.element_id)
         && query::match_string(&f.error_message, &inc.reason)
         && query::match_date_time_ms(&f.creation_time, Some(inc.created_at_ms as i64))
-        && query::match_string_opt(&f.tenant_id, None)
+        && query::match_string(&f.tenant_id, "<default>")
 }
 
 #[cfg(test)]
@@ -198,6 +198,29 @@ mod tests {
         assert_eq!(
             scoped.items[0].error_type,
             models::IncidentErrorTypeEnum::JobNoRetries
+        );
+    }
+
+    /// Filtering on the `tenantId` the result reports finds the row (#994).
+    #[test]
+    fn tenant_filter_matches_the_projected_tenant() {
+        let rows = vec![row(1, 10, IncidentState::Active)];
+        let projected = search_incident_rows(&rows, None, |_| true).items[0]
+            .tenant_id
+            .clone();
+        let q: models::IncidentSearchQuery =
+            serde_json::from_value(serde_json::json!({ "filter": { "tenantId": projected } }))
+                .unwrap();
+        assert_eq!(
+            keys(&search_incident_rows(&rows, Some(&q), |_| true)),
+            ["1"]
+        );
+        let q: models::IncidentSearchQuery =
+            serde_json::from_str(r#"{"filter":{"tenantId":"other"}}"#).unwrap();
+        assert!(
+            search_incident_rows(&rows, Some(&q), |_| true)
+                .items
+                .is_empty()
         );
     }
 }

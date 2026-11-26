@@ -906,6 +906,127 @@ fn core_searches_match_the_server_for_every_spec_operator_sort_and_page() {
     }
 }
 
+const JOB_XML: &str = r#"
+  <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                    xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                    xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                    xmlns:di="http://www.omg.org/spec/DD/20100524/DI">
+    <bpmn:process id="charge-flow">
+      <bpmn:startEvent id="s" />
+      <bpmn:serviceTask id="charge">
+        <bpmn:extensionElements><zeebe:taskDefinition type="charge" /></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="e" />
+      <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="charge" />
+      <bpmn:sequenceFlow id="b" sourceRef="charge" targetRef="e" />
+    </bpmn:process>
+    <bpmndi:BPMNDiagram id="d">
+      <bpmndi:BPMNPlane id="p" bpmnElement="charge-flow">
+        <bpmndi:BPMNShape id="s_di" bpmnElement="s"><dc:Bounds x="100" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="charge_di" bpmnElement="charge"><dc:Bounds x="190" y="78" width="100" height="80" /></bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="e_di" bpmnElement="e"><dc:Bounds x="350" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+        <bpmndi:BPMNEdge id="a_di" bpmnElement="a"><di:waypoint x="136" y="118" /><di:waypoint x="190" y="118" /></bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="b_di" bpmnElement="b"><di:waypoint x="290" y="118" /><di:waypoint x="350" y="118" /></bpmndi:BPMNEdge>
+      </bpmndi:BPMNPlane>
+    </bpmndi:BPMNDiagram>
+  </bpmn:definitions>"#;
+
+/// Three service-task instances created at different instants whose jobs are
+/// failed with no retries left (three incidents, distinct messages); the
+/// middle incident is resolved within its instance's span. Returns the engine and the log span of
+/// the deployment (0) and of each instance.
+fn incident_fixture() -> (TestEngine, Vec<std::ops::Range<usize>>) {
+    let mut eng = TestEngine::new();
+    eng.deploy(JOB_XML).unwrap();
+    let mut spans = Vec::new();
+    spans.push(0..eng.log.len());
+    for i in 0..3 {
+        let start = eng.log.len();
+        eng.advance_time(60_000.0).unwrap();
+        eng.create_instance("charge-flow", &json!({ "n": i }).to_string(), None)
+            .unwrap();
+        let res = eng.handle_request(
+            "POST",
+            "/v2/jobs/activation",
+            r#"{"Content-Type":"application/json"}"#,
+            &json!({ "type": "charge", "maxJobsToActivate": 1, "timeout": 60000, "worker": "w" })
+                .to_string(),
+        );
+        assert_eq!(res.status, 200, "{}", res.body);
+        let body: J = serde_json::from_str(&res.body).unwrap();
+        let job = body["jobs"][0]["jobKey"].as_str().unwrap().to_string();
+        eng.fail_job(&job, 0, &format!("failure-{i}"), None)
+            .unwrap();
+        if i == 1 {
+            let incidents: J = serde_json::from_str(
+                &eng.search_incidents_json(&json!({ "filter": { "jobKey": job } }).to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+            let incident = incidents["items"][0]["incidentKey"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            eng.update_retries(&job, 1, None).unwrap();
+            eng.resolve_incident(&incident).unwrap();
+            // Retry and finish the job so the next instance activates its own.
+            let res = eng.handle_request(
+                "POST",
+                "/v2/jobs/activation",
+                r#"{"Content-Type":"application/json"}"#,
+                &json!({ "type": "charge", "maxJobsToActivate": 1, "timeout": 60000, "worker": "w" })
+                    .to_string(),
+            );
+            assert!(res.body.contains(&job), "{}", res.body);
+            let res = eng.handle_request(
+                "POST",
+                &format!("/v2/jobs/{job}/completion"),
+                r#"{"Content-Type":"application/json"}"#,
+                "{}",
+            );
+            assert_eq!(res.status, 204, "{}", res.body);
+        }
+        spans.push(start..eng.log.len());
+    }
+    (eng, spans)
+}
+
+#[test]
+fn incident_search_matches_the_server_for_every_spec_operator_sort_and_page() {
+    let (eng, spans) = incident_fixture();
+    let rm = server_read_model(&eng, &spans);
+    let src = ServerSource(&rm);
+    let (eng, src) = (&eng, &src);
+    let all: J = serde_json::from_str(&eng.search_incidents_json("{}").unwrap()).unwrap();
+    let states: Vec<&J> = all["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| &i["state"])
+        .collect();
+    assert_eq!(states.len(), 3, "{all}");
+    assert!(states.contains(&&json!("RESOLVED")), "{all}");
+    assert!(states.contains(&&json!("ACTIVE")), "{all}");
+    let incidents = Op {
+        name: "searchIncidents",
+        filter_schema: "IncidentFilter",
+        sort_schema: "IncidentSearchQuerySortRequest",
+        wasm: Box::new(|b| eng.search_incidents_json(b)),
+        server: Box::new(|b| {
+            let body = server_body::<models::IncidentSearchQuery>(b)?;
+            let r = nanobpmn_search::incident::search_incidents(src, body.as_ref());
+            Ok(serde_json::to_value(r).unwrap())
+        }),
+        sample: all["items"][1].clone(),
+        page_filter: json!({}),
+    };
+    check_array_filters(&incidents);
+    let accepted = check_filters(&incidents);
+    assert!(accepted > 0, "searchIncidents: no filter request accepted");
+    check_paging(&incidents);
+}
+
 /// The gateway's mapping of a shared [`Lookup`](nanobpmn_search::get::Lookup)
 /// onto HTTP, rendered in the WASM transport's terms: 200 ⇒ the body, 404 ⇒
 /// JSON `null`, 400 ⇒ a rejection.
@@ -1043,12 +1164,13 @@ fn spec_read_operations() -> std::collections::BTreeSet<String> {
 /// The spec operations the parity tests in this module drive through BOTH
 /// surfaces. Extending the WASM read surface means adding the op's parity
 /// check above AND its name here; the guard below fails until both happen.
-const PARITY_CHECKED: [&str; 8] = [
+const PARITY_CHECKED: [&str; 9] = [
     "searchAgentInstances",
     "searchAgentInstanceHistory",
     "searchUserTasks",
     "searchProcessInstances",
     "searchVariables",
+    "searchIncidents",
     "getFormByKey",
     "getResource",
     "getAgentInstance",
@@ -1385,7 +1507,7 @@ fn ts_operators(
 
 /// The WASM search methods and the published TS request type each accepts.
 /// Must cover exactly the WASM `search*` read methods (checked below).
-const TS_SEARCH_REQUESTS: [(&str, &str); 5] = [
+const TS_SEARCH_REQUESTS: [(&str, &str); 6] = [
     ("searchAgentInstances", "AgentInstanceSearchQuery"),
     (
         "searchAgentInstanceHistory",
@@ -1394,6 +1516,7 @@ const TS_SEARCH_REQUESTS: [(&str, &str); 5] = [
     ("searchUserTasks", "UserTaskSearchQuery"),
     ("searchProcessInstances", "ProcessInstanceSearchQuery"),
     ("searchVariables", "VariableSearchQuery"),
+    ("searchIncidents", "IncidentSearchQuery"),
 ];
 
 /// Every TS-advertised filter probe for the request type `query`, as WASM
@@ -1537,6 +1660,7 @@ fn every_readmodel_types_filter_field_and_operator_is_accepted_by_wasm() {
                 "searchUserTasks" => core_eng.search_user_tasks_json(&body),
                 "searchProcessInstances" => core_eng.search_process_instances_json(&body),
                 "searchVariables" => core_eng.search_variables_json(&body, None),
+                "searchIncidents" => core_eng.search_incidents_json(&body),
                 other => panic!("no WASM dispatch for {other}"),
             };
             probes += 1;

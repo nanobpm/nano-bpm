@@ -87,6 +87,40 @@
       ]
     },
     {
+      "name": "job-incident",
+      "steps": [
+        { "id": "deploy", "op": "createDeployment", "resources": ["conformance-service.bpmn"], "compare": "status" },
+        {
+          "id": "create",
+          "op": "createProcessInstance",
+          "body": { "processDefinitionId": "conformance-service", "variables": { "orderId": "o-inc" } },
+          "capture": { "pi": ["/processInstanceKey", "/created"] },
+          "compare": "status"
+        },
+        {
+          "id": "activate",
+          "op": "activateJobs",
+          "body": { "type": "conformance-work", "maxJobsToActivate": 1, "timeout": 60000, "worker": "conformance", "requestTimeout": -1 },
+          "capture": { "job": ["/jobs/0/jobKey", "/0/key"] },
+          "compare": "status"
+        },
+        {
+          "id": "fail-no-retries",
+          "op": "failJob",
+          "params": { "jobKey": "${job}" },
+          "body": { "retries": 0, "errorMessage": "boom" },
+          "compare": "status"
+        },
+        {
+          "id": "search-incidents",
+          "op": "searchIncidents",
+          "body": { "filter": { "processInstanceKey": "${pi}" } },
+          "compare": "body"
+        },
+        { "id": "cancel", "op": "cancelProcessInstance", "params": { "processInstanceKey": "${pi}" }, "compare": "status" }
+      ]
+    },
+    {
       "name": "update-retries",
       "steps": [
         { "id": "deploy", "op": "createDeployment", "resources": ["conformance-service.bpmn"], "compare": "status" },

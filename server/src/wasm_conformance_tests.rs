@@ -158,6 +158,7 @@ const OP_TO_JS_METHOD: &[(&str, &str)] = &[
     ("searchProcessInstances", "searchProcessInstances"),
     ("searchUserTasks", "searchUserTasks"),
     ("searchVariables", "searchVariables"),
+    ("searchIncidents", "searchIncidents"),
 ];
 
 // ---------------------------------------------------------------- fixtures --
@@ -579,6 +580,7 @@ fn wasm_run(eng: &mut TestEngine, step: &Step, vars: &BTreeMap<String, String>) 
             "searchProcessInstances" => eng.search_process_instances(&body.to_string()),
             "searchUserTasks" => eng.search_user_tasks(&body.to_string()),
             "searchVariables" => eng.search_variables(&body.to_string(), None),
+            "searchIncidents" => eng.search_incidents(&body.to_string()),
             other => panic!("no TestEngine adapter for operation `{other}`"),
         };
         r.map_err(|_| ())
@@ -614,6 +616,9 @@ fn is_host_rejection(payload: &(dyn std::any::Any + Send)) -> bool {
 fn volatile(field: &str) -> bool {
     field.ends_with("Key")
         || (field.ends_with("Date") && !CLIENT_SUPPLIED_DATES.contains(&field))
+        // Incident `creationTime` is a clock timestamp too: wall clock on the
+        // server, the virtual clock (epoch at start) in wasm.
+        || field.ends_with("Time")
         || field == "deadline"
         || field == "jobLeaseToken"
         || field.ends_with("Cursor")
