@@ -31,7 +31,10 @@ import {
   MAX_GATEWAYS,
   issueBody,
   corpusIdentity,
-  uncommittedIssues
+  uncommittedIssues,
+  existingIssueFor,
+  fileIssue,
+  signatureLine
 } from './fuzz.mjs'
 import { prng } from '../traces/fuzz/generate.mjs'
 
@@ -299,8 +302,21 @@ test('stepSignatures / commandSignature fail closed on an unknown op', () => {
 export const TRIAGED_FUZZ_ISSUES = ['#1753', '#1754', '#1755', '#1756', '#1758']
 export const TRIAGE_ALIASES = { '#1753': '#1693', '#1754': '#1675' }
 
+// M14 fuzz triage (#1975): the auto-filed issues were closed as duplicates of
+// one fix issue per root cause, and their reproducers committed under it.
+// The #1988 group (message correlated once per process: a Reference/spec-oracle
+// defect) is deliberately not committed: Camunda never completes those
+// instances, so each replay costs the full awaitCompletion deadline (2 min) on
+// every PR. #1988's fix commits them together with the harness fix.
+export const M14_TRIAGED_FUZZ_ISSUES = ['#1789', '#1790', '#1795', '#1796', '#1813', '#1814', '#1895', '#1896']
+export const M14_TRIAGE_ALIASES = {
+  '#1795': '#1989', '#1796': '#1989', '#1813': '#1989', '#1814': '#1989',
+  '#1789': '#1990', '#1790': '#1990', '#1895': '#1990', '#1896': '#1990'
+}
+
 test('every triaged fuzz issue has a committed reproducer (or an alias that does)', () => {
   assert.deepEqual(uncommittedIssues(TRIAGED_FUZZ_ISSUES, loadCorpus(), TRIAGE_ALIASES), [])
+  assert.deepEqual(uncommittedIssues(M14_TRIAGED_FUZZ_ISSUES, loadCorpus(), M14_TRIAGE_ALIASES), [])
 })
 
 test('uncommittedIssues reports a filed finding absent from the corpus', () => {
@@ -314,4 +330,77 @@ test('issueBody states the commit obligation and carries the corpus identity', (
   assert.doesNotMatch(body, /committed in `formal\/corpus\/fuzz-corpus.json`/)
   assert.match(body, /NOT guarded until that corpus diff is committed/)
   assert.ok(body.includes(corpusIdentity(c)))
+})
+
+// #1975: nightly runs filed one issue per graph for the SAME signature
+// (#1792/#1895/#1966, #1793/#1896/#1967). A signature with an open issue must
+// get a comment there instead of a new issue.
+const fakeGh = (open, closed = []) => {
+  const calls = []
+  const gh = (args) => {
+    calls.push(args)
+    if (args[1] === 'list') return JSON.stringify(open)
+    if (args[1] === 'create') return 'https://github.com/nanobpm/nano-bpm/issues/9001\n'
+    if (args[1] === 'view') return JSON.stringify({ state: closed.includes(Number(args[2])) ? 'CLOSED' : 'OPEN' })
+    return ''
+  }
+  return { gh, calls }
+}
+
+test('fileIssue comments on the open issue carrying the signature instead of filing a duplicate', () => {
+  const c = loadCorpus()[0]
+  const { gh, calls } = fakeGh([
+    { number: 1966, body: issueBody(c) },
+    { number: 1792, body: issueBody({ ...c, graph: { id: 'Gen_other', key: 'and|0>1d' } }) },
+    { number: 1800, body: issueBody({ ...c, signature: `${c.signature},extra` }) }
+  ])
+  assert.equal(fileIssue(c, gh), '#1792')
+  assert.deepEqual(calls.map((a) => a.slice(0, 2)), [['issue', 'list'], ['issue', 'comment']])
+  assert.equal(calls[1][2], '1792')
+  assert.ok(calls[1][4].includes(c.graph.key))
+})
+
+test('fileIssue files a new issue for an unseen signature', () => {
+  const c = loadCorpus()[0]
+  const { gh, calls } = fakeGh([{ number: 1800, body: issueBody({ ...c, signature: `${c.signature},extra` }) }])
+  assert.equal(fileIssue(c, gh), '#9001')
+  assert.deepEqual(calls.map((a) => a.slice(0, 2)), [['issue', 'list'], ['issue', 'create']])
+})
+
+test('existingIssueFor matches the exact signature line, never a prefix', () => {
+  const body = `x\n${signatureLine('spec-oracle:completed,sequenceFlows,jobsCreated')}\n`
+  assert.equal(existingIssueFor('spec-oracle:completed,sequenceFlows', [{ number: 1, body }]), null)
+  assert.equal(existingIssueFor('spec-oracle:completed,sequenceFlows,jobsCreated', [{ number: 1, body }]), '#1')
+})
+
+test('fileIssue comments on a committed open case issue even when no open issue carries the signature line', () => {
+  const c = { ...loadCorpus()[0], graph: { id: 'Gen_new', key: 'new|graph' } }
+  const committed = [
+    { signature: c.signature, issue: '#1990', fixed: false, graph: { key: 'other' } },
+    { signature: c.signature, issue: '#1500', fixed: true, graph: { key: 'old' } },
+    { signature: `${c.signature},extra`, issue: '#1400', fixed: false, graph: { key: 'x' } }
+  ]
+  const { gh, calls } = fakeGh([]) // the auto-filed issues were closed as duplicates
+  assert.equal(fileIssue(c, gh, committed), '#1990')
+  assert.deepEqual(calls.map((a) => a.slice(0, 3)), [['issue', 'list', '--state'], ['issue', 'view', '1990'], ['issue', 'comment', '1990']])
+})
+
+test('fileIssue prefers the oldest open signature-line match over a committed case issue', () => {
+  const c = loadCorpus()[0]
+  const committed = [{ signature: c.signature, issue: '#1990', fixed: false, graph: { key: 'other' } }]
+  const { gh, calls } = fakeGh([{ number: 1988, body: issueBody(c) }])
+  assert.equal(fileIssue(c, gh, committed), '#1988')
+  assert.deepEqual(calls.map((a) => a.slice(0, 3)), [['issue', 'list', '--state'], ['issue', 'comment', '1988']])
+})
+
+test('fileIssue skips a committed case issue GitHub reports closed', () => {
+  const c = loadCorpus()[0]
+  const committed = [
+    { signature: c.signature, issue: '#1700', fixed: false, graph: { key: 'a' } },
+    { signature: c.signature, issue: '#1990', fixed: false, graph: { key: 'b' } }
+  ]
+  const { gh } = fakeGh([], [1700])
+  assert.equal(fileIssue(c, gh, committed), '#1990')
+  const { gh: gh2 } = fakeGh([], [1700, 1990])
+  assert.equal(fileIssue(c, gh2, committed), '#9001')
 })

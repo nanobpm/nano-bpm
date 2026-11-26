@@ -240,13 +240,15 @@ test('a boundary-bearing task still reaches the join through its boundary (inclu
   assert.equal(ref.pathReaches('T1', 'E', new Set([taskOut])), true)
 })
 
-test('a message boundary interrupts EVERY waiting activation of its task', () => {
+test('a message boundary publish interrupts ONE waiting activation of its task (#1988)', () => {
   const g = graphOf([[0, 1, 'bmsg']])
   const ref = new Reference(g)
   ref.settle()
   ref.waiting.T1 = 2 // two activations of the same task (repeated activation)
   const next = ref.apply({ op: 'correlateBoundary', node: 'B1', task: 'T1' })
-  assert.equal(next.waiting.T1, 0)
-  assert.equal(next.completedElements.B1, 2)
-  assert.equal(next.commands().some((c) => c.node === 'T1' || c.task === 'T1'), false)
+  // Zeebe correlates one publish once per process: the other T1 stays parked,
+  // still completable or interruptible by a further publish.
+  assert.equal(next.waiting.T1, 1)
+  assert.equal(next.completedElements.B1, 1)
+  assert.equal(next.commands().some((c) => c.op === 'correlateBoundary' && c.task === 'T1'), true)
 })

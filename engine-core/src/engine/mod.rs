@@ -12326,11 +12326,10 @@ impl Engine {
         // child's local scope view, matching Zeebe: an MI inner activity's output
         // mappings are applied on each instance's completion into the instance's
         // OWN scope (`getVariableScopeKey` returns the element-instance key while
-        // the loop counter is set), so `outputElement` can read them. They are NOT
-        // propagated to the parent — only the aggregated `outputCollection` is. We
-        // therefore overlay the mapped values onto the eval context in memory
-        // rather than writing them into the (about-to-be-torn-down, non-propagated)
-        // child scope.
+        // the loop counter is set), so `outputElement` can read them. Each inner
+        // instance's mapped outputs are ALSO propagated to the flow scope as that
+        // instance completes (#1982, `child_output_updates` below), in addition
+        // to the aggregated `outputCollection`.
         // ONE post-output view of the completing child, shared by `outputElement`
         // AND the completion condition (#1335): Zeebe applies the child's output
         // mappings (or receives a call activity's returned variables) before the
@@ -12351,6 +12350,33 @@ impl Engine {
         // were already applied — and validated — by the caller.
         let validates_outputs =
             output_overlay.is_none() && !self.io_outputs(instance_key, &element_id).is_empty();
+        // The child's own mapped outputs, written through to the flow scope
+        // when the child completes (#1982): Zeebe applies an MI activity's
+        // `zeebe:output` per INNER instance, merging into the body with
+        // propagation (a name no ancestor holds is created at the root).
+        //
+        // A call-activity child (`output_overlay` is `Some`) arrives with its
+        // mappings already evaluated by the caller: its mapped outputs are the
+        // overlay entries named by the activity's `zeebe:output` targets (the
+        // mappings override any propagated callee variable of the same name).
+        // Deriving them from the static targets — rather than carrying a second
+        // map — keeps the incident redrive (which preserves only the overlay)
+        // correct, and never exports unmapped callee variables (#1982 review).
+        let mut child_output_updates: BTreeMap<String, Value> = match &output_overlay {
+            Some(overlay) => {
+                let outputs = self.io_outputs(instance_key, &element_id);
+                let targets: std::collections::BTreeSet<&str> = outputs
+                    .iter()
+                    .filter_map(|m| resolve::io_target_segments(&m.target).first().copied())
+                    .collect();
+                overlay
+                    .iter()
+                    .filter(|(name, _)| targets.contains(name.as_str()))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            }
+            None => BTreeMap::new(),
+        };
         let post_view: Option<Arc<BTreeMap<String, Value>>> =
             if output_element.is_none() && completion_condition.is_none() && !validates_outputs {
                 None
@@ -12375,7 +12401,8 @@ impl Engine {
                             match self.eval_io_mappings_in(&visible, &outputs) {
                                 Ok(mapped) => {
                                     let mut vars = (*visible).clone();
-                                    vars.extend(mapped);
+                                    vars.extend(mapped.clone());
+                                    child_output_updates = mapped;
                                     Ok(vars)
                                 }
                                 Err(failure) => Err(failure),
@@ -12519,6 +12546,16 @@ impl Engine {
                 (Some(_), None) => unreachable!(),
             }
         };
+        if !child_output_updates.is_empty() {
+            let writes = self.propagated_updates(
+                instance_key,
+                body_key,
+                child_output_updates,
+                false,
+                &events,
+            );
+            events.extend(writes);
+        }
         events.push(Event::MultiInstanceChildCompleted {
             instance_key,
             body_key,
@@ -12530,7 +12567,8 @@ impl Engine {
         // the completing child's slot is written into the BODY-local
         // `outputCollection` — only when it actually changes (Zeebe's
         // `VariableBehavior` writes no record for a same-value merge).
-        if let Some(update) = self.mi_body_collection_update(instance_key, body_key, index, output)
+        if let Some(update) =
+            self.mi_body_collection_update(instance_key, body_key, index, output, &events)
         {
             events.push(update);
         }
@@ -12695,6 +12733,7 @@ impl Engine {
         body_key: Key,
         index: usize,
         output: Option<Value>,
+        pending: &[Event],
     ) -> Option<Event> {
         let mi = self
             .state
@@ -12715,13 +12754,12 @@ impl Engine {
         // Suppress only when the body-LOCAL binding already equals the rebuilt
         // collection — a child may have overwritten the binding without
         // changing the accumulator (review: `outputElement="=null"`).
-        let current = self
-            .state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.scope_variables.get(&body_key))
-            .and_then(|vars| vars.get(&name));
-        if current == Some(&rebuilt) {
+        // The comparison accounts for the batch's earlier `pending` writes: a
+        // propagated child output mapping targeting `outputCollection` lands in
+        // this same body scope before the restoring write (#1982 review).
+        let instance = self.state.instances.get(&instance_key)?;
+        let current = Self::value_in_scope(instance, pending, body_key, &name);
+        if current == Ok(Some(&rebuilt)) {
             return None;
         }
         Some(Event::ScopedVariablesUpdated {
@@ -18933,11 +18971,20 @@ impl Engine {
         ) else {
             return false;
         };
+        // An activity whose interrupting boundary timer is due in the current
+        // `TriggerTimers` batch is already doomed (#1989): Zeebe's guard for an
+        // arrival caused by an earlier timer of the batch sees it torn down
+        // (both TRIGGERs precede the join's ACTIVATE), so its token can only
+        // continue from the boundary event, never over the activity's own flow.
+        let doomed = self.doomed_by_due_boundary_timers(instance_key);
         let active = instance
             .active
             .iter()
             .filter(|(eik, id)| id.as_str() != join && self.scope_of(instance_key, **eik) == scope)
-            .map(|(_, id)| id.as_str());
+            .flat_map(|(eik, id)| match doomed.get(eik) {
+                Some(sources) => sources.clone(),
+                None => vec![id.as_str()],
+            });
         let in_transit = pending.iter().filter_map(|step| match step {
             Step::Activate {
                 instance_key: key,
@@ -18953,6 +19000,48 @@ impl Engine {
         active
             .chain(in_transit)
             .any(|source| path_reaches_join(process, source, join, taken))
+    }
+
+    /// The activities of `instance_key` an interrupting boundary timer still
+    /// due in the current `TriggerTimers` batch will tear down, each mapped to
+    /// the boundary events its tokens continue from (#1989): the non-interrupting
+    /// boundaries due before the first due interrupting one (queue order; they
+    /// fire and spawn a token first), then that interrupting boundary. Later
+    /// boundaries of the activity are cancelled by it and never fire.
+    fn doomed_by_due_boundary_timers(&self, instance_key: Key) -> BTreeMap<Key, Vec<&str>> {
+        let mut prior: BTreeMap<Key, Vec<&str>> = BTreeMap::new();
+        let mut doomed: BTreeMap<Key, Vec<&str>> = BTreeMap::new();
+        let due = self
+            .pending_timer_fires
+            .iter()
+            .filter_map(|fire| match fire {
+                PendingTimerFire::Timer(key) => self.state.timers.get(key),
+                PendingTimerFire::Start(_) => None,
+            })
+            .filter(|t| t.instance_key == instance_key && t.state == state::TimerState::Created);
+        for t in due {
+            let eik = t.element_instance_key;
+            if doomed.contains_key(&eik) {
+                continue;
+            }
+            match &t.kind {
+                state::TimerKind::NonInterruptingBoundary {
+                    boundary_element_id,
+                } => prior
+                    .entry(eik)
+                    .or_default()
+                    .push(boundary_element_id.as_str()),
+                state::TimerKind::InterruptingBoundary {
+                    boundary_element_id,
+                } => {
+                    let mut sources = prior.remove(&eik).unwrap_or_default();
+                    sources.push(boundary_element_id.as_str());
+                    doomed.insert(eik, sources);
+                }
+                _ => {}
+            }
+        }
+        doomed
     }
 
     /// A join fires: [`Event::ParallelJoinFired`] consumes one token per incoming

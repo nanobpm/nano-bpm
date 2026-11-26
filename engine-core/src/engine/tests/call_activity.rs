@@ -2165,3 +2165,108 @@ fn retire_below_reaps_an_ended_tree_leaf_first_within_budget() {
         assert!(!holds_any_state_for(&engine, key), "{key} left behind");
     }
 }
+
+/// #1982 review — a MULTI-INSTANCE call-activity child's own `zeebe:output`
+/// mapping (`result → o3`) propagates to the flow scope as each inner instance
+/// completes, exactly like a service-task child, so a later sequential sibling
+/// sees it. Unmapped callee variables (`extra`) are NOT exported: with output
+/// mappings declared only the mappings cross back.
+#[test]
+fn multi_instance_call_activity_child_output_mapping_propagates_to_siblings() {
+    let callee = ProcessBuilder::new("callee")
+        .start_event("cs")
+        .service_task("ct", "work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    let def = ProcessBuilder::new("mi-call-out")
+        .start_event("start")
+        .call_activity("each", "callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=o3".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: true,
+                sequential: true,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=result".to_string(),
+                    target: "o3".to_string(),
+                }],
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-call-out",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let first = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(first.len(), 1, "sequential: one callee at a time");
+    engine
+        .apply_command(Command::complete_job_with(
+            first[0].key,
+            vars(&[("result", Value::Int(85)), ("extra", Value::Int(7))]),
+        ))
+        .unwrap();
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("o3"),
+        Some(&Value::Int(85)),
+        "the call-activity child's mapped output propagates to the process scope"
+    );
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("extra"),
+        None,
+        "an unmapped callee variable must not be exported"
+    );
+    let second = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(second.len(), 1, "the second callee is spawned");
+    let evs = engine
+        .apply_command(Command::complete_job_with(
+            second[0].key,
+            vars(&[("result", Value::Int(86))]),
+        ))
+        .unwrap();
+    // The second child's mapping propagates as it completes. (The body's own
+    // completion later re-applies the activity mapping at body level, a
+    // separate divergence tracked in #1999, so assert on the event stream.)
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            crate::Event::VariablesUpdated { instance_key, variables }
+                if *instance_key == key && variables.get("o3") == Some(&Value::Int(86))
+        )),
+        "the second call-activity child's mapped output propagates on completion"
+    );
+    let inst = engine.instance(key).unwrap();
+    assert_eq!(
+        inst.variables.get("results"),
+        Some(&Value::List(vec![Value::Int(85), Value::Int(86)]))
+    );
+}
