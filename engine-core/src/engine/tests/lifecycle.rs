@@ -9027,3 +9027,44 @@ fn inclusive_join_still_waits_for_a_path_whose_boundary_timer_is_not_due() {
         "`t` can still reach the join"
     );
 }
+
+/// #1989 review: with two interrupting boundary timers due in the same tick,
+/// the FIRST in queue order fires and cancels its sibling, so `t`'s doomed
+/// path must continue from that one. `b1` (created first) leads elsewhere;
+/// `b2` (cancelled by `b1`) leads to the join. Mapping `t` to `b2` would make
+/// `w`'s arrival wait forever for a token that never comes.
+#[test]
+fn inclusive_join_doomed_path_uses_the_first_due_boundary_timer() {
+    let def = ProcessBuilder::new("inc-doomed-first")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .timer_intermediate_catch_event("w", 5_000)
+        .intermediate_throw_event("pre")
+        .service_task("t", "jt")
+        .timer_boundary_event("b1", "t", 5_000)
+        .timer_boundary_event("b2", "t", 5_000)
+        .inclusive_gateway("join")
+        .end_event("e")
+        .end_event("e2")
+        .end_event("e3")
+        .connect("s", "fork")
+        .connect("fork", "w")
+        .connect("fork", "pre")
+        .connect("pre", "t")
+        .connect("w", "join")
+        .connect("b2", "join")
+        .connect("b1", "e2")
+        .connect("t", "e3")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("inc-doomed-first"), 0)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let fired = engine.trigger_timers(5_000);
+    assert_eq!(join_fire_count(&fired, "join"), 1, "{fired:#?}");
+    assert!(engine.is_completed(instance_key));
+}

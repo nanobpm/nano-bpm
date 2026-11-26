@@ -18283,7 +18283,12 @@ impl Engine {
                 } => Some((t.element_instance_key, boundary_element_id.as_str())),
                 _ => None,
             })
-            .collect()
+            // The FIRST due boundary of an activity (queue order) fires and
+            // cancels its siblings, so keep the first, never the last.
+            .fold(BTreeMap::new(), |mut doomed, (eik, boundary)| {
+                doomed.entry(eik).or_insert(boundary);
+                doomed
+            })
     }
 
     /// A join fires: [`Event::ParallelJoinFired`] consumes one token per incoming
