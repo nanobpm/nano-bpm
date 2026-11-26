@@ -7225,16 +7225,33 @@ impl Engine {
                 // (each held-back ACTIVATE was queued before this fire's
                 // follow-ups), so a token still in transit from this fire is a
                 // live path to them rather than already consumed (r4703480366).
-                if self.pending_timer_fires.is_empty() {
-                    for d in self.deferred_join_arrivals.drain(..).rev() {
-                        queue.push_front(Step::Activate {
-                            instance_key: d.instance_key,
-                            element_id: d.element_id,
-                            scope: d.scope,
-                            via: d.via,
-                            race: None,
-                        });
-                    }
+                // Released per instance: once no timer of the batch still due
+                // targets an arrival's instance, the `AfterBatch` view it was
+                // held back under is the live state, so an unrelated later
+                // timer (another instance's, a process-start timer) must not
+                // delay it past this fire's downstream work (r4703550842).
+                let still_due: BTreeSet<Key> = self
+                    .pending_timer_fires
+                    .iter()
+                    .filter_map(|fire| match fire {
+                        PendingTimerFire::Timer(key) => self.state.timers.get(key),
+                        PendingTimerFire::Start(_) => None,
+                    })
+                    .map(|t| t.instance_key)
+                    .collect();
+                let (held, released): (VecDeque<_>, VecDeque<_>) = self
+                    .deferred_join_arrivals
+                    .drain(..)
+                    .partition(|d| still_due.contains(&d.instance_key));
+                self.deferred_join_arrivals = held;
+                for d in released.into_iter().rev() {
+                    queue.push_front(Step::Activate {
+                        instance_key: d.instance_key,
+                        element_id: d.element_id,
+                        scope: d.scope,
+                        via: d.via,
+                        race: None,
+                    });
                 }
                 if log.len() > fired_from {
                     if let Drive::Pause = driver.after_step(&log[fired_from..]) {

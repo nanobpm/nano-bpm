@@ -9209,3 +9209,84 @@ fn inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_wor
     assert_eq!(order.last(), Some(&"w3"), "{fired:#?}");
     assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
 }
+
+/// The three-catch scenario of
+/// [`inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_work`],
+/// parameterised over what `x`'s and `b`'s inputs are fed by.
+fn three_way_tick_def(id: &str, last_is_boundary: bool) -> crate::model::ProcessDefinition {
+    let mut builder = ProcessBuilder::new(id)
+        .start_event("s")
+        .inclusive_gateway("g1")
+        .timer_intermediate_catch_event("w1", 60_000)
+        .timer_intermediate_catch_event("w2", 60_000);
+    builder = if last_is_boundary {
+        builder
+            .service_task("t3", "jt3")
+            .timer_boundary_event("w3", "t3", 60_000)
+    } else {
+        builder.timer_intermediate_catch_event("w3", 60_000)
+    };
+    builder = builder
+        .exclusive_gateway("x")
+        .exclusive_gateway("a")
+        .exclusive_gateway("b")
+        .inclusive_gateway("g2")
+        .end_event("e")
+        .connect("s", "g1");
+    builder = if last_is_boundary {
+        builder.connect_when("g1", "t3", "true").connect("t3", "a")
+    } else {
+        builder.connect_when("g1", "w3", "true")
+    };
+    builder
+        .connect_when("g1", "w2", "true")
+        .connect_when("g1", "w1", "true")
+        .connect("w1", "x")
+        .connect("w2", "x")
+        .connect("x", "g2")
+        .connect("w3", "a")
+        .connect("a", "b")
+        .connect("b", "g2")
+        .connect("g2", "e")
+        .build()
+        .unwrap()
+}
+
+/// #2018 review (r4703550842): a timer of ANOTHER instance due last in the
+/// same batch must not delay the re-guard of this instance's held-back
+/// arrivals past its own last fire's downstream work.
+#[test]
+fn inclusive_join_reguard_is_not_delayed_by_another_instances_later_timer() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(three_way_tick_def(
+            "inc-tick-a",
+            false,
+        )))
+        .unwrap();
+    let other = ProcessBuilder::new("other-timer")
+        .start_event("s")
+        .timer_intermediate_catch_event("z", 60_000)
+        .end_event("e")
+        .connect("s", "z")
+        .connect("z", "e")
+        .build()
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(other)).unwrap();
+    engine
+        .apply_command_at(Command::create_instance("inc-tick-a"), 0)
+        .unwrap();
+    engine
+        .apply_command_at(Command::create_instance("other-timer"), 0)
+        .unwrap();
+    let fired = engine.trigger_timers(60_000);
+    let order: Vec<&str> = fired
+        .iter()
+        .filter_map(|e| match e {
+            Event::TimerTriggered { element_id, .. } => Some(element_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order.last(), Some(&"z"), "{fired:#?}");
+    assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
+}
