@@ -1435,7 +1435,12 @@ fn determinism_corpus_shapes_are_pinned_to_version() {
         .iter()
         .map(|(_, c)| serde_json::to_value(c).expect("serialize command"))
         .collect();
+    // Replay pre-latch (#2004), exactly as the corpus is generated and as the
+    // determinism runner replays it: a latched engine takes the gateway-owned
+    // trigger path, mints different keys, and every later corpus command
+    // then addresses the wrong entity.
     let mut engine = Engine::new();
+    engine.set_event_gateway_runtime(false);
     let mut events = Vec::new();
     for (now, command) in corpus {
         if let Ok(emitted) = engine.apply_command_at(command, now) {
