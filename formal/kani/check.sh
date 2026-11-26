@@ -42,6 +42,7 @@ ALL_HARNESSES=(
   job_index_resync_keeps_lockstep
   parallel_join_fires_only_when_every_flow_taken
   join_ready_kernel_total_and_exact
+  ack_outcome_kernel_is_consistent
   inclusive_join_ready_iff_no_active_path
   gateway_route_exclusive_total_and_sound
   gateway_route_inclusive_total_and_sound

@@ -873,6 +873,7 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
             consumed,
             deferred,
             delivery_key,
+            element_id,
             ..
         } => (
             true,
@@ -883,6 +884,7 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
                 accepted,
                 consumed,
                 deferred,
+                element_id,
             },
         ),
         _ => return None,
@@ -1187,6 +1189,7 @@ fn ack_paced_drain_replays_deterministically() {
                 accepted: true,
                 consumed: true,
                 deferred: false,
+                element_id: None,
             },
             2_002,
         )
@@ -3046,6 +3049,245 @@ fn a_close_before_the_deferred_ack_leaves_no_phantom_wait() {
     assert!(rig.instance.pending_resume_handshakes().is_empty());
     let second = rig.create("await-payment", &order, 3_000);
     assert_eq!(correlated(&rig, second), published, "{:?}", rig.trace);
+}
+
+/// The #2037 source / target processes: the catch is renamed by migration.
+fn await_payment(catch: &str) -> ProcessDefinition {
+    ProcessBuilder::new("await-payment")
+        .start_event("start")
+        .message_intermediate_catch_event(catch, "payment-received", "orderId")
+        .end_event("end")
+        .connect("start", catch)
+        .connect(catch, "end")
+        .build()
+        .unwrap()
+}
+
+/// #2037 scenario: a buffered message is reserved for a remote catch (the
+/// delivery held in flight), the instance is migrated (`await` ->
+/// `await-v2`), and only then is the held delivery consumed. `v2` is the
+/// replicated `message-correlation-ack-v2` envelope bit set on BOTH
+/// partitions before anything runs; `hold_ack` drops the instance
+/// partition's ack so its receipt stays pinned. Returns the rig, the
+/// instance and the published message keys.
+fn migrate_mid_reservation(v2: bool, hold_ack: bool) -> (Rig, Key, Vec<Key>) {
+    let (mut rig, order) = Rig::new(await_payment("await"));
+    rig.instance.set_message_correlation_ack_v2(v2);
+    rig.message.set_message_correlation_ack_v2(v2);
+    let published = rig.publish_named_backlog("payment-received", &order, 1);
+    // Reserve: the buffered message is delivered to the (remote) catch, and
+    // the delivery is held in flight.
+    let (instance_key, held) = rig.create_holding("await-payment", &order, 2_000, &|c| {
+        matches!(c, Command::CorrelateMessageSubscription { .. })
+    });
+    assert_eq!(held.len(), 1, "exactly one delivery in flight: {held:?}");
+    let Command::CorrelateMessageSubscription { element_id, .. } = &held[0].1 else {
+        unreachable!()
+    };
+    assert_eq!(element_id, "await", "routed before the migration");
+    // Migrate while the reservation is in flight.
+    let deployed = rig.on_instance(Command::DeployProcess(await_payment("await-v2")), 2_001);
+    let target_key = deployed
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .expect("target deployed");
+    rig.run(
+        false,
+        Command::MigrateInstance {
+            instance_key,
+            target_process_definition_key: target_key,
+            mapping_instructions: vec![("await".into(), "await-v2".into())],
+        },
+        2_002,
+    );
+    // Consume: the in-flight delivery arrives after the migration.
+    for (to_message, command) in held {
+        if hold_ack {
+            rig.run_holding(to_message, command, 2_003, &is_ack);
+        } else {
+            rig.run(to_message, command, 2_003);
+        }
+    }
+    (rig, instance_key, published)
+}
+
+/// The `(consumed, element_id)` of every `MessageCorrelationAcknowledging`
+/// and the `element_id` of every `MessageCorrelationAcknowledged` traced.
+#[allow(clippy::type_complexity)]
+fn ack_elements(rig: &Rig) -> (Vec<(bool, Option<String>)>, Vec<Option<String>>) {
+    let acking = rig
+        .trace
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCorrelationAcknowledging {
+                element_id,
+                consumed,
+                ..
+            } => Some((*consumed, element_id.clone())),
+            _ => None,
+        })
+        .collect();
+    let acked = rig
+        .trace
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCorrelationAcknowledged { element_id, .. } => Some(element_id.clone()),
+            _ => None,
+        })
+        .collect();
+    (acking, acked)
+}
+
+/// The element ids of the message partition's canonical subscriptions.
+fn canonical_elements(rig: &Rig) -> Vec<String> {
+    rig.message
+        .state()
+        .message_subscriptions
+        .values()
+        .map(|s| s.element_id.clone())
+        .collect()
+}
+
+/// #2037: an instance migrated BETWEEN the message partition's reservation of
+/// a buffered message (the in-flight ack-paced delivery) and the instance
+/// partition's consumption of it. Once the cluster-wide
+/// `message-correlation-ack-v2` latch is recorded, the durable receipt, the
+/// ack and the message partition's acknowledgement carry the RESOLVED
+/// post-migration consumption element — exactly as Zeebe's message-partition
+/// subscription is re-pointed by `MessageSubscription MIGRATE` before it is
+/// `CORRELATED` — and the canonical subscription is re-pointed at it.
+#[test]
+fn migration_between_reservation_and_consumption_acks_post_migration_metadata() {
+    let (rig, instance_key, published) = migrate_mid_reservation(true, false);
+    let expected = Some("await-v2".to_string());
+    let (acking, acked) = ack_elements(&rig);
+    assert_eq!(acking, vec![(true, expected.clone())], "{:?}", rig.trace);
+    assert_eq!(acked, vec![expected]);
+    assert_eq!(canonical_elements(&rig), vec!["await-v2".to_string()]);
+    // The consumed message stays taken by this instance.
+    assert!(rig
+        .message
+        .state()
+        .buffered_messages
+        .get(&published[0])
+        .is_none_or(|m| m.correlated_instances.contains(&instance_key)));
+    // Replay of both journals reproduces the live state (latch included).
+    let replayed = Engine::replay_partition(1, rig.message_journal.clone());
+    assert_eq!(replayed.state(), rig.message.state());
+    let replayed = Engine::replay_partition(0, rig.instance_journal.clone());
+    assert_eq!(replayed.state(), rig.instance.state());
+    assert!(replayed.message_correlation_ack_v2_required());
+}
+
+/// #2037: a pinned receipt re-driven (lost ack) carries the same
+/// post-migration metadata as the original answer.
+#[test]
+fn a_redriven_receipt_carries_the_post_migration_metadata() {
+    let (rig, _instance_key, _published) = migrate_mid_reservation(true, true);
+    let redriven = rig.instance.pending_unsettled_receipts();
+    assert_eq!(redriven.len(), 1, "{redriven:?}");
+    let Event::MessageCorrelationAcknowledging { element_id, .. } = &redriven[0] else {
+        unreachable!()
+    };
+    assert_eq!(element_id.as_deref(), Some("await-v2"));
+}
+
+/// #2037 capability gate: while ANY member lacks `message-correlation-ack-v2`
+/// (the envelope bit is off), no partition records the v2 latch and the ack
+/// output is the legacy v1 shape, unchanged — no record carries the resolved
+/// element, so no v1 member ever receives v2 output. The canonical
+/// subscription keeps its pre-#2037 element.
+#[test]
+fn no_v2_ack_output_before_the_cluster_wide_latch() {
+    for hold_ack in [false, true] {
+        let (rig, _instance_key, _published) = migrate_mid_reservation(false, hold_ack);
+        assert!(
+            !rig.trace
+                .iter()
+                .any(|e| matches!(e, Event::MessageCorrelationAckV2Activated { .. })),
+            "no latch before every member is v2"
+        );
+        assert!(!rig.instance.message_correlation_ack_v2_required());
+        assert!(!rig.message.message_correlation_ack_v2_required());
+        let (acking, acked) = ack_elements(&rig);
+        assert_eq!(acking, vec![(true, None)], "hold_ack={hold_ack}");
+        if !hold_ack {
+            assert_eq!(acked, vec![None]);
+            assert_eq!(canonical_elements(&rig), vec!["await".to_string()]);
+        }
+        for e in rig.instance.pending_unsettled_receipts() {
+            let Event::MessageCorrelationAcknowledging { element_id, .. } = &e else {
+                unreachable!()
+            };
+            assert_eq!(*element_id, None, "a re-driven receipt stays v1");
+        }
+        // Every routed follow-up keeps the v1 wire shape.
+        for e in &rig.trace {
+            if let Some((_, Command::AcknowledgeMessageCorrelation { element_id, .. })) = routed(e)
+            {
+                assert_eq!(element_id, None);
+            }
+        }
+    }
+}
+
+/// #2037: the v2 latch is recorded once, by the first command applied under
+/// an enabling envelope; it is one-way (a later disabled envelope, e.g. a
+/// peer transiently unreachable, is ignored) and survives journal replay and
+/// snapshot restore. A partition never enabled does not require v2.
+#[test]
+fn v2_latch_is_recorded_once_one_way_and_replayed() {
+    let (mut rig, _order) = Rig::new(non_interrupting_esp_process());
+    rig.message.set_message_correlation_ack_v2(false);
+    rig.on_message(Command::TriggerTimers { now: 1_000 }, 1_000);
+    assert!(!rig.message.message_correlation_ack_v2_required());
+    rig.message.set_message_correlation_ack_v2(true);
+    let first = rig.on_message(Command::TriggerTimers { now: 1_001 }, 1_001);
+    assert!(first.iter().any(
+        |e| matches!(e, Event::MessageCorrelationAckV2Activated { partition: 1 }
+            if e.owning_partition() == 1)
+    ));
+    let again = rig.on_message(Command::TriggerTimers { now: 1_002 }, 1_002);
+    assert!(!again
+        .iter()
+        .any(|e| matches!(e, Event::MessageCorrelationAckV2Activated { .. })));
+    rig.message.set_message_correlation_ack_v2(false);
+    rig.on_message(Command::TriggerTimers { now: 1_003 }, 1_003);
+    assert!(rig.message.message_correlation_ack_v2_required(), "one-way");
+    let mut replayed = Engine::replay_partition(1, rig.message_journal.clone());
+    replayed.set_message_correlation_ack_v2(false);
+    assert!(replayed.message_correlation_ack_v2_required());
+    assert_eq!(replayed.state(), rig.message.state());
+}
+
+/// #2037: a pre-v2 journal (acks recorded without the resolved element)
+/// replays to the identical state under the v2 binary and records no latch;
+/// once the cluster later turns v2 on, the same partition latches and
+/// answers in v2 from then on.
+#[test]
+fn a_pre_v2_journal_replays_unchanged_and_latches_later() {
+    let (rig, _instance_key, _published) = migrate_mid_reservation(false, false);
+    let mut instance = Engine::replay_partition(0, rig.instance_journal.clone());
+    let message = Engine::replay_partition(1, rig.message_journal.clone());
+    assert_eq!(instance.state(), rig.instance.state());
+    assert_eq!(message.state(), rig.message.state());
+    assert!(!instance.message_correlation_ack_v2_required());
+    assert!(!message.message_correlation_ack_v2_required());
+    instance.set_num_partitions(Rig::N);
+    instance.set_message_correlation_ack_v2(true);
+    let events = instance
+        .apply_command_at(Command::TriggerTimers { now: 3_000 }, 3_000)
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::MessageCorrelationAckV2Activated { partition: 0 })));
+    assert!(instance.message_correlation_ack_v2_required());
 }
 
 /// Suspends a fresh local `await-payment` instance, publishes a matching

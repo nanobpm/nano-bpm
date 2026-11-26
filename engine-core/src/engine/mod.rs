@@ -20,6 +20,7 @@ use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
+mod ack_outcome;
 mod agent_behavior;
 mod api;
 mod boundary;
@@ -373,6 +374,11 @@ pub struct Engine {
     /// as last passed to [`Engine::set_remote_buffered_delivery`]. Drives the
     /// one-time [`Event::RemoteBufferedDeliveryActivated`] record.
     remote_buffered_delivery_envelope: bool,
+    /// The CURRENT replicated envelope's `message-correlation-ack-v2` bit
+    /// (#2037), as last passed to [`Engine::set_message_correlation_ack_v2`].
+    /// Drives the one-time [`Event::MessageCorrelationAckV2Activated`]
+    /// record; the v2 ack output itself is gated on the durable latch only.
+    message_correlation_ack_v2_envelope: bool,
     /// Start of the log window the drain sweeps (`complete_drained_subprocesses`,
     /// `complete_finished_instances`) derive their touched-instance set from.
     /// `0` for a whole command; advanced to the fire point each time the
@@ -821,6 +827,7 @@ impl Engine {
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
             remote_buffered_delivery_envelope: false,
+            message_correlation_ack_v2_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied: None,
@@ -927,6 +934,38 @@ impl Engine {
     /// log/snapshot depends on `message-correlation-ack-v1` once `true`.
     pub fn message_correlation_ack_ever_used(&self) -> bool {
         self.state.message_correlation_ack_used
+    }
+
+    /// Sets the replicated envelope's `message-correlation-ack-v2` bit
+    /// (#2037): `true` only once EVERY cluster member advertises v2. A
+    /// replicated host MUST set it from the replicated command envelope
+    /// before every apply, never from local knowledge.
+    ///
+    /// One-way latch, exactly like v1 (#1949): the first command that applies
+    /// under an enabling envelope records
+    /// [`Event::MessageCorrelationAckV2Activated`], and from then on the ack
+    /// output carries the resolved (post-migration) consumption element. A
+    /// later `false` is ignored. Before the latch the legacy v1 ack output is
+    /// emitted unchanged, so mixed-version clusters, replay of pre-v2
+    /// journals and the wasm `TestEngine` keep working.
+    pub fn set_message_correlation_ack_v2(&mut self, enabled: bool) {
+        self.message_correlation_ack_v2_envelope = enabled;
+    }
+
+    /// Records the one-time v2 activation latch (#2037).
+    fn emit_message_correlation_ack_v2_activation(&mut self, log: &mut Vec<Event>) {
+        if self.message_correlation_ack_v2_envelope
+            && !self.state.message_correlation_ack_v2_latched
+        {
+            let partition = self.partition_id;
+            self.emit(log, Event::MessageCorrelationAckV2Activated { partition });
+        }
+    }
+
+    /// Whether this partition's retained log/snapshot depends on
+    /// `message-correlation-ack-v2` (#2037): the v2 latch is recorded. One-way.
+    pub fn message_correlation_ack_v2_required(&self) -> bool {
+        self.state.message_correlation_ack_v2_latched
     }
 
     /// The worker a terminal job event attributes (#963): the replicated
@@ -1088,6 +1127,7 @@ impl Engine {
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
             remote_buffered_delivery_envelope: false,
+            message_correlation_ack_v2_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
             raft_applied,
@@ -2750,6 +2790,9 @@ impl Engine {
     /// acknowledging it — the debug/normal-apply parity contract.
     fn finish_drained_command(&mut self, log: &mut Vec<Event>) {
         self.cascade_cancel_children(log, 0);
+        // The v2 latch (#2037) is recorded BEFORE the owed ack, so the first
+        // command applied under a v2 envelope already answers in v2.
+        self.emit_message_correlation_ack_v2_activation(log);
         self.emit_pending_correlation_ack(log);
         self.emit_remote_buffered_delivery_activation(log);
         self.remote_backlog_scan_pending = false;
@@ -5509,6 +5552,7 @@ impl Engine {
                             // The ORIGINAL answer, never one recomputed from
                             // the subscription's later state (#1949).
                             Some(receipt) => {
+                                let deferred = receipt.deferred;
                                 self.emit_receipt(&mut log, &ack, receipt);
                                 // A deferral answered while suspended whose
                                 // instance has since resumed: the message
@@ -5516,7 +5560,7 @@ impl Engine {
                                 // ack, then needs the resume handshake the
                                 // earlier resume could not complete (it found
                                 // the delivery still awaiting this ack).
-                                if receipt.deferred && !self.instance_is_suspended(instance_key) {
+                                if deferred && !self.instance_is_suspended(instance_key) {
                                     self.emit_subscription_resuming(&mut log, subscription_key);
                                 }
                             }
@@ -5611,6 +5655,7 @@ impl Engine {
                 accepted,
                 consumed,
                 deferred,
+                element_id,
             } => {
                 // Either way — applied now, or a duplicate / stale ack of a
                 // delivery no longer awaited — no re-drive of this delivery
@@ -5665,6 +5710,7 @@ impl Engine {
                         consumed,
                         deferred,
                         partition: self.partition_id,
+                        element_id,
                     },
                 );
                 if consumed {
@@ -8030,6 +8076,9 @@ impl Engine {
                         partition: self.partition_id,
                         target_partition: self.partition_id,
                         delivery_key: ack.delivery_key,
+                        // A self-routed release: nothing was consumed, so
+                        // there is no resolved consumption metadata.
+                        element_id: None,
                     });
                 };
                 Some(Event::RemoteMessageCorrelation {
@@ -8070,6 +8119,7 @@ impl Engine {
                     partition: self.partition_id,
                     target_partition: r.target_partition,
                     delivery_key,
+                    element_id: r.element_id,
                 },
             )
             .collect()
@@ -8256,24 +8306,38 @@ impl Engine {
     ///   its scope still waits.
     fn emit_correlation_ack(&mut self, log: &mut Vec<Event>, ack: PendingCorrelationAck) {
         let subscription = self.state.message_subscriptions.get(&ack.subscription_key);
-        let consumed = subscription.is_some_and(|s| {
-            if s.kind.stays_open_after_trigger() {
-                s.correlated_message_keys.contains(&ack.message_key)
-            } else {
-                s.state == state::MessageSubscriptionState::Correlated
-            }
-        });
-        let waiting =
-            subscription.is_some_and(|s| s.state == state::MessageSubscriptionState::Opening);
-        let accepted = consumed && waiting;
-        let deferred = !consumed && waiting && self.instance_is_suspended(ack.instance_key);
+        // Gather the durable facts; the decision is the pure kernel's.
+        let facts = ack_outcome::AckFacts {
+            subscription_present: subscription.is_some(),
+            stays_open: subscription.is_some_and(|s| s.kind.stays_open_after_trigger()),
+            message_recorded: subscription
+                .is_some_and(|s| s.correlated_message_keys.contains(&ack.message_key)),
+            correlated: subscription
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Correlated),
+            opening: subscription
+                .is_some_and(|s| s.state == state::MessageSubscriptionState::Opening),
+            instance_suspended: self.instance_is_suspended(ack.instance_key),
+        };
+        let outcome = ack_outcome::ack_outcome(facts);
+        // The RESOLVED consumption element (#2037), read from this
+        // partition's durable state now — after any migration that ran
+        // between the message partition's reservation and this consumption
+        // re-pointed the subscription. v2 output only (#2037): before the
+        // cluster-wide `message-correlation-ack-v2` latch the legacy v1 ack
+        // is emitted unchanged, so no member lacking v2 receives it.
+        let element_id = if self.state.message_correlation_ack_v2_latched {
+            subscription.map(|s| s.element_id.clone())
+        } else {
+            None
+        };
         let receipt = state::CorrelationReceipt {
-            accepted,
-            consumed,
-            deferred,
+            accepted: outcome.accepted,
+            consumed: outcome.consumed,
+            deferred: outcome.deferred,
             message_key: ack.message_key,
             instance_key: ack.instance_key,
             target_partition: ack.target_partition,
+            element_id,
         };
         self.emit_receipt(log, &ack, receipt);
     }
@@ -8299,6 +8363,7 @@ impl Engine {
                 partition: self.partition_id,
                 target_partition: ack.target_partition,
                 delivery_key: ack.delivery_key,
+                element_id: receipt.element_id,
             },
         );
     }
