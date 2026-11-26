@@ -315,6 +315,55 @@ fn migration_of_a_triggered_catch_parked_on_its_start_listener() {
     assert_completed_via(&engine, inst, &events, "endMsg2");
 }
 
+/// #2004 review: a triggered gateway held by its END listener has recorded
+/// its winning catch without activating it; finishing the gateway activates
+/// that catch under the target, so the catch must be mapped (mapping only the
+/// gateway would leave a source catch id the target may not contain).
+#[test]
+fn migration_of_a_triggered_gateway_on_its_end_listener_requires_the_catch() {
+    let mut engine = Engine::new();
+    let source = race_builder("source", "", "reply")
+        .with_listeners("gw", Vec::new(), vec![el(ListenerEventType::End, "audit")])
+        .build()
+        .unwrap();
+    deploy_for_migration(&mut engine, source);
+    let target_key = deploy_for_migration(&mut engine, race("target", "2", "reply"));
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "source",
+        vars(&[("orderId", Value::Str("o1".into()))]),
+    );
+    engine
+        .apply_command(Command::correlate_message("reply", "o1"))
+        .unwrap();
+    assert_eq!(active_ids(&engine, inst), ["gw"]);
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("gw", "gw2")]),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::UnmappedActiveElement { element_id, .. } if element_id == "onMsg"),
+        "{err:?}"
+    );
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("gw", "gw2"), ("onMsg", "onMsg2")]),
+        ))
+        .unwrap();
+    assert_eq!(active_ids(&engine, inst), ["gw2"]);
+    let job = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    assert_eq!(job.len(), 1);
+    let events = engine
+        .apply_command(Command::complete_job(job[0].key))
+        .unwrap();
+    assert_completed_via(&engine, inst, &events, "endMsg2");
+}
+
 /// Copilot #1564: the indexed race lookup must agree with the naive per-catch
 /// graph scan on every element of a definition carrying the ambiguous shapes
 /// (a catch fed by two gateways, a gateway with two incoming flows) that make

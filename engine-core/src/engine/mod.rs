@@ -6456,6 +6456,37 @@ impl Engine {
                     }
                 }
 
+                // 5b'. A triggered event-based gateway that is still active
+                //      (an end listener or a completion incident holds it,
+                //      #2004) has RECORDED its winning catch but not yet
+                //      activated it: finishing the gateway activates that
+                //      catch under the target, so it must be mapped like an
+                //      active element. Mapping the gateway then keeps it a
+                //      target of the mapped gateway (step 5's catch check).
+                let pending_catches: Vec<String> = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| {
+                        i.gateway_triggers
+                            .iter()
+                            .filter(|(gw, t)| {
+                                i.active.contains_key(gw)
+                                    && !i.active.contains_key(&t.catch_element_instance_key)
+                            })
+                            .map(|(_, t)| t.catch_element_id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for catch in &pending_catches {
+                    if !mapped.contains_key(catch) {
+                        return Err(EngineError::UnmappedActiveElement {
+                            instance_key,
+                            element_id: catch.clone(),
+                        });
+                    }
+                }
+
                 // 5b. A parked ad-hoc tool retry (#1630 review): an
                 //     activation / job-type incident names a PENDING tool
                 //     that has no active element instance yet, so step 5
