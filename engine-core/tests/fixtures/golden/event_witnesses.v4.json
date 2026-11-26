@@ -91,6 +91,91 @@
     }
   },
   {
+    "RemoteMessageCorrelation": {
+      "ack_partition": 1,
+      "delivery_key": 26,
+      "element_id": "b",
+      "element_instance_key": 24,
+      "instance_key": 23,
+      "kind": {
+        "NonInterruptingBoundary": {
+          "boundary_element_id": "nb"
+        }
+      },
+      "message_key": 20,
+      "subscription_key": 21,
+      "variables": {
+        "x": {
+          "Int": 1
+        }
+      }
+    }
+  },
+  {
+    "MessageCorrelationAcknowledging": {
+      "accepted": true,
+      "consumed": true,
+      "deferred": false,
+      "delivery_key": 26,
+      "instance_key": 23,
+      "message_key": 20,
+      "partition": 0,
+      "subscription_key": 21,
+      "target_partition": 1
+    }
+  },
+  {
+    "MessageSubscriptionResuming": {
+      "correlation_key": "order-1",
+      "generation": 2,
+      "instance_key": 23,
+      "subscription_key": 21
+    }
+  },
+  {
+    "MessageSubscriptionResumed": {
+      "generation": 2,
+      "instance_key": 23,
+      "partition": 1,
+      "subscription_key": 21
+    }
+  },
+  {
+    "MessageSubscriptionResumeConfirmed": {
+      "generation": 2,
+      "instance_key": 23,
+      "subscription_key": 21
+    }
+  },
+  {
+    "RemoteBufferedDeliveryActivated": {
+      "partition": 1
+    }
+  },
+  {
+    "MessageCorrelationSettled": {
+      "delivery_key": 26,
+      "partition": 1,
+      "subscription_key": 21
+    }
+  },
+  {
+    "MessageCorrelationReceiptSettled": {
+      "delivery_key": 26,
+      "subscription_key": 21
+    }
+  },
+  {
+    "MessageCorrelationAcknowledged": {
+      "accepted": false,
+      "consumed": false,
+      "deferred": false,
+      "message_key": 20,
+      "partition": 1,
+      "subscription_key": 21
+    }
+  },
+  {
     "RoutedDeliveryRecorded": {
       "close_tombstone": true,
       "delivery_key": 25,

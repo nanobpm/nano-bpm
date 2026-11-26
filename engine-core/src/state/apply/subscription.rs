@@ -70,6 +70,12 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     state: MessageSubscriptionState::Open,
                     kind: kind.clone(),
                     correlated_message_keys: Default::default(),
+                    awaiting_ack: None,
+                    rescan_from: None,
+                    resume_pending: false,
+                    resume_generation: 0,
+                    deferred: false,
+                    last_answered_delivery: 0,
                 },
             );
         }
@@ -99,6 +105,12 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     state: MessageSubscriptionState::Opening,
                     kind: kind.clone(),
                     correlated_message_keys: Default::default(),
+                    awaiting_ack: None,
+                    rescan_from: None,
+                    resume_pending: false,
+                    resume_generation: 0,
+                    deferred: false,
+                    last_answered_delivery: 0,
                 },
             );
         }
@@ -243,8 +255,9 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     delivery_key: *delivery_key,
                     subscription_key: *subscription_key,
                     close_tombstone: *close_tombstone,
+                    receipt: None,
+                    settled: false,
                 },
-                ROUTED_DELIVERY_LEDGER_CAP,
             );
         }
 
@@ -267,13 +280,184 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
         // token advance happens on the instance partition, driven by the
         // `CorrelateMessageSubscription` continuation the host routes there.
         Event::RemoteMessageCorrelation {
-            subscription_key, ..
+            subscription_key,
+            message_key,
+            delivery_key,
+            ack_partition,
+            ..
         } => {
+            if ack_partition.is_some() {
+                state.message_correlation_ack_used = true;
+            }
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
                 if !subscription.kind.stays_open_after_trigger() {
                     subscription.state = MessageSubscriptionState::Correlated;
                 }
+                if ack_partition.is_some() {
+                    // Ack-paced buffered delivery (#1949): the delivery and its
+                    // reservation stay in flight until the instance partition
+                    // answers; nothing more is sent meanwhile.
+                    subscription.awaiting_ack = Some(AwaitingAck {
+                        message_key: *message_key,
+                        delivery_key: *delivery_key,
+                    });
+                }
             }
+        }
+
+        // The instance partition answered an ack-paced delivery (#1949). An
+        // unconsumed delivery releases the message's reservation (it is
+        // available again, to this instance too). A deferral (suspended
+        // instance, scope alive) keeps — or, for a one-shot kind, re-opens —
+        // the subscription; any other rejection closes it, leaving the untaken
+        // buffered messages buffered.
+        Event::MessageCorrelationAcknowledged {
+            subscription_key,
+            message_key,
+            accepted,
+            consumed,
+            deferred,
+            ..
+        } => {
+            let still_buffered = state.buffered_messages.contains_key(message_key);
+            if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
+                if subscription
+                    .awaiting_ack
+                    .is_some_and(|a| a.message_key == *message_key)
+                {
+                    subscription.awaiting_ack = None;
+                    let instance_key = subscription.instance_key;
+                    if *deferred {
+                        if subscription.state == MessageSubscriptionState::Correlated {
+                            subscription.state = MessageSubscriptionState::Open;
+                            // Re-opened only to await the resume handshake:
+                            // no unpaced live publication may settle it. Not
+                            // for the self-routed release of an orphaned
+                            // reservation (its message is gone), which is
+                            // re-offered the backlog at once.
+                            subscription.deferred = still_buffered;
+                        }
+                    } else if !*accepted && subscription.state == MessageSubscriptionState::Open {
+                        subscription.state = MessageSubscriptionState::Correlated;
+                    }
+                    let index_key = (
+                        subscription.message_name.clone(),
+                        subscription.correlation_key.clone(),
+                    );
+                    if *consumed {
+                        // Its post-ack scan honours any earlier release (the
+                        // engine read `rescan_from` before emitting this).
+                        subscription.rescan_from = None;
+                    } else if let Some(message) = state.buffered_messages.get_mut(message_key) {
+                        message.correlated_instances.remove(&instance_key);
+                        // Every OTHER subscription of this instance on the same
+                        // (name, correlation key) that is awaiting its own ack
+                        // skipped this message while it was reserved: its next
+                        // scan must not resume past it.
+                        let entry = (message.seq, *message_key);
+                        for other in state.message_subscriptions.values_mut() {
+                            if other.key != *subscription_key
+                                && other.instance_key == instance_key
+                                && other.awaiting_ack.is_some()
+                                && other.message_name == index_key.0
+                                && other.correlation_key == index_key.1
+                            {
+                                other.rescan_from =
+                                    Some(other.rescan_from.map_or(entry, |r| r.min(entry)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // The instance partition's answer to an ack-paced delivery (#1949),
+        // applied on the EMITTING (instance) partition: record it as that
+        // delivery's durable receipt, so a re-driven duplicate is answered
+        // with exactly this outcome whatever happens to the subscription.
+        Event::MessageCorrelationAcknowledging {
+            accepted,
+            consumed,
+            deferred,
+            delivery_key,
+            subscription_key,
+            message_key,
+            instance_key,
+            target_partition,
+            ..
+        } => {
+            // Answering a paced delivery is capability use on the RECEIVING
+            // side too (Copilot r4702895398): a destination that never applied
+            // an enabling envelope must still keep its resume gate open, or the
+            // handshake for this deferral is suppressed. Durable (snapshot and
+            // replay) and one-way, like the sending side's flag.
+            state.message_correlation_ack_used = true;
+            // Only the delivery's FIRST answer moves the resume state: a
+            // re-emitted duplicate (original receipt, or one recomputed after
+            // settlement) must not clear a newer deferral or pending resume.
+            let first = *delivery_key == 0
+                || state.routed_deliveries.set_receipt(
+                    *delivery_key,
+                    CorrelationReceipt {
+                        accepted: *accepted,
+                        consumed: *consumed,
+                        deferred: *deferred,
+                        message_key: *message_key,
+                        instance_key: *instance_key,
+                        target_partition: *target_partition,
+                    },
+                );
+            if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
+                // Answer ordering lives with the subscription, not in the
+                // bounded ledger: a late duplicate whose ledger entry was
+                // evicted re-records as "first", but it answers an OLDER
+                // delivery than one already answered, so it must not move
+                // the resume state either.
+                let newer = *delivery_key == 0 || *delivery_key > s.last_answered_delivery;
+                if newer {
+                    s.last_answered_delivery = (*delivery_key).max(s.last_answered_delivery);
+                }
+                if first && newer && s.state == MessageSubscriptionState::Opening {
+                    s.resume_pending = *deferred;
+                    if *deferred {
+                        s.resume_generation = s.resume_generation.wrapping_add(1);
+                    }
+                }
+            }
+        }
+
+        // The message partition answered the resume handshake (#1949): the
+        // deferred backlog is re-offered from here, so the record may take
+        // live publications again.
+        Event::MessageSubscriptionResumed {
+            subscription_key, ..
+        } => {
+            if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
+                s.deferred = false;
+            }
+        }
+
+        // The message partition confirmed the resume handshake (#1949).
+        // Only the CURRENT generation clears it: a delayed confirmation of an
+        // older resume must not erase a newer obligation.
+        Event::MessageSubscriptionResumeConfirmed {
+            subscription_key,
+            generation,
+            ..
+        } => {
+            if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
+                if s.resume_generation == *generation {
+                    s.resume_pending = false;
+                }
+            }
+        }
+        // The message partition processed this delivery's ack (#1949):
+        // unpin its receipt.
+        Event::MessageCorrelationReceiptSettled { delivery_key, .. } => {
+            state.routed_deliveries.settle_receipt(*delivery_key);
+        }
+        Event::RemoteBufferedDeliveryActivated { .. } => {
+            state.remote_buffered_delivery_latched = true;
         }
 
         Event::MessageStartSubscriptionCreated {
