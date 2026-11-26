@@ -5261,6 +5261,11 @@
     }
   },
   {
+    "EventGatewayRuntimeActivated": {
+      "partition": 0
+    }
+  },
+  {
     "EventGatewaySubscriptionsOpened": {
       "catch_element_ids": [
         "onM1",

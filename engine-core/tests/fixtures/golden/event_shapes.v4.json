@@ -239,6 +239,8 @@
   "ElementTerminating.instance_key",
   "EndEvent",
   "EventBasedGateway",
+  "EventGatewayRuntimeActivated",
+  "EventGatewayRuntimeActivated.partition",
   "EventGatewaySubscriptionsOpened",
   "EventGatewaySubscriptionsOpened.catch_element_ids",
   "EventGatewaySubscriptionsOpened.gateway_element_id",

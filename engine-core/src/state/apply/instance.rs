@@ -147,7 +147,6 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 races: BTreeMap::new(),
                 gateway_subscriptions: BTreeMap::new(),
                 gateway_triggers: BTreeMap::new(),
-                event_gateway_owned: false,
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),
@@ -465,14 +464,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
 
         // An audit record: the modification's state change is carried by the
         // activation / termination events that follow it.
-        // Modification may activate a gateway-owned catch directly under the
-        // gateway-owned subscription model: mark the instance (#2004) so the
-        // legacy-race refusal does not mistake that catch for a legacy race.
-        Event::ProcessInstanceModified { instance_key, .. } => {
-            if let Some(instance) = state.instances.get_mut(instance_key) {
-                instance.event_gateway_owned = true;
-            }
-        }
+        Event::ProcessInstanceModified { .. } => {}
 
         Event::ProcessInstanceBusinessIdAssigned {
             instance_key,
@@ -493,12 +485,6 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             compensation_migrated,
             ..
         } => {
-            // Migration can land a catch on a target where it is gateway-owned
-            // under this build's model: mark the instance (#2004), as for
-            // modification, so the legacy-race refusal does not brick reload.
-            if let Some(instance) = state.instances.get_mut(instance_key) {
-                instance.event_gateway_owned = true;
-            }
             let remap: BTreeMap<&str, &str> = element_mappings
                 .iter()
                 .map(|(s, t)| (s.as_str(), t.as_str()))

@@ -119,7 +119,6 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             ..
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
-                instance.event_gateway_owned = true;
                 instance
                     .gateway_subscriptions
                     .insert(*gateway_element_instance_key, catch_element_ids.clone());

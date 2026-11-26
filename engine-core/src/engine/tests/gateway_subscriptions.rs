@@ -81,7 +81,7 @@ fn gateway_owned_runtime_arms_no_legacy_race() {
     let inst =
         create_instance_with_vars(&mut engine, "evt", vars(&[("key", Value::Str("k".into()))]));
     let instance = &engine.state().instances[&inst];
-    assert!(instance.event_gateway_owned, "the format marker is set");
+    assert!(engine.event_gateway_runtime_latched(), "the runtime latch is recorded");
     assert!(instance.races.is_empty());
     assert!(engine
         .state()
@@ -99,7 +99,7 @@ fn gateway_owned_runtime_arms_no_legacy_race() {
 /// An instance resting on a legacy race: the gateway is gone and its catches
 /// are active element instances. Built by hand, since this build never arms
 /// one.
-fn legacy_race_state(races: bool, marked: bool) -> (State, Key) {
+fn legacy_race_state(races: bool, latched: bool) -> (State, Key) {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(gateway_race()))
@@ -116,40 +116,38 @@ fn legacy_race_state(races: bool, marked: bool) -> (State, Key) {
         instance.races.insert(9101, 9100);
         instance.races.insert(9102, 9100);
     }
-    instance.event_gateway_owned = marked;
+    state.event_gateway_runtime_latched = latched;
     (state, inst)
 }
 
 #[test]
-fn legacy_race_detector_names_races_with_or_without_the_races_field() {
+fn legacy_race_detector_names_races_and_refuses_them_only_once_latched() {
     // A #1676 race carries `races` membership.
     let (state, inst) = legacy_race_state(true, false);
     assert_eq!(state.legacy_event_gateway_race_instances(), vec![inst]);
-    // A pre-#1676 race has no `races` field: the unmarked instance's
-    // gateway-owned active catches give it away.
-    let (state, inst) = legacy_race_state(false, false);
-    assert_eq!(state.legacy_event_gateway_race_instances(), vec![inst]);
-    // `races` membership is legacy-only, so it is refused even when marked.
+    // Before the latch the legacy runtime still owns it: loadable.
+    assert!(state.refused_legacy_event_gateway_race_instances().is_empty());
+    // Once latched, legacy race state is refused.
     let (state, inst) = legacy_race_state(true, true);
-    assert_eq!(state.legacy_event_gateway_race_instances(), vec![inst]);
-    // A marked instance resting on a gateway catch got there under this build
-    // (e.g. by modification): not a legacy race.
+    assert_eq!(state.refused_legacy_event_gateway_race_instances(), vec![inst]);
+    // No `races` membership: nothing to refuse either way.
     let (state, _) = legacy_race_state(false, true);
-    assert!(state.legacy_event_gateway_race_instances().is_empty());
+    assert!(state.refused_legacy_event_gateway_race_instances().is_empty());
 }
 
 #[test]
-fn legacy_race_detector_survives_serde_of_a_races_less_instance() {
+fn latched_refusal_survives_serde() {
     #[cfg(feature = "serde")]
     {
-        let (state, inst) = legacy_race_state(false, false);
+        let (state, inst) = legacy_race_state(true, true);
         let json = serde_json::to_string(&state).unwrap();
-        assert!(
-            !json.contains("event_gateway_owned"),
-            "an unmarked instance serializes like a legacy one"
-        );
         let back: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.legacy_event_gateway_race_instances(), vec![inst]);
+        assert!(back.event_gateway_runtime_latched);
+        assert_eq!(back.refused_legacy_event_gateway_race_instances(), vec![inst]);
+        // A pre-latch snapshot serializes without the field and loads unlatched.
+        let (state, _) = legacy_race_state(true, false);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("event_gateway_runtime_latched"));
     }
 }
 
@@ -216,7 +214,7 @@ fn replayed_legacy_journal_tail_is_detected() {
         .legacy_event_gateway_race_instances()
         .is_empty());
 
-    for race in [Some(9100), None] {
+    for (race, legacy) in [(Some(9100), true), (None, false)] {
         let mut tail = journal.clone();
         tail.push(Event::ElementActivating {
             instance_key: inst,
@@ -229,7 +227,7 @@ fn replayed_legacy_journal_tail_is_detected() {
             Engine::replay(tail)
                 .state()
                 .legacy_event_gateway_race_instances(),
-            vec![inst],
+            if legacy { vec![inst] } else { Vec::new() },
             "race {race:?}"
         );
     }

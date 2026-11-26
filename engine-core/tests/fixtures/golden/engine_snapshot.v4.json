@@ -596,6 +596,7 @@
         "version": 1
       }
     },
+    "event_gateway_runtime_latched": true,
     "form_versions": {},
     "forms": {},
     "incidents": {
@@ -852,7 +853,6 @@
         "compensation_waits": {},
         "created_at": 1700000000029,
         "esp_held_payloads": {},
-        "event_gateway_owned": true,
         "gateway_routes": {},
         "gateway_subscriptions": {
           "135": [
@@ -1296,7 +1296,6 @@
         "compensation_waits": {},
         "created_at": 1700000000018,
         "esp_held_payloads": {},
-        "event_gateway_owned": true,
         "gateway_routes": {},
         "incidents": [],
         "join_counts": [],

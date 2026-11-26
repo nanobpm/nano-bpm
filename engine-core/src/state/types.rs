@@ -1026,18 +1026,6 @@ pub struct ProcessInstance {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub gateway_triggers: BTreeMap<Key, GatewayTrigger>,
-    /// Explicit format marker (#2004): `true` once this instance has run under
-    /// the gateway-owned subscription model (it opened an event-based
-    /// gateway's subscriptions, or was modified or migrated, under this build). A legacy
-    /// snapshot or journal never sets it, so an unmarked instance resting on
-    /// an active gateway-owned catch is a legacy race the loader refuses
-    /// ([`State::legacy_event_gateway_race_instances`]) even when it predates
-    /// the #1676 `races` field.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "std::ops::Not::not")
-    )]
-    pub event_gateway_owned: bool,
     /// Keys of incidents currently **active** on this instance (parked tokens).
     /// The full records live in [`State::incidents`] and are retained after
     /// resolution; resolving an incident removes its key from this active index
@@ -2868,6 +2856,17 @@ pub struct State {
         serde(default, skip_serializing_if = "std::ops::Not::not")
     )]
     pub remote_buffered_delivery_latched: bool,
+    /// Whether the `event-gateway-runtime-v1` latch (#2004) is recorded on
+    /// this partition: set only by applying
+    /// [`crate::Event::EventGatewayRuntimeActivated`], so a snapshot and a
+    /// journal replay agree. One-way. Before it, event-based gateways run the
+    /// legacy #1676 race path; after it, the gateway-owned trigger path, and
+    /// legacy race state is refused on load. Additive.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub event_gateway_runtime_latched: bool,
     /// Open and settled **signal** subscriptions, keyed by subscription key. A
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) as an audit trail.
@@ -3192,41 +3191,33 @@ impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
 
 impl State {
     /// Instances carrying an armed LEGACY event-based gateway race (#1676
-    /// `races` membership): catches activated by an already-completed gateway.
-    /// The gateway-owned subscription model (#1963, #2003) cannot represent
-    /// these, so a pre-v4 snapshot holding any is refused on load
-    /// (`LegacyEventGatewayRace`) rather than silently dropped or rewound.
-    /// Ascending, deduplicated.
-    ///
-    /// Two signals, either suffices: a #1676 `races` membership (written only
-    /// by the legacy runtime), or — for state written before #1676 persisted
-    /// `races` — an UNMARKED instance (no
-    /// [`ProcessInstance::event_gateway_owned`] format marker) with an active
-    /// catch whose unambiguous owner is an event-based gateway
-    /// (`event_gateway_race_index`, resolved against the instance's pinned
-    /// definition). Run after snapshot load AND after journal replay, so a
-    /// race armed by tail events is refused too.
+    /// `races` membership): catches the legacy runtime activated from an
+    /// already-completed gateway, still waiting for the race winner to
+    /// withdraw them. Ascending, deduplicated.
     pub fn legacy_event_gateway_race_instances(&self) -> Vec<Key> {
         self.instances
             .iter()
-            .filter(|(_, i)| !i.races.is_empty() || self.has_unmarked_gateway_catch(i))
+            .filter(|(_, i)| !i.races.is_empty())
             .map(|(k, _)| *k)
             .collect()
     }
 
-    /// Whether unmarked (legacy) instance `i` rests on an active catch armed by
-    /// an event-based gateway (see [`Self::legacy_event_gateway_race_instances`]).
-    fn has_unmarked_gateway_catch(&self, i: &ProcessInstance) -> bool {
-        if i.event_gateway_owned {
-            return false;
+    /// The legacy race state a loader must REFUSE (#2004): every legacy race
+    /// ([`Self::legacy_event_gateway_race_instances`]) once the
+    /// `event-gateway-runtime-v1` latch is recorded, none before it. Before
+    /// the latch the legacy runtime still owns these races (a mixed-version
+    /// cluster, or a pre-latch journal replaying under legacy semantics), so
+    /// they load and settle as before. The engine records the latch only when
+    /// no legacy race is left (`Engine::event_gateway_runtime_decision`), so a
+    /// latched snapshot or journal holding one is corrupt or hand-edited, and
+    /// is refused rather than run under semantics it was not written for.
+    /// Run after snapshot load AND after journal replay.
+    pub fn refused_legacy_event_gateway_race_instances(&self) -> Vec<Key> {
+        if self.event_gateway_runtime_latched {
+            self.legacy_event_gateway_race_instances()
+        } else {
+            Vec::new()
         }
-        let Some(def) = self.process_by_key(i.process_definition_key) else {
-            return false;
-        };
-        let index = crate::engine::event_gateway_race_index(&def.definition);
-        i.active
-            .values()
-            .any(|element_id| index.owner_of(element_id).is_some())
     }
 
     /// The settlement half of the live `VariablesLostQuarantined` fold

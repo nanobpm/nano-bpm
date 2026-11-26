@@ -2117,6 +2117,15 @@ pub enum Event {
     /// envelope exactly like one that applied the enabling envelope live.
     /// Partition-level; names no instance.
     RemoteBufferedDeliveryActivated { partition: u64 },
+    /// The event-based gateway runtime of #2004 (`event-gateway-runtime-v1`)
+    /// was activated on this partition: from this log position on, an
+    /// event-based gateway waits on gateway-owned subscriptions and its
+    /// trigger activates only the winning catch. Before it, the legacy #1676
+    /// race path (arm every catch, withdraw the losing siblings) runs, so a
+    /// journal without this record replays under legacy semantics. Recorded
+    /// once, when the replicated envelope first enables the capability and no
+    /// legacy race state is left. Partition-level; names no instance.
+    EventGatewayRuntimeActivated { partition: u64 },
     /// A process-level message start subscription was opened at deploy time: a
     /// later [`Event::MessagePublished`] with a matching `message_name` creates a
     /// new instance of `process_id`. Carried on the log so replay reconstructs
@@ -2514,6 +2523,7 @@ impl Event {
             | Event::MessageCorrelationSettled { .. }
             | Event::MessageCorrelationReceiptSettled { .. }
             | Event::RemoteBufferedDeliveryActivated { .. }
+            | Event::EventGatewayRuntimeActivated { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
@@ -2708,7 +2718,8 @@ impl Event {
             | Event::MessageCorrelationAcknowledged { partition, .. }
             | Event::MessageSubscriptionResumed { partition, .. }
             | Event::MessageCorrelationSettled { partition, .. }
-            | Event::RemoteBufferedDeliveryActivated { partition } => *partition,
+            | Event::RemoteBufferedDeliveryActivated { partition }
+            | Event::EventGatewayRuntimeActivated { partition } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another
             // partition, so it never identifies the record's owner. Route by the

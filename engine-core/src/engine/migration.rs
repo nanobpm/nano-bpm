@@ -326,6 +326,203 @@ impl Engine {
         Ok(())
     }
 
+    /// LEGACY (#1676, the pre-`event-gateway-runtime-v1` path, #2004): run
+    /// only for an instance holding legacy race members.
+    /// Event-based gateway race preconditions (#1554, Zeebe migrates an active
+    /// event-based gateway together with its armed catch events). The engine
+    /// models the gateway as a pass-through whose catch events are each an
+    /// active element instance, so a resting race is a set of active catch
+    /// events sharing one owning gateway ([`event_gateway_race_index`] — the
+    /// same race definition the runtime withdrawal uses). Per source race:
+    ///
+    /// * every mapped member must be a race member of one target event-based
+    ///   gateway — the mapped target of the source gateway when that is mapped
+    ///   — otherwise [`EngineError::MigrationCatchEventDetached`];
+    /// * no two members may map onto the same target catch event
+    ///   ([`EngineError::MigrationCatchEventsMerged`]);
+    /// * an unmapped member is withdrawn (its subscriptions deleted, as Zeebe
+    ///   deletes an unmapped catch event's subscription) provided at least one
+    ///   sibling is mapped; a race with no mapped member is left for the
+    ///   unmapped-active-element rejection.
+    ///
+    /// A race is identified by its owning gateway **and** its token scope
+    /// (`scope_of`), exactly as the runtime withdrawal scopes a race, so two
+    /// live subprocess scopes resting at the same gateway are two races —
+    /// refined by the PERSISTED race identity (`race_of`, #1676), so two
+    /// activations of ONE gateway in one scope are two races, not one. Two
+    /// distinct source races in one scope must not land on the same target
+    /// gateway: the runtime would then treat them as one race and a win in
+    /// either would withdraw the other's catches
+    /// ([`EngineError::UnsupportedMigration`]).
+    ///
+    /// Returns the active `(element instance key, element id)`s to withdraw.
+    pub(crate) fn check_migrated_event_gateway_races(
+        instance_key: Key,
+        source: &ProcessDefinition,
+        target: &ProcessDefinition,
+        mapped: &BTreeMap<String, String>,
+        active: &[(Key, String)],
+        scope_of: impl Fn(Key) -> Key,
+        race_of: impl Fn(Key) -> Option<Key>,
+    ) -> Result<Vec<(Key, String)>, EngineError> {
+        // One indexed pass per definition, shared by every ownership lookup in
+        // this check (O(V + E) each, not a full rescan per active element).
+        let source_races = event_gateway_race_index(source);
+        let target_races = event_gateway_race_index(target);
+        // A race groups by its PERSISTED identity (#1676) — the arming gateway
+        // activation's element instance — so two activations of one gateway in
+        // one scope stay two races (the pre-#1676 element-id + scope grouping
+        // would merge them and reject their migration as a false merge).
+        // Catches armed before races were journaled carry no identity and fall
+        // back to the element-id + scope grouping (identity 0).
+        type RaceMembers<'a> = BTreeMap<(Key, Key, &'a str), Vec<(Key, &'a str)>>;
+        let mut races: RaceMembers = BTreeMap::new();
+        for (eik, eid) in active {
+            if let Some(owner) = source_races.owner_of(eid) {
+                races
+                    .entry((
+                        race_of(*eik).unwrap_or(0),
+                        scope_of(*eik),
+                        owner.id.as_str(),
+                    ))
+                    .or_default()
+                    .push((*eik, eid.as_str()));
+            }
+        }
+        // A target race (scope, target gateway) is claimed by the SOURCE
+        // gateway ELEMENT ids whose races land on it. Two races sharing one
+        // source gateway id are necessarily two activations of one gateway
+        // (#1676 — the runtime arms a catch only on a single-incoming-flow
+        // gateway, so each activation races independently) and stay
+        // independent after the mapping, so they may share the target gateway.
+        // Two DISTINCT source races (different gateway ids) landing on one
+        // target gateway would merge into one runtime race, so that collides.
+        let mut race_claims: BTreeMap<(Key, String), String> = BTreeMap::new();
+        let mut naked_claims: BTreeMap<(Key, String), String> = BTreeMap::new();
+        let merged = |origin: &str, other: &str, tg: &str| EngineError::UnsupportedMigration {
+            instance_key,
+            element_id: origin.to_string(),
+            reason: format!(
+                "`{other}` and `{origin}` in one scope would merge into the \
+                 single target event-based gateway race `{tg}`"
+            ),
+        };
+        let claim_race = |race_claims: &mut BTreeMap<(Key, String), String>,
+                          naked_claims: &BTreeMap<(Key, String), String>,
+                          scope: Key,
+                          gateway: &str,
+                          tg: String|
+         -> Result<(), EngineError> {
+            // Reject only when a DIFFERENT source gateway element already
+            // claimed this target race; a repeat by the same gateway id is a
+            // twin activation (#1676), which stays an independent race.
+            if let Some(other) = race_claims.get(&(scope, tg.clone())) {
+                if other != gateway {
+                    return Err(merged(gateway, other, &tg));
+                }
+            }
+            if let Some(other) = naked_claims.get(&(scope, tg.clone())) {
+                return Err(merged(gateway, other, &tg));
+            }
+            race_claims.insert((scope, tg), gateway.to_string());
+            Ok(())
+        };
+        let claim_naked = |race_claims: &BTreeMap<(Key, String), String>,
+                           naked_claims: &mut BTreeMap<(Key, String), String>,
+                           scope: Key,
+                           tg: String,
+                           origin: &str|
+         -> Result<(), EngineError> {
+            if let Some(other) = naked_claims.get(&(scope, tg.clone())) {
+                return Err(merged(origin, other, &tg));
+            }
+            if let Some(other) = race_claims.get(&(scope, tg.clone())) {
+                return Err(merged(origin, &other.clone(), &tg));
+            }
+            naked_claims.insert((scope, tg), origin.to_string());
+            Ok(())
+        };
+        let mut withdraw = Vec::new();
+        for ((_race, scope, gateway), members) in races {
+            let mapped_members: Vec<(&str, &String)> = members
+                .iter()
+                .filter_map(|(_, eid)| mapped.get(*eid).map(|t| (*eid, t)))
+                .collect();
+            let Some((_, first_target)) = mapped_members.first() else {
+                continue;
+            };
+            let target_gateway = mapped
+                .get(gateway)
+                .cloned()
+                .or_else(|| target_races.owner_of(first_target).map(|o| o.id.clone()));
+            let mut by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+            for (src, tgt) in &mapped_members {
+                let owner = target_races.owner_of(tgt).map(|o| o.id.as_str());
+                if owner.is_none() || owner != target_gateway.as_deref() {
+                    return Err(EngineError::MigrationCatchEventDetached {
+                        instance_key,
+                        element_id: gateway.to_string(),
+                        target_element_id: target_gateway
+                            .clone()
+                            .unwrap_or_else(|| gateway.to_string()),
+                        catch_event_id: src.to_string(),
+                        target_catch_event_id: tgt.to_string(),
+                    });
+                }
+                by_target
+                    .entry(tgt.as_str())
+                    .or_default()
+                    .push(src.to_string());
+            }
+            if let Some((tgt, mut sources)) = by_target.into_iter().find(|(_, s)| s.len() > 1) {
+                sources.sort();
+                return Err(EngineError::MigrationCatchEventsMerged {
+                    instance_key,
+                    element_id: gateway.to_string(),
+                    target_catch_event_id: tgt.to_string(),
+                    source_catch_event_ids: sources,
+                });
+            }
+            if let Some(tg) = target_gateway {
+                claim_race(&mut race_claims, &naked_claims, scope, gateway, tg)?;
+            }
+            withdraw.extend(
+                members
+                    .iter()
+                    .filter(|(_, eid)| !mapped.contains_key(*eid))
+                    .map(|(k, eid)| (*k, eid.to_string())),
+            );
+        }
+        // Live origins outside any source race that still land in a target
+        // race: a gateway paused before arming its catches (start listener /
+        // incident) mapped onto a target gateway, or a standalone catch mapped
+        // onto a target race member.
+        for (eik, eid) in active {
+            if source_races.owner_of(eid).is_some() {
+                continue;
+            }
+            let Some(tgt) = mapped.get(eid) else {
+                continue;
+            };
+            let source_is_gateway = matches!(
+                source.element(eid).map(|e| &e.kind),
+                Some(ElementKind::EventBasedGateway)
+            );
+            let tg = if source_is_gateway {
+                target
+                    .element(tgt)
+                    .filter(|e| matches!(e.kind, ElementKind::EventBasedGateway))
+                    .map(|e| e.id.clone())
+            } else {
+                target_races.owner_of(tgt).map(|o| o.id.clone())
+            };
+            if let Some(tg) = tg {
+                claim_naked(&race_claims, &mut naked_claims, scope_of(*eik), tg, eid)?;
+            }
+        }
+        Ok(withdraw)
+    }
+
     /// Every armed trigger resting on any of `hosts` (element-instance key ->
     /// host element id), grouped by host and sorted by key. One pass over each
     /// partition-wide trigger table per migration, not one per active element.

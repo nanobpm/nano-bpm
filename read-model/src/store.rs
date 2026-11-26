@@ -7908,6 +7908,8 @@ fn project_event(
         | Event::MessageCorrelationReceiptSettled { .. }
         // The activation latch (#1949) is partition bookkeeping.
         | Event::RemoteBufferedDeliveryActivated { .. }
+        // The event-gateway runtime latch (#2004) is partition bookkeeping.
+        | Event::EventGatewayRuntimeActivated { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }
