@@ -65,6 +65,19 @@ fn console_error(msg: &str) {
 /// without a conscious `TestEngine` decision.
 mod surface_parity;
 
+/// The transport-free REST driver ABI, `handle(req) -> res` (#992). Behind the
+/// `read-model` feature: reads are answered by the shared read layer, so the
+/// lean baseline build does not carry it.
+#[cfg(feature = "read-model")]
+mod gateway;
+#[cfg(all(test, feature = "read-model"))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only module (feature-gated, so the clippy.toml test exemptions do not apply)"
+)]
+mod gateway_tests;
+
 #[cfg(all(test, feature = "read-model", not(target_arch = "wasm32")))]
 #[allow(
     clippy::unwrap_used,
@@ -1357,6 +1370,19 @@ impl TestEngine {
     ) -> Result<String, JsValue> {
         self.search_variables_json(query_json, truncate_values)
             .map_err(|e| js_err(&e))
+    }
+
+    /// `handle` — the transport-free REST driver (#992): serve one Camunda v2
+    /// REST request as the gateway would. `method` is the HTTP method, `path`
+    /// the request target (with or without the `/v2` prefix; a query string is
+    /// honoured), `headers_json` a JSON object of header name → value (empty ⇒
+    /// none; `content-type` carries a multipart deployment's boundary) and
+    /// `body` the request body. Returns `{ "status", "headers", "body" }` as
+    /// JSON; never throws — a rejection is an RFC 9457 ProblemDetail response
+    /// whose status/title/detail come from the shared engine-error mapping.
+    pub fn handle(&mut self, method: &str, path: &str, headers_json: &str, body: &str) -> String {
+        let res = self.handle_request(method, path, headers_json, body);
+        serde_json::to_string(&res).unwrap_or_default()
     }
 
     /// `searchAgentInstances` — mirrors `POST /agent-instances/search`.
