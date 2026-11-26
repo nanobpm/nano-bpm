@@ -17656,8 +17656,6 @@ impl Engine {
             .is_some()
     }
 
-    /// The recorded trigger payload of a catch the gateway-owned trigger path
-    /// activated (#2004, #2047 review), or `None` for any other element.
     /// `vars` overlaid with the winning payload recorded when a gateway
     /// trigger activated `element_instance_key` (#2047 review). The ONE place
     /// a gateway-triggered catch's evaluation view is derived, shared by its
@@ -17683,6 +17681,8 @@ impl Engine {
         }
     }
 
+    /// The recorded trigger payload of a catch the gateway-owned trigger path
+    /// activated (#2004, #2047 review), or `None` for any other element.
     fn triggered_catch_payload(
         &self,
         instance_key: Key,
