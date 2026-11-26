@@ -145,6 +145,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 activating: Default::default(),
                 gateway_routes: BTreeMap::new(),
                 races: BTreeMap::new(),
+                gateway_subscriptions: BTreeMap::new(),
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),
@@ -416,6 +417,9 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // cancellation) bypasses those per-catch terminal events — clear
                 // the map so no armed race is stranded on the terminal shell.
                 instance.races.clear();
+                // #2003: gateway-owned subscriptions likewise outlive no
+                // whole-instance teardown.
+                instance.gateway_subscriptions.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();
@@ -823,6 +827,9 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // same forced-teardown rationale — a cancel bypasses the
                 // per-catch terminal events that would remove each entry.
                 instance.races.clear();
+                // #2003: gateway-owned subscriptions likewise outlive no
+                // whole-instance teardown.
+                instance.gateway_subscriptions.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();

@@ -657,6 +657,32 @@ pub enum Event {
         flows: Vec<usize>,
     },
 
+    /// An event-based gateway opened its gateway-owned subscriptions (#1963
+    /// slice i, #2003): one per outgoing catch target, owned by the gateway's
+    /// element instance and tagged with the target catch element id (Zeebe
+    /// `EventBasedGatewayProcessor.onActivate`). Additive; not yet emitted by
+    /// execution.
+    EventGatewaySubscriptionsOpened {
+        instance_key: Key,
+        /// The owning event-based gateway's element instance key.
+        gateway_element_instance_key: Key,
+        gateway_element_id: ElementId,
+        /// The target catch element ids, in outgoing-flow (document) order.
+        catch_element_ids: Vec<ElementId>,
+    },
+
+    /// A gateway-owned subscription fired (#1963 slice i, #2003): the gateway
+    /// recorded its event trigger for `catch_element_id` and every other
+    /// subscription it owns is deleted (Zeebe `EventTrigger` on the gateway's
+    /// event scope; first trigger wins). Additive; not yet emitted by
+    /// execution.
+    EventGatewayTriggered {
+        instance_key: Key,
+        gateway_element_instance_key: Key,
+        /// The catch element whose event fired.
+        catch_element_id: ElementId,
+    },
+
     /// A token moved along a sequence flow from one element to another.
     SequenceFlowTaken {
         instance_key: Key,
@@ -2242,6 +2268,8 @@ impl Event {
             | Event::ElementTerminating { instance_key, .. }
             | Event::ElementTerminated { instance_key, .. }
             | Event::GatewayRouteSelected { instance_key, .. }
+            | Event::EventGatewaySubscriptionsOpened { instance_key, .. }
+            | Event::EventGatewayTriggered { instance_key, .. }
             | Event::SequenceFlowTaken { instance_key, .. }
             | Event::ParallelJoinOpened { instance_key, .. }
             | Event::ParallelJoinTokenArrived { instance_key, .. }
