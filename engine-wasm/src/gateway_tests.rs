@@ -732,3 +732,41 @@ fn resource_names(v: &serde_json::Value) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
+
+/// #996: `activateJobs` long-poll over the ABI returns immediately — the
+/// `requestTimeout` is accepted but never blocks, an empty activation is 200
+/// with an empty list, and after the virtual clock advances past a lock the
+/// next poll returns the now-activatable job.
+#[test]
+fn activation_long_poll_returns_immediately_and_repolls_on_virtual_clock() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    let poll = |eng: &mut TestEngine| {
+        let started = std::time::Instant::now();
+        let res = call(
+            eng,
+            "POST",
+            "/v2/jobs/activation",
+            &json!({ "type": "charge", "maxJobsToActivate": 5, "timeout": 1000,
+                     "worker": "w", "requestTimeout": 600_000 }),
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(res.status, 200, "{}", res.body);
+        json_body(&res)["jobs"].as_array().map(Vec::len)
+    };
+    // Nothing activatable yet: 200 + empty list, promptly.
+    assert_eq!(poll(&mut eng), Some(0));
+    create(&mut eng);
+    assert_eq!(poll(&mut eng), Some(1));
+    // Locked to the first worker: the re-poll is empty, not blocking.
+    assert_eq!(poll(&mut eng), Some(0));
+    // Advance the virtual clock past the 1s lock; the next poll returns it.
+    let res = call(
+        &mut eng,
+        "PUT",
+        "/v2/clock",
+        &json!({ "timestamp": 10_000_000_000_000i64 }),
+    );
+    assert!(res.status < 300, "{}", res.body);
+    assert_eq!(poll(&mut eng), Some(1));
+}
