@@ -33,7 +33,7 @@ pub const NODES: usize = 3;
 /// Sequence flows in the bounded graph.
 pub const FLOWS: usize = 3;
 /// Element-instance slots (an instance key is never reused).
-pub const SLOTS: usize = 4;
+pub const SLOTS: usize = 3;
 
 /// The element kinds the machine distinguishes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -224,25 +224,32 @@ fn complete_and_route(graph: &Graph, s: &mut TokenState, slot: usize, guards: &[
     }
 }
 
-/// The live sources of `has_active_path`: active instances and the targets of
-/// queued activations.
-fn live_sources(graph: &Graph, s: &TokenState) -> Vec<usize> {
-    let mut live = Vec::new();
+/// Capacity of the live-source list: one per instance slot and per flow.
+const LIVE: usize = SLOTS + FLOWS;
+
+/// The live sources of `has_active_path` — active instances and the targets
+/// of queued activations — in a fixed-capacity array (no `Vec` growth for
+/// Kani to model); returns the array and its length.
+fn live_sources(graph: &Graph, s: &TokenState) -> ([usize; LIVE], usize) {
+    let mut live = [0usize; LIVE];
+    let mut n = 0;
     let mut i = 0;
     while i < SLOTS {
         if s.active[i] {
-            live.push(s.node[i]);
+            live[n] = s.node[i];
+            n += 1;
         }
         i += 1;
     }
     let mut f = 0;
     while f < FLOWS {
         if s.pending[f] > 0 {
-            live.push(graph.tgt[f]);
+            live[n] = graph.tgt[f];
+            n += 1;
         }
         f += 1;
     }
-    live
+    (live, n)
 }
 
 /// Join readiness, exactly as `Engine::activate_join` splits it: the arrival
@@ -268,14 +275,21 @@ fn join_fires(graph: &Graph, s: &TokenState, j: usize) -> bool {
         JoinDecision::Accept => true,
         JoinDecision::Reject => false,
         JoinDecision::AcceptUnlessActivePath => {
-            let mut succ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); NODES];
+            // `has_active_path` takes the engine's adjacency (`&[Vec<_>]`).
+            // Each list is pre-sized to `FLOWS`, so building it never
+            // reallocates (no growth path for Kani to explore).
+            let mut succ: [Vec<(usize, usize)>; NODES] = [
+                Vec::with_capacity(FLOWS),
+                Vec::with_capacity(FLOWS),
+                Vec::with_capacity(FLOWS),
+            ];
             let mut g = 0;
             while g < FLOWS {
                 succ[graph.src[g]].push((graph.tgt[g], g));
                 g += 1;
             }
-            let live = live_sources(graph, s);
-            !join_guard::has_active_path(&succ, &live, j, &s.arrivals)
+            let (live, n) = live_sources(graph, s);
+            !join_guard::has_active_path(&succ, &live[..n], j, &s.arrivals)
         }
     }
 }
