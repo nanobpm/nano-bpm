@@ -4,6 +4,10 @@
 //! existing `crate::state::…` path resolving.
 
 mod apply;
+#[cfg(any(test, kani))]
+mod kani_model;
+#[cfg(kani)]
+mod kani_proofs;
 pub(crate) mod types;
 
 pub use apply::apply;

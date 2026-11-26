@@ -876,6 +876,7 @@ async fn handle_client_frame(
         ClientFrame::CancelInstance { .. } => "cancel_instance",
         ClientFrame::SuspendInstance { .. } => "suspend_instance",
         ClientFrame::ResumeInstance { .. } => "resume_instance",
+        ClientFrame::DeleteInstanceHistory { .. } => "delete_instance_history",
         ClientFrame::MigrateInstance { .. } => "migrate_instance",
         ClientFrame::ModifyInstance { .. } => "modify_instance",
         ClientFrame::RouteSubscription { .. } => "route_subscription",
@@ -1570,6 +1571,18 @@ async fn handle_client_frame(
             forward_by_key_reply(conn, corr, &instance_key, |key| async move {
                 server
                     .suspend_instance_local(key, operation_reference)
+                    .await
+            })
+            .await;
+        }
+        ClientFrame::DeleteInstanceHistory {
+            corr,
+            instance_key,
+            operation_reference,
+        } => {
+            forward_by_key_reply(conn, corr, &instance_key, |key| async move {
+                server
+                    .delete_process_instance_history_local(key, operation_reference)
                     .await
             })
             .await;

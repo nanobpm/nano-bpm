@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { artifactsFor } from "./enumerate.mjs";
+import { artifactsFor, exploreOrders, materialize } from "./enumerate.mjs";
 import {
   referenceMilestones,
   observationMilestones,
@@ -154,7 +154,9 @@ test("an event-based gateway's expectation is the SPEC projection, not the engin
     ],
   };
   // The run correlates M1 (selecting f1): the engine-shaped record also takes
-  // the losing f2 and completes M2 (withdrawn).
+  // the losing f2 and completes M2 (withdrawn). Zeebe takes NEITHER gateway
+  // flow (it activates the triggered catch directly — #1962's exporter-trace
+  // validation), so the spec projection has no `G->M*` at all.
   const run = {
     steps: [{ op: "correlate", node: "G", flow: "f1", catch: "M1" }],
     route: {},
@@ -167,9 +169,8 @@ test("an event-based gateway's expectation is the SPEC projection, not the engin
   const ms = referenceMilestones(graph, run);
   assert.deepEqual(ms.sequenceFlows, {
     "S->G": 1,
-    "G->M1": 1,
     "M1->E": 1,
-    // No "G->M2": the spec never takes the losing catch's flow.
+    // No "G->M1"/"G->M2": the spec never takes a gateway->catch flow.
   });
 
   // The engine's WIRE record takes both gateway flows (arm all, withdraw the
@@ -196,9 +197,10 @@ test("an event-based gateway's expectation is the SPEC projection, not the engin
   assert.ok(bad.mismatches.some((m) => m.field === "sequenceFlows"));
 });
 
-test("event-gateway selections are counted per correlation step", () => {
-  // Gateway activated twice (loop), selecting each alternative once: the spec
-  // takes G->M1 once and G->M2 once — not the raw withdrawal-inclusive 2/2.
+test("event-gateway selections show only through each catch's continuation", () => {
+  // Gateway activated twice, selecting each alternative once: the spec takes
+  // no gateway->catch flow (not the raw withdrawal-inclusive 2/2); each
+  // selection is visible as its catch's continuation, once each.
   const graph = {
     id: "EvtLoop",
     nodes: { S: "start", G: "evt", M1: "msg", M2: "msg", E: "end" },
@@ -221,8 +223,10 @@ test("event-gateway selections are counted per correlation step", () => {
     joinsFired: {},
   };
   const ms = referenceMilestones(graph, run);
-  assert.equal(ms.sequenceFlows["G->M1"], 1);
-  assert.equal(ms.sequenceFlows["G->M2"], 1);
+  assert.equal(ms.sequenceFlows["G->M1"], undefined);
+  assert.equal(ms.sequenceFlows["G->M2"], undefined);
+  assert.equal(ms.sequenceFlows["M1->E"], 1);
+  assert.equal(ms.sequenceFlows["M2->E"], 1);
   const wire = {
     completed: true,
     sequenceFlows: { "S->G": 2, "G->M1": 2, "G->M2": 2, "M1->E": 1, "M2->E": 1 },
@@ -230,4 +234,31 @@ test("event-gateway selections are counted per correlation step", () => {
   };
   const r = checkSpecOracle(graph, run, wire);
   assert.ok(r.ok, JSON.stringify(r.mismatches));
+});
+
+test("one message publish is ONE correlation per instance in the spec oracle, as Zeebe (#1988, #1793)", () => {
+  // and,xor|0>1d,1>2d,1>2d,2>3n: two tokens park on T1, whose interrupting
+  // message boundary B1 routes to E. Zeebe (MessageCorrelateBehavior) correlates
+  // a publish once per process, so the run "publish B1, then cancel" has ONE
+  // B1->E flow and never completes; Nano's matching trace must conform.
+  const graph = materialize({
+    kinds: ["and", "xor"],
+    edges: [[0, 1, "direct"], [1, 2, "direct"], [1, 2, "direct"], [2, 3, "bmsg"]],
+  });
+  const run = exploreOrders(graph, {}, { cancel: true }).find(
+    (r) => r.steps.length === 2 && r.steps[0].op === "correlateBoundary" && r.steps[1].op === "cancel",
+  );
+  assert.ok(run, "publish-then-cancel run explored");
+  const expected = referenceMilestones(graph, run);
+  assert.equal(expected.completed, false);
+  assert.equal(expected.sequenceFlows["B1->E"], 1);
+  const zeebeLike = {
+    completed: false,
+    sequenceFlows: { ...expected.sequenceFlows },
+    jobsCreated: { ...expected.jobsCreated },
+  };
+  assert.equal(checkSpecOracle(graph, run, zeebeLike).ok, true);
+  // The pre-#1988 every-subscription expectation no longer conforms.
+  const everySub = { ...zeebeLike, completed: true, sequenceFlows: { ...zeebeLike.sequenceFlows, "B1->E": 2 } };
+  assert.equal(checkSpecOracle(graph, run, everySub).ok, false);
 });

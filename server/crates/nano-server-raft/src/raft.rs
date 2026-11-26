@@ -500,108 +500,16 @@ pub struct ReplicatedResponse {
     pub items: Vec<ReplicatedItem>,
 }
 
-/// Maps an engine rejection to the `(http_status, message)` the client sees,
-/// matching the direct (non-Raft) write path's status codes.
+/// Maps an engine rejection to the `(http_status, message)` the client sees.
+///
+/// Delegates to the ONE shared mapping, [`EngineError::problem`]
+/// (`engine-core/src/problem.rs`), which the wasm `TestEngine` also uses — so
+/// the server and wasm cannot drift (#1937).
+///
+/// [`EngineError::problem`]: nanobpmn_engine_core::EngineError::problem
 pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, String) {
-    use nanobpmn_engine_core::EngineError as E;
-    match e {
-        E::ProcessNotFound { process_id } => {
-            (400, format!("No deployed process with id '{process_id}'."))
-        }
-        E::JobNotFound { job_key } => (404, format!("No job with key {job_key}.")),
-        E::DecisionNotFound { .. } => (404, e.to_string()),
-        E::JobNotActive { job_key } => (409, format!("Job {job_key} is not active.")),
-        E::JobNotActivated { job_key } => (409, format!("Job {job_key} has not been activated.")),
-        E::JobLeaseMismatch { .. } => (409, e.to_string()),
-        E::JobUpdateInvalid { .. } => (400, e.to_string()),
-        E::AgentInstanceNotFound { .. }
-        | E::AgentInstanceElementInstanceInactive { .. }
-        | E::AgentInstanceJobNotActive { .. }
-        | E::AgentInstanceJobLeaseMismatch { .. } => (404, e.to_string()),
-        E::AgentInstanceAlreadyExists { .. }
-        | E::AgentInstanceActiveWriter { .. }
-        | E::AgentInstanceConflict { .. } => (409, e.to_string()),
-        E::AgentHistoryInvalid { .. }
-        | E::AgentInstanceElementNotEligible { .. }
-        | E::AgentInstanceMissingAgentDefinition { .. }
-        | E::AgentInstanceJobRequiredForHistory { .. }
-        | E::AgentInstanceJobElementMismatch { .. }
-        | E::AgentInstanceOwnershipMismatch { .. }
-        | E::AgentInstanceStatusNotSettable { .. }
-        | E::AgentInstanceAlreadyCompleted { .. }
-        | E::AgentInstanceLimitExceeded { .. } => (400, e.to_string()),
-        // Durable REST/operator mutations routed through
-        // `ServerImpl::apply_partition_command` surface their engine rejections
-        // here, so every by-key mutation command's error maps to its HTTP status
-        // in ONE place (the raft propose path and the direct local apply share
-        // this mapping — no per-handler drift). #1306.
-        E::InstanceNotFound { .. } => (404, e.to_string()),
-        // Off-heap state transiently unreadable (#1388): retryable, never 404.
-        E::InstanceUnavailable { .. } => (503, e.to_string()),
-        // The suspend/resume contracts (spec/process-instances.yaml) define a
-        // wrong-state transition as 409 Conflict, not 400: the instance exists
-        // but its (terminal) state conflicts with the requested transition.
-        E::InstanceTransitionInvalid { .. } => (409, e.to_string()),
-        E::IncidentNotFound { .. } => (404, e.to_string()),
-        E::IncidentNotResolvable { .. } => (409, e.to_string()),
-        E::ScopeNotFound { .. } => (400, e.to_string()),
-        E::UserTaskNotFound { .. } => (404, e.to_string()),
-        E::UserTaskNotActive { .. } => (409, e.to_string()),
-        E::UserTaskAlreadyAssigned { .. } => (409, e.to_string()),
-        E::AdHocSubProcessNotFound { .. } | E::AdHocUnknownElement { .. } => (404, e.to_string()),
-        E::AdHocNoActivationTargets { .. } => (400, e.to_string()),
-        // Instance migration: an unknown target definition is 404 (like an
-        // unknown instance above); an invalid mapping is 400; a migration the
-        // engine rejects for the instance's live state is 409.
-        E::TargetProcessDefinitionNotFound { .. } => (404, e.to_string()),
-        E::DuplicateMappingSourceElement { .. }
-        | E::MappingSourceElementNotFound { .. }
-        | E::MappingTargetElementNotFound { .. }
-        // Zeebe INVALID_ARGUMENT (#1631).
-        | E::MigrationCompensationBoundaryTypeChanged { .. } => (400, e.to_string()),
-        E::UnmappedActiveElement { .. }
-        | E::MappedElementTypeChanged { .. }
-        | E::MigratedParallelJoinArityChanged { .. }
-        | E::MigratedJoinFlowMissing { .. }
-        | E::MigratedGatewayRouteMissing { .. }
-        | E::UnsupportedMigration { .. } => (409, e.to_string()),
-        // Process-instance modification / migration rejection surface (#1374),
-        // Zeebe parity: a malformed or unresolvable instruction is
-        // INVALID_ARGUMENT (400); an instance in the wrong state and a
-        // migration precondition the live instance violates are INVALID_STATE
-        // (409). (An unknown instance is `InstanceNotFound` → 404 above.)
-        E::ElementNotFound { .. }
-        | E::ElementInstanceNotFound { .. }
-        | E::ModificationInstructionNotYetSupported { .. }
-        | E::ModificationInstructionInvalid { .. }
-        | E::AmbiguousFlowScope { .. }
-        | E::AncestorScopeNotFound { .. }
-        | E::AncestorNotAnAncestor { .. }
-        | E::ElementNotActivatable { .. } => (400, e.to_string()),
-        E::InstanceNotActive { .. }
-        | E::MigrationFlowScopeChanged { .. }
-        | E::MigrationMultiInstanceMismatch { .. }
-        | E::MigrationLoopCharacteristicsChanged { .. }
-        | E::MigrationCatchEventDetached { .. }
-        | E::MigrationCatchEventsMerged { .. }
-        // Zeebe INVALID_STATE (#1631).
-        | E::MigrationCompensationFlowScopeChanged { .. }
-        // A target catch event whose subscription expression fails to evaluate
-        // (Zeebe `ProcessInstanceMigrationCatchEventBehaviour`, INVALID_STATE).
-        | E::MigrationCatchEventSubscriptionFailed { .. } => (409, e.to_string()),
-        // A start event whose message-name / timer expression cannot be
-        // evaluated at deploy time (Zeebe INVALID_ARGUMENT, #1398).
-        E::StartEventExpressionInvalid { .. } => (400, e.to_string()),
-        // A structurally invalid process handed straight to deploy.
-        E::InvalidProcessModel { .. } => (400, e.to_string()),
-        // Replicated cluster-variable mutations (#1657).
-        E::ClusterVariableAlreadyExists { .. } => (409, e.to_string()),
-        E::ClusterVariableNotFound { .. } => (404, e.to_string()),
-        // A publish whose messageId is still buffered (#1874, Zeebe
-        // ALREADY_EXISTS).
-        E::MessageAlreadyExists { .. } => (409, e.to_string()),
-        other => (500, other.to_string()),
-    }
+    let p = e.problem();
+    (p.status, p.detail)
 }
 
 /// Maps an engine rejection to the `(http_status, message)` the client sees,
@@ -625,7 +533,9 @@ pub fn engine_error_status_for(kind: &str, e: &nanobpmn_engine_core::EngineError
         // ad-hoc-completion and business-id rejections (`complete_job_impl`):
         // an unknown/contradictory ad-hoc activation target and an invalid
         // business id are 400 (invalid data), a business-id conflict is 409.
-        // The shared mapping would otherwise surface these as 404 / 500.
+        // The shared mapping (`EngineError::problem`) already agrees for all of
+        // these except `AdHocUnknownElement`, which it maps to 404; this override
+        // exists to keep that one at 400 for `CompleteJob`.
         match e {
             E::AdHocUnknownElement { .. }
             | E::AdHocActivateWithCompletion { .. }

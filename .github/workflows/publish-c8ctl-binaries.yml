@@ -176,6 +176,8 @@ jobs:
 
   build:
     name: Build ${{ matrix.asset }}
+    # linker: every Linux leg cross-builds with cargo-zigbuild (`--target`),
+    # so the host-target mold rustflag never applies; zig is the linker.
     needs: prepare
     runs-on: ${{ matrix.os }}
     # Defensive cap so a future build wedge (see issue #634) fails fast instead of

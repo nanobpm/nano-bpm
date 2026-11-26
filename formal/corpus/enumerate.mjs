@@ -795,15 +795,14 @@ export class Reference {
       // An interrupting message boundary (#1673): the attached task is
       // TERMINATED (its job cancelled, never completed) and the boundary event
       // completes, routing its outgoing flow.
-      // The message correlates EVERY open subscription of this boundary, so
-      // every waiting activation of the task is interrupted and each boundary
-      // activation routes its outgoing flow — not just one.
-      const count = next.waiting[cmd.task]
-      next.waiting[cmd.task] = 0
-      for (let i = 0; i < count; i++) {
-        next.complete(cmd.node)
-        next.take(next.out[cmd.node])
-      }
+      // One published message correlates AT MOST ONCE per process (#1988):
+      // Zeebe's MessageCorrelateBehavior.correlateToMessageEvents skips every
+      // further subscription of the same bpmnProcessId once one correlated. So
+      // a publish interrupts exactly ONE waiting activation of the task; any
+      // other activation stays parked on its own (still open) subscription.
+      next.waiting[cmd.task] -= 1
+      next.complete(cmd.node)
+      next.take(next.out[cmd.node])
       next.settle()
       return next
     }
@@ -854,7 +853,10 @@ export class Reference {
  * that ends with wait states still held is stuck (left to TLC / the nano-only
  * scenarios).
  */
-export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = false, follow = null } = {}) {
+export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = false, follow = null, maxSteps = Infinity } = {}) {
+  // A `maxSteps` cut yields truncated prefixes, which a guided `follow`
+  // exploration must never emit: the two options are mutually exclusive.
+  if (follow && maxSteps !== Infinity) throw new Error('exploreOrders: `follow` and `maxSteps` are mutually exclusive')
   const runs = []
   // Instance cancellation (#1673) is opt-in: with `cancel`, every settled
   // state after the first command may also end the run with a `cancel`.
@@ -870,6 +872,13 @@ export function exploreOrders (graph, route = {}, { limit = Infinity, cancel = f
       return
     }
     const cmds = state.commands()
+    // A cyclic graph (the hand-written ExclusiveLoop) has unboundedly long
+    // runs: `maxSteps` unrolls it to a bound, keeping each run cut there as a
+    // settled PREFIX (a not-completed run) — still a behaviour to observe.
+    if (steps.length >= maxSteps) {
+      runs.push(runOf(state, steps))
+      return
+    }
     if (cancel && steps.length > 0 && cmds.length > 0) cmds.push({ op: 'cancel' })
     if (follow) {
       // Guided: only a run whose command signatures ARE `follow` can yield a

@@ -8795,3 +8795,498 @@ fn cancel_of_a_suspended_instance_honours_the_terminate_suspended_flag() {
         );
     }
 }
+
+/// `DeleteProcessInstanceHistory` (#1948, Camunda 8.8 `/process-instances/
+/// {key}/deletion`): a live (ACTIVE / SUSPENDED) instance is rejected with
+/// `InstanceTransitionInvalid { to: "DELETED" }` and no event; an ENDED
+/// (terminated) instance — and a key absent from engine state, i.e. evicted
+/// after ending — yields exactly one `ProcessInstanceHistoryDeleted`, whose
+/// apply removes the instance from engine state. Running the
+/// same command sequence on a second engine gives identical outcomes (replay
+/// determinism).
+#[test]
+fn delete_process_instance_history_rejects_live_and_accepts_ended() {
+    type Outcomes = Vec<Result<Vec<Event>, EngineError>>;
+    fn run() -> (Engine, Key, Outcomes, Vec<Event>) {
+        let mut engine = Engine::new();
+        let mut log = engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        log.extend(events.iter().cloned());
+        let key = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .unwrap();
+        let del = || Command::DeleteProcessInstanceHistory { instance_key: key };
+        let mut out = vec![engine.apply_command(del())];
+        log.extend(
+            engine
+                .apply_command(Command::suspend_instance(key))
+                .unwrap(),
+        );
+        out.push(engine.apply_command(del()));
+        log.extend(
+            engine
+                .apply_command(Command::cancel_instance_including_suspended(key))
+                .unwrap(),
+        );
+        out.push(engine.apply_command(del()));
+        out.push(engine.apply_command(Command::DeleteProcessInstanceHistory {
+            instance_key: 987_654_321,
+        }));
+        for ev in out.iter().flatten() {
+            log.extend(ev.iter().cloned());
+        }
+        (engine, key, out, log)
+    }
+    let (a, key, out_a, log) = run();
+    let (_b, _, out_b, _) = run();
+    assert_eq!(out_a, out_b, "replay must be deterministic");
+    for (i, from) in [(0, "ACTIVE"), (1, "SUSPENDED")] {
+        match &out_a[i] {
+            Err(EngineError::InstanceTransitionInvalid {
+                instance_key,
+                from: f,
+                to,
+            }) => {
+                assert_eq!(*instance_key, key);
+                assert_eq!(*f, from);
+                assert_eq!(*to, "DELETED");
+            }
+            other => panic!("live instance must be rejected, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        out_a[2].as_ref().unwrap(),
+        &vec![Event::ProcessInstanceHistoryDeleted { instance_key: key }]
+    );
+    assert_eq!(
+        out_a[3].as_ref().unwrap(),
+        &vec![Event::ProcessInstanceHistoryDeleted {
+            instance_key: 987_654_321
+        }]
+    );
+    // Event-sourced deletion: apply removed the ended instance from state.
+    assert!(
+        a.instance(key).is_none(),
+        "deleted instance must leave state"
+    );
+    // Replay of the journal must not advance the key allocator past the
+    // never-minted absent key: the next instance key matches the live engine.
+    let mut live = a;
+    let mut replayed = Engine::replay(log);
+    let next = |e: &mut Engine| {
+        e.apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|ev| match ev {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(next(&mut live), next(&mut replayed));
+}
+
+/// #1989 (fuzz #1795/#1796): two tokens reach `t2`, which has an interrupting
+/// timer boundary `b2`; `t2 -> join` and `b2 -> join` are the inclusive join's
+/// two incoming flows. One tick fires BOTH boundary timers. Zeebe writes both
+/// TRIGGERs before the join's ACTIVATE commands run, so neither arrival sees a
+/// live `t2`: each is accepted and the join activates twice (Camunda and the
+/// spec oracle agree). Nano used to evaluate the first arrival while the second
+/// `t2` was still live, park it, then fire once and strand the surplus.
+#[test]
+fn inclusive_join_fires_per_arrival_when_one_tick_interrupts_every_live_path() {
+    let def = ProcessBuilder::new("inc-tick")
+        .start_event("s")
+        .inclusive_gateway("fork")
+        .exclusive_gateway("merge")
+        .service_task("t2", "jt2")
+        .timer_boundary_event("b2", "t2", 60_000)
+        .inclusive_gateway("join")
+        .service_task("t1", "jt1")
+        .timer_boundary_event("b1", "t1", 60_000)
+        .end_event("e")
+        .end_event("e1")
+        .connect("s", "fork")
+        .connect("fork", "merge")
+        .connect("fork", "merge")
+        .connect("merge", "t2")
+        .connect("t2", "join")
+        .connect("b2", "join")
+        .connect("join", "t1")
+        .connect("t1", "e1")
+        .connect("b1", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("inc-tick"), 0)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let first = engine.trigger_timers(60_000);
+    assert_eq!(
+        join_fire_count(&first, "join"),
+        2,
+        "each interrupted token activates the join: {first:#?}"
+    );
+    assert_eq!(
+        first
+            .iter()
+            .filter(
+                |e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "t1")
+            )
+            .count(),
+        2
+    );
+    engine.trigger_timers(120_000);
+    assert!(engine.is_completed(instance_key));
+}
+
+/// #1989 (fuzz #1813/#1814), the same class through a timer CATCH: one tick
+/// fires the catch `w` (lower key, fired first) and the interrupting boundary
+/// `b` of `t`. Both continue through `merge -> join`; `t`'s own path to the
+/// join is doomed by its due boundary timer, so the first arrival must not
+/// wait for it. The join activates once per arrival and the instance
+/// completes.
+#[test]
+fn inclusive_join_ignores_a_path_doomed_by_a_boundary_timer_due_in_the_same_tick() {
+    let def = ProcessBuilder::new("inc-doomed")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .timer_intermediate_catch_event("w", 5_000)
+        .intermediate_throw_event("pre")
+        .service_task("t", "jt")
+        .timer_boundary_event("b", "t", 5_000)
+        .exclusive_gateway("merge")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "w")
+        .connect("fork", "pre")
+        .connect("pre", "t")
+        .connect("w", "merge")
+        .connect("b", "merge")
+        .connect("merge", "join")
+        .connect("t", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("inc-doomed"), 0)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let fired = engine.trigger_timers(5_000);
+    assert_eq!(join_fire_count(&fired, "join"), 2, "{fired:#?}");
+    assert!(engine.is_completed(instance_key));
+}
+
+/// The doomed-path rule (#1989) only covers boundary timers due in the SAME
+/// batch: a `t` whose boundary is not yet due still holds the join.
+#[test]
+fn inclusive_join_still_waits_for_a_path_whose_boundary_timer_is_not_due() {
+    let def = ProcessBuilder::new("inc-not-due")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .timer_intermediate_catch_event("w", 5_000)
+        .service_task("t", "jt")
+        .timer_boundary_event("b", "t", 50_000)
+        .exclusive_gateway("merge")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "w")
+        .connect("fork", "t")
+        .connect("w", "merge")
+        .connect("b", "merge")
+        .connect("merge", "join")
+        .connect("t", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command_at(Command::create_instance("inc-not-due"), 0)
+        .unwrap();
+    let fired = engine.trigger_timers(5_000);
+    assert_eq!(
+        join_fire_count(&fired, "join"),
+        0,
+        "`t` can still reach the join"
+    );
+}
+
+/// #1989 review: with two interrupting boundary timers due in the same tick,
+/// the FIRST in queue order fires and cancels its sibling, so `t`'s doomed
+/// path must continue from that one. `b1` (created first) leads elsewhere;
+/// `b2` (cancelled by `b1`) leads to the join. Mapping `t` to `b2` would make
+/// `w`'s arrival wait forever for a token that never comes.
+#[test]
+fn inclusive_join_doomed_path_uses_the_first_due_boundary_timer() {
+    let def = ProcessBuilder::new("inc-doomed-first")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .timer_intermediate_catch_event("w", 5_000)
+        .intermediate_throw_event("pre")
+        .service_task("t", "jt")
+        .timer_boundary_event("b1", "t", 5_000)
+        .timer_boundary_event("b2", "t", 5_000)
+        .inclusive_gateway("join")
+        .end_event("e")
+        .end_event("e2")
+        .end_event("e3")
+        .connect("s", "fork")
+        .connect("fork", "w")
+        .connect("fork", "pre")
+        .connect("pre", "t")
+        .connect("w", "join")
+        .connect("b2", "join")
+        .connect("b1", "e2")
+        .connect("t", "e3")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("inc-doomed-first"), 0)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let fired = engine.trigger_timers(5_000);
+    assert_eq!(join_fire_count(&fired, "join"), 1, "{fired:#?}");
+    assert!(engine.is_completed(instance_key));
+}
+
+/// #1989 review: a NON-interrupting boundary `b1` due before the interrupting
+/// `b2` of the same activity still fires (queue order) and spawns its token
+/// before `b2` tears `t` down, so `t`'s doomed path must keep `b1` as a
+/// source. `w` and `b1` both reach the join, `b2` leads elsewhere: the join
+/// must synchronize `w` with `b1` and fire once, not once per arrival.
+#[test]
+fn inclusive_join_doomed_path_keeps_prior_non_interrupting_boundaries() {
+    let def = ProcessBuilder::new("inc-doomed-mixed")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .timer_intermediate_catch_event("w", 5_000)
+        .intermediate_throw_event("pre")
+        .service_task("t", "jt")
+        .non_interrupting_timer_boundary_event("b1", "t", 5_000)
+        .timer_boundary_event("b2", "t", 5_000)
+        .inclusive_gateway("join")
+        .end_event("e")
+        .end_event("e2")
+        .end_event("e3")
+        .connect("s", "fork")
+        .connect("fork", "w")
+        .connect("fork", "pre")
+        .connect("pre", "t")
+        .connect("w", "join")
+        .connect("b1", "join")
+        .connect("b2", "e2")
+        .connect("t", "e3")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("inc-doomed-mixed"), 0)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let fired = engine.trigger_timers(5_000);
+    assert_eq!(join_fire_count(&fired, "join"), 1, "{fired:#?}");
+    assert!(engine.is_completed(instance_key));
+}
+
+/// #2018 (fuzz Gen_2d18f93dc0, the #1989 cases): one tick fires the timer
+/// catch `w1` AND the interrupting boundary `b1` of `t1`; both tokens route
+/// through the exclusive `g3` into the inclusive join `g2`, which `g3` could
+/// otherwise also reach over `t3 -> g4`. Zeebe writes both TRIGGERs (each
+/// completing its catch/boundary and queueing its `g3` activation) before
+/// either `g3` activation runs, so both tokens take `g3 -> g2` before the join
+/// guard evaluates: no live path remains, and the join activates once per
+/// arrival (the spec oracle and the committed fuzz expectation agree). Nano
+/// drained `w1`'s token into the join while `b1`'s token was still upstream
+/// of `g3`, parked it, then fired once and stranded the surplus.
+#[test]
+fn inclusive_join_fires_per_arrival_when_a_tick_fires_a_catch_and_a_boundary_upstream_of_a_split() {
+    let def = ProcessBuilder::new("inc-tick-xor")
+        .start_event("s")
+        .inclusive_gateway("g1")
+        .service_task("t1", "jt1")
+        .timer_boundary_event("b1", "t1", 60_000)
+        .timer_intermediate_catch_event("w1", 60_000)
+        .exclusive_gateway("g3")
+        .service_task("t3", "jt3")
+        .exclusive_gateway("g4")
+        .inclusive_gateway("g2")
+        .service_task("t2", "jt2")
+        .end_event("e")
+        .connect("s", "g1")
+        .connect_when("g1", "t1", "true")
+        .connect_when("g1", "w1", "true")
+        .connect("t1", "g3")
+        .connect("b1", "g3")
+        .connect("w1", "g3")
+        .connect_when("g3", "g2", "true")
+        .connect_when("g3", "t3", "false")
+        .connect("t3", "g4")
+        .connect("g4", "g2")
+        .connect("g2", "t2")
+        .connect("t2", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command_at(Command::create_instance("inc-tick-xor"), 0)
+        .unwrap();
+    let fired = engine.trigger_timers(60_000);
+    assert_eq!(join_fire_count(&fired, "g2"), 2, "{fired:#?}");
+}
+
+/// #2018 review (r4703480366): three catches due in one tick — `w1` and `w2`
+/// both feed the join input `x -> g2`, `w3` reaches the other input through
+/// the longer chain `a -> b`. Zeebe writes all three TRIGGERs, then runs the
+/// follow-ups first-in first-out: `w1`'s and `w2`'s join guards both still
+/// see `w3`'s token in transit and park; `w3`'s arrival then consumes one
+/// token per input, and the surplus stays parked. A held-back arrival must be
+/// re-guarded in that order — ahead of the last fire's downstream work — not
+/// at full quiescence, where it would fire the join a second time.
+#[test]
+fn inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_work() {
+    let def = ProcessBuilder::new("inc-tick-three")
+        .start_event("s")
+        .inclusive_gateway("g1")
+        .timer_intermediate_catch_event("w1", 60_000)
+        .timer_intermediate_catch_event("w2", 60_000)
+        .timer_intermediate_catch_event("w3", 60_000)
+        .exclusive_gateway("x")
+        .exclusive_gateway("a")
+        .exclusive_gateway("b")
+        .inclusive_gateway("g2")
+        .end_event("e")
+        .connect("s", "g1")
+        // Connected last-first: the split activates `w3` first, so its timer
+        // is due last in the batch, as in the reviewed scenario.
+        .connect_when("g1", "w3", "true")
+        .connect_when("g1", "w2", "true")
+        .connect_when("g1", "w1", "true")
+        .connect("w1", "x")
+        .connect("w2", "x")
+        .connect("x", "g2")
+        .connect("w3", "a")
+        .connect("a", "b")
+        .connect("b", "g2")
+        .connect("g2", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command_at(Command::create_instance("inc-tick-three"), 0)
+        .unwrap();
+    let fired = engine.trigger_timers(60_000);
+    let order: Vec<&str> = fired
+        .iter()
+        .filter_map(|e| match e {
+            Event::TimerTriggered { element_id, .. } => Some(element_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order.last(), Some(&"w3"), "{fired:#?}");
+    assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
+}
+
+/// The three-catch scenario of
+/// [`inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_work`],
+/// parameterised over what `x`'s and `b`'s inputs are fed by.
+fn three_way_tick_def(id: &str, last_is_boundary: bool) -> crate::model::ProcessDefinition {
+    let mut builder = ProcessBuilder::new(id)
+        .start_event("s")
+        .inclusive_gateway("g1")
+        .timer_intermediate_catch_event("w1", 60_000)
+        .timer_intermediate_catch_event("w2", 60_000);
+    builder = if last_is_boundary {
+        builder
+            .service_task("t3", "jt3")
+            .timer_boundary_event("w3", "t3", 60_000)
+    } else {
+        builder.timer_intermediate_catch_event("w3", 60_000)
+    };
+    builder = builder
+        .exclusive_gateway("x")
+        .exclusive_gateway("a")
+        .exclusive_gateway("b")
+        .inclusive_gateway("g2")
+        .end_event("e")
+        .connect("s", "g1");
+    builder = if last_is_boundary {
+        builder.connect_when("g1", "t3", "true").connect("t3", "a")
+    } else {
+        builder.connect_when("g1", "w3", "true")
+    };
+    builder
+        .connect_when("g1", "w2", "true")
+        .connect_when("g1", "w1", "true")
+        .connect("w1", "x")
+        .connect("w2", "x")
+        .connect("x", "g2")
+        .connect("w3", "a")
+        .connect("a", "b")
+        .connect("b", "g2")
+        .connect("g2", "e")
+        .build()
+        .unwrap()
+}
+
+/// #2018 review (r4703550842): a timer of ANOTHER instance due last in the
+/// same batch must not delay the re-guard of this instance's held-back
+/// arrivals past its own last fire's downstream work.
+#[test]
+fn inclusive_join_reguard_is_not_delayed_by_another_instances_later_timer() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(three_way_tick_def(
+            "inc-tick-a",
+            false,
+        )))
+        .unwrap();
+    let other = ProcessBuilder::new("other-timer")
+        .start_event("s")
+        .timer_intermediate_catch_event("z", 60_000)
+        .end_event("e")
+        .connect("s", "z")
+        .connect("z", "e")
+        .build()
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(other)).unwrap();
+    engine
+        .apply_command_at(Command::create_instance("inc-tick-a"), 0)
+        .unwrap();
+    engine
+        .apply_command_at(Command::create_instance("other-timer"), 0)
+        .unwrap();
+    let fired = engine.trigger_timers(60_000);
+    let order: Vec<&str> = fired
+        .iter()
+        .filter_map(|e| match e {
+            Event::TimerTriggered { element_id, .. } => Some(element_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order.last(), Some(&"z"), "{fired:#?}");
+    assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
+}

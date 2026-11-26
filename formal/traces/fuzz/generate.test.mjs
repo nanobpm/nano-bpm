@@ -201,3 +201,33 @@ test('shrink only accepts reductions that preserve the original divergence signa
   assert.equal(best.tree, tree)
   assert.equal(signature(best.verdict.diff), signature(sameDiff))
 })
+
+test('a failed runner error carries the tail of its log (#1964)', async () => {
+  const { runnerFailure, LOG_TAIL_LINES } = await import('./sweep.mjs')
+  const out = Array.from({ length: 80 }, (_, i) => `line ${i}`).join('\n') + "\ncollect2: fatal error: cannot find 'ld'\n"
+  const e = runnerFailure('nano runner failed', '/w/sweep/nano.log', out)
+  assert.match(e.message, /^nano runner failed — see \/w\/sweep\/nano\.log\n/)
+  assert.match(e.message, /cannot find 'ld'$/, 'the root cause at the end of the log is shown')
+  const shown = e.message.split('\n').slice(2)
+  assert.equal(shown.length, LOG_TAIL_LINES)
+  assert.ok(!e.message.includes('line 30\n'), 'only the tail is echoed')
+})
+
+// #1975: the sweep deduper matched via `gh --search` on a marker inside an HTML
+// comment; it must match the marker line in the open issues' bodies instead.
+test('sweep fileIssue comments on the open issue carrying the signature marker', async () => {
+  const { fileIssue, existingSweepIssue } = await import('./sweep.mjs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const script = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sweep-')), 'script.json')
+  fs.writeFileSync(script, '{}')
+  const open = [{ number: 12, body: 'x\n<!-- fuzz-signature:abc123 -->' }, { number: 11, body: '<!-- fuzz-signature:abc1234 -->' }]
+  assert.equal(existingSweepIssue('abc123', open), 12)
+  const calls = []
+  const sh = (cmd, args) => { calls.push(args.slice(0, 2)); return { code: 0, out: args[1] === 'list' ? JSON.stringify(open) : 'https://x/issues/99' } }
+  assert.deepEqual(fileIssue(1, 'abc123', 'd', script, sh), { known: true, ref: '#12 (commented)' })
+  assert.deepEqual(calls, [['issue', 'list'], ['issue', 'comment']])
+  calls.length = 0
+  assert.deepEqual(fileIssue(1, 'fff', 'd', script, sh), { known: false, ref: 'https://x/issues/99' })
+  assert.deepEqual(calls, [['issue', 'list'], ['issue', 'create']])
+})

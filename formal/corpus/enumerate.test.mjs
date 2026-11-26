@@ -603,3 +603,28 @@ test('Reference takes a fork\'s flows in reverse document order, as Zeebe (#1693
   // The order is per element: the reversed fork still takes BOTH flows.
   assert.deepEqual({ ...ref.takenFlows }, { f1: 1, f2: 1, f3: 1, f5: 1 })
 })
+
+test('exploreOrders rejects follow combined with maxSteps', async () => {
+  const { exploreOrders } = await import('./enumerate.mjs')
+  assert.throws(() => exploreOrders({}, {}, { follow: [], maxSteps: 3 }), /mutually exclusive/)
+})
+
+test('one publish correlates a message boundary ONCE per instance, as Zeebe (#1988, #1792)', () => {
+  // and,xor|0>1d,1>2d,1>2d,2>3n: a parallel fork sends two tokens through an
+  // XOR to T1, whose interrupting message boundary B1 routes to E. Zeebe's
+  // MessageCorrelateBehavior.correlateToMessageEvents correlates a published
+  // message at most once per bpmnProcessId, so ONE publish interrupts one T1
+  // activation: B1 completes once and the other T1 token stays parked.
+  const g = materialize({ kinds: ['and', 'xor'], edges: [[0, 1, 'direct'], [1, 2, 'direct'], [1, 2, 'direct'], [2, 3, 'bmsg']] })
+  const runs = exploreOrders(g)
+  for (const r of runs) {
+    const publishes = r.steps.filter((s) => s.op === 'correlateBoundary').length
+    assert.equal(r.completedElements.B1 ?? 0, publishes, 'each publish fires exactly one B1')
+  }
+  const ref = new Reference(g)
+  assert.equal(ref.waiting.T1, 2)
+  const after = ref.apply({ op: 'correlateBoundary', node: 'B1', task: 'T1' })
+  assert.equal(after.completedElements.B1, 1)
+  assert.equal(after.waiting.T1, 1, 'one publish leaves a T1 token waiting')
+  assert.equal(after.completed, false)
+})

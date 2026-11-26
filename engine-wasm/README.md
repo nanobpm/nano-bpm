@@ -255,10 +255,38 @@ embedded-only method.
 | `searchUserTasks(queryJson: string)` | string (throws) | [`searchUserTasks`](../spec/user-tasks.yaml) (`POST /user-tasks/search`) | `UserTaskSearchQuery` | `UserTaskSearchQueryResult` | `searchUserTasks` — mirrors `POST /user-tasks/search`. |
 | `searchProcessInstances(queryJson: string)` | string (throws) | [`searchProcessInstances`](../spec/process-instances.yaml) (`POST /process-instances/search`) | `ProcessInstanceSearchQuery` | `ProcessInstanceSearchQueryResult` | `searchProcessInstances` — mirrors `POST /process-instances/search`: the spec's `ProcessInstanceSearchQuery` through the shared pipeline, returning the generated `ProcessInstanceSearchQueryResult`. |
 | `searchVariables(queryJson: string, truncateValues: boolean?)` | string (throws) | [`searchVariables`](../spec/variables.yaml) (`POST /variables/search`) | `VariableSearchQuery` | `VariableSearchQueryResult` | `searchVariables` — mirrors `POST /variables/search`: the spec's `VariableSearchQuery` through the shared pipeline, returning the generated `VariableSearchQueryResult`. |
+| `handle(method: string, path: string, headersJson: string, body: string)` | string | — | — | — | `handle` — the transport-free REST driver (#992): serve one Camunda v2 REST request as the gateway would. |
 | `searchAgentInstances(queryJson: string)` | string (throws) | [`searchAgentInstances`](../spec/agent-instances.yaml) (`POST /agent-instances/search`) | `AgentInstanceSearchQuery` | `AgentInstanceSearchQueryResult` | `searchAgentInstances` — mirrors `POST /agent-instances/search`. |
 | `searchAgentInstanceHistory(agentInstanceKey: string, queryJson: string)` | string (throws) | [`searchAgentInstanceHistory`](../spec/agent-instances.yaml) (`POST /agent-instances/{agentInstanceKey}/history/search`) | `AgentInstanceHistorySearchQuery` | `AgentInstanceHistorySearchQueryResult` | `searchAgentInstanceHistory` — mirrors `POST /agent-instances/{agentInstanceKey}/history/search`. |
 
 <!-- END GENERATED API -->
+
+### `POST /v2/jobs/activation` via `handle` — long-poll semantics
+
+The engine is synchronous, so job activation over the `handle` ABI never
+long-polls. `requestTimeout` is accepted (and validated) but ignored for
+waiting: the call returns **immediately** with the jobs activatable at the
+current virtual instant — `200 {"jobs": []}` when there are none. To wait for
+work, advance the virtual clock (`PUT /v2/clock`, e.g. through the SDK's
+injected clock — camunda/orchestration-cluster-api-js#450 / #451) and re-poll;
+re-polling costs no real time. There is no streaming / SSE job push.
+
+## Errors — ProblemDetail-shaped (changed in 0.14.0)
+
+Since **0.14.0** (#1937, a breaking change to the thrown error type) an engine
+rejection is thrown as a JS `Error` carrying ProblemDetail fields, derived from
+the same `EngineError::problem` mapping the REST gateway uses:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | HTTP status: 400 / 404 / 409 / 503 |
+| `title` | Zeebe rejection class: `INVALID_ARGUMENT`, `NOT_FOUND`, `INVALID_STATE`, `ALREADY_EXISTS`, `UNAVAILABLE` |
+| `detail` | Human-readable message |
+| `nonRetryable` | `false` only for transient (`UNAVAILABLE`) failures |
+
+`message` keeps the former `"<operation> error: <detail>"` text. Before 0.14.0
+these rejections were thrown as plain strings. Non-engine failures (invalid
+JSON input, parse errors) are still thrown as strings.
 
 ## Choosing a subpath
 

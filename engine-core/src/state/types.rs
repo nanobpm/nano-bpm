@@ -989,6 +989,21 @@ pub struct ProcessInstance {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub races: BTreeMap<Key, Key>,
+    /// Gateway-owned event subscriptions (#1963 slice i, #2003): event-based
+    /// gateway element instance -> the target catch element ids it holds a
+    /// subscription for, in outgoing-flow (document) order. This is the Zeebe
+    /// model (`EventBasedGatewayProcessor.onActivate` subscribes the GATEWAY's
+    /// element instance to each catch's event, tagged with the catch element
+    /// id). Inserted by [`crate::Event::EventGatewaySubscriptionsOpened`],
+    /// removed when the gateway is triggered
+    /// ([`crate::Event::EventGatewayTriggered`]) or completes/terminates.
+    /// Not yet driven by execution (the legacy race machinery still runs).
+    /// `serde(default)` and omitted when empty.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub gateway_subscriptions: BTreeMap<Key, Vec<ElementId>>,
     /// Keys of incidents currently **active** on this instance (parked tokens).
     /// The full records live in [`State::incidents`] and are retained after
     /// resolution; resolving an incident removes its key from this active index
@@ -2860,6 +2875,20 @@ impl<'de> serde::Deserialize<'de> for VariablesLostTombstone {
 }
 
 impl State {
+    /// Instances carrying an armed LEGACY event-based gateway race (#1676
+    /// `races` membership): catches activated by an already-completed gateway.
+    /// The gateway-owned subscription model (#1963, #2003) cannot represent
+    /// these, so a pre-v4 snapshot holding any is refused on load
+    /// (`LegacyEventGatewayRace`) rather than silently dropped or rewound.
+    /// Ascending, deduplicated.
+    pub fn legacy_event_gateway_race_instances(&self) -> Vec<Key> {
+        self.instances
+            .iter()
+            .filter(|(_, i)| !i.races.is_empty())
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
     /// The settlement half of the live `VariablesLostQuarantined` fold
     /// (#1608): record `episode` as `instance_key`'s settled loss episode.
     /// The ONE canonical derivation of `settled_orphan_episodes`, shared by
@@ -3219,6 +3248,61 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Removes every instance in `victims` and every instance-scoped entity it
+    /// owns — jobs (via the `jobs_by_instance` reverse index, deindexed),
+    /// user tasks, incidents, timers and message / signal / conditional
+    /// subscriptions — from state. The apply step of
+    /// `Event::ProcessInstanceHistoryDeleted` (#1948). Keys not resident are
+    /// ignored, so re-applying the event is a no-op. The `settled_jobs`
+    /// ledger is deliberately kept: it fences duplicate settlements and is
+    /// not instance history.
+    pub fn purge_instance_tree(&mut self, victims: &BTreeSet<Key>) {
+        if victims.is_empty() {
+            return;
+        }
+        for key in victims {
+            // `remove_instance` unlinks the victim from its parent, so an entry
+            // empties (and is dropped) with its last child; a non-victim child's
+            // ancestry edge is never discarded here.
+            self.remove_instance(*key);
+            if let Some(job_keys) = self.jobs_by_instance.remove(key) {
+                for job_key in job_keys {
+                    if let Some(job) = self.jobs.remove(&job_key) {
+                        self.deindex_job(&job.job_type, job_key, job.priority);
+                    }
+                }
+            }
+        }
+        self.user_tasks
+            .retain(|_, t| !victims.contains(&t.instance_key));
+        self.incidents
+            .retain(|_, i| !victims.contains(&i.instance_key));
+        self.timers
+            .retain(|_, t| !victims.contains(&t.instance_key));
+        self.message_subscriptions
+            .retain(|_, s| !victims.contains(&s.instance_key));
+        self.signal_subscriptions
+            .retain(|_, s| !victims.contains(&s.instance_key));
+        self.conditional_subscriptions
+            .retain(|_, s| !victims.contains(&s.instance_key));
+    }
+
+    /// `root` plus every call-activity descendant reachable through
+    /// [`State::children_by_parent`], transitively. Residency is replica-local,
+    /// so the result must only drive local state effects, never an event.
+    pub fn resident_instance_tree(&self, root: Key) -> BTreeSet<Key> {
+        let mut tree = BTreeSet::new();
+        let mut stack = vec![root];
+        while let Some(k) = stack.pop() {
+            if tree.insert(k) {
+                if let Some(children) = self.children_by_parent.get(&k) {
+                    stack.extend(children.iter().copied());
+                }
+            }
+        }
+        tree
     }
 
     /// Removes a process instance, unlinking it from its parent's entry in
@@ -3807,12 +3891,8 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
     let job_type = job.job_type.clone();
     let job_state = job.state;
     let order = activation_order(job.priority, job_key);
-    let backoff_until = job.retry_backoff_until;
-    // A `Created` job with a pending backoff is deferred, not activatable: it
-    // leaves the hot ready set and is indexed by its eligibility deadline so a
-    // poll promotes only the due prefix instead of scanning the delayed prefix.
-    let deferred = job_state == JobState::Created && backoff_until.is_some();
-    if job_state == JobState::Created && !deferred {
+    let membership = job_index_membership(job_state, job.retry_backoff_until);
+    if membership.activatable {
         state
             .activatable_jobs
             .entry(job_type)
@@ -3824,8 +3904,7 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
             state.activatable_jobs.remove(&job_type);
         }
     }
-    if deferred {
-        let until = backoff_until.unwrap_or(0);
+    if let Some(until) = membership.deferred_until {
         if let Some(old) = state.deferred_job_deadlines.insert(job_key, until) {
             state.deferred_jobs.remove(&(old, job_key));
         }
@@ -3833,10 +3912,40 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
     } else {
         remove_deferred_job(state, job_key);
     }
-    if job_state == JobState::Activated {
+    if membership.activated {
         state.activated_jobs.insert(job_key);
     } else {
         state.activated_jobs.remove(&job_key);
+    }
+}
+
+/// Which derived job indexes a job belongs to, as a pure function of its state
+/// and retry backoff: the single decision [`resync_job_index`] applies, shared
+/// with the Kani stand-in model (`state::kani_model`) so the two cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JobIndexMembership {
+    /// In `activatable_jobs` (a `Created` job with no pending backoff).
+    pub activatable: bool,
+    /// In `deferred_jobs` / `deferred_job_deadlines` at this deadline.
+    pub deferred_until: Option<u64>,
+    /// In `activated_jobs`.
+    pub activated: bool,
+}
+
+/// See [`JobIndexMembership`]. A `Created` job with a pending backoff is
+/// deferred, not activatable: it leaves the hot ready set and is indexed by its
+/// eligibility deadline so a poll promotes only the due prefix instead of
+/// scanning the delayed prefix.
+#[inline]
+pub(crate) fn job_index_membership(
+    job_state: JobState,
+    retry_backoff_until: Option<u64>,
+) -> JobIndexMembership {
+    let created = job_state == JobState::Created;
+    JobIndexMembership {
+        activatable: created && retry_backoff_until.is_none(),
+        deferred_until: retry_backoff_until.filter(|_| created),
+        activated: job_state == JobState::Activated,
     }
 }
 

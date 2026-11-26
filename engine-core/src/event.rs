@@ -425,6 +425,21 @@ pub enum Event {
         decision_evaluation_key: Key,
     },
 
+    /// An ENDED process instance's history was deleted via the
+    /// `DeleteProcessInstanceHistory` management API (#1948). Journaled on the
+    /// instance's own partition, so the read-model shard that projected the
+    /// instance removes it — with every descendant (call-activity child)
+    /// instance and all their instance-scoped rows.
+    ///
+    /// Event-sourced deletion: the event carries only the root key, because
+    /// which ended descendants are still resident is replica-local (eviction,
+    /// cold spill) and a journaled set would differ between replicas. Each
+    /// consumer resolves the tree from its own state: engine apply REMOVES the
+    /// root and every resident call-activity descendant (so snapshots never
+    /// carry them and a reseed cannot resurrect them); the read model walks
+    /// its parent edges across the live store and the archive.
+    ProcessInstanceHistoryDeleted { instance_key: Key },
+
     /// A cluster variable was created (#1657; Zeebe `ClusterVariableIntent.CREATED`)
     /// — or, for a distributed fan-out copy, upserted (an existing variable keeps
     /// its id). `tenant_id` `None` is the global scope. Partition-agnostic
@@ -640,6 +655,32 @@ pub enum Event {
         /// The selected outgoing-flow indices (exactly one for an exclusive
         /// gateway, one or more for an inclusive fork).
         flows: Vec<usize>,
+    },
+
+    /// An event-based gateway opened its gateway-owned subscriptions (#1963
+    /// slice i, #2003): one per outgoing catch target, owned by the gateway's
+    /// element instance and tagged with the target catch element id (Zeebe
+    /// `EventBasedGatewayProcessor.onActivate`). Additive; not yet emitted by
+    /// execution.
+    EventGatewaySubscriptionsOpened {
+        instance_key: Key,
+        /// The owning event-based gateway's element instance key.
+        gateway_element_instance_key: Key,
+        gateway_element_id: ElementId,
+        /// The target catch element ids, in outgoing-flow (document) order.
+        catch_element_ids: Vec<ElementId>,
+    },
+
+    /// A gateway-owned subscription fired (#1963 slice i, #2003): the gateway
+    /// recorded its event trigger for `catch_element_id` and every other
+    /// subscription it owns is deleted (Zeebe `EventTrigger` on the gateway's
+    /// event scope; first trigger wins). Additive; not yet emitted by
+    /// execution.
+    EventGatewayTriggered {
+        instance_key: Key,
+        gateway_element_instance_key: Key,
+        /// The catch element whose event fired.
+        catch_element_id: ElementId,
     },
 
     /// A token moved along a sequence flow from one element to another.
@@ -2227,6 +2268,8 @@ impl Event {
             | Event::ElementTerminating { instance_key, .. }
             | Event::ElementTerminated { instance_key, .. }
             | Event::GatewayRouteSelected { instance_key, .. }
+            | Event::EventGatewaySubscriptionsOpened { instance_key, .. }
+            | Event::EventGatewayTriggered { instance_key, .. }
             | Event::SequenceFlowTaken { instance_key, .. }
             | Event::ParallelJoinOpened { instance_key, .. }
             | Event::ParallelJoinTokenArrived { instance_key, .. }
@@ -2289,7 +2332,8 @@ impl Event {
             | Event::VariablesLostQuarantined { instance_key, .. }
             | Event::OrphanStampSuperseded { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
-            | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+            | Event::ProcessInstanceTerminated { instance_key }
+            | Event::ProcessInstanceHistoryDeleted { instance_key, .. } => Some(*instance_key),
             // A standalone decision evaluation (and its deletion) belongs to no
             // process instance: `0` is the "none" sentinel (Zeebe's `-1`).
             Event::DecisionEvaluated { instance_key, .. }
@@ -2434,7 +2478,16 @@ impl Event {
     /// a `RemoteMessageCorrelation` naming an instance on a higher partition),
     /// which would otherwise mask the local delivery key behind the
     /// `partition_of(max) == partition_id` guard.
+    ///
+    /// A non-minting deletion record ([`Event::ProcessInstanceHistoryDeleted`],
+    /// [`Event::DecisionInstanceDeleted`]) only NAMES a key the caller supplied
+    /// — possibly one this engine never minted (an evicted or absent key) — so
+    /// it proves nothing about the allocator and must not advance it: the live
+    /// apply leaves `next_local` unchanged, and replay must agree (#1948).
     pub fn advance_allocator(&self, partition_id: u64, next_local: &mut u64) {
+        if self.is_non_minting_deletion() {
+            return;
+        }
         for k in [Some(self.max_key()), self.source_delivery_key()]
             .into_iter()
             .flatten()
@@ -2443,6 +2496,15 @@ impl Event {
                 *next_local = (*next_local).max(crate::state::local_of(k));
             }
         }
+    }
+
+    /// Whether this record deletes caller-named history without minting any key
+    /// (see [`Event::advance_allocator`]).
+    pub fn is_non_minting_deletion(&self) -> bool {
+        matches!(
+            self,
+            Event::ProcessInstanceHistoryDeleted { .. } | Event::DecisionInstanceDeleted { .. }
+        )
     }
 
     /// Whether this is a partition-agnostic deployment event (a process, DRG,

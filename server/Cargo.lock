@@ -1665,6 +1665,10 @@ dependencies = [
 name = "nanobpmn-engine-wasm"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures-util",
+ "js-sys",
+ "multer",
  "nanobpmn-engine-core",
  "nanobpmn-read-model",
  "nanobpmn-search",

@@ -65,6 +65,19 @@ fn console_error(msg: &str) {
 /// without a conscious `TestEngine` decision.
 mod surface_parity;
 
+/// The transport-free REST driver ABI, `handle(req) -> res` (#992). Behind the
+/// `read-model` feature: reads are answered by the shared read layer, so the
+/// lean baseline build does not carry it.
+#[cfg(feature = "read-model")]
+mod gateway;
+#[cfg(all(test, feature = "read-model"))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only module (feature-gated, so the clippy.toml test exemptions do not apply)"
+)]
+mod gateway_tests;
+
 #[cfg(all(test, feature = "read-model", not(target_arch = "wasm32")))]
 #[allow(
     clippy::unwrap_used,
@@ -185,7 +198,7 @@ impl TestEngine {
             Ok(defs) => {
                 let ids: Vec<String> = defs.iter().map(|d| d.id.clone()).collect();
                 self.apply(Command::DeployResources(defs))
-                    .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+                    .map_err(|e| engine_err("deploy error", &e))?;
                 let snapshot = self.snapshot_value(None);
                 to_json(&serde_json::json!({
                     "processIds": ids,
@@ -235,7 +248,7 @@ impl TestEngine {
     ) -> Result<serde_json::Value, JsValue> {
         let drg_id = drg.id.clone();
         self.apply(Command::DeployDecisionRequirements(vec![drg]))
-            .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+            .map_err(|e| engine_err("deploy error", &e))?;
         let (drg_key, version, decisions) = {
             let state = self.engine.state();
             let deployed = state.decision_requirements.get(&drg_id).ok_or_else(|| {
@@ -296,7 +309,10 @@ impl TestEngine {
         let variables = parse_vars(variables_json)?;
         let result = self
             .evaluate_decision_json(decision_id, variables)
-            .map_err(|e| js_err(&e))?;
+            .map_err(|e| match e {
+                DecisionEvalError::Engine(e) => engine_err("evaluate error", &e),
+                DecisionEvalError::Evaluation(msg) => js_err(&msg),
+            })?;
         to_json(&result)
     }
 
@@ -329,7 +345,7 @@ impl TestEngine {
             // `versionTag`-bound user-task form (#1193).
             version_tag: nanobpmn_engine_core::form_version_tag_of(schema),
         }]))
-        .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        .map_err(|e| engine_err("deploy error", &e))?;
         // Resolve from post-apply state rather than the emitted events: an
         // idempotent redeploy of the identical latest form emits no
         // `FormDeployed` event, but the deploy still succeeds and must return
@@ -379,7 +395,7 @@ impl TestEngine {
             // engine-side tag storage a future parameter populates).
             version_tag: None,
         }]))
-        .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        .map_err(|e| engine_err("deploy error", &e))?;
         // Resolve from post-apply state rather than the emitted events: an
         // idempotent redeploy of the identical latest resource emits no
         // `GenericResourceDeployed` event, but the deploy still succeeds as a
@@ -426,7 +442,7 @@ impl TestEngine {
                 process_definition_key: None,
                 version,
             })
-            .map_err(|e| js_err(&format!("create error: {e}")))?;
+            .map_err(|e| engine_err("create error", &e))?;
         let created = events.iter().find_map(|e| match e {
             Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
@@ -479,7 +495,7 @@ impl TestEngine {
                 self.now,
                 breakpoints,
             )
-            .map_err(|e| js_err(&format!("debug create error: {e}")))?;
+            .map_err(|e| engine_err("debug create error", &e))?;
         self.debug = Some(session);
         self.fold_debug_delta();
         to_json(&self.debug_state())
@@ -564,7 +580,7 @@ impl TestEngine {
             task_listener_result: None,
             business_id: None,
         })
-        .map_err(|e| js_err(&format!("complete error: {e}")))?;
+        .map_err(|e| engine_err("complete error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -611,7 +627,7 @@ impl TestEngine {
             task_listener_result: None,
             business_id: None,
         })
-        .map_err(|e| js_err(&format!("complete agent job error: {e}")))?;
+        .map_err(|e| engine_err("complete agent job error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -638,7 +654,7 @@ impl TestEngine {
             error_message: message.to_string(),
             retry_back_off: 0,
         })
-        .map_err(|e| js_err(&format!("fail error: {e}")))?;
+        .map_err(|e| engine_err("fail error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -708,7 +724,7 @@ impl TestEngine {
             time_to_live,
             message_id,
         })
-        .map_err(|e| js_err(&format!("correlate error: {e}")))?;
+        .map_err(|e| engine_err("correlate error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -725,9 +741,9 @@ impl TestEngine {
         self.now = self.now.saturating_add(delta);
         let now = self.now;
         self.apply(Command::TriggerTimers { now })
-            .map_err(|e| js_err(&format!("timer error: {e}")))?;
+            .map_err(|e| engine_err("timer error", &e))?;
         self.apply(Command::ExpireJobs { now })
-            .map_err(|e| js_err(&format!("expire error: {e}")))?;
+            .map_err(|e| engine_err("expire error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -748,9 +764,9 @@ impl TestEngine {
         }
         let now = self.now;
         self.apply(Command::TriggerTimers { now })
-            .map_err(|e| js_err(&format!("timer error: {e}")))?;
+            .map_err(|e| engine_err("timer error", &e))?;
         self.apply(Command::ExpireJobs { now })
-            .map_err(|e| js_err(&format!("expire error: {e}")))?;
+            .map_err(|e| engine_err("expire error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -786,7 +802,7 @@ impl TestEngine {
                     ..Default::default()
                 },
             ))
-            .map_err(|e| js_err(&format!("activate error: {e}")))?;
+            .map_err(|e| engine_err("activate error", &e))?;
         // Derive the returned job keys from the `JobActivated` events *this*
         // call emitted — not by scanning all `Activated` jobs, which would also
         // surface jobs locked by earlier `activateJobs` calls and could exceed
@@ -855,7 +871,7 @@ impl TestEngine {
             variables: BTreeMap::new(),
             lease_token,
         })
-        .map_err(|e| js_err(&format!("throw error: {e}")))?;
+        .map_err(|e| engine_err("throw error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -876,7 +892,7 @@ impl TestEngine {
             retries,
             lease_token,
         })
-        .map_err(|e| js_err(&format!("update retries error: {e}")))?;
+        .map_err(|e| engine_err("update retries error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -895,7 +911,7 @@ impl TestEngine {
             timeout,
             lease_token,
         })
-        .map_err(|e| js_err(&format!("update timeout error: {e}")))?;
+        .map_err(|e| engine_err("update timeout error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -908,7 +924,7 @@ impl TestEngine {
         self.guard_paused()?;
         let key = parse_key(incident_key)?;
         self.apply(Command::ResolveIncident { incident_key: key })
-            .map_err(|e| js_err(&format!("resolve incident error: {e}")))?;
+            .map_err(|e| engine_err("resolve incident error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -931,7 +947,7 @@ impl TestEngine {
             variables,
             local,
         })
-        .map_err(|e| js_err(&format!("set variables error: {e}")))?;
+        .map_err(|e| engine_err("set variables error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -951,7 +967,7 @@ impl TestEngine {
             signal_name: signal_name.to_string(),
             variables,
         })
-        .map_err(|e| js_err(&format!("broadcast signal error: {e}")))?;
+        .map_err(|e| engine_err("broadcast signal error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -963,7 +979,7 @@ impl TestEngine {
         self.guard_paused()?;
         let key = parse_key(instance_key)?;
         self.apply(Command::cancel_instance_including_suspended(key))
-            .map_err(|e| js_err(&format!("cancel instance error: {e}")))?;
+            .map_err(|e| engine_err("cancel instance error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -993,7 +1009,7 @@ impl TestEngine {
             terminate_element_ids: Vec::new(),
             move_instructions: Vec::new(),
         })
-        .map_err(|e| js_err(&format!("modify instance error: {e}")))?;
+        .map_err(|e| engine_err("modify instance error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1019,7 +1035,7 @@ impl TestEngine {
             target_process_definition_key: target_key,
             mapping_instructions,
         })
-        .map_err(|e| js_err(&format!("migrate instance error: {e}")))?;
+        .map_err(|e| engine_err("migrate instance error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1039,7 +1055,7 @@ impl TestEngine {
             user_task_key: key,
             variables,
         })
-        .map_err(|e| js_err(&format!("complete user task error: {e}")))?;
+        .map_err(|e| engine_err("complete user task error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1060,7 +1076,7 @@ impl TestEngine {
             assignee: assignee.to_string(),
             allow_override,
         })
-        .map_err(|e| js_err(&format!("assign user task error: {e}")))?;
+        .map_err(|e| engine_err("assign user task error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1071,7 +1087,7 @@ impl TestEngine {
         self.guard_paused()?;
         let key = parse_key(user_task_key)?;
         self.apply(Command::UnassignUserTask { user_task_key: key })
-            .map_err(|e| js_err(&format!("unassign user task error: {e}")))?;
+            .map_err(|e| engine_err("unassign user task error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1093,7 +1109,7 @@ impl TestEngine {
             user_task_key: key,
             changeset,
         })
-        .map_err(|e| js_err(&format!("update user task error: {e}")))?;
+        .map_err(|e| engine_err("update user task error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1193,7 +1209,7 @@ impl TestEngine {
                 limits: None,
                 history,
             })
-            .map_err(|e| js_err(&format!("create agent instance error: {e}")))?;
+            .map_err(|e| engine_err("create agent instance error", &e))?;
         let key = events
             .iter()
             .find_map(|event| match event {
@@ -1226,7 +1242,14 @@ impl TestEngine {
         let (element_id, process_instance_key) = self
             .engine
             .agent_instance_ownership(agent_instance_key)
-            .ok_or_else(|| js_err("no such agent instance"))?;
+            .ok_or_else(|| {
+                engine_err(
+                    "update agent instance error",
+                    &nanobpmn_engine_core::EngineError::AgentInstanceNotFound {
+                        agent_instance_key,
+                    },
+                )
+            })?;
         reject_non_updatable_status(req.status.as_deref()).map_err(|m| js_err(&m))?;
         let status = match req.status.as_deref() {
             Some(s) => Some(parse_agent_status(s)?),
@@ -1253,7 +1276,7 @@ impl TestEngine {
                 tools: None,
                 history,
             })
-            .map_err(|e| js_err(&format!("update agent instance error: {e}")))?;
+            .map_err(|e| engine_err("update agent instance error", &e))?;
         to_json(&serde_json::json!({
             "createdHistory": self.created_history_result(agent_instance_key, &history_ids, &events)?,
         }))
@@ -1269,7 +1292,7 @@ impl TestEngine {
         self.apply(Command::CompleteAgentInstance {
             agent_instance_key: key,
         })
-        .map_err(|e| js_err(&format!("complete agent instance error: {e}")))?;
+        .map_err(|e| engine_err("complete agent instance error", &e))?;
         to_json(&self.snapshot_value(None))
     }
 }
@@ -1347,6 +1370,19 @@ impl TestEngine {
     ) -> Result<String, JsValue> {
         self.search_variables_json(query_json, truncate_values)
             .map_err(|e| js_err(&e))
+    }
+
+    /// `handle` — the transport-free REST driver (#992): serve one Camunda v2
+    /// REST request as the gateway would. `method` is the HTTP method, `path`
+    /// the request target (with or without the `/v2` prefix; a query string is
+    /// honoured), `headers_json` a JSON object of header name → value (empty ⇒
+    /// none; `content-type` carries a multipart deployment's boundary) and
+    /// `body` the request body. Returns `{ "status", "headers", "body" }` as
+    /// JSON; never throws — a rejection is an RFC 9457 ProblemDetail response
+    /// whose status/title/detail come from the shared engine-error mapping.
+    pub fn handle(&mut self, method: &str, path: &str, headers_json: &str, body: &str) -> String {
+        let res = self.handle_request(method, path, headers_json, body);
+        serde_json::to_string(&res).unwrap_or_default()
     }
 
     /// `searchAgentInstances` — mirrors `POST /agent-instances/search`.
@@ -1634,17 +1670,19 @@ impl TestEngine {
         &mut self,
         decision_id: &str,
         variables: BTreeMap<String, Value>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, DecisionEvalError> {
         let events = self
             .apply(Command::EvaluateDecision {
                 decision: nanobpmn_engine_core::DecisionReference::Id(decision_id.to_string()),
                 variables,
             })
-            .map_err(|e| format!("evaluate error: {e}"))?;
+            .map_err(DecisionEvalError::Engine)?;
         let evaluated = events
             .iter()
             .find(|e| matches!(e, Event::DecisionEvaluated { .. }))
-            .ok_or("evaluate error: no evaluation was recorded")?;
+            .ok_or_else(|| {
+                DecisionEvalError::Evaluation("evaluate error: no evaluation was recorded".into())
+            })?;
         let Event::DecisionEvaluated {
             decision_key,
             decision_output,
@@ -1655,10 +1693,10 @@ impl TestEngine {
             unreachable!()
         };
         if let Some(failure) = failure {
-            return Err(format!(
+            return Err(DecisionEvalError::Evaluation(format!(
                 "evaluate error: failed to evaluate decision '{}': {}",
                 failure.failed_decision_id, failure.message
-            ));
+            )));
         }
         #[allow(
             clippy::expect_used,
@@ -1857,14 +1895,20 @@ impl TestEngine {
 
     /// Activate the job's type so a `Created` job can be completed/failed. A job
     /// that has already been activated is left as-is.
+    ///
+    /// A missing job is left for the caller's command to reject, so it surfaces
+    /// as the typed `JobNotFound` (ProblemDetail 404 via [`engine_err`]) with the
+    /// caller's own context — never a bare string (#1937).
     fn ensure_activated(&mut self, job_key: u64) -> Result<(), JsValue> {
-        let (state, leased) = self
+        let Some((state, leased)) = self
             .engine
             .state()
             .jobs
             .get(&job_key)
             .map(|j| (j.state, j.lease_token.is_some()))
-            .ok_or_else(|| js_err(&format!("no such job: {job_key}")))?;
+        else {
+            return Ok(());
+        };
         // Already activated (or terminal) — nothing to do; completion is by key.
         if state != JobState::Created || leased {
             return Ok(());
@@ -1878,7 +1922,7 @@ impl TestEngine {
             fetch_variables: Vec::new(),
             with_lease: false,
         })
-        .map_err(|e| js_err(&format!("activate error: {e}")))?;
+        .map_err(|e| engine_err("activate error", &e))?;
         Ok(())
     }
 
@@ -2338,6 +2382,44 @@ fn user_task_state(s: &UserTaskState) -> String {
         UserTaskState::Canceled => "Canceled",
     }
     .to_string()
+}
+
+/// An engine rejection as a ProblemDetail-shaped JS `Error` (#1937): its
+/// `message` is `"<context>: <detail>"` and it carries `status`, `title`,
+/// `detail` and `nonRetryable`, all from the ONE mapping the server shares,
+/// [`nanobpmn_engine_core::EngineError::problem`] — so the wasm surface and the
+/// REST gateway cannot drift.
+#[cfg(target_arch = "wasm32")]
+fn engine_err(context: &str, e: &nanobpmn_engine_core::EngineError) -> JsValue {
+    let p = e.problem();
+    let err = js_sys::Error::new(&format!("{context}: {}", p.detail));
+    let obj: &JsValue = err.as_ref();
+    // `Reflect::set` on a fresh, extensible `Error` object cannot fail.
+    let _ = js_sys::Reflect::set(obj, &"status".into(), &JsValue::from(p.status));
+    let _ = js_sys::Reflect::set(obj, &"title".into(), &JsValue::from_str(p.title));
+    let _ = js_sys::Reflect::set(obj, &"detail".into(), &JsValue::from_str(&p.detail));
+    let _ = js_sys::Reflect::set(obj, &"nonRetryable".into(), &JsValue::from(!p.retryable));
+    err.into()
+}
+
+/// Off wasm32 (host tests): the same catchable panic as [`js_err`], with the
+/// shared ProblemDetail fields appended so host callers can assert on them.
+#[cfg(not(target_arch = "wasm32"))]
+fn engine_err(context: &str, e: &nanobpmn_engine_core::EngineError) -> JsValue {
+    let p = e.problem();
+    js_err(&format!(
+        "{context}: {} [status={} title={} nonRetryable={}]",
+        p.detail, p.status, p.title, !p.retryable
+    ))
+}
+
+/// Why `evaluate_decision_json` failed: a typed engine rejection (thrown with
+/// the shared ProblemDetail fields via [`engine_err`]) kept apart from a DMN
+/// evaluation failure, which is recorded state, not a command rejection.
+#[derive(Debug)]
+enum DecisionEvalError {
+    Engine(nanobpmn_engine_core::EngineError),
+    Evaluation(String),
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4453,17 +4535,82 @@ mod tests {
         let err = eng
             .evaluate_decision_json("pick", vars(r#"{"lang":"xx"}"#))
             .unwrap_err();
+        let DecisionEvalError::Evaluation(err) = err else {
+            panic!("expected an evaluation failure, got {err:?}")
+        };
         assert!(
             err.starts_with("evaluate error: failed to evaluate decision 'pick'"),
             "{err}"
         );
         let err = eng.evaluate_decision_json("nope", vars("{}")).unwrap_err();
-        assert_eq!(err, "evaluate error: no deployed decision with id 'nope'");
+        let DecisionEvalError::Engine(err) = err else {
+            panic!("expected a typed engine rejection, got {err:?}")
+        };
+        assert_eq!(err.problem().status, 404);
+        assert_eq!(err.to_string(), "no deployed decision with id 'nope'");
         let snap = parse(&eng.snapshot().unwrap());
         let decisions = snap["decisionInstances"].as_array().unwrap();
         assert_eq!(decisions.len(), 1, "{decisions:?}");
         assert_eq!(decisions[0]["state"], "FAILED");
         assert!(decisions[0]["evaluationFailure"].as_str().is_some());
+    }
+
+    /// Missing-resource lookups are typed 404 rejections on every entry point,
+    /// not only on the paths that reach `apply` (#1937): a no-lease job call and
+    /// an unknown-agent update used to throw a bare string.
+    #[test]
+    fn missing_resource_lookups_throw_problem_detail() {
+        fn rejection(f: impl FnOnce(&mut TestEngine)) -> String {
+            let mut eng = TestEngine::new();
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut eng)))
+                .expect_err("call must reject");
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default()
+        }
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "complete error",
+                rejection(|e| {
+                    let _ = e.complete_job("424242", "{}", None);
+                }),
+            ),
+            (
+                "complete agent job error",
+                rejection(|e| {
+                    let _ = e.complete_agent_job("424242", "{}", "{}", None);
+                }),
+            ),
+            (
+                "fail error",
+                rejection(|e| {
+                    let _ = e.fail_job("424242", 0, "x", None);
+                }),
+            ),
+            (
+                "throw error",
+                rejection(|e| {
+                    let _ = e.throw_error("424242", "E", "x", None);
+                }),
+            ),
+            (
+                "update agent instance error",
+                rejection(|e| {
+                    let _ = e.update_agent_instance(
+                        "424242",
+                        r#"{"elementInstanceKey":"1","jobKey":"2"}"#,
+                    );
+                }),
+            ),
+        ];
+        for (context, msg) in cases {
+            assert!(
+                msg.starts_with(&format!("{HOST_REJECTION_PREFIX}{context}: "))
+                    && msg.contains("[status=404 title=NOT_FOUND nonRetryable=true]"),
+                "{context}: {msg}"
+            );
+        }
     }
 
     #[test]

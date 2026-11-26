@@ -223,6 +223,27 @@ impl ReadModel {
 
     // --- point lookups: route to the key's owning partition shard ---
 
+    /// Routes [`ReadStore::try_parent_process_instance_key_any`] (live +
+    /// archive ancestry, #1948) to the key's owning shard.
+    pub fn try_parent_process_instance_key_any(&self, key: Key) -> rusqlite::Result<Option<Key>> {
+        match self.shard_for(key) {
+            Some(shard) => shard.try_parent_process_instance_key_any(key),
+            None => Ok(None),
+        }
+    }
+
+    /// Routes [`ReadStore::try_process_instance_any`] (live + terminal
+    /// archive, #1948) to the key's owning shard.
+    pub fn try_process_instance_any(
+        &self,
+        key: Key,
+    ) -> rusqlite::Result<Option<ProcessInstanceRow>> {
+        match self.shard_for(key) {
+            Some(shard) => shard.try_process_instance_any(key),
+            None => Ok(None),
+        }
+    }
+
     pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
         self.shard_for(key)?.process_instance(key)
     }
@@ -432,6 +453,16 @@ impl ReadModel {
             .iter()
             .flat_map(|s| s.process_instances())
             .collect()
+    }
+
+    /// Routes [`ReadStore::try_process_instances_any`] (live + terminal
+    /// archive, #1948) over every shard.
+    pub fn try_process_instances_any(&self) -> rusqlite::Result<Vec<ProcessInstanceRow>> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.try_process_instances_any()?);
+        }
+        Ok(out)
     }
 
     pub fn jobs(&self) -> Vec<JobRow> {

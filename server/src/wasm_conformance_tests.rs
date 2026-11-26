@@ -969,3 +969,77 @@ fn comparator_keeps_client_supplied_dates_and_payloads_verbatim() {
         }
     }
 }
+
+/// Review #1997 (operator): multipart deployment parity. Every fixture in
+/// `conformance/multipart-deploy.json` is POSTed raw to the native router AND
+/// to the wasm `handle()` driver; both must answer with the fixture's status
+/// and, on success, deploy exactly its resource names. The engine-wasm suite
+/// runs the same file against `handle()` alone, so either side drifting fails.
+#[tokio::test]
+async fn multipart_deploy_fixtures_agree_between_server_and_wasm() {
+    let bpmn = resource("conformance-service.bpmn");
+    let raw: J = serde_json::from_str(&resource("multipart-deploy.json")).expect("fixtures");
+    let ops = spec_operations();
+    let (method, path) = ops["createDeployment"].clone();
+    let names = |v: &J| -> Vec<String> {
+        v["deployments"]
+            .as_array()
+            .expect("deployments")
+            .iter()
+            .flat_map(|d| d.as_object().expect("metadata").values())
+            .filter_map(|m| m.get("resourceName").and_then(J::as_str))
+            .map(str::to_string)
+            .collect()
+    };
+    for f in raw["fixtures"].as_array().expect("fixtures array") {
+        let name = s(&f["name"]);
+        let ct = s(&f["contentType"]);
+        let body = s(&f["body"]).replace("{{BPMN}}", &bpmn);
+        let status = f["status"].as_u64().expect("status");
+        let expected: Vec<String> = f["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .map(s)
+            .collect();
+
+        let server = ServerSide {
+            server: ServerImpl::default(),
+            ops: ops.clone(),
+            fences: 0,
+        };
+        match server
+            .send(method.clone(), &path, &ct, Body::from(body.clone()))
+            .await
+        {
+            Outcome::Accepted(v) => {
+                assert_eq!(
+                    status, 200,
+                    "{name}: server accepted, fixture expects {status}"
+                );
+                assert_eq!(names(&v), expected, "{name}: server resources");
+            }
+            Outcome::Rejected { status: got, .. } => {
+                assert_eq!(
+                    got,
+                    Some(u16::try_from(status).expect("u16")),
+                    "{name}: server status"
+                );
+            }
+        }
+
+        let mut eng = TestEngine::new();
+        let headers = json!({ "content-type": ct }).to_string();
+        let res: J =
+            serde_json::from_str(&eng.handle("POST", &path, &headers, &body)).expect("res");
+        assert_eq!(
+            res["status"].as_u64(),
+            Some(status),
+            "{name}: wasm status {res}"
+        );
+        if status == 200 {
+            let v: J = serde_json::from_str(res["body"].as_str().expect("body")).expect("json");
+            assert_eq!(names(&v), expected, "{name}: wasm resources");
+        }
+    }
+}

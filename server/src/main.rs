@@ -92,7 +92,7 @@ use nanobpmn_search::process_instance::{
 };
 use nanobpmn_search::user_task::user_task_result;
 use nanobpmn_search::variable::{truncate_value, variable_result};
-use nanobpmn_search::{convert::epoch, query};
+use nanobpmn_search::{convert::epoch, incident::incident_result, query};
 
 use crate::backpressure::{
     AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, GlobalGuard,
@@ -8619,11 +8619,10 @@ impl ServerImpl {
                         &process_id,
                         operation_reference,
                     )
-                    .map_err(|e| match e {
-                        EngineError::ProcessNotFound { process_id } => {
-                            (400, format!("No deployed process with id '{process_id}'."))
-                        }
-                        other => (500, other.to_string()),
+                    .map_err(|e| {
+                        // The shared engine-core mapping (#1937).
+                        let p = e.problem();
+                        (p.status, p.detail)
                     })?;
                     Ok((process_id, created))
                 },
@@ -8832,6 +8831,204 @@ impl ServerImpl {
                 ))
             }
         })
+    }
+
+    /// `POST /v2/process-instances/{processInstanceKey}/deletion` (#1948):
+    /// deletes an ENDED instance's history. 404 for an unknown key, 409 for a
+    /// live (ACTIVE / SUSPENDED / TERMINATING) instance.
+    async fn delete_process_instance_impl(
+        &self,
+        path_params: &models::DeleteProcessInstancePathParams,
+        body: &Option<models::DeleteProcessInstanceRequest>,
+    ) -> Result<apis::process_instance::DeleteProcessInstanceResponse, ()> {
+        use apis::process_instance::DeleteProcessInstanceResponse as Resp;
+        let Ok(instance_key) = path_params.process_instance_key.parse::<u64>() else {
+            return Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                "Process instance not found",
+                404,
+                format!(
+                    "Process instance key '{}' is not a valid key.",
+                    path_params.process_instance_key
+                ),
+            )));
+        };
+        let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
+        Ok(
+            match self
+                .delete_process_instance_history_core(instance_key, operation_reference)
+                .await
+            {
+                TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsMarkedForDeletion,
+                TransitionInstanceOutcome::Conflict(d) => {
+                    Resp::Status409_TheProcessInstanceIsNotInACompletedOrTerminatedStateAndCannotBeDeleted(
+                        problem("Invalid state", 409, d),
+                    )
+                }
+                TransitionInstanceOutcome::NotFound(d) => {
+                    Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                        "Process instance not found",
+                        404,
+                        d,
+                    ))
+                }
+                TransitionInstanceOutcome::Unavailable(d) => {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
+                        d,
+                    ))
+                }
+                TransitionInstanceOutcome::Internal(d) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        500,
+                        d,
+                    ))
+                }
+            },
+        )
+    }
+
+    /// Surface-independent core of "delete an ended process instance's history"
+    /// (#1948), shared by the single-instance endpoint and the deletion batch.
+    /// Rolling-upgrade gate first (503 while any peer does not advertise
+    /// `FEATURE_PROCESS_INSTANCE_HISTORY_DELETION` — which also guarantees every
+    /// peer decodes the `DeleteInstanceHistory` forward frame), then
+    /// leader-forward when this node is not the instance's leader (mirroring
+    /// [`Self::cancel_instance_core`]), else
+    /// [`Self::delete_process_instance_history_local`].
+    pub(crate) async fn delete_process_instance_history_core(
+        &self,
+        instance_key: u64,
+        operation_reference: Option<i64>,
+    ) -> TransitionInstanceOutcome {
+        use TransitionInstanceOutcome as Out;
+        if !self
+            .peers
+            .all_peers_support(
+                nano_falcon_protocol::cluster_join::FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
+            )
+            .await
+        {
+            return Out::Unavailable(
+                "process-instance deletion unavailable: a peer does not support it yet \
+                 (rolling upgrade in progress) or is unreachable"
+                    .to_string(),
+            );
+        }
+        if let Some(node) = self.route_by_leader(instance_key) {
+            return match self.peer_link(node).await {
+                Ok(link) => match link
+                    .delete_instance_history(instance_key.to_string(), operation_reference)
+                    .await
+                {
+                    Ok(r) if is_ok_status(r.status) => Out::Ok,
+                    Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
+                    Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
+                    Ok(r) => Out::Internal(peer_detail(&r)),
+                    // Unknown outcome is safe to retry: deleting already-deleted
+                    // history is a deterministic 404 / idempotent no-op (#1931).
+                    Err(e) if e.is_retryable() => Out::Unavailable(e.to_string()),
+                    Err(e) => Out::Internal(e.to_string()),
+                },
+                Err((503, m)) => Out::Unavailable(m),
+                Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
+            };
+        }
+        self.delete_process_instance_history_local(instance_key, operation_reference)
+            .await
+            .into()
+    }
+
+    /// Deletes an ended instance's history on this node (the instance's
+    /// leader). Resolves the instance from the read model (404 when absent; 409
+    /// fast-path for a live instance), then proposes
+    /// [`Command::DeleteProcessInstanceHistory`] on the owning partition —
+    /// replicated through Raft before success is reported, and re-checked by
+    /// the engine (which rejects a live instance deterministically on every
+    /// replica, paging a cold one in first). Shared by the REST core and the
+    /// intra-cluster `DeleteInstanceHistory` frame so the two cannot drift.
+    pub(crate) async fn delete_process_instance_history_local(
+        &self,
+        instance_key: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<(), (u16, String)> {
+        let Some((state, ended)) = self.history_state(instance_key).await? else {
+            return Err((
+                404,
+                format!("No process instance with key '{instance_key}'."),
+            ));
+        };
+        if !ended {
+            return Err((
+                409,
+                format!(
+                    "Process instance {instance_key} is {state} and cannot be deleted; only \
+                     COMPLETED or TERMINATED instances can be deleted.",
+                ),
+            ));
+        }
+        let (_events, commit) = self
+            .apply_partition_command_ref(
+                instance_key,
+                Command::DeleteProcessInstanceHistory { instance_key },
+                operation_reference,
+            )
+            .await?;
+        commit.wait().await;
+        Ok(())
+    }
+
+    /// Resolves whether `instance_key`'s history exists and has ended (#1948),
+    /// as `Some((state label, ended))` or `None` when unknown. The answer comes
+    /// from the key's OWNING read-model shard, over its live store AND its
+    /// terminal archive — so an ended instance retention pruned into the
+    /// archive is still deletable, and a leader that does not own the shard
+    /// (leadership moved to a replica after a failover) asks the static owner
+    /// instead of 404-ing from its own shard-less read model.
+    async fn history_state(
+        &self,
+        instance_key: u64,
+    ) -> Result<Option<(String, bool)>, (u16, String)> {
+        let Some(owner) = self.remote_owner_of(instance_key) else {
+            return self
+                .store
+                .try_process_instance_any(instance_key)
+                .map(|row| {
+                    row.map(|r| (r.state.as_str().to_string(), history_state_ended(r.state)))
+                })
+                .map_err(|e| (500, format!("read-model lookup failed: {e}")));
+        };
+        let (status, body) = self
+            .forward_get(
+                owner,
+                crate::falcon::ReadKind::ProcessInstanceHistory,
+                instance_key,
+            )
+            .await;
+        match (status, body) {
+            (200, Some(b)) => {
+                let state = b.get("state").and_then(|v| v.as_str());
+                let ended = b.get("ended").and_then(|v| v.as_bool());
+                match (state, ended) {
+                    (Some(state), Some(ended)) => Ok(Some((state.to_string(), ended))),
+                    _ => Err((
+                        500,
+                        format!("owner node {owner} returned a malformed history state"),
+                    )),
+                }
+            }
+            (404, _) => Ok(None),
+            (503, _) => Err((
+                503,
+                format!("owner node {owner} unavailable to resolve instance {instance_key}"),
+            )),
+            (s, _) => Err((
+                500,
+                format!("owner node {owner} returned status {s} resolving instance {instance_key}"),
+            )),
+        }
     }
 
     async fn suspend_process_instance_impl(
@@ -13113,6 +13310,10 @@ impl ServerImpl {
                     &readstore::RootResolver::new(|k| self.store.process_instance(k)),
                 ))
             }),
+            ReadKind::ProcessInstanceHistory => match self.store.try_process_instance_any(key) {
+                Ok(row) => row.map(|x| Ok(history_state_body(x.state))),
+                Err(_) => return (500, None),
+            },
             ReadKind::Incident => self
                 .store
                 .incident(key)
@@ -13955,11 +14156,10 @@ impl ServerImpl {
                         &process_id,
                         operation_reference,
                     )
-                    .map_err(|e| match e {
-                        EngineError::ProcessNotFound { process_id } => {
-                            (400, format!("No deployed process with id '{process_id}'."))
-                        }
-                        other => (500, other.to_string()),
+                    .map_err(|e| {
+                        // The shared engine-core mapping (#1937).
+                        let p = e.problem();
+                        (p.status, p.detail)
                     })?;
                     Ok((process_id, created))
                 },
@@ -14653,53 +14853,8 @@ impl ServerImpl {
     ) -> Result<apis::incident::SearchIncidentsResponse, ()> {
         use apis::incident::SearchIncidentsResponse as Resp;
 
-        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let incidents = self.store.incidents();
-
-        // Apply the filter algebra over each incident's string projections. The
-        // process-definition identity is denormalized onto the row at projection
-        // time, so no cross-entity lookup is needed here.
-        let mut matched: Vec<&readstore::IncidentRow> = incidents
-            .iter()
-            .filter(|inc| match filter {
-                None => true,
-                Some(f) => match_incident_filter(inc, f),
-            })
-            .collect();
-
-        // Sort: known fields, defaulting to incidentKey; entity key tiebreaks.
-        let sort = query::sort_keys(
-            body.as_ref().and_then(|q| q.sort.as_ref()),
-            |r: &models::IncidentSearchQuerySortRequest| (r.field.clone(), r.order),
-        );
-        query::sort_items(
-            &mut matched,
-            &sort,
-            |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
-                "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
-                "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
-                "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
-                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
-                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
-                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
-                "incidentKey" => query::SortVal::Num(inc.key as i128),
-                "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(inc.key as i128),
-            },
-            |inc| inc.key,
-        );
-
-        let sorted: Vec<(u64, &readstore::IncidentRow)> =
-            matched.into_iter().map(|inc| (inc.key, inc)).collect();
-        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::IncidentResult> =
-            page.items.into_iter().map(incident_result).collect();
-
         Ok(Resp::Status200_TheIncidentSearchResult(
-            models::IncidentSearchQueryResult::new(page.response, items),
+            nanobpmn_search::incident::search_incidents(&self.read_source(), body.as_ref()),
         ))
     }
 
@@ -14778,49 +14933,12 @@ impl ServerImpl {
             }
         }
 
-        let filter = body.filter.as_ref();
-        let incidents = self.store.incidents();
-        let mut matched: Vec<&readstore::IncidentRow> = incidents
-            .iter()
-            .filter(|inc| contained.contains(&inc.element_instance_key))
-            .filter(|inc| match filter {
-                None => true,
-                Some(f) => match_incident_filter(inc, f),
-            })
-            .collect();
-
-        let sort = query::sort_keys(
-            body.sort.as_ref(),
-            |r: &models::IncidentSearchQuerySortRequest| (r.field.clone(), r.order),
-        );
-        query::sort_items(
-            &mut matched,
-            &sort,
-            |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at_ms as i128),
-                "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
-                "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
-                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i128),
-                "elementId" => query::SortVal::Str(inc.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(inc.element_instance_key as i128),
-                "jobKey" => query::opt_num_sort_val(inc.job_key.map(|k| k as i128)),
-                "processDefinitionId" => query::SortVal::Str(inc.process_definition_id.clone()),
-                "processDefinitionKey" => query::key_sort_val(&inc.process_definition_key),
-                "incidentKey" => query::SortVal::Num(inc.key as i128),
-                "tenantId" => query::SortVal::Str("<default>".to_string()),
-                _ => query::SortVal::Num(inc.key as i128),
-            },
-            |inc| inc.key,
-        );
-
-        let sorted: Vec<(u64, &readstore::IncidentRow)> =
-            matched.into_iter().map(|inc| (inc.key, inc)).collect();
-        let page = query::paginate(sorted, body.page.as_ref());
-        let items: Vec<models::IncidentResult> =
-            page.items.into_iter().map(incident_result).collect();
-
         Ok(Resp::Status200_TheElementInstanceIncidentSearchResult(
-            models::IncidentSearchQueryResult::new(page.response, items),
+            nanobpmn_search::incident::search_incident_rows(
+                &self.store.incidents(),
+                Some(body),
+                |inc| contained.contains(&inc.element_instance_key),
+            ),
         ))
     }
 
@@ -23174,11 +23292,10 @@ impl ServerImpl {
                         &process_id,
                         None,
                     )
-                    .map_err(|e| match e {
-                        EngineError::ProcessNotFound { process_id } => {
-                            (400, format!("No deployed process with id '{process_id}'."))
-                        }
-                        other => (500, other.to_string()),
+                    .map_err(|e| {
+                        // The shared engine-core mapping (#1937).
+                        let p = e.problem();
+                        (p.status, p.detail)
                     })
                 },
                 None,
@@ -25209,10 +25326,26 @@ impl ServerImpl {
         // The same matcher `search_process_instances_impl` uses (one algebra,
         // including `$or` — #1293: an ignored `$or` here would silently broaden
         // a mutating batch), with the batch-specific state/hierarchy overrides.
+        self.batch_matched_process_instances_from(
+            self.store.process_instances(),
+            filter,
+            state_policy,
+            honour_hierarchy,
+        )
+    }
+
+    /// [`Self::batch_matched_process_instances_in`] over an explicit candidate
+    /// set — the one matching implementation every batch selection shares.
+    /// Deletion passes the live + terminal-archive set (#1948).
+    fn batch_matched_process_instances_from(
+        &self,
+        candidates: Vec<readstore::ProcessInstanceRow>,
+        filter: &models::ProcessInstanceFilter,
+        state_policy: ProcessInstanceStatePolicy,
+        honour_hierarchy: BatchHierarchyPolicy,
+    ) -> Vec<u64> {
         let matcher = ProcessInstanceMatcher::new(filter, &self.read_source());
-        let mut keys: Vec<u64> = self
-            .store
-            .process_instances()
+        let mut keys: Vec<u64> = candidates
             .into_iter()
             .filter(|inst| matcher.matches(inst, state_policy, honour_hierarchy))
             .map(|inst| inst.key)
@@ -25257,6 +25390,99 @@ impl ServerImpl {
                     CancelInstanceOutcome::NotFound(d)
                     | CancelInstanceOutcome::Unavailable(d)
                     | CancelInstanceOutcome::Internal(d) => Err(d),
+                }
+            });
+        Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
+        ))
+    }
+
+    /// `POST /v2/process-instances/deletion` (#1948) — mint a
+    /// `DELETE_PROCESS_INSTANCE` batch operation over every ENDED (COMPLETED or
+    /// TERMINATED) process instance matched by the request filter and delete
+    /// each one's history (with its call-activity descendants) through the same
+    /// [`Self::delete_process_instance_history_core`] as the single-instance
+    /// endpoint. The caller's `state` predicate is honoured on top of the
+    /// ended-only override ([`ProcessInstanceStatePolicy::EndedOnly`]). Unlike
+    /// cancellation, deletion honours the hierarchy filters
+    /// (`parentProcessInstanceKey` / `parentElementInstanceKey`), so an ended
+    /// child can be selected on its own; a selected instance whose ancestor is
+    /// also selected is dropped, since the ancestor's deletion already removes
+    /// it ([`dedupe_selected_descendants`]).
+    async fn delete_process_instances_batch_operation_impl(
+        &self,
+        body: &models::ProcessInstanceDeletionBatchOperationRequest,
+    ) -> Result<apis::process_instance::DeleteProcessInstancesBatchOperationResponse, ()> {
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as Resp;
+        let op_type = models::BatchOperationTypeEnum::DeleteProcessInstance;
+        // Same contract validation as the other process-instance batches
+        // (spec/process-instances.yaml): both deprecated `batchOperationId`
+        // and `batchOperationKey` together is a 400, before any batch exists.
+        if body.filter.batch_operation_id.is_some() && body.filter.batch_operation_key.is_some() {
+            return Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(problem(
+                "INVALID_ARGUMENT",
+                400,
+                "Provide only one of batchOperationId and batchOperationKey; batchOperationId is deprecated.".to_string(),
+            )));
+        }
+        // Deletion's candidate set spans the live store AND the terminal
+        // archive (#1948): retention prunes ended instances into the archive,
+        // and the single-instance endpoint can still delete them via
+        // `try_process_instance_any`, so a batch must select them too — unless
+        // the filter reads live-only secondary data (see `live_only` below).
+        // Fail closed (#1948): archive-only rows have no live secondary data
+        // (root variables, elements, jobs, incidents), so a filter reading
+        // such a facet cannot be evaluated against them — a negated predicate
+        // (`$exists:false`, `$neq`, …) would match the ABSENT data and select
+        // history the filter excludes. Such filters select live rows only.
+        let live_only = ProcessInstanceMatcher::reads_live_secondary_data(&body.filter);
+        let candidates = match if live_only {
+            Ok(self.store.process_instances())
+        } else {
+            self.store.try_process_instances_any()
+        } {
+            Ok(rows) => rows,
+            Err(e) => {
+                return Ok(
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        500,
+                        format!("Failed to enumerate process instances for deletion: {e}"),
+                    )),
+                );
+            }
+        };
+        let selected = self.batch_matched_process_instances_from(
+            candidates,
+            &body.filter,
+            ProcessInstanceStatePolicy::EndedOnly,
+            BatchHierarchyPolicy::HonourFilters,
+        );
+        // Ancestry spans the live store AND the terminal archive — the same
+        // hierarchy deletion walks — so a selected grandchild under a pruned
+        // (archive-only) child is still recognised as covered by its root. A
+        // failed lookup keeps the item (it then fails or succeeds on its own).
+        let items = dedupe_selected_descendants(selected, |key| {
+            self.store
+                .try_parent_process_instance_key_any(key)
+                .ok()
+                .flatten()
+        })
+        .into_iter()
+        .map(BatchItem::process_instance)
+        .collect();
+        let operation_reference = body.operation_reference;
+        let key =
+            self.drive_process_instance_batch(op_type, items, move |server, instance| async move {
+                match server
+                    .delete_process_instance_history_core(instance, operation_reference)
+                    .await
+                {
+                    TransitionInstanceOutcome::Ok => Ok(()),
+                    TransitionInstanceOutcome::Conflict(d)
+                    | TransitionInstanceOutcome::NotFound(d)
+                    | TransitionInstanceOutcome::Unavailable(d)
+                    | TransitionInstanceOutcome::Internal(d) => Err(d),
                 }
             });
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
@@ -26242,66 +26468,6 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Maps an engine [`IncidentKind`] to the REST `errorType` taxonomy.
-fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum {
-    match kind {
-        IncidentKind::JobNoRetries => models::IncidentErrorTypeEnum::JobNoRetries,
-        IncidentKind::NoMatchingSequenceFlow => models::IncidentErrorTypeEnum::ConditionError,
-        IncidentKind::ExpressionEvaluation => models::IncidentErrorTypeEnum::ExtractValueError,
-        IncidentKind::UnhandledError => models::IncidentErrorTypeEnum::UnhandledErrorEvent,
-        IncidentKind::DecisionEvaluation => models::IncidentErrorTypeEnum::DecisionEvaluationError,
-        IncidentKind::CalledElementError => models::IncidentErrorTypeEnum::CalledElementError,
-        IncidentKind::IoMapping => models::IncidentErrorTypeEnum::IoMappingError,
-        IncidentKind::ExtractValueError => models::IncidentErrorTypeEnum::ExtractValueError,
-        // A nano-internal durability incident (#1384): an off-heap orphan's spilled
-        // variables were definitively lost. The Camunda taxonomy has no analogue,
-        // so it surfaces as `UNKNOWN` (the honest catch-all), not a BPMN error.
-        IncidentKind::VariablesLost => models::IncidentErrorTypeEnum::Unknown,
-    }
-}
-
-/// Maps an engine [`IncidentState`] to the REST incident `state` enum.
-fn incident_state_enum(state: IncidentState) -> models::IncidentStateEnum {
-    match state {
-        IncidentState::Active => models::IncidentStateEnum::Active,
-        IncidentState::Resolved => models::IncidentStateEnum::Resolved,
-    }
-}
-
-/// Projects an [`IncidentRow`] into the generated `IncidentResult`. The
-/// process-definition identity is denormalized onto the row at projection time.
-fn incident_result(incident: &readstore::IncidentRow) -> models::IncidentResult {
-    let process_definition_id = incident.process_definition_id.clone();
-    let process_definition_key = incident.process_definition_key.clone();
-
-    let error_type = incident_error_type_enum(incident.kind);
-    let job_key = match incident.job_key {
-        Some(k) => types::Nullable::Present(models::JobKey(k.to_string())),
-        None => types::Nullable::Null,
-    };
-    let creation_time =
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(incident.created_at_ms as i64)
-            .unwrap_or_else(epoch);
-
-    let incident_state = incident_state_enum(incident.state);
-
-    models::IncidentResult::new(
-        process_definition_id,
-        error_type,
-        incident.reason.clone(),
-        incident.element_id.clone(),
-        creation_time,
-        incident_state,
-        "<default>".to_string(),
-        models::IncidentKey(incident.key.to_string()),
-        models::ProcessDefinitionKey(process_definition_key),
-        models::ProcessInstanceKey(incident.instance_key.to_string()),
-        types::Nullable::Null,
-        models::ElementInstanceKey(incident.element_instance_key.to_string()),
-        job_key,
-    )
-}
-
 /// Parses a stored `inputs_json` array into the generated input items.
 fn decision_instance_inputs(inputs_json: &str) -> Vec<models::EvaluatedDecisionInputItem> {
     let parsed: Vec<serde_json::Value> = serde_json::from_str(inputs_json).unwrap_or_default();
@@ -26630,37 +26796,6 @@ fn match_element_instance_fields(
             };
             v == t
         })
-}
-
-/// The incident filter predicate, shared by `searchIncidents` and the
-/// element-instance-scoped incident search so the two cannot drift. Every
-/// declared `IncidentFilter` field is matched: the process-definition identity
-/// is denormalized onto the row at projection time (no cross-entity lookup),
-/// and single-tenant Nano stores no tenant on incidents, so `tenantId` matches
-/// against an absent value — value operators exclude the row (honest, never
-/// silently widening the search) while `$exists: false` still matches.
-fn match_incident_filter(inc: &readstore::IncidentRow, f: &models::IncidentFilter) -> bool {
-    query::match_basic_string(&f.incident_key, &inc.key.to_string())
-        && query::match_process_instance_key(&f.process_instance_key, &inc.instance_key.to_string())
-        && query::match_element_instance_key(
-            &f.element_instance_key,
-            &inc.element_instance_key.to_string(),
-        )
-        && query::match_process_definition_key(
-            &f.process_definition_key,
-            &inc.process_definition_key,
-        )
-        && query::match_string(&f.process_definition_id, &inc.process_definition_id)
-        && query::match_job_key_opt(&f.job_key, inc.job_key.map(|k| k.to_string()).as_deref())
-        && query::match_incident_state(&f.state, &incident_state_enum(inc.state).to_string())
-        && query::match_incident_error_type(
-            &f.error_type,
-            &incident_error_type_enum(inc.kind).to_string(),
-        )
-        && query::match_string(&f.element_id, &inc.element_id)
-        && query::match_string(&f.error_message, &inc.reason)
-        && query::match_date_time_ms(&f.creation_time, Some(inc.created_at_ms as i64))
-        && query::match_string_opt(&f.tenant_id, None)
 }
 
 /// Copies the shared filter fields out of a top-level `ElementInstanceFilter`
@@ -27181,39 +27316,9 @@ fn job_state_enum(state: nanobpmn_engine_core::JobState) -> models::JobStateEnum
     }
 }
 
-/// Maps an engine [`nanobpmn_engine_core::JobKind`] to the REST `jobKind` +
-/// `listenerEventType` pair. Ordinary element jobs report `BpmnElement` /
-/// `Unspecified`; an execution-listener job (ADR 0037) reports
-/// `ExecutionListener` and its start/end event type; a task-listener job (ADR
-/// 0037 §6) reports `TaskListener` and its user-task lifecycle event type.
-fn job_kind_enums(
-    kind: &nanobpmn_engine_core::JobKind,
-) -> (models::JobKindEnum, models::JobListenerEventTypeEnum) {
-    use nanobpmn_engine_core::{JobKind, ListenerEventType, TaskListenerEventType};
-    match kind {
-        JobKind::BpmnElement => (
-            models::JobKindEnum::BpmnElement,
-            models::JobListenerEventTypeEnum::Unspecified,
-        ),
-        JobKind::ExecutionListener { event_type, .. } => (
-            models::JobKindEnum::ExecutionListener,
-            match event_type {
-                ListenerEventType::Start => models::JobListenerEventTypeEnum::Start,
-                ListenerEventType::End => models::JobListenerEventTypeEnum::End,
-            },
-        ),
-        JobKind::TaskListener { event_type, .. } => (
-            models::JobKindEnum::TaskListener,
-            match event_type {
-                TaskListenerEventType::Creating => models::JobListenerEventTypeEnum::Creating,
-                TaskListenerEventType::Assigning => models::JobListenerEventTypeEnum::Assigning,
-                TaskListenerEventType::Updating => models::JobListenerEventTypeEnum::Updating,
-                TaskListenerEventType::Completing => models::JobListenerEventTypeEnum::Completing,
-                TaskListenerEventType::Canceling => models::JobListenerEventTypeEnum::Canceling,
-            },
-        ),
-    }
-}
+/// The shared `JobKind` → REST enum mapping (#992): one implementation for the
+/// gateway and the in-browser `engine-wasm` driver.
+use nanobpmn_search::job::job_kind_enums;
 
 /// Sort projection for job search: string-encoded definition keys sort
 /// numerically (so `"2"` precedes `"10"`), optional fields sort as
@@ -27660,10 +27765,9 @@ fn wait_state_type_of(details: &models::WaitStateDetails) -> &str {
 const CONFLICTING_LEASE_TOKENS_DETAIL: &str = "jobLeaseToken and the deprecated legacy alias (leaseToken/jobLease) were both supplied \
      with different values. Supply only jobLeaseToken.";
 
-/// Camunda's default physical tenant id (`PhysicalTenantIds.DEFAULT_PHYSICAL_TENANT_ID`),
-/// the one every Nano activation is served by — Nano has no physical tenants.
-const DEFAULT_PHYSICAL_TENANT_ID: &str = "default";
-
+/// Maps an activated job (with its resolved identity) into the generated
+/// `ActivatedJobResult` through the shared mapper (#992), so the gateway and the
+/// in-browser `engine-wasm` driver answer an activation with the same wire shape.
 fn activated_job_result(
     activated: ActivatedJobWithIdentity,
     fetch_variable: Option<&[String]>,
@@ -27675,87 +27779,13 @@ fn activated_job_result(
         process_definition_key,
         secret_provenance: _,
     } = activated;
-
-    // Project the job's variables into the REST object map off the engine
-    // thread. `job.variables` is an `Arc` shared with engine state, so reading it
-    // here neither blocks the command thread nor deep-clones the value tree.
-    let variables = match fetch_variable {
-        Some(names) => {
-            let filtered: std::collections::BTreeMap<String, Value> = job
-                .variables
-                .iter()
-                .filter(|(name, _)| names.iter().any(|n| n == *name))
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect();
-            to_object_map(&filtered)
-        }
-        None => to_object_map(&job.variables),
-    };
-
-    let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
-
-    // Zeebe `customHeaders`: the task's static `zeebe:taskHeaders`, surfaced as
-    // an object map (each value a JSON string) so the REST contract matches.
-    let custom_headers: std::collections::HashMap<String, types::Object> = job
-        .custom_headers
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                types::Object(serde_json::Value::String(v.clone())),
-            )
-        })
-        .collect();
-    let tags: Vec<models::Tag> = job.tags.iter().cloned().map(models::Tag).collect();
-
-    let mut result = models::ActivatedJobResult {
-        r_type: job.job_type,
-        process_definition_id: process_id,
-        process_definition_version: version,
-        element_id: job.element_id,
-        custom_headers,
-        worker: job.worker,
-        retries: job.retries,
-        deadline: job.deadline as i64,
-        variables,
-        tenant_id: "<default>".to_string(),
-        // Nano has no physical tenants: every activation is served by Camunda's
-        // default one (`PhysicalTenantIds.DEFAULT_PHYSICAL_TENANT_ID`).
-        physical_tenant_id: DEFAULT_PHYSICAL_TENANT_ID.to_string(),
-        job_key: models::JobKey(job.key.to_string()),
-        process_instance_key: models::ProcessInstanceKey(job.instance_key.to_string()),
-        process_definition_key: models::ProcessDefinitionKey(process_definition_key),
-        element_instance_key: models::ElementInstanceKey(job.element_instance_key.to_string()),
-        kind: job_kind_enum,
-        listener_event_type: job_listener_event_type_enum,
-        user_task: types::Nullable::Null,
-        tags,
-        root_process_instance_key: types::Nullable::Null,
-        business_id: job
-            .business_id
-            .map_or(types::Nullable::Null, types::Nullable::Present),
-        priority: job.priority,
-        job_lease_token: job
-            .lease_token
-            .map_or(types::Nullable::Null, types::Nullable::Present),
-        lease_token: None,
-    };
-    // Deprecation window (#1283): also emit the pre-8.10 `leaseToken` name so
-    // workers that have not yet moved to `jobLeaseToken` keep receiving their
-    // token. Mirrors jobLeaseToken exactly (null when the job is unleased).
-    result.lease_token = Some(result.job_lease_token.clone());
-    result
-}
-
-/// Converts engine variables into the generated `Object` (JSON) map used by the
-/// REST models.
-fn to_object_map(
-    variables: &std::collections::BTreeMap<String, Value>,
-) -> std::collections::HashMap<String, types::Object> {
-    variables
-        .iter()
-        .map(|(name, value)| (name.clone(), types::Object(value_to_json(value))))
-        .collect()
+    nanobpmn_search::job::activated_job_result(
+        job,
+        process_id,
+        version,
+        process_definition_key,
+        fetch_variable,
+    )
 }
 
 /// Converts a REST `Object` (JSON) variable map into engine variables.
@@ -47229,6 +47259,81 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn history_deletion_follows_leadership_to_a_non_owning_replica() {
+        // #1948 review: after the static owner's Raft groups go down, the new
+        // partition leader is a replica that owns no read-model shard for the
+        // partition. Deleting an ended instance there must resolve the
+        // instance's history through the OWNING shard (the static owner's
+        // read model), not 404 from the leader's own shard-less store.
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits via quorum");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+        assert!(matches!(
+            node0.cancel_instance_core(instance_key, None).await,
+            CancelInstanceOutcome::Canceled
+        ));
+        let mut terminated = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if node0
+                .store
+                .process_instance(instance_key)
+                .is_some_and(|r| r.state == ProcessInstanceState::Terminated)
+            {
+                terminated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            terminated,
+            "the owner's read model projects the termination"
+        );
+
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        let new_leader = wait_new_leader(&node1, &node2, 0).await;
+        assert_eq!(
+            new_leader.remote_owner_of(instance_key),
+            Some(0),
+            "the new leader is a non-owning replica"
+        );
+        assert!(
+            new_leader.store.process_instance(instance_key).is_none(),
+            "the non-owning leader has no read-model row for the instance"
+        );
+
+        let outcome = new_leader
+            .delete_process_instance_history_core(instance_key, None)
+            .await;
+        let detail = match outcome {
+            TransitionInstanceOutcome::Ok => None,
+            TransitionInstanceOutcome::Conflict(d) => Some(format!("409 {d}")),
+            TransitionInstanceOutcome::NotFound(d) => Some(format!("404 {d}")),
+            TransitionInstanceOutcome::Unavailable(d) => Some(format!("503 {d}")),
+            TransitionInstanceOutcome::Internal(d) => Some(format!("500 {d}")),
+        };
+        assert_eq!(
+            detail, None,
+            "deletion on a non-owning leader must resolve via the owning shard"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_create_on_a_node_that_leads_nothing_forwards_to_a_peer_leader() {
         // s3-create-forward: when a node leads NO partition (here because its Raft
         // groups were shut down while its gateway/peer links stay up), a stream
@@ -63374,3 +63479,533 @@ pub(crate) const PROCESS_DEFINITION_SORT_FIELDS: &[&str] = &[
     "versionTag",
     "tenantId",
 ];
+
+/// Whether a process-instance state has ended, i.e. its history may be
+/// deleted (#1948): the single predicate both the local and the owner-side
+/// existence resolution use.
+fn history_state_ended(state: ProcessInstanceState) -> bool {
+    matches!(
+        state,
+        ProcessInstanceState::Completed | ProcessInstanceState::Terminated
+    )
+}
+
+/// The owner-side `ReadKind::ProcessInstanceHistory` answer (#1948).
+fn history_state_body(state: ProcessInstanceState) -> serde_json::Value {
+    serde_json::json!({ "state": state.as_str(), "ended": history_state_ended(state) })
+}
+
+/// Drops every key in `selected` that has an ancestor (via `parent_of`) also in
+/// `selected` (#1948): deleting an instance's history deletes its call-activity
+/// descendants, so enqueuing both would make the descendant's item fail with a
+/// 404 once its ancestor's deletion projected. Order of `selected` is kept.
+fn dedupe_selected_descendants(
+    selected: Vec<u64>,
+    parent_of: impl Fn(u64) -> Option<u64>,
+) -> Vec<u64> {
+    let set: std::collections::HashSet<u64> = selected.iter().copied().collect();
+    selected
+        .into_iter()
+        .filter(|&key| {
+            // Bounded walk: a corrupt parent cycle cannot hang the batch.
+            const MAX_DEPTH: usize = 4096;
+            let mut cur = parent_of(key);
+            for _ in 0..MAX_DEPTH {
+                match cur {
+                    Some(p) if set.contains(&p) => return false,
+                    Some(p) => cur = parent_of(p),
+                    None => return true,
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Process-instance history deletion (#1948): single-instance endpoint, batch
+/// by filter (through the shared batch seam) and a load-shaped batch.
+#[cfg(test)]
+mod process_instance_deletion_tests {
+    use super::*;
+
+    async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
+        for _ in 0..3000 {
+            if ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    async fn deploy(server: &ServerImpl, proc: ProcessDefinition) {
+        let id = proc.id.clone();
+        let mut names = std::collections::HashMap::new();
+        names.insert(id.clone(), format!("{id}.bpmn"));
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+    }
+
+    async fn create(server: &ServerImpl, id: &str) -> u64 {
+        server
+            .create_for_stream(Some(id.into()), None, std::collections::BTreeMap::new())
+            .await
+            .expect("create the instance")
+            .0
+    }
+
+    fn waiting() -> ProcessDefinition {
+        ProcessBuilder::new("waiting")
+            .start_event("s")
+            .user_task("wait")
+            .end_event("e")
+            .connect("s", "wait")
+            .connect("wait", "e")
+            .build()
+            .expect("valid process")
+    }
+
+    fn straight() -> ProcessDefinition {
+        ProcessBuilder::new("straight")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process")
+    }
+
+    async fn delete(
+        server: &ServerImpl,
+        key: &str,
+    ) -> apis::process_instance::DeleteProcessInstanceResponse {
+        server
+            .delete_process_instance_impl(
+                &models::DeleteProcessInstancePathParams {
+                    process_instance_key: key.to_string(),
+                },
+                &None,
+            )
+            .await
+            .expect("handler returns a response")
+    }
+
+    async fn search_total(server: &ServerImpl) -> i64 {
+        use apis::process_instance::SearchProcessInstancesResponse as Resp;
+        match server.search_process_instances_impl(&None).await.unwrap() {
+            Resp::Status200_TheProcessInstanceSearchResult(r) => r.page.total_items,
+            other => panic!("expected a search result, got {other:?}"),
+        }
+    }
+
+    /// A live instance is rejected (409, history intact); once terminated it
+    /// is deleted (204) with its element instances and variables; a second
+    /// delete and a malformed key are 404.
+    #[tokio::test]
+    async fn single_deletion_rejects_live_and_deletes_ended() {
+        use apis::process_instance::DeleteProcessInstanceResponse as Resp;
+        let server = ServerImpl::default();
+        deploy(&server, waiting()).await;
+        let key = create(&server, "waiting").await;
+        eventually("instance projects", || {
+            server.store.process_instance(key).is_some()
+        })
+        .await;
+
+        let live = delete(&server, &key.to_string()).await;
+        assert!(
+            matches!(
+                live,
+                Resp::Status409_TheProcessInstanceIsNotInACompletedOrTerminatedStateAndCannotBeDeleted(_)
+            ),
+            "live instance must be 409, got {live:?}"
+        );
+        assert!(server.store.process_instance(key).is_some());
+
+        assert!(matches!(
+            server.cancel_instance_core(key, None).await,
+            CancelInstanceOutcome::Canceled
+        ));
+        eventually("instance terminates", || {
+            server
+                .store
+                .process_instance(key)
+                .is_some_and(|r| r.state == ProcessInstanceState::Terminated)
+        })
+        .await;
+        assert!(
+            server
+                .store
+                .element_instances()
+                .iter()
+                .any(|e| e.instance_key == key)
+        );
+
+        let ok = delete(&server, &key.to_string()).await;
+        assert!(
+            matches!(ok, Resp::Status204_TheProcessInstanceIsMarkedForDeletion),
+            "ended instance must be 204, got {ok:?}"
+        );
+        eventually("history is gone", || {
+            server.store.process_instance(key).is_none()
+                && !server
+                    .store
+                    .element_instances()
+                    .iter()
+                    .any(|e| e.instance_key == key)
+                && !server
+                    .store
+                    .variables()
+                    .iter()
+                    .any(|v| v.instance_key == key)
+        })
+        .await;
+
+        assert!(matches!(
+            delete(&server, &key.to_string()).await,
+            Resp::Status404_TheProcessInstanceIsNotFound(_)
+        ));
+        assert!(matches!(
+            delete(&server, "not-a-key").await,
+            Resp::Status404_TheProcessInstanceIsNotFound(_)
+        ));
+    }
+
+    /// #1948 review: both `batchOperationId` and `batchOperationKey` in the
+    /// filter is a 400, before any batch is minted (the shared
+    /// `ProcessInstanceFilter` contract).
+    #[tokio::test]
+    async fn batch_deletion_rejects_both_batch_operation_id_and_key() {
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as Resp;
+        let server = ServerImpl::default();
+        let mut filter = models::ProcessInstanceFilter::new();
+        filter.batch_operation_id = Some(models::StringFilterProperty::String("1".into()));
+        filter.batch_operation_key = Some(models::StringFilterProperty::String("1".into()));
+        let resp = server
+            .delete_process_instances_batch_operation_impl(
+                &models::ProcessInstanceDeletionBatchOperationRequest::new(filter),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                resp,
+                Resp::Status400_TheProcessInstanceBatchOperationFailed(_)
+            ),
+            "got {resp:?}"
+        );
+    }
+
+    /// #1948 review: a selected instance whose (transitive) ancestor is also
+    /// selected is dropped — the ancestor's deletion removes it — while a child
+    /// selected on its own (ancestor not selected) is kept.
+    #[test]
+    fn dedupe_drops_only_descendants_of_selected_ancestors() {
+        let parents: std::collections::HashMap<u64, u64> =
+            [(2, 1), (3, 2), (5, 4)].into_iter().collect();
+        let parent_of = |k: u64| parents.get(&k).copied();
+        assert_eq!(
+            dedupe_selected_descendants(vec![1, 3, 5, 6], parent_of),
+            vec![1, 5, 6]
+        );
+        assert_eq!(
+            dedupe_selected_descendants(vec![3, 5], parent_of),
+            vec![3, 5]
+        );
+        // A corrupt parent cycle terminates.
+        let cyclic = |k: u64| Some(k + 100);
+        assert_eq!(dedupe_selected_descendants(vec![1], cyclic), vec![1]);
+    }
+
+    /// #1948 review: an ended instance that retention pruned into the
+    /// file-backed terminal archive must still be selected — and deleted — by
+    /// the batch deletion endpoint, exactly as the single-instance endpoint
+    /// reaches it via `try_process_instance_any`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_deletion_selects_instances_pruned_into_the_archive() {
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as CreateResp;
+        let dir = std::env::temp_dir().join(format!(
+            "nano-1948-batch-archive-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = Journal::in_memory();
+        let pid = journal.partition_id();
+        let shard = Arc::new(
+            nano_server_storage::readstore::ReadStore::open(Some(&dir.join("read-model.sqlite")))
+                .unwrap(),
+        );
+        let store = Arc::new(ReadModel::from_shards(vec![(pid, Arc::clone(&shard))]));
+        let server = build_server(vec![journal], store, cluster::Topology::single(1));
+        deploy(&server, straight()).await;
+        let pruned = create(&server, "straight").await;
+        let kept = create(&server, "straight").await;
+        eventually("both instances project as ended", || {
+            [pruned, kept].iter().all(|k| {
+                server
+                    .store
+                    .process_instance(*k)
+                    .is_some_and(|r| r.state == ProcessInstanceState::Completed)
+            })
+        })
+        .await;
+        shard.prune_terminal_instances(1, 0).unwrap();
+        assert!(
+            server.store.process_instance(pruned).is_none(),
+            "not pruned"
+        );
+        assert!(
+            server
+                .store
+                .try_process_instance_any(pruned)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut filter = models::ProcessInstanceFilter::new();
+        filter.process_instance_key = Some(
+            models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                models::ProcessInstanceKey(pruned.to_string()),
+            ),
+        );
+        let created = match server
+            .delete_process_instances_batch_operation_impl(
+                &models::ProcessInstanceDeletionBatchOperationRequest::new(filter),
+            )
+            .await
+            .unwrap()
+        {
+            CreateResp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected 200, got {other:?}"),
+        };
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: created.batch_operation_key,
+        };
+        let mut batch = None;
+        for _ in 0..2_000 {
+            let GetResp::Status200_TheBatchOperationWasFound(r) =
+                server.get_batch_operation_impl(&path).await.unwrap()
+            else {
+                panic!("batch must be found");
+            };
+            if r.state != models::BatchOperationStateEnum::Active {
+                batch = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let batch = batch.expect("batch settles");
+        assert_eq!(batch.state, models::BatchOperationStateEnum::Completed);
+        assert_eq!(batch.operations_total_count, 1);
+        assert_eq!(batch.operations_completed_count, 1);
+        eventually("archived deletion projects", || {
+            server
+                .store
+                .try_process_instance_any(pruned)
+                .is_ok_and(|r| r.is_none())
+        })
+        .await;
+        assert!(server.store.process_instance(kept).is_some());
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948 review: an archive-only instance has no live secondary data, so a
+    /// NEGATED variable filter (`$exists:false`) — at top level or inside an
+    /// `$or` clause — must not select it (it would match the ABSENT variables
+    /// and delete history the filter excludes). Fail closed: such filters
+    /// select live rows only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_deletion_negated_variable_filter_never_selects_archived_instances() {
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as CreateResp;
+        let dir = std::env::temp_dir().join(format!(
+            "nano-1948-batch-archive-negvar-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = Journal::in_memory();
+        let pid = journal.partition_id();
+        let shard = Arc::new(
+            nano_server_storage::readstore::ReadStore::open(Some(&dir.join("read-model.sqlite")))
+                .unwrap(),
+        );
+        let store = Arc::new(ReadModel::from_shards(vec![(pid, Arc::clone(&shard))]));
+        let server = build_server(vec![journal], store, cluster::Topology::single(1));
+        deploy(&server, straight()).await;
+        let pruned = create(&server, "straight").await;
+        let kept = create(&server, "straight").await;
+        eventually("both instances project as ended", || {
+            [pruned, kept].iter().all(|k| {
+                server
+                    .store
+                    .process_instance(*k)
+                    .is_some_and(|r| r.state == ProcessInstanceState::Completed)
+            })
+        })
+        .await;
+        shard.prune_terminal_instances(1, 0).unwrap();
+        assert!(
+            server.store.process_instance(pruned).is_none(),
+            "not pruned"
+        );
+
+        let absent = || {
+            Some(vec![models::VariableValueFilterProperty::new(
+                "keep".to_string(),
+                models::StringFilterProperty::AdvancedStringFilter(models::AdvancedStringFilter {
+                    dollar_exists: Some(false),
+                    ..models::AdvancedStringFilter::new()
+                }),
+            )])
+        };
+        let key_filter = || {
+            Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(pruned.to_string()),
+                ),
+            )
+        };
+        let mut top = models::ProcessInstanceFilter::new();
+        top.process_instance_key = key_filter();
+        top.variables = absent();
+        let mut in_or = models::ProcessInstanceFilter::new();
+        in_or.process_instance_key = key_filter();
+        let mut clause = models::ProcessInstanceFilterFields::new();
+        clause.variables = absent();
+        in_or.dollar_or = Some(vec![clause]);
+        for filter in [top, in_or] {
+            let created = match server
+                .delete_process_instances_batch_operation_impl(
+                    &models::ProcessInstanceDeletionBatchOperationRequest::new(filter),
+                )
+                .await
+                .unwrap()
+            {
+                CreateResp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+                other => panic!("expected 200, got {other:?}"),
+            };
+            let path = models::GetBatchOperationPathParams {
+                batch_operation_key: created.batch_operation_key,
+            };
+            let GetResp::Status200_TheBatchOperationWasFound(r) =
+                server.get_batch_operation_impl(&path).await.unwrap()
+            else {
+                panic!("batch must be found");
+            };
+            assert_eq!(r.operations_total_count, 0, "archived instance selected");
+        }
+        assert!(
+            server
+                .store
+                .try_process_instance_any(pruned)
+                .unwrap()
+                .is_some(),
+            "archived history must survive"
+        );
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Load-shaped (#1948): batch-delete ~10k ended instances by filter. The
+    /// batch runs through the shared seam to COMPLETED with every item
+    /// completed and none failed; search totals drop by exactly that many and
+    /// the read model shrinks, while a live instance is neither enqueued nor
+    /// deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_deletion_of_10k_ended_instances_shrinks_the_read_model() {
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::process_instance::DeleteProcessInstancesBatchOperationResponse as CreateResp;
+        const N: usize = 10_000;
+        let server = ServerImpl::default();
+        deploy(&server, straight()).await;
+        deploy(&server, waiting()).await;
+        let live = create(&server, "waiting").await;
+        let mut ended = Vec::with_capacity(N);
+        for _ in 0..N {
+            ended.push(create(&server, "straight").await);
+        }
+        eventually("all instances project as ended", || {
+            server.store.process_instance(live).is_some()
+                && ended.iter().all(|k| {
+                    server
+                        .store
+                        .process_instance(*k)
+                        .is_some_and(|r| r.state == ProcessInstanceState::Completed)
+                })
+        })
+        .await;
+        let total_before = search_total(&server).await;
+        let elements_before = server.store.element_instances().len();
+        assert_eq!(total_before, (N + 1) as i64);
+
+        let created = match server
+            .delete_process_instances_batch_operation_impl(
+                &models::ProcessInstanceDeletionBatchOperationRequest::new(
+                    models::ProcessInstanceFilter::new(),
+                ),
+            )
+            .await
+            .unwrap()
+        {
+            CreateResp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected 200, got {other:?}"),
+        };
+        assert_eq!(
+            created.batch_operation_type,
+            models::BatchOperationTypeEnum::DeleteProcessInstance
+        );
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: created.batch_operation_key,
+        };
+        let mut batch = None;
+        for _ in 0..12_000 {
+            let GetResp::Status200_TheBatchOperationWasFound(r) =
+                server.get_batch_operation_impl(&path).await.unwrap()
+            else {
+                panic!("batch must be found");
+            };
+            if r.state != models::BatchOperationStateEnum::Active {
+                batch = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let batch = batch.expect("batch settles");
+        assert_eq!(batch.state, models::BatchOperationStateEnum::Completed);
+        assert_eq!(batch.operations_total_count, N as i32);
+        assert_eq!(batch.operations_completed_count, N as i32);
+        assert_eq!(batch.operations_failed_count, 0);
+
+        eventually("deletions project", || {
+            server.store.process_instances().len() == 1
+        })
+        .await;
+        assert_eq!(search_total(&server).await, 1);
+        assert!(server.store.process_instance(live).is_some());
+        let elements_after = server.store.element_instances().len();
+        assert!(
+            elements_after < elements_before / 100,
+            "read model must shrink: {elements_before} -> {elements_after}"
+        );
+        assert!(
+            server
+                .store
+                .element_instances()
+                .iter()
+                .all(|e| e.instance_key == live)
+        );
+    }
+}

@@ -39,6 +39,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::GenericResourceDeployed { .. }
         | Event::DecisionEvaluated { .. }
         | Event::DecisionInstanceDeleted { .. }
+        | Event::ProcessInstanceHistoryDeleted { .. }
         | Event::ClusterVariableCreated { .. }
         | Event::ClusterVariableUpdated { .. }
         | Event::ClusterVariableDeleted { .. } => resource::apply_resource(state, event),
@@ -73,6 +74,8 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::ElementTerminating { .. }
         | Event::ElementTerminated { .. }
         | Event::GatewayRouteSelected { .. }
+        | Event::EventGatewaySubscriptionsOpened { .. }
+        | Event::EventGatewayTriggered { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::ParallelJoinOpened { .. }
         | Event::ParallelJoinTokenArrived { .. }

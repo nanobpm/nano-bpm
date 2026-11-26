@@ -11,7 +11,8 @@
 //!
 //! Operations: `searchAgentInstances`, `searchAgentInstanceHistory`
 //! ([`agent`]), `searchProcessInstances` ([`process_instance`]),
-//! `searchUserTasks` ([`user_task`]), `searchVariables` ([`variable`]) and the
+//! `searchUserTasks` ([`user_task`]), `searchVariables` ([`variable`]),
+//! `searchIncidents` ([`incident`]) and the
 //! single-entity reads `getFormByKey`, `getResource`, `getAgentInstance`
 //! ([`get`]). Each pipeline reads rows through [`source::ReadSource`], so the
 //! gateway's sharded read model and the WASM engine's single store share it.
@@ -19,6 +20,8 @@
 pub mod agent;
 pub mod convert;
 pub mod get;
+pub mod incident;
+pub mod job;
 pub mod process_instance;
 pub mod query;
 pub mod source;
