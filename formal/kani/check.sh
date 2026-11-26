@@ -50,6 +50,7 @@ ALL_HARNESSES=(
   escalation_plan_total_and_sound
   token_flow_invariants_preserved
   token_flow_inclusive_join_invariants_preserved
+  token_flow_inclusive_join_waits_for_live_sibling
 )
 # `--list` prints the canonical harness list (one per line) and exits; the
 # nightly workflow derives its matrix and failure report from it.

@@ -128,3 +128,53 @@ fn token_flow_inclusive_join_invariants_preserved() {
         "the inclusive join fires with one flow taken"
     );
 }
+
+/// The inclusive join waits while a live sibling can still reach a missing
+/// incoming flow: split 0 feeds join 1 directly (flow 0) and via task 2
+/// (flow 2 then flow 1). With the flow-0 arrival present and task 2 live
+/// (queued or active), draining flow 0 must hold the token, not fire.
+#[kani::proof]
+#[kani::unwind(5)]
+fn token_flow_inclusive_join_waits_for_live_sibling() {
+    let graph = Graph {
+        kind: [Kind::Inclusive, Kind::Inclusive, Kind::Task],
+        src: [0, 2, 0],
+        tgt: [1, 1, 2],
+    };
+    let Some(mut s) = TokenState::new(&graph, 0) else {
+        return;
+    };
+    let sibling_live: bool = kani::any();
+    if sibling_live {
+        s.ghost += 1;
+        if kani::any() {
+            s.pending[2] = 1;
+        } else {
+            s.active[0] = true;
+            s.node[0] = 2;
+        }
+    }
+    assert_invariants(&graph, &s);
+    let before = s;
+    let applied = step(
+        &graph,
+        &mut s,
+        Action::Drain {
+            flow: 0,
+            guards: [any_guard(), any_guard(), any_guard()],
+        },
+    )
+    .is_ok();
+    assert!(applied);
+    assert_invariants(&graph, &s);
+    let fired = s.arrivals[0] == 0;
+    assert!(
+        fired != sibling_live,
+        "waits iff a live sibling can reach the join"
+    );
+    kani::cover!(
+        sibling_live && !fired && before.arrivals[0] == 1,
+        "join waits"
+    );
+    kani::cover!(!sibling_live && fired, "join fires");
+}

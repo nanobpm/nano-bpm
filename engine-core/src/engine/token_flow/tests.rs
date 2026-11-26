@@ -197,3 +197,34 @@ fn invariants_detect_corruption() {
     held.arrivals[0] = 1;
     assert!(!tokens_accounted(&graph, &held));
 }
+
+#[test]
+fn inclusive_join_waits_for_live_sibling_then_fires() {
+    let graph = Graph {
+        kind: [Kind::Inclusive, Kind::Inclusive, Kind::Task],
+        src: [0, 2, 0],
+        tgt: [1, 1, 2],
+    };
+    for sibling_live in [false, true] {
+        let mut s = TokenState::new(&graph, 0).unwrap();
+        if sibling_live {
+            s.ghost += 1;
+            s.pending[2] = 1;
+        }
+        let drain = |flow| Action::Drain {
+            flow,
+            guards: [Guard::Unconditional; FLOWS],
+        };
+        step(&graph, &mut s, drain(0)).unwrap();
+        assert!(tokens_accounted(&graph, &s));
+        assert_eq!(s.arrivals[0] == 0, !sibling_live, "live={sibling_live}");
+        if sibling_live {
+            step(&graph, &mut s, drain(2)).unwrap();
+            let slot = (0..SLOTS).find(|&i| s.active[i] && s.node[i] == 2).unwrap();
+            step(&graph, &mut s, Action::CompleteTask { slot }).unwrap();
+            step(&graph, &mut s, drain(1)).unwrap();
+            assert_eq!(s.arrivals, [0, 0, 0], "join fires once the sibling arrives");
+            assert!(tokens_accounted(&graph, &s));
+        }
+    }
+}
