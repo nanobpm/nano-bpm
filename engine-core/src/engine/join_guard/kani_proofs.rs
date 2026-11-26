@@ -70,7 +70,9 @@ fn join_ready_kernel_total_and_exact() {
 /// → its edge; node 1 is the join, whose out-edges are never followed), so
 /// CBMC runs one search — the two-search form ran out of memory.
 #[kani::proof]
-#[kani::unwind(4)]
+// Unwind 3 is complete here too (2 nodes, ≤ 2 incoming flows); unwind 4
+// exceeds the hard memory cap on the hosted runner (#2040).
+#[kani::unwind(3)]
 fn inclusive_join_ready_iff_no_active_path() {
     let edge = any_edge();
     let succ: Vec<Vec<(usize, usize)>> = vec![vec![edge], Vec::new()];
