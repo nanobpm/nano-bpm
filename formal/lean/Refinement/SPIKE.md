@@ -105,7 +105,16 @@ refactor is behaviour-preserving by test before it is by proof.
 3. `formal/lean/Refinement/Proof.lean`: `∀ g live join taken unidentified,
    join_ready … = ok b ↔ (b = true ↔ ZeebeJoinReady …)` — BFS soundness and
    completeness against reflexive-transitive reachability that avoids the
-   taken flows into the join; no bound on graph size.
+   taken flows into the join; no bound on graph size. The theorem is stated
+   under the applicability hypothesis `unidentified = 0`: an unidentified
+   arrival (`via = None`) has no per-flow counterpart in Zeebe's state, and
+   for arbitrary `unidentified` the equivalence is false (two incoming flows,
+   `taken = [0, 0]`, `unidentified = 2`: Nano's `activate_join` accepts,
+   `ZeebeParallelReady` in `formal/tla/ZeebeTokenFlow.tla` rejects). The
+   proof must therefore also discharge (or the slice must state as an
+   explicit applicability invariant) that every join arrival on a modelled
+   path is identified; the `unidentified > 0` case is out of the parity
+   claim unless a justified mapping into Zeebe's per-flow state is added.
 4. Lakefile: a `Refinement` `lean_lib` target (with the Aeneas Lean library
    as a Lake dependency — its pinned Lean toolchain must be reconciled with
    `formal/lean/lean-toolchain`, a known integration risk).
