@@ -65,11 +65,13 @@ a = bytearray(200 << 20); a[::4096] = b"x" * len(a[::4096]); time.sleep(3)'
 fi
 
 # Descendants in another process group (a nested GNU timeout) must die with
-# the tree on a cap violation, not survive it.
+# the tree on a cap violation, not survive it. Four workers, each inside
+# RLIMIT_DATA (192 MiB < 256 MiB cap), so only the tree-wide sampler can stop
+# them; a single worker would hit RLIMIT_DATA first and exit on MemoryError.
 rc=0
-MEMGUARD_CGROUP=0 MEMGUARD_INTERVAL=0.1 "$here/memguard.sh" $((64 * 1024)) "$tmp/peak" -- \
-  sh -c "timeout 60 python3 -c '$hog' & echo \$! >'$tmp/nested'; wait" 2>/dev/null || rc=$?
-[[ $rc -eq 125 ]] || { echo "selftest: nested-timeout workload exited $rc, want 125" >&2; exit 1; }
+MEMGUARD_CGROUP=0 MEMGUARD_INTERVAL=0.1 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- \
+  sh -c "for i in 1 2 3 4; do timeout 60 python3 -c '$hog' & done; wait" 2>"$tmp/err" || rc=$?
+[[ $rc -eq 125 ]] || { echo "selftest: nested-timeout workload exited $rc, want 125" >&2; cat "$tmp/err" >&2; exit 1; }
 sleep 0.5
 ! pgrep -f "bytearray\(16 << 20\)" >/dev/null || { echo "selftest: nested-timeout descendant survived the cap kill" >&2; exit 1; }
 
