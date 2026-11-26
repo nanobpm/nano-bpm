@@ -929,44 +929,6 @@ jobs:
       - name: 'Test (vitest: source map unit + headless DAP e2e)'
         run: npm test
 
-  kani:
-    name: kani (engine-core proofs)
-    runs-on: ubuntu-24.04
-    # Bounded model checking of the engine-core harnesses (#1960,
-    # formal/kani/README.md). Its own job with a hard job-level timeout so a
-    # harness that outgrows its bound can never hold the TLC job hostage; each
-    # harness is additionally boxed by check.sh (KANI_HARNESS_TIMEOUT).
-    needs: changes
-    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true' }}
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        # One leg per harness, so each is timed and reported on its own and
-        # one harness's memory/time cannot starve another. Keep in sync with
-        # ALL_HARNESSES in formal/kani/check.sh (it rejects unknown names).
-        # The first two prove over the bounded stand-ins in
-        # engine-core/src/state/kani_model.rs (#1994).
-        harness:
-          - flow_arrivals_preserve_join_invariant
-          - job_index_resync_keeps_lockstep
-          - parallel_join_fires_only_when_every_flow_taken
-    steps:
-      - uses: actions/checkout@v5
-      - name: Resolve pinned Kani version
-        id: kani
-        run: echo "version=$(sed -n 's/^KANI_VERSION="\(.*\)"$/\1/p' formal/kani/check.sh)" >> "$GITHUB_OUTPUT"
-      - name: Cache Kani toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/cargo-kani
-            ~/.cargo/bin/kani
-            ~/.kani
-          key: kani-${{ steps.kani.outputs.version }}
-      - name: Kani proof (timed)
-        run: formal/kani/check.sh "${{ matrix.harness }}"
-
   formal:
     name: formal (tlc)
     # linker: its only Rust build (formal/lean/feel-diff.sh) falls back to
@@ -976,19 +938,9 @@ jobs:
     # model recorded in formal/tla/check.sh. That includes known-defect
     # ratchets, which fail once the defect stops reproducing. Also guards the
     # Zeebe parity coverage matrix in formal/parity (#1245).
-    #
-    # Also the required-check carrier for the Kani proofs (#1994): it `needs`
-    # the `kani` matrix and runs under `always()` so a failed/cancelled/timed-out
-    # Kani leg FAILS this required check instead of skipping it (a skipped
-    # required check is accepted by the merge protocol).
-    needs: [changes, kani]
-    if: ${{ always() && needs.changes.result == 'success' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true') }}
+    needs: changes
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true' }}
     steps:
-      - name: Require Kani proofs to pass
-        if: ${{ needs.kani.result != 'success' }}
-        run: |
-          echo "::error::kani (engine-core proofs) concluded '${{ needs.kani.result }}', expected 'success'"
-          exit 1
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:

@@ -1,0 +1,108 @@
+# Nightly Kani proofs over engine-core (#1960, #1994; formal/kani/README.md).
+#
+# NOT a PR gate — never a required check (not in branch protection /
+# .mergify.yml). The harnesses are bounded to fit a GitHub-hosted runner with
+# headroom: check.sh boxes each one in wall time (KANI_HARNESS_TIMEOUT) and
+# fails it when its peak RSS exceeds KANI_MAX_RSS_PCT (60%) of runner memory,
+# reporting peak RSS and wall time per harness.
+#
+# A failing harness never goes silent: the scheduled run files an issue per
+# failure signature (class + harness + failed check), and comments on the open
+# issue carrying the same signature instead of filing a duplicate — the
+# dedupe-by-signature pattern of the nightly fuzz workflows. No retries: a red
+# run is a harness or product defect to root-cause.
+#
+# Repro locally: formal/kani/check.sh <harness>
+
+name: Kani (engine-core proofs, nightly)
+
+on:
+  schedule:
+    - cron: '29 4 * * *'
+  workflow_dispatch:
+  # Validate changes to the harnesses before they reach the nightly run.
+  # Non-required; never files issues.
+  pull_request:
+    paths:
+      - '.github/workflows/kani-nightly.yml'
+      - 'formal/kani/**'
+      - 'engine-core/src/state/kani_model.rs'
+      - 'engine-core/src/state/kani_proofs.rs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kani-nightly-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  kani:
+    name: kani (${{ matrix.harness }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # One leg per harness, so each is timed and measured on its own and one
+        # harness's memory/time cannot starve another. Keep in sync with
+        # ALL_HARNESSES in formal/kani/check.sh (it rejects unknown names).
+        harness:
+          - flow_arrivals_preserve_join_invariant
+          - job_index_resync_keeps_lockstep
+          - parallel_join_fires_only_when_every_flow_taken
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve pinned Kani version
+        id: kani
+        run: echo "version=$(sed -n 's/^KANI_VERSION="\(.*\)"$/\1/p' formal/kani/check.sh)" >> "$GITHUB_OUTPUT"
+      - name: Cache Kani toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-${{ steps.kani.outputs.version }}
+      - name: Install GNU time (peak RSS measurement)
+        run: |
+          [[ -x /usr/bin/time ]] || { sudo apt-get update -q && sudo apt-get install -y -q time; }
+      - name: Kani proof (timed, memory-bounded)
+        env:
+          KANI_REQUIRE_RSS: '1'
+          KANI_FAILURE_FILE: ${{ runner.temp }}/kani-failure
+        run: |
+          set -o pipefail
+          formal/kani/check.sh "${{ matrix.harness }}" 2>&1 | tee "$RUNNER_TEMP/kani.log"
+      - name: Report cost
+        if: always()
+        run: |
+          {
+            echo "### kani ${{ matrix.harness }}"
+            grep -E '^kani .*(peak RSS|SUCCESSFUL|failed)|^::error::' "$RUNNER_TEMP/kani.log" || echo "(no result line)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: File or comment on the failure issue (deduped by signature)
+        if: failure() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HARNESS: ${{ matrix.harness }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          f="$RUNNER_TEMP/kani-failure"
+          # No failure record means the job died outside check.sh (setup, the
+          # runner being killed): still report it rather than go silent.
+          read -r class harness detail < "$f" 2>/dev/null || { class=error; harness="$HARNESS"; detail=no-result; }
+          sig="$(printf '%s %s %s' "$class" "$harness" "$detail" | sha256sum | cut -c1-12)"
+          marker="<!-- kani-signature:${sig} -->"
+          body="$(printf '%s\n\nNightly Kani harness `%s` failed: **%s** (`%s`).\n\nRun: %s\n\nRepro: `formal/kani/check.sh %s` (formal/kani/README.md). A harness that fails intermittently is a defect in its bound or in the code, not a flaky test (#1994).\n' \
+            "$marker" "$harness" "$class" "$detail" "$RUN_URL" "$harness")"
+          existing="$(gh issue list --state open --search 'kani in:title' --limit 1000 --json number,body \
+            | jq -r --arg m "$marker" '[.[] | select(.body | contains($m))][0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "Seen again: $RUN_URL"
+          else
+            gh issue create --title "kani: ${harness} ${class} (signature ${sig})" --body "$body"
+          fi
