@@ -16,7 +16,10 @@
 //!    of the latch rejoins without divergence; after the latch EVERY member
 //!    (the last-upgraded one included) is restarted in turn and must rejoin
 //!    ACTIVE with its log matching the leader prefix and fresh digest claims
-//!    still verifying (#2058);
+//!    still verifying (#2058). Before each of those restarts the harness forces
+//!    a journal snapshot on every partition the member journals, grows a journal
+//!    tail past it, and asserts the restart restored exactly that snapshot and
+//!    replayed the tail;
 //! 4. **rollback refusal** — after the latch an old binary started on a
 //!    member's data is refused by the cluster with a clear error instead of
 //!    silently misapplying the post-latch log.
@@ -161,6 +164,10 @@ impl Cluster {
             .env("NANOBPMN_PARTITIONS", PARTITIONS.to_string())
             .env("NANOBPMN_RAFT", "1")
             .env("PORT", m.port.to_string())
+            // Journal snapshots only when the harness forces one through
+            // `POST /debug/journal-snapshot` (#2058), so the snapshot a restart
+            // recovers from is a recorded, deterministic checkpoint.
+            .env("NANOBPMN_SNAPSHOT_INTERVAL_MS", "3600000")
             .stdin(Stdio::null())
             .stdout(file.try_clone().unwrap())
             .stderr(file);
@@ -572,6 +579,129 @@ fn committed_floor(c: &Cluster) -> Option<Vec<i128>> {
     )
 }
 
+/// Log message of a recovered journal partition (`seglog::RECOVERED_PARTITION`).
+const RECOVERED: &str = "journal partition recovered";
+
+/// Drops ANSI SGR escapes (`ESC [ ... m`) the tracing formatter may wrap field
+/// names in, so `key=value` pairs parse.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The `u64` value of `key=` in a whitespace-separated `key=value` line.
+fn kv(line: &str, key: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
+        .and_then(|v| v.parse().ok())
+}
+
+/// Forces a journal snapshot on EVERY partition whose engine journal member
+/// `id` holds (its owned partitions) and returns each `(partition, boundary)`
+/// the durable snapshot now covers — non-empty, every boundary > 0.
+fn force_journal_snapshot(c: &Cluster, id: usize) -> Vec<(usize, u64)> {
+    let (code, body) = request(c.port(id), "POST", "/debug/journal-snapshot", None)
+        .expect("node answers /debug/journal-snapshot");
+    assert_eq!(
+        code, 200,
+        "forced journal snapshot on node {id} failed: {body}"
+    );
+    let out: Vec<(usize, u64)> = body
+        .lines()
+        .filter_map(|line| {
+            let p = usize::try_from(kv(line, "partition")?).ok()?;
+            Some((p, kv(line, "snapshot_index")?))
+        })
+        .collect();
+    assert!(
+        !out.is_empty() && out.iter().all(|(p, i)| *p < PARTITIONS as usize && *i > 0),
+        "node {id}: the forced snapshot must cover a non-empty prefix of every owned partition, got {out:?}\n{body}"
+    );
+    out
+}
+
+/// Grows a journal tail after member `id`'s snapshot checkpoint: creates
+/// instances (bounded) until the member has locally applied a new entry on
+/// every checkpointed partition past `applied_at_checkpoint`, so each one's
+/// journal holds events the snapshot does not cover.
+fn grow_tail_past_checkpoint(
+    c: &Cluster,
+    id: usize,
+    checkpoint: &[(usize, u64)],
+    applied_at_checkpoint: &[(i128, i128)],
+    keys: &mut Vec<String>,
+) {
+    for _ in 0..30 {
+        let advanced = raft_status(c, id).is_some_and(|now| {
+            checkpoint
+                .iter()
+                .all(|(p, _)| now[*p].1 > applied_at_checkpoint[*p].1)
+        });
+        if advanced {
+            return;
+        }
+        keys.extend(create_instances(c, id, 1));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "node {id}: no journal tail on every partition after the snapshot checkpoint ({:?} -> {:?})\n{}",
+        applied_at_checkpoint,
+        raft_status(c, id),
+        tail(&c.all_logs())
+    );
+}
+
+/// The restart of member `id` went snapshot + journal: on every checkpointed
+/// partition the boot log reports recovery FROM exactly the recorded
+/// boundary and a non-empty replayed journal tail after it.
+fn assert_recovered_from_checkpoint(c: &Cluster, id: usize, checkpoint: &[(usize, u64)]) {
+    let log = strip_ansi(&c.log_of_boot(id, c.last_boot(id)));
+    let mut seen = vec![None; PARTITIONS as usize];
+    for line in log.lines().filter(|l| l.contains(RECOVERED)) {
+        if let (Some(p), Some(snap), Some(replayed)) = (
+            kv(line, "partition"),
+            kv(line, "snapshot_index"),
+            kv(line, "replayed_entries"),
+        ) && let Some(slot) = usize::try_from(p).ok().and_then(|p| seen.get_mut(p))
+        {
+            *slot = Some((snap, replayed));
+        }
+    }
+    for &(p, want) in checkpoint {
+        match seen[p] {
+            Some((snap, replayed)) => {
+                assert_eq!(
+                    snap,
+                    want,
+                    "node {id} partition {p}: recovery did not load the recorded snapshot checkpoint\n{}",
+                    tail(&log)
+                );
+                assert!(
+                    replayed > 0,
+                    "node {id} partition {p}: recovery replayed no journal tail after the snapshot\n{}",
+                    tail(&log)
+                );
+            }
+            None => panic!(
+                "node {id} partition {p}: no `{RECOVERED}` line in the restart log\n{}",
+                tail(&log)
+            ),
+        }
+    }
+}
+
 /// After a post-latch restart from snapshot + journal, member `id` must have
 /// caught up and agree with EVERY peer over the committed prefix. Per
 /// partition: the actual leader is resolved through `/debug/raft` (agreed by
@@ -878,10 +1008,18 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     // old binary longest). Sequential, one member down at a time, so quorum
     // holds and the runtime stays within the nightly budget.
     for id in 0..NODES {
+        // Deterministic snapshot checkpoint on every partition of this
+        // member, then a journal tail past it, so the restart must go
+        // snapshot + journal (not journal-only).
+        let checkpoint = force_journal_snapshot(&c, id);
+        // Read AFTER the snapshot: an entry applied past this is never covered.
+        let applied_at_checkpoint = raft_status(&c, id).expect("node answers /debug/raft");
+        grow_tail_past_checkpoint(&c, id, &checkpoint, &applied_at_checkpoint, &mut keys);
         let before = log_heads(&c);
         c.kill(id);
         c.start(id, Bin::New);
         wait_ready(&c, id);
+        assert_recovered_from_checkpoint(&c, id, &checkpoint);
         // Drive traffic; `assert_fresh_digest_claims` adds bounded extra
         // creates until every partition and member holds a fresh claim.
         keys.extend(create_instances(&c, (id + 1) % NODES, PARTITIONS as usize));

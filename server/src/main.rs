@@ -28937,6 +28937,55 @@ fn health_response(report: &snapshot_health::HealthReport) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+/// `POST /debug/journal-snapshot` (#2058): forces one tick of the clustered
+/// multi-partition journal snapshot/compaction loop and answers with the
+/// per-partition boundary the durable combined snapshot now covers, one
+/// `partition=<p> snapshot_index=<n>` line each. Lets the upgrade harness take a
+/// deterministic snapshot checkpoint before a restart and then prove the restart
+/// restored exactly that snapshot (see [`seglog::RECOVERED_PARTITION`]).
+mod journal_snapshot_trigger {
+    use std::sync::OnceLock;
+
+    use tokio::sync::{mpsc, oneshot};
+
+    /// Message of the per-partition line every successful tick logs.
+    pub(crate) const WRITTEN: &str = "journal snapshot written";
+
+    pub(crate) type Reply = oneshot::Sender<Vec<(u64, u64)>>;
+
+    static TX: OnceLock<mpsc::Sender<Reply>> = OnceLock::new();
+
+    /// The maintenance loop's end of the trigger channel. `None` once taken
+    /// (one loop per process).
+    pub(crate) fn receiver() -> Option<mpsc::Receiver<Reply>> {
+        let (tx, rx) = mpsc::channel(1);
+        TX.set(tx).ok().map(|()| rx)
+    }
+
+    /// Runs one forced tick; `None` when no loop runs here or the tick failed.
+    pub(crate) async fn trigger() -> Option<Vec<(u64, u64)>> {
+        let (reply, done) = oneshot::channel();
+        TX.get()?.send(reply).await.ok()?;
+        done.await.ok()
+    }
+
+    pub(crate) async fn route() -> axum::response::Response {
+        use axum::response::IntoResponse;
+        match trigger().await {
+            Some(covered) => covered
+                .iter()
+                .map(|(p, c)| format!("partition={p} snapshot_index={c}\n"))
+                .collect::<String>()
+                .into_response(),
+            None => (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "journal snapshot unavailable (no segmented multi-partition journal, or the tick failed)\n",
+            )
+                .into_response(),
+        }
+    }
+}
+
 // #1386 — admin tooling for snapshot blockers (follow-up to #1383).
 //
 // #1383 showed a single orphaned spilled instance could fail-close every
@@ -31438,8 +31487,20 @@ async fn main() {
                     // retaining the latest generation as the replay-migration
                     // fallback (#1071).
                     let mut prev_floor: u64 = 0;
+                    // `POST /debug/journal-snapshot` (#2058): an operator/test
+                    // forced tick, answered with the covered boundaries once the
+                    // combined snapshot is durable (dropped on a failed tick).
+                    let mut forced = journal_snapshot_trigger::receiver();
                     loop {
-                        ticker.tick().await;
+                        let reply = tokio::select! {
+                            _ = ticker.tick() => None,
+                            Some(reply) = async {
+                                match forced.as_mut() {
+                                    Some(rx) => rx.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => Some(reply),
+                        };
                         // Serialize this capture -> publish cycle with a Raft
                         // snapshot adoption's base checkpoint (#1405): taken off
                         // the engine actor, held until the tick ends.
@@ -31545,11 +31606,12 @@ async fn main() {
                         // partitions a clustered node does not own, and its min
                         // would pin the floor at 0 forever (unbounded cold
                         // archive, #1076).
-                        let owned_covered: Vec<u64> = if varstore.is_some() {
-                            entries.iter().map(|e| e.1).collect()
+                        let owned_pairs: Vec<(u64, u64)> = if varstore.is_some() {
+                            entries.iter().map(|e| (e.0, e.1)).collect()
                         } else {
-                            stream_entries.iter().map(|e| e.1).collect()
+                            stream_entries.iter().map(|e| (e.0, e.1)).collect()
                         };
+                        let owned_covered: Vec<u64> = owned_pairs.iter().map(|e| e.1).collect();
                         // Lean path: control-only snapshots written inline (the
                         // authoritative var store holds the payloads, so a spilled
                         // placeholder is serialized as-is). Non-lean path (#1463):
@@ -31610,6 +31672,17 @@ async fn main() {
                         }
                         prev_floor = seglog::cold_prune_floor(&owned_covered);
                         record_snapshot_health_tick(health, &handles, &shared, Ok(())).await;
+                        for &(pid, covered_p) in &owned_pairs {
+                            tracing::info!(
+                                partition = pid,
+                                snapshot_index = covered_p,
+                                "{}",
+                                journal_snapshot_trigger::WRITTEN
+                            );
+                        }
+                        if let Some(reply) = reply {
+                            let _ = reply.send(owned_pairs);
+                        }
 
                         // Bound the durable var-store WAL: truncate it back to zero
                         // on its own cadence so a sustained write load can't grow it
@@ -31935,6 +32008,10 @@ async fn main() {
                 let reg = raft_reg_dbg.clone();
                 async move { raft_debug_body(&reg) }
             }),
+        )
+        .route(
+            "/debug/journal-snapshot",
+            axum::routing::post(journal_snapshot_trigger::route),
         )
         .route(
             "/debug/instances",
