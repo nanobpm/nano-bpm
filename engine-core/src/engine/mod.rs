@@ -7230,6 +7230,13 @@ impl Engine {
                 // held back under is the live state, so an unrelated later
                 // timer (another instance's, a process-start timer) must not
                 // delay it past this fire's downstream work (r4703550842).
+                // Known divergence (deferred): when an interrupting boundary
+                // fires LAST in the batch, its host is already removed and the
+                // queued boundary activation (`via: None`) is invisible to
+                // `has_active_path_to`, so a boundary feeding the join can let
+                // it fire once per arrival instead of once (r4703550889). The
+                // Zeebe-faithful batch restructure is tracked in
+                // https://github.com/nanobpm/nano-bpm/issues/2024.
                 let still_due: BTreeSet<Key> = self
                     .pending_timer_fires
                     .iter()
