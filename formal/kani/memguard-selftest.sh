@@ -20,8 +20,10 @@ for _ in range(12):
 time.sleep(30)'
 tree="for i in 1 2 3 4; do python3 -c '$hog' & done; wait"
 
+# The cgroup layer is off here: this check pins the sampler alone, and a
+# delayed sample must not let MemoryMax kill the tree first.
 rc=0
-MEMGUARD_INTERVAL=0.1 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c "$tree" 2>"$tmp/err" || rc=$?
+MEMGUARD_CGROUP=0 MEMGUARD_INTERVAL=0.1 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c "$tree" 2>"$tmp/err" || rc=$?
 [[ $rc -eq 125 ]] || { echo "selftest: oversized workload exited $rc, want 125" >&2; cat "$tmp/err" >&2; exit 1; }
 grep -q 'memguard: .* exceeded cap 256 MiB' "$tmp/err" || { echo "selftest: no cap message" >&2; cat "$tmp/err" >&2; exit 1; }
 peak="$(cat "$tmp/peak")"
@@ -46,8 +48,27 @@ else
 a = bytearray(200 << 20); a[::4096] = b"x" * len(a[::4096]); time.sleep(3)'
   rc=0
   MEMGUARD_INTERVAL=5 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c "rc=0; for i in 1 2 3 4; do python3 -c '$conc' & p=\"\$p \$!\"; done; for q in \$p; do wait \$q || rc=1; done; exit \$rc" 2>"$tmp/err" || rc=$?
-  [[ $rc -ne 0 ]] || { echo "selftest: concurrent ~800 MiB burst under a 256 MiB cap succeeded" >&2; cat "$tmp/err" >&2; exit 1; }
+  [[ $rc -eq 125 ]] || { echo "selftest: concurrent ~800 MiB burst exited $rc, want 125 (memory failure)" >&2; cat "$tmp/err" >&2; exit 1; }
+  grep -q 'memguard: ' "$tmp/err" || { echo "selftest: cgroup OOM kill not reported" >&2; cat "$tmp/err" >&2; exit 1; }
 fi
+
+# Descendants in another process group (a nested GNU timeout) must die with
+# the tree on a cap violation, not survive it.
+rc=0
+MEMGUARD_CGROUP=0 MEMGUARD_INTERVAL=0.1 "$here/memguard.sh" $((64 * 1024)) "$tmp/peak" -- \
+  sh -c "timeout 60 python3 -c '$hog' & echo \$! >'$tmp/nested'; wait" 2>/dev/null || rc=$?
+[[ $rc -eq 125 ]] || { echo "selftest: nested-timeout workload exited $rc, want 125" >&2; exit 1; }
+sleep 0.5
+! pgrep -f "bytearray\(16 << 20\)" >/dev/null || { echo "selftest: nested-timeout descendant survived the cap kill" >&2; exit 1; }
+
+# SIGTERM to the guard must take the workload down with it.
+# shellcheck disable=SC2016 # expanded by the inner sh
+MEMGUARD_CGROUP=0 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c 'sleep 300 & echo $! >"$0"; wait' "$tmp/child" &
+g=$!
+for _ in $(seq 50); do [[ -s "$tmp/child" ]] && break; sleep 0.1; done
+kill -TERM "$g"; rc=0; wait "$g" || rc=$?
+sleep 0.5
+! kill -0 "$(cat "$tmp/child")" 2>/dev/null || { echo "selftest: workload survived SIGTERM to memguard (rc $rc)" >&2; exit 1; }
 
 rc=0
 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c 'exit 7' || rc=$?

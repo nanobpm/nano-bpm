@@ -8,7 +8,8 @@
 # script exits 125 after printing a `memguard: ... exceeded cap` line, so an
 # over-budget harness fails cleanly *before* the kernel OOM killer takes the
 # runner down (which would leave no cost and no failure record). Otherwise it
-# exits with the command's status (a burst stopped by the kernel limit shows
+# exits with the command's status, except that a cgroup OOM kill (SIGKILL
+# inside the scope) also exits 125 (a single-process burst stopped by the kernel limit shows
 # up as the command's own allocation failure, i.e. a non-zero status). The sampled peak RSS (kB) is written to
 # <peak_file> in both cases.
 #
@@ -55,23 +56,39 @@ fi
 export MEMGUARD_SCOPED=$(( ${#scope[@]} > 0 ))
 (ulimit -d "$cap_kb" && exec setsid "${scope[@]}" "$@") &
 pid=$!
+# setsid made $pid a session leader, so the session id names the whole tree,
+# including descendants that moved to their own process group (e.g. GNU
+# `timeout`). Sample and kill by session, not by group.
+kill_tree() {
+  kill -KILL -- "-$pid" 2>/dev/null
+  pkill -KILL -s "$pid" 2>/dev/null
+}
+# Terminating the guard must not orphan the workload.
+trap 'kill_tree; wait "$pid" 2>/dev/null; echo "$peak" > "$peak_file"; exit 143' TERM INT HUP
 peak=0
 over=0
 while kill -0 "$pid" 2>/dev/null; do
-  rss="$(ps -o rss= -g "$pid" 2>/dev/null | awk '{s += $1} END {print s + 0}')"
+  rss="$(ps -o rss= -s "$pid" 2>/dev/null | awk '{s += $1} END {print s + 0}')"
   (( rss > peak )) && peak=$rss
   if (( rss > cap_kb )); then
     over=1
-    kill -KILL -- "-$pid" 2>/dev/null
+    kill_tree
     break
   fi
-  sleep "$interval"
+  sleep "$interval" & wait $!
 done
 wait "$pid"
 rc=$?
+kill_tree
 echo "$peak" > "$peak_file"
 if (( over )); then
   echo "memguard: process group RSS $((peak / 1024)) MiB exceeded cap $((cap_kb / 1024)) MiB; killed (shrink the bound)" >&2
+  exit 125
+fi
+# A SIGKILL'd workload inside the scope is the cgroup MemoryMax OOM kill (the
+# guard itself only kills on `over`): report it as the same memory failure.
+if (( ${#scope[@]} > 0 && rc == 137 )); then
+  echo "memguard: workload OOM-killed by the aggregate cgroup limit $((hard_kb / 1024)) MiB (cap $((cap_kb / 1024)) MiB, sampled peak $((peak / 1024)) MiB); shrink the bound" >&2
   exit 125
 fi
 exit "$rc"
