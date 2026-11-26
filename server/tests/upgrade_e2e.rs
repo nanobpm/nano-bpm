@@ -451,9 +451,41 @@ fn raft_items(data: &Path, partition: u64) -> Vec<LoggedItem> {
 /// Once no old member remains, every member's log must carry the SAME
 /// `digest_cutover` batch at the SAME index per partition: that is what makes
 /// the replicas' digest chains comparable, so `assert_no_divergence` is
-/// proven active rather than passing vacuously.
-fn assert_digest_cutover_agreed(c: &Cluster) {
+/// proven active rather than passing vacuously. A cutover can already land in
+/// the all-old phase (v0.13.0 supports it), so additionally every member must
+/// hold a post-`barrier[p]` (post-upgrade) batch carrying a `digest` claim, and
+/// every member's claim at each such index must agree — proving the ledger
+/// actually checked post-upgrade traffic on every partition and member.
+fn assert_digest_cutover_agreed(c: &Cluster, barrier: &[u64]) {
     for p in 0..PARTITIONS {
+        let after = barrier[p as usize];
+        let claims: Vec<std::collections::BTreeMap<u64, serde_json::Value>> = c
+            .members
+            .iter()
+            .map(|m| {
+                raft_batches(&m.data, p)
+                    .into_iter()
+                    .filter(|(i, b)| *i > after && !b["digest"].is_null())
+                    .map(|(i, b)| (i, b["digest"].clone()))
+                    .collect()
+            })
+            .collect();
+        for (id, mine) in claims.iter().enumerate() {
+            assert!(
+                !mine.is_empty(),
+                "partition {p}: node {id} logged no post-upgrade digest claim (divergence check vacuous)"
+            );
+            for (other, theirs) in claims.iter().enumerate() {
+                for (i, d) in mine {
+                    if let Some(t) = theirs.get(i) {
+                        assert_eq!(
+                            d, t,
+                            "partition {p}: digest claims of nodes {id} and {other} differ at index {i}"
+                        );
+                    }
+                }
+            }
+        }
         let cutovers: Vec<Option<(u64, serde_json::Value)>> = c
             .members
             .iter()
@@ -599,7 +631,7 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     keys.extend(create_instances(&c, 0, 6));
     assert_visible_everywhere(&mut c, &keys);
     c.assert_no_divergence("after the latch");
-    assert_digest_cutover_agreed(&c);
+    assert_digest_cutover_agreed(&c, &barrier);
 
     // ---- Phase 3: recovery AFTER the latch.
     c.kill(1);
