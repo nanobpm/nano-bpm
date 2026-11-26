@@ -37,20 +37,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The single source of the harness list is ALL_HARNESSES in
+  # formal/kani/check.sh; the matrix and the failure report both derive it.
+  harnesses:
+    name: kani (list harnesses)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: list
+        run: |
+          list="$(formal/kani/check.sh --list | jq -Rnc '[inputs | select(length > 0)]')"
+          [[ "$(jq length <<<"$list")" -gt 0 ]] || { echo "::error::no Kani harnesses listed"; exit 1; }
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
   kani:
     name: kani (${{ matrix.harness }})
+    needs: harnesses
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         # One leg per harness, so each is timed and measured on its own and one
-        # harness's memory/time cannot starve another. Keep in sync with
-        # ALL_HARNESSES in formal/kani/check.sh (it rejects unknown names).
-        harness:
-          - flow_arrivals_preserve_join_invariant
-          - job_index_resync_keeps_lockstep
-          - parallel_join_fires_only_when_every_flow_taken
+        # harness's memory/time cannot starve another.
+        harness: ${{ fromJSON(needs.harnesses.outputs.list) }}
     steps:
       - uses: actions/checkout@v5
       - name: Resolve pinned Kani version
@@ -110,8 +123,8 @@ jobs:
   # leg uploads no outcome record and is filed as `timeout-or-lost`.
   report:
     name: kani (report failures)
-    needs: kani
-    if: always() && github.event_name != 'pull_request' && needs.kani.result != 'success'
+    needs: [harnesses, kani]
+    if: always() && github.event_name != 'pull_request' && (needs.harnesses.result != 'success' || needs.kani.result != 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -129,12 +142,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # Keep in sync with the kani job's matrix.
-          HARNESSES: >-
-            flow_arrivals_preserve_join_invariant
-            job_index_resync_keeps_lockstep
-            parallel_join_fires_only_when_every_flow_taken
+          HARNESSES_JSON: ${{ needs.harnesses.outputs.list }}
         run: |
+          # Fail closed: if the harness list itself could not be derived, file
+          # that as a failure rather than reporting nothing.
+          HARNESSES="$(jq -r '.[]' <<<"${HARNESSES_JSON:-[]}" 2>/dev/null || true)"
+          [[ -n "$HARNESSES" ]] || HARNESSES="harness-list-unavailable"
           for h in $HARNESSES; do
             rec="$RUNNER_TEMP/outcomes/kani-outcome-$h/record"
             if [[ -s "$rec" ]]; then
@@ -146,6 +159,7 @@ jobs:
             harness="${harness:-$h}"; detail="${detail:-unknown}"
             sig="$(printf '%s %s %s' "$class" "$harness" "$detail" | sha256sum | cut -c1-12)"
             marker="<!-- kani-signature:${sig} -->"
+            # shellcheck disable=SC2016 # backticks are literal Markdown
             body="$(printf '%s\n\nNightly Kani harness `%s` failed: **%s** (`%s`).\n\nRun: %s\n\nRepro: `formal/kani/check.sh %s` (formal/kani/README.md). A harness that fails intermittently is a defect in its bound or in the code, not a flaky test (#1994).\n' \
               "$marker" "$harness" "$class" "$detail" "$RUN_URL" "$harness")"
             existing="$(gh issue list --state open --search 'kani in:title' --limit 1000 --json number,body \

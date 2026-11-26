@@ -40,6 +40,12 @@ ALL_HARNESSES=(
   job_index_resync_keeps_lockstep
   parallel_join_fires_only_when_every_flow_taken
 )
+# `--list` prints the canonical harness list (one per line) and exits; the
+# nightly workflow derives its matrix and failure report from it.
+if [[ "${1:-}" == --list ]]; then
+  printf '%s\n' "${ALL_HARNESSES[@]}"
+  exit 0
+fi
 if [[ $# -gt 0 ]]; then
   for h in "$@"; do
     [[ " ${ALL_HARNESSES[*]} " == *" $h "* ]] || { echo "unknown harness: $h" >&2; exit 2; }
