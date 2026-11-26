@@ -9068,3 +9068,44 @@ fn inclusive_join_doomed_path_uses_the_first_due_boundary_timer() {
     assert_eq!(join_fire_count(&fired, "join"), 1, "{fired:#?}");
     assert!(engine.is_completed(instance_key));
 }
+
+/// #1989 review: a NON-interrupting boundary `b1` due before the interrupting
+/// `b2` of the same activity still fires (queue order) and spawns its token
+/// before `b2` tears `t` down, so `t`'s doomed path must keep `b1` as a
+/// source. `w` and `b1` both reach the join, `b2` leads elsewhere: the join
+/// must synchronize `w` with `b1` and fire once, not once per arrival.
+#[test]
+fn inclusive_join_doomed_path_keeps_prior_non_interrupting_boundaries() {
+    let def = ProcessBuilder::new("inc-doomed-mixed")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .timer_intermediate_catch_event("w", 5_000)
+        .intermediate_throw_event("pre")
+        .service_task("t", "jt")
+        .non_interrupting_timer_boundary_event("b1", "t", 5_000)
+        .timer_boundary_event("b2", "t", 5_000)
+        .inclusive_gateway("join")
+        .end_event("e")
+        .end_event("e2")
+        .end_event("e3")
+        .connect("s", "fork")
+        .connect("fork", "w")
+        .connect("fork", "pre")
+        .connect("pre", "t")
+        .connect("w", "join")
+        .connect("b1", "join")
+        .connect("b2", "e2")
+        .connect("t", "e3")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("inc-doomed-mixed"), 0)
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let fired = engine.trigger_timers(5_000);
+    assert_eq!(join_fire_count(&fired, "join"), 1, "{fired:#?}");
+    assert!(engine.is_completed(instance_key));
+}

@@ -18248,7 +18248,10 @@ impl Engine {
             .active
             .iter()
             .filter(|(eik, id)| id.as_str() != join && self.scope_of(instance_key, **eik) == scope)
-            .map(|(eik, id)| doomed.get(eik).copied().unwrap_or(id.as_str()));
+            .flat_map(|(eik, id)| match doomed.get(eik) {
+                Some(sources) => sources.clone(),
+                None => vec![id.as_str()],
+            });
         let in_transit = pending.iter().filter_map(|step| match step {
             Step::Activate {
                 instance_key: key,
@@ -18268,27 +18271,44 @@ impl Engine {
 
     /// The activities of `instance_key` an interrupting boundary timer still
     /// due in the current `TriggerTimers` batch will tear down, each mapped to
-    /// the boundary event its token continues from (#1989).
-    fn doomed_by_due_boundary_timers(&self, instance_key: Key) -> BTreeMap<Key, &str> {
-        self.pending_timer_fires
+    /// the boundary events its tokens continue from (#1989): the non-interrupting
+    /// boundaries due before the first due interrupting one (queue order; they
+    /// fire and spawn a token first), then that interrupting boundary. Later
+    /// boundaries of the activity are cancelled by it and never fire.
+    fn doomed_by_due_boundary_timers(&self, instance_key: Key) -> BTreeMap<Key, Vec<&str>> {
+        let mut prior: BTreeMap<Key, Vec<&str>> = BTreeMap::new();
+        let mut doomed: BTreeMap<Key, Vec<&str>> = BTreeMap::new();
+        let due = self
+            .pending_timer_fires
             .iter()
             .filter_map(|fire| match fire {
                 PendingTimerFire::Timer(key) => self.state.timers.get(key),
                 PendingTimerFire::Start(_) => None,
             })
-            .filter(|t| t.instance_key == instance_key && t.state == state::TimerState::Created)
-            .filter_map(|t| match &t.kind {
+            .filter(|t| t.instance_key == instance_key && t.state == state::TimerState::Created);
+        for t in due {
+            let eik = t.element_instance_key;
+            if doomed.contains_key(&eik) {
+                continue;
+            }
+            match &t.kind {
+                state::TimerKind::NonInterruptingBoundary {
+                    boundary_element_id,
+                } => prior
+                    .entry(eik)
+                    .or_default()
+                    .push(boundary_element_id.as_str()),
                 state::TimerKind::InterruptingBoundary {
                     boundary_element_id,
-                } => Some((t.element_instance_key, boundary_element_id.as_str())),
-                _ => None,
-            })
-            // The FIRST due boundary of an activity (queue order) fires and
-            // cancels its siblings, so keep the first, never the last.
-            .fold(BTreeMap::new(), |mut doomed, (eik, boundary)| {
-                doomed.entry(eik).or_insert(boundary);
-                doomed
-            })
+                } => {
+                    let mut sources = prior.remove(&eik).unwrap_or_default();
+                    sources.push(boundary_element_id.as_str());
+                    doomed.insert(eik, sources);
+                }
+                _ => {}
+            }
+        }
+        doomed
     }
 
     /// A join fires: [`Event::ParallelJoinFired`] consumes one token per incoming
