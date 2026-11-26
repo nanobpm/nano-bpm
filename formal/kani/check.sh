@@ -61,7 +61,10 @@ fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
-[[ -n "$mem_total_kb" ]] || { echo "check.sh: cannot read MemTotal; the memory cap needs it" >&2; exit 2; }
+# Linux-only by design: the hard cap needs /proc/meminfo and util-linux setsid
+# (memguard.sh). Fail closed rather than run a harness with no memory cap.
+[[ -n "$mem_total_kb" ]] || { echo "check.sh: cannot read MemTotal from /proc/meminfo; check.sh is Linux-only (the memory cap needs it)" >&2; exit 2; }
+command -v setsid >/dev/null || { echo "check.sh: setsid (util-linux) not found; check.sh is Linux-only (memguard needs it)" >&2; exit 2; }
 cap_kb=$(( mem_total_kb * MAX_RSS_PCT / 100 ))
 if ! cargo kani --version 2>/dev/null | grep -q "$KANI_VERSION"; then
   cargo install --locked kani-verifier --version "$KANI_VERSION"

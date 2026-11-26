@@ -41,6 +41,11 @@ formal/kani/check.sh            # every harness; installs the pinned kani-verifi
 formal/kani/check.sh <harness>  # just that harness
 ```
 
+`check.sh` is **Linux-only**: its hard memory cap (`memguard.sh`) reads
+`/proc/meminfo` and needs util-linux `setsid` and `ps -g`. On other hosts it
+exits 2 rather than run a harness uncapped; use a Linux VM/container (or the
+nightly workflow) there.
+
 ### CI: nightly, non-gating
 
 Kani is **not** a PR gate. `.github/workflows/kani-nightly.yml` runs every
