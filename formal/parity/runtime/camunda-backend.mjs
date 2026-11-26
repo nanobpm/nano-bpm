@@ -100,6 +100,18 @@ function requireOk(res, body, what) {
   }
 }
 
+/**
+ * Whether a create-instance failure is the awaitCompletion deadline (HTTP 504
+ * `DEADLINE_EXCEEDED`) — the instance is still running, not a broken backend.
+ */
+export function isAwaitCompletionTimeout(err) {
+  return (
+    err instanceof CamundaHttpError &&
+    err.status === 504 &&
+    err.body?.title === "DEADLINE_EXCEEDED"
+  );
+}
+
 export class CamundaBackend {
   static id = "camunda";
 
@@ -278,8 +290,9 @@ export class CamundaBackend {
     //     as the first step) has no such barrier: v2 correlation does not buffer,
     //     so a dispatch racing ahead of the subscription is dropped. But then the
     //     instance simply never leaves its catch, the `awaitCompletion` create
-    //     times out (DEFAULT_COMPLETION_TIMEOUT_MS) and THROWS — the run fails
-    //     loudly instead of reporting a bogus match. Adding such a scenario is
+    //     times out (DEFAULT_COMPLETION_TIMEOUT_MS) and is observed as
+    //     `completed: false` (#1988) — a loud differential mismatch against a
+    //     completing nano run, never a bogus match. Adding such a scenario is
     //     gated on wiring the query-API barrier above (#1260 review).
     const handle = { processId, abort: new AbortController(), instanceKeys: new Set() };
     this.#inflight.add(handle);
@@ -491,6 +504,14 @@ export class CamundaBackend {
           continue;
         }
         requireOk(res, text, "correlate message");
+        // Keep the correlated instance's key so a later timeout can still be
+        // verified and `reset()` can cancel it even if no job was activated.
+        try {
+          const k = JSON.parse(text)?.processInstanceKey;
+          if (k != null) handle.instanceKeys.add(String(k));
+        } catch {
+          // A non-JSON 2xx body carries no key; nothing to record.
+        }
         return;
       }
     }
@@ -577,7 +598,56 @@ export class CamundaBackend {
 
   async observe(handle) {
     const obs = emptyObservation();
-    const result = await handle.pending;
+    let result;
+    try {
+      result = await handle.pending;
+    } catch (err) {
+      // An awaitCompletion create that hits its deadline on an instance that is
+      // still ACTIVE (a token correctly parked on a task — e.g. Zeebe
+      // correlating one publish once per process, #1988) is an OBSERVATION, not
+      // a backend error: Camunda reports it as HTTP 504 DEADLINE_EXCEEDED, so
+      // the instance did not complete. Its final variables were never read, so
+      // they are marked `unobserved` and the differential skips them (#1794).
+      // Every other create failure still fails loudly.
+      if (!isAwaitCompletionTimeout(err)) throw err;
+      // The create's deadline started in `start()`, before the steps ran, so a
+      // timeout does NOT prove the instance is still active now: verify its
+      // current state. Without a learned key the instance can be neither
+      // verified nor cancelled by `reset()` — fail loudly rather than leave a
+      // possibly-live instance to contaminate later scenarios.
+      if (handle.instanceKeys.size === 0) {
+        throw new BackendCleanupError(
+          "awaitCompletion create timed out and no process instance key was learned " +
+            "(no job activated): the instance cannot be verified or cancelled",
+          { cause: err },
+        );
+      }
+      obs.unobserved = ["variables"];
+      const states = [];
+      for (const key of handle.instanceKeys) {
+        try {
+          const pi = await this.#json("GET", `/process-instances/${key}`, undefined, "get process instance");
+          states.push(pi?.state);
+        } catch {
+          states.push(undefined);
+        }
+      }
+      if (states.includes("ACTIVE")) {
+        obs.completed = false;
+      } else if (states.every((s) => s === "COMPLETED")) {
+        obs.completed = true;
+      } else {
+        // State unreadable (or terminated): the outcome is inconclusive. An
+        // observation with nothing comparable would let the differential and
+        // checkExpectations report a vacuous pass, so fail loudly instead.
+        throw new Error(
+          `awaitCompletion create timed out and the instance state is inconclusive ` +
+            `(${JSON.stringify(states)}): refusing to report an unverifiable run`,
+          { cause: err },
+        );
+      }
+      return obs;
+    }
     // A successful Camunda v2 awaitCompletion create response IS the completion
     // signal: HTTP 200 carries the result variables but NOT a `processCompleted`
     // field (an await-completion timeout surfaces as an error status, not a 200 +

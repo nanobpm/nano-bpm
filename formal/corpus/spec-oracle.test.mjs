@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { artifactsFor } from "./enumerate.mjs";
+import { artifactsFor, exploreOrders, materialize } from "./enumerate.mjs";
 import {
   referenceMilestones,
   observationMilestones,
@@ -234,4 +234,31 @@ test("event-gateway selections show only through each catch's continuation", () 
   };
   const r = checkSpecOracle(graph, run, wire);
   assert.ok(r.ok, JSON.stringify(r.mismatches));
+});
+
+test("one message publish is ONE correlation per instance in the spec oracle, as Zeebe (#1988, #1793)", () => {
+  // and,xor|0>1d,1>2d,1>2d,2>3n: two tokens park on T1, whose interrupting
+  // message boundary B1 routes to E. Zeebe (MessageCorrelateBehavior) correlates
+  // a publish once per process, so the run "publish B1, then cancel" has ONE
+  // B1->E flow and never completes; Nano's matching trace must conform.
+  const graph = materialize({
+    kinds: ["and", "xor"],
+    edges: [[0, 1, "direct"], [1, 2, "direct"], [1, 2, "direct"], [2, 3, "bmsg"]],
+  });
+  const run = exploreOrders(graph, {}, { cancel: true }).find(
+    (r) => r.steps.length === 2 && r.steps[0].op === "correlateBoundary" && r.steps[1].op === "cancel",
+  );
+  assert.ok(run, "publish-then-cancel run explored");
+  const expected = referenceMilestones(graph, run);
+  assert.equal(expected.completed, false);
+  assert.equal(expected.sequenceFlows["B1->E"], 1);
+  const zeebeLike = {
+    completed: false,
+    sequenceFlows: { ...expected.sequenceFlows },
+    jobsCreated: { ...expected.jobsCreated },
+  };
+  assert.equal(checkSpecOracle(graph, run, zeebeLike).ok, true);
+  // The pre-#1988 every-subscription expectation no longer conforms.
+  const everySub = { ...zeebeLike, completed: true, sequenceFlows: { ...zeebeLike.sequenceFlows, "B1->E": 2 } };
+  assert.equal(checkSpecOracle(graph, run, everySub).ok, false);
 });
