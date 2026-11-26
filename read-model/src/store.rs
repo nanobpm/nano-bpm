@@ -5628,6 +5628,24 @@ struct CorrelationHistory<'a> {
     correlation_key: &'a str,
 }
 
+/// #2037: the message shard never sees the owning instance's migration, so a
+/// retained open wait still names the pre-migration element. The ack carries
+/// the element the engine resolved; re-point the open wait to it. A legacy ack
+/// (`None`) leaves the row untouched.
+fn repoint_open_wait_element(
+    tx: &rusqlite::Transaction<'_>,
+    subscription_key: u64,
+    resolved: Option<&str>,
+) -> rusqlite::Result<()> {
+    if let Some(element_id) = resolved {
+        tx.cexecute(
+            "UPDATE message_subscriptions SET element_id = ?2 WHERE subscription_key = ?1",
+            params![subscription_key as i64, element_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// The single canonical insert of an instance-scoped correlation history row.
 fn insert_correlation_history(
     tx: &rusqlite::Transaction,
@@ -6247,8 +6265,10 @@ fn project_event(
             subscription_key,
             message_key,
             deferred: true,
+            element_id: resolved_element_id,
             ..
         } => {
+            repoint_open_wait_element(tx, *subscription_key, resolved_element_id.as_deref())?;
             tx.cexecute(
                 "DELETE FROM paced_message_correlations \
                  WHERE subscription_key = ?1 AND message_key = ?2",
@@ -6305,7 +6325,9 @@ fn project_event(
                  WHERE subscription_key = ?1 AND message_key = ?2",
                 params![*subscription_key as i64, *message_key as i64],
             )?;
-            if !*accepted {
+            if *accepted {
+                repoint_open_wait_element(tx, *subscription_key, resolved_element_id.as_deref())?;
+            } else {
                 tx.cexecute(
                     "DELETE FROM message_subscriptions WHERE subscription_key = ?1",
                     params![*subscription_key as i64],
@@ -13563,6 +13585,41 @@ mod element_instance_tests {
         let corr = store.correlated_message_subscriptions();
         assert_eq!(corr.len(), 1);
         assert_eq!(corr[0].element_id, "await-v2");
+    }
+
+    /// #2037 (Copilot r4706477790): a persistent subscription's open wait is
+    /// re-pointed to the ack's resolved (post-migration) element, on both the
+    /// accepted and the deferred arm; a legacy ack leaves it unchanged.
+    #[test]
+    fn paced_ack_repoints_the_retained_open_wait_element() {
+        for (deferred, resolved, want) in [
+            (false, Some("await-v2"), "await-v2"),
+            (true, Some("await-v2"), "await-v2"),
+            (false, None, "await"),
+            (true, None, "await"),
+        ] {
+            let store = ReadStore::open(None).unwrap();
+            let mut ack = paced_ack(3401, 51, true, !deferred);
+            if let Event::MessageCorrelationAcknowledged {
+                element_id,
+                deferred: d,
+                ..
+            } = &mut ack
+            {
+                *element_id = resolved.map(str::to_string);
+                *d = deferred;
+            }
+            store
+                .export(&[&deploy(), &created(), &paced_sub_created(3401)])
+                .unwrap();
+            store.export(&[&paced_delivery(3401, 51), &ack]).unwrap();
+            let subs = store.message_subscriptions();
+            assert_eq!(subs.len(), 1, "deferred={deferred}");
+            assert_eq!(
+                subs[0].element_id, want,
+                "deferred={deferred} resolved={resolved:?}"
+            );
+        }
     }
 
     /// #1949 (Copilot r4701849028): a permanently rejected one-shot delivery
