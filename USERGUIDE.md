@@ -665,6 +665,29 @@ A few rules of thumb if you configure topology yourself:
 > switching tiers on an existing data directory is unsupported. Start each
 > reconfigured cluster from a fresh data directory.
 
+### Rolling upgrades and capability latches
+
+You can upgrade a Raft cluster one member at a time. A new behaviour that would
+make replicas disagree (for example ack-paced cross-partition message delivery,
+`message-correlation-ack-v1`) stays off while any member still runs an older
+binary. Once every member advertises the capability, the leader turns it on and
+each partition records a **latch** in its journal.
+
+Latches are **one-way**:
+
+- After the latch, the cluster refuses to admit an older binary as a member. The
+  join is rejected with `incompatible peer binary: the cluster's replicated state
+  requires feature "<capability>"`.
+- An older binary started on post-latch data refuses to start (`cannot replay` …
+  `fail-closed`). It does not run the data with the old semantics.
+- So a **rollback after the latch means restoring a backup taken before the
+  latch** (stop the cluster, restore every member's `NANOBPMN_DATA_DIR`, start
+  the older binary). Take a backup before you begin a rolling upgrade.
+
+The mixed-binary upgrade harness (`scripts/upgrade-harness.sh run <dir>`, nightly
+workflow `upgrade-harness-nightly.yml`) checks this contract with a real 3-node
+cluster that mixes the previous release and the current build.
+
 ## Tune durability and performance
 
 Single-node defaults are tuned for correctness and need no thought: one partition,
