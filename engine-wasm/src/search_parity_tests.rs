@@ -908,7 +908,10 @@ fn core_searches_match_the_server_for_every_spec_operator_sort_and_page() {
 
 const JOB_XML: &str = r#"
   <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+                    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                    xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                    xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                    xmlns:di="http://www.omg.org/spec/DD/20100524/DI">
     <bpmn:process id="charge-flow">
       <bpmn:startEvent id="s" />
       <bpmn:serviceTask id="charge">
@@ -918,6 +921,15 @@ const JOB_XML: &str = r#"
       <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="charge" />
       <bpmn:sequenceFlow id="b" sourceRef="charge" targetRef="e" />
     </bpmn:process>
+    <bpmndi:BPMNDiagram id="d">
+      <bpmndi:BPMNPlane id="p" bpmnElement="charge-flow">
+        <bpmndi:BPMNShape id="s_di" bpmnElement="s"><dc:Bounds x="100" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="charge_di" bpmnElement="charge"><dc:Bounds x="190" y="78" width="100" height="80" /></bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="e_di" bpmnElement="e"><dc:Bounds x="350" y="100" width="36" height="36" /></bpmndi:BPMNShape>
+        <bpmndi:BPMNEdge id="a_di" bpmnElement="a"><di:waypoint x="136" y="118" /><di:waypoint x="190" y="118" /></bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="b_di" bpmnElement="b"><di:waypoint x="290" y="118" /><di:waypoint x="350" y="118" /></bpmndi:BPMNEdge>
+      </bpmndi:BPMNPlane>
+    </bpmndi:BPMNDiagram>
   </bpmn:definitions>"#;
 
 /// Three service-task instances created at different instants whose jobs are
