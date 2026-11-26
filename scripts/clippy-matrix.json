@@ -286,6 +286,20 @@
       "count": 2,
       "reason": "cfg_attr(expect(dead_code)) on the proven `join_ready` composition and `distinct_taken`: the items themselves are linted by every engine-core entry; only the expect attribute is conditional, and the predicate is unknown to the evaluator solely because of the cargo-kani-only `kani` atom.",
       "trackedIn": 2010
+    },
+    {
+      "file": "engine-core/src/engine/token_flow.rs",
+      "pred": "kani",
+      "count": 2,
+      "reason": "gates the TokenFlow Kani harnesses (engine/token_flow/kani_proofs.rs) and the kani::any() oracle stand-in, which reference the `kani` crate that only `cargo kani` injects; plain cargo clippy cannot compile them. They are compiled and checked by the non-gating nightly `.github/workflows/kani-nightly.yml` (formal/kani/check.sh).",
+      "trackedIn": 1960
+    },
+    {
+      "file": "engine-core/src/engine/token_flow.rs",
+      "pred": "not(kani)",
+      "count": 3,
+      "reason": "the concrete has_active_path oracle (LIVE, live_sources, active_path) that Kani replaces with a nondeterministic stand-in: the items are compiled and linted by every engine-core entry (kani is never set under plain cargo); the predicate is unknown to the evaluator solely because of the cargo-kani-only `kani` atom.",
+      "trackedIn": 1960
     }
   ]
 }
