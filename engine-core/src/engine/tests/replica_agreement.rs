@@ -393,3 +393,69 @@ fn snapshot_plus_tail_seeds_the_next_command_like_the_live_engine() {
     assert_eq!(expected.len(), 1);
     assert_eq!(got, expected, "snapshot+tail recovery seeded differently");
 }
+
+/// An exclusive gateway whose LAST-declared flow (evaluated first, in
+/// execution order) holds, and whose other flow's condition is `skipped`. Task
+/// `A`'s input mapping then draws from the command's random stream.
+fn lazy_routing_xml(skipped: &str) -> String {
+    format!(
+        r#"
+  <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+    <bpmn:process id="lazy">
+      <bpmn:startEvent id="s" />
+      <bpmn:exclusiveGateway id="gw" />
+      <bpmn:serviceTask id="A">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="a" />
+          <zeebe:ioMapping>
+            <zeebe:input source="=random number()" target="r" />
+          </zeebe:ioMapping>
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="C" />
+      <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="gw" />
+      <bpmn:sequenceFlow id="toC" sourceRef="gw" targetRef="C">
+        <bpmn:conditionExpression>{skipped}</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="toA" sourceRef="gw" targetRef="A">
+        <bpmn:conditionExpression>=true</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+    </bpmn:process>
+  </bpmn:definitions>"#
+    )
+}
+
+/// Task `A`'s drawn `r`, for a fresh engine running `lazy_routing_xml(skipped)`.
+fn lazy_routing_draw(skipped: &str) -> Value {
+    let def = crate::bpmn::parse_bpmn(&lazy_routing_xml(skipped))
+        .unwrap()
+        .remove(0);
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(def), T0)
+        .unwrap();
+    let events = engine
+        .apply_command_at(Command::create_instance("lazy"), T0)
+        .unwrap();
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::ScopedVariablesUpdated { variables, .. } => variables.get("r").cloned(),
+            _ => None,
+        })
+        .expect("the gateway routed to A, whose input mapping drew r")
+}
+
+/// #2051 review: split-gateway routing must keep the lazy scan's stopping
+/// points (exclusive: the first holding condition or error; inclusive: the
+/// first error). A condition the scan never reaches must not draw from the
+/// shared per-command random stream, or it perturbs every later draw.
+#[test]
+fn exclusive_routing_does_not_evaluate_conditions_past_the_first_match() {
+    assert_eq!(
+        lazy_routing_draw("=random number() &lt; 2"),
+        lazy_routing_draw("=false"),
+        "a condition after the first holding one advanced the random stream"
+    );
+}

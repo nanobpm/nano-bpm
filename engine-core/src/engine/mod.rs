@@ -28,6 +28,7 @@ mod debug;
 mod event_subprocess;
 mod expression;
 mod flow_scope;
+pub(crate) mod gateway_route;
 pub(crate) mod join_guard;
 mod memory;
 mod migration;
@@ -18318,36 +18319,22 @@ impl Engine {
                 &owned
             }
         };
-        let mut default_flow = None;
-        let mut unconditional = None;
-        for (index, flow) in self.outgoing_in_execution_order(instance_key, element_id) {
-            // The explicit `default` flow is a fallback only: it is never taken
-            // by position, but kept aside in case no conditional flow matches.
-            if flow.is_default {
-                default_flow = Some(index);
-                continue;
-            }
-            match &flow.condition {
-                // Iterating in reverse document order, the last one kept is
-                // the first declared.
-                None => unconditional = Some(index),
-                Some(condition) => match condition.eval(variables) {
-                    Ok(true) => return Ok(index),
-                    Ok(false) => continue,
-                    Err(err) => {
-                        return Err(RoutingFailure::condition(
-                            "exclusive",
-                            element_id,
-                            &condition.expression,
-                            &err.0,
-                        ));
-                    }
-                },
-            }
+        let flows = self.outgoing_in_execution_order(instance_key, element_id);
+        let (guards, errors) = gather_route_guards(&flows, variables, true);
+        match gateway_route::select_exclusive(&guards) {
+            gateway_route::Route::Take(pos) => flows
+                .get(pos)
+                .map(|(index, _)| *index)
+                .ok_or_else(|| RoutingFailure::no_match("exclusive", element_id)),
+            gateway_route::Route::NoMatch => Err(RoutingFailure::no_match("exclusive", element_id)),
+            gateway_route::Route::ConditionError(pos) => Err(route_condition_failure(
+                "exclusive",
+                element_id,
+                &flows,
+                &errors,
+                pos,
+            )),
         }
-        unconditional
-            .or(default_flow)
-            .ok_or_else(|| RoutingFailure::no_match("exclusive", element_id))
     }
 
     /// The outgoing-flow selection a split gateway completion must take: the
@@ -18501,38 +18488,25 @@ impl Engine {
                 &owned
             }
         };
-        let mut default_flow = None;
-        let mut selected = Vec::new();
-        // Execution order (reverse document order): the order Zeebe evaluates
-        // the conditions in and takes the selected flows in.
-        for (index, flow) in self.outgoing_in_execution_order(instance_key, element_id) {
-            if flow.is_default {
-                default_flow = Some(index);
-                continue;
-            }
-            match &flow.condition {
-                None => selected.push(index),
-                Some(condition) => match condition.eval(variables) {
-                    Ok(true) => selected.push(index),
-                    Ok(false) => continue,
-                    Err(err) => {
-                        return Err(RoutingFailure::condition(
-                            "inclusive",
-                            element_id,
-                            &condition.expression,
-                            &err.0,
-                        ));
-                    }
-                },
-            }
+        let flows = self.outgoing_in_execution_order(instance_key, element_id);
+        let (guards, errors) = gather_route_guards(&flows, variables, false);
+        let mut mask = vec![false; guards.len()];
+        match gateway_route::select_inclusive(&guards, &mut mask) {
+            gateway_route::Route::Take(_) => Ok(flows
+                .iter()
+                .zip(mask)
+                .filter(|(_, taken)| *taken)
+                .map(|((index, _), _)| *index)
+                .collect()),
+            gateway_route::Route::NoMatch => Err(RoutingFailure::no_match("inclusive", element_id)),
+            gateway_route::Route::ConditionError(pos) => Err(route_condition_failure(
+                "inclusive",
+                element_id,
+                &flows,
+                &errors,
+                pos,
+            )),
         }
-        if selected.is_empty() {
-            match default_flow {
-                Some(d) => selected.push(d),
-                None => return Err(RoutingFailure::no_match("inclusive", element_id)),
-            }
-        }
-        Ok(selected)
     }
 
     /// Completes an inclusive gateway re-driven through `Step::Complete`: a
@@ -22083,4 +22057,67 @@ fn drain_scope_subscriptions(
     }
     let open = subs.len() - drained.len();
     (drained, open)
+}
+
+/// The gathering half of split-gateway routing (#1983): evaluates every
+/// outgoing flow's condition (in execution order) into the dense
+/// [`gateway_route::Guard`] view the pure kernel decides over. Returns the
+/// guards and each position's evaluation error message (if any).
+///
+/// Conditions are NOT side-effect free: FEEL's `random number()` / `uuid()`
+/// advance the command's shared random stream. So the scan keeps the lazy
+/// routing loop's stopping points and returns only the evaluated prefix: it
+/// stops after the first condition error, and — when `stop_on_holds`
+/// (exclusive routing) — after the first holding condition. Neither kernel's
+/// decision depends on guards past those points (a hold / error wins outright),
+/// so deciding over the prefix is exact.
+fn gather_route_guards(
+    flows: &[(usize, crate::model::SequenceFlow)],
+    variables: &BTreeMap<String, Value>,
+    stop_on_holds: bool,
+) -> (Vec<gateway_route::Guard>, Vec<Option<String>>) {
+    let mut guards = Vec::with_capacity(flows.len());
+    let mut errors = Vec::with_capacity(flows.len());
+    for (_, flow) in flows {
+        let (guard, error) = if flow.is_default {
+            (gateway_route::Guard::Default, None)
+        } else {
+            match &flow.condition {
+                None => (gateway_route::Guard::Unconditional, None),
+                Some(condition) => match condition.eval(variables) {
+                    Ok(true) => (gateway_route::Guard::Holds, None),
+                    Ok(false) => (gateway_route::Guard::Fails, None),
+                    Err(err) => (gateway_route::Guard::Errors, Some(err.0)),
+                },
+            }
+        };
+        let stop = match guard {
+            gateway_route::Guard::Errors => true,
+            gateway_route::Guard::Holds => stop_on_holds,
+            _ => false,
+        };
+        guards.push(guard);
+        errors.push(error);
+        if stop {
+            break;
+        }
+    }
+    (guards, errors)
+}
+
+/// The [`RoutingFailure`] for the condition at kernel position `pos`.
+fn route_condition_failure(
+    gateway: &str,
+    element_id: &str,
+    flows: &[(usize, crate::model::SequenceFlow)],
+    errors: &[Option<String>],
+    pos: usize,
+) -> RoutingFailure {
+    let expression = flows
+        .get(pos)
+        .and_then(|(_, f)| f.condition.as_ref())
+        .map(|c| c.expression.as_str())
+        .unwrap_or_default();
+    let err = errors.get(pos).cloned().flatten().unwrap_or_default();
+    RoutingFailure::condition(gateway, element_id, expression, &err)
 }
