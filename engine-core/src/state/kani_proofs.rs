@@ -5,7 +5,7 @@
 //! Compiled only under `cargo kani` (`cfg(kani)`). See `formal/kani/README.md`
 //! for what is proven, the bounds and how to run them.
 
-use super::kani_model::{BoundedArrivals, JobIndexes, assert_job_index_lockstep};
+use super::kani_model::{assert_job_index_lockstep, BoundedArrivals, JobIndexes};
 use super::*;
 use crate::model::IncomingFlow;
 
