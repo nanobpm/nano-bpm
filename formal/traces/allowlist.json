@@ -8,18 +8,6 @@
       "nanoTrace": "f536758fff754e45"
     },
     {
-      "scenario": "g-2",
-      "issue": "#1534",
-      "reason": "multi-instance child output mapping not applied to the process scope (call-activity input locality fixed by #1536)",
-      "nanoTrace": "99d19b69dfb04a3b"
-    },
-    {
-      "scenario": "g-5",
-      "issue": "#1534",
-      "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "c62210578eaa400b"
-    },
-    {
       "scenario": "g-6",
       "issue": "#1536",
       "reason": "call-activity input mapping creates no local variable on the call activity scope",
@@ -33,9 +21,9 @@
     },
     {
       "scenario": "g-30",
-      "issue": "#1534",
-      "reason": "MI outputCollection not body-local + #1518 outputElement nil seed",
-      "nanoTrace": "652eaf66bc039ec2"
+      "issue": "#1999",
+      "reason": "MI body re-applies the activity's output mapping at body completion (extra o23 UPDATED)",
+      "nanoTrace": "fd5fe27ff2a2a694"
     }
   ]
 }
