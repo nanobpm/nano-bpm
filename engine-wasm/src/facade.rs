@@ -982,9 +982,21 @@ mod facade_guard_tests {
                 }
                 let mut outer = Vec::new();
                 let mut k = i;
-                while k > 0 && lines[k - 1].starts_with("#[") {
+                // Walk up over the outer attributes, skipping doc comments,
+                // plain comments and blank lines interleaved with them; stop
+                // only at real code.
+                while k > 0 {
+                    let l = lines[k - 1].trim();
+                    if l.starts_with("#[") {
+                        outer.push(l);
+                    } else if !(l.is_empty()
+                        || l.starts_with("//")
+                        || l.starts_with("/*")
+                        || l.starts_with('*'))
+                    {
+                        break;
+                    }
                     k -= 1;
-                    outer.push(lines[k]);
                 }
                 if !outer.iter().any(|a| a.starts_with("#[wasm_bindgen")) {
                     i += 1;
@@ -1052,8 +1064,16 @@ mod facade_guard_tests {
             "#[wasm_bindgen]\n#[cfg(feature = \"read-model\")]\nimpl TestEngine {\n    pub fn sneaky(&self) {\n    }\n}\n",
             "#[cfg(feature = \"read-model\")]\n#[wasm_bindgen]\nimpl TestEngine {\n    pub fn sneaky(&self) {\n    }\n}\n",
             "#[wasm_bindgen]\n#[cfg(not(feature = \"read-model\"))]\n#[allow(dead_code)]\nimpl TestEngine {\n    pub fn sneaky(&self) {\n    }\n}\n",
+            "#[wasm_bindgen]\n/// Lean-only methods\nimpl TestEngine {\n    pub fn sneaky(&self) {\n    }\n}\n",
+            "#[wasm_bindgen]\n\n// note\n#[cfg(not(feature = \"read-model\"))]\n/** doc */\nimpl TestEngine {\n    pub fn sneaky(&self) {\n    }\n}\n",
         ];
-        let builds = [Build::ReadModel, Build::ReadModel, Build::Lean];
+        let builds = [
+            Build::ReadModel,
+            Build::ReadModel,
+            Build::Lean,
+            Build::Both,
+            Build::Lean,
+        ];
         for (src, build) in fixtures.iter().zip(builds) {
             let e = exports_in("lib.rs", src);
             assert_eq!(e.len(), 1, "missed export in:\n{src}");
