@@ -777,7 +777,7 @@ impl Engine {
                 .collect();
             for catch in new_catches {
                 for event in self
-                    .arm_catch_event(instance_key, eik, &boundary_vars, &catch)
+                    .arm_catch_event(instance_key, eik, &catch_vars, &catch)
                     .map_err(fail)?
                 {
                     if let Some(trigger) = Self::report_of(&event) {

@@ -19010,6 +19010,16 @@ impl Engine {
             } if *key == instance_key && *step_scope == scope && element_id != join => {
                 Some(element_id.as_str())
             }
+            // A gateway-triggered catch (#2004) is in transit too: its gateway
+            // has already completed, so it is the only live path source.
+            Step::ActivateTriggeredCatch {
+                instance_key: key,
+                element_id,
+                scope: step_scope,
+                ..
+            } if *key == instance_key && *step_scope == scope && element_id != join => {
+                Some(element_id.as_str())
+            }
             _ => None,
         });
         // Fast path: no live or in-transit source means nothing can still
