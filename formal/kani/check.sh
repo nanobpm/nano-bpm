@@ -46,6 +46,8 @@ ALL_HARNESSES=(
   inclusive_join_ready_iff_no_active_path
   gateway_route_exclusive_total_and_sound
   gateway_route_inclusive_total_and_sound
+  completion_plan_total_and_sound
+  escalation_plan_total_and_sound
 )
 # `--list` prints the canonical harness list (one per line) and exits; the
 # nightly workflow derives its matrix and failure report from it.
