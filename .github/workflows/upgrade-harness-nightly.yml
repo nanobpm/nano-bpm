@@ -1,0 +1,92 @@
+# Mixed-binary upgrade harness for capability latches (#2052).
+#
+# Runs a real 3-node Raft cluster that mixes the previous release's server
+# binary with this build and checks the latch contract: no latch and no
+# divergence while an old member is present, the latch only after a full
+# rolling upgrade, recovery on both sides of it, and rollback refusal. All
+# logic lives in scripts/upgrade-harness.sh + server/tests/upgrade_e2e.rs, so a
+# run reproduces locally with `scripts/upgrade-harness.sh run <dir>`.
+#
+# NOT a required gate (not in branch protection / .mergify.yml). No retries.
+
+name: Upgrade harness (mixed-binary capability latches, nightly)
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Old release tag (default: newest tag predating the capability)'
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - '.github/workflows/upgrade-harness-nightly.yml'
+      - 'scripts/upgrade-harness.sh'
+      - 'server/tests/upgrade_e2e.rs'
+      - 'server/crates/nano-falcon-protocol/src/cluster_join.rs'
+      - 'server/crates/nano-server-raft/src/**'
+      - 'server/src/main.rs'
+      - 'server/src/falcon.rs'
+      # Latch application, replay and recovery (broad on purpose: a gap
+      # would let a latch/recovery change skip the harness).
+      - 'engine-core/src/engine/**'
+      - 'engine-core/src/state/**'
+      - 'engine-core/src/event.rs'
+      - 'server/crates/nano-server-storage/src/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upgrade-harness-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  upgrade:
+    name: upgrade-harness (previous release <-> HEAD, 3-node raft)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the old release is resolved and built from its tag
+      - name: Build tools
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: REST codegen (Java + uv, also used for the old tag's build)
+        uses: ./.github/actions/rest-codegen
+      - name: Resolve the old release tag
+        id: old
+        run: |
+          tag='${{ github.event.inputs.tag }}'
+          [ -n "$tag" ] || tag=$(scripts/upgrade-harness.sh old-ref)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Cache the old release binary
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/upgrade/bin
+          key: upgrade-harness-old-bin-${{ runner.os }}-${{ steps.old.outputs.tag }}
+      - name: Restore the cached openapi-generator JAR (#1684)
+        uses: ./.github/actions/openapi-generator-cache
+      - name: Generate HEAD's codegen and stub the console
+        run: |
+          make generate
+          mkdir -p console/dist
+          [ -f console/dist/index.html ] || echo stub > console/dist/index.html
+      - name: Run the upgrade scenarios
+        env:
+          NANO_UPGRADE_SCRATCH: ${{ runner.temp }}/upgrade/runs
+        run: scripts/upgrade-harness.sh run "$RUNNER_TEMP/upgrade" "${{ steps.old.outputs.tag }}"
+      - name: Upload node logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-harness-logs
+          path: ${{ runner.temp }}/upgrade/runs/**/*.log
+          if-no-files-found: ignore
