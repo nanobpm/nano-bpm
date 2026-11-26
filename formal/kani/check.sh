@@ -17,9 +17,11 @@ fi
 # (so ~5 min of verification): one that cannot prove within it must shrink its
 # input domain, not be given more time (README "Running").
 HARNESS_TIMEOUT="${KANI_HARNESS_TIMEOUT:-420}"
-# Memory headroom (#1994): a harness whose peak RSS exceeds this percentage of
-# the host's MemTotal fails even if it proved, so a bound that only fits
-# sometimes is caught before the OOM killer makes it intermittent.
+# Memory headroom (#1994, #2040): this percentage of the host's MemTotal is a
+# HARD cap enforced while the harness runs (memguard.sh kills the process
+# group on crossing it), and also re-checked against the exact post-exit peak,
+# so a bound that only fits sometimes fails cleanly every time instead of
+# being OOM-killed with the runner.
 MAX_RSS_PCT="${KANI_MAX_RSS_PCT:-60}"
 # When set, the first failure is recorded there as `<class> <harness> <detail>`
 # (class: timeout | verification | vacuous-cover | memory | error) so the
@@ -57,7 +59,15 @@ else
   HARNESSES=("${ALL_HARNESSES[@]}")
 fi
 
-root="$(cd "$(dirname "$0")/../.." && pwd)"
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=formal/kani/oom.sh
+source "$here/oom.sh"
+root="$(cd "$here/../.." && pwd)"
+# Linux-only by design: the hard cap needs /proc/meminfo and util-linux setsid
+# (memguard.sh). Fail closed rather than run a harness with no memory cap.
+[[ -n "$mem_total_kb" ]] || { echo "check.sh: cannot read MemTotal from /proc/meminfo; check.sh is Linux-only (the memory cap needs it)" >&2; exit 2; }
+command -v setsid >/dev/null || { echo "check.sh: setsid (util-linux) not found; check.sh is Linux-only (memguard needs it)" >&2; exit 2; }
+cap_kb=$(( mem_total_kb * MAX_RSS_PCT / 100 ))
 if ! cargo kani --version 2>/dev/null | grep -q "$KANI_VERSION"; then
   cargo install --locked kani-verifier --version "$KANI_VERSION"
 fi
@@ -81,7 +91,26 @@ for h in "${HARNESSES[@]}"; do
   timefile="$(mktemp)"
   timer=()
   [[ -x /usr/bin/time ]] && timer=(/usr/bin/time -v -o "$timefile")
-  timeout "$HARNESS_TIMEOUT" "${timer[@]}" cargo kani "${UNWIND_ARGS[@]}" --harness "$h" 2>&1 | tee "$log" || rc=$?
+  # Hard cap (#2040): memguard kills the run the moment its process-group
+  # RSS crosses the cap, so an over-budget bound fails cleanly with a
+  # `memory` record instead of taking the runner down unreported.
+  peakfile="$(mktemp)"
+  "$here/memguard.sh" "$cap_kb" "$peakfile" -- \
+    timeout "$HARNESS_TIMEOUT" "${timer[@]}" cargo kani "${UNWIND_ARGS[@]}" --harness "$h" 2>&1 | tee "$log" || rc=$?
+  sampled_kb="$(cat "$peakfile" 2>/dev/null || echo 0)"
+  rm -f "$peakfile"
+  # A kernel-limit refusal (RLIMIT_DATA -> ENOMEM) exits with the tool's own
+  # status, not 125; its allocator diagnostic makes it a memory failure too.
+  if [[ $rc -ne 0 && $rc -ne 124 && $rc -ne 125 ]] && alloc_oom_in "$log"; then
+    rc=125
+  fi
+  if [[ $rc -eq 125 ]]; then
+    echo "::endgroup::"
+    echo "::error::kani $h killed at peak RSS $((sampled_kb / 1024)) MiB: over the hard cap of ${MAX_RSS_PCT}% of host memory ($((cap_kb / 1024)) MiB); shrink the bound"
+    fail memory "$h" "over-${MAX_RSS_PCT}pct"
+    rm -f "$log" "$timefile"
+    exit 1
+  fi
   echo "::endgroup::"
   elapsed=$(( $(date +%s) - start ))
   grep -E '^(VERIFICATION:|Verification Time:|Complete - )' "$log" || true
@@ -98,6 +127,10 @@ for h in "${HARNESSES[@]}"; do
   rm -f "$log"
   peak_kb="$(sed -n 's/^\s*Maximum resident set size (kbytes): //p' "$timefile")"
   rm -f "$timefile"
+  # GNU time is exact but optional; the memguard sample is always present.
+  if [[ -z "$peak_kb" ]] || (( sampled_kb > peak_kb )); then
+    (( sampled_kb > 0 )) && peak_kb="$sampled_kb"
+  fi
   if [[ -z "$peak_kb" && "$REQUIRE_RSS" == 1 && $rc -eq 0 ]]; then
     echo "::error::kani $h: peak RSS not measured (/usr/bin/time missing)"
     fail error "$h" "no-rss"
