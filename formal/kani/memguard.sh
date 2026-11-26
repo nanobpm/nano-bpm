@@ -8,7 +8,8 @@
 # script exits 125 after printing a `memguard: ... exceeded cap` line, so an
 # over-budget harness fails cleanly *before* the kernel OOM killer takes the
 # runner down (which would leave no cost and no failure record). Otherwise it
-# exits with the command's status. The sampled peak RSS (kB) is written to
+# exits with the command's status (a burst stopped by the kernel limit shows
+# up as the command's own allocation failure, i.e. a non-zero status). The sampled peak RSS (kB) is written to
 # <peak_file> in both cases.
 #
 # The check `KANI_MAX_RSS_PCT` used to do only after exit (via /usr/bin/time)
@@ -22,9 +23,14 @@ peak_file="$2"
 shift 3
 interval="${MEMGUARD_INTERVAL:-1}"
 
+# Kernel-backed limit first: RLIMIT_DATA (heap + private writable mappings,
+# Linux >= 4.7) is set to the cap in the child before it execs, so a burst
+# allocation fails inside the kernel instead of outrunning the 1 s sampler.
+# It is per process (inherited by every child), so the sampler below still
+# enforces the cap on the whole tree and records the peak for reporting.
 # In a non-interactive shell a background child is not a process-group
 # leader, so setsid execs in place: $! is the group id of the whole tree.
-setsid "$@" &
+(ulimit -d "$cap_kb" && exec setsid "$@") &
 pid=$!
 peak=0
 over=0

@@ -9,21 +9,31 @@ here="$(cd "$(dirname "$0")" && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# Grows by 32 MiB every 50 ms up to 4 GiB: far beyond the 256 MiB cap, but
-# slow enough that the 1 s sampler kills it long before host memory runs out.
+# Four processes, each growing by 16 MiB every 100 ms to 192 MiB: every one
+# stays inside the per-process kernel limit (RLIMIT_DATA = cap), but the tree
+# totals ~768 MiB, so only the tree-wide sampler can (and must) stop it.
 hog='import time
 a = []
-for _ in range(128):
-    a.append(bytearray(32 << 20))
-    time.sleep(0.05)'
+for _ in range(12):
+    a.append(bytearray(16 << 20))
+    time.sleep(0.1)
+time.sleep(30)'
+tree="for i in 1 2 3 4; do python3 -c '$hog' & done; wait"
 
 rc=0
-python3 -c "$hog" >/dev/null 2>&1 || true # warm python startup (not measured)
-"$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- python3 -c "$hog" 2>"$tmp/err" || rc=$?
+"$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c "$tree" 2>"$tmp/err" || rc=$?
 [[ $rc -eq 125 ]] || { echo "selftest: oversized workload exited $rc, want 125" >&2; cat "$tmp/err" >&2; exit 1; }
 grep -q 'memguard: .* exceeded cap 256 MiB' "$tmp/err" || { echo "selftest: no cap message" >&2; cat "$tmp/err" >&2; exit 1; }
 peak="$(cat "$tmp/peak")"
 (( peak > 256 * 1024 && peak < 2 * 1024 * 1024 )) || { echo "selftest: implausible peak ${peak} kB" >&2; exit 1; }
+
+# A single burst far beyond the cap must be refused by the kernel limit
+# (RLIMIT_DATA) before it is ever resident: the sampler alone would miss it.
+rc=0
+"$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- python3 -c 'a = bytearray(2 << 30); a[::4096] = b"x" * len(a[::4096])' 2>"$tmp/err" || rc=$?
+[[ $rc -ne 0 ]] || { echo "selftest: 2 GiB burst under a 256 MiB cap succeeded" >&2; exit 1; }
+burst="$(cat "$tmp/peak")"
+(( burst <= 256 * 1024 )) || { echo "selftest: burst reached ${burst} kB, above the cap" >&2; exit 1; }
 
 rc=0
 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c 'exit 7' || rc=$?
