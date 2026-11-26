@@ -30,6 +30,8 @@ on:
       - 'engine-core/src/state/kani_proofs.rs'
       - 'engine-core/src/engine/join_guard.rs'
       - 'engine-core/src/engine/join_guard/kani_proofs.rs'
+      - 'engine-core/src/engine/gateway_route.rs'
+      - 'engine-core/src/engine/gateway_route/kani_proofs.rs'
 
 permissions:
   contents: read
