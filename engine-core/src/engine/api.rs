@@ -144,7 +144,10 @@ impl Engine {
             | Command::SetVariables { .. }
             | Command::CorrelateMessage { .. }
             | Command::TriggerTimers { .. }
-            | Command::BroadcastSignal { .. } => true,
+            | Command::BroadcastSignal { .. }
+            // #2012: the resume re-offer (#1949) can correlate a LOCAL buffered
+            // message, e.g. an interrupting boundary cancelling a soft job.
+            | Command::ResumeInstance { .. } => true,
             Command::DeployProcess(_)
             | Command::DeployResources(_)
             | Command::DeployDecisionRequirements(_)
@@ -173,7 +176,6 @@ impl Engine {
             | Command::ConfirmMessageSubscriptionResume { .. }
             | Command::SettleMessageCorrelationReceipt { .. }
             | Command::SuspendInstance { .. }
-            | Command::ResumeInstance { .. }
             | Command::DispatchStartInstance { .. }
             | Command::CreateAgentInstance { .. }
             | Command::UpdateAgentInstance { .. }
@@ -234,7 +236,8 @@ impl Engine {
             Command::CancelInstance { instance_key, .. }
             | Command::ModifyInstance { instance_key, .. }
             | Command::MigrateInstance { instance_key, .. }
-            | Command::CorrelateMessageSubscription { instance_key, .. } => {
+            | Command::CorrelateMessageSubscription { instance_key, .. }
+            | Command::ResumeInstance { instance_key } => {
                 roots.push(*instance_key);
             }
             Command::ActivateAdHocActivities {

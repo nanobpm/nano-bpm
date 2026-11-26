@@ -2762,26 +2762,41 @@ impl Engine {
             self.plan_command_at(command, now, terminal_deadlines)
                 .map(|(mut log, queue)| {
                     self.run(&mut log, queue);
-                    self.cascade_cancel_children(&mut log, 0);
-                    self.emit_pending_correlation_ack(&mut log);
-                    self.emit_remote_buffered_delivery_activation(&mut log);
-                    self.remote_backlog_scan_pending = false;
-                    // Every engine test exercises the parent -> children index the
-                    // cascade reads (#1827): a write path that bypassed it fails here.
-                    #[cfg(test)]
-                    self.state.assert_children_index_covers_instances();
-                    #[cfg(test)]
-                    self.state.assert_buffered_message_id_index_consistent();
+                    self.finish_drained_command(&mut log);
                     log
                 });
+        self.clear_command_scratch();
+        result
+    }
+
+    /// The post-drain tail of EVERY command, shared by the production path
+    /// and the debugger once a debug run reaches quiescence (#2012): reaping
+    /// orphaned children, flushing the ack an ack-paced delivery owes
+    /// (#1874/#1949) and recording the one-time activation latch. A driver
+    /// that skipped it would advance a paced delivery's token without ever
+    /// acknowledging it — the debug/normal-apply parity contract.
+    fn finish_drained_command(&mut self, log: &mut Vec<Event>) {
+        self.cascade_cancel_children(log, 0);
+        self.emit_pending_correlation_ack(log);
+        self.emit_remote_buffered_delivery_activation(log);
+        self.remote_backlog_scan_pending = false;
+        // Every engine test exercises the parent -> children index the
+        // cascade reads (#1827): a write path that bypassed it fails here.
+        #[cfg(test)]
+        self.state.assert_children_index_covers_instances();
+        #[cfg(test)]
+        self.state.assert_buffered_message_id_index_consistent();
+    }
+
+    /// Drops every per-command scratch field on every exit (success, rejection
+    /// or a finished debug run), so neither a reference nor a deadline stamp
+    /// nor a candidate queue can leak into a later command (#1874).
+    fn clear_command_scratch(&mut self) {
         self.operation_reference = None;
         self.terminal_deadline_stamps.clear();
-        // Per-command scratch must not outlive the command: an idle engine
-        // retains no candidate queues (#1874).
         self.buffer_candidates.clear();
         self.buffer_requeue.clear();
         self.pending_correlation_ack = None;
-        result
     }
 
     /// Translates `command` into the initial `(log, queue)` the fixpoint loop
@@ -8376,6 +8391,14 @@ impl Engine {
     /// without remote delivery nothing was deferred). Ordered by
     /// subscription key.
     fn reoffer_buffered_after_resume(&mut self, log: &mut Vec<Event>, instance_key: Key) {
+        // Rolling-upgrade gate (#2012): BOTH re-offers are new in #1949, so a
+        // pre-#1949 replica resuming the same instance only emits
+        // `ProcessInstanceResumed`. Gating only the remote handshake would let
+        // an upgraded replica consume a LOCAL backlog its legacy peer leaves
+        // buffered — replicas diverging on the same committed command.
+        if !self.remote_buffered_delivery_gate() {
+            return;
+        }
         let mut remote = Vec::new();
         for s in self.state.message_subscriptions.values() {
             if s.instance_key != instance_key {
@@ -8384,11 +8407,8 @@ impl Engine {
             match s.state {
                 state::MessageSubscriptionState::Open => self.buffer_requeue.push_back(s.key),
                 state::MessageSubscriptionState::Opening
-                    if self.remote_buffered_delivery_gate()
-                        && state::subscription_partition(
-                            &s.correlation_key,
-                            self.num_partitions,
-                        ) != self.partition_id =>
+                    if state::subscription_partition(&s.correlation_key, self.num_partitions)
+                        != self.partition_id =>
                 {
                     remote.push(s.key);
                 }
