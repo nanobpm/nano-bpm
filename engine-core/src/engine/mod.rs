@@ -38,6 +38,8 @@ mod migration;
 mod modify;
 mod resolve;
 pub(crate) mod timer_cycle;
+#[cfg(any(test, kani))]
+mod token_flow;
 pub use debug::{BreakCondition, DebugSession};
 use resolve::{rearm_repetitions, JobProps, ResolvedUserTask};
 
