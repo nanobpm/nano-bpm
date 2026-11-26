@@ -37,7 +37,8 @@ formal/
 │   ├── feel-diff.sh          # build Lean, generate a corpus, check Rust against it
 │   ├── Feel/                 # FEEL reference semantics + generator (this slice, #1230)
 │   ├── Replay/               # replay determinism (#1231) — adds files here only
-│   └── Roundtrip/            # processos IR ⇄ BPMN round-trip (#1232) — adds files here only
+│   ├── Roundtrip/            # processos IR ⇄ BPMN round-trip (#1232) — adds files here only
+│   └── Refinement/           # Nano join guard ⇔ Zeebe (Aeneas spike, #1961) — see SPIKE.md
 └── parity/                   # Zeebe parity coverage matrix (see below)
     ├── zeebe-pin.json        # the Zeebe commit the matrix is derived from
     ├── fetch-zeebe.sh        # sparse-fetches the pinned sources
