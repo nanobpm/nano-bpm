@@ -18320,7 +18320,7 @@ impl Engine {
             }
         };
         let flows = self.outgoing_in_execution_order(instance_key, element_id);
-        let (guards, errors) = gather_route_guards(&flows, variables);
+        let (guards, errors) = gather_route_guards(&flows, variables, true);
         match gateway_route::select_exclusive(&guards) {
             gateway_route::Route::Take(pos) => flows
                 .get(pos)
@@ -18489,7 +18489,7 @@ impl Engine {
             }
         };
         let flows = self.outgoing_in_execution_order(instance_key, element_id);
-        let (guards, errors) = gather_route_guards(&flows, variables);
+        let (guards, errors) = gather_route_guards(&flows, variables, false);
         let mut mask = vec![false; guards.len()];
         match gateway_route::select_inclusive(&guards, &mut mask) {
             gateway_route::Route::Take(_) => Ok(flows
@@ -22061,12 +22061,20 @@ fn drain_scope_subscriptions(
 
 /// The gathering half of split-gateway routing (#1983): evaluates every
 /// outgoing flow's condition (in execution order) into the dense
-/// [`gateway_route::Guard`] view the pure kernel decides over. Conditions are
-/// pure, so eager evaluation selects exactly what a lazy scan would. Returns the
+/// [`gateway_route::Guard`] view the pure kernel decides over. Returns the
 /// guards and each position's evaluation error message (if any).
+///
+/// Conditions are NOT side-effect free: FEEL's `random number()` / `uuid()`
+/// advance the command's shared random stream. So the scan keeps the lazy
+/// routing loop's stopping points and returns only the evaluated prefix: it
+/// stops after the first condition error, and — when `stop_on_holds`
+/// (exclusive routing) — after the first holding condition. Neither kernel's
+/// decision depends on guards past those points (a hold / error wins outright),
+/// so deciding over the prefix is exact.
 fn gather_route_guards(
     flows: &[(usize, crate::model::SequenceFlow)],
     variables: &BTreeMap<String, Value>,
+    stop_on_holds: bool,
 ) -> (Vec<gateway_route::Guard>, Vec<Option<String>>) {
     let mut guards = Vec::with_capacity(flows.len());
     let mut errors = Vec::with_capacity(flows.len());
@@ -22083,8 +22091,16 @@ fn gather_route_guards(
                 },
             }
         };
+        let stop = match guard {
+            gateway_route::Guard::Errors => true,
+            gateway_route::Guard::Holds => stop_on_holds,
+            _ => false,
+        };
         guards.push(guard);
         errors.push(error);
+        if stop {
+            break;
+        }
     }
     (guards, errors)
 }
