@@ -97,3 +97,14 @@ test("live drift guard diagnoses a missing or malformed checks array", () => {
     );
   }
 });
+
+test("parity-coverage ratchet is a required merge gate (#1977)", () => {
+  // #1944 merged with `parity-coverage (nano llvm-cov)` red because the job
+  // was in neither branch protection nor the Mergify gate.
+  assert.ok(
+    protocol.requiredChecks.some(
+      ({ name }) => name === "parity-coverage (nano llvm-cov)",
+    ),
+    "parity-coverage (nano llvm-cov) must be a required check",
+  );
+});
