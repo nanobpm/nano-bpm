@@ -667,11 +667,28 @@ A few rules of thumb if you configure topology yourself:
 
 ### Rolling upgrades and capability latches
 
-You can upgrade a Raft cluster one member at a time. A new behaviour that would
-make replicas disagree (for example ack-paced cross-partition message delivery,
-`message-correlation-ack-v1`) stays off while any member still runs an older
-binary. Once every member advertises the capability, the leader turns it on and
-each partition records a **latch** in its journal.
+Rolling upgrade (mixed versions in one cluster) is supported **only between
+consecutive releases whose release notes declare rolling-upgrade
+compatibility**. Any replica-visible behaviour change that is *not* behind a
+capability latch needs a full-cluster stop and upgrade: stop every member,
+upgrade them all, then start them. Never run mixed versions in that case.
+
+When a rolling upgrade is supported:
+
+1. Back up every member's `NANOBPMN_DATA_DIR` first.
+2. Upgrade exactly **one member at a time**. Stop it, replace the binary,
+   start it.
+3. Wait until that member has rejoined, is `ACTIVE`, and has caught up (its
+   commit index matches the leader's for every partition) before you stop the
+   next one.
+4. Never take down a second member of a 3-node cluster while one is down or
+   catching up: that loses quorum.
+
+A new behaviour that would make replicas disagree (for example ack-paced
+cross-partition message delivery, `message-correlation-ack-v1`) stays off
+while any member still runs an older binary. Once every member advertises the
+capability, the leader turns it on and each partition records a **latch** in
+its journal.
 
 Latches are **one-way**:
 

@@ -29,8 +29,12 @@ on:
       - 'server/crates/nano-server-raft/src/**'
       - 'server/src/main.rs'
       - 'server/src/falcon.rs'
-      - 'engine-core/src/engine/mod.rs'
-      - 'engine-core/src/state/apply/subscription.rs'
+      # Latch application, replay and recovery (broad on purpose: a gap
+      # would let a latch/recovery change skip the harness).
+      - 'engine-core/src/engine/**'
+      - 'engine-core/src/state/**'
+      - 'engine-core/src/event.rs'
+      - 'server/crates/nano-server-storage/src/**'
 
 permissions:
   contents: read
