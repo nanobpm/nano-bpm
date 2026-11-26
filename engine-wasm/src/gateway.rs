@@ -1260,15 +1260,41 @@ fn deployment_meta(kind: &str, value: serde_json::Value) -> serde_json::Value {
     m
 }
 
-/// Whether `create_deployment` registers the part `filename`/`content` as a
-/// generic resource (not a process, decision or form) — its dispatch order:
-/// `.bpmn`, BPMN-parseable `.xml`, `.dmn`, `.form`, else generic.
-pub(crate) fn is_generic_resource(filename: &str, content: &str) -> bool {
+/// How `create_deployment` registers one multipart part — the single
+/// dispatch (mirroring the gateway's `parse_deploy_resources`): `.bpmn` is
+/// always BPMN; any `.xml` is BPMN iff it parses as BPMN; then `.dmn`,
+/// `.form`, else a generic resource. The route and the `deployResource`
+/// pre-check both derive from this, so they cannot drift.
+pub(crate) enum PartKind {
+    /// A process part; `Some` carries the already-parsed `.xml` definitions.
+    Process(Option<Vec<nanobpmn_engine_core::model::ProcessDefinition>>),
+    Decision,
+    Form,
+    Generic,
+}
+
+pub(crate) fn classify_part(filename: &str, content: &str) -> PartKind {
     let lower = filename.to_ascii_lowercase();
-    !(lower.ends_with(".bpmn")
-        || lower.ends_with(".dmn")
-        || lower.ends_with(".form")
-        || (lower.ends_with(".xml") && parse_bpmn(content).is_ok()))
+    if lower.ends_with(".bpmn") {
+        return PartKind::Process(None);
+    }
+    if lower.ends_with(".xml") {
+        if let Ok(defs) = parse_bpmn(content) {
+            return PartKind::Process(Some(defs));
+        }
+    }
+    if lower.ends_with(".dmn") {
+        PartKind::Decision
+    } else if lower.ends_with(".form") {
+        PartKind::Form
+    } else {
+        PartKind::Generic
+    }
+}
+
+/// Whether `create_deployment` registers the part as a generic resource.
+pub(crate) fn is_generic_resource(filename: &str, content: &str) -> bool {
+    matches!(classify_part(filename, content), PartKind::Generic)
 }
 
 impl TestEngine {
@@ -1282,48 +1308,44 @@ impl TestEngine {
         let mut processes: Vec<(String, String)> = Vec::new();
         let mut drgs: Vec<(String, String)> = Vec::new();
         for Part { filename, content } in parts {
-            let lower = filename.to_ascii_lowercase();
-            // Dispatch mirrors the gateway's `parse_deploy_resources`: `.bpmn`
-            // is always BPMN; any `.xml` is BPMN iff it parses as BPMN, else
-            // a generic resource.
-            let xml_bpmn = if lower.ends_with(".xml") {
-                parse_bpmn(&content).ok()
-            } else {
-                None
-            };
-            if lower.ends_with(".bpmn") || xml_bpmn.is_some() {
-                let defs = match xml_bpmn {
-                    Some(defs) => defs,
-                    None => parse_bpmn(&content)
-                        .map_err(|e| Problem::invalid(format!("{filename}: {e}")))?,
-                };
-                processes.extend(defs.iter().map(|d| (filename.clone(), d.id.clone())));
-                bundle.processes.extend(defs);
-            } else if lower.ends_with(".dmn") {
-                let drg = nanobpmn_engine_core::dmn::parse_dmn(&content)
-                    .map_err(|e| Problem::invalid(format!("{filename}: {e}")))?;
-                drgs.push((filename.clone(), drg.id.clone()));
-                bundle.decisions.push(drg);
-            } else if lower.ends_with(".form") {
-                let id = form_id_of(&content).ok_or_else(|| {
-                    Problem::invalid(format!(
-                        "{filename}: not a valid form-js document (expected a JSON object \
+            match classify_part(&filename, &content) {
+                PartKind::Process(parsed) => {
+                    let defs = match parsed {
+                        Some(defs) => defs,
+                        None => parse_bpmn(&content)
+                            .map_err(|e| Problem::invalid(format!("{filename}: {e}")))?,
+                    };
+                    processes.extend(defs.iter().map(|d| (filename.clone(), d.id.clone())));
+                    bundle.processes.extend(defs);
+                }
+                PartKind::Decision => {
+                    let drg = nanobpmn_engine_core::dmn::parse_dmn(&content)
+                        .map_err(|e| Problem::invalid(format!("{filename}: {e}")))?;
+                    drgs.push((filename.clone(), drg.id.clone()));
+                    bundle.decisions.push(drg);
+                }
+                PartKind::Form => {
+                    let id = form_id_of(&content).ok_or_else(|| {
+                        Problem::invalid(format!(
+                            "{filename}: not a valid form-js document (expected a JSON object \
                          with a non-empty string \"id\")"
-                    ))
-                })?;
-                bundle.forms.push(FormResource {
-                    id,
-                    resource_name: filename.clone(),
-                    version_tag: nanobpmn_engine_core::form_version_tag_of(&content),
-                    schema: content,
-                });
-            } else {
-                bundle.resources.push(GenericResource {
-                    resource_id: filename.clone(),
-                    resource_name: filename,
-                    content,
-                    version_tag: None,
-                });
+                        ))
+                    })?;
+                    bundle.forms.push(FormResource {
+                        id,
+                        resource_name: filename.clone(),
+                        version_tag: nanobpmn_engine_core::form_version_tag_of(&content),
+                        schema: content,
+                    });
+                }
+                PartKind::Generic => {
+                    bundle.resources.push(GenericResource {
+                        resource_id: filename.clone(),
+                        resource_name: filename,
+                        content,
+                        version_tag: None,
+                    });
+                }
             }
         }
         let forms: Vec<String> = bundle.forms.iter().map(|f| f.id.clone()).collect();
