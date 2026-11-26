@@ -596,3 +596,71 @@ fn deployment_accepts_resource_parts_with_any_form_name() {
     let res = eng.handle_request("POST", "/v2/deployments", &headers.to_string(), &body);
     assert_eq!(res.status, 200, "{}", res.body);
 }
+
+/// Native parity (`activate_jobs_impl`): `timeout` is clamped to `>= 0` and a
+/// non-positive `maxJobsToActivate` drains nothing — 200 `{jobs: []}`, never 400.
+#[test]
+fn activation_clamps_timeout_and_non_positive_max_like_native() {
+    for max in [0, -1] {
+        let mut eng = TestEngine::new();
+        deploy(&mut eng);
+        create(&mut eng);
+        let res = call(
+            &mut eng,
+            "POST",
+            "/v2/jobs/activation",
+            &json!({ "type": "charge", "maxJobsToActivate": max, "timeout": 60000 }),
+        );
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(json_body(&res), json!({ "jobs": [] }));
+        // No command ran: the job is still activatable.
+        assert_eq!(activate(&mut eng).jobs.len(), 1);
+    }
+    for timeout in [0, -5] {
+        let mut eng = TestEngine::new();
+        deploy(&mut eng);
+        create(&mut eng);
+        let res = call(
+            &mut eng,
+            "POST",
+            "/v2/jobs/activation",
+            &json!({ "type": "charge", "maxJobsToActivate": 5, "timeout": timeout }),
+        );
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(json_body(&res)["jobs"].as_array().map(Vec::len), Some(1));
+    }
+}
+
+/// Query keys and values are `application/x-www-form-urlencoded`-decoded.
+#[test]
+fn query_parameters_are_form_decoded() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    create(&mut eng);
+    for q in ["truncateValues=%66alse", "%74runcateValues=false"] {
+        let res = call(
+            &mut eng,
+            "POST",
+            &format!("/v2/variables/search?{q}"),
+            &json!({}),
+        );
+        assert_eq!(res.status, 200, "{q}: {}", res.body);
+    }
+    // `+` decodes to a space, so the value is not a boolean.
+    let res = call(
+        &mut eng,
+        "POST",
+        "/v2/variables/search?truncateValues=+false",
+        &json!({}),
+    );
+    assert_eq!(res.status, 400, "{}", res.body);
+    for bad in ["truncateValues=%6", "truncateValues=%zz", "%G1=x", "a=%ff"] {
+        let res = call(
+            &mut eng,
+            "POST",
+            &format!("/v2/variables/search?{bad}"),
+            &json!({}),
+        );
+        assert_eq!(res.status, 400, "{bad}: {}", res.body);
+    }
+}

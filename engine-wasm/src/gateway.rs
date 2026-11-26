@@ -314,7 +314,36 @@ thread_local! {
 /// parameters.
 struct Target<'a> {
     path: &'a str,
-    query: BTreeMap<String, String>,
+    /// Form-decoded query parameters, or the 400 for a malformed escape.
+    query: Result<BTreeMap<String, String>, Problem>,
+}
+
+/// Decode one `application/x-www-form-urlencoded` component: `+` is a space
+/// and `%XX` a byte; a malformed escape or non-UTF-8 result is a 400.
+fn form_decode(raw: &str) -> Result<String, Problem> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let byte = bytes
+                    .get(i + 1..i + 3)
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+                    .ok_or_else(|| {
+                        Problem::invalid(format!("invalid percent-escape in query: {raw:?}"))
+                    })?;
+                out.push(byte);
+                i += 2;
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8(out)
+        .map_err(|_| Problem::invalid(format!("query component is not UTF-8: {raw:?}")))
 }
 
 fn split_target(raw: &str) -> Target<'_> {
@@ -330,9 +359,9 @@ fn split_target(raw: &str) -> Target<'_> {
         .filter(|kv| !kv.is_empty())
         .map(|kv| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (k.to_string(), v.to_string())
+            Ok((form_decode(k)?, form_decode(v)?))
         })
-        .collect();
+        .collect::<Result<_, Problem>>();
     Target { path, query }
 }
 
@@ -544,9 +573,10 @@ impl TestEngine {
     ) -> HttpResponse {
         let t = split_target(target);
         let instance = format!("/v2{}", t.path);
-        let outcome = parse_headers(headers_json).and_then(|headers| {
+        let outcome = t.query.and_then(|query| {
+            let headers = parse_headers(headers_json)?;
             let (route, params) = resolve(method, t.path)?;
-            self.dispatch(route.op, &params, &t.query, &headers, body)
+            self.dispatch(route.op, &params, &query, &headers, body)
                 .map(|b| (route.status, b))
         });
         let mut headers = BTreeMap::new();
@@ -980,14 +1010,14 @@ impl TestEngine {
     /// mapper the gateway uses (`nanobpmn_search::job`).
     fn activate_jobs_rest(&mut self, raw: &str) -> Handled {
         let req = required_body::<models::JobActivationRequest>(raw)?;
-        let max_jobs = usize::try_from(req.max_jobs_to_activate)
-            .ok()
-            .filter(|n| *n > 0)
-            .ok_or_else(|| Problem::invalid("maxJobsToActivate must be positive"))?;
-        let timeout = u64::try_from(req.timeout)
-            .ok()
-            .filter(|t| *t > 0)
-            .ok_or_else(|| Problem::invalid("timeout must be positive"))?;
+        // Native gateway parity (`activate_jobs_impl`): a non-positive
+        // `maxJobsToActivate` drains nothing (200, empty list, no command) and
+        // `timeout` is clamped to `>= 0` rather than rejected.
+        let max_jobs = usize::try_from(req.max_jobs_to_activate.max(0)).unwrap_or(0);
+        if max_jobs == 0 {
+            return ok_json(&models::JobActivationResult { jobs: Vec::new() });
+        }
+        let timeout = u64::try_from(req.timeout.max(0)).unwrap_or(0);
         // An empty `fetchVariable` list means "all visible variables"
         // (`spec/jobs.yaml`), as the native gateway normalises it.
         let fetch = req.fetch_variable.clone().filter(|f| !f.is_empty());
