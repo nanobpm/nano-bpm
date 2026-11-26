@@ -2137,6 +2137,12 @@ pub enum Event {
     /// envelope exactly like one that applied the enabling envelope live.
     /// Partition-level; names no instance.
     RemoteBufferedDeliveryActivated { partition: u64 },
+    /// A replicated envelope enabled `message-correlation-ack-v2` on this
+    /// partition for the first time (#2037): every cluster member advertises
+    /// v2, so from here on the ack output carries the resolved consumption
+    /// element. One-way latch, recorded in the journal so replay restores it.
+    /// Partition-level; names no instance.
+    MessageCorrelationAckV2Activated { partition: u64 },
     /// A process-level message start subscription was opened at deploy time: a
     /// later [`Event::MessagePublished`] with a matching `message_name` creates a
     /// new instance of `process_id`. Carried on the log so replay reconstructs
@@ -2534,6 +2540,7 @@ impl Event {
             | Event::MessageCorrelationSettled { .. }
             | Event::MessageCorrelationReceiptSettled { .. }
             | Event::RemoteBufferedDeliveryActivated { .. }
+            | Event::MessageCorrelationAckV2Activated { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
@@ -2728,7 +2735,8 @@ impl Event {
             | Event::MessageCorrelationAcknowledged { partition, .. }
             | Event::MessageSubscriptionResumed { partition, .. }
             | Event::MessageCorrelationSettled { partition, .. }
-            | Event::RemoteBufferedDeliveryActivated { partition } => *partition,
+            | Event::RemoteBufferedDeliveryActivated { partition }
+            | Event::MessageCorrelationAckV2Activated { partition } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another
             // partition, so it never identifies the record's owner. Route by the

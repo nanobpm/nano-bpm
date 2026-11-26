@@ -144,7 +144,7 @@ impl Engine {
         // command's own `JobAttribution` stamp behind either (#1856 review).
         let (log, queue) = self
             .plan_command_at(command, now, None)
-            .inspect_err(|_| self.terminal_deadline_stamps.clear())?;
+            .inspect_err(|_| self.clear_command_scratch())?;
         let mut session = DebugSession {
             log,
             paused: Some(Paused { queue, cursor: 0 }),
@@ -186,9 +186,12 @@ impl Engine {
         match result {
             Some(paused) => session.paused = Some(paused),
             None => {
-                // The run is over: drop its per-command deadline stamps
-                // (kept while paused, since the remaining steps still read them).
-                self.terminal_deadline_stamps.clear();
+                // The run is over: finish it exactly as `apply_command` does
+                // (#2012: flush a paced delivery's ack, reap children, latch),
+                // then drop its per-command scratch (kept while paused, since
+                // the remaining steps still read it).
+                self.finish_drained_command(&mut session.log);
+                self.clear_command_scratch();
                 session.paused = None;
             }
         }

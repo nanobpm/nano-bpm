@@ -1,0 +1,17 @@
+{
+  "name": "inclusive-join-timer-tick-per-trigger",
+  "bpmn": "process.bpmn",
+  "backends": ["nano", "camunda"],
+  "timersArmedBy": "probe",
+  "processId": "parity-inclusive-join-timer-tick",
+  "variables": { "fires": 0 },
+  "steps": [
+    { "op": "activateAndComplete", "jobType": "probe" },
+    { "op": "advanceTime", "ms": 60000 },
+    { "op": "activateAndComplete", "jobType": "jt2" }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": { "fires": 1 }
+  }
+}

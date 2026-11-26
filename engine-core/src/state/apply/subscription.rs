@@ -469,6 +469,9 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
         Event::RemoteBufferedDeliveryActivated { .. } => {
             state.remote_buffered_delivery_latched = true;
         }
+        Event::MessageCorrelationAckV2Activated { .. } => {
+            state.message_correlation_ack_v2_latched = true;
+        }
 
         Event::MessageStartSubscriptionCreated {
             process_definition_key,

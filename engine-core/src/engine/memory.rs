@@ -134,13 +134,13 @@ impl Engine {
             esp_start_payloads: std::collections::BTreeMap::new(),
             boundary_payloads: std::collections::BTreeMap::new(),
             pending_timer_fires: std::collections::VecDeque::new(),
-            deferred_join_arrivals: std::collections::VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: std::collections::VecDeque::new(),
             pending_correlation_ack: None,
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
             remote_buffered_delivery_envelope: false,
+            message_correlation_ack_v2_envelope: false,
             buffer_candidates: std::collections::BTreeMap::new(),
             sweep_from: 0,
             raft_applied: snapshot.raft_applied,
@@ -795,11 +795,12 @@ impl Engine {
         if limit == 0 {
             return Vec::new();
         }
+        let pinned = self.resume_pinned_instances();
         let mut candidates: Vec<Key> = self
             .state
             .instances
             .iter()
-            .filter(|(key, i)| self.is_cold_spillable(key, i))
+            .filter(|(key, i)| self.is_cold_spillable(key, i, &pinned))
             .map(|(key, _)| *key)
             .collect();
         candidates.sort_unstable();
@@ -810,20 +811,31 @@ impl Engine {
     /// How many resident instances are cold-spill candidates right now (see
     /// [`Engine::cold_spillable_instances`]).
     pub fn cold_spillable_count(&self) -> usize {
+        let pinned = self.resume_pinned_instances();
         self.state
             .instances
             .iter()
-            .filter(|(key, i)| self.is_cold_spillable(key, i))
+            .filter(|(key, i)| self.is_cold_spillable(key, i, &pinned))
             .count()
     }
 
     /// Whether `instance` (keyed `key`) is an idle cold-spill candidate: `Active`,
     /// holding at least one parked token, and owning no job that currently holds
-    /// an activation lock (a locked job means a worker is mid-task — keep it hot).
-    pub(crate) fn is_cold_spillable(&self, key: &Key, instance: &state::ProcessInstance) -> bool {
+    /// an activation lock (a locked job means a worker is mid-task — keep it hot),
+    /// and not owing a resume handshake (`pinned`, see
+    /// [`Self::resume_pinned_instances`]): [`Engine::snapshot_instance`] refuses
+    /// those, so offering one would let a batch of pinned instances starve the
+    /// spill sweep of eligible ones (#2012).
+    pub(crate) fn is_cold_spillable(
+        &self,
+        key: &Key,
+        instance: &state::ProcessInstance,
+        pinned: &std::collections::BTreeSet<Key>,
+    ) -> bool {
         if instance.state != ProcessInstanceState::Active
             || instance.active.is_empty()
             || instance.variables_spilled
+            || pinned.contains(key)
         {
             return false;
         }
@@ -831,6 +843,19 @@ impl Engine {
             Some(jobs) => !jobs.iter().any(|j| self.state.activated_jobs.contains(j)),
             None => true,
         }
+    }
+
+    /// The instances that owe a resume handshake (#1949: a subscription with
+    /// `resume_pending`) and so must stay resident until it is confirmed. The
+    /// single predicate shared by spill eligibility and the snapshot safety
+    /// check (#2012), so the two can never disagree.
+    fn resume_pinned_instances(&self) -> std::collections::BTreeSet<Key> {
+        self.state
+            .message_subscriptions
+            .values()
+            .filter(|s| s.resume_pending)
+            .map(|s| s.instance_key)
+            .collect()
     }
 
     /// Lifts an idle instance and every entity it owns (jobs, timers, message
@@ -852,12 +877,7 @@ impl Engine {
         // subscription scan (`pending_resume_handshakes`); cold-spilling it
         // would hide that recovery intent until a later rehydrate, stranding
         // the message partition's backlog. Keep it resident until confirmed.
-        if self
-            .state
-            .message_subscriptions
-            .values()
-            .any(|s| s.instance_key == key && s.resume_pending)
-        {
+        if self.resume_pinned_instances().contains(&key) {
             return None;
         }
 

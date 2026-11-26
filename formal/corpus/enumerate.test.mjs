@@ -628,3 +628,18 @@ test('one publish correlates a message boundary ONCE per instance, as Zeebe (#19
   assert.equal(after.waiting.T1, 1, 'one publish leaves a T1 token waiting')
   assert.equal(after.completed, false)
 })
+
+test('a decision pause inside one tick keeps the gateway routing cache: explore == replay (#2024)', () => {
+  // and,xor,xor: two parallel timers reach XOR G2 in ONE tick. The first
+  // routes G2 -> G3 and pauses at undecided G3. Resuming (decide) must reuse
+  // G2's cached same-command choice for the second timer, exactly as replay
+  // with the recorded routes does — not open a fresh G2 decision.
+  const g = materialize({ kinds: ['and', 'xor', 'xor'], edges: [[0, 1, 'direct'], [1, 2, 'timer'], [1, 2, 'timer'], [2, 3, 'direct'], [2, 4, 'direct'], [3, 4, 'direct'], [3, 4, 'task']] })
+  const paused = new Reference(g, { route_G2: [['f6']] }).apply({ op: 'tick' })
+  assert.deepEqual(paused.pendingChoices().map((p) => p.node), ['G3'])
+  const explored = paused.decide('G3', 0, ['f9'])
+  const replayed = new Reference(g, { route_G2: [['f6']], route_G3: [['f9']] }).apply({ op: 'tick' })
+  assert.deepEqual(explored.pendingChoices(), [])
+  assert.deepEqual({ ...explored.takenFlows }, { ...replayed.takenFlows })
+  assert.deepEqual({ ...explored.waiting }, { ...replayed.waiting })
+})

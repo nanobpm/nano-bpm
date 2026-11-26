@@ -154,6 +154,11 @@
     }
   },
   {
+    "MessageCorrelationAckV2Activated": {
+      "partition": 1
+    }
+  },
+  {
     "MessageCorrelationSettled": {
       "delivery_key": 26,
       "partition": 1,

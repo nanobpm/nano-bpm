@@ -237,7 +237,8 @@ node formal/corpus/fuzz.mjs --seed 42 --labels task,timer --cancel-rate 0  # nar
   step carrying that gateway's route suffix, and a message **boundary**
   correlation takes the same settlement barrier (`settled`) as a catch's.
   `--labels` picks the wait-state labels drawn (default: all). The Reference
-  models each: a tick fires every due timer atomically, an interrupting boundary
+  models each: a tick fires every due timer within the one command, one TRIGGER
+  at a time in timer-key order, each drained before the next (#2024), an interrupting boundary
   terminates its task (never completed), the container completes when its inner
   end does. The bounded-exhaustive enumeration keeps its legacy vocabulary by
   default (`enumerateSkeletons({ labels })` opts in).

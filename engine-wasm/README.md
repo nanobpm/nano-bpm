@@ -151,6 +151,9 @@ command and cleared by `reset()`.
   `truncateValues` (default `true`) is the endpoint's query parameter: long
   values are cut to the preview length and flagged `isTruncated: true`.
   Mirrors `POST /variables/search`.
+- **`searchIncidents(queryJson)`** → `IncidentSearchQueryResult`. Mirrors
+  `POST /incidents/search`: a job failed with no retries left (or any other
+  incident) is listed here, and its instance reports `hasIncident: true`.
 - **`searchAgentInstances(queryJson)`** / **`searchAgentInstanceHistory(key,
   queryJson)`** → the agent search results. Mirror `POST /agent-instances/search`
   and `POST /agent-instances/{key}/history/search`.
@@ -254,6 +257,7 @@ embedded-only method.
 | `getAgentInstance(agentInstanceKey: string)` | string (throws) | [`getAgentInstance`](../spec/agent-instances.yaml) (`GET /agent-instances/{agentInstanceKey}`) | — | `AgentInstanceResult` | `getAgentInstance` — mirrors `GET /agent-instances/{agentInstanceKey}`. |
 | `searchUserTasks(queryJson: string)` | string (throws) | [`searchUserTasks`](../spec/user-tasks.yaml) (`POST /user-tasks/search`) | `UserTaskSearchQuery` | `UserTaskSearchQueryResult` | `searchUserTasks` — mirrors `POST /user-tasks/search`. |
 | `searchProcessInstances(queryJson: string)` | string (throws) | [`searchProcessInstances`](../spec/process-instances.yaml) (`POST /process-instances/search`) | `ProcessInstanceSearchQuery` | `ProcessInstanceSearchQueryResult` | `searchProcessInstances` — mirrors `POST /process-instances/search`: the spec's `ProcessInstanceSearchQuery` through the shared pipeline, returning the generated `ProcessInstanceSearchQueryResult`. |
+| `searchIncidents(queryJson: string)` | string (throws) | [`searchIncidents`](../spec/incidents.yaml) (`POST /incidents/search`) | `IncidentSearchQuery` | `IncidentSearchQueryResult` | `searchIncidents` — mirrors `POST /incidents/search`: the spec's `IncidentSearchQuery` through the shared pipeline (the server's filter, sort and page algebra), returning the generated `IncidentSearchQueryResult`. |
 | `searchVariables(queryJson: string, truncateValues: boolean?)` | string (throws) | [`searchVariables`](../spec/variables.yaml) (`POST /variables/search`) | `VariableSearchQuery` | `VariableSearchQueryResult` | `searchVariables` — mirrors `POST /variables/search`: the spec's `VariableSearchQuery` through the shared pipeline, returning the generated `VariableSearchQueryResult`. |
 | `handle(method: string, path: string, headersJson: string, body: string)` | string | — | — | — | `handle` — the transport-free REST driver (#992): serve one Camunda v2 REST request as the gateway would. |
 | `searchAgentInstances(queryJson: string)` | string (throws) | [`searchAgentInstances`](../spec/agent-instances.yaml) (`POST /agent-instances/search`) | `AgentInstanceSearchQuery` | `AgentInstanceSearchQueryResult` | `searchAgentInstances` — mirrors `POST /agent-instances/search`. |

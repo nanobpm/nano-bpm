@@ -487,8 +487,9 @@ impl RaftTransport for PeerTransport {
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
         FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES, FEATURE_MESSAGE_BUFFERING,
-        FEATURE_MESSAGE_CORRELATION_ACK, FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
-        FEATURE_REPLICATED_LENIENT_COMPLETION, FEATURE_TERMINAL_DEADLINES,
+        FEATURE_MESSAGE_CORRELATION_ACK, FEATURE_MESSAGE_CORRELATION_ACK_V2,
+        FEATURE_PROCESS_INSTANCE_HISTORY_DELETION, FEATURE_REPLICATED_LENIENT_COMPLETION,
+        FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
     let RaftRpcRequest::AppendEntries(r) = req else {
@@ -512,6 +513,21 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
             if item.remote_buffered_delivery && !required.contains(&FEATURE_MESSAGE_CORRELATION_ACK)
             {
                 required.push(FEATURE_MESSAGE_CORRELATION_ACK);
+            }
+            // #2037: an entry that may record the v2 latch, or an ack
+            // carrying the resolved element, is v2 output a v1 peer would
+            // drop.
+            let v2_ack = matches!(
+                item.command,
+                Command::AcknowledgeMessageCorrelation {
+                    element_id: Some(_),
+                    ..
+                }
+            );
+            if (item.message_correlation_ack_v2 || v2_ack)
+                && !required.contains(&FEATURE_MESSAGE_CORRELATION_ACK_V2)
+            {
+                required.push(FEATURE_MESSAGE_CORRELATION_ACK_V2);
             }
             let feature = match item.command {
                 Command::SetLenientCompletion { .. } => FEATURE_REPLICATED_LENIENT_COMPLETION,
@@ -572,6 +588,7 @@ mod codec_tests {
                     operation_reference: None,
                     terminal_deadlines: std::collections::BTreeMap::new(),
                     remote_buffered_delivery: false,
+                    message_correlation_ack_v2: false,
                 },
             ])),
         };
@@ -694,6 +711,34 @@ mod codec_tests {
         assert_eq!(
             required_features_for(&req(vec![remote])),
             vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK]
+        );
+        // #2037: an entry that may record the v2 latch, or an ack carrying
+        // the resolved element (v2 output), never ships to a v1 peer.
+        let mut latching = entry(Command::cancel_instance(1));
+        if let EntryPayload::Normal(batch) = &mut latching.payload {
+            batch.items[0].message_correlation_ack_v2 = true;
+        }
+        assert_eq!(
+            required_features_for(&req(vec![latching])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2]
+        );
+        let mut v2_ack =
+            required_features_for(&req(vec![entry(Command::AcknowledgeMessageCorrelation {
+                subscription_key: 1,
+                message_key: 2,
+                delivery_key: 5,
+                accepted: true,
+                consumed: true,
+                deferred: false,
+                element_id: Some("await-v2".to_string()),
+            })]));
+        v2_ack.sort_unstable();
+        assert_eq!(
+            v2_ack,
+            vec![
+                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
+                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
+            ]
         );
         // #1856 review: a stamped entry is never shipped to a peer that would
         // ignore the deadline map; an unstamped one requires nothing.

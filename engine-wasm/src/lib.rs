@@ -1358,6 +1358,16 @@ impl TestEngine {
             .map_err(|e| js_err(&e))
     }
 
+    /// `searchIncidents` — mirrors `POST /incidents/search`: the spec's
+    /// `IncidentSearchQuery` through the shared pipeline (the server's filter,
+    /// sort and page algebra), returning the generated
+    /// `IncidentSearchQueryResult`.
+    #[wasm_bindgen(js_name = searchIncidents)]
+    pub fn search_incidents(&self, query_json: &str) -> Result<String, JsValue> {
+        self.search_incidents_json(query_json)
+            .map_err(|e| js_err(&e))
+    }
+
     /// `searchVariables` — mirrors `POST /variables/search`: the spec's
     /// `VariableSearchQuery` through the shared pipeline, returning the
     /// generated `VariableSearchQueryResult`. `truncate_values` is the
@@ -1493,6 +1503,15 @@ impl TestEngine {
                 &self.read_model,
                 query.as_ref(),
             ),
+        )
+    }
+
+    fn search_incidents_json(&self, query_json: &str) -> Result<String, String> {
+        const OP: &str = "searchIncidents";
+        let query = search_query::<nanobpmn_search::models::IncidentSearchQuery>(OP, query_json)?;
+        result_json(
+            OP,
+            &nanobpmn_search::incident::search_incidents(&self.read_model, query.as_ref()),
         )
     }
 

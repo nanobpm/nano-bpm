@@ -2842,6 +2842,17 @@ pub struct State {
         serde(default, skip_serializing_if = "std::ops::Not::not")
     )]
     pub remote_buffered_delivery_latched: bool,
+    /// Whether a replicated envelope has EVER enabled
+    /// `message-correlation-ack-v2` on this partition (#2037): from then on
+    /// the ack output carries the resolved consumption element. One-way and
+    /// snapshotted; set only by applying
+    /// [`crate::Event::MessageCorrelationAckV2Activated`], so journal replay
+    /// restores it too. Additive.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub message_correlation_ack_v2_latched: bool,
     /// Open and settled **signal** subscriptions, keyed by subscription key. A
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) as an audit trail.

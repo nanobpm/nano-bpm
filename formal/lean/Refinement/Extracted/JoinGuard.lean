@@ -31,12 +31,12 @@ namespace join_guard
 axiom core.mem.maybe_uninit.MaybeUninit (T : Type _) : Type
 
 /-- [join_guard::NO_FLOW]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 22:0-22:38
+    Source: 'engine-core/src/engine/join_guard.rs', lines 21:0-21:38
     Visibility: public -/
 @[global_simps, irreducible] def NO_FLOW : Std.Usize := core.num.Usize.MAX
 
 /-- [join_guard::JoinKind]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 27:0-30:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 26:0-29:1
     Visibility: public -/
 @[discriminant isize]
 inductive JoinKind where
@@ -44,35 +44,35 @@ inductive JoinKind where
 | Inclusive : JoinKind
 
 /-- [join_guard::{impl core::clone::Clone for join_guard::JoinKind}::clone]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 26:9-26:14
+    Source: 'engine-core/src/engine/join_guard.rs', lines 25:9-25:14
     Visibility: public -/
 def JoinKind.Insts.CoreCloneClone.clone
   (self : JoinKind) : Result JoinKind := do
   ok self
 
 /-- Trait implementation: [join_guard::{impl core::clone::Clone for join_guard::JoinKind}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 26:9-26:14 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 25:9-25:14 -/
 @[reducible]
 def JoinKind.Insts.CoreCloneClone : core.clone.Clone JoinKind := {
   clone := JoinKind.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [join_guard::{impl core::marker::Copy for join_guard::JoinKind}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 26:16-26:20 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 25:16-25:20 -/
 @[reducible]
 def JoinKind.Insts.CoreMarkerCopy : core.marker.Copy JoinKind := {
   cloneInst := JoinKind.Insts.CoreCloneClone
 }
 
 /-- Trait implementation: [join_guard::{impl core::marker::StructuralPartialEq for join_guard::JoinKind}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 26:22-26:31 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 25:22-25:31 -/
 @[reducible]
 def JoinKind.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq JoinKind := {
 }
 
 /-- [join_guard::{impl core::cmp::PartialEq<join_guard::JoinKind> for join_guard::JoinKind}::eq]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 26:22-26:31
+    Source: 'engine-core/src/engine/join_guard.rs', lines 25:22-25:31
     Visibility: public -/
 def JoinKind.Insts.CoreCmpPartialEqJoinKind.eq
   (self : JoinKind) (other : JoinKind) : Result Bool := do
@@ -81,7 +81,7 @@ def JoinKind.Insts.CoreCmpPartialEqJoinKind.eq
   ok (self1 = other1)
 
 /-- Trait implementation: [join_guard::{impl core::cmp::PartialEq<join_guard::JoinKind> for join_guard::JoinKind}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 26:22-26:31 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 25:22-25:31 -/
 @[reducible]
 def JoinKind.Insts.CoreCmpPartialEqJoinKind : core.cmp.PartialEq JoinKind
   JoinKind := {
@@ -89,14 +89,14 @@ def JoinKind.Insts.CoreCmpPartialEqJoinKind : core.cmp.PartialEq JoinKind
 }
 
 /-- Trait implementation: [join_guard::{impl core::cmp::Eq for join_guard::JoinKind}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 26:33-26:35 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 25:33-25:35 -/
 @[reducible]
 def JoinKind.Insts.CoreCmpEq : core.cmp.Eq JoinKind := {
   partialEqInst := JoinKind.Insts.CoreCmpPartialEqJoinKind
 }
 
 /-- [join_guard::JoinDecision]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 36:0-45:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 35:0-44:1
     Visibility: public -/
 @[discriminant isize]
 inductive JoinDecision where
@@ -105,35 +105,35 @@ inductive JoinDecision where
 | AcceptUnlessActivePath : JoinDecision
 
 /-- [join_guard::{impl core::clone::Clone for join_guard::JoinDecision}::clone]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 35:9-35:14
+    Source: 'engine-core/src/engine/join_guard.rs', lines 34:9-34:14
     Visibility: public -/
 def JoinDecision.Insts.CoreCloneClone.clone
   (self : JoinDecision) : Result JoinDecision := do
   ok self
 
 /-- Trait implementation: [join_guard::{impl core::clone::Clone for join_guard::JoinDecision}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 35:9-35:14 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 34:9-34:14 -/
 @[reducible]
 def JoinDecision.Insts.CoreCloneClone : core.clone.Clone JoinDecision := {
   clone := JoinDecision.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [join_guard::{impl core::marker::Copy for join_guard::JoinDecision}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 35:16-35:20 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 34:16-34:20 -/
 @[reducible]
 def JoinDecision.Insts.CoreMarkerCopy : core.marker.Copy JoinDecision := {
   cloneInst := JoinDecision.Insts.CoreCloneClone
 }
 
 /-- Trait implementation: [join_guard::{impl core::marker::StructuralPartialEq for join_guard::JoinDecision}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 35:22-35:31 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 34:22-34:31 -/
 @[reducible]
 def JoinDecision.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq JoinDecision := {
 }
 
 /-- [join_guard::{impl core::cmp::PartialEq<join_guard::JoinDecision> for join_guard::JoinDecision}::eq]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 35:22-35:31
+    Source: 'engine-core/src/engine/join_guard.rs', lines 34:22-34:31
     Visibility: public -/
 def JoinDecision.Insts.CoreCmpPartialEqJoinDecision.eq
   (self : JoinDecision) (other : JoinDecision) : Result Bool := do
@@ -142,7 +142,7 @@ def JoinDecision.Insts.CoreCmpPartialEqJoinDecision.eq
   ok (self1 = other1)
 
 /-- Trait implementation: [join_guard::{impl core::cmp::PartialEq<join_guard::JoinDecision> for join_guard::JoinDecision}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 35:22-35:31 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 34:22-34:31 -/
 @[reducible]
 def JoinDecision.Insts.CoreCmpPartialEqJoinDecision : core.cmp.PartialEq
   JoinDecision JoinDecision := {
@@ -150,14 +150,14 @@ def JoinDecision.Insts.CoreCmpPartialEqJoinDecision : core.cmp.PartialEq
 }
 
 /-- Trait implementation: [join_guard::{impl core::cmp::Eq for join_guard::JoinDecision}]
-    Source: 'engine-core/src/engine/join_guard.rs', lines 35:33-35:35 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 34:33-34:35 -/
 @[reducible]
 def JoinDecision.Insts.CoreCmpEq : core.cmp.Eq JoinDecision := {
   partialEqInst := JoinDecision.Insts.CoreCmpPartialEqJoinDecision
 }
 
 /-- [join_guard::join_decision]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 50:0-65:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 49:0-64:1
     Visibility: public -/
 def join_decision
   (kind : JoinKind) (taken : Std.Usize) (incoming : Std.Usize) :
@@ -174,7 +174,7 @@ def join_decision
       else ok JoinDecision.Reject
 
 /-- [join_guard::edge_open]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 70:0-78:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 69:0-77:1
     Visibility: public -/
 def edge_open
   (target : Std.Usize) (flow : Std.Usize) (join : Std.Usize)
@@ -192,7 +192,7 @@ def edge_open
     | some count => ok (count = 0#u32)
 
 /-- [join_guard::enqueue_open_successors]: loop body 0:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-105:1 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-104:1 -/
 @[rust_loop_body]
 def enqueue_open_successors_loop.body
   (edges : Slice (Std.Usize × Std.Usize)) (join : Std.Usize)
@@ -232,7 +232,7 @@ def enqueue_open_successors_loop.body
   else ok (done (false, visited, queue))
 
 /-- [join_guard::enqueue_open_successors]: loop 0:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-105:1 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-104:1 -/
 @[rust_loop]
 def enqueue_open_successors_loop
   (edges : Slice (Std.Usize × Std.Usize)) (join : Std.Usize)
@@ -246,7 +246,7 @@ def enqueue_open_successors_loop
     (visited, queue, i)
 
 /-- [join_guard::enqueue_open_successors]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 83:0-105:1 -/
+    Source: 'engine-core/src/engine/join_guard.rs', lines 82:0-104:1 -/
 @[reducible]
 def enqueue_open_successors
   (edges : Slice (Std.Usize × Std.Usize)) (join : Std.Usize)
@@ -257,7 +257,7 @@ def enqueue_open_successors
   enqueue_open_successors_loop edges join taken visited queue 0#usize
 
 /-- [join_guard::path_reaches_join]: loop body 0:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 131:4-139:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 130:4-138:1
     Visibility: public -/
 @[rust_loop_body]
 def path_reaches_join_loop.body
@@ -285,7 +285,7 @@ def path_reaches_join_loop.body
   else ok (done false)
 
 /-- [join_guard::path_reaches_join]: loop 0:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 131:4-139:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 130:4-138:1
     Visibility: public -/
 @[rust_loop]
 def path_reaches_join_loop
@@ -300,7 +300,7 @@ def path_reaches_join_loop
     (visited, queue, head)
 
 /-- [join_guard::path_reaches_join]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 115:0-139:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 114:0-138:1
     Visibility: public -/
 def path_reaches_join
   (succ : Slice (alloc.vec.Vec (Std.Usize × Std.Usize))) (source : Std.Usize)
@@ -327,7 +327,7 @@ def path_reaches_join
       path_reaches_join_loop succ join taken visited1 ret 0#usize
 
 /-- [join_guard::has_active_path]: loop body 0:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-158:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-157:1
     Visibility: public -/
 @[rust_loop_body]
 def has_active_path_loop.body
@@ -352,7 +352,7 @@ def has_active_path_loop.body
   else ok (done false)
 
 /-- [join_guard::has_active_path]: loop 0:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-158:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-157:1
     Visibility: public -/
 @[rust_loop]
 def has_active_path_loop
@@ -366,7 +366,7 @@ def has_active_path_loop
     i
 
 /-- [join_guard::has_active_path]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 144:0-158:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 143:0-157:1
     Visibility: public -/
 @[reducible]
 def has_active_path
@@ -377,7 +377,7 @@ def has_active_path
   has_active_path_loop succ live join taken 0#usize
 
 /-- [join_guard::distinct_taken]: loop body 0:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-178:5
+    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-177:5
     Visibility: public -/
 @[rust_loop_body]
 def distinct_taken_loop.body
@@ -404,7 +404,7 @@ def distinct_taken_loop.body
   else ok (done count)
 
 /-- [join_guard::distinct_taken]: loop 0:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-178:5
+    Source: 'engine-core/src/engine/join_guard.rs', lines 1:0-177:5
     Visibility: public -/
 @[rust_loop]
 def distinct_taken_loop
@@ -417,7 +417,7 @@ def distinct_taken_loop
     (count, i)
 
 /-- [join_guard::distinct_taken]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 168:0-180:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 167:0-179:1
     Visibility: public -/
 @[reducible]
 def distinct_taken
@@ -425,7 +425,7 @@ def distinct_taken
   distinct_taken_loop incoming taken 0#usize 0#usize
 
 /-- [join_guard::join_ready]:
-    Source: 'engine-core/src/engine/join_guard.rs', lines 199:0-214:1
+    Source: 'engine-core/src/engine/join_guard.rs', lines 198:0-213:1
     Visibility: public -/
 def join_ready
   (succ : Slice (alloc.vec.Vec (Std.Usize × Std.Usize))) (kind : JoinKind)

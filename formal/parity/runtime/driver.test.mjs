@@ -964,6 +964,11 @@ test("CamundaBackend settled.ack fails loudly on a non-404 correlation error (#1
 // #1918 review: the Camunda backend has no timer-readiness/settlement barrier
 // and does not observe timer firings, so a hand-written corpus scenario that
 // advances the clock must be nano-only (mirrors formal/corpus/enumerate.mjs).
+// The one exception (#2024) is a scenario that names its own readiness
+// barrier in `timersArmedBy`: a job type activated in the SAME creation batch
+// that arms every timer, completed by a step before the first `advanceTime`,
+// so the clock can never overtake a timer that is not yet armed. Its timer
+// firings are observed through a process variable the fired path writes.
 test("every corpus scenario that advances time is nano-only", async () => {
   const { readdirSync, readFileSync, existsSync } = await import("node:fs");
   const dir = new URL("./corpus/", import.meta.url);
@@ -971,7 +976,18 @@ test("every corpus scenario that advances time is nano-only", async () => {
     const file = new URL(`${name}/scenario.json`, dir);
     if (!existsSync(file)) continue;
     const s = JSON.parse(readFileSync(file, "utf8"));
-    if (!(s.steps ?? []).some((st) => st.op === "advanceTime")) continue;
+    const steps = s.steps ?? [];
+    const firstTick = steps.findIndex((st) => st.op === "advanceTime");
+    if (firstTick < 0) continue;
+    if (s.timersArmedBy) {
+      assert.ok(
+        steps
+          .slice(0, firstTick)
+          .some((st) => st.op === "activateAndComplete" && st.jobType === s.timersArmedBy),
+        `${name}: its timersArmedBy barrier job must be completed before the first advanceTime`,
+      );
+      continue;
+    }
     assert.deepEqual(s.backends, ["nano"], `${name} advances time but is not nano-only`);
   }
 });

@@ -41,6 +41,7 @@ ALL_HARNESSES=(
   parallel_join_fires_only_when_every_flow_taken
   join_ready_kernel_total_and_exact
   ack_outcome_kernel_is_consistent
+  inclusive_join_ready_iff_no_active_path
 )
 # `--list` prints the canonical harness list (one per line) and exits; the
 # nightly workflow derives its matrix and failure report from it.
