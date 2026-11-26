@@ -3131,3 +3131,29 @@ fn debug_apply_of_a_paced_delivery_flushes_its_ack() {
         assert_eq!(debug.instance.state(), normal.instance.state());
     }
 }
+
+/// #2012 (3): an instance owing a resume handshake is not even OFFERED for
+/// cold spill — otherwise a batch of pinned (oldest-first) candidates, all
+/// refused by `snapshot_instance`, starves newer eligible instances.
+#[test]
+fn a_pinned_instance_does_not_block_eligible_cold_spill_candidates() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    rig.publish_backlog(&order, 1);
+    let (pinned, _) = create_suspended(&mut rig, &order, &|_| false);
+    let lost = rig.run_holding(
+        false,
+        Command::ResumeInstance {
+            instance_key: pinned,
+        },
+        3_000,
+        &|c| matches!(c, Command::ResumeMessageSubscription { .. }),
+    );
+    assert_eq!(lost.len(), 1);
+    assert_eq!(rig.instance.pending_resume_handshakes().len(), 1);
+    let eligible = rig.create("ni", "unrelated-order", 4_000);
+    assert!(pinned < eligible, "the pinned instance is the oldest");
+
+    assert_eq!(rig.instance.cold_spillable_instances(1), vec![eligible]);
+    assert_eq!(rig.instance.cold_spillable_count(), 1);
+    assert!(rig.instance.snapshot_instance(pinned).is_none());
+}

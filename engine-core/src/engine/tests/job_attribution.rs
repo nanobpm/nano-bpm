@@ -1157,3 +1157,75 @@ fn a_soft_job_migrated_to_an_agent_marked_target_keeps_its_cascade_deadline() {
     assert_eq!(terminal_deadline(&on_leader, job_key), Some(Some(1_000)));
     assert_eq!(terminal_deadline(&on_follower, job_key), Some(Some(1_000)));
 }
+
+/// #2012 (4): a `ResumeInstance` whose #1949 re-offer correlates a buffered
+/// message to an interrupting boundary cancels the attached soft-activated
+/// job — with the leader's soft deadline stamped on every replica, exactly
+/// like a `CorrelateMessage` cascade (suspend → buffer → resume).
+#[test]
+fn resume_reoffer_cascade_stamps_soft_job_deadline_on_every_replica() {
+    let def = ProcessBuilder::new("msg_cancel")
+        .start_event("start")
+        .service_task("task", "work")
+        .message_boundary_event("msg_b", "task", "cancel_msg", "orderId")
+        .end_event("end_ok")
+        .end_event("end_msg")
+        .connect("start", "task")
+        .connect("task", "end_ok")
+        .connect("msg_b", "end_msg")
+        .build()
+        .unwrap();
+    let mut replicas: Vec<Engine> = (0..2)
+        .map(|_| {
+            let mut e = Engine::new();
+            e.apply_command(Command::SetLenientCompletion { lenient: true })
+                .unwrap();
+            e.apply_command(Command::DeployProcess(def.clone()))
+                .unwrap();
+            e.apply_command_at(
+                Command::create_instance_with(
+                    "msg_cancel",
+                    vars(&[("orderId", Value::Str("o-1".into()))]),
+                ),
+                1_000,
+            )
+            .unwrap();
+            e
+        })
+        .collect();
+    let mut follower = replicas.pop().unwrap();
+    let mut leader = replicas.pop().unwrap();
+    let activated = leader.activate_jobs("work", "w", 1, 30_000, 1_500);
+    assert_eq!(activated.len(), 1);
+    let job_key = activated[0].key;
+    let instance_key = leader.state().jobs[&job_key].instance_key;
+
+    replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::SuspendInstance { instance_key },
+        2_000,
+    );
+    replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::CorrelateMessage {
+            message_name: "cancel_msg".into(),
+            correlation_key: "o-1".into(),
+            variables: BTreeMap::new(),
+            business_id: None,
+            message_key: None,
+            time_to_live: Some(60_000),
+            message_id: None,
+        },
+        3_000,
+    );
+    let (on_leader, on_follower) = replicate_stamped(
+        &mut leader,
+        &mut follower,
+        Command::ResumeInstance { instance_key },
+        4_000,
+    );
+    assert_eq!(terminal_deadline(&on_leader, job_key), Some(Some(31_500)));
+    assert_eq!(terminal_deadline(&on_follower, job_key), Some(Some(31_500)));
+}

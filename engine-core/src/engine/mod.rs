@@ -8407,10 +8407,8 @@ impl Engine {
             match s.state {
                 state::MessageSubscriptionState::Open => self.buffer_requeue.push_back(s.key),
                 state::MessageSubscriptionState::Opening
-                    if state::subscription_partition(
-                            &s.correlation_key,
-                            self.num_partitions,
-                        ) != self.partition_id =>
+                    if state::subscription_partition(&s.correlation_key, self.num_partitions)
+                        != self.partition_id =>
                 {
                     remote.push(s.key);
                 }
