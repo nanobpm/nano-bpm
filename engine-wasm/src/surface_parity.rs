@@ -286,7 +286,7 @@ fn read_model_read(_js_method: &'static str) -> Surface {
 /// exhaustiveness guard fires — under *both* the lean feature-off and the
 /// `read-model` `wasm32` builds, linking nothing new.
 ///
-/// The `Surfaced` verdict is kept honest to each build: the five read-model reads
+/// The `Surfaced` verdict is kept honest to each build: the read-model reads
 /// resolve through [`read_model_read`], which reports [`Surface::Surfaced`] only
 /// in the `read-model` build (where the `#[wasm_bindgen]` getter is actually
 /// compiled) and [`Surface::NotSurfaced`] in the lean build (where it is absent).
@@ -300,6 +300,7 @@ pub(crate) fn classify_read(query: &ReadQuery) -> Surface {
         ReadQuery::SearchProcessInstances => read_model_read("searchProcessInstances"),
         ReadQuery::SearchUserTasks => read_model_read("searchUserTasks"),
         ReadQuery::SearchVariables => read_model_read("searchVariables"),
+        ReadQuery::SearchIncidents => read_model_read("searchIncidents"),
 
         // ---- Not surfaced: conscious exclusions from the modeler test engine.
         // Revisit each if the modeler grows a need for it; the read model already
@@ -322,10 +323,6 @@ pub(crate) fn classify_read(query: &ReadQuery) -> Surface {
         ReadQuery::SearchJobs => Surface::NotSurfaced {
             reason: "job inventory listing; the modeler activates/completes jobs directly \
                      (activateJobs/completeJob) rather than browsing the job table",
-        },
-        ReadQuery::SearchIncidents => Surface::NotSurfaced {
-            reason: "incident listing; incidents surface inline in the simulation's debug state, \
-                     and are resolved via resolveIncident",
         },
         ReadQuery::GetIncident => Surface::NotSurfaced {
             reason: "single-incident lookup by key; not needed by the in-browser test engine",

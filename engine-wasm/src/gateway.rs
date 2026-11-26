@@ -55,6 +55,7 @@ pub(crate) enum Op {
     SearchUserTasks,
     SearchProcessInstances,
     SearchVariables,
+    SearchIncidents,
     SearchAgentInstances,
     SearchAgentInstanceHistory,
 }
@@ -228,6 +229,13 @@ pub(crate) const ROUTES: &[Route] = &[
         "searchVariables",
         200,
         Op::SearchVariables,
+    ),
+    route(
+        "POST",
+        "/incidents/search",
+        "searchIncidents",
+        200,
+        Op::SearchIncidents,
     ),
     route(
         "POST",
@@ -857,6 +865,13 @@ impl TestEngine {
                 ok_json(&nanobpmn_search::variable::search_variables(
                     &self.read_model,
                     truncate,
+                    q.as_ref(),
+                ))
+            }
+            Op::SearchIncidents => {
+                let q = search::<models::IncidentSearchQuery>(raw)?;
+                ok_json(&nanobpmn_search::incident::search_incidents(
+                    &self.read_model,
                     q.as_ref(),
                 ))
             }

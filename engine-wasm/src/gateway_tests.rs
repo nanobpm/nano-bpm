@@ -241,6 +241,79 @@ fn drives_a_process_end_to_end() {
     assert_eq!(json_body(&res)["items"][0]["value"], json!("true"));
 }
 
+/// #994: a no-retries `failJob` raises an incident that `searchIncidents`
+/// returns, filtered by the server's algebra, and the instance reports
+/// `hasIncident` on its process-instance result.
+#[test]
+fn no_retries_fail_job_incident_is_searchable() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    let failed = create(&mut eng);
+    let healthy = create(&mut eng);
+    let failed_key = &failed.process_instance_key.0;
+    let jobs = activate(&mut eng).jobs;
+    let job = jobs
+        .iter()
+        .find(|j| &j.process_instance_key.0 == failed_key)
+        .expect("the failed instance's job");
+    let res = call(
+        &mut eng,
+        "POST",
+        &format!("/v2/jobs/{}/failure", job.job_key.0),
+        &json!({ "retries": 0, "errorMessage": "card declined" }),
+    );
+    assert_eq!(res.status, 204, "{}", res.body);
+
+    let res = call(&mut eng, "POST", "/v2/incidents/search", &json!({}));
+    assert_eq!(res.status, 200, "{}", res.body);
+    let page: models::IncidentSearchQueryResult = decode(&res);
+    assert_eq!(page.items.len(), 1, "{}", res.body);
+    let body = json_body(&res);
+    let inc = &body["items"][0];
+    assert_eq!(inc["processInstanceKey"], json!(failed_key));
+    assert_eq!(inc["elementId"], json!("charge"));
+    assert_eq!(inc["errorType"], json!("JOB_NO_RETRIES"));
+    assert_eq!(inc["errorMessage"], json!("card declined"));
+    assert_eq!(inc["state"], json!("ACTIVE"));
+    assert_eq!(inc["jobKey"], json!(job.job_key.0));
+
+    // The server's filter algebra: an operator filter on the instance key.
+    let res = call(
+        &mut eng,
+        "POST",
+        "/v2/incidents/search",
+        &json!({ "filter": { "processInstanceKey": { "$eq": healthy.process_instance_key.0 } } }),
+    );
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(json_body(&res)["items"], json!([]));
+    let res = call(
+        &mut eng,
+        "POST",
+        "/v2/incidents/search",
+        &json!({ "filter": { "unknownField": 1 } }),
+    );
+    assert_eq!(res.status, 400, "{}", res.body);
+
+    // Incident fields on the process-instance result.
+    let res = call(
+        &mut eng,
+        "POST",
+        "/v2/process-instances/search",
+        &json!({ "filter": { "hasIncident": true } }),
+    );
+    assert_eq!(res.status, 200, "{}", res.body);
+    let body = json_body(&res);
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body["items"][0]["processInstanceKey"], json!(failed_key));
+    assert_eq!(body["items"][0]["hasIncident"], json!(true));
+
+    // The positional method answers the same as the route.
+    let direct: serde_json::Value =
+        serde_json::from_str(&eng.search_incidents_json("{}").unwrap()).unwrap();
+    let routed = json_body(&call(&mut eng, "POST", "/v2/incidents/search", &json!({})));
+    assert_eq!(direct, routed);
+}
+
 /// Assert `res` is the ProblemDetail of the given status / title / detail.
 fn assert_problem(res: &HttpResponse, status: u16, title: &str, detail: &str) {
     assert_eq!(res.status, status, "{}", res.body);
