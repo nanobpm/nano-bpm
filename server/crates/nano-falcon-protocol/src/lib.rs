@@ -594,6 +594,20 @@ pub enum ClientFrame {
         operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key process-instance
+    /// history deletion (#1948) to the instance's leader. Answered by a
+    /// `CommandResult` (204 on success, 404 unknown instance, 409 live
+    /// instance, 5xx otherwise). Only sent once every peer advertises
+    /// `FEATURE_PROCESS_INSTANCE_HISTORY_DELETION`, so an older peer never
+    /// receives a variant it cannot decode.
+    #[serde(rename_all = "camelCase")]
+    DeleteInstanceHistory {
+        corr: u64,
+        instance_key: String,
+        /// The REST request's `operationReference` (#1606).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_reference: Option<i64>,
+    },
+    /// **Intra-cluster only.** A gateway forwards a by-key process-instance
     /// resumption to the peer that owns the instance's partition. Answered by a
     /// `CommandResult` (204 on success, 400 illegal transition from a terminal
     /// state, 404 unknown instance, 5xx otherwise).
@@ -1156,6 +1170,13 @@ pub enum ReadKind {
     UserTask,
     Variable,
     ElementInstance,
+    /// Existence + state of a process instance's history across the owning
+    /// shard's live store AND terminal archive (#1948), answered as
+    /// `{"state": "<STATE>"}`. Only sent by history deletion, which first
+    /// requires every peer to advertise
+    /// `FEATURE_PROCESS_INSTANCE_HISTORY_DELETION`, so an older peer never
+    /// receives a variant it cannot decode.
+    ProcessInstanceHistory,
 }
 
 /// The user-task mutation a [`ClientFrame::ForwardUserTask`] carries.

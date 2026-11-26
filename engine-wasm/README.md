@@ -260,6 +260,23 @@ embedded-only method.
 
 <!-- END GENERATED API -->
 
+## Errors — ProblemDetail-shaped (changed in 0.14.0)
+
+Since **0.14.0** (#1937, a breaking change to the thrown error type) an engine
+rejection is thrown as a JS `Error` carrying ProblemDetail fields, derived from
+the same `EngineError::problem` mapping the REST gateway uses:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | HTTP status: 400 / 404 / 409 / 503 |
+| `title` | Zeebe rejection class: `INVALID_ARGUMENT`, `NOT_FOUND`, `INVALID_STATE`, `ALREADY_EXISTS`, `UNAVAILABLE` |
+| `detail` | Human-readable message |
+| `nonRetryable` | `false` only for transient (`UNAVAILABLE`) failures |
+
+`message` keeps the former `"<operation> error: <detail>"` text. Before 0.14.0
+these rejections were thrown as plain strings. Non-engine failures (invalid
+JSON input, parse errors) are still thrown as strings.
+
 ## Choosing a subpath
 
 - **Reach for lean** for demos, the modeler, debuggers/adapters, and anything

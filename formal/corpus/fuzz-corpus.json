@@ -2612,6 +2612,1688 @@
           "b": true
         }
       ]
+    },
+    {
+      "signature": "nano:completedElements,jobsCreated,sequenceFlows:completed=false/false",
+      "kind": "nano",
+      "issue": "#1990",
+      "fixed": false,
+      "seed": 1139086798,
+      "graph": {
+        "id": "Gen_b3c3b6ae63",
+        "key": "evt,or,or|0>1d,1>2m,1>4m,2>3c,2>3d,3>4d,3>4t"
+      },
+      "skeleton": {
+        "kinds": [
+          "evt",
+          "or",
+          "or"
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            "direct"
+          ],
+          [
+            1,
+            2,
+            "msg"
+          ],
+          [
+            2,
+            3,
+            "timer"
+          ],
+          [
+            3,
+            4,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "task"
+          ],
+          [
+            2,
+            3,
+            "direct"
+          ],
+          [
+            1,
+            4,
+            "msg"
+          ]
+        ]
+      },
+      "scenario": {
+        "name": "Gen_b3c3b6ae63-shrinkr17x31-o14",
+        "graph": "Gen_b3c3b6ae63",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_b3c3b6ae63",
+        "variables": {
+          "correlationKey": "Gen_b3c3b6ae63-shrinkr17x31-o14",
+          "route_G2": [
+            [
+              "f6",
+              "f8"
+            ]
+          ]
+        },
+        "steps": [
+          {
+            "op": "publishMessage",
+            "name": "Gen_b3c3b6ae63_M1",
+            "correlationKey": "Gen_b3c3b6ae63-shrinkr17x31-o14",
+            "settled": {
+              "ack": true
+            }
+          },
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          },
+          {
+            "op": "cancelInstance"
+          }
+        ],
+        "expect": {
+          "completed": false,
+          "cancelled": true,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "variables": {
+            "correlationKey": "Gen_b3c3b6ae63-shrinkr17x31-o14"
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "M2": 1,
+            "M1": 1,
+            "G2": 1,
+            "W1": 1,
+            "G3": 1
+          },
+          "sequenceFlows": {
+            "S->G1": 1,
+            "G1->M2": 1,
+            "G1->M1": 1,
+            "M1->G2": 1,
+            "G2->G3": 1,
+            "G2->W1": 1,
+            "W1->G3": 1,
+            "G3->T1": 1
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "correlate",
+              "node": "G1",
+              "flow": "f2",
+              "catch": "M1"
+            },
+            {
+              "op": "tick"
+            },
+            {
+              "op": "cancel"
+            }
+          ],
+          "route": {
+            "route_G2": [
+              [
+                "f6",
+                "f8"
+              ]
+            ],
+            "route_G3": [
+              [
+                "f10"
+              ]
+            ]
+          },
+          "completed": false,
+          "cancelled": true,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "M2": 1,
+            "M1": 1,
+            "G2": 1,
+            "W1": 1,
+            "G3": 1
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f4": 1,
+            "f2": 1,
+            "f3": 1,
+            "f8": 1,
+            "f6": 1,
+            "f7": 1,
+            "f10": 1
+          },
+          "joinsFired": {
+            "G3": 1
+          }
+        },
+        "backends": [
+          "nano"
+        ]
+      },
+      "detail": [
+        {
+          "field": "jobsCreated",
+          "expected": {
+            "T1": 1
+          },
+          "actual": {}
+        },
+        {
+          "field": "completedElements",
+          "expected": {
+            "S": 1,
+            "G1": 1,
+            "M2": 1,
+            "M1": 1,
+            "G2": 1,
+            "W1": 1,
+            "G3": 1
+          },
+          "actual": {
+            "S": 1,
+            "G1": 1,
+            "M1": 1,
+            "M2": 1,
+            "G2": 1,
+            "W1": 1
+          }
+        },
+        {
+          "field": "sequenceFlows",
+          "expected": {
+            "S->G1": 1,
+            "G1->M2": 1,
+            "G1->M1": 1,
+            "M1->G2": 1,
+            "G2->G3": 1,
+            "G2->W1": 1,
+            "W1->G3": 1,
+            "G3->T1": 1
+          },
+          "actual": {
+            "S->G1": 1,
+            "G1->M2": 1,
+            "G1->M1": 1,
+            "M1->G2": 1,
+            "G2->G3": 1,
+            "G2->W1": 1,
+            "W1->G3": 1
+          }
+        }
+      ]
+    },
+    {
+      "signature": "spec-oracle:jobsCreated,sequenceFlows",
+      "kind": "spec-oracle",
+      "issue": "#1990",
+      "fixed": false,
+      "seed": 1139086798,
+      "graph": {
+        "id": "Gen_b3c3b6ae63",
+        "key": "evt,or,or|0>1d,1>2m,1>4m,2>3c,2>3d,3>4d,3>4t"
+      },
+      "skeleton": {
+        "kinds": [
+          "evt",
+          "or",
+          "or"
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            "direct"
+          ],
+          [
+            1,
+            2,
+            "msg"
+          ],
+          [
+            2,
+            3,
+            "timer"
+          ],
+          [
+            3,
+            4,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "task"
+          ],
+          [
+            2,
+            3,
+            "direct"
+          ],
+          [
+            1,
+            4,
+            "msg"
+          ]
+        ]
+      },
+      "scenario": {
+        "name": "Gen_b3c3b6ae63-shrinkr17x57-o14",
+        "graph": "Gen_b3c3b6ae63",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_b3c3b6ae63",
+        "variables": {
+          "correlationKey": "Gen_b3c3b6ae63-shrinkr17x57-o14",
+          "route_G2": [
+            [
+              "f6",
+              "f8"
+            ]
+          ]
+        },
+        "steps": [
+          {
+            "op": "publishMessage",
+            "name": "Gen_b3c3b6ae63_M1",
+            "correlationKey": "Gen_b3c3b6ae63-shrinkr17x57-o14",
+            "settled": {
+              "ack": true
+            }
+          },
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          },
+          {
+            "op": "cancelInstance"
+          }
+        ],
+        "expect": {
+          "completed": false,
+          "cancelled": true,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "variables": {
+            "correlationKey": "Gen_b3c3b6ae63-shrinkr17x57-o14"
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "M2": 1,
+            "M1": 1,
+            "G2": 1,
+            "W1": 1,
+            "G3": 1
+          },
+          "sequenceFlows": {
+            "S->G1": 1,
+            "G1->M2": 1,
+            "G1->M1": 1,
+            "M1->G2": 1,
+            "G2->G3": 1,
+            "G2->W1": 1,
+            "W1->G3": 1,
+            "G3->T1": 1
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "correlate",
+              "node": "G1",
+              "flow": "f2",
+              "catch": "M1"
+            },
+            {
+              "op": "tick"
+            },
+            {
+              "op": "cancel"
+            }
+          ],
+          "route": {
+            "route_G2": [
+              [
+                "f6",
+                "f8"
+              ]
+            ],
+            "route_G3": [
+              [
+                "f10"
+              ]
+            ]
+          },
+          "completed": false,
+          "cancelled": true,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "M2": 1,
+            "M1": 1,
+            "G2": 1,
+            "W1": 1,
+            "G3": 1
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f4": 1,
+            "f2": 1,
+            "f3": 1,
+            "f8": 1,
+            "f6": 1,
+            "f7": 1,
+            "f10": 1
+          },
+          "joinsFired": {
+            "G3": 1
+          }
+        },
+        "backends": [
+          "nano"
+        ]
+      },
+      "detail": [
+        {
+          "field": "sequenceFlows",
+          "a": {
+            "S->G1": 1,
+            "M1->G2": 1,
+            "G2->G3": 1,
+            "G2->W1": 1,
+            "W1->G3": 1,
+            "G1->M1": 1
+          },
+          "b": {
+            "S->G1": 1,
+            "M1->G2": 1,
+            "G2->G3": 1,
+            "G2->W1": 1,
+            "W1->G3": 1,
+            "G3->T1": 1,
+            "G1->M1": 1
+          }
+        },
+        {
+          "field": "jobsCreated",
+          "a": {},
+          "b": {
+            "T1": 1
+          }
+        }
+      ]
+    },
+    {
+      "signature": "nano:completed,completedElements,jobsCreated,sequenceFlows:completed=false/true",
+      "kind": "nano",
+      "issue": "#1989",
+      "fixed": false,
+      "seed": 3675536154,
+      "graph": {
+        "id": "Gen_730e7e574b",
+        "key": "or,or,xor|0>1d,1>3d,1>3d,2>4b,3>2b"
+      },
+      "skeleton": {
+        "kinds": [
+          "or",
+          "xor",
+          "or"
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "btimer"
+          ],
+          [
+            2,
+            3,
+            "btimer"
+          ],
+          [
+            1,
+            2,
+            "direct"
+          ],
+          [
+            1,
+            2,
+            "direct"
+          ]
+        ]
+      },
+      "scenario": {
+        "name": "Gen_730e7e574b-shrinkr17x96-o22",
+        "graph": "Gen_730e7e574b",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_730e7e574b",
+        "variables": {
+          "route_G1": [
+            [
+              "f2",
+              "f3"
+            ]
+          ]
+        },
+        "steps": [
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          },
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          }
+        ],
+        "expect": {
+          "completed": true,
+          "jobsCreated": {
+            "T2": 2,
+            "T1": 2
+          },
+          "variables": {},
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "G3": 2,
+            "B2": 2,
+            "G2": 2,
+            "B1": 2,
+            "E": 2
+          },
+          "sequenceFlows": {
+            "S->G1": 1,
+            "G1->G3": 2,
+            "G3->T2": 2,
+            "B2->G2": 2,
+            "G2->T1": 2,
+            "B1->E": 2
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "tick"
+            },
+            {
+              "op": "tick"
+            }
+          ],
+          "route": {
+            "route_G1": [
+              [
+                "f2",
+                "f3"
+              ]
+            ]
+          },
+          "completed": true,
+          "cancelled": false,
+          "jobsCreated": {
+            "T2": 2,
+            "T1": 2
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "G3": 2,
+            "B2": 2,
+            "G2": 2,
+            "B1": 2,
+            "E": 2
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f3": 1,
+            "f2": 1,
+            "f7": 2,
+            "f9": 2,
+            "f4": 2,
+            "f6": 2
+          },
+          "joinsFired": {
+            "G2": 2
+          }
+        },
+        "backends": [
+          "nano"
+        ]
+      },
+      "detail": [
+        {
+          "field": "completed",
+          "expected": true,
+          "actual": false
+        },
+        {
+          "field": "jobsCreated",
+          "expected": {
+            "T2": 2,
+            "T1": 2
+          },
+          "actual": {
+            "T2": 2,
+            "T1": 1
+          }
+        },
+        {
+          "field": "completedElements",
+          "expected": {
+            "S": 1,
+            "G1": 1,
+            "G3": 2,
+            "B2": 2,
+            "G2": 2,
+            "B1": 2,
+            "E": 2
+          },
+          "actual": {
+            "S": 1,
+            "G1": 1,
+            "G3": 2,
+            "B2": 2,
+            "G2": 1,
+            "B1": 1,
+            "E": 1
+          }
+        },
+        {
+          "field": "sequenceFlows",
+          "expected": {
+            "S->G1": 1,
+            "G1->G3": 2,
+            "G3->T2": 2,
+            "B2->G2": 2,
+            "G2->T1": 2,
+            "B1->E": 2
+          },
+          "actual": {
+            "S->G1": 1,
+            "G1->G3": 2,
+            "G3->T2": 2,
+            "B2->G2": 2,
+            "G2->T1": 1,
+            "B1->E": 1
+          }
+        }
+      ]
+    },
+    {
+      "signature": "spec-oracle:completed,jobsCreated,sequenceFlows",
+      "kind": "spec-oracle",
+      "issue": "#1989",
+      "fixed": false,
+      "seed": 3675536154,
+      "graph": {
+        "id": "Gen_730e7e574b",
+        "key": "or,or,xor|0>1d,1>3d,1>3d,2>4b,3>2b"
+      },
+      "skeleton": {
+        "kinds": [
+          "or",
+          "xor",
+          "or"
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "btimer"
+          ],
+          [
+            2,
+            3,
+            "btimer"
+          ],
+          [
+            1,
+            2,
+            "direct"
+          ],
+          [
+            1,
+            2,
+            "direct"
+          ]
+        ]
+      },
+      "scenario": {
+        "name": "Gen_730e7e574b-shrinkr17x101-o22",
+        "graph": "Gen_730e7e574b",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_730e7e574b",
+        "variables": {
+          "route_G1": [
+            [
+              "f2",
+              "f3"
+            ]
+          ]
+        },
+        "steps": [
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          },
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          }
+        ],
+        "expect": {
+          "completed": true,
+          "jobsCreated": {
+            "T2": 2,
+            "T1": 2
+          },
+          "variables": {},
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "G3": 2,
+            "B2": 2,
+            "G2": 2,
+            "B1": 2,
+            "E": 2
+          },
+          "sequenceFlows": {
+            "S->G1": 1,
+            "G1->G3": 2,
+            "G3->T2": 2,
+            "B2->G2": 2,
+            "G2->T1": 2,
+            "B1->E": 2
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "tick"
+            },
+            {
+              "op": "tick"
+            }
+          ],
+          "route": {
+            "route_G1": [
+              [
+                "f2",
+                "f3"
+              ]
+            ]
+          },
+          "completed": true,
+          "cancelled": false,
+          "jobsCreated": {
+            "T2": 2,
+            "T1": 2
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "G3": 2,
+            "B2": 2,
+            "G2": 2,
+            "B1": 2,
+            "E": 2
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f3": 1,
+            "f2": 1,
+            "f7": 2,
+            "f9": 2,
+            "f4": 2,
+            "f6": 2
+          },
+          "joinsFired": {
+            "G2": 2
+          }
+        },
+        "backends": [
+          "nano"
+        ]
+      },
+      "detail": [
+        {
+          "field": "completed",
+          "a": false,
+          "b": true
+        },
+        {
+          "field": "sequenceFlows",
+          "a": {
+            "S->G1": 1,
+            "G1->G3": 2,
+            "G3->T2": 2,
+            "B2->G2": 2,
+            "G2->T1": 1,
+            "B1->E": 1
+          },
+          "b": {
+            "S->G1": 1,
+            "G1->G3": 2,
+            "G3->T2": 2,
+            "B2->G2": 2,
+            "G2->T1": 2,
+            "B1->E": 2
+          }
+        },
+        {
+          "field": "jobsCreated",
+          "a": {
+            "T2": 2,
+            "T1": 1
+          },
+          "b": {
+            "T2": 2,
+            "T1": 2
+          }
+        }
+      ]
+    },
+    {
+      "signature": "nano:completed,completedElements,jobsCreated,sequenceFlows:completed=false/true",
+      "kind": "nano",
+      "issue": "#1989",
+      "fixed": false,
+      "seed": 3080194952,
+      "graph": {
+        "id": "Gen_2d18f93dc0",
+        "key": "or,or,xor,xor|0>1d,1>3b,1>3c,2>5n,3>2d,3>4b,4>2d"
+      },
+      "skeleton": {
+        "kinds": [
+          "or",
+          "xor",
+          "xor",
+          "or"
+        ],
+        "edges": [
+          [
+            1,
+            2,
+            "timer"
+          ],
+          [
+            2,
+            3,
+            "btimer"
+          ],
+          [
+            2,
+            4,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "direct"
+          ],
+          [
+            1,
+            2,
+            "btimer"
+          ],
+          [
+            4,
+            5,
+            "bmsg"
+          ],
+          [
+            0,
+            1,
+            "direct"
+          ]
+        ]
+      },
+      "scenario": {
+        "name": "Gen_2d18f93dc0-shrinkr18x43-o64",
+        "graph": "Gen_2d18f93dc0",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_2d18f93dc0",
+        "variables": {
+          "correlationKey": "Gen_2d18f93dc0-shrinkr18x43-o64",
+          "route_G1": [
+            [
+              "f2",
+              "f5"
+            ]
+          ],
+          "route_G3": [
+            [
+              "f10"
+            ]
+          ]
+        },
+        "steps": [
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          },
+          {
+            "op": "completeOneJob",
+            "jobType": "T2"
+          },
+          {
+            "op": "publishMessage",
+            "name": "Gen_2d18f93dc0_B2",
+            "correlationKey": "Gen_2d18f93dc0-shrinkr18x43-o64"
+          }
+        ],
+        "expect": {
+          "completed": true,
+          "jobsCreated": {
+            "T1": 1,
+            "T2": 2
+          },
+          "variables": {
+            "correlationKey": "Gen_2d18f93dc0-shrinkr18x43-o64"
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "B1": 1,
+            "W1": 1,
+            "G3": 2,
+            "G2": 2,
+            "T2": 1,
+            "E": 2,
+            "B2": 1
+          },
+          "sequenceFlows": {
+            "S->G1": 1,
+            "G1->W1": 1,
+            "G1->T1": 1,
+            "B1->G3": 1,
+            "W1->G3": 1,
+            "G3->G2": 2,
+            "G2->T2": 2,
+            "T2->E": 1,
+            "B2->E": 1
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "tick"
+            },
+            {
+              "op": "complete",
+              "node": "T2"
+            },
+            {
+              "op": "correlateBoundary",
+              "node": "B2",
+              "task": "T2"
+            }
+          ],
+          "route": {
+            "route_G1": [
+              [
+                "f2",
+                "f5"
+              ]
+            ],
+            "route_G3": [
+              [
+                "f10"
+              ]
+            ]
+          },
+          "completed": true,
+          "cancelled": false,
+          "jobsCreated": {
+            "T1": 1,
+            "T2": 2
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "B1": 1,
+            "W1": 1,
+            "G3": 2,
+            "G2": 2,
+            "T2": 1,
+            "E": 2,
+            "B2": 1
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f5": 1,
+            "f2": 1,
+            "f4": 1,
+            "f6": 1,
+            "f10": 2,
+            "f7": 2,
+            "f8": 1,
+            "f9": 1
+          },
+          "joinsFired": {
+            "G2": 2
+          }
+        },
+        "backends": [
+          "nano"
+        ]
+      },
+      "detail": [
+        {
+          "field": "completed",
+          "expected": true,
+          "actual": false
+        },
+        {
+          "field": "jobsCreated",
+          "expected": {
+            "T1": 1,
+            "T2": 2
+          },
+          "actual": {
+            "T1": 1,
+            "T2": 1
+          }
+        },
+        {
+          "field": "completedElements",
+          "expected": {
+            "S": 1,
+            "G1": 1,
+            "B1": 1,
+            "W1": 1,
+            "G3": 2,
+            "G2": 2,
+            "T2": 1,
+            "E": 2,
+            "B2": 1
+          },
+          "actual": {
+            "S": 1,
+            "G1": 1,
+            "W1": 1,
+            "G3": 2,
+            "B1": 1,
+            "G2": 1,
+            "T2": 1,
+            "E": 1
+          }
+        },
+        {
+          "field": "sequenceFlows",
+          "expected": {
+            "S->G1": 1,
+            "G1->W1": 1,
+            "G1->T1": 1,
+            "B1->G3": 1,
+            "W1->G3": 1,
+            "G3->G2": 2,
+            "G2->T2": 2,
+            "T2->E": 1,
+            "B2->E": 1
+          },
+          "actual": {
+            "S->G1": 1,
+            "G1->W1": 1,
+            "G1->T1": 1,
+            "W1->G3": 1,
+            "G3->G2": 2,
+            "B1->G3": 1,
+            "G2->T2": 1,
+            "T2->E": 1
+          }
+        }
+      ]
+    },
+    {
+      "signature": "spec-oracle:completed,jobsCreated,sequenceFlows",
+      "kind": "spec-oracle",
+      "issue": "#1989",
+      "fixed": false,
+      "seed": 3080194952,
+      "graph": {
+        "id": "Gen_2d18f93dc0",
+        "key": "or,or,xor,xor|0>1d,1>3b,1>3c,2>5n,3>2d,3>4b,4>2d"
+      },
+      "skeleton": {
+        "kinds": [
+          "or",
+          "xor",
+          "xor",
+          "or"
+        ],
+        "edges": [
+          [
+            1,
+            2,
+            "timer"
+          ],
+          [
+            2,
+            3,
+            "btimer"
+          ],
+          [
+            2,
+            4,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "direct"
+          ],
+          [
+            1,
+            2,
+            "btimer"
+          ],
+          [
+            4,
+            5,
+            "bmsg"
+          ],
+          [
+            0,
+            1,
+            "direct"
+          ]
+        ]
+      },
+      "scenario": {
+        "name": "Gen_2d18f93dc0-shrinkr18x82-o64",
+        "graph": "Gen_2d18f93dc0",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_2d18f93dc0",
+        "variables": {
+          "correlationKey": "Gen_2d18f93dc0-shrinkr18x82-o64",
+          "route_G1": [
+            [
+              "f2",
+              "f5"
+            ]
+          ],
+          "route_G3": [
+            [
+              "f10"
+            ]
+          ]
+        },
+        "steps": [
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          },
+          {
+            "op": "completeOneJob",
+            "jobType": "T2"
+          },
+          {
+            "op": "publishMessage",
+            "name": "Gen_2d18f93dc0_B2",
+            "correlationKey": "Gen_2d18f93dc0-shrinkr18x82-o64"
+          }
+        ],
+        "expect": {
+          "completed": true,
+          "jobsCreated": {
+            "T1": 1,
+            "T2": 2
+          },
+          "variables": {
+            "correlationKey": "Gen_2d18f93dc0-shrinkr18x82-o64"
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "B1": 1,
+            "W1": 1,
+            "G3": 2,
+            "G2": 2,
+            "T2": 1,
+            "E": 2,
+            "B2": 1
+          },
+          "sequenceFlows": {
+            "S->G1": 1,
+            "G1->W1": 1,
+            "G1->T1": 1,
+            "B1->G3": 1,
+            "W1->G3": 1,
+            "G3->G2": 2,
+            "G2->T2": 2,
+            "T2->E": 1,
+            "B2->E": 1
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "tick"
+            },
+            {
+              "op": "complete",
+              "node": "T2"
+            },
+            {
+              "op": "correlateBoundary",
+              "node": "B2",
+              "task": "T2"
+            }
+          ],
+          "route": {
+            "route_G1": [
+              [
+                "f2",
+                "f5"
+              ]
+            ],
+            "route_G3": [
+              [
+                "f10"
+              ]
+            ]
+          },
+          "completed": true,
+          "cancelled": false,
+          "jobsCreated": {
+            "T1": 1,
+            "T2": 2
+          },
+          "completedElements": {
+            "S": 1,
+            "G1": 1,
+            "B1": 1,
+            "W1": 1,
+            "G3": 2,
+            "G2": 2,
+            "T2": 1,
+            "E": 2,
+            "B2": 1
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f5": 1,
+            "f2": 1,
+            "f4": 1,
+            "f6": 1,
+            "f10": 2,
+            "f7": 2,
+            "f8": 1,
+            "f9": 1
+          },
+          "joinsFired": {
+            "G2": 2
+          }
+        },
+        "backends": [
+          "nano"
+        ]
+      },
+      "detail": [
+        {
+          "field": "completed",
+          "a": false,
+          "b": true
+        },
+        {
+          "field": "sequenceFlows",
+          "a": {
+            "S->G1": 1,
+            "G1->W1": 1,
+            "G1->T1": 1,
+            "W1->G3": 1,
+            "G3->G2": 2,
+            "B1->G3": 1,
+            "G2->T2": 1,
+            "T2->E": 1
+          },
+          "b": {
+            "S->G1": 1,
+            "G1->W1": 1,
+            "G1->T1": 1,
+            "B1->G3": 1,
+            "W1->G3": 1,
+            "G3->G2": 2,
+            "G2->T2": 2,
+            "T2->E": 1,
+            "B2->E": 1
+          }
+        },
+        {
+          "field": "jobsCreated",
+          "a": {
+            "T1": 1,
+            "T2": 1
+          },
+          "b": {
+            "T1": 1,
+            "T2": 2
+          }
+        }
+      ]
+    },
+    {
+      "signature": "nano:completed,completedElements,sequenceFlows:completed=false/true",
+      "kind": "nano",
+      "issue": "#1990",
+      "fixed": false,
+      "seed": 827360813,
+      "graph": {
+        "id": "Gen_5b9cf143fb",
+        "key": "and,evt,or|0>2d,1>3b,1>3d,2>1m,2>4m,3>4d,3>4d"
+      },
+      "skeleton": {
+        "kinds": [
+          "evt",
+          "and",
+          "or"
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            "direct"
+          ],
+          [
+            1,
+            2,
+            "msg"
+          ],
+          [
+            2,
+            3,
+            "btimer"
+          ],
+          [
+            3,
+            4,
+            "direct"
+          ],
+          [
+            2,
+            3,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "direct"
+          ],
+          [
+            1,
+            4,
+            "msg"
+          ]
+        ]
+      },
+      "scenario": {
+        "name": "Gen_5b9cf143fb-shrinkr28x28-o1",
+        "graph": "Gen_5b9cf143fb",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_5b9cf143fb",
+        "variables": {
+          "correlationKey": "Gen_5b9cf143fb-shrinkr28x28-o1"
+        },
+        "steps": [
+          {
+            "op": "publishMessage",
+            "name": "Gen_5b9cf143fb_M1",
+            "correlationKey": "Gen_5b9cf143fb-shrinkr28x28-o1",
+            "settled": {
+              "jobType": "T1"
+            }
+          },
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          }
+        ],
+        "expect": {
+          "completed": true,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "variables": {
+            "correlationKey": "Gen_5b9cf143fb-shrinkr28x28-o1"
+          },
+          "completedElements": {
+            "S": 1,
+            "G2": 1,
+            "M2": 1,
+            "M1": 1,
+            "G1": 1,
+            "B1": 1,
+            "G3": 1,
+            "E": 1
+          },
+          "sequenceFlows": {
+            "S->G2": 1,
+            "G2->M2": 1,
+            "G2->M1": 1,
+            "M1->G1": 1,
+            "G1->G3": 1,
+            "G1->T1": 1,
+            "B1->G3": 1,
+            "G3->E": 1
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "correlate",
+              "node": "G2",
+              "flow": "f6",
+              "catch": "M1"
+            },
+            {
+              "op": "tick"
+            }
+          ],
+          "route": {
+            "route_G3": [
+              [
+                "f10"
+              ]
+            ]
+          },
+          "completed": true,
+          "cancelled": false,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "completedElements": {
+            "S": 1,
+            "G2": 1,
+            "M2": 1,
+            "M1": 1,
+            "G1": 1,
+            "B1": 1,
+            "G3": 1,
+            "E": 1
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f8": 1,
+            "f6": 1,
+            "f7": 1,
+            "f5": 1,
+            "f2": 1,
+            "f4": 1,
+            "f10": 1
+          },
+          "joinsFired": {
+            "G3": 1
+          }
+        },
+        "backends": [
+          "nano"
+        ]
+      },
+      "detail": [
+        {
+          "field": "completed",
+          "expected": true,
+          "actual": false
+        },
+        {
+          "field": "completedElements",
+          "expected": {
+            "S": 1,
+            "G2": 1,
+            "M2": 1,
+            "M1": 1,
+            "G1": 1,
+            "B1": 1,
+            "G3": 1,
+            "E": 1
+          },
+          "actual": {
+            "S": 1,
+            "G2": 1,
+            "M1": 1,
+            "M2": 1,
+            "G1": 1,
+            "B1": 1
+          }
+        },
+        {
+          "field": "sequenceFlows",
+          "expected": {
+            "S->G2": 1,
+            "G2->M2": 1,
+            "G2->M1": 1,
+            "M1->G1": 1,
+            "G1->G3": 1,
+            "G1->T1": 1,
+            "B1->G3": 1,
+            "G3->E": 1
+          },
+          "actual": {
+            "S->G2": 1,
+            "G2->M2": 1,
+            "G2->M1": 1,
+            "M1->G1": 1,
+            "G1->G3": 1,
+            "G1->T1": 1,
+            "B1->G3": 1
+          }
+        }
+      ]
+    },
+    {
+      "signature": "spec-oracle:completed,sequenceFlows",
+      "kind": "spec-oracle",
+      "issue": "#1990",
+      "fixed": false,
+      "seed": 827360813,
+      "graph": {
+        "id": "Gen_5b9cf143fb",
+        "key": "and,evt,or|0>2d,1>3b,1>3d,2>1m,2>4m,3>4d,3>4d"
+      },
+      "skeleton": {
+        "kinds": [
+          "evt",
+          "and",
+          "or"
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            "direct"
+          ],
+          [
+            1,
+            2,
+            "msg"
+          ],
+          [
+            2,
+            3,
+            "btimer"
+          ],
+          [
+            3,
+            4,
+            "direct"
+          ],
+          [
+            2,
+            3,
+            "direct"
+          ],
+          [
+            3,
+            4,
+            "direct"
+          ],
+          [
+            1,
+            4,
+            "msg"
+          ]
+        ]
+      },
+      "scenario": {
+        "name": "Gen_5b9cf143fb-shrinkr28x47-o1",
+        "graph": "Gen_5b9cf143fb",
+        "bpmn": "process.bpmn",
+        "processId": "Gen_5b9cf143fb",
+        "variables": {
+          "correlationKey": "Gen_5b9cf143fb-shrinkr28x47-o1"
+        },
+        "steps": [
+          {
+            "op": "publishMessage",
+            "name": "Gen_5b9cf143fb_M1",
+            "correlationKey": "Gen_5b9cf143fb-shrinkr28x47-o1",
+            "settled": {
+              "jobType": "T1"
+            }
+          },
+          {
+            "op": "advanceTime",
+            "ms": 60000
+          }
+        ],
+        "expect": {
+          "completed": true,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "variables": {
+            "correlationKey": "Gen_5b9cf143fb-shrinkr28x47-o1"
+          },
+          "completedElements": {
+            "S": 1,
+            "G2": 1,
+            "M2": 1,
+            "M1": 1,
+            "G1": 1,
+            "B1": 1,
+            "G3": 1,
+            "E": 1
+          },
+          "sequenceFlows": {
+            "S->G2": 1,
+            "G2->M2": 1,
+            "G2->M1": 1,
+            "M1->G1": 1,
+            "G1->G3": 1,
+            "G1->T1": 1,
+            "B1->G3": 1,
+            "G3->E": 1
+          }
+        },
+        "run": {
+          "steps": [
+            {
+              "op": "correlate",
+              "node": "G2",
+              "flow": "f6",
+              "catch": "M1"
+            },
+            {
+              "op": "tick"
+            }
+          ],
+          "route": {
+            "route_G3": [
+              [
+                "f10"
+              ]
+            ]
+          },
+          "completed": true,
+          "cancelled": false,
+          "jobsCreated": {
+            "T1": 1
+          },
+          "completedElements": {
+            "S": 1,
+            "G2": 1,
+            "M2": 1,
+            "M1": 1,
+            "G1": 1,
+            "B1": 1,
+            "G3": 1,
+            "E": 1
+          },
+          "takenFlows": {
+            "f1": 1,
+            "f8": 1,
+            "f6": 1,
+            "f7": 1,
+            "f5": 1,
+            "f2": 1,
+            "f4": 1,
+            "f10": 1
+          },
+          "joinsFired": {
+            "G3": 1
+          }
+        },
+        "backends": [
+          "nano"
+        ]
+      },
+      "detail": [
+        {
+          "field": "completed",
+          "a": false,
+          "b": true
+        },
+        {
+          "field": "sequenceFlows",
+          "a": {
+            "S->G2": 1,
+            "M1->G1": 1,
+            "G1->G3": 1,
+            "G1->T1": 1,
+            "B1->G3": 1,
+            "G2->M1": 1
+          },
+          "b": {
+            "S->G2": 1,
+            "M1->G1": 1,
+            "G1->G3": 1,
+            "G1->T1": 1,
+            "B1->G3": 1,
+            "G3->E": 1,
+            "G2->M1": 1
+          }
+        }
+      ]
     }
   ]
 }

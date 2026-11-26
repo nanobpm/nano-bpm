@@ -65,6 +65,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine-core
+      - name: Install mold linker
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu;
+        # without mold the nano runner's cargo build dies with `cannot find
+        # 'ld'` (guarded by scripts/rust-linker-provisioned.test.mjs).
+        uses: ./.github/actions/build-tools
+        with:
+          mold: 'true'
       # The pinned camunda checkout + engine build (capture.sh caches it),
       # cached TOGETHER with the Maven repository its saved classpath points
       # into: restoring the build stamp + `.nano-traces-classpath` without

@@ -872,6 +872,7 @@ dependencies = [
 name = "nanobpmn-engine-wasm"
 version = "0.1.0"
 dependencies = [
+ "js-sys",
  "nano-server-storage",
  "nanobpmn-engine-core",
  "nanobpmn-read-model",

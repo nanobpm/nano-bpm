@@ -1,0 +1,13 @@
+{
+  "name": "engine-wasm-problem-detail-test",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Asserts @nanobpm/engine-wasm throws ProblemDetail-shaped Errors (status/title/detail/nonRetryable) from the shared engine-core mapping (#1937), for both subpath variants (lean + readmodel).",
+  "scripts": {
+    "test": "node verify.mjs"
+  },
+  "dependencies": {
+    "@nanobpm/engine-wasm": "file:../../pkg"
+  }
+}

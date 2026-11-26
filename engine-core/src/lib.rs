@@ -76,6 +76,7 @@ mod engine;
 mod event;
 mod json;
 mod model;
+mod problem;
 mod read_query;
 mod state;
 mod temporal;
@@ -149,6 +150,7 @@ pub use model::{
     TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections, UserTaskProps, Value,
     TOOL_NAME_PROPERTY, TOOL_PROPERTY_PREFIX,
 };
+pub use problem::{EngineProblem, ProblemKind};
 pub use read_query::ReadQuery;
 pub use state::{
     compose_key, local_of, partition_of, restore_instance_snapshot, stable_hash,

@@ -1153,6 +1153,23 @@ impl PeerLink {
         .await
     }
 
+    /// Forwards a process-instance history deletion (#1948) to the instance's
+    /// leader.
+    pub async fn delete_instance_history(
+        &self,
+        instance_key: String,
+        operation_reference: Option<i64>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::DeleteInstanceHistory {
+                corr,
+                instance_key,
+                operation_reference,
+            }
+        })
+        .await
+    }
+
     /// Forwards a `resumeProcessInstance` to the peer that owns the instance.
     pub async fn resume_instance(
         &self,

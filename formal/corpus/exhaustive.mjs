@@ -143,9 +143,12 @@ export function verdictFromLog (log, properties, exitCode) {
 
 // One TLC run in its OWN directory and JVM temp dir: concurrent TLC processes
 // sharing either clobber each other's extracted standard modules.
-function runTlc (jar, work, module, tla, cfg, coverage = false) {
+// `extra` lists further module files (absolute paths) the model needs, e.g.
+// the trace-validation wrapper of formal/traces/conformance (#1962).
+export function runTlc (jar, work, module, tla, cfg, coverage = false, extra = []) {
   const dir = fs.mkdtempSync(path.join(work, `${module}-`))
   for (const base of ['TokenFlow', 'ZeebeTokenFlow']) fs.copyFileSync(path.join(tlaDir, `${base}.tla`), path.join(dir, `${base}.tla`))
+  for (const file of extra) fs.copyFileSync(file, path.join(dir, path.basename(file)))
   fs.writeFileSync(path.join(dir, `${module}.tla`), tla)
   fs.mkdirSync(path.join(dir, 'tmp'))
   return new Promise((resolve) => {
@@ -192,7 +195,7 @@ export function compareVerdicts (mc, zmc) {
   return out
 }
 
-async function pool (items, limit, fn) {
+export async function pool (items, limit, fn) {
   const results = new Array(items.length)
   let next = 0
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {

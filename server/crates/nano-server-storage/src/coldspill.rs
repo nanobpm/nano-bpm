@@ -216,7 +216,16 @@ impl ColdIndex {
                     targets.extend(self.instance_for_scope(*scope_key));
                 }
             }
-            Command::CancelInstance { instance_key, .. } => {
+            // Every by-instance-key lifecycle command must page a cold instance
+            // in: spilling removes a LIVE instance from resident engine state, so
+            // without rehydration the engine would see it as absent and judge
+            // the command against replica-local spill state (e.g. history
+            // deletion, #1948, would accept a cold live instance it rejects
+            // when resident).
+            Command::CancelInstance { instance_key, .. }
+            | Command::SuspendInstance { instance_key }
+            | Command::ResumeInstance { instance_key }
+            | Command::DeleteProcessInstanceHistory { instance_key } => {
                 if self.contains(*instance_key) {
                     targets.push(*instance_key);
                 }
@@ -562,5 +571,29 @@ mod tests {
 
         idx.remove(400);
         assert_eq!(idx.instance_for_scope(450), None);
+    }
+
+    /// Every by-instance-key lifecycle command addressing a cold instance pages
+    /// it in (#1948 review): a cold LIVE instance must be judged exactly as its
+    /// resident equivalent, not as absent.
+    #[test]
+    fn routes_by_instance_lifecycle_commands_to_cold_instances() {
+        let mut idx = ColdIndex::default();
+        idx.insert(&snapshot_with_job(700, 701, "work"));
+        for command in [
+            Command::CancelInstance {
+                instance_key: 700,
+                terminate_suspended: true,
+            },
+            Command::SuspendInstance { instance_key: 700 },
+            Command::ResumeInstance { instance_key: 700 },
+            Command::DeleteProcessInstanceHistory { instance_key: 700 },
+        ] {
+            assert_eq!(idx.command_targets(&command), vec![700], "{command:?}");
+        }
+        assert!(
+            idx.command_targets(&Command::DeleteProcessInstanceHistory { instance_key: 999 })
+                .is_empty()
+        );
     }
 }

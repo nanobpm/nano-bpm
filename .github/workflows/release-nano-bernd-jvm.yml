@@ -23,6 +23,8 @@ jobs:
   publish:
     if: startsWith(github.ref, 'refs/tags/nano-bernd-jvm-v')
     name: Publish io.github.jwulf:nano-bernd
+    # linker: builds only `--target wasm32-unknown-unknown`, so the host-target
+    # mold rustflag never applies.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
