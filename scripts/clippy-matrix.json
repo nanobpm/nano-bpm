@@ -244,6 +244,13 @@
       "count": 1,
       "reason": "registers the e2e harness's pre-main inherited-pipe closer in the Mach-O __mod_init_func section; only an Apple target compiles it and the clippy matrix runs on the Linux CI runner (the sibling not(apple) .init_array arm is linted there).",
       "trackedIn": null
+    },
+    {
+      "file": "engine-core/src/state/mod.rs",
+      "pred": "kani",
+      "count": 1,
+      "reason": "gates the Kani proof harnesses (kani_proofs.rs), which reference the `kani` crate that only `cargo kani` injects; plain cargo clippy cannot compile them. They are compiled and checked by the `kani (engine-core proofs)` CI job (formal/kani/check.sh).",
+      "trackedIn": 1960
     }
   ]
 }
