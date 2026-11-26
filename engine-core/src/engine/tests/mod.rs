@@ -21,6 +21,7 @@ mod event_subprocess;
 mod execution_order;
 mod expression_failures;
 mod feel_fallbacks;
+mod gateway_subscriptions;
 mod incidents;
 mod job_attribution;
 mod job_settlement;

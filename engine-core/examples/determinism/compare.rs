@@ -318,6 +318,7 @@ pub const INSTANCE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("activating", FieldRule::KeySet),
     ("gateway_routes", FieldRule::KeyedMap),
     ("races", FieldRule::KeyToKeyMap),
+    ("gateway_subscriptions", FieldRule::KeyedMap),
     ("incidents", FieldRule::KeyList),
     ("variables_spilled", FieldRule::Exact),
     (
