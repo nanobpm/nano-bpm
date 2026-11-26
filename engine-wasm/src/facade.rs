@@ -198,13 +198,49 @@ impl Rejection {
 /// resource with.
 const BOUNDARY: &str = "nanobpm-testengine-facade-2046";
 
-/// A one-resource `multipart/form-data` deployment body.
-fn multipart_one(filename: &str, content: &str) -> String {
-    format!(
-        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"resources\"; \
+/// A one-resource `multipart/form-data` deployment: `(content type, body)`.
+///
+/// Fails closed on a filename that would break out of its quoted header
+/// (`"`, `\\`, or any control character such as CR/LF), and picks a boundary
+/// that does not occur in the content so the frame cannot be split early.
+fn multipart_one(filename: &str, content: &str) -> Result<(String, String), String> {
+    if filename
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_control())
+    {
+        return Err(format!(
+            "invalid resource name {filename:?}: it must not contain quotes, backslashes or control characters"
+        ));
+    }
+    let mut boundary = BOUNDARY.to_string();
+    let mut n: u32 = 0;
+    while content.contains(boundary.as_str()) {
+        n = n.saturating_add(1);
+        boundary = format!("{BOUNDARY}-{n}");
+    }
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"resources\"; \
          filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n\
-         {content}\r\n--{BOUNDARY}--\r\n"
-    )
+         {content}\r\n--{boundary}--\r\n"
+    );
+    Ok((format!("multipart/form-data; boundary={boundary}"), body))
+}
+
+/// A caller key as one route path segment: rejected unless it is non-empty
+/// and free of anything that could change the route (`/`, `?`, `#`, `%`,
+/// `\\` or control characters). Other characters reach the server's own
+/// key parsing, which answers a malformed key like the REST surface does.
+fn path_key(op: &str, key: &str) -> Result<String, String> {
+    if key.is_empty() {
+        return Err(format!("{op}: the key must not be empty"));
+    }
+    if key
+        .chars()
+        .any(|c| matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_control())
+    {
+        return Err(format!("{op}: invalid key {key:?}"));
+    }
+    Ok(key.to_string())
 }
 
 /// A positional JSON-object argument (`""` ⇒ `{}`), with the messages the
@@ -283,15 +319,11 @@ impl TestEngine {
 
     /// A one-resource deployment through `POST /deployments`.
     fn deploy_route(&mut self, filename: &str, content: &str) -> Result<J, JsValue> {
-        let ct = format!("multipart/form-data; boundary={BOUNDARY}");
-        self.call_route(
-            "POST",
-            "/deployments",
-            Some(&ct),
-            &multipart_one(filename, content),
-        )
-        .map(|b| body_json(&b))
-        .map_err(|r| r.into_js("deploy error"))
+        let (ct, body) =
+            multipart_one(filename, content).map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        self.call_route("POST", "/deployments", Some(&ct), &body)
+            .map(|b| body_json(&b))
+            .map_err(|r| r.into_js("deploy error"))
     }
 
     /// A read through `handle()` (host-testable): the REST body, JSON `null`
@@ -303,11 +335,6 @@ impl TestEngine {
         path: &str,
         body: &str,
     ) -> Result<String, String> {
-        // A blank key would leave an empty path segment, which matches no
-        // route (404 → `null`); the server rejects it as a malformed key.
-        if path.ends_with('/') {
-            return Err(format!("{op}: the key must not be empty"));
-        }
         let body = if body.trim().is_empty() { "" } else { body };
         let ct = (!body.is_empty()).then_some("application/json");
         match self.call_route(method, path, ct, body) {
@@ -361,18 +388,21 @@ impl TestEngine {
 // wasm32); the exported read methods below are these plus the JS error.
 impl TestEngine {
     pub(crate) fn get_form_by_key_json(&mut self, form_key: &str) -> Result<String, String> {
-        self.read_route("getFormByKey", "GET", &format!("/forms/{form_key}"), "")
+        let k = path_key("getFormByKey", form_key)?;
+        self.read_route("getFormByKey", "GET", &format!("/forms/{k}"), "")
     }
 
     pub(crate) fn get_resource_by_key_json(&mut self, key: &str) -> Result<String, String> {
-        self.read_route("getResourceByKey", "GET", &format!("/resources/{key}"), "")
+        let k = path_key("getResourceByKey", key)?;
+        self.read_route("getResourceByKey", "GET", &format!("/resources/{k}"), "")
     }
 
     pub(crate) fn get_agent_instance_json(&mut self, key: &str) -> Result<String, String> {
+        let k = path_key("getAgentInstance", key)?;
         self.read_route(
             "getAgentInstance",
             "GET",
-            &format!("/agent-instances/{key}"),
+            &format!("/agent-instances/{k}"),
             "",
         )
     }
@@ -420,10 +450,11 @@ impl TestEngine {
         key: &str,
         query: &str,
     ) -> Result<String, String> {
+        let k = path_key("searchAgentInstanceHistory", key)?;
         self.read_route(
             "searchAgentInstanceHistory",
             "POST",
-            &format!("/agent-instances/{key}/history/search"),
+            &format!("/agent-instances/{k}/history/search"),
             query,
         )
     }
@@ -1079,5 +1110,51 @@ mod facade_guard_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only module (feature-gated, so the clippy.toml test exemptions do not apply)"
+)]
+mod request_framing_tests {
+    use super::{multipart_one, path_key, BOUNDARY};
+
+    #[test]
+    fn multipart_rejects_header_breaking_filenames() {
+        for bad in [
+            "a\".bpmn",
+            "a\r\nX: y.bpmn",
+            "a\n.bpmn",
+            "a\\b.bpmn",
+            "a\0.bpmn",
+        ] {
+            assert!(multipart_one(bad, "<x/>").is_err(), "{bad:?}");
+        }
+        assert!(multipart_one("my process (v2).bpmn", "<x/>").is_ok());
+    }
+
+    #[test]
+    fn multipart_boundary_never_occurs_in_content() {
+        let content = format!("a --{BOUNDARY} b --{BOUNDARY}-1 c");
+        let (ct, body) = multipart_one("r.bpmn", &content).unwrap();
+        let boundary = ct.split("boundary=").nth(1).unwrap();
+        assert!(!content.contains(boundary));
+        assert!(body.contains(&content));
+        assert!(body.ends_with(&format!("\r\n--{boundary}--\r\n")));
+    }
+
+    #[test]
+    fn path_key_rejects_route_changing_keys() {
+        for bad in ["", "1?x=y", "1/history/search", "1#", "1%2F", "a\\b", "1\n"] {
+            assert!(path_key("op", bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            path_key("op", "2251799813685249").unwrap(),
+            "2251799813685249"
+        );
+        assert_eq!(path_key("op", "my-form_id.v1").unwrap(), "my-form_id.v1");
     }
 }
