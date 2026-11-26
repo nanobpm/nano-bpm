@@ -253,6 +253,13 @@
       "trackedIn": 1960
     },
     {
+      "file": "engine-core/src/engine/ack_outcome.rs",
+      "pred": "kani",
+      "count": 1,
+      "reason": "gates the ack-outcome Kani harnesses, which reference the `kani` crate that only `cargo kani` injects; plain cargo clippy cannot compile them. They are compiled and checked by the non-gating nightly `.github/workflows/kani-nightly.yml` (formal/kani/check.sh).",
+      "trackedIn": 1960
+    },
+    {
       "file": "engine-core/src/engine/gateway_route.rs",
       "pred": "kani",
       "count": 1,
