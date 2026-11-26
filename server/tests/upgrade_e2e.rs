@@ -386,11 +386,18 @@ struct LoggedItem {
     /// The whole replicated item, so entries with different commands never
     /// compare equal.
     payload: String,
+    /// The batch-level replicated fields next to `items` in
+    /// `payload.Normal` (the leader's `digest` claim and `digest_cutover`):
+    /// byte-identical on every replica, so the prefix comparison covers them.
+    /// The node-local `raft_state` digest is deliberately NOT read here.
+    batch: String,
 }
 
 /// Reads `<data>/raft/p<partition>/seg-*.ndjson` (one JSON entry per line;
 /// later lines for the same index supersede earlier ones after a truncation).
-fn raft_items(data: &Path, partition: u64) -> Vec<LoggedItem> {
+/// Returns one `payload.Normal` batch per index, the whole replicated batch
+/// included.
+fn raft_batches(data: &Path, partition: u64) -> Vec<(u64, serde_json::Value)> {
     let dir = data.join("raft").join(format!("p{partition}"));
     let mut segs: Vec<PathBuf> = std::fs::read_dir(&dir)
         .into_iter()
@@ -413,20 +420,64 @@ fn raft_items(data: &Path, partition: u64) -> Vec<LoggedItem> {
             let Some(index) = entry["log_id"]["index"].as_u64() else {
                 continue;
             };
-            let items: Vec<LoggedItem> = entry["payload"]["Normal"]["items"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|item| LoggedItem {
-                    index,
-                    stamped: item["remote_buffered_delivery"].as_bool() == Some(true),
-                    payload: item.to_string(),
-                })
-                .collect();
-            by_index.insert(index, items);
+            by_index.insert(index, entry["payload"]["Normal"].clone());
         }
     }
-    by_index.into_values().flatten().collect()
+    by_index.into_iter().collect()
+}
+
+/// Every replicated command in a member's Raft log, each carrying its batch's
+/// replicated fields (see [`LoggedItem::batch`]).
+fn raft_items(data: &Path, partition: u64) -> Vec<LoggedItem> {
+    let mut out = Vec::new();
+    for (index, normal) in raft_batches(data, partition) {
+        let mut batch = normal.clone();
+        if let Some(obj) = batch.as_object_mut() {
+            obj.remove("items");
+        }
+        let batch = batch.to_string();
+        for item in normal["items"].as_array().into_iter().flatten() {
+            out.push(LoggedItem {
+                index,
+                stamped: item["remote_buffered_delivery"].as_bool() == Some(true),
+                payload: item.to_string(),
+                batch: batch.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Once no old member remains, every member's log must carry the SAME
+/// `digest_cutover` batch at the SAME index per partition: that is what makes
+/// the replicas' digest chains comparable, so `assert_no_divergence` is
+/// proven active rather than passing vacuously.
+fn assert_digest_cutover_agreed(c: &Cluster) {
+    for p in 0..PARTITIONS {
+        let cutovers: Vec<Option<(u64, serde_json::Value)>> = c
+            .members
+            .iter()
+            .map(|m| {
+                raft_batches(&m.data, p)
+                    .into_iter()
+                    .find(|(_, b)| b["digest_cutover"].as_bool() == Some(true))
+            })
+            .collect();
+        let first = cutovers[0].clone().unwrap_or_else(|| {
+            panic!("partition {p}: node 0 never logged a digest_cutover (divergence check vacuous)")
+        });
+        for (id, cut) in cutovers.iter().enumerate() {
+            assert_eq!(
+                cut.as_ref(),
+                Some(&first),
+                "partition {p}: node {id}'s digest_cutover disagrees with node 0's"
+            );
+        }
+        eprintln!(
+            "[upgrade] partition {p}: digest cutover at index {}",
+            first.0
+        );
+    }
 }
 
 /// The latch's ordering contract over every member's Raft log, per partition:
@@ -548,6 +599,7 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     keys.extend(create_instances(&c, 0, 6));
     assert_visible_everywhere(&mut c, &keys);
     c.assert_no_divergence("after the latch");
+    assert_digest_cutover_agreed(&c);
 
     // ---- Phase 3: recovery AFTER the latch.
     c.kill(1);
