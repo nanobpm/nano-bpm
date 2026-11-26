@@ -13620,6 +13620,8 @@ mod element_instance_tests {
                 rescan_from: None,
                 resume_pending: false,
                 resume_generation: 0,
+                deferred: false,
+                last_answered_delivery: 0,
             },
         );
         let store = ReadStore::open(None).unwrap();
@@ -13666,6 +13668,8 @@ mod element_instance_tests {
                 rescan_from: None,
                 resume_pending: false,
                 resume_generation: 0,
+                deferred: false,
+                last_answered_delivery: 0,
             },
         );
         let store = ReadStore::open(None).unwrap();
@@ -15578,6 +15582,8 @@ mod element_instance_tests {
                 rescan_from: None,
                 resume_pending: false,
                 resume_generation: 0,
+                deferred: false,
+                last_answered_delivery: 0,
             },
         );
         state.signal_subscriptions.insert(

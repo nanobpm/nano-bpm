@@ -2098,6 +2098,34 @@ pub struct MessageSubscription {
     /// erase a newer obligation. Additive.
     #[cfg_attr(feature = "serde", serde(default))]
     pub resume_generation: u64,
+    /// Message-partition (canonical) one-shot record only (#1949): its last
+    /// ack-paced delivery was DEFERRED (the instance is suspended), which
+    /// re-opened it while the deferred backlog still waits for the resume
+    /// handshake. While set, an unpaced live publication must not settle it
+    /// (the suspended instance would drop that delivery and the handshake
+    /// would then find the record settled, stranding the backlog): the
+    /// publication waits (buffered) like any other message. Cleared by
+    /// [`crate::Event::MessageSubscriptionResumed`]. Additive, omitted when
+    /// `false`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub deferred: bool,
+    /// Instance-partition `Opening` record only (#1949): the newest
+    /// `delivery_key` this subscription has answered. Delivery keys are
+    /// minted monotonically by the subscription's single message partition,
+    /// so an answer to an OLDER delivery (a late duplicate, even one whose
+    /// ledger entry was evicted) never moves the resume state. Kept with the
+    /// subscription, not in the bounded ledger. Additive, omitted when 0.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_key"))]
+    pub last_answered_delivery: Key,
+}
+
+/// `serde` skip predicate for [`MessageSubscription::last_answered_delivery`].
+#[cfg(feature = "serde")]
+fn is_zero_key(key: &Key) -> bool {
+    *key == 0
 }
 
 /// An in-flight buffered delivery awaiting its acknowledgement (#1949): see

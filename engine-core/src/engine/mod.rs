@@ -5117,7 +5117,12 @@ impl Engine {
                     // instance partition's ack for a buffered delivery takes
                     // nothing now; a TTL message stays buffered for it, so it
                     // is delivered in publish order once the ack arrives.
-                    if subscription.awaiting_ack.is_some() {
+                    //
+                    // A one-shot re-opened by a deferral (#1949) likewise
+                    // takes nothing until the resume handshake: an unpaced
+                    // delivery would settle it while the suspended instance
+                    // drops the message, stranding the deferred backlog.
+                    if subscription.awaiting_ack.is_some() || subscription.deferred {
                         continue;
                     }
                     let element_instance_key = subscription.element_instance_key;
@@ -5804,14 +5809,20 @@ impl Engine {
                 }
                 // Disarm the canonical subscription because the instance partition
                 // tore down the waiting element. Idempotent: only an open
-                // subscription is cancelled.
-                let open = matches!(
-                    self.state
-                        .message_subscriptions
-                        .get(&subscription_key)
-                        .map(|s| s.state),
-                    Some(state::MessageSubscriptionState::Open)
-                );
+                // subscription is cancelled — or a one-shot RESERVED by an
+                // ack-paced delivery still in flight (#1949): its reservation
+                // marked it `Correlated`, but a deferred answer would re-open
+                // it into a phantom wait. Cancelling keeps `awaiting_ack`, so
+                // the late ack still settles (and releases) the delivery.
+                let open = self
+                    .state
+                    .message_subscriptions
+                    .get(&subscription_key)
+                    .is_some_and(|s| match s.state {
+                        state::MessageSubscriptionState::Open => true,
+                        state::MessageSubscriptionState::Correlated => s.awaiting_ack.is_some(),
+                        _ => false,
+                    });
                 if open {
                     self.emit(
                         &mut log,
@@ -8112,8 +8123,10 @@ impl Engine {
             return false;
         }
         // Zeebe `CORRELATING`: one buffered delivery in flight per
-        // remote subscription until the instance partition acks it.
-        if subscription.awaiting_ack.is_some() {
+        // remote subscription until the instance partition acks it. A
+        // one-shot re-opened by a deferral waits for the resume handshake
+        // (#1949), which clears `deferred` before its re-offer runs.
+        if subscription.awaiting_ack.is_some() || subscription.deferred {
             return false;
         }
         let local = state::partition_of(instance_key) == self.partition_id;

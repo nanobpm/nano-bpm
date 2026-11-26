@@ -537,6 +537,8 @@ mod tests {
             rescan_from: None,
             resume_pending: false,
             resume_generation: 0,
+            deferred: false,
+            last_answered_delivery: 0,
         });
         snap.timers.push(Timer {
             key: 320,

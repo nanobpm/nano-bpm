@@ -1901,8 +1901,18 @@ fn create_suspended(
     order: &str,
     hold: &dyn Fn(&Command) -> bool,
 ) -> (Key, Vec<(bool, Command)>) {
+    create_suspended_in(rig, "ni", order, hold)
+}
+
+/// [`create_suspended`] for an arbitrary deployed `process`.
+fn create_suspended_in(
+    rig: &mut Rig,
+    process: &str,
+    order: &str,
+    hold: &dyn Fn(&Command) -> bool,
+) -> (Key, Vec<(bool, Command)>) {
     let created = rig.on_instance(
-        Command::create_instance_with("ni", vars(&[("orderId", Value::Str(order.into()))])),
+        Command::create_instance_with(process, vars(&[("orderId", Value::Str(order.into()))])),
         2_000,
     );
     let instance_key = created
@@ -2843,4 +2853,162 @@ fn a_duplicate_acknowledgement_does_not_rewrite_resume_state() {
         st.routed_deliveries.receipt(delivery_key).is_none(),
         "a settled receipt is never re-pinned"
     );
+
+    // Variant 4: settle → evict → newer deferral → lost resume → late
+    // duplicate. The evicted duplicate re-records as a fresh ledger entry,
+    // but it answers an OLDER delivery, so the newer obligation stands.
+    let mut st = rig.instance.state().clone();
+    st.routed_deliveries.set_cap(2);
+    state::apply(
+        &mut st,
+        &Event::MessageCorrelationReceiptSettled {
+            subscription_key,
+            delivery_key,
+        },
+    );
+    let record = |st: &mut state::State, key: Key| {
+        state::apply(
+            st,
+            &Event::RoutedDeliveryRecorded {
+                delivery_key: key,
+                recipient_partition: 0,
+                subscription_key: Some(subscription_key),
+                close_tombstone: false,
+            },
+        );
+    };
+    for i in 0..4 {
+        record(&mut st, state::compose_key(1, 900_000 + i));
+    }
+    assert!(!st.routed_deliveries.contains(delivery_key), "evicted");
+    let newer = state::compose_key(1, 950_000);
+    assert!(newer > delivery_key);
+    record(&mut st, newer);
+    let mut newer_deferral = original.clone();
+    if let Event::MessageCorrelationAcknowledging { delivery_key, .. } = &mut newer_deferral {
+        *delivery_key = newer;
+    }
+    state::apply(&mut st, &newer_deferral);
+    assert_eq!(resume_state(&st), (true, generation + 1), "newer deferral");
+    // The resume handshake is lost; the late duplicate lands.
+    record(&mut st, delivery_key);
+    state::apply(&mut st, &recomputed);
+    assert_eq!(
+        resume_state(&st),
+        (true, generation + 1),
+        "late duplicate after eviction"
+    );
+}
+
+/// The rig's canonical (message-partition) record for its single remote
+/// subscription.
+fn canonical_record(rig: &Rig) -> state::MessageSubscription {
+    rig.message
+        .state()
+        .message_subscriptions
+        .values()
+        .next()
+        .cloned()
+        .expect("a canonical record")
+}
+
+/// #1949 (Copilot r4702442021): a suspended remote ONE-SHOT catch defers a
+/// buffered delivery, which re-opens its canonical record. A live publish
+/// before the resume must not settle it through an unpaced delivery (the
+/// suspended instance drops it, stranding the backlog): the live message
+/// waits, and the resume delivers the buffered one exactly once.
+#[test]
+fn a_live_publish_never_settles_a_deferred_one_shot_before_resume() {
+    let (mut rig, order) = Rig::new(process_with_message_catch());
+    let published = rig.publish_named_backlog("payment-received", &order, 1);
+    let (instance_key, _) = create_suspended_in(&mut rig, "await-payment", &order, &|_| false);
+    let canonical = canonical_record(&rig);
+    assert_eq!(canonical.state, state::MessageSubscriptionState::Open);
+    assert!(canonical.deferred, "awaits the resume handshake");
+
+    let before = rig.trace.len();
+    rig.run(
+        true,
+        publish_with("payment-received", &order, BTreeMap::new(), None),
+        2_500,
+    );
+    let live = rig.trace[before..]
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageBuffered { message_key, .. } => Some(*message_key),
+            _ => None,
+        })
+        .expect("the live message waits, buffered");
+    assert!(
+        !rig.trace[before..]
+            .iter()
+            .any(|e| matches!(e, Event::RemoteMessageCorrelation { .. })),
+        "{:?}",
+        &rig.trace[before..]
+    );
+    assert_eq!(
+        canonical_record(&rig).state,
+        state::MessageSubscriptionState::Open
+    );
+    // Durable: a replayed message partition holds the same deferral.
+    let replayed = Engine::replay_partition(1, rig.message_journal.clone());
+    assert_eq!(replayed.state(), rig.message.state());
+
+    rig.run(false, Command::ResumeInstance { instance_key }, 3_000);
+    assert_eq!(correlated(&rig, instance_key), published, "{:?}", rig.trace);
+    assert!(rig.instance.is_completed(instance_key));
+    assert!(!canonical_record(&rig).deferred);
+    assert!(
+        rig.message.state().buffered_messages[&live]
+            .correlated_instances
+            .is_empty(),
+        "the live message still waits"
+    );
+    assert!(redrive(&rig).is_empty());
+}
+
+/// #1949 (Copilot r4702442076): the suspended one-shot catch is CANCELLED
+/// after its deferred answer but before that ack reaches the message
+/// partition. The close cancels the reserved record; the late ack settles
+/// the delivery and releases the message without re-opening a phantom wait,
+/// so a later instance takes it.
+#[test]
+fn a_close_before_the_deferred_ack_leaves_no_phantom_wait() {
+    let (mut rig, order) = Rig::new(process_with_message_catch());
+    let published = rig.publish_named_backlog("payment-received", &order, 1);
+    let (first, held_acks) = create_suspended_in(&mut rig, "await-payment", &order, &is_ack);
+    assert_eq!(held_acks.len(), 1, "the deferral's ack is delayed");
+    assert_eq!(
+        canonical_record(&rig).state,
+        state::MessageSubscriptionState::Correlated,
+        "reserved"
+    );
+    rig.run(
+        false,
+        Command::CancelInstance {
+            instance_key: first,
+            terminate_suspended: true,
+        },
+        2_600,
+    );
+    let canceled = canonical_record(&rig);
+    assert_eq!(canceled.state, state::MessageSubscriptionState::Canceled);
+    assert!(
+        canceled.awaiting_ack.is_some(),
+        "the late ack still settles"
+    );
+    for (to_message, command) in held_acks {
+        rig.run(to_message, command, 2_700);
+    }
+    let settled = canonical_record(&rig);
+    assert_eq!(settled.state, state::MessageSubscriptionState::Canceled);
+    assert!(settled.awaiting_ack.is_none());
+    assert!(!settled.deferred, "no phantom wait");
+    assert!(rig.message.state().buffered_messages[&published[0]]
+        .correlated_instances
+        .is_empty());
+    assert!(redrive(&rig).is_empty());
+    assert!(rig.instance.pending_resume_handshakes().is_empty());
+    let second = rig.create("await-payment", &order, 3_000);
+    assert_eq!(correlated(&rig, second), published, "{:?}", rig.trace);
 }

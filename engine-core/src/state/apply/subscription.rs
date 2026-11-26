@@ -74,6 +74,8 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     rescan_from: None,
                     resume_pending: false,
                     resume_generation: 0,
+                    deferred: false,
+                    last_answered_delivery: 0,
                 },
             );
         }
@@ -107,6 +109,8 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     rescan_from: None,
                     resume_pending: false,
                     resume_generation: 0,
+                    deferred: false,
+                    last_answered_delivery: 0,
                 },
             );
         }
@@ -315,6 +319,7 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             deferred,
             ..
         } => {
+            let still_buffered = state.buffered_messages.contains_key(message_key);
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
                 if subscription
                     .awaiting_ack
@@ -325,6 +330,12 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     if *deferred {
                         if subscription.state == MessageSubscriptionState::Correlated {
                             subscription.state = MessageSubscriptionState::Open;
+                            // Re-opened only to await the resume handshake:
+                            // no unpaced live publication may settle it. Not
+                            // for the self-routed release of an orphaned
+                            // reservation (its message is gone), which is
+                            // re-offered the backlog at once.
+                            subscription.deferred = still_buffered;
                         }
                     } else if !*accepted && subscription.state == MessageSubscriptionState::Open {
                         subscription.state = MessageSubscriptionState::Correlated;
@@ -390,15 +401,33 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                         target_partition: *target_partition,
                     },
                 );
-            if first {
-                if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
-                    if s.state == MessageSubscriptionState::Opening {
-                        s.resume_pending = *deferred;
-                        if *deferred {
-                            s.resume_generation = s.resume_generation.wrapping_add(1);
-                        }
+            if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
+                // Answer ordering lives with the subscription, not in the
+                // bounded ledger: a late duplicate whose ledger entry was
+                // evicted re-records as "first", but it answers an OLDER
+                // delivery than one already answered, so it must not move
+                // the resume state either.
+                let newer = *delivery_key == 0 || *delivery_key > s.last_answered_delivery;
+                if newer {
+                    s.last_answered_delivery = (*delivery_key).max(s.last_answered_delivery);
+                }
+                if first && newer && s.state == MessageSubscriptionState::Opening {
+                    s.resume_pending = *deferred;
+                    if *deferred {
+                        s.resume_generation = s.resume_generation.wrapping_add(1);
                     }
                 }
+            }
+        }
+
+        // The message partition answered the resume handshake (#1949): the
+        // deferred backlog is re-offered from here, so the record may take
+        // live publications again.
+        Event::MessageSubscriptionResumed {
+            subscription_key, ..
+        } => {
+            if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {
+                s.deferred = false;
             }
         }
 
