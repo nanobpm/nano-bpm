@@ -46,7 +46,7 @@ if [[ "${MEMGUARD_CGROUP:-1}" != 0 ]] && command -v systemd-run >/dev/null 2>&1;
   if systemd-run --user --scope -q "${props[@]}" true >/dev/null 2>&1; then
     scope=(systemd-run --user --scope -q "${props[@]}" --)
   elif sudo -n systemd-run --scope -q "${props[@]}" true >/dev/null 2>&1; then
-    scope=(sudo -n --preserve-env systemd-run --scope -q --uid="$(id -u)" --gid="$(id -g)" "${props[@]}" --)
+    scope=(sudo -n --preserve-env systemd-run --scope -q --uid="$(id -u)" --gid="$(id -g)" "${props[@]}" -- env PATH="$PATH" HOME="$HOME")
   fi
 fi
 if (( ${#scope[@]} == 0 )); then

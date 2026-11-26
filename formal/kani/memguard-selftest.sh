@@ -53,4 +53,13 @@ rc=0
 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c 'exit 7' || rc=$?
 [[ $rc -eq 7 ]] || { echo "selftest: in-budget workload exited $rc, want 7" >&2; exit 1; }
 
+# A command found only on the caller's PATH must still resolve through the
+# scope wrapper (sudo resets PATH to secure_path; memguard re-pins it).
+mkdir -p "$tmp/bin"
+printf '#!/bin/sh\nexit 9\n' >"$tmp/bin/memguard-path-probe"
+chmod +x "$tmp/bin/memguard-path-probe"
+rc=0
+PATH="$tmp/bin:$PATH" "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- memguard-path-probe || rc=$?
+[[ $rc -eq 9 ]] || { echo "selftest: caller-PATH command exited $rc, want 9" >&2; exit 1; }
+
 echo "memguard selftest: OK (oversized workload killed at peak $((peak / 1024)) MiB)"
