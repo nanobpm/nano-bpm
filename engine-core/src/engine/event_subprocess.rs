@@ -696,7 +696,10 @@ impl Engine {
             }
         }
         // A gateway-owned subscription (#2004): stage the payload for the
-        // gateway's trigger record (#2047 review). Still merged below.
+        // gateway's trigger record (#2047 review). Like a boundary payload it
+        // is NOT merged into the flow scope here: Zeebe writes it LOCAL to
+        // the triggered catch when that catch activates (see `activate`), and
+        // propagates it from there.
         if matches!(kind, state::MessageSubscriptionKind::IntermediateCatch)
             && self
                 .state
@@ -713,6 +716,7 @@ impl Engine {
             self.gateway_trigger_payloads
                 .entry((instance_key, element_instance_key))
                 .or_insert_with(|| variables.clone());
+            return;
         }
         let flow_scope = self.event_payload_scope(instance_key, element_instance_key, kind);
         // A boundary event's payload is created LOCAL to the boundary instance

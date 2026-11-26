@@ -10042,12 +10042,29 @@ impl Engine {
             .boundary_payloads
             .get_mut(&(instance_key, scope, element_id.clone()))
             .and_then(VecDeque::pop_front);
-        let propagate_boundary_payload = boundary_payload.clone().filter(|_| {
-            !self
-                .process_of_instance(instance_key)
-                .and_then(|p| p.element(&element_id))
-                .is_some_and(|e| !e.io.outputs.is_empty())
-        });
+        // A catch activated by its event-based gateway's recorded trigger
+        // (#2004, #2047 review) receives the payload recorded at the trigger
+        // the same way: LOCAL to the catch, then propagated (no outputs) — so
+        // its listeners, workers and output mappings read the payload as
+        // correlated, never a newer value of the enclosing scope.
+        // Unlike a boundary, it propagates even with output mappings: the
+        // same catch reached without a gateway merges its payload into the
+        // flow scope at correlation regardless of outputs, and the gated
+        // catch must end with the identical scope.
+        let triggered_payload = self
+            .triggered_catch_payload(instance_key, element_instance_key)
+            .filter(|p| !p.is_empty())
+            .cloned();
+        let propagate_boundary_payload = match &triggered_payload {
+            Some(payload) => Some(payload.clone()),
+            None => boundary_payload.clone().filter(|_| {
+                !self
+                    .process_of_instance(instance_key)
+                    .and_then(|p| p.element(&element_id))
+                    .is_some_and(|e| !e.io.outputs.is_empty())
+            }),
+        };
+        let boundary_payload = boundary_payload.or(triggered_payload);
         if let Some(payload) = boundary_payload
             .or_else(|| self.held_esp_start_payload(instance_key, &element_id, scope))
         {
@@ -10205,8 +10222,6 @@ impl Engine {
         element_vars: Arc<BTreeMap<String, Value>>,
         scope_pre_registered: bool,
     ) -> (Vec<Event>, Vec<Step>) {
-        let element_vars =
-            self.with_triggered_catch_payload(instance_key, element_instance_key, element_vars);
         // Input mappings (zeebe:input): evaluate against the variables visible to
         // the activating element and create the mapped values LOCAL to the
         // element's own scope (Zeebe semantics) — visible to the element's job or
@@ -16331,11 +16346,7 @@ impl Engine {
         let output_updates = if outputs.is_empty() {
             BTreeMap::new()
         } else {
-            let visible = self.with_triggered_catch_payload(
-                instance_key,
-                element_instance_key,
-                self.variables_for_element(instance_key, element_instance_key),
-            );
+            let visible = self.variables_for_element(instance_key, element_instance_key);
             let eval = match &script_update {
                 // The script result event is not applied to state until this
                 // step returns, so overlay it onto the eval context by hand.
@@ -17654,31 +17665,6 @@ impl Engine {
     fn is_triggered_catch(&self, instance_key: Key, element_instance_key: Key) -> bool {
         self.triggered_catch_payload(instance_key, element_instance_key)
             .is_some()
-    }
-
-    /// `vars` overlaid with the winning payload recorded when a gateway
-    /// trigger activated `element_instance_key` (#2047 review). The ONE place
-    /// a gateway-triggered catch's evaluation view is derived, shared by its
-    /// input mappings / FEEL attributes (activation) and its output mappings
-    /// (completion), so both read the payload as recorded at the trigger, not
-    /// whatever the enclosing scope holds now.
-    fn with_triggered_catch_payload(
-        &self,
-        instance_key: Key,
-        element_instance_key: Key,
-        vars: Arc<BTreeMap<String, Value>>,
-    ) -> Arc<BTreeMap<String, Value>> {
-        match self
-            .triggered_catch_payload(instance_key, element_instance_key)
-            .filter(|p| !p.is_empty())
-        {
-            Some(payload) => {
-                let mut merged = (*vars).clone();
-                merged.extend(payload.clone());
-                Arc::new(merged)
-            }
-            None => vars,
-        }
     }
 
     /// The recorded trigger payload of a catch the gateway-owned trigger path

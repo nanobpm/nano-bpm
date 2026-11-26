@@ -560,3 +560,95 @@ fn winning_payload_is_snapshotted_across_an_intervening_update() {
         );
     }
 }
+
+/// The winning payload is written LOCAL to the triggered catch when it
+/// activates (#2047 operator assessment, Zeebe parity): with the process
+/// variable `payload` updated to 99 while the gateway waits on its `end`
+/// listener, the catch's own `end`-listener job sees the correlated 21, an
+/// output mapping `=payload * 2` yields 42, and the parent scope ends with
+/// the correlated 21 (propagation overwrites the newer value) — live, after
+/// snapshot restore, and after journal replay.
+#[cfg(feature = "serde")]
+#[test]
+fn winning_payload_is_local_to_the_triggered_catch() {
+    for with_output in [false, true] {
+        let builder = ProcessBuilder::new("mm")
+            .start_event("start")
+            .event_based_gateway("gw")
+            .message_intermediate_catch_event("onM1", "M1", "=key")
+            .message_intermediate_catch_event("onM2", "M2", "=key")
+            .service_task("hold", "hold")
+            .end_event("end")
+            .connect("start", "gw")
+            .connect("gw", "onM1")
+            .connect("gw", "onM2")
+            .connect("onM1", "hold")
+            .connect("onM2", "hold")
+            .connect("hold", "end")
+            .with_listeners("gw", Vec::new(), vec![el(ListenerEventType::End, "audit")])
+            .with_listeners(
+                "onM1",
+                Vec::new(),
+                vec![el(ListenerEventType::End, "catchEnd")],
+            );
+        let builder = if with_output {
+            builder.with_io(
+                "onM1",
+                crate::model::IoMapping {
+                    inputs: Vec::new(),
+                    outputs: vec![crate::model::Mapping {
+                        source: "=payload * 2".to_string(),
+                        target: "doubled".to_string(),
+                    }],
+                },
+            )
+        } else {
+            builder
+        };
+        let mut run = Journaled::new(builder.build().unwrap(), true);
+        let inst = run.create("mm", 1_000);
+        run.apply(publish("M1", "k", 21, 0), 2_000);
+        run.apply(
+            Command::set_variables(
+                inst,
+                BTreeMap::from([("payload".to_string(), Value::Int(99))]),
+            ),
+            2_500,
+        );
+        let json = serde_json::to_string(&run.engine.snapshot()).unwrap();
+        let mut restored = Engine::from_snapshot(serde_json::from_str(&json).unwrap());
+        let mut replayed = Engine::replay(run.journal.clone());
+        for (label, engine) in [
+            ("live", &mut run.engine),
+            ("restored", &mut restored),
+            ("replayed", &mut replayed),
+        ] {
+            let label = format!("{label} with_output={with_output}");
+            let audit = engine.activate_jobs("audit", "W", 10, 1_000, 3_000);
+            assert_eq!(audit.len(), 1, "{label}");
+            engine
+                .apply_command_at(Command::complete_job(audit[0].key), 4_000)
+                .unwrap();
+            let listener = engine.activate_jobs("catchEnd", "W", 10, 1_000, 5_000);
+            assert_eq!(listener.len(), 1, "{label}");
+            assert_eq!(
+                listener[0].variables.get("payload"),
+                Some(&Value::Int(21)),
+                "{label}: the catch's end-listener job sees the correlated payload"
+            );
+            engine
+                .apply_command_at(Command::complete_job(listener[0].key), 6_000)
+                .unwrap();
+            assert!(holding(engine, inst), "{label}");
+            let scope = &engine.instance(inst).unwrap().variables;
+            assert_eq!(
+                scope.get("payload"),
+                Some(&Value::Int(21)),
+                "{label}: the parent scope ends with the correlated payload"
+            );
+            if with_output {
+                assert_eq!(scope.get("doubled"), Some(&Value::Int(42)), "{label}");
+            }
+        }
+    }
+}
