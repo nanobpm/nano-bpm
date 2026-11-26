@@ -217,8 +217,10 @@ mod tests {
         );
         let q: models::IncidentSearchQuery =
             serde_json::from_str(r#"{"filter":{"tenantId":"other"}}"#).unwrap();
-        assert!(search_incident_rows(&rows, Some(&q), |_| true)
-            .items
-            .is_empty());
+        assert!(
+            search_incident_rows(&rows, Some(&q), |_| true)
+                .items
+                .is_empty()
+        );
     }
 }
