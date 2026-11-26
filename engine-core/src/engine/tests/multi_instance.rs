@@ -1075,6 +1075,67 @@ fn mi_collection_write_restores_a_worker_overwritten_body_binding() {
     );
 }
 
+/// #1982 review — the output-MAPPING variant of
+/// `mi_collection_write_restores_a_worker_overwritten_body_binding`: a child
+/// `zeebe:output` targeting `outputCollection` is a PENDING write into the body
+/// scope, so the restoring collection write must not be suppressed against the
+/// committed (unchanged) binding.
+#[test]
+fn mi_collection_write_restores_an_output_mapping_overwritten_body_binding() {
+    let def = ProcessBuilder::new("mi-null-elem-map")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=null".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: false,
+                sequential: true,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=[9, 9]".to_string(),
+                    target: "results".to_string(),
+                }],
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-null-elem-map",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+
+    let first = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(first.len(), 1);
+    engine
+        .apply_command(Command::complete_job_with(first[0].key, vars(&[])))
+        .unwrap();
+    let second = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(second.len(), 1, "the second child is spawned");
+    assert_eq!(
+        second[0].variables.get("results"),
+        Some(&Value::List(vec![Value::Null, Value::Null])),
+        "the next child sees the accumulator, not the output mapping's overwrite"
+    );
+}
+
 #[test]
 fn multi_instance_input_mapping_cannot_clobber_loop_counter() {
     // A malicious/careless `zeebe:input` mapping targeting the reserved
