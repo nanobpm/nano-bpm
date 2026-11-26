@@ -329,13 +329,18 @@ fn create_instances(c: &Cluster, via: usize, n: usize) -> Vec<String> {
     keys
 }
 
-/// Every running member answers the instance as ACTIVE (reads are served from
-/// each member's own projection of the replicated log).
+/// Every member answers every instance as ACTIVE. All callers expect every
+/// member to be running, so an exited member fails the phase instead of
+/// silently shrinking it to two replicas. (A local miss may be forwarded to a
+/// peer, so per-member replication is proven separately on the raw Raft logs
+/// by `assert_latch_ordering`.)
 fn assert_visible_everywhere(c: &mut Cluster, keys: &[String]) {
     for id in 0..NODES {
-        if !c.running(id) {
-            continue;
-        }
+        assert!(
+            c.running(id),
+            "node {id} exited unexpectedly\n{}",
+            tail(&c.all_logs())
+        );
         for key in keys {
             let port = c.port(id);
             let path = format!("/v2/process-instances/{key}");
@@ -345,7 +350,11 @@ fn assert_visible_everywhere(c: &mut Cluster, keys: &[String]) {
                 Duration::from_secs(60),
                 || {
                     last = request(port, "GET", &path, None);
-                    matches!(&last, Some((200, _)))
+                    match &last {
+                        Some((200, body)) => serde_json::from_str::<serde_json::Value>(body)
+                            .is_ok_and(|v| v["state"] == "ACTIVE"),
+                        _ => false,
+                    }
                 },
                 c,
             );
@@ -378,6 +387,9 @@ struct LoggedItem {
     /// The latch's new-format envelope output (`remote_buffered_delivery`,
     /// #1949): what an old member would apply differently.
     stamped: bool,
+    /// The whole replicated item, so entries with different commands never
+    /// compare equal.
+    payload: String,
 }
 
 /// Reads `<data>/raft/p<partition>/seg-*.ndjson` (one JSON entry per line;
@@ -413,6 +425,7 @@ fn raft_items(data: &Path, partition: u64) -> Vec<LoggedItem> {
                     index,
                     now: item["now"].as_u64().unwrap_or_default(),
                     stamped: item["remote_buffered_delivery"].as_bool() == Some(true),
+                    payload: item.to_string(),
                 })
                 .collect();
             by_index.insert(index, items);
@@ -430,23 +443,34 @@ fn assert_latch_ordering(c: &Cluster, all_new_at: u64) {
         let logs: Vec<Vec<LoggedItem>> = c.members.iter().map(|m| raft_items(&m.data, p)).collect();
         let longest = logs.iter().max_by_key(|l| l.len()).unwrap();
         for (id, log) in logs.iter().enumerate() {
-            let shared = log.len().min(longest.len());
+            // Every member must itself hold both sides of the latch (an empty
+            // or pre-latch-only follower fails), agree with its peers item for
+            // item (payload included) over its whole log, and obey the
+            // ordering contract on its own log.
             assert_eq!(
-                log[..shared],
-                longest[..shared],
+                log[..],
+                longest[..log.len()],
                 "partition {p}: node {id}'s raft log disagrees with its peers"
             );
+            let early = log.iter().filter(|i| i.now < all_new_at).count();
+            let late_stamped = log.iter().filter(|i| i.stamped).count();
+            assert!(
+                early > 0,
+                "partition {p}: node {id} has no pre-latch traffic (vacuous)"
+            );
+            assert!(
+                late_stamped > 0,
+                "partition {p}: node {id} never saw the latch open (vacuous)"
+            );
+            if let Some(bad) = log.iter().find(|i| i.stamped && i.now < all_new_at) {
+                panic!(
+                    "partition {p}: node {id}: new-format output while an old member was \
+                     present: {bad:?}"
+                );
+            }
         }
         let early = longest.iter().filter(|i| i.now < all_new_at).count();
         let late_stamped = longest.iter().filter(|i| i.stamped).count();
-        assert!(early > 0, "partition {p}: no pre-latch traffic (vacuous)");
-        assert!(
-            late_stamped > 0,
-            "partition {p}: the latch never opened (vacuous)"
-        );
-        if let Some(bad) = longest.iter().find(|i| i.stamped && i.now < all_new_at) {
-            panic!("partition {p}: new-format output while an old member was present: {bad:?}");
-        }
         // The envelope is NOT one-way: a leader re-decides it per batch and
         // drops it while a peer is unreachable (e.g. the recovery restart).
         // The latch itself is one-way in engine state — later disabled
