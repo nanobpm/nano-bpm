@@ -76,6 +76,14 @@ optional `messageId` and `expectRejected` (the publish must be refused — Zeebe
 `message-buffered-non-interrupting-boundary-drain` (several buffered messages
 drained in publish order), `message-buffered-interrupting-boundary-one` (exactly
 one taken) and `message-buffered-expired` (nano-only: it advances the clock).
+`inclusive-join-timer-tick-per-trigger` (#2024) is the one tick scenario that
+also runs on live Camunda: one tick fires a timer catch and an interrupting
+timer boundary whose tokens both reach an inclusive join, and the `fires`
+variable counts the join's firings. Zeebe drains each TIMER TRIGGER's
+follow-ups before the next, so the first arrival is held by the still-live
+path and the join fires **once** (confirmed on `camunda/camunda:8.10.11`). It
+declares its readiness barrier in `timersArmedBy` (a job activated in the
+creation batch that arms both timers, completed before the tick).
 The **single-source corpus generator** ([#1258], `formal/corpus/`) has since
 landed; wiring this runner to its output (pointing `--corpus` at the generated
 directory) is a follow-up, with the scenario schema above as the contract.
