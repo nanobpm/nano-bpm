@@ -32197,7 +32197,13 @@ async fn main() {
                 // single `now` as client writes, so they go through the leader's
                 // Raft log (followers apply in lockstep). Non-Raft uses the direct
                 // local path below, byte-identical to the pre-cluster behaviour.
-                let outcomes: Vec<(bool, Vec<Event>)> = if !tick_server.raft.is_empty() {
+                //
+                // The mode is the node's replication MODE, not whether its Raft
+                // registry is populated yet (#2054): mid-bootstrap a Raft node's
+                // registry is still empty, and taking the local path there fired
+                // timers and journaled capability latches on a Raft replica
+                // OUTSIDE the log — diverging its chain digest from its peers'.
+                let outcomes: Vec<(bool, Vec<Event>)> = if tick_server.raft_replicated() {
                     let led = tick_server.led_partitions();
                     // Reclaim hot RAM on the partitions this node FOLLOWS (hosts a
                     // replica of but does not currently lead). The leader spills its

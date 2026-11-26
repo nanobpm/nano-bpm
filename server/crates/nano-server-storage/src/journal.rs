@@ -3436,6 +3436,8 @@ impl Journal {
         index: u64,
         raft_state: String,
     ) -> io::Result<(Arc<Vec<Event>>, Commit)> {
+        // The envelopes armed for this entry's commands end with it (#2054).
+        self.disarm_capability_envelopes();
         if self.fenced {
             self.raft_entry = None;
             return Err(io::Error::other(
@@ -3541,6 +3543,7 @@ impl Journal {
     /// the entry's partial, non-durable effects; the replica must shut down and
     /// rebuild from the durable journal, which never saw them.
     pub fn abort_raft_entry(&mut self) {
+        self.disarm_capability_envelopes();
         self.raft_entry = None;
         self.fenced = true;
     }
@@ -4237,15 +4240,41 @@ impl Journal {
     /// message to a remote instance (#1949; see
     /// [`Engine::set_remote_buffered_delivery`]). The Raft apply loop sets it
     /// from each replicated command's envelope before applying it.
+    ///
+    /// On a replicated-apply (Raft) journal the envelope is a Raft-entry
+    /// decision: arming it outside an open entry is refused (#2054), else a
+    /// local command (a mid-bootstrap tick, a leader-local op) would journal
+    /// the activation latch outside the log and the replicas' chain digests
+    /// would diverge at the next entry.
     pub fn set_remote_buffered_delivery(&mut self, enabled: bool) {
+        let enabled = enabled && self.capability_envelope_armable();
         self.engine.set_remote_buffered_delivery(enabled);
     }
 
     /// Sets, for the NEXT applied command, the replicated
     /// `message-correlation-ack-v2` envelope bit (#2037; see
-    /// [`Engine::set_message_correlation_ack_v2`]).
+    /// [`Engine::set_message_correlation_ack_v2`]). Refused outside a Raft
+    /// entry on a replicated-apply journal, like
+    /// [`set_remote_buffered_delivery`](Self::set_remote_buffered_delivery).
     pub fn set_message_correlation_ack_v2(&mut self, enabled: bool) {
+        let enabled = enabled && self.capability_envelope_armable();
         self.engine.set_message_correlation_ack_v2(enabled);
+    }
+
+    /// Whether the replicated capability envelopes (#1949, #2037) may be armed
+    /// now: always on a non-replicated journal (its local tick is the only
+    /// arbiter), only inside an open Raft entry on a replicated one (#2054).
+    fn capability_envelope_armable(&self) -> bool {
+        !self.replicated_apply || self.raft_entry.is_some()
+    }
+
+    /// Ends the capability envelopes' scope at the Raft entry boundary, so no
+    /// later local command inherits an entry's arming (#2054).
+    fn disarm_capability_envelopes(&mut self) {
+        if self.replicated_apply || self.raft_entry.is_some() {
+            self.engine.set_remote_buffered_delivery(false);
+            self.engine.set_message_correlation_ack_v2(false);
+        }
     }
 
     /// Sets the pre-cutover LEGACY lenient-completion host flag (#1661, ADR 0066
@@ -11183,6 +11212,95 @@ mod tests {
             "replicas diverged applying {command:?}"
         );
         on_leader.unwrap_or_default()
+    }
+
+    fn records_a_capability_latch(events: &[Event]) -> bool {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                Event::RemoteBufferedDeliveryActivated { .. }
+                    | Event::MessageCorrelationAckV2Activated { .. }
+            )
+        })
+    }
+
+    /// #2054: a Raft replica's mid-bootstrap tick armed the capability
+    /// envelopes and applied a local command OUTSIDE any Raft entry, so the
+    /// restarted leader journaled both activation latches locally. At the next
+    /// replicated entry it then emitted no latch while its followers did —
+    /// a chain-digest divergence that fail-stopped every follower. On a
+    /// replicated-apply journal the envelopes are Raft-entry decisions only:
+    /// arming them outside an entry is refused.
+    #[test]
+    fn replicated_journal_never_records_a_capability_latch_outside_a_raft_entry() {
+        let mut journal = Journal::in_memory();
+        journal.set_replicated_apply(true);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .expect("deploy");
+        journal.set_remote_buffered_delivery(true);
+        journal.set_message_correlation_ack_v2(true);
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .expect("create");
+        assert!(
+            !records_a_capability_latch(&events),
+            "a replicated journal recorded a capability latch outside a Raft entry: {events:?}"
+        );
+        // The same arming INSIDE a Raft entry records the latch.
+        journal.begin_raft_entry();
+        journal.set_remote_buffered_delivery(true);
+        journal.set_message_correlation_ack_v2(true);
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .expect("create");
+        assert!(records_a_capability_latch(&events));
+        let _ = journal.commit_raft_entry(1, String::new()).expect("commit");
+    }
+
+    /// #2054 (defect class): the envelopes are scoped to the Raft entry that
+    /// armed them. An entry whose command was REJECTED records no latch; a
+    /// later local (leader-local / tick) command must not inherit the armed
+    /// envelope and record the latch outside the log.
+    #[test]
+    fn capability_envelopes_do_not_outlive_their_raft_entry() {
+        let mut journal = Journal::in_memory();
+        journal.set_replicated_apply(true);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .expect("deploy");
+        journal.begin_raft_entry();
+        journal.set_remote_buffered_delivery(true);
+        journal.set_message_correlation_ack_v2(true);
+        assert!(
+            journal
+                .apply_command(Command::create_instance("no-such-process"))
+                .is_err()
+        );
+        let _ = journal.commit_raft_entry(1, String::new()).expect("commit");
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .expect("create");
+        assert!(
+            !records_a_capability_latch(&events),
+            "an envelope leaked past its Raft entry: {events:?}"
+        );
+    }
+
+    /// A non-replicated (single-node / non-Raft) journal keeps arming the
+    /// envelopes from its local tick, exactly as before.
+    #[test]
+    fn non_replicated_journal_still_arms_capability_envelopes_locally() {
+        let mut journal = Journal::in_memory();
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .expect("deploy");
+        journal.set_remote_buffered_delivery(true);
+        journal.set_message_correlation_ack_v2(true);
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .expect("create");
+        assert!(records_a_capability_latch(&events));
     }
 
     /// #1908 red/green: the leader's out-of-band retirement broadcast (the
