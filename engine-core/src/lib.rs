@@ -154,7 +154,7 @@ pub use problem::{EngineProblem, ProblemKind};
 pub use read_query::ReadQuery;
 pub use state::{
     compose_key, local_of, partition_of, restore_instance_snapshot, stable_hash,
-    subscription_partition, BufferedMessage, ConditionalSubscription, DeployedProcess,
+    subscription_partition, AwaitingAck, BufferedMessage, ConditionalSubscription, DeployedProcess,
     DeployedResource, Incident, IncidentKind, IncidentState, InstanceSnapshot, IoMappingRedrive,
     Job, JobKind, JobSettlement, JobSettlementOutcome, JobState, JobTerminalEnd, JoinKey, Key,
     MessageStartSubscription, MessageSubscription, MessageSubscriptionKind,

@@ -196,6 +196,22 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::CorrelateMessageSubscription { .. } => Surface::NotSurfaced {
             reason: "internal subscription correlation; user-facing entry is correlateMessage",
         },
+        Command::ResumeMessageSubscription { .. } => Surface::NotSurfaced {
+            reason: "internal cross-partition resume handshake for a paced buffered delivery; \
+                 single-partition test engine never paces",
+        },
+        Command::ConfirmMessageSubscriptionResume { .. } => Surface::NotSurfaced {
+            reason: "internal cross-partition resume confirmation; \
+                 single-partition test engine never paces",
+        },
+        Command::SettleMessageCorrelationReceipt { .. } => Surface::NotSurfaced {
+            reason: "internal cross-partition settlement of a paced delivery's receipt; \
+                 single-partition test engine never paces",
+        },
+        Command::AcknowledgeMessageCorrelation { .. } => Surface::NotSurfaced {
+            reason: "internal cross-partition ack of a paced buffered delivery; single-partition \
+                 test engine never paces",
+        },
         Command::CloseMessageSubscription { .. } => Surface::NotSurfaced {
             reason: "internal subscription lifecycle the engine drives itself; not a user op",
         },

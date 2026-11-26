@@ -168,6 +168,10 @@ impl Engine {
             | Command::EvaluateConditionalStartEvents { .. }
             | Command::OpenMessageSubscription { .. }
             | Command::CloseMessageSubscription { .. }
+            | Command::AcknowledgeMessageCorrelation { .. }
+            | Command::ResumeMessageSubscription { .. }
+            | Command::ConfirmMessageSubscriptionResume { .. }
+            | Command::SettleMessageCorrelationReceipt { .. }
             | Command::SuspendInstance { .. }
             | Command::ResumeInstance { .. }
             | Command::DispatchStartInstance { .. }

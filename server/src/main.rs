@@ -3900,6 +3900,9 @@ pub struct ServerImpl {
     /// Undelivered cross-partition subscription opens awaiting the
     /// background re-drive (#1866, see [`ServerImpl::spawn_failed_open_redrive`]).
     failed_opens: publication_gate::FailedOpens,
+    /// Ack-paced buffered deliveries seen in flight on the previous re-drive
+    /// pass (#1949, see [`ServerImpl::redrive_stalled_buffered_deliveries`]).
+    stalled_deliveries: publication_gate::StalledDeliveries,
     /// Test-only fault injection (#1866): panics the routing pump task.
     #[cfg(test)]
     fail_routing_pump_for_test: Arc<std::sync::atomic::AtomicBool>,
@@ -4093,6 +4096,14 @@ impl ServerImpl {
                     now_millis(),
                 );
             }
+            // Cluster-wide rolling-upgrade gate for ack-paced remote buffered
+            // delivery (#1949, ADR 0066): a multi-node node starts with it OFF
+            // (the 1944 behaviour: remote subscriptions take no buffered
+            // messages) until every member is known to advertise
+            // `message-correlation-ack-v1` — the Raft batcher decides it per
+            // entry, the non-Raft tick via `remote_buffered_delivery_gate`. A
+            // single node has no other binary to disagree with.
+            journal.set_remote_buffered_delivery(topology.is_single_node());
         }
         // The deployment partition (id 0) is the only one that seeds the demo
         // process and owns the message-/timer-start subscriptions. In a clustered
@@ -4558,6 +4569,7 @@ impl ServerImpl {
             #[cfg(test)]
             publication_gate_deadline_override: Arc::new(std::sync::Mutex::new(None)),
             failed_opens: publication_gate::FailedOpens::default(),
+            stalled_deliveries: publication_gate::StalledDeliveries::default(),
             #[cfg(test)]
             fail_routing_pump_for_test: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -8238,19 +8250,7 @@ fn apply_create_instance_direct(
         .unwrap_or_else(|| (fallback_process_id.to_string(), 1));
     let sync_completed = journal.engine().is_completed(instance_key);
     let routable: Vec<Event> = if journal.engine().num_partitions() > 1 {
-        events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Event::MessageSubscriptionOpening { .. }
-                        | Event::RemoteMessageCorrelation { .. }
-                        | Event::MessageSubscriptionClosing { .. }
-                        | Event::StartInstanceDispatched { .. }
-                )
-            })
-            .cloned()
-            .collect()
+        events.iter().filter(|e| e.is_routable()).cloned().collect()
     } else {
         Vec::new()
     };
@@ -11934,13 +11934,7 @@ impl ServerImpl {
     /// another partition: a subscription open/correlate/close, or a
     /// start-instance dispatch.
     fn is_routable_event(e: &Event) -> bool {
-        matches!(
-            e,
-            Event::MessageSubscriptionOpening { .. }
-                | Event::RemoteMessageCorrelation { .. }
-                | Event::MessageSubscriptionClosing { .. }
-                | Event::StartInstanceDispatched { .. }
-        )
+        e.is_routable()
     }
 
     /// The cross-partition follow-ups carried in `events`, cloned for routing.
@@ -12348,6 +12342,8 @@ impl ServerImpl {
     /// re-recorded by the pump, so attempts are unbounded. Entries are grouped
     /// by target partition and the groups run concurrently (serial within a
     /// group), so a stalled partition's backlog never delays a healthy one.
+    /// The same pass re-drives stalled ack-paced buffered deliveries (#1949,
+    /// [`Self::redrive_stalled_buffered_deliveries`]).
     async fn redrive_failed_opens(&self) {
         let num_partitions = self.engine.topology().num_partitions;
         let mut by_target: std::collections::BTreeMap<u64, Vec<(Event, Option<i64>)>> =
@@ -12375,6 +12371,50 @@ impl ServerImpl {
             if let Err(e) = group.await {
                 tracing::warn!("failed-open re-drive group failed: {e}");
             }
+        }
+        self.redrive_stalled_buffered_deliveries().await;
+    }
+
+    /// The ack-paced buffered deliveries (#1949) still awaiting their ack on
+    /// every partition this node writes (leads under Raft, owns otherwise),
+    /// plus the resume handshakes still owed after a deferral and the
+    /// answers whose settlement is still unseen (pinned receipts), rebuilt
+    /// from durable engine state.
+    async fn in_flight_buffered_deliveries(&self) -> Vec<Event> {
+        let topology = self.engine.topology();
+        let mut in_flight = Vec::new();
+        for p in 0..topology.num_partitions {
+            if self.partition_write_node(p) != topology.node_id {
+                continue;
+            }
+            let Some(handle) = self.engine_handle_for(p) else {
+                continue;
+            };
+            if let Some(events) = handle
+                .try_with(|journal| {
+                    let engine = journal.engine();
+                    let mut events = engine.pending_buffered_deliveries();
+                    events.extend(engine.pending_resume_handshakes());
+                    events.extend(engine.pending_unsettled_receipts());
+                    events
+                })
+                .await
+            {
+                in_flight.extend(events);
+            }
+        }
+        in_flight
+    }
+
+    /// Re-drives every buffered delivery still unacknowledged since the
+    /// previous pass (#1949, Copilot r4693719423): a delivery — or its ack —
+    /// lost to exhausted routing retries, a restart or a leader change would
+    /// otherwise leave the subscription awaiting an ack forever. The re-send
+    /// reuses the original delivery key, so it is idempotent end to end.
+    async fn redrive_stalled_buffered_deliveries(&self) {
+        let in_flight = self.in_flight_buffered_deliveries().await;
+        for event in self.stalled_deliveries.due(in_flight) {
+            self.drive_subscription_routing(vec![event], None).await;
         }
     }
 
@@ -12503,6 +12543,7 @@ impl ServerImpl {
                 kind,
                 variables,
                 delivery_key,
+                ack_partition,
             } => {
                 let target = nanobpmn_engine_core::partition_of(*instance_key);
                 let command = Command::CorrelateMessageSubscription {
@@ -12514,9 +12555,74 @@ impl ServerImpl {
                     kind: kind.clone(),
                     variables: variables.clone(),
                     delivery_key: *delivery_key,
+                    ack_partition: *ack_partition,
                 };
                 Some((target, command))
             }
+            // The instance partition's ack of an ack-paced buffered delivery
+            // (#1874) goes back to the message partition that awaits it.
+            Event::MessageCorrelationAcknowledging {
+                subscription_key,
+                message_key,
+                accepted,
+                consumed,
+                deferred,
+                target_partition,
+                delivery_key,
+                ..
+            } => Some((
+                *target_partition,
+                Command::AcknowledgeMessageCorrelation {
+                    subscription_key: *subscription_key,
+                    message_key: *message_key,
+                    delivery_key: *delivery_key,
+                    accepted: *accepted,
+                    consumed: *consumed,
+                    deferred: *deferred,
+                },
+            )),
+            // The resume handshake (#1949) goes to the subscription's message
+            // partition, which re-offers its buffered backlog.
+            Event::MessageSubscriptionResuming {
+                subscription_key,
+                correlation_key,
+                generation,
+                ..
+            } => Some((
+                nanobpmn_engine_core::subscription_partition(correlation_key, num_partitions),
+                Command::ResumeMessageSubscription {
+                    subscription_key: *subscription_key,
+                    generation: *generation,
+                },
+            )),
+            // Its confirmation (#1949) goes back to the instance's partition,
+            // ending the handshake re-drive.
+            Event::MessageSubscriptionResumed {
+                subscription_key,
+                instance_key,
+                generation,
+                ..
+            } => Some((
+                nanobpmn_engine_core::partition_of(*instance_key),
+                Command::ConfirmMessageSubscriptionResume {
+                    subscription_key: *subscription_key,
+                    generation: *generation,
+                },
+            )),
+            // The message partition's settlement of an ack (#1949) goes back
+            // to the instance's partition (the subscription key was minted
+            // there), unpinning the delivery's receipt.
+            Event::MessageCorrelationSettled {
+                subscription_key,
+                delivery_key,
+                ..
+            } => Some((
+                nanobpmn_engine_core::partition_of(*subscription_key),
+                Command::SettleMessageCorrelationReceipt {
+                    subscription_key: *subscription_key,
+                    delivery_key: *delivery_key,
+                },
+            )),
             Event::MessageSubscriptionClosing {
                 subscription_key,
                 instance_key,
@@ -12609,7 +12715,19 @@ impl ServerImpl {
     /// is NOT idempotent — the single source of truth is
     /// [`Command::routed_delivery_key`].
     fn routed_command_is_idempotent(command: &Command) -> bool {
+        // An ack (#1874) is idempotent by content: the message partition
+        // applies it only while that subscription awaits that exact delivery
+        // (message AND delivery key, #1949).
+        // A resume handshake (#1949) only re-offers an open, non-awaiting
+        // subscription its backlog, so a repeat is harmless too.
         command.routed_delivery_key().is_some()
+            || matches!(
+                command,
+                Command::AcknowledgeMessageCorrelation { .. }
+                    | Command::ResumeMessageSubscription { .. }
+                    | Command::ConfirmMessageSubscriptionResume { .. }
+                    | Command::SettleMessageCorrelationReceipt { .. }
+            )
     }
 
     /// Removes the routable follow-ups from a proposal result whose detached
@@ -21916,7 +22034,10 @@ impl ServerImpl {
     /// a cluster-variable create — sticky even after every variable is deleted,
     /// because the retained log/snapshot still carries those records — and
     /// `message-buffering-v1` (#1874) once any hosted partition has EVER
-    /// buffered a message (sticky across expiry, compaction and restart).
+    /// buffered a message (sticky across expiry, compaction and restart), and
+    /// `message-correlation-ack-v1` (#1949) once any hosted partition has EVER
+    /// sent an ack-paced remote buffered delivery (its snapshot carries the
+    /// in-flight `awaiting_ack` state a legacy peer would drop).
     ///
     /// `None` = UNKNOWN: some partition's engine actor is dead or did not answer
     /// within [`ENGINE_HEALTH_PROBE_BOUND`]. The probe is bounded and uses
@@ -21928,7 +22049,7 @@ impl ServerImpl {
     async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
         use nano_falcon_protocol::cluster_join::{
             FEATURE_CLUSTER_VARIABLES as CV, FEATURE_MESSAGE_BUFFERING as MB,
-            FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
+            FEATURE_MESSAGE_CORRELATION_ACK as MCA, FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
         };
         // A single node never replicates its log to anyone, so its local state
         // places no requirement on a peer.
@@ -21937,7 +22058,7 @@ impl ServerImpl {
         }
         // Every feature the recovered/replicated state can depend on, each
         // with its one-way state predicate (sticky once observed).
-        const FEATURES: [&str; 3] = [LC, CV, MB];
+        const FEATURES: [&str; 4] = [LC, CV, MB, MCA];
         let mut required: Vec<&'static str> = FEATURES
             .into_iter()
             .filter(|f| self.peers.requires_feature(f))
@@ -21962,6 +22083,7 @@ impl ServerImpl {
                         engine.replicated_lenient_completion(),
                         engine.cluster_variables_ever_used(),
                         engine.message_buffering_ever_used(),
+                        engine.message_correlation_ack_required(),
                     ]
                 }),
             )
@@ -23147,20 +23269,7 @@ impl ServerImpl {
         {
             produced = true;
             if multi_partition {
-                routable.extend(
-                    resp.events
-                        .iter()
-                        .filter(|e| {
-                            matches!(
-                                e,
-                                Event::MessageSubscriptionOpening { .. }
-                                    | Event::RemoteMessageCorrelation { .. }
-                                    | Event::MessageSubscriptionClosing { .. }
-                                    | Event::StartInstanceDispatched { .. }
-                            )
-                        })
-                        .cloned(),
-                );
+                routable.extend(resp.events.iter().filter(|e| e.is_routable()).cloned());
             }
         }
         if jobs_due {
@@ -23905,13 +24014,7 @@ impl ServerImpl {
                     let routable: Vec<Event> = events
                         .iter()
                         .filter(|e| {
-                            matches!(
-                                e,
-                                Event::MessageSubscriptionOpening { .. }
-                                    | Event::RemoteMessageCorrelation { .. }
-                                    | Event::MessageSubscriptionClosing { .. }
-                                    | Event::StartInstanceDispatched { .. }
-                            )
+                            e.is_routable()
                         })
                         .cloned()
                         .collect();
@@ -27486,6 +27589,20 @@ enum PreparedActivation {
 /// path — both keep the per-node legacy host flag instead.
 fn local_lenient_reconcile(topology: &cluster::Topology, policy: ActivationPolicy) -> bool {
     topology.is_single_node() && policy.may_be_leader_local()
+}
+
+/// The non-Raft cluster-wide rolling-upgrade gate for ack-paced remote
+/// buffered delivery (#1949, ADR 0066): on only when EVERY other cluster
+/// member is known to advertise `message-correlation-ack-v1` (an unreachable
+/// or unknown member fails closed). A single node is trivially on.
+async fn remote_buffered_delivery_gate(
+    topology: &cluster::Topology,
+    peers: &peer::PeerSet,
+) -> bool {
+    topology.is_single_node()
+        || peers
+            .all_peers_support(nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK)
+            .await
 }
 
 fn reconcile_lenient_completion_local(journal: &mut Journal, lenient: bool, now: u64) {
@@ -32105,11 +32222,18 @@ async fn main() {
                         tick_server.engine.topology(),
                         tick_server.activation_policy,
                     );
+                    let remote_delivery = remote_buffered_delivery_gate(
+                        tick_server.engine.topology(),
+                        &tick_server.peers,
+                    )
+                    .await;
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
                             // Without Raft this journal is the partition's only
                             // replica: reconcile the lenient flag directly (#1661).
                             reconcile_lenient_completion_local(journal, lenient, now);
+                            // The cluster-wide #1949 capability gate (ADR 0066).
+                            journal.set_remote_buffered_delivery(remote_delivery);
                             let (fired, commit) = journal.trigger_timers(now);
                             // Fire-and-forget tick: nothing reads disk after it and
                             // follow-ups are re-derived from engine state (#1855).
@@ -32137,13 +32261,7 @@ async fn main() {
                                 fired
                                     .iter()
                                     .filter(|e| {
-                                        matches!(
-                                            e,
-                                            Event::MessageSubscriptionOpening { .. }
-                                                | Event::RemoteMessageCorrelation { .. }
-                                                | Event::MessageSubscriptionClosing { .. }
-                                                | Event::StartInstanceDispatched { .. }
-                                        )
+                                        e.is_routable()
                                     })
                                     .cloned()
                                     .collect()
@@ -34013,6 +34131,75 @@ mod clustered_startup_tests {
             .blocking_wait();
         assert!(
             journal.engine().message_buffering_ever_used(),
+            "precondition"
+        );
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(!server.peers.requires_feature(F), "precondition");
+        let _transport = server.raft_transport_for_start().await;
+        assert!(server.peers.requires_feature(F));
+        assert_eq!(server.required_cluster_features().await, Some(vec![F]));
+    }
+
+    /// #1949 cluster-wide capability gate (ADR 0066), non-Raft path: a
+    /// multi-node cluster keeps remote ack-paced delivery OFF while any member
+    /// is not known to advertise `message-correlation-ack-v1` (here: both
+    /// peers unreachable, i.e. unknown — fails closed); a single node is on.
+    #[tokio::test]
+    async fn remote_buffered_delivery_gate_fails_closed_on_an_unknown_member() {
+        let multi = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 2,
+            replication_factor: 1,
+        };
+        let peers = peer::PeerSet::new(multi.clone());
+        assert!(!remote_buffered_delivery_gate(&multi, &peers).await);
+        let single = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://127.0.0.1:1".to_string()],
+            num_partitions: 2,
+            replication_factor: 1,
+        };
+        let peers = peer::PeerSet::new(single.clone());
+        assert!(remote_buffered_delivery_gate(&single, &peers).await);
+    }
+
+    /// #1949: a node whose recovered state has EVER sent an ack-paced remote
+    /// buffered delivery must require `message-correlation-ack-v1` from every
+    /// peer after restart/compaction — the AppendEntries-only gate cannot see
+    /// compacted entries, and the snapshot carries `awaiting_ack` state a
+    /// legacy peer would silently drop.
+    #[tokio::test]
+    async fn raft_start_requires_message_correlation_ack_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK as F;
+        let journal = Journal::in_memory_from_events(
+            0,
+            vec![Event::RemoteMessageCorrelation {
+                subscription_key: 1,
+                message_key: 2,
+                instance_key: 3,
+                element_instance_key: 4,
+                element_id: "catch".into(),
+                kind: nanobpmn_engine_core::MessageSubscriptionKind::IntermediateCatch,
+                variables: Default::default(),
+                delivery_key: 5,
+                ack_partition: Some(0),
+            }],
+        );
+        assert!(
+            journal.engine().message_correlation_ack_ever_used(),
             "precondition"
         );
         let topology = cluster::Topology {
@@ -46210,8 +46397,17 @@ mod clustered_startup_tests {
             "every replica holds the replicated flag: {upgraded:?}"
         );
 
-        // A featureless (pre-#1661) binary is now refused at join.
-        assert_eq!(n0.required_cluster_features().await, Some(vec![F]));
+        // A featureless (pre-#1661) binary is now refused at join. The
+        // upgrade also opened the cluster-wide #1949 gate, so the entries
+        // committed since carry ack-paced remote delivery and require that
+        // capability too (one-way, like lenience).
+        assert_eq!(
+            n0.required_cluster_features().await,
+            Some(vec![
+                F,
+                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK
+            ])
+        );
         assert!(
             n0.peers.requires_feature(F),
             "outbound dials require it too"
@@ -53905,6 +54101,22 @@ mod subscription_placement_tests {
             crate::publication_gate::GateWait::TimedOut,
             "the create's subscription open must be routed before the baseline"
         );
+        // Likewise the resume's handshake (#1949) is routed to the message
+        // partition asynchronously; wait for its confirmation record so it
+        // cannot fall into the post-cancel suffix either.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !read_journal().values().flatten().any(|r| {
+            matches!(
+                &r.event,
+                Event::MessageSubscriptionResumed { instance_key: k, .. } if *k == instance_key
+            )
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resume handshake was never confirmed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let before_cancel: std::collections::BTreeMap<_, usize> = read_journal()
             .into_iter()
             .map(|(p, recs)| (p, recs.len()))
@@ -55374,6 +55586,134 @@ mod subscription_placement_tests {
         );
     }
 
+    /// #1949 (Copilot r4693719423): an ack-paced buffered delivery lost to
+    /// exhausted routing retries must not leave the subscription awaiting an
+    /// ack forever. The in-flight delivery is durable message-partition state;
+    /// the background re-drive re-sends it (same delivery key) once it has
+    /// been in flight for a full pass, and the instance completes.
+    #[tokio::test]
+    async fn lost_buffered_delivery_is_redriven_in_the_background() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+        let create_partition = server.engine.for_create().stats().partition;
+        let order = cross_partition_order(create_partition);
+        let num_partitions = server.engine.topology().num_partitions;
+        let message_partition =
+            nanobpmn_engine_core::subscription_partition(&order, num_partitions);
+        // A buffered message waits on the message partition (applied there
+        // directly: the REST publish does not carry a TTL yet).
+        let RoutedApply::Applied(buffered) = server
+            .apply_routed_command(
+                message_partition,
+                Command::CorrelateMessage {
+                    message_name: "payment-received".into(),
+                    correlation_key: order.clone(),
+                    variables: Default::default(),
+                    business_id: None,
+                    message_key: None,
+                    time_to_live: Some(3_600_000),
+                    message_id: None,
+                },
+                None,
+            )
+            .await
+        else {
+            panic!("the publish applies on the message partition");
+        };
+        assert!(
+            buffered
+                .iter()
+                .any(|e| matches!(e, Event::MessageBuffered { .. })),
+            "{buffered:?}"
+        );
+        // The open fails to route; deliver it by hand and DROP the buffered
+        // delivery it produces — a send lost to exhausted retries.
+        server
+            .fail_routing_pump_for_test
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let instance = create_await_payment_detached(&server, &order).await;
+        for _ in 0..100 {
+            if server.failed_opens.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let open = server.failed_opens.queued().pop().expect("the failed open");
+        server
+            .fail_routing_pump_for_test
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (target, command) =
+            ServerImpl::route_event(&open, num_partitions).expect("a routed open");
+        assert_eq!(target, message_partition);
+        let RoutedApply::Applied(produced) =
+            server.apply_routed_command(target, command, None).await
+        else {
+            panic!("the open applies on the message partition");
+        };
+        assert!(
+            produced.iter().any(|e| matches!(
+                e,
+                Event::RemoteMessageCorrelation {
+                    ack_partition: Some(_),
+                    ..
+                }
+            )),
+            "the open sends the buffered message: {produced:?}"
+        );
+        assert_eq!(server.in_flight_buffered_deliveries().await.len(), 1);
+
+        // A fresh in-flight delivery is not re-sent on the first pass…
+        server.redrive_stalled_buffered_deliveries().await;
+        let message_engine = server.engine_handle_for(message_partition).unwrap();
+        let instance_engine = server
+            .engine_handle_for(nanobpmn_engine_core::partition_of(instance))
+            .unwrap();
+        assert!(
+            instance_engine
+                .with(move |journal| journal
+                    .engine()
+                    .instance(instance)
+                    .is_some_and(|i| i.state == ProcessInstanceState::Active))
+                .await,
+            "the instance still waits after the first pass"
+        );
+        // …but one still unacknowledged on the next pass is, and settles.
+        server.redrive_stalled_buffered_deliveries().await;
+        // Observe completion through the read model, not hot engine state: once
+        // the instance completes and its receipt settles, the owner evicts the
+        // terminal instance from the engine, where `is_completed` then reads
+        // `false` for an instance that DID complete.
+        let mut completed = false;
+        for _ in 0..500 {
+            completed = server
+                .store
+                .process_instance(instance)
+                .is_some_and(|r| r.state == ProcessInstanceState::Completed);
+            if completed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(completed, "the re-driven delivery completed the instance");
+        assert!(server.in_flight_buffered_deliveries().await.is_empty());
+        assert!(
+            message_engine
+                .with(|journal| journal
+                    .engine()
+                    .state()
+                    .message_subscriptions
+                    .values()
+                    .all(|s| s.awaiting_ack.is_none()))
+                .await
+        );
+    }
+
     /// Two sequential message catches on the same correlation key, under the
     /// `await-payment` process id so [`create_await_payment_detached`] drives it:
     /// correlating the first produces the second catch's open mid-cascade.
@@ -55849,13 +56189,15 @@ mod subscription_placement_tests {
 
     /// End-to-end #1874 (multi-partition): three messages are BUFFERED on the
     /// correlation key's partition, then an instance on ANOTHER partition opens
-    /// a message event sub-process subscription. Buffered correlation is
-    /// LOCAL-ONLY in this slice (remote drain is #1949): once the routed open
-    /// is durable on the buffer's partition, the remote subscription must take
-    /// NOTHING from the buffer. Returns the `seq` variable each `handle` job
+    /// a message event sub-process subscription, which the buffer's partition
+    /// drains through ack-paced remote deliveries (#1949). Waits until
+    /// `expected` `handle` jobs exist, then returns the `seq` variable each
     /// saw and — per buffered message, in publish order — how many instances
     /// it has correlated to.
-    async fn drain_buffered_backlog_remotely(interrupting: bool) -> (Vec<Value>, Vec<usize>) {
+    async fn drain_buffered_backlog_remotely(
+        interrupting: bool,
+        expected: usize,
+    ) -> (Vec<Value>, Vec<usize>) {
         let server = single_node_multi_partition();
         let process_id = if interrupting {
             "drain-int"
@@ -55987,7 +56329,14 @@ mod subscription_placement_tests {
         })
         .await
         .expect("the routed subscription open reaches the buffer's partition");
-        // Let any (wrong) remote delivery land before asserting none did.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handle_jobs().await.len() < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the ack-paced remote drain delivers the backlog");
+        // Let any extra (wrong) delivery land before asserting none did.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let seen = handle_jobs().await;
         let correlated = sub_engine
@@ -56003,22 +56352,23 @@ mod subscription_placement_tests {
         (seen, correlated)
     }
 
-    /// #1874: a REMOTE non-interrupting (persistent) subscription takes
-    /// nothing from the buffer (local-only correlation; remote drain #1949).
+    /// #1949: a REMOTE non-interrupting (persistent) subscription drains the
+    /// whole buffered backlog, one ack-paced delivery at a time, in publish
+    /// order — each message consumed exactly once.
     #[tokio::test]
-    async fn remote_persistent_subscription_leaves_buffer_untouched() {
-        let (seen, correlated) = drain_buffered_backlog_remotely(false).await;
-        assert!(seen.is_empty(), "no remote delivery: {seen:?}");
-        assert_eq!(correlated, vec![0, 0, 0]);
+    async fn remote_persistent_subscription_drains_the_backlog_in_order() {
+        let (seen, correlated) = drain_buffered_backlog_remotely(false, 3).await;
+        assert_eq!(seen, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert_eq!(correlated, vec![1, 1, 1]);
     }
 
-    /// #1874: a REMOTE interrupting subscription takes nothing from the
-    /// buffer either; every message stays buffered, uncorrelated.
+    /// #1949: a REMOTE interrupting subscription takes exactly the oldest
+    /// buffered message; the rest stay buffered, uncorrelated.
     #[tokio::test]
-    async fn remote_interrupting_subscription_leaves_buffer_untouched() {
-        let (seen, correlated) = drain_buffered_backlog_remotely(true).await;
-        assert!(seen.is_empty(), "no remote delivery: {seen:?}");
-        assert_eq!(correlated, vec![0, 0, 0]);
+    async fn remote_interrupting_subscription_takes_exactly_the_oldest() {
+        let (seen, correlated) = drain_buffered_backlog_remotely(true, 1).await;
+        assert_eq!(seen, vec![Value::Int(1)]);
+        assert_eq!(correlated, vec![1, 0, 0]);
     }
 
     /// #1604 (crash recovery): if a single-node server crashes AFTER the
@@ -56284,6 +56634,29 @@ mod subscription_placement_tests {
             .collect();
         assert_eq!(picks, vec![1, 3, 1, 3]);
         assert_eq!(ServerImpl::rotate_replica(&[2], 2, 0), None);
+    }
+
+    /// #1949: the message partition's resume confirmation is routed back
+    /// to the INSTANCE's partition (not the subscription's), as an
+    /// idempotent `ConfirmMessageSubscriptionResume`.
+    #[test]
+    fn resume_confirmation_routes_to_the_instance_partition() {
+        let instance_key = (3u64 << nanobpmn_engine_core::LOCAL_BITS) | 7;
+        let resumed = Event::MessageSubscriptionResumed {
+            subscription_key: instance_key + 1,
+            instance_key,
+            partition: 1,
+            generation: 4,
+        };
+        assert!(ServerImpl::is_routable_event(&resumed));
+        let (target, command) = ServerImpl::route_event(&resumed, 4).expect("routable");
+        assert_eq!(target, 3);
+        assert!(matches!(
+            command,
+            Command::ConfirmMessageSubscriptionResume { subscription_key, generation }
+                if subscription_key == instance_key + 1 && generation == 4
+        ));
+        assert!(ServerImpl::routed_command_is_idempotent(&command));
     }
 
     /// #1582: only keyed (deduped) routed commands may have their proposal
