@@ -386,6 +386,12 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             target_partition,
             ..
         } => {
+            // Answering a paced delivery is capability use on the RECEIVING
+            // side too (Copilot r4702895398): a destination that never applied
+            // an enabling envelope must still keep its resume gate open, or the
+            // handshake for this deferral is suppressed. Durable (snapshot and
+            // replay) and one-way, like the sending side's flag.
+            state.message_correlation_ack_used = true;
             // Only the delivery's FIRST answer moves the resume state: a
             // re-emitted duplicate (original receipt, or one recomputed after
             // settlement) must not clear a newer deferral or pending resume.

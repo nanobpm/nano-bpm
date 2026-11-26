@@ -1197,6 +1197,16 @@ fn build_event_witnesses() -> Vec<Event> {
         },
         // #1949 activation latch record (additive variant).
         Event::RemoteBufferedDeliveryActivated { partition: 1 },
+        // #1949 receipt settlement (additive variants).
+        Event::MessageCorrelationSettled {
+            subscription_key: 21,
+            delivery_key: 26,
+            partition: 1,
+        },
+        Event::MessageCorrelationReceiptSettled {
+            subscription_key: 21,
+            delivery_key: 26,
+        },
         Event::MessageCorrelationAcknowledged {
             subscription_key: 21,
             message_key: 20,

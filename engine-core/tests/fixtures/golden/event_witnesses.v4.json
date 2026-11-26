@@ -153,6 +153,19 @@
     }
   },
   {
+    "MessageCorrelationSettled": {
+      "delivery_key": 26,
+      "partition": 1,
+      "subscription_key": 21
+    }
+  },
+  {
+    "MessageCorrelationReceiptSettled": {
+      "delivery_key": 26,
+      "subscription_key": 21
+    }
+  },
+  {
     "MessageCorrelationAcknowledged": {
       "accepted": false,
       "consumed": false,

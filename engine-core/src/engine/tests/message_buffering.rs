@@ -2096,6 +2096,41 @@ fn resume_handshake_is_gated_off_in_a_mixed_version_cluster() {
     assert_eq!(rig.message.state().buffered_messages.len(), 1);
 }
 
+/// #1949 (Copilot r4702895398): the SOURCE partition enabled paced delivery
+/// but the destination never applied an enabling envelope. The destination
+/// answers (defers) a paced delivery, so it has used the capability: its
+/// resume gate must honour that durably (live and after replay), or the
+/// resume handshake is suppressed and the backlog strands.
+#[test]
+fn a_never_enabled_destination_that_deferred_still_resumes() {
+    let (mut rig, order) = Rig::new(non_interrupting_esp_process());
+    rig.instance.set_remote_buffered_delivery(false);
+    rig.message.set_remote_buffered_delivery(true);
+    rig.publish_backlog(&order, 1);
+    let (instance_key, _) = create_suspended(&mut rig, &order, &|_| false);
+    assert!(rig.trace.iter().any(|e| matches!(
+        e,
+        Event::MessageCorrelationAcknowledging { deferred: true, .. }
+    )));
+    assert!(
+        rig.instance.message_correlation_ack_required(),
+        "answering a paced delivery is capability usage"
+    );
+    let mut replayed = state::State::default();
+    for e in &rig.instance_journal {
+        state::apply(&mut replayed, e);
+    }
+    assert!(
+        replayed.message_correlation_ack_used,
+        "durable across replay"
+    );
+    let before = rig.trace.len();
+    rig.run(false, Command::ResumeInstance { instance_key }, 3_000);
+    assert!(rig.trace[before..]
+        .iter()
+        .any(|e| matches!(e, Event::MessageSubscriptionResuming { .. })));
+}
+
 /// #1949 reservation release on subscription close: the instance is
 /// cancelled while a delivery is in flight; the late delivery is answered
 /// unconsumed, the reservation is released, and the message is never

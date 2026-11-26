@@ -940,6 +940,14 @@ impl Engine {
         self.remote_buffered_delivery_active()
     }
 
+    /// The effective gate: the envelope's setting OR the durable decision,
+    /// re-derived at every use so capability usage recorded by an apply
+    /// mid-envelope (e.g. this partition answering a paced delivery, Copilot
+    /// r4702895398) opens the gate at once, not only at the next envelope.
+    fn remote_buffered_delivery_gate(&self) -> bool {
+        self.remote_buffered_delivery || self.remote_buffered_delivery_active()
+    }
+
     /// The durable gate decision: latched on, or ack-paced delivery used.
     fn remote_buffered_delivery_active(&self) -> bool {
         self.state.remote_buffered_delivery_latched || self.message_correlation_ack_ever_used()
@@ -8148,7 +8156,7 @@ impl Engine {
     /// subscription is answered without deferral. Empty while
     /// remote buffered delivery is off. Ordered by subscription key.
     pub fn pending_resume_handshakes(&self) -> Vec<Event> {
-        if !self.remote_buffered_delivery {
+        if !self.remote_buffered_delivery_gate() {
             return Vec::new();
         }
         self.state
@@ -8218,7 +8226,7 @@ impl Engine {
         // Rolling-upgrade gate (#1949): until every replica can apply
         // ack-paced delivery, a remote subscription takes nothing (the
         // pre-#1949 local-only behaviour) — the message stays buffered.
-        if !local && !self.remote_buffered_delivery {
+        if !local && !self.remote_buffered_delivery_gate() {
             return false;
         }
         let Some(message) = self.next_buffered_candidate(subscription_key, now) else {
@@ -8381,7 +8389,7 @@ impl Engine {
             match s.state {
                 state::MessageSubscriptionState::Open => self.buffer_requeue.push_back(s.key),
                 state::MessageSubscriptionState::Opening
-                    if self.remote_buffered_delivery
+                    if self.remote_buffered_delivery_gate()
                         && state::subscription_partition(
                             &s.correlation_key,
                             self.num_partitions,

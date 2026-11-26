@@ -7704,6 +7704,14 @@ fn project_event(
                      WHERE instance_key = ?1 AND element_id = ?2",
                     params![ik, source_id, t],
                 )?;
+                // In-flight ack-paced captures (#1949) are live waits too: a
+                // delivery reserved before the migration is consumed on the
+                // MAPPED element, so its history must record that id.
+                tx.cexecute(
+                    "UPDATE paced_message_correlations SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2",
+                    params![ik, source_id, t],
+                )?;
             }
 
             // Phase B — resolve temp ids to the target id + re-home the
@@ -7776,6 +7784,11 @@ fn project_event(
                 // definition identity, so only the element id moves).
                 tx.cexecute(
                     "UPDATE message_subscriptions SET element_id = ?2 \
+                     WHERE instance_key = ?1 AND element_id = ?3",
+                    params![ik, target_id, t],
+                )?;
+                tx.cexecute(
+                    "UPDATE paced_message_correlations SET element_id = ?2 \
                      WHERE instance_key = ?1 AND element_id = ?3",
                     params![ik, target_id, t],
                 )?;
@@ -13576,6 +13589,55 @@ mod element_instance_tests {
         assert_eq!(corr[0].message_key, 31);
         assert_eq!(corr[0].element_instance_key, TASK_EI);
         assert_eq!(corr[0].message_name, "OrderPlaced");
+        assert_eq!(paced_in_flight(&store), 0);
+    }
+
+    /// #1949 (Copilot r4703349799): reserve -> migrate -> deliver ->
+    /// acknowledge. The continuation consumes the message on the MAPPED
+    /// element, so the captured metadata must re-home with the migration and
+    /// the history must record the target element id.
+    #[test]
+    fn ack_paced_history_records_the_migrated_element_id() {
+        let store = ReadStore::open(None).unwrap();
+        let target = ProcessBuilder::new("p2")
+            .start_event("s2")
+            .message_intermediate_catch_event("await2", "OrderPlaced", "=orderId")
+            .end_event("e2")
+            .connect("s2", "await2")
+            .connect("await2", "e2")
+            .build()
+            .unwrap();
+        let target_key: u64 = 601;
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::ProcessDeployed {
+                    deployment_key: 2,
+                    process_definition_key: target_key,
+                    version: 3,
+                    process: target,
+                },
+                &paced_sub_created(3401),
+                &paced_delivery(3401, 41),
+                &Event::ProcessInstanceMigrated {
+                    instance_key: INST,
+                    target_process_id: "p2".to_string(),
+                    target_process_definition_key: target_key,
+                    element_mappings: vec![("await".to_string(), "await2".to_string())],
+                    migrated_flow_scopes: vec![],
+                    subscriptions: vec![],
+                    child_instances: vec![],
+                    join_scoped: true,
+                    compensation_subscriptions: vec![],
+                    compensation_migrated: true,
+                },
+                &paced_ack(3401, 41, false, true),
+            ])
+            .unwrap();
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].element_id, "await2");
         assert_eq!(paced_in_flight(&store), 0);
     }
 
