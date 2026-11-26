@@ -3,8 +3,8 @@
 # NOT a PR gate — never a required check (not in branch protection /
 # .mergify.yml). The harnesses are bounded to fit a GitHub-hosted runner with
 # headroom: check.sh boxes each one in wall time (KANI_HARNESS_TIMEOUT) and
-# fails it when its peak RSS exceeds KANI_MAX_RSS_PCT (60%) of runner memory,
-# reporting peak RSS and wall time per harness.
+# kills it (memguard.sh, a hard cap) the moment its RSS crosses
+# KANI_MAX_RSS_PCT (60%) of runner memory, reporting peak RSS and wall time.
 #
 # A failing harness never goes silent: the scheduled run files an issue per
 # failure signature (class + harness + failed check), and comments on the open
@@ -85,6 +85,10 @@ jobs:
         uses: ./.github/actions/build-tools
         with:
           apt: time
+      # The hard memory cap must actually fire (#2040): a deliberately
+      # oversized workload has to be killed with a clean, reported failure.
+      - name: Memory cap self-check
+        run: formal/kani/memguard-selftest.sh
       - name: Kani proof (timed, memory-bounded)
         env:
           KANI_REQUIRE_RSS: '1'
@@ -129,7 +133,10 @@ jobs:
   report:
     name: kani (report failures)
     needs: [harnesses, kani]
-    if: always() && github.event_name != 'pull_request' && (needs.harnesses.result != 'success' || needs.kani.result != 'success')
+    # Runs on every non-success outcome — including a leg cancelled or lost
+    # with its runner (#2040) — and on PRs too, where it only summarises and
+    # fails (never files issues).
+    if: always() && (needs.harnesses.result != 'success' || needs.kani.result != 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -148,7 +155,9 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           HARNESSES_JSON: ${{ needs.harnesses.outputs.list }}
+          EVENT: ${{ github.event_name }}
         run: |
+          failures=0
           # Fail closed: if the harness list itself could not be derived, file
           # that as a failure rather than reporting nothing.
           HARNESSES="$(jq -r '.[]' <<<"${HARNESSES_JSON:-[]}" 2>/dev/null || true)"
@@ -162,6 +171,12 @@ jobs:
             fi
             [[ "$class" == pass ]] && continue
             harness="${harness:-$h}"; detail="${detail:-unknown}"
+            failures=$((failures + 1))
+            echo "- kani \`$harness\`: **$class** (\`$detail\`)" >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$EVENT" == pull_request ]]; then
+              echo "::error::kani $harness $class ($detail)"
+              continue
+            fi
             sig="$(printf '%s %s %s' "$class" "$harness" "$detail" | sha256sum | cut -c1-12)"
             marker="<!-- kani-signature:${sig} -->"
             # shellcheck disable=SC2016 # backticks are literal Markdown
@@ -175,3 +190,5 @@ jobs:
               gh issue create --title "kani: ${harness} ${class} (signature ${sig})" --body "$body"
             fi
           done
+          # A PR preview never files issues, so it must at least go red.
+          if [[ "$EVENT" == pull_request && $failures -gt 0 ]]; then exit 1; fi

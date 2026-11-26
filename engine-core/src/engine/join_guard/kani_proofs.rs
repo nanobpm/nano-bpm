@@ -25,7 +25,10 @@ fn any_edge() -> (usize, usize) {
 }
 
 #[kani::proof]
-#[kani::unwind(4)]
+// Unwind 3 is complete for this graph: the BFS runs at most `NODES` = 2 rounds
+// and every other loop at most 2 iterations (Kani's unwinding assertions
+// check it). Unwind 4 blew past 7 GiB and killed the hosted runner (#2040).
+#[kani::unwind(3)]
 fn join_ready_kernel_total_and_exact() {
     let succ: Vec<Vec<(usize, usize)>> = vec![vec![any_edge()], vec![any_edge()]];
     let taken: [u32; 2] = [kani::any(), kani::any()];

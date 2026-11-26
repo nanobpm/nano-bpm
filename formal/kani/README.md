@@ -16,7 +16,7 @@ Harnesses are compiled only under `cfg(kani)` (declared in
 | `flow_arrivals_preserve_join_invariant` | `engine-core/src/state/kani_proofs.rs` | Any interleaving of join arrivals (`record`/`add`) and firings (`consume_one_each`) keeps every stored token count positive, entries strictly sorted (one per flow), conserves tokens, never under/overflows. Restates the `TokenFlow.tla` join invariant. Proven over `BoundedArrivals` (fixed-array stand-in, `kani_model.rs`). | 3 ops over 2 symbolic flows (the three-flow case is covered by the `kani_model.rs` refinement test, not by Kani), checked against a ghost count per flow, `add` ≤ 2 tokens; a firing (as in the engine) only once every flow holds a token |
 | `job_index_resync_keeps_lockstep` | `engine-core/src/state/kani_proofs.rs` | The `resync_job_index` algorithm — the one index maintainer every job applier arm calls after a state change — keeps `activatable_jobs`, `deferred_jobs` / `deferred_job_deadlines` and `activated_jobs` in lockstep with the job across any two consecutive changes to any of the six job states, with or without a retry backoff (any deadline), at any priority. Proven over `JobIndexes` (bounded-set stand-in, `kani_model.rs`), which shares the membership decision `job_index_membership` with production. | 2 transitions from a `Created` job |
 | `parallel_join_fires_only_when_every_flow_taken` | `engine-core/src/state/kani_proofs.rs` | The parallel-diamond join (`P2`, two incoming flows) under the guard `Engine::activate_join` applies: over any arrival order it fires exactly when both flows have been taken, once per full round (`fired == min(from_A, from_B)`), keeps the surplus, and is never left ready-but-waiting. Proven over `BoundedArrivals` (`kani_model.rs`); a `cover!` keeps the firing branch non-vacuous. | 3 arrivals |
-| `join_ready_kernel_total_and_exact` | `engine-core/src/engine/join_guard/kani_proofs.rs` | The pure join guard kernel `join_guard::join_ready` (#2010) — the code the Lean refinement proof `formal/lean/Refinement/Proof.lean` is about — never panics or overflows on any graph (including out-of-range targets/live nodes), saturates the Nano-only `unidentified` count, accepts whenever every incoming flow is accounted for, never accepts with no arrival, and for a parallel join accepts exactly when all flows arrived. Two `cover!`s keep the inclusive-accept-with-pending and still-waiting branches non-vacuous. Full functional equality with Zeebe is the Lean proof, not this harness. | 2 nodes, one symbolic out-edge each, 1 live source, 2 incoming flows, unwind 4 (3 nodes / unwind 5 was killed on the hosted runner) |
+| `join_ready_kernel_total_and_exact` | `engine-core/src/engine/join_guard/kani_proofs.rs` | The pure join guard kernel `join_guard::join_ready` (#2010) — the code the Lean refinement proof `formal/lean/Refinement/Proof.lean` is about — never panics or overflows on any graph (including out-of-range targets/live nodes), saturates the Nano-only `unidentified` count, accepts whenever every incoming flow is accounted for, never accepts with no arrival, and for a parallel join accepts exactly when all flows arrived. Two `cover!`s keep the inclusive-accept-with-pending and still-waiting branches non-vacuous. Full functional equality with Zeebe is the Lean proof, not this harness. | 2 nodes, one symbolic out-edge each, 1 live source, 2 incoming flows, unwind 3 (complete: BFS ≤ 2 rounds, ≤ 2 incoming; Kani's unwinding assertions hold). Cost: ~4.4 GiB peak RSS, ~2 min verification (`check.sh`, 4-core/16 GiB host). Unwind 4 exceeded 7 GiB and killed the hosted runner (#2040); 3 nodes / unwind 5 likewise. |
 | `inclusive_join_ready_iff_no_active_path` | `engine-core/src/engine/join_guard/kani_proofs.rs` | #2024: an inclusive join with at least one but not every incoming flow taken fires (`join_ready`) **iff** no live token can still reach an untaken incoming flow (checked against a closed-form reachability oracle, so CBMC runs one search); with every flow taken it fires regardless of live tokens, with none it never fires. Two `cover!`s keep the held-by-live-path and live-token-that-cannot-reach branches non-vacuous. | 2 nodes (node 1 = join), one symbolic edge out of node 0, 1 live source, 2 incoming flows, unwind 4 (same order of cost as `join_ready_kernel_total_and_exact`) |
 
 The earlier engine-level diamond harness (full deploy + create-instance through `Engine::apply_command`) did not prove inside the CI box — it needed unwind 24 over the whole command path — so it was replaced by the pure join transition above.
@@ -32,7 +32,7 @@ production through **every** operation sequence up to a bound (4 arrival ops
 over 3 flows; 3 job transitions over 6 states × 3 backoffs × 4 priorities) and
 assert identical observable state.
 
-All three harnesses declare `#[kani::unwind(4)]` (capacity-3 array loops + exit); `--default-unwind 3` covers anything else. Setting `KANI_UNWIND` passes `--unwind`, overriding every harness.
+The three `state` harnesses declare `#[kani::unwind(4)]` (capacity-3 array loops + exit); `join_ready_kernel_total_and_exact` declares `#[kani::unwind(3)]` (its loops run at most twice); `--default-unwind 3` covers anything else. Never raise an unwind beyond the loops' real bound: each extra round multiplies the formula (#2040). Setting `KANI_UNWIND` passes `--unwind`, overriding every harness.
 
 ## Running
 
@@ -52,16 +52,28 @@ Each harness is boxed by `check.sh`:
 
 - **Wall time:** `KANI_HARNESS_TIMEOUT` seconds (default 420: a ~2 min cold
   build plus ~5 min of verification).
-- **Memory:** peak RSS is measured with `/usr/bin/time -v` and printed with the
-  wall time (`kani <harness>: peak RSS <n> MiB, wall <s>s`). A harness whose
-  peak RSS exceeds `KANI_MAX_RSS_PCT` (default 60) percent of host memory
-  **fails even if it proved**, so a bound that fits only sometimes fails every
-  time instead of being OOM-killed on some runs.
+- **Memory (hard cap, #2040):** `KANI_MAX_RSS_PCT` (default 60) percent of
+  host memory is enforced *while the harness runs*: `formal/kani/memguard.sh`
+  runs it in its own process group, samples the group's RSS every second and
+  kills it the moment it crosses the cap, failing the leg cleanly with a
+  `memory` record (`kani <harness> killed at peak RSS …: over the hard cap`).
+  A post-exit check alone could never fire on a harness that exhausts memory,
+  because the OOM killer takes the runner down first and nothing is reported.
+  Peak RSS (exact via `/usr/bin/time -v` when installed, else the sample) is
+  printed with the wall time (`kani <harness>: peak RSS <n> MiB, wall <s>s`),
+  and a harness over the cap **fails even if it proved**.
+  `formal/kani/memguard-selftest.sh` (run in every leg before the harness)
+  proves the cap fires on a deliberately oversized workload.
 
 The per-run cost is in each leg's job summary. A harness that passes on one run
 and is killed on the next is a defect in the harness bound, not a flaky test:
 shrink its bound or replace it with a smaller transition rather than tuning
 the solver.
+
+The `report failures` job runs whenever any leg did not succeed — including
+a leg cancelled or lost with its runner, which uploads no outcome record and
+is reported as `timeout-or-lost`. On PR previews it writes the failures to the
+job summary and fails; only scheduled/dispatched runs file issues.
 
 A failing scheduled run files an issue titled `kani: <harness> <class>`, with a
 `<!-- kani-signature:… -->` marker built from the failure class
