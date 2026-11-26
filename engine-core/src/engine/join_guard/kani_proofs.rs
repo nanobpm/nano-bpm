@@ -57,8 +57,5 @@ fn join_ready_kernel_total_and_exact() {
         ready && arrived < incoming.len(),
         "an inclusive join accepts with a flow pending once no live path reaches it"
     );
-    kani::cover!(
-        !ready && arrived > 0,
-        "a join with an arrival still waits"
-    );
+    kani::cover!(!ready && arrived > 0, "a join with an arrival still waits");
 }
