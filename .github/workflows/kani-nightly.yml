@@ -32,6 +32,8 @@ on:
       - 'engine-core/src/engine/join_guard/kani_proofs.rs'
       - 'engine-core/src/engine/gateway_route.rs'
       - 'engine-core/src/engine/gateway_route/kani_proofs.rs'
+      - 'engine-core/src/engine/completion_step.rs'
+      - 'engine-core/src/engine/completion_step/kani_proofs.rs'
 
 permissions:
   contents: read

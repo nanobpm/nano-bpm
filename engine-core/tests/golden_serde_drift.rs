@@ -1175,6 +1175,8 @@ fn build_event_witnesses() -> Vec<Event> {
             partition: 0,
             target_partition: 1,
             delivery_key: 26,
+            // #2037 resolved post-migration consumption metadata (additive).
+            element_id: Some("b2".into()),
         },
         // #1949 resume handshake (additive variant).
         Event::MessageSubscriptionResuming {
@@ -1197,6 +1199,7 @@ fn build_event_witnesses() -> Vec<Event> {
         },
         // #1949 activation latch record (additive variant).
         Event::RemoteBufferedDeliveryActivated { partition: 1 },
+        Event::MessageCorrelationAckV2Activated { partition: 1 },
         // #1949 receipt settlement (additive variants).
         Event::MessageCorrelationSettled {
             subscription_key: 21,
@@ -1214,6 +1217,7 @@ fn build_event_witnesses() -> Vec<Event> {
             consumed: false,
             deferred: false,
             partition: 1,
+            element_id: Some("b2".into()),
         },
         // The #1497 routed-delivery ledger frame (additive variant, no version
         // bump): the recipient partition's dedup / close-tombstone record.

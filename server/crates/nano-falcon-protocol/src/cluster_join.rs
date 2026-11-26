@@ -103,6 +103,13 @@ pub const FEATURE_CANCEL_SUSPENDED_INSTANCE: &str = "cancel-suspended-instance-v
 /// entry carrying either never ships to a peer that does not advertise this.
 pub const FEATURE_MESSAGE_CORRELATION_ACK: &str = "message-correlation-ack-v1";
 
+/// Resolved consumption metadata on ack-paced acknowledgements (#2037): the
+/// ack carries the element the delivery was actually consumed at (after a
+/// migration between reservation and consumption). A v1 binary would drop the
+/// field, so the engine emits it only after a replicated, one-way latch that
+/// the leader enables once every member advertises this.
+pub const FEATURE_MESSAGE_CORRELATION_ACK_V2: &str = "message-correlation-ack-v2";
+
 /// Process-instance history deletion (#1948): this binary decodes and applies
 /// `Command::DeleteProcessInstanceHistory` / `Event::ProcessInstanceHistoryDeleted`.
 /// An older binary cannot decode either, so a gateway proposes the command only
@@ -122,6 +129,7 @@ pub const LOCAL_CLUSTER_FEATURES: &[&str] = &[
     FEATURE_MESSAGE_BUFFERING,
     FEATURE_CANCEL_SUSPENDED_INSTANCE,
     FEATURE_MESSAGE_CORRELATION_ACK,
+    FEATURE_MESSAGE_CORRELATION_ACK_V2,
     FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
 ];
 

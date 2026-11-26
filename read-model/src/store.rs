@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -75,6 +75,11 @@ const MESSAGE_START_SUBSCRIPTIONS_SCHEMA_VERSION: i64 = 15;
 /// A database migrated across it receives `0`; every existing row already
 /// reflects every event below the warm cursor, so the migration stamps it.
 const MESSAGE_START_POSITION_SCHEMA_VERSION: i64 = 16;
+/// The schema version that introduced the durable replay identity of an open
+/// message wait (`message_subscriptions.last_event_position`, #2037). A
+/// database migrated across it receives `0`; every existing row already
+/// reflects every event below the warm cursor, so the migration stamps it.
+const MESSAGE_SUBSCRIPTION_POSITION_SCHEMA_VERSION: i64 = 21;
 /// `meta` key flagging that `message_start_subscriptions` awaits an
 /// engine-state backfill (see [`ReadStore::backfill_pending_event_waits`]).
 const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
@@ -88,7 +93,7 @@ const MESSAGE_START_SUBSCRIPTIONS_BACKFILL_KEY: &str =
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 5412230291263395802;
+const SCHEMA_FINGERPRINT: i64 = -8245564130662199229;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -371,7 +376,12 @@ CREATE TABLE message_subscriptions (
     message_name           TEXT NOT NULL,
     correlation_key        TEXT NOT NULL,
     created_at_ms          INTEGER NOT NULL DEFAULT 0,
-    non_interrupting       INTEGER NOT NULL DEFAULT 0
+    non_interrupting       INTEGER NOT NULL DEFAULT 0,
+    -- journal position of the newest event the row reflects (its creation, or
+    -- the ack that re-pointed it, #2037; a migration stamps the shard cursor):
+    -- an event applies only from a strictly later position, so an
+    -- overlapping or out-of-order replay never regresses the element.
+    last_event_position    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
 CREATE TABLE message_start_subscriptions (
@@ -2501,6 +2511,9 @@ impl ReadStore {
                 [],
             )?;
         }
+        if stored_version.is_none_or(|v| v < MESSAGE_SUBSCRIPTION_POSITION_SCHEMA_VERSION) {
+            stamp_message_subscription_positions_to_cursor(conn)?;
+        }
         let new_version = stored_version.map_or(SCHEMA_VERSION, |v| v.max(SCHEMA_VERSION));
         conn.execute(
             "INSERT INTO meta (k, v) VALUES ('schema_version', ?1) \
@@ -2917,7 +2930,10 @@ impl ReadStore {
     pub fn stamp_job_positions_to_cursor(&self) -> rusqlite::Result<()> {
         let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        stamp_job_positions_to_cursor(&conn)
+        stamp_job_positions_to_cursor(&conn)?;
+        // The same floor for the open message waits (#2037) the reseed
+        // materialised, so an at-or-below-cursor ack never re-points them.
+        stamp_message_subscription_positions_to_cursor(&conn)
     }
 
     /// Caps retained *terminal* (Completed/Terminated) process instances at
@@ -5597,6 +5613,18 @@ fn stamp_job_positions_to_cursor(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Raises every open message wait's durable position floor to the shard's
+/// cursor (#2037): the v21 migration and the engine-state reseed, never per
+/// event (see [`stamp_job_positions_to_cursor`]).
+fn stamp_message_subscription_positions_to_cursor(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE message_subscriptions SET last_event_position = MAX(last_event_position, \
+         COALESCE((SELECT v FROM meta WHERE k = 'exported_position'), 0))",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Projects one journal `event` whose durable identity is `position` — its
 /// absolute, 1-based index in this shard's journal (#1347).
 fn project(
@@ -5626,6 +5654,28 @@ struct CorrelationHistory<'a> {
     element_id: &'a str,
     message_name: &'a str,
     correlation_key: &'a str,
+}
+
+/// #2037: the message shard never sees the owning instance's migration, so a
+/// retained open wait still names the pre-migration element. The ack carries
+/// the element the engine resolved; re-point the open wait to it — but only
+/// when the ack at journal `position` is strictly newer than the event the
+/// row already reflects, so an overlapping or out-of-order replay of an older
+/// ack never regresses it. A legacy ack (`None`) leaves the row untouched.
+fn repoint_open_wait_element(
+    tx: &rusqlite::Transaction<'_>,
+    subscription_key: u64,
+    resolved: Option<&str>,
+    position: u64,
+) -> rusqlite::Result<()> {
+    if let Some(element_id) = resolved {
+        tx.cexecute(
+            "UPDATE message_subscriptions SET element_id = ?2, last_event_position = ?3 \
+             WHERE subscription_key = ?1 AND last_event_position < ?3",
+            params![subscription_key as i64, element_id, position as i64],
+        )?;
+    }
+    Ok(())
 }
 
 /// The single canonical insert of an instance-scoped correlation history row.
@@ -6129,14 +6179,16 @@ fn project_event(
                 tx.cexecute(
                     "INSERT INTO message_subscriptions (subscription_key, instance_key, \
                      element_instance_key, element_id, message_name, correlation_key, created_at_ms, \
-                     non_interrupting, business_id) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, (SELECT business_id FROM process_instances WHERE key = ?2)) \
+                     non_interrupting, business_id, last_event_position) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, (SELECT business_id FROM process_instances WHERE key = ?2), ?9) \
                      ON CONFLICT(subscription_key) DO UPDATE SET \
                      element_instance_key = excluded.element_instance_key, \
                      element_id = excluded.element_id, \
                      message_name = excluded.message_name, \
                      correlation_key = excluded.correlation_key, \
-                     non_interrupting = excluded.non_interrupting",
+                     non_interrupting = excluded.non_interrupting, \
+                     last_event_position = excluded.last_event_position \
+                     WHERE excluded.last_event_position > message_subscriptions.last_event_position",
                     params![
                         *subscription_key as i64,
                         *instance_key as i64,
@@ -6146,6 +6198,7 @@ fn project_event(
                         correlation_key,
                         now_ms as i64,
                         non_interrupting as i64,
+                        position as i64,
                     ],
                 )?;
             }
@@ -6247,8 +6300,15 @@ fn project_event(
             subscription_key,
             message_key,
             deferred: true,
+            element_id: resolved_element_id,
             ..
         } => {
+            repoint_open_wait_element(
+                tx,
+                *subscription_key,
+                resolved_element_id.as_deref(),
+                position,
+            )?;
             tx.cexecute(
                 "DELETE FROM paced_message_correlations \
                  WHERE subscription_key = ?1 AND message_key = ?2",
@@ -6267,6 +6327,7 @@ fn project_event(
             accepted,
             consumed,
             deferred: false,
+            element_id: resolved_element_id,
             ..
         } => {
             let captured: Option<(i64, i64, String, String, String)> = tx
@@ -6290,7 +6351,10 @@ fn project_event(
                             message_key: *message_key,
                             host_key: *host_key as Key,
                             instance_key: *instance_key as Key,
-                            element_id,
+                            // The ack's resolved (post-migration) element
+                            // wins over the one captured at reservation
+                            // (#2037); a legacy ack carries none.
+                            element_id: resolved_element_id.as_ref().unwrap_or(element_id),
                             message_name,
                             correlation_key,
                         },
@@ -6301,7 +6365,14 @@ fn project_event(
                  WHERE subscription_key = ?1 AND message_key = ?2",
                 params![*subscription_key as i64, *message_key as i64],
             )?;
-            if !*accepted {
+            if *accepted {
+                repoint_open_wait_element(
+                tx,
+                *subscription_key,
+                resolved_element_id.as_deref(),
+                position,
+            )?;
+            } else {
                 tx.cexecute(
                     "DELETE FROM message_subscriptions WHERE subscription_key = ?1",
                     params![*subscription_key as i64],
@@ -7908,6 +7979,7 @@ fn project_event(
         | Event::MessageCorrelationReceiptSettled { .. }
         // The activation latch (#1949) is partition bookkeeping.
         | Event::RemoteBufferedDeliveryActivated { .. }
+        | Event::MessageCorrelationAckV2Activated { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }
@@ -13480,6 +13552,7 @@ mod element_instance_tests {
                 consumed,
                 deferred,
                 partition: 0,
+                element_id: None,
             };
         // Deferred (suspended instance): still waiting, no history.
         store
@@ -13537,7 +13610,168 @@ mod element_instance_tests {
             consumed,
             deferred: false,
             partition: 0,
+            element_id: None,
         }
+    }
+
+    /// #2037: an instance migrated between the reservation and the
+    /// consumption — the history row names the element the ack resolved
+    /// (post-migration), not the one captured at reservation.
+    #[test]
+    fn paced_history_uses_the_acks_post_migration_element() {
+        let store = ReadStore::open(None).unwrap();
+        let mut ack = paced_ack(3301, 41, false, true);
+        if let Event::MessageCorrelationAcknowledged { element_id, .. } = &mut ack {
+            *element_id = Some("await-v2".to_string());
+        }
+        store
+            .export(&[&deploy(), &created(), &paced_sub_created(3301)])
+            .unwrap();
+        store.export(&[&paced_delivery(3301, 41), &ack]).unwrap();
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].element_id, "await-v2");
+    }
+
+    /// #2037 (Copilot r4706477790): a persistent subscription's open wait is
+    /// re-pointed to the ack's resolved (post-migration) element, on both the
+    /// accepted and the deferred arm; a legacy ack leaves it unchanged.
+    #[test]
+    fn paced_ack_repoints_the_retained_open_wait_element() {
+        for (deferred, resolved, want) in [
+            (false, Some("await-v2"), "await-v2"),
+            (true, Some("await-v2"), "await-v2"),
+            (false, None, "await"),
+            (true, None, "await"),
+        ] {
+            let store = ReadStore::open(None).unwrap();
+            let mut ack = paced_ack(3401, 51, true, !deferred);
+            if let Event::MessageCorrelationAcknowledged {
+                element_id,
+                deferred: d,
+                ..
+            } = &mut ack
+            {
+                *element_id = resolved.map(str::to_string);
+                *d = deferred;
+            }
+            store
+                .export(&[&deploy(), &created(), &paced_sub_created(3401)])
+                .unwrap();
+            store.export(&[&paced_delivery(3401, 51), &ack]).unwrap();
+            let subs = store.message_subscriptions();
+            assert_eq!(subs.len(), 1, "deferred={deferred}");
+            assert_eq!(
+                subs[0].element_id, want,
+                "deferred={deferred} resolved={resolved:?}"
+            );
+        }
+    }
+
+    fn project_at(store: &ReadStore, event: &Event, position: u64) {
+        let mut conn = store.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        super::project(&tx, event, position, 1_000).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn resolved_ack(subscription_key: Key, message_key: Key, element: &str) -> Event {
+        let mut ack = paced_ack(subscription_key, message_key, true, true);
+        if let Event::MessageCorrelationAcknowledged { element_id, .. } = &mut ack {
+            *element_id = Some(element.to_string());
+        }
+        ack
+    }
+
+    fn open_wait_element(store: &ReadStore, subscription_key: Key) -> String {
+        store
+            .message_subscriptions()
+            .into_iter()
+            .find(|s| s.subscription_key == subscription_key)
+            .expect("open wait present")
+            .element_id
+    }
+
+    /// #2037: the open wait is re-pointed only by an ack strictly newer than
+    /// the event the row reflects — an out-of-order or overlapping replay of
+    /// an older ack (or of the creation) never regresses the element.
+    #[test]
+    fn paced_ack_repoint_is_gated_on_the_journal_position() {
+        let store = ReadStore::open(None).unwrap();
+        project_at(&store, &deploy(), 1);
+        project_at(&store, &created(), 2);
+        project_at(&store, &paced_sub_created(3501), 3);
+        project_at(&store, &resolved_ack(3501, 61, "await-v3"), 10);
+        assert_eq!(open_wait_element(&store, 3501), "await-v3");
+        // An older ack delivered after the newer one is held.
+        project_at(&store, &resolved_ack(3501, 60, "await-v2"), 8);
+        assert_eq!(open_wait_element(&store, 3501), "await-v3");
+        // Re-delivery of the same ack is idempotent.
+        project_at(&store, &resolved_ack(3501, 61, "await-v3"), 10);
+        assert_eq!(open_wait_element(&store, 3501), "await-v3");
+        // A replayed creation (older position) does not revert the re-point.
+        project_at(&store, &paced_sub_created(3501), 3);
+        assert_eq!(open_wait_element(&store, 3501), "await-v3");
+        // A genuinely newer ack still applies.
+        project_at(&store, &resolved_ack(3501, 62, "await-v4"), 11);
+        assert_eq!(open_wait_element(&store, 3501), "await-v4");
+    }
+
+    /// #2037: a database migrated across the v21 schema receives the
+    /// position column stamped to the warm cursor, so an ack replayed at or
+    /// below the cursor is held while one past it applies.
+    #[test]
+    fn message_subscription_position_migration_stamps_the_cursor() {
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-readstore-2037-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = ReadStore::open(Some(&path)).expect("fresh open");
+            store
+                .export(&[&deploy(), &created(), &paced_sub_created(3601)])
+                .unwrap();
+            assert_eq!(store.exported_position(), 3);
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                // A v20 table (rebuilt: SQLite's DROP COLUMN cannot drop a
+                // trailing column that follows a comment).
+                "CREATE TABLE ms_v20 AS SELECT business_id, subscription_key, \
+                 instance_key, element_instance_key, element_id, message_name, \
+                 correlation_key, created_at_ms, non_interrupting FROM message_subscriptions;
+                 DROP TABLE message_subscriptions;
+                 ALTER TABLE ms_v20 RENAME TO message_subscriptions;
+                 UPDATE meta SET v = 20 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        {
+            let store = ReadStore::open(Some(&path)).expect("migration on open");
+            let stamped: i64 = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT last_event_position FROM message_subscriptions \
+                     WHERE subscription_key = 3601",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stamped, 3);
+            // An ack at or below the cursor was already reflected: held.
+            project_at(&store, &resolved_ack(3601, 71, "stale"), 3);
+            assert_eq!(open_wait_element(&store, 3601), "await");
+            // The next ack the exporter delivers past the cursor applies.
+            store
+                .export(&[&resolved_ack(3601, 72, "await-v2")])
+                .unwrap();
+            assert_eq!(open_wait_element(&store, 3601), "await-v2");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// #1949 (Copilot r4701849028): a permanently rejected one-shot delivery
