@@ -433,7 +433,6 @@ fn raft_items(data: &Path, partition: u64) -> Vec<LoggedItem> {
 /// no new-format item at or below `barrier[p]` — the partition's last Raft
 /// log index when the last old member stopped (all prior submissions had been
 /// awaited, so nothing was pending) — replicas agree entry for entry, and
-/// replicas agree entry for entry, and
 /// both sides of the latch actually carried traffic (non-vacuous).
 fn assert_latch_ordering(c: &Cluster, barrier: &[u64]) {
     for p in 0..PARTITIONS {
