@@ -637,8 +637,14 @@ export class CamundaBackend {
       } else if (states.every((s) => s === "COMPLETED")) {
         obs.completed = true;
       } else {
-        // State unreadable (or terminated): the outcome is inconclusive.
-        obs.unobserved = ["completed", "variables"];
+        // State unreadable (or terminated): the outcome is inconclusive. An
+        // observation with nothing comparable would let the differential and
+        // checkExpectations report a vacuous pass, so fail loudly instead.
+        throw new Error(
+          `awaitCompletion create timed out and the instance state is inconclusive ` +
+            `(${JSON.stringify(states)}): refusing to report an unverifiable run`,
+          { cause: err },
+        );
       }
       return obs;
     }

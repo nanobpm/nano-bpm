@@ -1104,10 +1104,12 @@ test("CamundaBackend verifies instance state after an awaitCompletion DEADLINE_E
     const done = await backend.observe(await startKeyed(backend));
     assert.equal(done.completed, true);
     assert.deepEqual(done.unobserved, ["variables"]);
-    // State unreadable: inconclusive, `completed` is not asserted either way.
+    // State unreadable or terminated: inconclusive must FAIL, never be a
+    // vacuous pass with no compared fields.
     piState = null;
-    const unk = await backend.observe(await startKeyed(backend));
-    assert.deepEqual(unk.unobserved, ["completed", "variables"]);
+    await assert.rejects(async () => backend.observe(await startKeyed(backend)), /inconclusive/);
+    piState = "TERMINATED";
+    await assert.rejects(async () => backend.observe(await startKeyed(backend)), /inconclusive/);
     // No key learned (no job activated): uncancellable → cleanup failure.
     await assert.rejects(async () => backend.observe(await backend.start("P", {})), BackendCleanupError);
     createStatus = 500;
