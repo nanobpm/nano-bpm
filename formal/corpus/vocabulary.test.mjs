@@ -130,11 +130,12 @@ test('cancellation is opt-in and ends the run not completed (nano-only scenario)
   assert.deepEqual(ref.apply({ op: 'cancel' }).commands(), [])
 })
 
-test('cancellation with an armed event-based gateway counts the gateway as passed', () => {
+test('cancellation with a waiting event-based gateway terminates the gateway (#2004)', () => {
   const g = materialize({ kinds: ['evt'], edges: [[0, 1, 'task'], [1, 2, 'msg'], [1, 2, 'msg']] })
   const run = exploreOrders(g, {}, { cancel: true }).find((r) => r.cancelled && r.steps.length === 2)
   assert.ok(run)
-  assert.equal(run.completedElements.G1, 1)
+  assert.equal(run.completedElements.G1, undefined)
+  assert.equal(run.takenFlows[g.edges.find((e) => e.from === 'G1').id], undefined)
   assert.equal(run.completedElements.M1, undefined)
   assert.equal(run.completedElements.M2, undefined)
 })
