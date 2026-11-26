@@ -164,6 +164,12 @@ pub fn run(
     opts: &RunOptions,
     out: &mut dyn Write,
 ) -> std::io::Result<u64> {
+    // The corpus replays PRE-LATCH (#2004): a feature-gated behaviour runs
+    // only once every member advertises it, so the previous-release
+    // comparison is a mixed-version cluster, where head must execute exactly
+    // as the previous release. The previous release has no such switch; the
+    // CI script strips `determinism:head-only` lines from its copy.
+    engine.set_event_gateway_runtime(false); // determinism:head-only
     if opts.canary {
         canary_permute(&mut entries);
     }

@@ -129,7 +129,10 @@ cmd_prev_release() {
   # against the previous release's engine.
   mkdir -p "$PREV_SRC/engine-core/examples/determinism"
   cp "$ENGINE/examples/determinism_replay.rs" "$PREV_SRC/engine-core/examples/"
-  cp "$ENGINE/examples/determinism/runner.rs" "$PREV_SRC/engine-core/examples/determinism/"
+  # Lines tagged `determinism:head-only` call head-only engine API (e.g. a
+  # feature-gate switch, #2004) the previous release does not have.
+  grep -v 'determinism:head-only' "$ENGINE/examples/determinism/runner.rs" \
+    >"$PREV_SRC/engine-core/examples/determinism/runner.rs"
   # Build the previous release into an ISOLATED target dir, never the shared
   # one: under an absolute CARGO_TARGET_DIR (#1716) HEAD and the previous
   # release would resolve to the SAME directory, so this build would overwrite

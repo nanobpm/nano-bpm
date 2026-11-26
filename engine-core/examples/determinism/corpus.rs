@@ -77,8 +77,11 @@ impl Default for Gen {
 
 impl Gen {
     pub fn new() -> Self {
+        // Generate pre-latch (#2004), exactly as the runner replays.
+        let mut engine = Engine::new();
+        engine.set_event_gateway_runtime(false);
         Self {
-            engine: Engine::new(),
+            engine,
             now: T0,
             entries: Vec::new(),
             rng: 0x9E37_79B9_7F4A_7C15,
