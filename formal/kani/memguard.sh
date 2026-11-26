@@ -84,10 +84,11 @@ cgroup_dir() {
 tree_rss() {
   local pids=""
   [[ -n "$cg" ]] && pids="$(tr '\n' ',' <"$cg/cgroup.procs" 2>/dev/null)"
+  # A PID can appear in both listings (user-scope path); count it once.
   {
-    ps -o rss= -s "$pid" 2>/dev/null
-    [[ -n "${pids%,}" ]] && ps -o rss= -p "${pids%,}" 2>/dev/null
-  } | awk '{s += $1} END {print s + 0}'
+    ps -o pid=,rss= -s "$pid" 2>/dev/null
+    [[ -n "${pids%,}" ]] && ps -o pid=,rss= -p "${pids%,}" 2>/dev/null
+  } | awk '!seen[$1]++ {s += $2} END {print s + 0}'
 }
 kill_tree() {
   (( ${#ctl[@]} )) && "${ctl[@]}" kill -s KILL "$unit" 2>/dev/null
