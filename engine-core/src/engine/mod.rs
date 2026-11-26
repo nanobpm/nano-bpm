@@ -315,6 +315,12 @@ pub struct Engine {
     /// before the next, mirroring Zeebe's one-TRIGGER-command-per-timer
     /// processing. Per-command scratch: cleared by every `plan_command_at`.
     pending_timer_fires: VecDeque<PendingTimerFire>,
+    /// Inclusive-join arrivals of the current `TriggerTimers` batch held back
+    /// only by elements a still-pending timer of the batch fires on (#2018).
+    /// The fixpoint loop re-runs each once every timer of the batch has fired,
+    /// as Zeebe runs the join's ACTIVATE after all the batch's TRIGGERs.
+    /// Per-command scratch: cleared by every `plan_command_at`.
+    deferred_join_arrivals: VecDeque<DeferredJoinArrival>,
     /// Log index from which the fixpoint loop still has to look for freshly
     /// opened message subscriptions that may correlate a **buffered** message
     /// (#1874). Per-command scratch: reset by every `plan_command_at`.
@@ -340,6 +346,26 @@ pub struct Engine {
     /// its key into the new window. Keeps an N-timer batch linear instead of
     /// rescanning the growing prefix after every fire. Per-command scratch.
     sweep_from: usize,
+}
+
+/// An inclusive-join arrival held back until its `TriggerTimers` batch has
+/// fired (#2018); re-run as a [`Step::Activate`] over the same flow.
+#[derive(Clone, Debug)]
+struct DeferredJoinArrival {
+    instance_key: Key,
+    element_id: String,
+    scope: Key,
+    via: Option<IncomingFlow>,
+}
+
+/// Which state an inclusive join's live-path guard reads (#2018).
+#[derive(Clone, Copy, Debug)]
+enum BatchDueView {
+    /// The engine's current state.
+    Live,
+    /// As if every timer still due in the current `TriggerTimers` batch had
+    /// fired: the elements those fires end are no longer live sources.
+    AfterBatch,
 }
 
 /// One due timer awaiting its fire in a `TriggerTimers` batch (#1712).
@@ -781,6 +807,7 @@ impl Engine {
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
+            deferred_join_arrivals: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
             buffer_candidates: BTreeMap::new(),
@@ -975,6 +1002,7 @@ impl Engine {
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
+            deferred_join_arrivals: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
             buffer_candidates: BTreeMap::new(),
@@ -2702,6 +2730,7 @@ impl Engine {
         self.esp_start_payloads.clear();
         self.boundary_payloads.clear();
         self.pending_timer_fires.clear();
+        self.deferred_join_arrivals.clear();
         self.buffer_scan_from = 0;
         self.buffer_requeue.clear();
         self.buffer_candidates.clear();
@@ -7195,6 +7224,22 @@ impl Engine {
                         return Some(Paused { queue, cursor });
                     }
                 }
+                continue;
+            }
+            // Every timer of the batch has fired: guard the held-back
+            // inclusive-join arrivals again (#2018).
+            if !self.deferred_join_arrivals.is_empty() {
+                queue.extend(
+                    self.deferred_join_arrivals
+                        .drain(..)
+                        .map(|d| Step::Activate {
+                            instance_key: d.instance_key,
+                            element_id: d.element_id,
+                            scope: d.scope,
+                            via: d.via,
+                            race: None,
+                        }),
+                );
                 continue;
             }
             self.debug_assert_join_bookkeeping_coherent(log);
@@ -18153,6 +18198,7 @@ impl Engine {
                             scope,
                             &arrivals,
                             pending,
+                            BatchDueView::Live,
                         ))
             }
         };
@@ -18161,6 +18207,32 @@ impl Engine {
         if !accepted {
             if taken > 0 && open.is_none() {
                 self.open_join(instance_key, &element_id, scope, &mut events);
+            }
+            // #2018: Zeebe writes every TRIGGER of a timer batch before the
+            // join's ACTIVATE commands run, so an inclusive arrival held back
+            // ONLY by elements a still-pending timer of this batch fires on
+            // (a due catch, an activity a due interrupting boundary dooms) is
+            // guarded again once the batch has fired, against the state those
+            // fires leave — rather than parked against tokens Zeebe never sees.
+            if matches!(join, JoinKind::Inclusive)
+                && taken > 0
+                && via.is_some()
+                && !self.pending_timer_fires.is_empty()
+                && !self.has_active_path_to(
+                    instance_key,
+                    &element_id,
+                    scope,
+                    &arrivals,
+                    pending,
+                    BatchDueView::AfterBatch,
+                )
+            {
+                self.deferred_join_arrivals.push_back(DeferredJoinArrival {
+                    instance_key,
+                    element_id,
+                    scope,
+                    via,
+                });
             }
             return (events, Vec::new());
         }
@@ -18269,12 +18341,21 @@ impl Engine {
         scope: Key,
         taken: &state::FlowArrivals,
         pending: &VecDeque<Step>,
+        batch: BatchDueView,
     ) -> bool {
         let (Some(process), Some(instance)) = (
             self.process_of_instance(instance_key),
             self.state.instances.get(&instance_key),
         ) else {
             return false;
+        };
+        // In the `AfterBatch` view (#2018) every element a timer still due in
+        // the current batch will fire on — a due timer catch, an activity an
+        // interrupting boundary timer dooms — is gone, together with the
+        // tokens its fire spawns: those TRIGGERs precede the join's ACTIVATE.
+        let gone: BTreeSet<Key> = match batch {
+            BatchDueView::Live => BTreeSet::new(),
+            BatchDueView::AfterBatch => self.fired_by_due_timers(instance_key),
         };
         // An activity whose interrupting boundary timer is due in the current
         // `TriggerTimers` batch is already doomed (#1989): Zeebe's guard for an
@@ -18286,6 +18367,7 @@ impl Engine {
             .active
             .iter()
             .filter(|(eik, id)| id.as_str() != join && self.scope_of(instance_key, **eik) == scope)
+            .filter(|(eik, _)| !gone.contains(*eik))
             .flat_map(|(eik, id)| match doomed.get(eik) {
                 Some(sources) => sources.clone(),
                 None => vec![id.as_str()],
@@ -18305,6 +18387,32 @@ impl Engine {
         active
             .chain(in_transit)
             .any(|source| path_reaches_join(process, source, join, taken))
+    }
+
+    /// The element instances of `instance_key` a timer still due in the
+    /// current `TriggerTimers` batch ends when it fires (#2018): a timer catch
+    /// completes, an activity is torn down by an interrupting boundary (the
+    /// activities of [`Engine::doomed_by_due_boundary_timers`]).
+    fn fired_by_due_timers(&self, instance_key: Key) -> BTreeSet<Key> {
+        let mut gone: BTreeSet<Key> = self
+            .doomed_by_due_boundary_timers(instance_key)
+            .into_keys()
+            .collect();
+        gone.extend(
+            self.pending_timer_fires
+                .iter()
+                .filter_map(|fire| match fire {
+                    PendingTimerFire::Timer(key) => self.state.timers.get(key),
+                    PendingTimerFire::Start(_) => None,
+                })
+                .filter(|t| {
+                    t.instance_key == instance_key
+                        && t.state == state::TimerState::Created
+                        && matches!(t.kind, state::TimerKind::IntermediateCatch)
+                })
+                .map(|t| t.element_instance_key),
+        );
+        gone
     }
 
     /// The activities of `instance_key` an interrupting boundary timer still

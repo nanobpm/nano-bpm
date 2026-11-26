@@ -9109,3 +9109,50 @@ fn inclusive_join_doomed_path_keeps_prior_non_interrupting_boundaries() {
     assert_eq!(join_fire_count(&fired, "join"), 1, "{fired:#?}");
     assert!(engine.is_completed(instance_key));
 }
+
+/// #2018 (fuzz Gen_2d18f93dc0, the #1989 cases): one tick fires the timer
+/// catch `w1` AND the interrupting boundary `b1` of `t1`; both tokens route
+/// through the exclusive `g3` into the inclusive join `g2`, which `g3` could
+/// otherwise also reach over `t3 -> g4`. Zeebe writes both TRIGGERs (each
+/// completing its catch/boundary and queueing its `g3` activation) before
+/// either `g3` activation runs, so both tokens take `g3 -> g2` before the join
+/// guard evaluates: no live path remains, and the join activates once per
+/// arrival (the spec oracle and the committed fuzz expectation agree). Nano
+/// drained `w1`'s token into the join while `b1`'s token was still upstream
+/// of `g3`, parked it, then fired once and stranded the surplus.
+#[test]
+fn inclusive_join_fires_per_arrival_when_a_tick_fires_a_catch_and_a_boundary_upstream_of_a_split() {
+    let def = ProcessBuilder::new("inc-tick-xor")
+        .start_event("s")
+        .inclusive_gateway("g1")
+        .service_task("t1", "jt1")
+        .timer_boundary_event("b1", "t1", 60_000)
+        .timer_intermediate_catch_event("w1", 60_000)
+        .exclusive_gateway("g3")
+        .service_task("t3", "jt3")
+        .exclusive_gateway("g4")
+        .inclusive_gateway("g2")
+        .service_task("t2", "jt2")
+        .end_event("e")
+        .connect("s", "g1")
+        .connect_when("g1", "t1", "true")
+        .connect_when("g1", "w1", "true")
+        .connect("t1", "g3")
+        .connect("b1", "g3")
+        .connect("w1", "g3")
+        .connect_when("g3", "g2", "true")
+        .connect_when("g3", "t3", "false")
+        .connect("t3", "g4")
+        .connect("g4", "g2")
+        .connect("g2", "t2")
+        .connect("t2", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command_at(Command::create_instance("inc-tick-xor"), 0)
+        .unwrap();
+    let fired = engine.trigger_timers(60_000);
+    assert_eq!(join_fire_count(&fired, "g2"), 2, "{fired:#?}");
+}
