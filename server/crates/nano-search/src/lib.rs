@@ -21,6 +21,7 @@ pub mod agent;
 pub mod convert;
 pub mod get;
 pub mod incident;
+pub mod job;
 pub mod process_instance;
 pub mod query;
 pub mod source;
