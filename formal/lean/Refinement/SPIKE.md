@@ -23,10 +23,12 @@ CI anti-drift gate are tracked in #2010.
 1. **Receiver is the whole `Engine`.** `has_active_path_to(&self, …)` reads
    `self.state.instances`, `self.pending_timer_fires`, `self.state.timers`,
    `scope_of`, `process_of_instance` and calls
-   `doomed_by_due_boundary_timers`. Charon would have to translate the full
-   transitive type closure of `Engine` (journals, FEEL values, `serde`-gated
-   types, `Box<dyn …>`-carrying fields); trait objects and many of those std
-   types are outside Aeneas' supported subset. This is the dominant blocker.
+   `doomed_by_due_boundary_timers`. `Engine` (`engine-core/src/engine/mod.rs`)
+   holds in-memory state and scratch data (no journal, no trait objects), but
+   the `&self` receiver still drags the full transitive type closure of
+   `State` (instances, timers, deployed definitions, FEEL values) into Charon.
+   This receiver-closure problem is the dominant blocker; the specific
+   collection types inside that closure are blocker 2.
 2. **std collections without an Aeneas model.** `BTreeSet<&str>`,
    `VecDeque<&str>`, `BTreeMap<ElementId, Element>` (`process.elements`,
    `ProcessDefinition::element`) and `BTreeMap<Key, Vec<&str>>`. Aeneas' Lean
@@ -78,8 +80,11 @@ pub fn path_reaches_join(g: &JoinGraph, source: usize, join: usize, taken: &[u32
 pub fn has_active_path(g: &JoinGraph, live: &[usize], join: usize, taken: &[u32]) -> bool;
 
 /// `ZeebeJoinReady`, parallel and inclusive.
+/// `unidentified` counts arrivals with no known incoming flow (`via` is
+/// `None` in `activate_join`), which today count towards `all_taken`.
 pub fn join_ready(g: &JoinGraph, kind: JoinKind, join: usize,
-                  incoming: &[usize], live: &[usize], taken: &[u32]) -> bool;
+                  incoming: &[usize], live: &[usize], taken: &[u32],
+                  unidentified: u32) -> bool;
 ```
 
 `Engine::has_active_path_to` keeps computing the live-source set (scope
@@ -97,7 +102,7 @@ refactor is behaviour-preserving by test before it is by proof.
    classes (`ProcessInstanceStateTransitionGuard.canActivateParallelGateway`,
    `BpmnInclusiveGatewayBehavior.hasActivePathToTheGateway`) at the sha in
    `formal/parity/zeebe-pin.json`.
-3. `formal/lean/Refinement/Proof.lean`: `∀ g live join taken,
+3. `formal/lean/Refinement/Proof.lean`: `∀ g live join taken unidentified,
    join_ready … = ok b ↔ (b = true ↔ ZeebeJoinReady …)` — BFS soundness and
    completeness against reflexive-transitive reachability that avoids the
    taken flows into the join; no bound on graph size.
