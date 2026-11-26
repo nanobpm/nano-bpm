@@ -75,10 +75,11 @@ mod determinism_corpus;
 
 use nanobpmn_engine_core::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, Engine, EngineSnapshot, Event,
-    IoMapping, Mapping, MessageStartCorrelation, MigratedChildInstance,
-    MigratedCompensationSubscription, MigratedElementInstance, MigratedSubscription,
-    MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder, ProcessDefinition,
-    SubscriptionMigrationAction, Value, VariableInstruction, SNAPSHOT_FORMAT_VERSION,
+    ExecutionListener, IoMapping, ListenerEventType, Mapping, MessageStartCorrelation,
+    MigratedChildInstance, MigratedCompensationSubscription, MigratedElementInstance,
+    MigratedSubscription, MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder,
+    ProcessDefinition, SubscriptionMigrationAction, Value, VariableInstruction,
+    SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Directory holding the checked-in golden corpus, relative to the crate root.
@@ -1052,6 +1053,67 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .map(|i| i.gateway_subscriptions.len()),
         Some(2),
         "the twins snapshot must persist two gateways' subscriptions"
+    );
+
+    // Pending gateway trigger witness (#2004): the gateway's message fired, so
+    // `EventGatewayTriggered` recorded the winning catch on the gateway, but
+    // the gateway is parked on its `end` execution listener (one created,
+    // un-activated job), so the snapshot pins a non-empty `gateway_triggers`
+    // (gateway element instance -> catch id + journaled catch key).
+    let paused: ProcessDefinition = ProcessBuilder::new("paused_gw")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "P1", "=key")
+        .message_intermediate_catch_event("onM2", "P2", "=key")
+        .end_event("end")
+        .connect("start", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "end")
+        .connect("onM2", "end")
+        .with_listeners(
+            "gw",
+            Vec::new(),
+            vec![ExecutionListener {
+                event_type: ListenerEventType::End,
+                job_type: "gw-end-audit".to_string(),
+                retries: None,
+            }],
+        )
+        .build()
+        .expect("build paused gateway process");
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(paused), T0 + 30)
+            .expect("deploy paused gateway"),
+    );
+    let mut paused_vars = BTreeMap::new();
+    paused_vars.insert("key".to_string(), Value::Str("p".to_string()));
+    let paused_created = engine
+        .apply_command_at(
+            Command::create_instance_with("paused_gw", paused_vars),
+            T0 + 31,
+        )
+        .expect("create paused gateway instance");
+    let paused_inst = paused_created
+        .iter()
+        .find_map(|e| e.instance_key())
+        .expect("paused gateway instance key");
+    journal.extend(paused_created);
+    journal.extend(
+        engine
+            .apply_command_at(Command::correlate_message("P1", "p"), T0 + 32)
+            .expect("trigger the paused gateway"),
+    );
+    assert_eq!(
+        engine
+            .snapshot()
+            .state
+            .instances
+            .get(&paused_inst)
+            .map(|i| i.gateway_triggers.len()),
+        Some(1),
+        "the paused gateway snapshot must persist its pending trigger"
     );
 
     let snapshot = engine.snapshot();

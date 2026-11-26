@@ -5346,5 +5346,326 @@
       "message_name": "M2",
       "subscription_key": 140
     }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 141
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 141,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "end": {
+            "end_listeners": [],
+            "id": "end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "gw": {
+            "end_listeners": [
+              {
+                "event_type": "End",
+                "job_type": "gw-end-audit",
+                "retries": null
+              }
+            ],
+            "id": "gw",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EventBasedGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "onM1"
+              },
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "onM2"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "onM1": {
+            "end_listeners": [],
+            "id": "onM1",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "MessageIntermediateCatchEvent": {
+                "correlation_key": "=key",
+                "message_name": "P1"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "end"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "onM2": {
+            "end_listeners": [],
+            "id": "onM2",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "MessageIntermediateCatchEvent": {
+                "correlation_key": "=key",
+                "message_name": "P2"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "end"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "start": {
+            "end_listeners": [],
+            "id": "start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "gw"
+              }
+            ],
+            "parent": null,
+            "properties": {},
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "paused_gw",
+        "name": null,
+        "start_event": "start",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 142,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000031,
+      "instance_key": 143,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 142,
+      "process_id": "paused_gw",
+      "tags": [],
+      "variables": {
+        "key": {
+          "Str": "p"
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 144,
+      "instance_key": 143,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 144,
+      "instance_key": 143,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 144,
+      "instance_key": 143
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 144,
+      "instance_key": 143
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 143,
+      "to": "gw"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "gw",
+      "element_instance_key": 145,
+      "instance_key": 143,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "gw",
+      "element_instance_key": 145,
+      "instance_key": 143,
+      "scope": 0
+    }
+  },
+  {
+    "VariableScopeCreated": {
+      "instance_key": 143,
+      "parent_scope_key": 0,
+      "scope_key": 145
+    }
+  },
+  {
+    "EventGatewaySubscriptionsOpened": {
+      "catch_element_ids": [
+        "onM1",
+        "onM2"
+      ],
+      "gateway_element_id": "gw",
+      "gateway_element_instance_key": 145,
+      "instance_key": 143
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "p",
+      "element_id": "onM1",
+      "element_instance_key": 145,
+      "instance_key": 143,
+      "kind": "IntermediateCatch",
+      "message_name": "P1",
+      "subscription_key": 146
+    }
+  },
+  {
+    "MessageSubscriptionCreated": {
+      "correlation_key": "p",
+      "element_id": "onM2",
+      "element_instance_key": 145,
+      "instance_key": 143,
+      "kind": "IntermediateCatch",
+      "message_name": "P2",
+      "subscription_key": 147
+    }
+  },
+  {
+    "MessagePublished": {
+      "correlation_key": "p",
+      "message_key": 148,
+      "message_name": "P1"
+    }
+  },
+  {
+    "MessageCorrelated": {
+      "element_id": "onM1",
+      "element_instance_key": 145,
+      "instance_key": 143,
+      "message_key": 148,
+      "subscription_key": 146
+    }
+  },
+  {
+    "EventGatewayTriggered": {
+      "catch_element_id": "onM1",
+      "catch_element_instance_key": 149,
+      "gateway_element_instance_key": 145,
+      "instance_key": 143
+    }
+  },
+  {
+    "MessageSubscriptionCanceled": {
+      "element_id": "onM2",
+      "element_instance_key": 145,
+      "instance_key": 143,
+      "subscription_key": 147
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "gw",
+      "element_instance_key": 145,
+      "instance_key": 143
+    }
+  },
+  {
+    "ExecutionListenerJobCreated": {
+      "created_at": 1700000000032,
+      "element_id": "gw",
+      "element_instance_key": 145,
+      "event_type": "End",
+      "instance_key": 143,
+      "job_key": 150,
+      "job_type": "gw-end-audit",
+      "listener_index": 0,
+      "retries": 3,
+      "scope": 0
+    }
   }
 ]

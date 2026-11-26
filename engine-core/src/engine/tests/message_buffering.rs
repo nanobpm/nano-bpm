@@ -3399,3 +3399,69 @@ fn a_pinned_instance_does_not_block_eligible_cold_spill_candidates() {
     assert_eq!(rig.instance.cold_spillable_count(), 1);
     assert!(rig.instance.snapshot_instance(pinned).is_none());
 }
+
+/// #2004 operator evidence: a message the message partition correlated to a
+/// gateway catch, delivered to the instance partition only AFTER that gateway
+/// was already triggered by another message (a late duplicate), is rejected
+/// there but never lost: the ack answers `consumed: false`, the message
+/// partition releases it, and the next waiting instance takes it. Holds on
+/// the v1 ack protocol and with the v2 latch recorded on both partitions.
+#[test]
+fn late_gateway_delivery_is_released_by_the_ack_not_lost() {
+    for ack_v2 in [false, true] {
+        let (mut rig, order) = Rig::new(event_gateway_two_messages());
+        rig.instance.set_message_correlation_ack_v2(ack_v2);
+        rig.message.set_message_correlation_ack_v2(ack_v2);
+        let m1 = rig.publish_named_backlog("m1", &order, 1)[0];
+        let m2 = rig.publish_named_backlog("m2", &order, 1)[0];
+        let is_m2_delivery = |command: &Command| matches!(command, Command::CorrelateMessageSubscription { message_key, .. } if *message_key == m2);
+        let (first, held) = rig.create_holding("gw", &order, 2_000, &is_m2_delivery);
+        assert_eq!(held.len(), 1, "ack_v2={ack_v2}");
+        assert!(rig.instance.is_completed(first), "m1 won the gateway");
+        assert_eq!(rig.delivered_to(first), vec![m1, m2]);
+
+        // The held m2 delivery arrives late: the gateway is long gone.
+        let before = rig.trace.len();
+        for (to_message, command) in held {
+            rig.run(to_message, command, 3_000);
+        }
+        let late = &rig.trace[before..];
+        assert!(
+            !late
+                .iter()
+                .any(|e| matches!(e, Event::ElementActivated { .. })),
+            "the late delivery activates nothing: {late:?}"
+        );
+        let acked: Vec<(bool, bool)> = late
+            .iter()
+            .filter_map(|e| match e {
+                Event::MessageCorrelationAcknowledged {
+                    message_key,
+                    accepted,
+                    consumed,
+                    ..
+                } if *message_key == m2 => Some((*accepted, *consumed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acked.len(), 1, "settled by exactly one ack: {late:?}");
+        assert!(!acked[0].1, "answered not consumed: {late:?}");
+        let buffered = &rig.message.state().buffered_messages;
+        assert!(buffered[&m1].correlated_instances.contains(&first));
+        assert!(
+            buffered[&m2].correlated_instances.is_empty(),
+            "m2 is released, not lost"
+        );
+        assert!(rig.message.pending_buffered_deliveries().is_empty());
+
+        // Released means available: it is delivered again to the next
+        // waiting instance.
+        let second = rig.create("gw", &order, 4_000);
+        assert!(rig.instance.is_completed(second), "ack_v2={ack_v2}");
+        assert!(
+            rig.delivered_to(second).contains(&m2),
+            "m2 is re-delivered: {:?}",
+            rig.delivered_to(second)
+        );
+    }
+}

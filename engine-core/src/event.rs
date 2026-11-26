@@ -2748,7 +2748,7 @@ impl Event {
             | Event::MessageSubscriptionResumed { partition, .. }
             | Event::MessageCorrelationSettled { partition, .. }
             | Event::RemoteBufferedDeliveryActivated { partition }
-            | Event::EventGatewayRuntimeActivated { partition } => *partition,
+            | Event::EventGatewayRuntimeActivated { partition }
             | Event::MessageCorrelationAckV2Activated { partition } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another

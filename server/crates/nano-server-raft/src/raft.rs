@@ -262,6 +262,7 @@ struct ReplicatedCommandWire {
     remote_buffered_delivery: bool,
     #[serde(default)]
     event_gateway_runtime: bool,
+    #[serde(default)]
     message_correlation_ack_v2: bool,
 }
 
