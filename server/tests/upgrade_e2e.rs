@@ -376,18 +376,10 @@ fn wait_ready(c: &Cluster, id: usize) {
     );
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
 /// One replicated command as recorded in a member's on-disk Raft log.
 #[derive(Debug, PartialEq, Eq)]
 struct LoggedItem {
     index: u64,
-    now: u64,
     /// The latch's new-format envelope output (`remote_buffered_delivery`,
     /// #1949): what an old member would apply differently.
     stamped: bool,
@@ -427,7 +419,6 @@ fn raft_items(data: &Path, partition: u64) -> Vec<LoggedItem> {
                 .flatten()
                 .map(|item| LoggedItem {
                     index,
-                    now: item["now"].as_u64().unwrap_or_default(),
                     stamped: item["remote_buffered_delivery"].as_bool() == Some(true),
                     payload: item.to_string(),
                 })
@@ -439,11 +430,14 @@ fn raft_items(data: &Path, partition: u64) -> Vec<LoggedItem> {
 }
 
 /// The latch's ordering contract over every member's Raft log, per partition:
-/// no new-format item before `all_new_at` (while an old member was present),
+/// no new-format item at or below `barrier[p]` — the partition's last Raft
+/// log index when the last old member stopped (all prior submissions had been
+/// awaited, so nothing was pending) — replicas agree entry for entry, and
 /// replicas agree entry for entry, and
 /// both sides of the latch actually carried traffic (non-vacuous).
-fn assert_latch_ordering(c: &Cluster, all_new_at: u64) {
+fn assert_latch_ordering(c: &Cluster, barrier: &[u64]) {
     for p in 0..PARTITIONS {
+        let all_new_at = barrier[p as usize];
         let logs: Vec<Vec<LoggedItem>> = c.members.iter().map(|m| raft_items(&m.data, p)).collect();
         let longest = logs.iter().max_by_key(|l| l.len()).unwrap();
         for (id, log) in logs.iter().enumerate() {
@@ -456,7 +450,7 @@ fn assert_latch_ordering(c: &Cluster, all_new_at: u64) {
                 longest[..log.len()],
                 "partition {p}: node {id}'s raft log disagrees with its peers"
             );
-            let early = log.iter().filter(|i| i.now < all_new_at).count();
+            let early = log.iter().filter(|i| i.index <= all_new_at).count();
             let late_stamped = log.iter().filter(|i| i.stamped).count();
             assert!(
                 early > 0,
@@ -466,14 +460,14 @@ fn assert_latch_ordering(c: &Cluster, all_new_at: u64) {
                 late_stamped > 0,
                 "partition {p}: node {id} never saw the latch open (vacuous)"
             );
-            if let Some(bad) = log.iter().find(|i| i.stamped && i.now < all_new_at) {
+            if let Some(bad) = log.iter().find(|i| i.stamped && i.index <= all_new_at) {
                 panic!(
                     "partition {p}: node {id}: new-format output while an old member was \
                      present: {bad:?}"
                 );
             }
         }
-        let early = longest.iter().filter(|i| i.now < all_new_at).count();
+        let early = longest.iter().filter(|i| i.index <= all_new_at).count();
         let late_stamped = longest.iter().filter(|i| i.stamped).count();
         // The envelope is NOT one-way: a leader re-decides it per batch and
         // drops it while a peer is unreachable (e.g. the recovery restart).
@@ -509,12 +503,24 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     // ---- Phase 1: rolling upgrade, one member at a time. While any old
     // member remains, no new member may record the latch (it would refuse
     // the old peer) and nothing may diverge.
-    // When the last old member stopped: every entry proposed before it was
-    // proposed while an old member was present.
-    let mut all_new_at = 0;
+    // Per-partition log barrier at the moment the last old member stopped:
+    // every earlier submission was awaited (`assert_visible_everywhere`), so
+    // nothing is pending and every entry at or below it was proposed while an
+    // old member was present. Log indices, not clock stamps, order this.
+    let mut barrier = vec![0u64; PARTITIONS as usize];
     for id in 0..NODES {
         c.kill(id);
-        all_new_at = now_ms();
+        if id + 1 == NODES {
+            for (p, b) in barrier.iter_mut().enumerate() {
+                *b = c
+                    .members
+                    .iter()
+                    .flat_map(|m| raft_items(&m.data, p as u64))
+                    .map(|i| i.index)
+                    .max()
+                    .unwrap_or_default();
+            }
+        }
         c.start(id, Bin::New);
         wait_ready(&c, id);
         keys.extend(create_instances(&c, id, 4));
@@ -582,7 +588,7 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
         tail(&old_log)
     );
 
-    assert_latch_ordering(&c, all_new_at);
+    assert_latch_ordering(&c, &barrier);
 
     // An old binary REPLACING a member (fresh disk, so it has no post-latch
     // record of its own) is refused at the join handshake by the latched

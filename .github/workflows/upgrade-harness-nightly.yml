@@ -27,6 +27,8 @@ on:
       - 'server/tests/upgrade_e2e.rs'
       - 'server/crates/nano-falcon-protocol/src/cluster_join.rs'
       - 'server/crates/nano-server-raft/src/**'
+      - 'server/src/main.rs'
+      - 'server/src/falcon.rs'
       - 'engine-core/src/engine/mod.rs'
       - 'engine-core/src/state/apply/subscription.rs'
 
