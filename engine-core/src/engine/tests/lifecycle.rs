@@ -9290,3 +9290,31 @@ fn inclusive_join_reguard_is_not_delayed_by_another_instances_later_timer() {
     assert_eq!(order.last(), Some(&"z"), "{fired:#?}");
     assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
 }
+
+/// #2024 (r4703550889): the three-way tick of
+/// [`inclusive_join_deferred_arrivals_reguard_before_the_last_fires_downstream_work`]
+/// with `w3` an interrupting boundary of `t3` (due last in the batch) feeding
+/// `a -> b -> g2`. The join must fire exactly once.
+#[test]
+fn inclusive_join_fires_once_when_an_interrupting_boundary_fires_last_in_the_batch() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(three_way_tick_def(
+            "inc-tick-boundary-last",
+            true,
+        )))
+        .unwrap();
+    engine
+        .apply_command_at(Command::create_instance("inc-tick-boundary-last"), 0)
+        .unwrap();
+    let fired = engine.trigger_timers(60_000);
+    let order: Vec<&str> = fired
+        .iter()
+        .filter_map(|e| match e {
+            Event::TimerTriggered { element_id, .. } => Some(element_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order.last(), Some(&"t3"), "{order:?}");
+    assert_eq!(join_fire_count(&fired, "g2"), 1, "{fired:#?}");
+}
