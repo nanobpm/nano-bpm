@@ -507,3 +507,92 @@ fn operation_reference_is_rejected_not_dropped() {
     );
     assert_eq!(res.status, 400, "{}", res.body);
 }
+
+/// Review #1997: user-task `action` is rejected (never silently dropped) on
+/// completion, assignment and update — before any mutation.
+#[test]
+fn user_task_action_is_rejected_before_mutation() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    create(&mut eng);
+    let job_key = activate(&mut eng).jobs[0].job_key.0.clone();
+    call(
+        &mut eng,
+        "POST",
+        &format!("/v2/jobs/{job_key}/completion"),
+        &json!({}),
+    );
+    let task = user_task_key(&mut eng);
+    for (suffix, method, body) in [
+        ("completion", "POST", json!({ "action": "approve" })),
+        (
+            "assignment",
+            "POST",
+            json!({ "assignee": "ada", "action": "approve" }),
+        ),
+        (
+            "",
+            "PATCH",
+            json!({ "action": "approve", "changeset": { "priority": 10 } }),
+        ),
+    ] {
+        let path = if suffix.is_empty() {
+            format!("/v2/user-tasks/{task}")
+        } else {
+            format!("/v2/user-tasks/{task}/{suffix}")
+        };
+        let res = call(&mut eng, method, &path, &body);
+        assert_eq!(res.status, 400, "{path}: {}", res.body);
+    }
+    let res = call(&mut eng, "POST", "/v2/user-tasks/search", &json!({}));
+    let item = &json_body(&res)["items"][0];
+    assert_eq!(item["state"], json!("CREATED"), "{item}");
+    assert!(item.get("assignee").is_none_or(J::is_null), "{item}");
+}
+
+/// Review #1997: an empty assignee is a 400, not an assignment to "".
+#[test]
+fn empty_assignee_is_rejected() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    create(&mut eng);
+    let job_key = activate(&mut eng).jobs[0].job_key.0.clone();
+    call(
+        &mut eng,
+        "POST",
+        &format!("/v2/jobs/{job_key}/completion"),
+        &json!({}),
+    );
+    let task = user_task_key(&mut eng);
+    let res = call(
+        &mut eng,
+        "POST",
+        &format!("/v2/user-tasks/{task}/assignment"),
+        &json!({ "assignee": "" }),
+    );
+    assert_eq!(res.status, 400, "{}", res.body);
+}
+
+/// Review #1997: `pinClock` sets the exact instant, including an earlier one.
+#[test]
+fn pin_clock_can_move_backwards() {
+    let mut eng = TestEngine::new();
+    for t in [2000, 1000] {
+        let res = call(&mut eng, "PUT", "/v2/clock", &json!({ "timestamp": t }));
+        assert_eq!(res.status, 204, "{}", res.body);
+        assert_eq!(eng.now(), t as f64);
+    }
+}
+
+/// Review #1997: a resource part is accepted whatever its form name.
+#[test]
+fn deployment_accepts_resource_parts_with_any_form_name() {
+    let mut eng = TestEngine::new();
+    let boundary = "nano-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"tenantId\"\r\n\r\n<default>\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"order.bpmn\"; filename=\"order.bpmn\"\r\n\r\n{BPMN}\r\n--{boundary}--\r\n"
+    );
+    let headers = json!({ "Content-Type": format!("multipart/form-data; boundary={boundary}") });
+    let res = eng.handle_request("POST", "/v2/deployments", &headers.to_string(), &body);
+    assert_eq!(res.status, 200, "{}", res.body);
+}

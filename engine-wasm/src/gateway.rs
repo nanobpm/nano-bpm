@@ -428,6 +428,17 @@ where
     Ok(parsed)
 }
 
+/// A user-task `action` cannot be carried by the engine command, so a
+/// non-null one is rejected before mutation rather than silently dropped.
+fn reject_action(action: Option<String>) -> Result<(), Problem> {
+    match action {
+        Some(_) => Err(Problem::invalid(
+            "`action` is not supported by the in-browser engine",
+        )),
+        None => Ok(()),
+    }
+}
+
 /// A required request body.
 fn required_body<T>(raw: &str) -> Result<T, Problem>
 where
@@ -710,6 +721,7 @@ impl TestEngine {
             Op::CompleteUserTask => {
                 let user_task_key = path_key("userTaskKey", param(0))?;
                 let req = body::<models::UserTaskCompletionRequest>(raw)?;
+                reject_action(req.as_ref().and_then(|r| present(r.action.as_ref())))?;
                 let vars = req.as_ref().and_then(|r| present(r.variables.as_ref()));
                 self.exec(Command::CompleteUserTask {
                     user_task_key,
@@ -720,10 +732,14 @@ impl TestEngine {
             Op::AssignUserTask => {
                 let user_task_key = path_key("userTaskKey", param(0))?;
                 let req = required_body::<models::UserTaskAssignmentRequest>(raw)?;
+                reject_action(present(req.action.as_ref()))?;
                 let assignee = req
                     .assignee
                     .clone()
-                    .ok_or_else(|| Problem::invalid("assignUserTask: `assignee` is required"))?;
+                    .filter(|a| !a.is_empty())
+                    .ok_or_else(|| {
+                        Problem::invalid("assignUserTask: `assignee` must be a non-empty string")
+                    })?;
                 self.exec(Command::AssignUserTask {
                     user_task_key,
                     assignee,
@@ -739,6 +755,7 @@ impl TestEngine {
             Op::UpdateUserTask => {
                 let user_task_key = path_key("userTaskKey", param(0))?;
                 let req = body::<models::UserTaskUpdateRequest>(raw)?;
+                reject_action(req.as_ref().and_then(|r| present(r.action.as_ref())))?;
                 let changeset = req
                     .as_ref()
                     .and_then(|r| present(r.changeset.as_ref()))
@@ -755,12 +772,11 @@ impl TestEngine {
                 let pinned = u64::try_from(req.timestamp).map_err(|_| {
                     Problem::invalid("pinClock: `timestamp` must be a non-negative epoch millis")
                 })?;
-                // The virtual clock never moves backwards (same as `tickNow`).
+                // `pinClock` sets the EXACT instant (spec/clock.yaml), unlike
+                // the monotonic `tickNow`: pinning to an earlier time is allowed.
                 self.check_not_paused()
                     .map_err(|m| Problem::of(ProblemKind::InvalidState, m))?;
-                if pinned > self.now {
-                    self.now = pinned;
-                }
+                self.now = pinned;
                 let now = self.now;
                 self.exec(Command::TriggerTimers { now })?;
                 self.exec(Command::ExpireJobs { now })?;
@@ -1048,15 +1064,11 @@ fn multipart(headers: &BTreeMap<String, String>, raw: &str) -> Result<Vec<Part>,
                         .map(|v| v.trim_matches('"').to_string())
                 })
         };
-        match attr("name").as_deref() {
-            Some("resources") => {}
-            // `tenantId` is the only other field; Nano is single-tenant.
-            Some("tenantId") => continue,
-            other => {
-                return Err(Problem::invalid(format!(
-                    "createDeployment: unexpected form field {other:?}"
-                )))
-            }
+        // `tenantId` is the only non-resource field (Nano is single-tenant);
+        // every other part is a resource whatever its form name
+        // (spec/deployments.yaml, same as the native `create_deployment_impl`).
+        if attr("name").as_deref() == Some("tenantId") {
+            continue;
         }
         let filename = attr("filename")
             .filter(|f| !f.is_empty())
