@@ -1177,7 +1177,6 @@ fn build_event_witnesses() -> Vec<Event> {
             delivery_key: 26,
             // #2037 resolved post-migration consumption metadata (additive).
             element_id: Some("b2".into()),
-            process_definition_key: Some(27),
         },
         // #1949 resume handshake (additive variant).
         Event::MessageSubscriptionResuming {
@@ -1218,7 +1217,6 @@ fn build_event_witnesses() -> Vec<Event> {
             deferred: false,
             partition: 1,
             element_id: Some("b2".into()),
-            process_definition_key: Some(27),
         },
         // The #1497 routed-delivery ledger frame (additive variant, no version
         // bump): the recipient partition's dedup / close-tombstone record.

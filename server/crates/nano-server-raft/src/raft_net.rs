@@ -664,7 +664,6 @@ mod codec_tests {
                 consumed: true,
                 deferred: false,
                 element_id: None,
-                process_definition_key: None,
             },
             Command::ResumeMessageSubscription {
                 subscription_key: 1,

@@ -13485,7 +13485,6 @@ mod element_instance_tests {
                 deferred,
                 partition: 0,
                 element_id: None,
-                process_definition_key: None,
             };
         // Deferred (suspended instance): still waiting, no history.
         store
@@ -13544,7 +13543,6 @@ mod element_instance_tests {
             deferred: false,
             partition: 0,
             element_id: None,
-            process_definition_key: None,
         }
     }
 
@@ -13555,14 +13553,8 @@ mod element_instance_tests {
     fn paced_history_uses_the_acks_post_migration_element() {
         let store = ReadStore::open(None).unwrap();
         let mut ack = paced_ack(3301, 41, false, true);
-        if let Event::MessageCorrelationAcknowledged {
-            element_id,
-            process_definition_key,
-            ..
-        } = &mut ack
-        {
+        if let Event::MessageCorrelationAcknowledged { element_id, .. } = &mut ack {
             *element_id = Some("await-v2".to_string());
-            *process_definition_key = Some(7);
         }
         store
             .export(&[&deploy(), &created(), &paced_sub_created(3301)])

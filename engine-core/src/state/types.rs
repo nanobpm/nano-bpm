@@ -2410,13 +2410,6 @@ pub struct CorrelationReceipt {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub element_id: Option<ElementId>,
-    /// The instance's (post-migration) process definition key (#2037).
-    /// Additive, omitted when `None`.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
-    pub process_definition_key: Option<Key>,
 }
 
 /// The routed-delivery ledger (#1497): dedup set + applied-order FIFO + a
@@ -4603,7 +4596,6 @@ mod routed_ledger_eviction_tests {
             instance_key: 2,
             target_partition: 0,
             element_id: None,
-            process_definition_key: None,
         }
     }
 

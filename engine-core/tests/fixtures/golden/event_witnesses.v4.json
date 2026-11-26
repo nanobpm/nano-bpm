@@ -121,7 +121,6 @@
       "instance_key": 23,
       "message_key": 20,
       "partition": 0,
-      "process_definition_key": 27,
       "subscription_key": 21,
       "target_partition": 1
     }
@@ -175,7 +174,6 @@
       "element_id": "b2",
       "message_key": 20,
       "partition": 1,
-      "process_definition_key": 27,
       "subscription_key": 21
     }
   },

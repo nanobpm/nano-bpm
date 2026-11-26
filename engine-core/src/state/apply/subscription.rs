@@ -393,7 +393,6 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             instance_key,
             target_partition,
             element_id,
-            process_definition_key,
             ..
         } => {
             // Answering a paced delivery is capability use on the RECEIVING
@@ -416,7 +415,6 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                         instance_key: *instance_key,
                         target_partition: *target_partition,
                         element_id: element_id.clone(),
-                        process_definition_key: *process_definition_key,
                     },
                 );
             if let Some(s) = state.message_subscriptions.get_mut(subscription_key) {

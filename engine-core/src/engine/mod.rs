@@ -5627,7 +5627,6 @@ impl Engine {
                 consumed,
                 deferred,
                 element_id,
-                process_definition_key,
             } => {
                 // Either way — applied now, or a duplicate / stale ack of a
                 // delivery no longer awaited — no re-drive of this delivery
@@ -5683,7 +5682,6 @@ impl Engine {
                         deferred,
                         partition: self.partition_id,
                         element_id,
-                        process_definition_key,
                     },
                 );
                 if consumed {
@@ -8102,7 +8100,6 @@ impl Engine {
                         // A self-routed release: nothing was consumed, so
                         // there is no resolved consumption metadata.
                         element_id: None,
-                        process_definition_key: None,
                     });
                 };
                 Some(Event::RemoteMessageCorrelation {
@@ -8144,7 +8141,6 @@ impl Engine {
                     target_partition: r.target_partition,
                     delivery_key,
                     element_id: r.element_id,
-                    process_definition_key: r.process_definition_key,
                 },
             )
             .collect()
@@ -8344,17 +8340,11 @@ impl Engine {
             instance_suspended: self.instance_is_suspended(ack.instance_key),
         };
         let outcome = ack_outcome::ack_outcome(facts);
-        // The RESOLVED consumption metadata (#2037), read from this
+        // The RESOLVED consumption element (#2037), read from this
         // partition's durable state now — after any migration that ran
         // between the message partition's reservation and this consumption
-        // re-pointed the subscription and the instance.
+        // re-pointed the subscription.
         let element_id = subscription.map(|s| s.element_id.clone());
-        let process_definition_key = self
-            .state
-            .instances
-            .get(&ack.instance_key)
-            .map(|i| i.process_definition_key)
-            .filter(|k| *k != 0);
         let receipt = state::CorrelationReceipt {
             accepted: outcome.accepted,
             consumed: outcome.consumed,
@@ -8363,7 +8353,6 @@ impl Engine {
             instance_key: ack.instance_key,
             target_partition: ack.target_partition,
             element_id,
-            process_definition_key,
         };
         self.emit_receipt(log, &ack, receipt);
     }
@@ -8390,7 +8379,6 @@ impl Engine {
                 target_partition: ack.target_partition,
                 delivery_key: ack.delivery_key,
                 element_id: receipt.element_id,
-                process_definition_key: receipt.process_definition_key,
             },
         );
     }

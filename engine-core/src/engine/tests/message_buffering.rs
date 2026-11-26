@@ -874,7 +874,6 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
             deferred,
             delivery_key,
             element_id,
-            process_definition_key,
             ..
         } => (
             true,
@@ -886,7 +885,6 @@ fn routed(event: &Event) -> Option<(bool, Command)> {
                 consumed,
                 deferred,
                 element_id,
-                process_definition_key,
             },
         ),
         _ => return None,
@@ -1192,7 +1190,6 @@ fn ack_paced_drain_replays_deterministically() {
                 consumed: true,
                 deferred: false,
                 element_id: None,
-                process_definition_key: None,
             },
             2_002,
         )
@@ -3120,17 +3117,16 @@ fn migration_between_reservation_and_consumption_acks_post_migration_metadata() 
     for (to_message, command) in held {
         rig.run(to_message, command, 2_003);
     }
-    let expected = (Some("await-v2".to_string()), Some(target_key));
+    let expected = Some("await-v2".to_string());
     let acking: Vec<_> = rig
         .trace
         .iter()
         .filter_map(|e| match e {
             Event::MessageCorrelationAcknowledging {
                 element_id,
-                process_definition_key,
                 consumed,
                 ..
-            } => Some((*consumed, (element_id.clone(), *process_definition_key))),
+            } => Some((*consumed, element_id.clone())),
             _ => None,
         })
         .collect();
@@ -3139,11 +3135,7 @@ fn migration_between_reservation_and_consumption_acks_post_migration_metadata() 
         .trace
         .iter()
         .filter_map(|e| match e {
-            Event::MessageCorrelationAcknowledged {
-                element_id,
-                process_definition_key,
-                ..
-            } => Some((element_id.clone(), *process_definition_key)),
+            Event::MessageCorrelationAcknowledged { element_id, .. } => Some(element_id.clone()),
             _ => None,
         })
         .collect();
@@ -3222,14 +3214,8 @@ fn a_redriven_receipt_carries_the_post_migration_metadata() {
     }
     let redriven = rig.instance.pending_unsettled_receipts();
     assert_eq!(redriven.len(), 1, "{redriven:?}");
-    let Event::MessageCorrelationAcknowledging {
-        element_id,
-        process_definition_key,
-        ..
-    } = &redriven[0]
-    else {
+    let Event::MessageCorrelationAcknowledging { element_id, .. } = &redriven[0] else {
         unreachable!()
     };
     assert_eq!(element_id.as_deref(), Some("await-v2"));
-    assert_eq!(*process_definition_key, Some(target_key));
 }

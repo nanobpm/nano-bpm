@@ -12570,7 +12570,6 @@ impl ServerImpl {
                 target_partition,
                 delivery_key,
                 element_id,
-                process_definition_key,
                 ..
             } => Some((
                 *target_partition,
@@ -12582,7 +12581,6 @@ impl ServerImpl {
                     consumed: *consumed,
                     deferred: *deferred,
                     element_id: element_id.clone(),
-                    process_definition_key: *process_definition_key,
                 },
             )),
             // The resume handshake (#1949) goes to the subscription's message
