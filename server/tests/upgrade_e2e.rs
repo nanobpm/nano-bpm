@@ -57,6 +57,17 @@ fn feature() -> String {
     std::env::var("NANO_UPGRADE_FEATURE").unwrap_or_else(|_| "message-correlation-ack-v1".into())
 }
 
+/// The replicated-item envelope field the selected capability's latch stamps
+/// (`nano-server-raft` `raft.rs`). An unsupported capability name fails the
+/// test instead of silently checking another latch's bit.
+fn envelope_field() -> &'static str {
+    match feature().as_str() {
+        "message-correlation-ack-v1" => "remote_buffered_delivery",
+        "message-correlation-ack-v2" => "message_correlation_ack_v2",
+        other => panic!("unsupported NANO_UPGRADE_FEATURE {other:?}"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bin {
     Old,
@@ -249,10 +260,15 @@ impl Cluster {
         );
     }
 
-    /// Whether any CURRENT boot of a new member has refused a peer for lacking
-    /// the latched capability — i.e. the latch is recorded on that member.
+    /// How many times a new member has refused a peer for lacking a latched
+    /// capability — i.e. a latch is recorded on that member. Any named
+    /// capability counts: `check_join` reports only the FIRST missing one in
+    /// `required_cluster_features` order, so an old binary lacking both ack-v1
+    /// and ack-v2 is refused naming ack-v1 even when ack-v2 is the selected
+    /// latch. The selected latch itself is verified independently by its
+    /// envelope bit in [`assert_latch_ordering`].
     fn latch_refusals(&self) -> usize {
-        let needle = format!("{REFUSAL} \"{}\"", feature());
+        let needle = format!("{REFUSAL} \"");
         self.members
             .iter()
             .flat_map(|m| m.boots.iter())
@@ -392,8 +408,8 @@ fn wait_ready(c: &Cluster, id: usize) {
 #[derive(Debug, PartialEq, Eq)]
 struct LoggedItem {
     index: u64,
-    /// The latch's new-format envelope output (`remote_buffered_delivery`,
-    /// #1949): what an old member would apply differently.
+    /// The selected latch's new-format envelope bit ([`envelope_field`]):
+    /// what an old member would apply differently.
     stamped: bool,
     /// The whole replicated item, so entries with different commands never
     /// compare equal.
@@ -451,7 +467,7 @@ fn raft_items(data: &Path, partition: u64) -> Vec<LoggedItem> {
         for item in normal["items"].as_array().into_iter().flatten() {
             out.push(LoggedItem {
                 index,
-                stamped: item["remote_buffered_delivery"].as_bool() == Some(true),
+                stamped: item[envelope_field()].as_bool() == Some(true),
                 payload: item.to_string(),
                 batch: batch.clone(),
             });
@@ -942,6 +958,7 @@ fn assert_latch_ordering(c: &Cluster, barrier: &[u64]) {
 #[test]
 #[ignore = "needs NANO_UPGRADE_OLD_BIN; run via scripts/upgrade-harness.sh"]
 fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
+    envelope_field(); // fail fast on an unsupported NANO_UPGRADE_FEATURE
     let mut c = Cluster::new("latch");
 
     // ---- Phase 0: all-old cluster.

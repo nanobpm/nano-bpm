@@ -78,6 +78,13 @@ cmd_build_old() {
   local target="$out/old-target"
   mkdir -p "$target" "$src/console/dist"
   [ -f "$src/console/dist/index.html" ] || echo stub > "$src/console/dist/index.html"
+  # The old release resolves its generator JAR under its own PROJECT_ROOT, so
+  # seed it with HEAD's cached JARs (restored by CI); the old release selects
+  # and checksum-verifies its pinned version, so a Maven outage cannot fail it.
+  if compgen -G "$ROOT/build/tools/openapi-generator-cli-*.jar" >/dev/null; then
+    mkdir -p "$src/build/tools"
+    cp -n "$ROOT"/build/tools/openapi-generator-cli-*.jar "$src/build/tools/"
+  fi
   (cd "$src" && make generate) >&2
   (export CARGO_TARGET_DIR="$target"; cd "$src/server" && cargo build --bin "$BIN_NAME") >&2
   local built; built=$(cd "$src/server" && CARGO_TARGET_DIR="$target" cargo_target_dir Cargo.toml cargo)

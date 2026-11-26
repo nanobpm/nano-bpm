@@ -72,6 +72,8 @@ jobs:
         with:
           path: ${{ runner.temp }}/upgrade/bin
           key: upgrade-harness-old-bin-${{ runner.os }}-${{ steps.old.outputs.tag }}
+      - name: Restore the cached openapi-generator JAR (#1684)
+        uses: ./.github/actions/openapi-generator-cache
       - name: Generate HEAD's codegen and stub the console
         run: |
           make generate
