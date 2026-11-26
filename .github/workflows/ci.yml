@@ -929,6 +929,45 @@ jobs:
       - name: 'Test (vitest: source map unit + headless DAP e2e)'
         run: npm test
 
+  kani:
+    name: kani (engine-core proofs)
+    runs-on: ubuntu-24.04
+    # Bounded model checking of the engine-core harnesses (#1960,
+    # formal/kani/README.md). Its own job with a hard job-level timeout so a
+    # harness that outgrows its bound can never hold the TLC job hostage; each
+    # harness is additionally boxed by check.sh (KANI_HARNESS_TIMEOUT).
+    # NON-GATING, manual only (workflow_dispatch) until #1994: even the join
+    # harness is memory-borderline on a hosted runner (killed in SSA
+    # conversion), so it cannot gate PRs or the merge queue.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # One leg per harness, so each is timed and reported on its own and
+        # one harness's memory/time cannot starve another. Keep in sync with
+        # ALL_HARNESSES in formal/kani/check.sh (it rejects unknown names).
+        # Only the join harness is CI-gated for now; the other two
+        # (flow_arrivals_preserve_join_invariant, job_index_resync_keeps_lockstep)
+        # run locally via check.sh until #1994 brings them into the CI box.
+        harness:
+          - parallel_join_fires_only_when_every_flow_taken
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve pinned Kani version
+        id: kani
+        run: echo "version=$(sed -n 's/^KANI_VERSION="\(.*\)"$/\1/p' formal/kani/check.sh)" >> "$GITHUB_OUTPUT"
+      - name: Cache Kani toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-${{ steps.kani.outputs.version }}
+      - name: Kani proof (timed)
+        run: formal/kani/check.sh "${{ matrix.harness }}"
+
   formal:
     name: formal (tlc)
     # linker: its only Rust build (formal/lean/feel-diff.sh) falls back to

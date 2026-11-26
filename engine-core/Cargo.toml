@@ -74,6 +74,8 @@ required-features = ["serde"]
 # warning (unused code, deprecations, future-incompat lints, linker_messages,
 # etc.). See .cargo/config.toml for the macOS `__eh_frame` linker-warning fix.
 warnings = "deny"
+# `cfg(kani)` gates the Kani proof harnesses (#1960, formal/kani/README.md).
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(kani)"] }
 
 [lints.clippy]
 # Epic #1357: production code must not panic via `.unwrap()`/`.expect()`.

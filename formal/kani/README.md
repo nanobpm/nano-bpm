@@ -1,0 +1,42 @@
+# Kani: code-level proofs over `engine-core` (#1960)
+
+TLA+ (`formal/tla`) proves properties of a *model*; trace validation and fuzzing
+link it to `engine-core` by sampling. [Kani](https://github.com/model-checking/kani)
+is a bounded model checker over the Rust code itself: within the bound, every
+input is covered, and any panic, arithmetic overflow or out-of-bounds access is a
+counterexample (the code-level complement of the unwrap/expect ratchet, #1357).
+
+Harnesses are compiled only under `cfg(kani)` (declared in
+`engine-core/Cargo.toml`'s `check-cfg`), so normal builds are unaffected.
+
+## What is proven
+
+| Harness | File | Property | Bound |
+|---|---|---|---|
+| `flow_arrivals_preserve_join_invariant` | `engine-core/src/state/kani_proofs.rs` | Any interleaving of join arrivals (`record`/`add`) and firings (`consume_one_each`) keeps every stored token count positive, entries strictly sorted (one per flow), conserves tokens, never under/overflows. Restates the `TokenFlow.tla` join invariant. | both flows seeded with 1–2 tokens (so a firing, with or without surplus, is reachable), then 2 ops over 2 flow identities (same source, distinct ordinals), checked against a ghost count per flow, `add` ≤ 2 tokens; a firing (as in the engine) only once both flows hold a token |
+| `job_index_resync_keeps_lockstep` | `engine-core/src/state/kani_proofs.rs` | `resync_job_index` — the one index maintainer every job applier arm calls after a state change — keeps `activatable_jobs`, `deferred_jobs` / `deferred_job_deadlines` and `activated_jobs` in lockstep with the job across any two consecutive changes to any of the six job states, with or without a retry backoff, at any priority. (Driving `state::apply` symbolically did not fit the CI box.) | 2 transitions from a directly built `Created` job |
+| `parallel_join_fires_only_when_every_flow_taken` | `engine-core/src/state/kani_proofs.rs` | The parallel-diamond join (`P2`, two incoming flows) under the guard `Engine::activate_join` applies: over any arrival order it fires exactly when both flows have been taken, once per full round (`fired == min(from_A, from_B)`), keeps the surplus, and is never left ready-but-waiting. | 3 arrivals (so a firing can leave a surplus token; `kani::cover!` checks it is reached) |
+
+The earlier engine-level diamond harness (full deploy + create-instance through `Engine::apply_command`) did not prove inside the CI box — it needed unwind 24 over the whole command path — so it was replaced by the pure join transition above.
+
+Harnesses declare their own unwind: `#[kani::unwind(3)]` for the 2-step harnesses, `#[kani::unwind(4)]` for the 3-arrival parallel-join harness (so it fires with a surplus token); every collection holds ≤ 2 entries. `kani::cover!` checks make the firing-with-surplus and firing-without-surplus cases reachability-checked: `check.sh` fails a harness unless every cover property is satisfied (Kani itself exits 0 on an unsatisfiable cover), so they cannot silently go untested; `--default-unwind 3` covers anything else. Setting `KANI_UNWIND` passes `--unwind`, overriding every harness.
+
+## Running
+
+```bash
+formal/kani/check.sh            # every harness; installs the pinned kani-verifier on first use
+formal/kani/check.sh <harness>  # just that harness
+```
+
+CI has its own `kani (engine-core proofs)` job (job timeout 25 minutes), one matrix leg per harness. It is **non-gating and manual only** (run it with `workflow_dispatch`): even `parallel_join_fires_only_when_every_flow_taken` is memory-borderline on a hosted runner (it passed once, then the runner was killed in SSA conversion). The other two run locally only. https://github.com/nanobpm/nano-bpm/issues/1994 makes all three fit with margin and brings them back as a PR gate. Each harness is boxed to
+`KANI_HARNESS_TIMEOUT` seconds (default 420: a ~2 min cold build plus ~5 min of verification) and reporting its Kani
+`VERIFICATION:` line and wall time. If a harness outgrows the box, shrink its bound or
+replace it with a smaller transition rather than optimising the solver.
+
+## Defects found
+
+None so far. Any counterexample is filed as an issue and fixed red/green.
+
+Further harnesses (bounded `kani::any()` graphs from the `formal/corpus`
+vocabulary, `take_flow` / `has_active_path_to`) are tracked in the follow-up
+checklist issue.
