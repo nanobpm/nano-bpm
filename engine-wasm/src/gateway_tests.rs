@@ -192,7 +192,8 @@ fn drives_a_process_end_to_end() {
 
     let created = create(&mut eng);
     assert_eq!(created.process_definition_id, "order");
-    assert_eq!(created.variables["amount"].0, json!(42));
+    // Gateway parity: no variables echoed without `awaitCompletion`.
+    assert!(created.variables.is_empty(), "{:?}", created.variables);
 
     let jobs = activate(&mut eng).jobs;
     assert_eq!(jobs.len(), 1);
@@ -447,4 +448,62 @@ fn empty_fetch_variable_returns_all_variables() {
     );
     assert_eq!(res.status, 200, "{}", res.body);
     assert_eq!(json_body(&res)["jobs"][0]["variables"]["amount"], json!(42));
+}
+
+/// Review #1997: adjacent delimiter lines are malformed (400), never a panic.
+#[test]
+fn adjacent_multipart_delimiters_are_rejected_without_panicking() {
+    assert!(super::gateway::split_multipart("--b\r\n--b--\r\n", "b").is_err());
+    assert!(super::gateway::split_multipart("--b\n--b--", "b").is_err());
+}
+
+/// Review #1997: a `;` inside a quoted filename does not split the parameter.
+#[test]
+fn quoted_multipart_filename_keeps_semicolons() {
+    assert_eq!(
+        super::gateway::split_params(r#"form-data; name="resources"; filename="order;v2.bpmn""#),
+        vec![
+            "form-data",
+            r#" name="resources""#,
+            r#" filename="order;v2.bpmn""#
+        ]
+    );
+    let mut eng = TestEngine::new();
+    let res = deploy_raw(&mut eng, "order;v2.bpmn", BPMN);
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(
+        json_body(&res)["deployments"][0]["processDefinition"].is_object(),
+        "{}",
+        res.body
+    );
+}
+
+/// Review #1997: `operationReference` is rejected before mutation on every
+/// mutating route, never accepted and silently dropped.
+#[test]
+fn operation_reference_is_rejected_not_dropped() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    let res = call(
+        &mut eng,
+        "POST",
+        "/v2/process-instances",
+        &json!({ "processDefinitionId": "order", "operationReference": 7 }),
+    );
+    assert_eq!(res.status, 400, "{}", res.body);
+    let key = create(&mut eng).process_instance_key.0;
+    let res = call(
+        &mut eng,
+        "POST",
+        &format!("/v2/process-instances/{key}/cancellation"),
+        &json!({ "operationReference": 7 }),
+    );
+    assert_eq!(res.status, 400, "{}", res.body);
+    let res = call(
+        &mut eng,
+        "PUT",
+        &format!("/v2/element-instances/{key}/variables"),
+        &json!({ "variables": { "a": 1 }, "operationReference": 7 }),
+    );
+    assert_eq!(res.status, 400, "{}", res.body);
 }

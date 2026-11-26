@@ -411,6 +411,16 @@ where
 {
     let parsed = nanobpmn_search::strict::decode_strict::<T>(raw.as_bytes())
         .map_err(|e| Problem::invalid(format!("invalid request body: {e}")))?;
+    // The in-browser engine has no audit-record execution path, so a caller's
+    // `operationReference` would be silently lost. Reject it on every route,
+    // before any mutation, rather than accept-and-drop.
+    if let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(raw) {
+        if m.contains_key("operationReference") {
+            return Err(Problem::invalid(
+                "operationReference is not supported by the in-browser engine",
+            ));
+        }
+    }
     if let Some(v) = &parsed {
         v.validate()
             .map_err(|e| Problem::invalid(format!("invalid request body: {e}")))?;
@@ -915,7 +925,6 @@ impl TestEngine {
                 Event::ProcessInstanceCreated {
                     instance_key,
                     process_id,
-                    variables,
                     tags,
                     business_id,
                     process_definition_key,
@@ -925,7 +934,9 @@ impl TestEngine {
                     process_definition_id: process_id.clone(),
                     process_definition_version: *version,
                     tenant_id: nanobpmn_engine_core::DEFAULT_TENANT.to_string(),
-                    variables: nanobpmn_search::job::to_object_map(variables),
+                    // Like the native gateway when `awaitCompletion` is not set
+                    // (the only mode supported here): no variables echoed.
+                    variables: Default::default(),
                     process_definition_key: models::ProcessDefinitionKey(
                         process_definition_key.to_string(),
                     ),
@@ -1028,11 +1039,14 @@ fn multipart(headers: &BTreeMap<String, String>, raw: &str) -> Result<Vec<Part>,
             .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
             .unwrap_or_default();
         let attr = |name: &str| {
-            disposition.split(';').map(str::trim).find_map(|p| {
-                p.strip_prefix(name)
-                    .and_then(|v| v.strip_prefix('='))
-                    .map(|v| v.trim_matches('"').to_string())
-            })
+            split_params(disposition)
+                .into_iter()
+                .map(str::trim)
+                .find_map(|p| {
+                    p.strip_prefix(name)
+                        .and_then(|v| v.strip_prefix('='))
+                        .map(|v| v.trim_matches('"').to_string())
+                })
         };
         match attr("name").as_deref() {
             Some("resources") => {}
@@ -1107,7 +1121,30 @@ pub(crate) fn split_multipart<'a>(raw: &'a str, boundary: &str) -> Result<Vec<&'
     if !marks.last().is_some_and(|m| m.2) {
         return Err(malformed());
     }
-    Ok(marks.windows(2).map(|w| &raw[w[0].1..w[1].0]).collect())
+    marks
+        .windows(2)
+        .map(|w| raw.get(w[0].1..w[1].0).ok_or_else(malformed))
+        .collect()
+}
+
+/// Split a header value on `;`, ignoring semicolons inside quoted strings
+/// (with backslash escapes), so `filename="a;b.bpmn"` stays one parameter.
+pub(crate) fn split_params(value: &str) -> Vec<&str> {
+    let (mut out, mut start, mut quoted, mut escaped) = (Vec::new(), 0, false, false);
+    for (i, c) in value.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                out.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&value[start..]);
+    out
 }
 
 /// A `DeploymentMetadataResult` with exactly one member set.
