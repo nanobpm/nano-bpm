@@ -1024,6 +1024,14 @@ impl TestEngine {
 
     /// `POST /jobs/activation` → `JobActivationResult`, each job shaped by the
     /// mapper the gateway uses (`nanobpmn_search::job`).
+    ///
+    /// Long-poll semantics (#996): the engine is synchronous, so there is
+    /// nothing to wait *for* in-process. The `requestTimeout` long-poll
+    /// parameter is accepted (and validated by the generated model) but never
+    /// blocks: the call returns **immediately** with the jobs activatable at
+    /// the current virtual instant — an empty list (200) when there are none.
+    /// Consumers re-poll after advancing the virtual clock (`PUT /clock`), so
+    /// a re-poll costs no real time. There is no streaming/SSE.
     fn activate_jobs_rest(&mut self, raw: &str) -> Handled {
         let req = required_body::<models::JobActivationRequest>(raw)?;
         // Native gateway parity (`activate_jobs_impl`): a non-positive

@@ -265,6 +265,16 @@ embedded-only method.
 
 <!-- END GENERATED API -->
 
+### `POST /v2/jobs/activation` via `handle` — long-poll semantics
+
+The engine is synchronous, so job activation over the `handle` ABI never
+long-polls. `requestTimeout` is accepted (and validated) but ignored for
+waiting: the call returns **immediately** with the jobs activatable at the
+current virtual instant — `200 {"jobs": []}` when there are none. To wait for
+work, advance the virtual clock (`PUT /v2/clock`, e.g. through the SDK's
+injected clock — camunda/orchestration-cluster-api-js#450 / #451) and re-poll;
+re-polling costs no real time. There is no streaming / SSE job push.
+
 ## Errors — ProblemDetail-shaped (changed in 0.14.0)
 
 Since **0.14.0** (#1937, a breaking change to the thrown error type) an engine
