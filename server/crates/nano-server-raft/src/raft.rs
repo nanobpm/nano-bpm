@@ -135,6 +135,14 @@ pub struct ReplicatedCommand {
     /// `false` (the legacy behaviour), omitted when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub event_gateway_runtime: bool,
+    /// Whether this command may record the one-way
+    /// `message-correlation-ack-v2` latch (#2037). Decided once by the
+    /// proposing leader — `true` only while every cluster member advertises
+    /// [`FEATURE_MESSAGE_CORRELATION_ACK_V2`](nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2)
+    /// — and applied identically on every replica. Additive: absent decodes
+    /// as `false`, omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub message_correlation_ack_v2: bool,
 }
 
 /// Serialized-size estimate of one `terminal_deadlines` entry: a JSON
@@ -150,6 +158,8 @@ const REMOTE_BUFFERED_DELIVERY_FIELD_BYTES: u64 = 32;
 
 /// Serialized size of `,"event_gateway_runtime":true` (#2004).
 const EVENT_GATEWAY_RUNTIME_FIELD_BYTES: u64 = 29;
+/// Serialized size of `,"message_correlation_ack_v2":true` (#2037).
+const MESSAGE_CORRELATION_ACK_V2_FIELD_BYTES: u64 = 34;
 
 impl ReplicatedCommand {
     /// Approximate serialized size of the whole replicated item — the command
@@ -171,7 +181,12 @@ impl ReplicatedCommand {
         } else {
             0
         };
-        self.command.approx_bytes() + stamps + remote + gateway
+        let ack_v2 = if self.message_correlation_ack_v2 {
+            MESSAGE_CORRELATION_ACK_V2_FIELD_BYTES
+        } else {
+            0
+        };
+        self.command.approx_bytes() + stamps + remote + gateway + ack_v2
     }
 
     /// Drops the envelope deadline stamps (#1856 review): emitted only while
@@ -223,6 +238,14 @@ impl ReplicatedCommand {
     fn enable_event_gateway_runtime(&mut self) {
         self.event_gateway_runtime = true;
     }
+
+    /// Enables the `message-correlation-ack-v2` latch for this command
+    /// (#2037): called by the propose batcher only once every member
+    /// advertises
+    /// [`FEATURE_MESSAGE_CORRELATION_ACK_V2`](nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2).
+    fn enable_message_correlation_ack_v2(&mut self) {
+        self.message_correlation_ack_v2 = true;
+    }
 }
 
 /// Raw wire shape of a [`ReplicatedCommand`], used to lift the legacy nested
@@ -239,6 +262,7 @@ struct ReplicatedCommandWire {
     remote_buffered_delivery: bool,
     #[serde(default)]
     event_gateway_runtime: bool,
+    message_correlation_ack_v2: bool,
 }
 
 /// A [`Command`] plus any legacy (pre-#1556) `operation_reference` that was
@@ -280,6 +304,7 @@ impl From<ReplicatedCommandWire> for ReplicatedCommand {
             terminal_deadlines: wire.terminal_deadlines,
             remote_buffered_delivery: wire.remote_buffered_delivery,
             event_gateway_runtime: wire.event_gateway_runtime,
+            message_correlation_ack_v2: wire.message_correlation_ack_v2,
         }
     }
 }
@@ -294,6 +319,7 @@ impl ReplicatedCommand {
             terminal_deadlines: std::collections::BTreeMap::new(),
             remote_buffered_delivery: false,
             event_gateway_runtime: false,
+            message_correlation_ack_v2: false,
         }
     }
 }
@@ -2735,16 +2761,18 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 terminal_deadlines,
                                 remote_buffered_delivery,
                                 event_gateway_runtime,
+                                message_correlation_ack_v2,
                             } in batch.items
                             {
                                 // The leader's replicated rolling-upgrade
-                                // decision (#1949), re-armed before EVERY
-                                // apply so no command inherits another's.
+                                // decisions (#1949, #2037), re-armed before
+                                // EVERY apply so no command inherits another's.
                                 journal.set_remote_buffered_delivery(remote_buffered_delivery);
                                 // #2004: the leader's replicated decision
                                 // whether this command may latch the
                                 // event-gateway runtime.
                                 journal.set_event_gateway_runtime(event_gateway_runtime);
+                                journal.set_message_correlation_ack_v2(message_correlation_ack_v2);
                                 // Per-command actor profiling (off unless
                                 // NANOBPM_CMD_PROFILE): time + allocated-byte
                                 // delta by command kind, on the engine thread.
@@ -3742,6 +3770,25 @@ impl Batcher {
                         .iter_mut()
                         .for_each(ReplicatedCommand::enable_event_gateway_runtime);
                 }
+                // Rolling-upgrade gate for the v2 ack output (#2037): the
+                // same cluster-wide decision, for the v2 capability, so a v1
+                // member never receives an ack carrying the resolved element.
+                if all_members_support(
+                    &raft,
+                    transport.as_ref(),
+                    nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
+                )
+                .await
+                    && transport
+                        .cluster_supports(
+                            nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
+                        )
+                        .await
+                {
+                    items
+                        .iter_mut()
+                        .for_each(ReplicatedCommand::enable_message_correlation_ack_v2);
+                }
                 // Carry this (leader) replica's latest chain digest so
                 // followers can compare at that index (#1664).
                 // Rolling-upgrade gate (#1664 / #1661): stamp only while
@@ -3865,10 +3912,11 @@ impl Batcher {
                 now,
                 operation_reference,
                 terminal_deadlines,
-                // Decided by the batcher at proposal time (#1949).
+                // Decided by the batcher at proposal time (#1949, #2037).
                 remote_buffered_delivery: false,
                 // Decided by the batcher at proposal time (#2004).
                 event_gateway_runtime: false,
+                message_correlation_ack_v2: false,
             },
             resp,
         })
@@ -5392,6 +5440,32 @@ mod tests {
         let stamped_json = serde_json::to_string(&stamped).unwrap();
         let decoded: ReplicatedCommand = serde_json::from_str(&stamped_json).unwrap();
         assert!(decoded.event_gateway_runtime);
+        let extra = (stamped_json.len() - plain_json.len()) as u64;
+        assert!(
+            stamped.approx_bytes() - plain.approx_bytes() >= extra,
+            "estimate undercounts the stamp ({extra} bytes)"
+        );
+    }
+
+    /// #2037: the `message_correlation_ack_v2` envelope bit is additive on
+    /// the wire (omitted when off, absent decodes as off) and counted by the
+    /// batcher's size estimate.
+    #[test]
+    fn replicated_command_message_correlation_ack_v2_is_additive_on_the_wire() {
+        let plain = ReplicatedCommand::new(Command::cancel_instance(42), 10);
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !plain_json.contains("message_correlation_ack_v2"),
+            "{plain_json}"
+        );
+        let decoded_plain: ReplicatedCommand = serde_json::from_str(&plain_json).unwrap();
+        assert!(!decoded_plain.message_correlation_ack_v2);
+
+        let mut stamped = plain.clone();
+        stamped.enable_message_correlation_ack_v2();
+        let stamped_json = serde_json::to_string(&stamped).unwrap();
+        let decoded: ReplicatedCommand = serde_json::from_str(&stamped_json).unwrap();
+        assert!(decoded.message_correlation_ack_v2);
         let extra = (stamped_json.len() - plain_json.len()) as u64;
         assert!(
             stamped.approx_bytes() - plain.approx_bytes() >= extra,

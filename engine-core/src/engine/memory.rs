@@ -141,6 +141,7 @@ impl Engine {
             remote_backlog_scan_pending: false,
             remote_buffered_delivery_envelope: false,
             event_gateway_runtime_envelope: true,
+            message_correlation_ack_v2_envelope: false,
             buffer_candidates: std::collections::BTreeMap::new(),
             sweep_from: 0,
             raft_applied: snapshot.raft_applied,

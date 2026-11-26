@@ -148,6 +148,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::MessageCorrelationReceiptSettled { .. }
         | Event::RemoteBufferedDeliveryActivated { .. }
         | Event::EventGatewayRuntimeActivated { .. }
+        | Event::MessageCorrelationAckV2Activated { .. }
         | Event::MessageStartSubscriptionCreated { .. }
         | Event::RoutedDeliveryRecorded { .. } => subscription::apply_subscription(state, event),
         // A history-only record (#1300): the instance it names was already

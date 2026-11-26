@@ -2375,7 +2375,7 @@ pub const ROUTED_DELIVERY_LEDGER_CAP: usize = 65_536;
 /// it concerned, and whether it is a **close tombstone** (a
 /// `CloseMessageSubscription`) that rejects a delayed `OpenMessageSubscription`
 /// for that subscription (which bears its own, different `delivery_key`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RoutedDelivery {
     pub delivery_key: Key,
@@ -2409,7 +2409,7 @@ pub struct RoutedDelivery {
 
 /// The durable answer to one ack-paced buffered delivery (#1949): see
 /// [`RoutedDelivery::receipt`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CorrelationReceipt {
     pub accepted: bool,
@@ -2425,6 +2425,13 @@ pub struct CorrelationReceipt {
     /// The message partition awaiting the ack. Additive.
     #[cfg_attr(feature = "serde", serde(default))]
     pub target_partition: u64,
+    /// The resolved (post-migration) element the delivery was consumed at
+    /// (#2037), re-driven with the receipt. Additive, omitted when `None`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub element_id: Option<ElementId>,
 }
 
 /// The routed-delivery ledger (#1497): dedup set + applied-order FIFO + a
@@ -2513,13 +2520,14 @@ impl RoutedDeliveries {
     /// The durable answer recorded for ack-paced delivery `delivery_key`
     /// (#1949), while it is unsettled (pinned).
     pub fn receipt(&self, delivery_key: Key) -> Option<CorrelationReceipt> {
-        self.receipts.get(&delivery_key).copied()
+        self.receipts.get(&delivery_key).cloned()
     }
     /// Every unsettled receipt, `(delivery_key, subscription_key, receipt)`,
     /// in applied order (#1949).
     pub fn unsettled_receipts(&self) -> impl Iterator<Item = (Key, Key, CorrelationReceipt)> + '_ {
         self.order.values().filter_map(|e| {
             e.receipt
+                .clone()
                 .map(|r| (e.delivery_key, e.subscription_key.unwrap_or(0), r))
         })
     }
@@ -2552,7 +2560,7 @@ impl RoutedDeliveries {
         if entry.receipt.is_some() || entry.settled {
             return false;
         }
-        entry.receipt = Some(receipt);
+        entry.receipt = Some(receipt.clone());
         self.receipts.insert(delivery_key, receipt);
         self.evictable.remove(&seq);
         true
@@ -2590,9 +2598,9 @@ impl RoutedDeliveries {
                 self.tombstones.insert(sub, entry.delivery_key);
             }
         }
-        match entry.receipt {
+        match &entry.receipt {
             Some(receipt) => {
-                self.receipts.insert(entry.delivery_key, receipt);
+                self.receipts.insert(entry.delivery_key, receipt.clone());
             }
             None => {
                 self.evictable.insert(seq);
@@ -2867,6 +2875,17 @@ pub struct State {
         serde(default, skip_serializing_if = "std::ops::Not::not")
     )]
     pub event_gateway_runtime_latched: bool,
+    /// Whether a replicated envelope has EVER enabled
+    /// `message-correlation-ack-v2` on this partition (#2037): from then on
+    /// the ack output carries the resolved consumption element. One-way and
+    /// snapshotted; set only by applying
+    /// [`crate::Event::MessageCorrelationAckV2Activated`], so journal replay
+    /// restores it too. Additive.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub message_correlation_ack_v2_latched: bool,
     /// Open and settled **signal** subscriptions, keyed by subscription key. A
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) as an audit trail.
@@ -4658,6 +4677,7 @@ mod routed_ledger_eviction_tests {
             message_key: 1,
             instance_key: 2,
             target_partition: 0,
+            element_id: None,
         }
     }
 

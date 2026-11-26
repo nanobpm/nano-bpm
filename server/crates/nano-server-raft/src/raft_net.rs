@@ -488,6 +488,7 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
         FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES,
         FEATURE_EVENT_GATEWAY_RUNTIME, FEATURE_MESSAGE_BUFFERING, FEATURE_MESSAGE_CORRELATION_ACK,
+        FEATURE_MESSAGE_CORRELATION_ACK_V2,
         FEATURE_PROCESS_INSTANCE_HISTORY_DELETION, FEATURE_REPLICATED_LENIENT_COMPLETION,
         FEATURE_TERMINAL_DEADLINES,
     };
@@ -518,6 +519,21 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
             // run the legacy race on a pre-#2004 peer.
             if item.event_gateway_runtime && !required.contains(&FEATURE_EVENT_GATEWAY_RUNTIME) {
                 required.push(FEATURE_EVENT_GATEWAY_RUNTIME);
+            }
+            // #2037: an entry that may record the v2 latch, or an ack
+            // carrying the resolved element, is v2 output a v1 peer would
+            // drop.
+            let v2_ack = matches!(
+                item.command,
+                Command::AcknowledgeMessageCorrelation {
+                    element_id: Some(_),
+                    ..
+                }
+            );
+            if (item.message_correlation_ack_v2 || v2_ack)
+                && !required.contains(&FEATURE_MESSAGE_CORRELATION_ACK_V2)
+            {
+                required.push(FEATURE_MESSAGE_CORRELATION_ACK_V2);
             }
             let feature = match item.command {
                 Command::SetLenientCompletion { .. } => FEATURE_REPLICATED_LENIENT_COMPLETION,
@@ -579,6 +595,7 @@ mod codec_tests {
                     terminal_deadlines: std::collections::BTreeMap::new(),
                     remote_buffered_delivery: false,
                     event_gateway_runtime: false,
+                    message_correlation_ack_v2: false,
                 },
             ])),
         };
@@ -670,6 +687,7 @@ mod codec_tests {
                 accepted: true,
                 consumed: true,
                 deferred: false,
+                element_id: None,
             },
             Command::ResumeMessageSubscription {
                 subscription_key: 1,
@@ -710,6 +728,34 @@ mod codec_tests {
         assert_eq!(
             required_features_for(&req(vec![gateway])),
             vec![nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME]
+        );
+        // #2037: an entry that may record the v2 latch, or an ack carrying
+        // the resolved element (v2 output), never ships to a v1 peer.
+        let mut latching = entry(Command::cancel_instance(1));
+        if let EntryPayload::Normal(batch) = &mut latching.payload {
+            batch.items[0].message_correlation_ack_v2 = true;
+        }
+        assert_eq!(
+            required_features_for(&req(vec![latching])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2]
+        );
+        let mut v2_ack =
+            required_features_for(&req(vec![entry(Command::AcknowledgeMessageCorrelation {
+                subscription_key: 1,
+                message_key: 2,
+                delivery_key: 5,
+                accepted: true,
+                consumed: true,
+                deferred: false,
+                element_id: Some("await-v2".to_string()),
+            })]));
+        v2_ack.sort_unstable();
+        assert_eq!(
+            v2_ack,
+            vec![
+                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
+                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
+            ]
         );
         // #1856 review: a stamped entry is never shipped to a peer that would
         // ignore the deadline map; an unstamped one requires nothing.

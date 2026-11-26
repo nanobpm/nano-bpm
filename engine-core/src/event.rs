@@ -1609,6 +1609,21 @@ pub enum Event {
         /// Additive: `0` on a pre-receipt record (no receipt stored).
         #[cfg_attr(feature = "serde", serde(default))]
         delivery_key: Key,
+        /// The RESOLVED consumption element (#2037): the element the
+        /// delivery was consumed at, read from the instance partition's durable state when the
+        /// answer is derived — so an instance migrated between the message
+        /// partition's reservation and the consumption reports the
+        /// post-migration element, not the stale one the delivery was
+        /// routed with (Zeebe re-points the message-partition
+        /// subscription on migration). `None` when unresolvable and on a
+        /// pre-#2037 record (additive). No process definition key is
+        /// carried: it is derivable from the instance, whose migration
+        /// already re-points it, so a copy here would be a drift surface.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        element_id: Option<ElementId>,
     },
     /// The message partition applied an instance partition's acknowledgement
     /// (#1949): clears the canonical subscription's `awaiting_ack`; an
@@ -1627,6 +1642,13 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default))]
         deferred: bool,
         partition: u64,
+        /// See [`Event::MessageCorrelationAcknowledging`]'s `element_id`
+        /// (#2037): applying it re-points the canonical subscription.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        element_id: Option<ElementId>,
     },
     /// A published message correlated to a process-level **message start
     /// event** and created instance `instance_key` (#1300; Zeebe records this as
@@ -2126,6 +2148,12 @@ pub enum Event {
     /// once, when the replicated envelope first enables the capability and no
     /// legacy race state is left. Partition-level; names no instance.
     EventGatewayRuntimeActivated { partition: u64 },
+    /// A replicated envelope enabled `message-correlation-ack-v2` on this
+    /// partition for the first time (#2037): every cluster member advertises
+    /// v2, so from here on the ack output carries the resolved consumption
+    /// element. One-way latch, recorded in the journal so replay restores it.
+    /// Partition-level; names no instance.
+    MessageCorrelationAckV2Activated { partition: u64 },
     /// A process-level message start subscription was opened at deploy time: a
     /// later [`Event::MessagePublished`] with a matching `message_name` creates a
     /// new instance of `process_id`. Carried on the log so replay reconstructs
@@ -2524,6 +2552,7 @@ impl Event {
             | Event::MessageCorrelationReceiptSettled { .. }
             | Event::RemoteBufferedDeliveryActivated { .. }
             | Event::EventGatewayRuntimeActivated { .. }
+            | Event::MessageCorrelationAckV2Activated { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
@@ -2720,6 +2749,7 @@ impl Event {
             | Event::MessageCorrelationSettled { partition, .. }
             | Event::RemoteBufferedDeliveryActivated { partition }
             | Event::EventGatewayRuntimeActivated { partition } => *partition,
+            | Event::MessageCorrelationAckV2Activated { partition } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another
             // partition, so it never identifies the record's owner. Route by the

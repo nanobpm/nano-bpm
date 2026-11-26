@@ -271,6 +271,7 @@ pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("message_correlation_ack_used", FieldRule::Exact),
     ("remote_buffered_delivery_latched", FieldRule::Exact),
     ("event_gateway_runtime_latched", FieldRule::Exact),
+    ("message_correlation_ack_v2_latched", FieldRule::Exact),
     ("signal_subscriptions", FieldRule::EntityMap),
     ("conditional_subscriptions", FieldRule::EntityMap),
     ("message_start_subscriptions", FieldRule::Exact),

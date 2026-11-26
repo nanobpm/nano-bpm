@@ -117,6 +117,7 @@
       "consumed": true,
       "deferred": false,
       "delivery_key": 26,
+      "element_id": "b2",
       "instance_key": 23,
       "message_key": 20,
       "partition": 0,
@@ -158,6 +159,11 @@
     }
   },
   {
+    "MessageCorrelationAckV2Activated": {
+      "partition": 1
+    }
+  },
+  {
     "MessageCorrelationSettled": {
       "delivery_key": 26,
       "partition": 1,
@@ -175,6 +181,7 @@
       "accepted": false,
       "consumed": false,
       "deferred": false,
+      "element_id": "b2",
       "message_key": 20,
       "partition": 1,
       "subscription_key": 21
