@@ -13,7 +13,10 @@
 //! 2. **rolling upgrade** — members are replaced one by one; the latch is
 //!    recorded only once every member runs the new binary;
 //! 3. **recovery** — a member restarted from snapshot + journal on either side
-//!    of the latch rejoins without divergence;
+//!    of the latch rejoins without divergence; after the latch EVERY member
+//!    (the last-upgraded one included) is restarted in turn and must rejoin
+//!    ACTIVE with its log matching the leader prefix and fresh digest claims
+//!    still verifying (#2058);
 //! 4. **rollback refusal** — after the latch an old binary started on a
 //!    member's data is refused by the cluster with a clear error instead of
 //!    silently misapplying the post-latch log.
@@ -512,6 +515,94 @@ fn assert_digest_cutover_agreed(c: &Cluster, barrier: &[u64]) {
     }
 }
 
+/// Per member, per partition: the highest Raft log index on disk.
+fn log_heads(c: &Cluster) -> Vec<Vec<u64>> {
+    c.members
+        .iter()
+        .map(|m| {
+            (0..PARTITIONS)
+                .map(|p| {
+                    raft_batches(&m.data, p)
+                        .last()
+                        .map(|(i, _)| *i)
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// After a post-latch restart from snapshot + journal, member `id`'s
+/// replicated log must be a prefix of the longest peer log (the leader's),
+/// comparing the WHOLE `payload.Normal` per index — items plus the batch
+/// fields `digest` and `digest_cutover` — and must have caught up to the
+/// entries proposed since it rejoined. Polled: the follower appends
+/// asynchronously after the create was acknowledged by a quorum.
+fn assert_restarted_matches_prefix(c: &Cluster, id: usize) {
+    for p in 0..PARTITIONS {
+        wait_for(
+            &format!("node {id}'s partition {p} log to match the leader prefix"),
+            Duration::from_secs(60),
+            || {
+                let logs: Vec<Vec<(u64, serde_json::Value)>> =
+                    c.members.iter().map(|m| raft_batches(&m.data, p)).collect();
+                let leader = logs.iter().max_by_key(|l| l.len()).unwrap();
+                let mine = &logs[id];
+                if mine.len() < leader.len() {
+                    return false;
+                }
+                if let Some((a, b)) = mine.iter().zip(leader.iter()).find(|(a, b)| a != b) {
+                    panic!(
+                        "partition {p}: restarted node {id} disagrees with the leader prefix: \
+                         {a:?} vs {b:?}"
+                    );
+                }
+                true
+            },
+            c,
+        );
+    }
+}
+
+/// Post-restart digest claims keep verifying: on every partition, every member
+/// logged a NEW `digest` claim beyond its pre-restart head `before`, and every
+/// member's claim at each such index agrees with every other member's.
+fn assert_fresh_digest_claims(c: &Cluster, before: &[Vec<u64>], restarted: usize) {
+    for p in 0..PARTITIONS {
+        let claims: Vec<std::collections::BTreeMap<u64, serde_json::Value>> = c
+            .members
+            .iter()
+            .enumerate()
+            .map(|(id, m)| {
+                let head = before[id][p as usize];
+                raft_batches(&m.data, p)
+                    .into_iter()
+                    .filter(|(i, b)| *i > head && !b["digest"].is_null())
+                    .map(|(i, b)| (i, b["digest"].clone()))
+                    .collect()
+            })
+            .collect();
+        for (id, mine) in claims.iter().enumerate() {
+            assert!(
+                !mine.is_empty(),
+                "partition {p}: node {id} logged no digest claim after node {restarted}'s \
+                 post-latch restart (divergence check vacuous)"
+            );
+            for (other, theirs) in claims.iter().enumerate() {
+                for (i, d) in mine {
+                    if let Some(t) = theirs.get(i) {
+                        assert_eq!(
+                            d, t,
+                            "partition {p}: after node {restarted}'s restart, digest claims of \
+                             nodes {id} and {other} differ at index {i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The latch's ordering contract over every member's Raft log, per partition:
 /// no new-format item at or below `barrier[p]` — the partition's last Raft
 /// log index when the last old member stopped (all prior submissions had been
@@ -633,13 +724,21 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     c.assert_no_divergence("after the latch");
     assert_digest_cutover_agreed(&c, &barrier);
 
-    // ---- Phase 3: recovery AFTER the latch.
-    c.kill(1);
-    c.start(1, Bin::New);
-    wait_ready(&c, 1);
-    keys.extend(create_instances(&c, 1, 3));
-    assert_visible_everywhere(&mut c, &keys);
-    c.assert_no_divergence("after post-latch recovery");
+    // ---- Phase 3: recovery AFTER the latch, for EVERY member (#2058) —
+    // including the last-upgraded one, whose log history differs (it ran the
+    // old binary longest). Sequential, one member down at a time, so quorum
+    // holds and the runtime stays within the nightly budget.
+    for id in 0..NODES {
+        let before = log_heads(&c);
+        c.kill(id);
+        c.start(id, Bin::New);
+        wait_ready(&c, id);
+        keys.extend(create_instances(&c, (id + 1) % NODES, 2));
+        assert_visible_everywhere(&mut c, &keys);
+        assert_restarted_matches_prefix(&c, id);
+        assert_fresh_digest_claims(&c, &before, id);
+        c.assert_no_divergence(&format!("after post-latch recovery of node {id}"));
+    }
 
     // ---- Phase 4: rollback refusal. Latches are one-way: the OLD binary
     // started on node 2's post-latch data must refuse it (fail closed on the
