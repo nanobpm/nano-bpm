@@ -3047,3 +3047,87 @@ fn a_close_before_the_deferred_ack_leaves_no_phantom_wait() {
     let second = rig.create("await-payment", &order, 3_000);
     assert_eq!(correlated(&rig, second), published, "{:?}", rig.trace);
 }
+
+/// Suspends a fresh local `await-payment` instance, publishes a matching
+/// buffered message while it is suspended, then resumes it under the given
+/// remote-buffered-delivery envelope. Returns the resume's events and engine.
+fn suspend_publish_resume(delivery: bool) -> (Engine, Vec<Event>) {
+    let mut engine = deployed();
+    engine.set_remote_buffered_delivery(delivery);
+    let (inst, _) = create(&mut engine, "o-1", 0);
+    engine
+        .apply_command(Command::SuspendInstance { instance_key: inst })
+        .unwrap();
+    engine
+        .apply_command_at(
+            publish("payment-received", "o-1", Some(10_000), None),
+            1_000,
+        )
+        .unwrap();
+    let events = engine
+        .apply_command_at(Command::ResumeInstance { instance_key: inst }, 2_000)
+        .unwrap();
+    (engine, events)
+}
+
+/// #2012 (1): with the rolling-upgrade gate closed, a LOCAL resume re-offer
+/// must not run — a pre-#1949 replica only emits `ProcessInstanceResumed`,
+/// so an upgraded replica consuming the backlog would diverge.
+#[test]
+fn local_resume_reoffer_is_gated_off_in_a_mixed_version_cluster() {
+    let (engine, events) = suspend_publish_resume(false);
+    assert!(
+        matches!(events.as_slice(), [Event::ProcessInstanceResumed { .. }]),
+        "legacy-identical resume, got {events:?}"
+    );
+    assert_eq!(engine.state().buffered_messages.len(), 1);
+}
+
+/// #2012 (1) control: with the gate open the local backlog is re-offered.
+#[test]
+fn local_resume_reoffer_runs_when_the_gate_is_open() {
+    let (_, events) = suspend_publish_resume(true);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::BufferedMessageCorrelated { .. })));
+}
+
+/// A rig whose instance partition holds one un-applied ack-paced delivery of
+/// a buffered message to a fresh `await-payment` instance.
+fn rig_holding_a_paced_delivery() -> (Rig, Command) {
+    let (mut rig, order) = Rig::new(process_with_message_catch());
+    rig.publish_named_backlog("payment-received", &order, 1);
+    let (_, mut held) = rig.create_holding("await-payment", &order, 2_000, &is_delivery);
+    assert_eq!(held.len(), 1, "one paced delivery in flight");
+    let (to_message, delivery) = held.remove(0);
+    assert!(!to_message);
+    (rig, delivery)
+}
+
+/// #2012 (2): a paced delivery applied through the debugger must produce the
+/// same records as a normal apply — in particular the correlation ack the
+/// message partition waits on (`MessageCorrelationAcknowledging`).
+#[test]
+fn debug_apply_of_a_paced_delivery_flushes_its_ack() {
+    let (mut normal, delivery) = rig_holding_a_paced_delivery();
+    let expected = normal.instance.apply_command_at(delivery, 3_000).unwrap();
+    assert!(
+        expected
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelationAcknowledging { .. })),
+        "{expected:?}"
+    );
+
+    for breakpoints in [Vec::new(), vec![BreakCondition::EveryStep]] {
+        let (mut debug, delivery) = rig_holding_a_paced_delivery();
+        let mut session = debug
+            .instance
+            .debug_command_at(delivery, 3_000, breakpoints)
+            .unwrap();
+        while session.is_paused() {
+            debug.instance.debug_step(&mut session);
+        }
+        assert_eq!(session.log(), expected.as_slice());
+        assert_eq!(debug.instance.state(), normal.instance.state());
+    }
+}
