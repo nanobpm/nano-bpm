@@ -48748,22 +48748,47 @@ mod clustered_startup_tests {
             .create_for_stream(Some("intake".into()), None, Default::default())
             .await
             .expect("raft-routed create commits via quorum");
-        let mut leased = false;
+        // A DURABLE lease (`with_lease = true`), so the lock is replicated
+        // state and its expiry can only reach followers through the Raft log —
+        // a volatile leader-local lock could expire locally and pass vacuously.
+        let mut job_key = None;
         for _ in 0..200 {
-            if !node0
-                .activate_for_stream("do-work", "w", 10, 500, None)
-                .await
-                .is_empty()
-            {
-                leased = true;
+            let jobs = node0
+                .activate_for_stream_with_lease("do-work", "w", 10, 500, None, true)
+                .await;
+            if let Some(j) = jobs.into_iter().next() {
+                job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(leased, "the job leases on the leader");
+        let job_key = job_key.expect("the job leases on the leader");
         assert!(
             node0.led_partitions().contains(&0),
             "node0 leads partition 0"
+        );
+        let follower_state = |node: &ServerImpl| {
+            let handle = node
+                .engine_handle_for(0)
+                .expect("follower materializes partition 0");
+            async move {
+                handle
+                    .with(move |journal| journal.engine().job(job_key).map(|j| j.state))
+                    .await
+            }
+        };
+        // The follower must observe the replicated activation before the tick.
+        let mut activated = false;
+        for _ in 0..200 {
+            if follower_state(&node1).await == Some(nanobpmn_engine_core::JobState::Activated) {
+                activated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            activated,
+            "the follower observes the durable lease (Activated)"
         );
         let far_future = now_millis() + 600_000;
         let mut produced = false;
@@ -48778,6 +48803,19 @@ mod clustered_startup_tests {
         assert!(
             produced,
             "the Raft tick reclaims the expired lease via the log"
+        );
+        // The expiry replicated: the follower sees the job back in Created.
+        let mut reclaimed = false;
+        for _ in 0..200 {
+            if follower_state(&node1).await == Some(nanobpmn_engine_core::JobState::Created) {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            reclaimed,
+            "the follower observes the lease expiry replicated through Raft (Created)"
         );
         for node in [&node0, &node1, &node2] {
             for p in 0..3u64 {
