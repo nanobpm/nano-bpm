@@ -236,3 +236,66 @@ fn latch_waits_for_a_legacy_gateway_paused_on_its_end_listener() {
         "an unlatched partition never refuses its legacy races"
     );
 }
+
+/// Cold spill must not hide a legacy cutover blocker (#2004, #2047 review):
+/// the cutover decision scans RESIDENT instances only, so a cold-spilled
+/// legacy race (or a legacy gateway still in flight) would let a cold-spilling
+/// replica latch where a resident one keeps the legacy path — divergence, and
+/// a latched snapshot that refuses the race once folded back. Legacy blockers
+/// therefore stay resident until they settle: neither offered as cold-spill
+/// candidates nor accepted by `snapshot_instance`.
+#[test]
+fn legacy_cutover_blockers_are_never_cold_spilled() {
+    // A legacy race (armed catches tagged with their gateway).
+    let (mut engine, _) = engine_with(false);
+    let (race, _) = create(&mut engine);
+    assert!(!engine
+        .state
+        .legacy_event_gateway_race_instances()
+        .is_empty());
+    assert!(!engine.cold_spillable_instances(usize::MAX).contains(&race));
+    assert_eq!(engine.cold_spillable_count(), 0);
+    assert!(engine.snapshot_instance(race).is_none());
+
+    // So a resident replica and one that tried to spill decide alike.
+    engine.set_event_gateway_runtime(true);
+    let (_, events) = create(&mut engine);
+    assert_eq!(
+        latches(&events),
+        0,
+        "the resident legacy race blocks the latch"
+    );
+
+    // A legacy gateway paused on its end listener (in flight, no race yet).
+    let listened = ProcessBuilder::new("evtl")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "M1", "=key")
+        .message_intermediate_catch_event("onM2", "M2", "=key")
+        .end_event("end1")
+        .end_event("end2")
+        .connect("start", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "end1")
+        .connect("onM2", "end2")
+        .with_listeners("gw", Vec::new(), vec![el(ListenerEventType::End, "gw-end")])
+        .build()
+        .unwrap();
+    let (mut engine, _) = engine_with(false);
+    engine
+        .apply_command(Command::DeployProcess(listened))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::create_instance_with(
+            "evtl",
+            vars(&[("key", Value::Str("k".into()))]),
+        ))
+        .unwrap();
+    let paused = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(engine.state.legacy_event_gateway_in_flight(0));
+    assert!(!engine
+        .cold_spillable_instances(usize::MAX)
+        .contains(&paused));
+    assert!(engine.snapshot_instance(paused).is_none());
+}

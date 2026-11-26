@@ -3229,17 +3229,31 @@ impl State {
     /// once it completes it arms its catches as a race, so the runtime latch
     /// must not be recorded while one exists.
     pub fn legacy_event_gateway_in_flight(&self, except: Key) -> bool {
-        self.instances.values().any(|i| {
-            let Some(def) = self.definition_for(i) else {
-                return false;
-            };
-            i.active.iter().any(|(eik, id)| {
-                *eik != except
-                    && !i.gateway_subscriptions.contains_key(eik)
-                    && def.definition.element(id).is_some_and(|e| {
-                        matches!(e.kind, crate::model::ElementKind::EventBasedGateway)
-                    })
-            })
+        self.instances
+            .values()
+            .any(|i| self.legacy_event_gateway_in_flight_in(i, except))
+    }
+
+    /// Whether `instance` blocks the `event-gateway-runtime-v1` cutover
+    /// (#2004): it holds a legacy race or a legacy gateway still in flight.
+    /// The cutover decision scans resident instances only, so these are kept
+    /// out of cold spill until they settle (#2047 review); this is the ONE
+    /// per-instance predicate shared by that pin and the cutover scans.
+    pub fn is_legacy_event_gateway_blocker(&self, instance: &ProcessInstance) -> bool {
+        !instance.races.is_empty() || self.legacy_event_gateway_in_flight_in(instance, 0)
+    }
+
+    fn legacy_event_gateway_in_flight_in(&self, i: &ProcessInstance, except: Key) -> bool {
+        let Some(def) = self.definition_for(i) else {
+            return false;
+        };
+        i.active.iter().any(|(eik, id)| {
+            *eik != except
+                && !i.gateway_subscriptions.contains_key(eik)
+                && def
+                    .definition
+                    .element(id)
+                    .is_some_and(|e| matches!(e.kind, crate::model::ElementKind::EventBasedGateway))
         })
     }
 
