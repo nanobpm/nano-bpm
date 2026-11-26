@@ -385,10 +385,6 @@ fn multipart_only_frames_on_complete_delimiter_lines() {
     let content = "prefix--nano-boundary--suffix\n--nano-boundaryX";
     let res = deploy_raw(&mut eng, "notes.txt", content);
     assert_eq!(res.status, 200, "{}", res.body);
-    // The framing keeps the content byte-for-byte.
-    let body = format!("--nano-boundary\r\nH: v\r\n\r\n{content}\r\n--nano-boundary--\r\n");
-    let parts = super::gateway::split_multipart(&body, "nano-boundary").expect("framed");
-    assert_eq!(parts, vec![format!("H: v\r\n\r\n{content}")]);
 
     let headers = json!({ "Content-Type": "multipart/form-data; boundary=nano-boundary" });
     let body = "--nano-boundary\r\nContent-Disposition: form-data; name=\"resources\"; filename=\"a.txt\"\r\n\r\nx\r\n";
@@ -450,24 +446,9 @@ fn empty_fetch_variable_returns_all_variables() {
     assert_eq!(json_body(&res)["jobs"][0]["variables"]["amount"], json!(42));
 }
 
-/// Review #1997: adjacent delimiter lines are malformed (400), never a panic.
-#[test]
-fn adjacent_multipart_delimiters_are_rejected_without_panicking() {
-    assert!(super::gateway::split_multipart("--b\r\n--b--\r\n", "b").is_err());
-    assert!(super::gateway::split_multipart("--b\n--b--", "b").is_err());
-}
-
 /// Review #1997: a `;` inside a quoted filename does not split the parameter.
 #[test]
 fn quoted_multipart_filename_keeps_semicolons() {
-    assert_eq!(
-        super::gateway::split_params(r#"form-data; name="resources"; filename="order;v2.bpmn""#),
-        vec![
-            "form-data",
-            r#" name="resources""#,
-            r#" filename="order;v2.bpmn""#
-        ]
-    );
     let mut eng = TestEngine::new();
     let res = deploy_raw(&mut eng, "order;v2.bpmn", BPMN);
     assert_eq!(res.status, 200, "{}", res.body);
@@ -670,4 +651,84 @@ fn query_parameters_are_form_decoded() {
         );
         assert_eq!(res.status, 400, "{bad}: {}", res.body);
     }
+}
+
+/// Review #1997 (operator): activation without a `worker` attributes the jobs
+/// to `"default"`, as the native `activate_jobs_impl` does — never `""`.
+#[test]
+fn activation_without_worker_attributes_jobs_to_default() {
+    let mut eng = TestEngine::new();
+    deploy(&mut eng);
+    create(&mut eng);
+    let res = call(
+        &mut eng,
+        "POST",
+        "/v2/jobs/activation",
+        &json!({ "type": "charge", "maxJobsToActivate": 5, "timeout": 60000 }),
+    );
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(json_body(&res)["jobs"][0]["worker"], json!("default"));
+}
+
+/// Review #1997 (operator): the shared multipart fixtures
+/// (`server/conformance/multipart-deploy.json`, also run against the native
+/// gateway by `server/src/wasm_conformance_tests.rs`) produce the expected
+/// status and deployed resource names through `handle()`.
+#[test]
+fn multipart_deploy_fixtures_match_the_native_gateway_expectations() {
+    for f in multipart_fixtures() {
+        let mut eng = TestEngine::new();
+        let headers = json!({ "Content-Type": f.content_type });
+        let res = eng.handle_request("POST", "/v2/deployments", &headers.to_string(), &f.body);
+        assert_eq!(res.status, f.status, "{}: {}", f.name, res.body);
+        if res.status == 200 {
+            assert_eq!(resource_names(&json_body(&res)), f.resources, "{}", f.name);
+        }
+    }
+}
+
+struct MultipartFixture {
+    name: String,
+    content_type: String,
+    body: String,
+    status: u16,
+    resources: Vec<String>,
+}
+
+fn multipart_fixtures() -> Vec<MultipartFixture> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../server/conformance");
+    let bpmn = std::fs::read_to_string(format!("{dir}/conformance-service.bpmn")).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{dir}/multipart-deploy.json")).unwrap(),
+    )
+    .unwrap();
+    raw["fixtures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| MultipartFixture {
+            name: f["name"].as_str().unwrap().to_string(),
+            content_type: f["contentType"].as_str().unwrap().to_string(),
+            body: f["body"].as_str().unwrap().replace("{{BPMN}}", &bpmn),
+            status: u16::try_from(f["status"].as_u64().unwrap()).unwrap(),
+            resources: f["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r.as_str().unwrap().to_string())
+                .collect(),
+        })
+        .collect()
+}
+
+/// Every `resourceName` in a `DeploymentResult`, in response order.
+fn resource_names(v: &serde_json::Value) -> Vec<String> {
+    v["deployments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|d| d.as_object().unwrap().values())
+        .filter_map(|m| m.get("resourceName").and_then(|n| n.as_str()))
+        .map(str::to_string)
+        .collect()
 }

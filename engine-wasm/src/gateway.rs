@@ -1025,7 +1025,8 @@ impl TestEngine {
         let now = self.now;
         let events = self.exec(Command::activate_jobs_with_options(
             req.r_type.clone(),
-            req.worker.clone().unwrap_or_default(),
+            // Native parity (`activate_jobs_impl`): no worker ⇒ `"default"`.
+            req.worker.clone().unwrap_or_else(|| "default".to_string()),
             max_jobs,
             timeout,
             now,
@@ -1053,141 +1054,66 @@ impl TestEngine {
     }
 }
 
-/// One `resources` file of a `multipart/form-data` deployment.
+/// One resource part of a `multipart/form-data` deployment.
 struct Part {
     filename: String,
     content: String,
 }
 
-/// Parse a `multipart/form-data` body into its `resources` file parts. The
-/// boundary comes from the `content-type` header.
+/// Parse a `multipart/form-data` deployment body exactly as the native
+/// gateway's `create_deployment_impl` does: the boundary via
+/// `multer::parse_boundary` (axum's `Multipart` extractor), the parts via
+/// `multer` itself, `tenantId` skipped, every other part a resource named by
+/// its filename or `resource-<n>.bpmn` when it has none. Sharing the parser
+/// (rather than re-implementing it) is what keeps the two transports from
+/// drifting; `server/conformance/multipart-deploy.json` pins the parity.
 fn multipart(headers: &BTreeMap<String, String>, raw: &str) -> Result<Vec<Part>, Problem> {
-    let content_type = header(headers, "content-type").unwrap_or_default();
-    let boundary = content_type
-        .split(';')
-        .map(str::trim)
-        .find_map(|p| p.strip_prefix("boundary="))
-        .map(|b| b.trim_matches('"'))
-        .filter(|b| !b.is_empty())
+    let boundary = header(headers, "content-type")
+        .and_then(|ct| multer::parse_boundary(ct).ok())
         .ok_or_else(|| {
             Problem::invalid(
                 "createDeployment: expected a multipart/form-data body with a boundary",
             )
         })?;
-    let chunks = split_multipart(raw, boundary)?;
+    let body = bytes::Bytes::from(raw.to_owned());
+    let stream =
+        futures_util::stream::once(std::future::ready(Ok::<_, std::convert::Infallible>(body)));
+    let mut form = multer::Multipart::new(stream, boundary);
+    let malformed =
+        |e: multer::Error| Problem::invalid(format!("Malformed multipart request: {e}."));
     let mut parts = Vec::new();
-    for chunk in chunks {
-        let (head, content) = chunk
-            .split_once("\r\n\r\n")
-            .or_else(|| chunk.split_once("\n\n"))
-            .ok_or_else(|| Problem::invalid("createDeployment: malformed multipart part"))?;
-        let disposition = head
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
-            .unwrap_or_default();
-        let attr = |name: &str| {
-            split_params(disposition)
-                .into_iter()
-                .map(str::trim)
-                .find_map(|p| {
-                    p.strip_prefix(name)
-                        .and_then(|v| v.strip_prefix('='))
-                        .map(|v| v.trim_matches('"').to_string())
-                })
-        };
-        // `tenantId` is the only non-resource field (Nano is single-tenant);
-        // every other part is a resource whatever its form name
-        // (spec/deployments.yaml, same as the native `create_deployment_impl`).
-        if attr("name").as_deref() == Some("tenantId") {
+    while let Some(field) = poll_ready(form.next_field())?.map_err(malformed)? {
+        let name = field.name().unwrap_or_default().to_string();
+        let file_name = field.file_name().map(str::to_string);
+        let data = poll_ready(field.bytes())?.map_err(malformed)?;
+        if name == "tenantId" {
             continue;
         }
-        let filename = attr("filename")
-            .filter(|f| !f.is_empty())
-            .ok_or_else(|| Problem::invalid("createDeployment: a resource part has no filename"))?;
-        parts.push(Part {
-            filename,
-            content: content.to_string(),
-        });
+        let content = String::from_utf8(data.to_vec())
+            .map_err(|_| Problem::invalid("A deployment resource was not valid UTF-8 BPMN XML."))?;
+        let filename = file_name.unwrap_or_else(|| format!("resource-{}.bpmn", parts.len()));
+        parts.push(Part { filename, content });
     }
     if parts.is_empty() {
-        return Err(Problem::invalid("createDeployment: no resources to deploy"));
+        return Err(Problem::invalid(
+            "At least one deployment resource is required.",
+        ));
     }
     Ok(parts)
 }
 
-/// Split a multipart body into its raw parts (headers + content), recognising
-/// a delimiter only as a COMPLETE line (`--boundary` at the body start or right
-/// after a line break, followed by optional whitespace and a line break) and
-/// requiring the closing `--boundary--` delimiter. Boundary text occurring
-/// inside content is therefore never mistaken for framing. The line break that
-/// precedes a delimiter belongs to the delimiter (RFC 2046 §5.1.1).
-pub(crate) fn split_multipart<'a>(raw: &'a str, boundary: &str) -> Result<Vec<&'a str>, Problem> {
-    let malformed = || Problem::invalid("createDeployment: malformed multipart body");
-    let delimiter = format!("--{boundary}");
-    // Find each delimiter line: (start of its preceding line break, end of the delimiter line, is_close).
-    let mut marks: Vec<(usize, usize, bool)> = Vec::new();
-    let mut from = 0;
-    while let Some(off) = raw[from..].find(delimiter.as_str()) {
-        let at = from + off;
-        from = at + delimiter.len();
-        let pre = if at == 0 {
-            Some(0)
-        } else if raw[..at].ends_with("\r\n") {
-            Some(at - 2)
-        } else if raw[..at].ends_with('\n') {
-            Some(at - 1)
-        } else {
-            None
-        };
-        let Some(pre) = pre else { continue };
-        let mut rest = &raw[from..];
-        let close = rest.starts_with("--");
-        if close {
-            rest = &rest[2..];
-        }
-        let trimmed = rest.trim_start_matches([' ', '\t']);
-        let ws = rest.len() - trimmed.len();
-        let eol = if trimmed.starts_with("\r\n") {
-            2
-        } else if trimmed.starts_with('\n') || (close && trimmed.is_empty()) {
-            usize::from(!trimmed.is_empty())
-        } else {
-            continue;
-        };
-        let end = from + usize::from(close) * 2 + ws + eol;
-        marks.push((pre, end, close));
-        if close {
-            break;
-        }
-        from = end;
+/// Drive a `multer` future to completion. The whole body is one ready
+/// in-memory chunk, so the parser never waits on I/O; a `Pending` would be a
+/// parser that needs more input than exists, i.e. a malformed body.
+fn poll_ready<F: std::future::Future>(fut: F) -> Result<F::Output, Problem> {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(out) => Ok(out),
+        std::task::Poll::Pending => Err(Problem::invalid(
+            "Malformed multipart request: incomplete body.",
+        )),
     }
-    if !marks.last().is_some_and(|m| m.2) {
-        return Err(malformed());
-    }
-    marks
-        .windows(2)
-        .map(|w| raw.get(w[0].1..w[1].0).ok_or_else(malformed))
-        .collect()
-}
-
-/// Split a header value on `;`, ignoring semicolons inside quoted strings
-/// (with backslash escapes), so `filename="a;b.bpmn"` stays one parameter.
-pub(crate) fn split_params(value: &str) -> Vec<&str> {
-    let (mut out, mut start, mut quoted, mut escaped) = (Vec::new(), 0, false, false);
-    for (i, c) in value.char_indices() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            ';' if !quoted => {
-                out.push(&value[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push(&value[start..]);
-    out
 }
 
 /// A `DeploymentMetadataResult` with exactly one member set.
