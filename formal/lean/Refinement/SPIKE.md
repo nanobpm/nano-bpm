@@ -16,7 +16,7 @@ CI anti-drift gate are tracked in #2010.
 | --- | --- |
 | `Engine::has_active_path_to` (method) | `ZeebeHasActivePath(j, taken, liveSources)` |
 | free fn `path_reaches_join` (BFS) | the BFS of `BpmnInclusiveGatewayBehavior.hasActivePathToTheGateway` |
-| parallel-join readiness (`take_flow`, all incoming flows taken) | `ZeebeParallelReady(j, taken)` |
+| join readiness in `Engine::activate_join` (`all_taken`, dispatch on join kind; `take_flow` only records the arrival) | `ZeebeParallelReady(j, taken)` |
 
 ## Blockers, construct by construct
 
@@ -32,15 +32,21 @@ CI anti-drift gate are tracked in #2010.
    `ProcessDefinition::element`) and `BTreeMap<Key, Vec<&str>>`. Aeneas' Lean
    standard library models `Vec`/slices/`Option`/integers, not the B-tree or
    ring-buffer collections.
-3. **Iterator adaptors with closures.** `filter`, `filter_map`, `flat_map`,
-   `chain`, `any`, `enumerate`, `extend(… .filter_map(|other| …))`,
-   `Option::is_some_and`, `bool::then_some`. Aeneas supports closures only in a
-   limited form and has no model of the `Iterator` trait machinery; each must
-   become an explicit indexed `while` loop (which Aeneas extracts to a
-   `loop`/`divergent` Lean definition with a termination obligation).
-4. **Borrowed-string identity.** Nodes are `&str` / `String` compared with
-   `==`, and `incoming_flow` allocates (`to_string`, `clone`). Strings are
-   opaque to Aeneas; the graph needs dense `usize` node/flow indices.
+3. **Iterator adaptors with closures (untested combination, not a verified
+   blocker).** `filter`, `filter_map`, `flat_map`, `chain`, `any`,
+   `enumerate`, `extend(… .filter_map(|other| …))`, `Option::is_some_and`,
+   `bool::then_some`. Upstream Aeneas (`69280e07`) does model `Iterator`,
+   `enumerate` and `Option::is_some_and` with a closure; whether this exact
+   chain of adaptors extracts cleanly has not been tried against a pinned
+   revision. Rewriting them as explicit indexed `while` loops is a *proposed
+   simplification* (smaller, more predictable Lean output), not a requirement.
+4. **Owned-string operations and std-heavy lookups.** Borrowed `&str` is not
+   opaque upstream (`Str` is `Slice U8` with decidable equality), so string
+   identity alone does not force a change. What remains unverified is the
+   owned-`String` work in `incoming_flow` (`to_string`, `clone`) and
+   string-keyed `BTreeMap` lookups (blocker 2). Dense `usize` node/flow
+   indices are a *proposed simplification* that removes those operations and
+   makes the BFS proof a plain array-reachability argument.
 5. **Let-else / slice range patterns** (`let Some(..) = .. else`,
    `outgoing[..index]`) are supported by recent Charon but add noise; they
    disappear with the refactor below anyway.
@@ -88,7 +94,7 @@ refactor is behaviour-preserving by test before it is by proof.
    `formal/lean/Refinement/Extracted/JoinGuard.lean` (committed).
 2. `formal/lean/Refinement/Zeebe.lean`: `ZeebeJoinReady` (parallel +
    inclusive) as a declarative reachability predicate, citing the pinned Zeebe
-   classes (`ParallelGatewayProcessor.canActivateParallelGateway`,
+   classes (`ProcessInstanceStateTransitionGuard.canActivateParallelGateway`,
    `BpmnInclusiveGatewayBehavior.hasActivePathToTheGateway`) at the sha in
    `formal/parity/zeebe-pin.json`.
 3. `formal/lean/Refinement/Proof.lean`: `∀ g live join taken,
