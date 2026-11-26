@@ -150,3 +150,24 @@ test("firstSentence keeps code spans and abbreviations intact", async () => {
   assert.equal(firstSentence("Plain i.e. text, etc. done! Tail"), "Plain i.e. text, etc. done!");
   assert.equal(firstSentence("No terminator"), "No terminator");
 });
+
+test("a lean @deprecated method names its replacing route in the summary (#2046)", () => {
+  const src = [
+    "#[cfg(not(feature = \"read-model\"))]",
+    "#[wasm_bindgen]",
+    "impl TestEngine {",
+    "    /// Cancel an instance.",
+    "    ///",
+    "    /// @deprecated Use `handle(\"POST\", \"/process-instances/{key}/cancellation\", …)` — the route.",
+    "    #[wasm_bindgen(js_name = cancelInstance)]",
+    "    pub fn cancel_instance(&mut self, key: &str) -> Result<String, JsValue> {",
+    "        todo!()",
+    "    }",
+    "}",
+  ].join("\n");
+  const [m] = parseExports(src);
+  assert.equal(m.readModel, false);
+  assert.match(m.summary, /^\*\*Deprecated\*\* \(Use `handle\("POST", "\/process-instances\/\{key\}\/cancellation", …\)`\)\. Cancel an instance\.$/);
+  const [f] = parseExports(src.replace(/^#\[cfg.*\n/, ""), { allReadModel: true });
+  assert.equal(f.readModel, true);
+});
