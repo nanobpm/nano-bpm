@@ -50,6 +50,18 @@ a = bytearray(200 << 20); a[::4096] = b"x" * len(a[::4096]); time.sleep(3)'
   MEMGUARD_INTERVAL=5 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c "rc=0; for i in 1 2 3 4; do python3 -c '$conc' & p=\"\$p \$!\"; done; for q in \$p; do wait \$q || rc=1; done; exit \$rc" 2>"$tmp/err" || rc=$?
   [[ $rc -eq 125 ]] || { echo "selftest: concurrent ~800 MiB burst exited $rc, want 125 (memory failure)" >&2; cat "$tmp/err" >&2; exit 1; }
   grep -q 'memguard: ' "$tmp/err" || { echo "selftest: cgroup OOM kill not reported" >&2; cat "$tmp/err" >&2; exit 1; }
+
+  # Slow growth inside the scope (the sudo-scope path on GitHub runners) must
+  # still be sampled through the cgroup and capped: non-zero peak, exit 125.
+  rc=0
+  MEMGUARD_INTERVAL=0.1 "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c "$tree" 2>"$tmp/err" || rc=$?
+  [[ $rc -eq 125 ]] || { echo "selftest: scoped slow growth exited $rc, want 125" >&2; cat "$tmp/err" >&2; exit 1; }
+  scoped="$(cat "$tmp/peak")"
+  (( scoped > 0 )) || { echo "selftest: scoped run recorded no peak" >&2; exit 1; }
+  # A workload's own SIGKILL is not a cgroup OOM kill and must keep its 137.
+  rc=0
+  "$here/memguard.sh" $((256 * 1024)) "$tmp/peak" -- sh -c 'kill -KILL $$' 2>"$tmp/err" || rc=$?
+  [[ $rc -eq 137 ]] || { echo "selftest: self-SIGKILL in scope exited $rc, want 137" >&2; cat "$tmp/err" >&2; exit 1; }
 fi
 
 # Descendants in another process group (a nested GNU timeout) must die with
