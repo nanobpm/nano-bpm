@@ -3862,12 +3862,8 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
     let job_type = job.job_type.clone();
     let job_state = job.state;
     let order = activation_order(job.priority, job_key);
-    let backoff_until = job.retry_backoff_until;
-    // A `Created` job with a pending backoff is deferred, not activatable: it
-    // leaves the hot ready set and is indexed by its eligibility deadline so a
-    // poll promotes only the due prefix instead of scanning the delayed prefix.
-    let deferred = job_state == JobState::Created && backoff_until.is_some();
-    if job_state == JobState::Created && !deferred {
+    let membership = job_index_membership(job_state, job.retry_backoff_until);
+    if membership.activatable {
         state
             .activatable_jobs
             .entry(job_type)
@@ -3879,8 +3875,7 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
             state.activatable_jobs.remove(&job_type);
         }
     }
-    if deferred {
-        let until = backoff_until.unwrap_or(0);
+    if let Some(until) = membership.deferred_until {
         if let Some(old) = state.deferred_job_deadlines.insert(job_key, until) {
             state.deferred_jobs.remove(&(old, job_key));
         }
@@ -3888,10 +3883,40 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
     } else {
         remove_deferred_job(state, job_key);
     }
-    if job_state == JobState::Activated {
+    if membership.activated {
         state.activated_jobs.insert(job_key);
     } else {
         state.activated_jobs.remove(&job_key);
+    }
+}
+
+/// Which derived job indexes a job belongs to, as a pure function of its state
+/// and retry backoff: the single decision [`resync_job_index`] applies, shared
+/// with the Kani stand-in model (`state::kani_model`) so the two cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JobIndexMembership {
+    /// In `activatable_jobs` (a `Created` job with no pending backoff).
+    pub activatable: bool,
+    /// In `deferred_jobs` / `deferred_job_deadlines` at this deadline.
+    pub deferred_until: Option<u64>,
+    /// In `activated_jobs`.
+    pub activated: bool,
+}
+
+/// See [`JobIndexMembership`]. A `Created` job with a pending backoff is
+/// deferred, not activatable: it leaves the hot ready set and is indexed by its
+/// eligibility deadline so a poll promotes only the due prefix instead of
+/// scanning the delayed prefix.
+#[inline]
+pub(crate) fn job_index_membership(
+    job_state: JobState,
+    retry_backoff_until: Option<u64>,
+) -> JobIndexMembership {
+    let created = job_state == JobState::Created;
+    JobIndexMembership {
+        activatable: created && retry_backoff_until.is_none(),
+        deferred_until: retry_backoff_until.filter(|_| created),
+        activated: job_state == JobState::Activated,
     }
 }
 
