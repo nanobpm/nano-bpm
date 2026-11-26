@@ -168,6 +168,8 @@ impl Cluster {
             // `POST /debug/journal-snapshot` (#2058), so the snapshot a restart
             // recovers from is a recorded, deterministic checkpoint.
             .env("NANOBPMN_SNAPSHOT_INTERVAL_MS", "3600000")
+            // The forced-snapshot endpoint is opt-in (off by default).
+            .env("NANOBPMN_DEBUG_JOURNAL_SNAPSHOT", "1")
             .stdin(Stdio::null())
             .stdout(file.try_clone().unwrap())
             .stderr(file);
