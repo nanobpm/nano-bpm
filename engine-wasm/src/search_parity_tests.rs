@@ -716,13 +716,15 @@ fn server_read_model(eng: &TestEngine, spans: &[std::ops::Range<usize>]) -> Read
 fn agent_searches_match_the_server_for_every_spec_operator_sort_and_page() {
     let (eng, history_key, spans) = fixture();
     let rm = server_read_model(&eng, &spans);
+    // Reads go through `handle()` (#2046), which takes `&mut self`.
+    let eng = std::cell::RefCell::new(eng);
     let key: u64 = history_key.parse().unwrap();
 
     let instances = Op {
         name: "searchAgentInstances",
         filter_schema: "AgentInstanceFilter",
         sort_schema: "AgentInstanceSearchQuerySortRequest",
-        wasm: Box::new(|b| eng.search_agent_instances_json(b)),
+        wasm: Box::new(|b| eng.borrow_mut().search_agent_instances_json(b)),
         server: Box::new(|b| {
             let body = server_body::<models::AgentInstanceSearchQuery>(b)?;
             let r = nanobpmn_search::agent::search_agent_instances(body.as_ref(), || {
@@ -731,17 +733,20 @@ fn agent_searches_match_the_server_for_every_spec_operator_sort_and_page() {
             .map_err(|e| e.to_string())?;
             Ok(serde_json::to_value(r).unwrap())
         }),
-        sample: serde_json::from_str::<J>(&eng.search_agent_instances_json("{}").unwrap()).unwrap()
-            ["items"][1]
+        sample: serde_json::from_str::<J>(
+            &eng.borrow_mut().search_agent_instances_json("{}").unwrap(),
+        )
+        .unwrap()["items"][1]
             .clone(),
         page_filter: json!({}),
     };
     let history_sample = serde_json::from_str::<J>(
-        &eng.search_agent_instance_history_json(
-            &history_key,
-            r#"{"filter":{"commitStatus":"PENDING"}}"#,
-        )
-        .unwrap(),
+        &eng.borrow_mut()
+            .search_agent_instance_history_json(
+                &history_key,
+                r#"{"filter":{"commitStatus":"PENDING"}}"#,
+            )
+            .unwrap(),
     )
     .unwrap()["items"][0]
         .clone();
@@ -749,7 +754,10 @@ fn agent_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         name: "searchAgentInstanceHistory",
         filter_schema: "AgentInstanceHistoryFilter",
         sort_schema: "AgentInstanceHistorySearchQuerySortRequest",
-        wasm: Box::new(|b| eng.search_agent_instance_history_json(&history_key, b)),
+        wasm: Box::new(|b| {
+            eng.borrow_mut()
+                .search_agent_instance_history_json(&history_key, b)
+        }),
         server: Box::new(|b| {
             let body = server_body::<models::AgentInstanceHistorySearchQuery>(b)?;
             let r =
@@ -850,6 +858,8 @@ fn core_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         store
     })]);
     let var_src = ServerSource(&single_shard);
+    // Reads go through `handle()` (#2046), which takes `&mut self`.
+    let eng = std::cell::RefCell::new(eng);
     let (eng, src, var_src) = (&eng, &src, &var_src);
     let sample = |json: String| serde_json::from_str::<J>(&json).unwrap()["items"][1].clone();
 
@@ -857,26 +867,30 @@ fn core_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         name: "searchUserTasks",
         filter_schema: "UserTaskFilter",
         sort_schema: "UserTaskSearchQuerySortRequest",
-        wasm: Box::new(|b| eng.search_user_tasks_json(b)),
+        wasm: Box::new(|b| eng.borrow_mut().search_user_tasks_json(b)),
         server: Box::new(|b| {
             let body = server_body::<models::UserTaskSearchQuery>(b)?;
             let r = nanobpmn_search::user_task::search_user_tasks(src, body.as_ref());
             Ok(serde_json::to_value(r).unwrap())
         }),
-        sample: sample(eng.search_user_tasks_json("{}").unwrap()),
+        sample: sample(eng.borrow_mut().search_user_tasks_json("{}").unwrap()),
         page_filter: json!({}),
     };
     let instances = Op {
         name: "searchProcessInstances",
         filter_schema: "ProcessInstanceFilter",
         sort_schema: "ProcessInstanceSearchQuerySortRequest",
-        wasm: Box::new(|b| eng.search_process_instances_json(b)),
+        wasm: Box::new(|b| eng.borrow_mut().search_process_instances_json(b)),
         server: Box::new(|b| {
             let body = server_body::<models::ProcessInstanceSearchQuery>(b)?;
             let r = nanobpmn_search::process_instance::search_process_instances(src, body.as_ref());
             Ok(serde_json::to_value(r).unwrap())
         }),
-        sample: sample(eng.search_process_instances_json("{}").unwrap()),
+        sample: sample(
+            eng.borrow_mut()
+                .search_process_instances_json("{}")
+                .unwrap(),
+        ),
         page_filter: json!({}),
     };
     let variables = |truncate: bool| Op {
@@ -887,13 +901,17 @@ fn core_searches_match_the_server_for_every_spec_operator_sort_and_page() {
         },
         filter_schema: "VariableFilter",
         sort_schema: "VariableSearchQuerySortRequest",
-        wasm: Box::new(move |b| eng.search_variables_json(b, Some(truncate))),
+        wasm: Box::new(move |b| eng.borrow_mut().search_variables_json(b, Some(truncate))),
         server: Box::new(move |b| {
             let body = server_body::<models::VariableSearchQuery>(b)?;
             let r = nanobpmn_search::variable::search_variables(var_src, truncate, body.as_ref());
             Ok(serde_json::to_value(r).unwrap())
         }),
-        sample: sample(eng.search_variables_json("{}", Some(truncate)).unwrap()),
+        sample: sample(
+            eng.borrow_mut()
+                .search_variables_json("{}", Some(truncate))
+                .unwrap(),
+        ),
         page_filter: json!({}),
     };
 
@@ -997,8 +1015,11 @@ fn incident_search_matches_the_server_for_every_spec_operator_sort_and_page() {
     let (eng, spans) = incident_fixture();
     let rm = server_read_model(&eng, &spans);
     let src = ServerSource(&rm);
+    // Reads go through `handle()` (#2046), which takes `&mut self`.
+    let eng = std::cell::RefCell::new(eng);
     let (eng, src) = (&eng, &src);
-    let all: J = serde_json::from_str(&eng.search_incidents_json("{}").unwrap()).unwrap();
+    let all: J =
+        serde_json::from_str(&eng.borrow_mut().search_incidents_json("{}").unwrap()).unwrap();
     let states: Vec<&J> = all["items"]
         .as_array()
         .unwrap()
@@ -1012,7 +1033,7 @@ fn incident_search_matches_the_server_for_every_spec_operator_sort_and_page() {
         name: "searchIncidents",
         filter_schema: "IncidentFilter",
         sort_schema: "IncidentSearchQuerySortRequest",
-        wasm: Box::new(|b| eng.search_incidents_json(b)),
+        wasm: Box::new(|b| eng.borrow_mut().search_incidents_json(b)),
         server: Box::new(|b| {
             let body = server_body::<models::IncidentSearchQuery>(b)?;
             let r = nanobpmn_search::incident::search_incidents(src, body.as_ref());
@@ -1050,7 +1071,7 @@ fn server_lookup<T: serde::Serialize>(
 #[test]
 fn get_operations_match_the_server_for_found_missing_and_malformed_keys() {
     let (mut eng, spans) = core_fixture();
-    let (agent_eng, agent_key, agent_spans) = fixture();
+    let (mut agent_eng, agent_key, agent_spans) = fixture();
     let rm = server_read_model(&eng, &spans);
     let src = ServerSource(&rm);
     let agent_rm = server_read_model(&agent_eng, &agent_spans);
@@ -1078,7 +1099,10 @@ fn get_operations_match_the_server_for_found_missing_and_malformed_keys() {
             "0".to_string(),
             "-1".to_string(),
             "x".to_string(),
-            String::new(),
+            // No empty key: since #2046 the getters are `handle()` routes, and
+            // `GET /forms/` (an empty segment) is no route on either surface —
+            // pinned below as an error rather than compared against the
+            // lookup function, which never sees a path.
             format!(" {real}"),
         ]
     };
@@ -1118,13 +1142,17 @@ fn get_operations_match_the_server_for_found_missing_and_malformed_keys() {
         );
     }
     assert_eq!(found, 3, "each real key resolves on both surfaces");
+    assert!(eng.get_form_by_key_json("").is_err());
+    assert!(eng.get_resource_by_key_json("").is_err());
+    assert!(agent_eng.get_agent_instance_json("").is_err());
 }
 
 /// The WASM read methods (`js_name`s) that answer a spec operation, derived
 /// from the `#[wasm_bindgen(js_name = …)]` attributes in `lib.rs` itself. The
 /// only rename: the WASM `getResourceByKey` answers the spec's `getResource`.
 fn wasm_read_operations() -> std::collections::BTreeSet<String> {
-    let src = include_str!("lib.rs");
+    // The read methods live in the facade since #2046; scan both sources.
+    let src = concat!(include_str!("lib.rs"), include_str!("facade.rs"));
     src.split("js_name = ")
         .skip(1)
         .map(|rest| {
@@ -1646,8 +1674,8 @@ fn ts_search_requests_cover_every_wasm_search_method() {
 
 #[test]
 fn every_readmodel_types_filter_field_and_operator_is_accepted_by_wasm() {
-    let (agent_eng, history_key, _) = fixture();
-    let (core_eng, _) = core_fixture();
+    let (mut agent_eng, history_key, _) = fixture();
+    let (mut core_eng, _) = core_fixture();
     let mut rejected = Vec::new();
     let mut probes = 0;
     for (method, query) in TS_SEARCH_REQUESTS {
