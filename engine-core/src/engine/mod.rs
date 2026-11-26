@@ -10205,6 +10205,8 @@ impl Engine {
         element_vars: Arc<BTreeMap<String, Value>>,
         scope_pre_registered: bool,
     ) -> (Vec<Event>, Vec<Step>) {
+        let element_vars =
+            self.with_triggered_catch_payload(instance_key, element_instance_key, element_vars);
         // Input mappings (zeebe:input): evaluate against the variables visible to
         // the activating element and create the mapped values LOCAL to the
         // element's own scope (Zeebe semantics) — visible to the element's job or
@@ -16329,18 +16331,11 @@ impl Engine {
         let output_updates = if outputs.is_empty() {
             BTreeMap::new()
         } else {
-            let mut visible = self.variables_for_element(instance_key, element_instance_key);
-            // A gateway-triggered catch reads its winning event's payload as
-            // recorded at the trigger (#2047 review), not whatever the scope
-            // holds now.
-            if let Some(payload) = self
-                .triggered_catch_payload(instance_key, element_instance_key)
-                .filter(|p| !p.is_empty())
-            {
-                let mut vars = (*visible).clone();
-                vars.extend(payload.clone());
-                visible = std::sync::Arc::new(vars);
-            }
+            let visible = self.with_triggered_catch_payload(
+                instance_key,
+                element_instance_key,
+                self.variables_for_element(instance_key, element_instance_key),
+            );
             let eval = match &script_update {
                 // The script result event is not applied to state until this
                 // step returns, so overlay it onto the eval context by hand.
@@ -17663,6 +17658,31 @@ impl Engine {
 
     /// The recorded trigger payload of a catch the gateway-owned trigger path
     /// activated (#2004, #2047 review), or `None` for any other element.
+    /// `vars` overlaid with the winning payload recorded when a gateway
+    /// trigger activated `element_instance_key` (#2047 review). The ONE place
+    /// a gateway-triggered catch's evaluation view is derived, shared by its
+    /// input mappings / FEEL attributes (activation) and its output mappings
+    /// (completion), so both read the payload as recorded at the trigger, not
+    /// whatever the enclosing scope holds now.
+    fn with_triggered_catch_payload(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        vars: Arc<BTreeMap<String, Value>>,
+    ) -> Arc<BTreeMap<String, Value>> {
+        match self
+            .triggered_catch_payload(instance_key, element_instance_key)
+            .filter(|p| !p.is_empty())
+        {
+            Some(payload) => {
+                let mut merged = (*vars).clone();
+                merged.extend(payload.clone());
+                Arc::new(merged)
+            }
+            None => vars,
+        }
+    }
+
     fn triggered_catch_payload(
         &self,
         instance_key: Key,
@@ -21482,7 +21502,10 @@ fn has_conditional_start(definition: &ProcessDefinition) -> bool {
 
 /// Whether `element_id` is an intermediate catch event — the only element
 /// class that takes part in an event-based gateway's deferred choice.
-fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str) -> bool {
+pub(crate) fn is_intermediate_catch(
+    def: &crate::model::ProcessDefinition,
+    element_id: &str,
+) -> bool {
     matches!(
         def.elements.get(element_id).map(|e| &e.kind),
         Some(

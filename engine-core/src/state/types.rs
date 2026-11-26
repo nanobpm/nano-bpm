@@ -3288,7 +3288,14 @@ impl State {
         let candidates: Vec<&str> = instance
             .active
             .iter()
-            .filter(|(eik, _)| !instance.races.contains_key(eik) && !triggered(eik))
+            .filter(|(eik, id)| {
+                !instance.races.contains_key(eik)
+                    && !triggered(eik)
+                    // Only an intermediate catch can be gateway-owned: skip
+                    // tasks etc. before building the race index, so a scan
+                    // over ordinary workloads never traverses the model.
+                    && crate::engine::is_intermediate_catch(def, id)
+            })
             .map(|(_, id)| id.as_str())
             .collect();
         if candidates.is_empty() {

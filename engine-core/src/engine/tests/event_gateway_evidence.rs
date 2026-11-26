@@ -481,7 +481,7 @@ fn two_gateway_conditions_true_together_trigger_once() {
 
 /// The winning payload is snapshotted at the trigger (#2047 review): a
 /// variable update while the gateway waits on its `end` listener does not
-/// change what the catch's output mapping reads — live, after snapshot
+/// change what the catch's input or output mappings read — live, after snapshot
 /// restore, and after journal replay.
 #[cfg(feature = "serde")]
 #[test]
@@ -494,11 +494,20 @@ fn winning_payload_is_snapshotted_across_an_intervening_update() {
         .with_io(
             "onM1",
             crate::model::IoMapping {
-                inputs: Vec::new(),
-                outputs: vec![crate::model::Mapping {
+                inputs: vec![crate::model::Mapping {
                     source: "=payload * 2".to_string(),
-                    target: "doubled".to_string(),
+                    target: "local".to_string(),
                 }],
+                outputs: vec![
+                    crate::model::Mapping {
+                        source: "=payload * 2".to_string(),
+                        target: "doubled".to_string(),
+                    },
+                    crate::model::Mapping {
+                        source: "=local".to_string(),
+                        target: "fromInput".to_string(),
+                    },
+                ],
             },
         )
         .service_task("hold", "hold")
@@ -543,6 +552,11 @@ fn winning_payload_is_snapshotted_across_an_intervening_update() {
             engine.instance(inst).unwrap().variables.get("doubled"),
             Some(&Value::Int(42)),
             "{label}: the output reads the payload recorded at the trigger"
+        );
+        assert_eq!(
+            engine.instance(inst).unwrap().variables.get("fromInput"),
+            Some(&Value::Int(42)),
+            "{label}: the input mapping reads the payload recorded at the trigger"
         );
     }
 }
