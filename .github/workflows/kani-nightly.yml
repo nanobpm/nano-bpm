@@ -77,9 +77,12 @@ jobs:
             ~/.cargo/bin/kani
             ~/.kani
           key: kani-${{ steps.kani.outputs.version }}
+      # GNU time for peak RSS measurement. No bare apt (#1546): the
+      # build-tools action is the one place CI installs distro packages.
       - name: Install GNU time (peak RSS measurement)
-        run: |
-          [[ -x /usr/bin/time ]] || { sudo apt-get update -q && sudo apt-get install -y -q time; }
+        uses: ./.github/actions/build-tools
+        with:
+          apt: time
       - name: Kani proof (timed, memory-bounded)
         env:
           KANI_REQUIRE_RSS: '1'
