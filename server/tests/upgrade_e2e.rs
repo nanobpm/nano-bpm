@@ -651,9 +651,9 @@ fn force_journal_snapshot(c: &Cluster, id: usize) -> Vec<(usize, u64)> {
 }
 
 /// Grows a journal tail after member `id`'s snapshot checkpoint: creates
-/// instances (bounded) until the member has locally applied a new entry on
-/// every checkpointed partition past `applied_at_checkpoint`, so each one's
-/// journal holds events the snapshot does not cover.
+/// instances (bounded) until the member has locally applied a new `Normal`
+/// (command) entry on every checkpointed partition past
+/// `applied_at_checkpoint`, so each one's journal holds events the snapshot does not cover.
 fn grow_tail_past_checkpoint(
     c: &Cluster,
     id: usize,
@@ -663,9 +663,14 @@ fn grow_tail_past_checkpoint(
 ) {
     for _ in 0..30 {
         let advanced = raft_status(c, id).is_some_and(|now| {
-            checkpoint
-                .iter()
-                .all(|(p, _)| now[*p].1 > applied_at_checkpoint[*p].1)
+            checkpoint.iter().all(|(p, _)| {
+                normal_applied_past(
+                    &c.members[id].data,
+                    *p,
+                    applied_at_checkpoint[*p].1,
+                    now[*p].1,
+                )
+            })
         });
         if advanced {
             return;
@@ -679,6 +684,17 @@ fn grow_tail_past_checkpoint(
         raft_status(c, id),
         tail(&c.all_logs())
     );
+}
+
+/// Whether member data `data` holds, on partition `p`, a locally applied
+/// `Normal` Raft entry (an engine command batch, which journals events) in
+/// `(from, to]`. A bare applied-index increase is not enough: a `Blank`
+/// (election) entry advances `applied` without journaling anything.
+fn normal_applied_past(data: &Path, p: usize, from: i128, to: i128) -> bool {
+    raft_batches(data, p as u64).iter().any(|(i, b)| {
+        let i = i128::from(*i);
+        i > from && i <= to && !b.is_null()
+    })
 }
 
 /// The restart of member `id` went snapshot + journal: on every checkpointed
