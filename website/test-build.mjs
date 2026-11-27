@@ -10,10 +10,16 @@ import { fileURLToPath } from "node:url";
 
 const BUILD = fileURLToPath(new URL("./build.mjs", import.meta.url));
 
-/** Build the site into a fresh temp dir; returns `read(relPath)` over it. */
-export function buildSite() {
+/**
+ * Build the site into a fresh temp dir; returns `read(relPath)` over it.
+ * Builds are offline by default (no nano-coder docs fetch: tests must not hit
+ * the network or depend on nano-coder's latest release); `env` overrides.
+ */
+export function buildSite(env = {}) {
   const dir = mkdtempSync(join(tmpdir(), "nano-site-"));
   after(() => rmSync(dir, { recursive: true, force: true }));
-  execFileSync(process.execPath, [BUILD], { stdio: "pipe", env: { ...process.env, SITE_OUT_DIR: dir } });
-  return (rel) => readFileSync(join(dir, rel), "utf8");
+  execFileSync(process.execPath, [BUILD], { stdio: "pipe", env: { ...process.env, NANO_CODER_DOCS_OFFLINE: "1", ...env, SITE_OUT_DIR: dir } });
+  const read = (rel) => readFileSync(join(dir, rel), "utf8");
+  read.dir = dir;
+  return read;
 }

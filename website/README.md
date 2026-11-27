@@ -26,6 +26,7 @@ served files can only ever agree.
 | `/` | Marketing landing page ("The load-bearing runtime for agent systems") | `homeHtml()` in [`build.mjs`](build.mjs) — always generated (pure static HTML, no toolchain) |
 | `/demo/` | The in-browser Bojtos demo (ADR 0043), a live wasm-engine run | [`website/demo/`](demo) Vite app (`base: "/demo/"`); copied in when its `dist/` has been built |
 | `/schemas/` | The published-schema registry (the table of the URLs above) | `schemasHtml()` in [`build.mjs`](build.mjs) |
+| `/nano-coder/docs/` | nano-coder usage docs (website-only; never in the gateway's `/docs/`) | nanobpm/nano-coder's `docs/` at its **latest release**, rendered by [`nano-coder-docs.mjs`](nano-coder-docs.mjs) with the shared [`console/scripts/docs-render.mjs`](../console/scripts/docs-render.mjs) |
 
 The landing page and schema registry are always emitted, so `node website/build.mjs`
 runs without the demo's npm toolchain (e.g. the zero-dep `schemas` CI drift check);
@@ -35,8 +36,20 @@ in the table above own their own paths and are unaffected by this layout.
 ## Build
 
 ```sh
+npm ci --prefix website  # markdown-it, for /nano-coder/docs/ (pinned to the console's)
 node website/build.mjs   # Node >= 23.6 / 24 (imports the .ts descriptor directly)
 ```
+
+`/nano-coder/docs/` is fetched live from nano-coder's latest release
+(`GITHUB_TOKEN` used when set). If the fetch fails, the build falls back to the
+vendored snapshot in `website/data/nano-coder-docs/` (with its `VERSION`) and
+warns; in CI (`CI=true`) a failed fetch fails the build instead. A release with
+no `docs/` is skipped with a warning (no nav link). `NANO_CODER_DOCS_OFFLINE=1`
+skips the fetch (the tests use it), and `NANO_CODER_DOCS_SNAPSHOT=<dir>` points
+at another snapshot. Refresh the snapshot with
+`node website/scripts/update-nano-coder-docs.mjs`. nano-coder's release workflow
+sends the `nano-coder-released` `repository_dispatch` to rebuild the site; the
+daily cron rebuild is the backstop.
 
 Output lands in `website/_site/` (git-ignored). CI builds it on every PR (drift
 guard) and deploys it to GitHub Pages on merge to `main` — see

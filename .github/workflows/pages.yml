@@ -18,6 +18,7 @@ on:
       - 'USERGUIDE.md'
       - 'docs/**'
       - 'console/scripts/build-docs.mjs'
+      - 'console/scripts/docs-render.mjs'
       - 'console/scripts/build-whitepaper.mjs'
       - 'spec-app/nano-app.schema.json'
       - 'console/src/moddle/nanoShapes.ts'
@@ -28,8 +29,12 @@ on:
   # blessed install script" step). That source lives in ANOTHER repo, so a change
   # to it never matches the push `paths` above — nano-workforce CI fires this
   # event on merge-to-main touching install.sh so the mirror refreshes promptly.
+  #
+  # `nano-coder-released`: nano-coder's release workflow fires it so
+  # /nano-coder/docs/ (rendered from its latest release's docs/) refreshes on
+  # release. The nightly cron below self-heals a missed dispatch within 24 h.
   repository_dispatch:
-    types: [install-sh-updated]
+    types: [install-sh-updated, nano-coder-released]
   # Backstop for the cross-repo mirror: refresh nightly even if no dispatch fired
   # (e.g. the dispatch token lapsed), so nanobpm.io/install.sh can't silently rot.
   schedule:
@@ -89,7 +94,14 @@ jobs:
         # console node_modules installed by the docs step above.
         working-directory: console
         run: node scripts/build-whitepaper.mjs
+      - name: Install website build deps (markdown-it for /nano-coder/docs/)
+        run: npm ci --prefix website
       - name: Build site
+        # Fetches nano-coder's latest release docs/ live (website/nano-coder-docs.mjs).
+        # CI=true makes a failed fetch fatal, so a broken fetch never deploys
+        # silently; a release without docs/ is skipped with a warning.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node website/build.mjs
       - name: Mirror the blessed install script (nano-workforce/install.sh)
         # Serve https://nanobpm.io/install.sh as the ACTUAL script bytes: GitHub

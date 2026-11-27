@@ -5,10 +5,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const BUILD = fileURLToPath(new URL("./build.mjs", import.meta.url));
+// The fixture docs include a historical "written in Rust" line, proving the
+// imported-docs exclusion below works.
+const FIXTURE = fileURLToPath(new URL("./test-fixtures/nano-coder-docs/", import.meta.url));
 
 function walk(dir, out = []) {
   for (const n of readdirSync(dir)) {
@@ -24,9 +27,15 @@ function walk(dir, out = []) {
 function buildSite() {
   const dir = mkdtempSync(join(tmpdir(), "nano-site-"));
   try {
-    execFileSync(process.execPath, [BUILD], { stdio: "pipe", env: { ...process.env, SITE_OUT_DIR: dir } });
+    execFileSync(process.execPath, [BUILD], { stdio: "pipe", env: { ...process.env, NANO_CODER_DOCS_OFFLINE: "1", NANO_CODER_DOCS_SNAPSHOT: FIXTURE, SITE_OUT_DIR: dir } });
     const files = new Map();
-    for (const f of walk(dir)) files.set(f, readFileSync(f, "utf8"));
+    // Exclude the imported nano-coder release docs (/nano-coder/docs/): they are
+    // third-party release documentation, not our marketing copy, and may
+    // legitimately carry historical Rust-to-D migration text.
+    const docsRoot = join(dir, "nano-coder", "docs") + sep;
+    const all = walk(dir);
+    if (!all.some((f) => f.startsWith(docsRoot))) throw new Error(`expected imported docs under ${docsRoot}`);
+    for (const f of all) if (!f.startsWith(docsRoot)) files.set(f, readFileSync(f, "utf8"));
     return { dir, files };
   } catch (err) {
     rmSync(dir, { recursive: true, force: true });
