@@ -642,3 +642,33 @@ test('a decision pause inside one tick keeps the gateway routing cache: explore 
   assert.deepEqual({ ...explored.takenFlows }, { ...replayed.takenFlows })
   assert.deepEqual({ ...explored.waiting }, { ...replayed.waiting })
 })
+
+// #1990: a message-first run that TICKS before any job completes buffered the
+// route of a gateway the tick reaches for "the first job completion", which a
+// tick never is — the route was dropped, the gateway read an unset variable and
+// nano raised an incident: a false "inclusive join never fires" divergence.
+// Defect-class guard: in every scenario, every routed gateway the run passes
+// through has its route variable delivered (start variables or a step's).
+test('every route a run consumes is delivered to the engine, including across a tick (#1990)', () => {
+  const graphs = [
+    // #1895: evt -> M1 -> and-fork -> (T1 + timer boundary, direct) -> or-join
+    graphOf(['and', 'evt', 'or'], [[0, 2, 'direct'], [1, 3, 'btimer'], [1, 3, 'direct'], [2, 1, 'msg'], [2, 4, 'msg'], [3, 4, 'direct'], [3, 4, 'direct']]),
+    // #1789: evt -> M1 -> or-fork -> (timer catch, direct) -> or-join
+    graphOf(['evt', 'or', 'or'], [[0, 1, 'direct'], [1, 2, 'msg'], [1, 4, 'msg'], [2, 3, 'timer'], [2, 3, 'direct'], [3, 4, 'direct'], [3, 4, 'task']])
+  ]
+  let ticked = 0
+  for (const g of graphs) {
+    const ref = new Reference(g)
+    for (const s of scenariosFor(g).scenarios) {
+      const delivered = new Set(Object.keys(s.variables))
+      for (const st of s.steps) for (const k of Object.keys(st.variables ?? {})) delivered.add(k)
+      if (s.steps.some((st) => st.op === 'advanceTime')) ticked += 1
+      for (const n of Object.keys(g.nodes)) {
+        if (!ref.isRouted(n)) continue
+        const consumed = g.edges.some((e) => e.from === n && (s.run.takenFlows[e.id] ?? 0) > 0)
+        if (consumed) assert.ok(delivered.has(routeVariable(n)), `${s.name}: ${routeVariable(n)} is never delivered: ${JSON.stringify(s.steps)}`)
+      }
+    }
+  }
+  assert.ok(ticked > 0, 'the guard must cover a ticking scenario')
+})
