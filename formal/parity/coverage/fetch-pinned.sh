@@ -7,15 +7,20 @@
 #
 # - A cached <dest> that verifies is reused: NO network request is made.
 # - Otherwise each URL is tried in turn. A 429 / 5xx / connection failure is
-#   retried with exponential backoff (honouring a numeric Retry-After), up to
-#   FETCH_PINNED_BUDGET_S seconds of waiting per URL (default 300). Any other
+#   retried with exponential backoff (capped at 120 s), up to
+#   FETCH_PINNED_BUDGET_S seconds of wall-clock time per URL (default 300),
+#   request time included; each attempt's curl --max-time is bounded by the
+#   remaining budget (min 10 s, max 300 s). A numeric Retry-After is never
+#   shortened: if it exceeds the remaining budget the source is abandoned at
+#   once for the next mirror, otherwise it is slept in full. Any other
 #   status (e.g. 404) moves on to the next mirror. This is a retry of the
 #   FETCH of an immutable artifact, not a test retry.
 # - A download enters the cache only after it matches the pinned SHA-256, so
 #   a bad mirror can never poison it. Fails closed with a message naming the
 #   artifact and the last HTTP status.
 #
-# FETCH_PINNED_SLEEP overrides the sleep command (tests).
+# FETCH_PINNED_SLEEP overrides the sleep command and FETCH_PINNED_NOW the
+# clock command (prints epoch seconds; default `date +%s`) for tests.
 
 fetch_pinned_sha256() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
@@ -32,12 +37,15 @@ fetch_pinned() {
   rm -f "$dest"
   mkdir -p "$(dirname "$dest")"
   local budget="${FETCH_PINNED_BUDGET_S:-300}" sleeper="${FETCH_PINNED_SLEEP:-sleep}"
-  local tmp="$dest.tmp" hdr="$dest.hdr" url status="none" waited delay ra
+  local clock="${FETCH_PINNED_NOW:-date +%s}"
+  local tmp="$dest.tmp" hdr="$dest.hdr" url status="none" start elapsed remaining delay ra maxt wait_s
   for url in "$@"; do
-    waited=0 delay=5
+    start="$($clock)" delay=5
     while :; do
+      elapsed=$(( $($clock) - start )); remaining=$(( budget - elapsed ))
+      maxt=$remaining; (( maxt > 300 )) && maxt=300; (( maxt < 10 )) && maxt=10
       echo "$name: fetching $url"
-      status="$(curl -sS -L --connect-timeout 20 --max-time 300 -D "$hdr" -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null)" || true
+      status="$(curl -sS -L --connect-timeout 20 --max-time "$maxt" -D "$hdr" -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null)" || true
       status="${status:-000}"
       if [[ "$status" == 200 ]]; then
         if [[ "$(fetch_pinned_sha256 "$tmp")" == "$want" ]]; then
@@ -55,16 +63,23 @@ fetch_pinned() {
         break
       fi
       ra="$(tr -d '\r' < "$hdr" 2>/dev/null | sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' | tail -1)"
-      local wait_s="$delay"
-      if [[ -n "$ra" ]] && (( ra > wait_s )); then wait_s="$ra"; fi
-      (( wait_s > 120 )) && wait_s=120
-      if (( waited + wait_s > budget )); then
-        echo "$name: $url still failing (HTTP $status) after ${waited}s of backoff — trying next source" >&2
-        break
+      elapsed=$(( $($clock) - start )); remaining=$(( budget - elapsed ))
+      if [[ -n "$ra" ]]; then
+        if (( ra > remaining )); then
+          echo "$name: $url returned HTTP $status with Retry-After ${ra}s, beyond the ${remaining}s left of its budget — trying next source" >&2
+          break
+        fi
+        wait_s="$ra"
+      else
+        wait_s="$delay"
+        (( wait_s > 120 )) && wait_s=120
+        if (( wait_s > remaining )); then
+          echo "$name: $url still failing (HTTP $status) after ${elapsed}s — trying next source" >&2
+          break
+        fi
       fi
       echo "$name: $url returned HTTP $status; retrying in ${wait_s}s" >&2
       "$sleeper" "$wait_s"
-      waited=$(( waited + wait_s ))
       delay=$(( delay * 2 ))
     done
   done
