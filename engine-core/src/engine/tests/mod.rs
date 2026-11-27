@@ -19,6 +19,7 @@ mod error_end_event;
 mod esp_error_escalation;
 mod event_gateway_evidence;
 mod event_gateway_runtime_latch;
+mod event_gateway_teardown;
 mod event_subprocess;
 mod execution_order;
 mod expression_failures;
