@@ -489,7 +489,6 @@ impl Engine {
                 element_id: start_event,
                 scope: 0,
                 via: None,
-                race: None,
             }],
         )
     }

@@ -1,10 +1,9 @@
 //! Message cardinality (#1676, Zeebe `MessageCorrelator`): one published
 //! message correlates to at most ONE subscription per process instance. Two
 //! tokens resting on separate armed copies of the same catch (here: two
-//! activations of one event-based gateway, each arming `M1` and `M2` under the
-//! same correlation key) must be resumed one per message, not both by the
-//! first message — and the winner of one race withdraws only ITS OWN losing
-//! sibling, never the other race's.
+//! activations of one event-based gateway, each subscribing to `M1` and `M2`
+//! under the same correlation key) must be resumed one per message, not both
+//! by the first message.
 use super::*;
 
 /// start -> fork(and) => merge(xor) -> gw(event-based) -> { onM1 | onM2 } -> end
@@ -48,17 +47,14 @@ fn one_message_correlates_once_per_instance() {
     let first = engine
         .apply_command(Command::correlate_message("M1", "k"))
         .unwrap();
-    // One onM1 wins (resumed by M1) and only its race's onM2 is withdrawn.
+    // M1 triggers exactly one gateway; the other gateway's subscriptions
+    // stay open (no catch is ever withdrawn: none was activated).
     assert_eq!(
         completions(&first, "onM1"),
         1,
-        "M1 must resume exactly one armed gateway"
+        "M1 must resume exactly one waiting gateway"
     );
-    assert_eq!(
-        completions(&first, "onM2"),
-        1,
-        "only the winning race's onM2 is withdrawn"
-    );
+    assert_eq!(completions(&first, "onM2"), 0, "no onM2 was activated");
 
     let second = engine
         .apply_command(Command::correlate_message("M2", "k"))
@@ -68,11 +64,7 @@ fn one_message_correlates_once_per_instance() {
         1,
         "M2 must resume the other armed gateway"
     );
-    assert_eq!(
-        completions(&second, "onM1"),
-        1,
-        "the second race's onM1 loses to M2"
-    );
+    assert_eq!(completions(&second, "onM1"), 0, "M1 does not run twice");
     assert_eq!(
         engine.instance(inst).unwrap().state,
         ProcessInstanceState::Completed
@@ -162,7 +154,7 @@ fn gateway_then_top_level_terminate() -> ProcessDefinition {
 /// whole-instance `ProcessInstanceTerminated` reducer — never stranded on the
 /// terminal shell until eviction.
 #[test]
-fn cancel_clears_armed_races() {
+fn cancel_clears_gateway_subscriptions() {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(single_gateway()))
@@ -173,9 +165,9 @@ fn cancel_clears_armed_races() {
         vars(&[("key", Value::Str("k".into()))]),
     );
     assert_eq!(
-        engine.instance(inst).unwrap().races.len(),
-        2,
-        "both armed catches carry their gateway race while waiting"
+        engine.instance(inst).unwrap().gateway_subscriptions.len(),
+        1,
+        "the waiting gateway owns its subscriptions"
     );
 
     engine
@@ -189,9 +181,9 @@ fn cancel_clears_armed_races() {
         "the cancel terminates the instance"
     );
     assert!(
-        instance.races.is_empty(),
-        "terminal teardown must not retain armed race state: {:?}",
-        instance.races
+        instance.gateway_subscriptions.is_empty(),
+        "terminal teardown must not retain gateway subscriptions: {:?}",
+        instance.gateway_subscriptions
     );
 }
 
@@ -200,7 +192,7 @@ fn cancel_clears_armed_races() {
 /// terminal events — so the `ProcessInstanceCompleted` reducer must clear the
 /// armed races the same way.
 #[test]
-fn top_level_terminate_end_clears_armed_races() {
+fn top_level_terminate_end_clears_gateway_subscriptions() {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(gateway_then_top_level_terminate()))
@@ -211,9 +203,9 @@ fn top_level_terminate_end_clears_armed_races() {
         vars(&[("key", Value::Str("k".into()))]),
     );
     assert_eq!(
-        engine.instance(inst).unwrap().races.len(),
-        2,
-        "both catches are armed while the terminate branch waits on its job"
+        engine.instance(inst).unwrap().gateway_subscriptions.len(),
+        1,
+        "the gateway waits while the terminate branch waits on its job"
     );
 
     let job_key = engine.activate_jobs("hold", "w", 1, 60_000, 0)[0].key;
@@ -228,9 +220,9 @@ fn top_level_terminate_end_clears_armed_races() {
         "the top-level terminate end completes the whole instance"
     );
     assert!(
-        instance.races.is_empty(),
-        "terminal teardown must not retain armed race state: {:?}",
-        instance.races
+        instance.gateway_subscriptions.is_empty(),
+        "terminal teardown must not retain gateway subscriptions: {:?}",
+        instance.gateway_subscriptions
     );
 }
 
@@ -242,7 +234,7 @@ fn top_level_terminate_end_clears_armed_races() {
 /// regression that a live-engine-only test cannot see.
 #[cfg(feature = "serde")]
 #[test]
-fn twin_races_survive_snapshot_restore_and_journal_replay() {
+fn twin_gateways_survive_snapshot_restore_and_journal_replay() {
     // Build the two-race armed state once, collecting the journal, then
     // exercise both restore paths from the same point.
     let mut source = Engine::new();
@@ -258,9 +250,9 @@ fn twin_races_survive_snapshot_restore_and_journal_replay() {
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
     journal.extend(created);
     assert_eq!(
-        source.instance(inst).unwrap().races.len(),
-        4,
-        "two races armed (four catches) before the restore"
+        source.instance(inst).unwrap().gateway_subscriptions.len(),
+        2,
+        "two gateways wait before the restore"
     );
 
     // Path 1: restore from a SERIALIZED snapshot (round-tripped through JSON,
@@ -275,9 +267,9 @@ fn twin_races_survive_snapshot_restore_and_journal_replay() {
 
     for (path, mut engine) in [("snapshot", from_snapshot), ("journal", from_journal)] {
         assert_eq!(
-            engine.instance(inst).unwrap().races.len(),
-            4,
-            "{path}: the armed race membership survives the restore"
+            engine.instance(inst).unwrap().gateway_subscriptions.len(),
+            2,
+            "{path}: the gateway-owned subscriptions survive the restore"
         );
         let first = engine
             .apply_command(Command::correlate_message("M1", "k"))
@@ -289,8 +281,8 @@ fn twin_races_survive_snapshot_restore_and_journal_replay() {
         );
         assert_eq!(
             completions(&first, "onM2"),
-            1,
-            "{path}: only the winning race's sibling is withdrawn after the restore"
+            0,
+            "{path}: the other gateway still waits after the restore"
         );
         let second = engine
             .apply_command(Command::correlate_message("M2", "k"))

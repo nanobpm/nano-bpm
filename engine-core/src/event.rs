@@ -584,13 +584,16 @@ pub enum Event {
         /// `ElementActivated`, which records the scope.
         #[cfg_attr(feature = "serde", serde(default))]
         scope: Key,
-        /// The event-based gateway element instance whose deferred choice armed
-        /// this (catch) element instance, `None` for every other activation
-        /// (#1676). Siblings of a race winner are withdrawn only within the same
-        /// race, so two activations of one gateway in one scope race
-        /// independently. Additive: `serde(default)` and omitted when `None`, so
-        /// older journals decode unchanged and other activations serialize
-        /// byte-identically.
+        /// LEGACY (#1676, retired by #2004): the event-based gateway element
+        /// instance whose deferred choice armed this (catch) element instance.
+        /// Before the `event-gateway-runtime-v1` latch is set, this build
+        /// still emits `Some` (via `activate_legacy_race_member`), so a
+        /// mixed-version cluster keeps one race model; a replayed `Some`
+        /// lands in `ProcessInstance::races`, and those races load and settle
+        /// normally. Once the latch is set, new activations carry `None`
+        /// (gateway-owned triggers replace races), and the loader refuses an
+        /// instance still holding an in-flight legacy race
+        /// (`State::refused_legacy_event_gateway_race_instances`).
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
@@ -660,8 +663,7 @@ pub enum Event {
     /// An event-based gateway opened its gateway-owned subscriptions (#1963
     /// slice i, #2003): one per outgoing catch target, owned by the gateway's
     /// element instance and tagged with the target catch element id (Zeebe
-    /// `EventBasedGatewayProcessor.onActivate`). Additive; not yet emitted by
-    /// execution.
+    /// `EventBasedGatewayProcessor.onActivate`).
     EventGatewaySubscriptionsOpened {
         instance_key: Key,
         /// The owning event-based gateway's element instance key.
@@ -671,16 +673,46 @@ pub enum Event {
         catch_element_ids: Vec<ElementId>,
     },
 
-    /// A gateway-owned subscription fired (#1963 slice i, #2003): the gateway
+    /// A gateway-owned subscription fired (#1963, #2004): the gateway
     /// recorded its event trigger for `catch_element_id` and every other
     /// subscription it owns is deleted (Zeebe `EventTrigger` on the gateway's
-    /// event scope; first trigger wins). Additive; not yet emitted by
-    /// execution.
+    /// event scope; first trigger in log order wins, arbitrated per batch;
+    /// losing catches are cancelled with no trigger record). The gateway then
+    /// completes and activates the catch directly under
+    /// `catch_element_instance_key`. Replay contract (legacy before the
+    /// `event-gateway-runtime-v1` latch, new runtime after):
+    /// `docs/adr/0067-event-gateway-runtime-latch.md`.
     EventGatewayTriggered {
         instance_key: Key,
         gateway_element_instance_key: Key,
         /// The catch element whose event fired.
         catch_element_id: ElementId,
+        /// The element instance key minted for the triggered catch's direct
+        /// activation. Additive (`serde(default)`; `0` on a record written
+        /// before #2004, which no build ever emitted).
+        #[cfg_attr(feature = "serde", serde(default))]
+        catch_element_instance_key: Key,
+        /// The winning event's payload (#2047 review), snapshotted at the
+        /// trigger and written LOCAL to the catch element instance when it
+        /// activates, so its listeners, output mappings and propagation read
+        /// it even when a variable changes while the gateway completes (e.g.
+        /// on an `end` listener). Additive and written only when non-empty.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "BTreeMap::is_empty")
+        )]
+        variables: BTreeMap<String, Value>,
+    },
+    /// A gateway's recorded trigger (#2004) was discarded without its catch
+    /// activating: the scope it would activate in was torn down (e.g. the
+    /// enclosing sub-process terminated) after the gateway completed but
+    /// before the queued triggered-catch activation ran. Drops the
+    /// `gateway_triggers` entry whose catch is `catch_element_instance_key`,
+    /// so abandoned triggers never accumulate in memory or snapshots.
+    /// Additive variant (old journals never contain it).
+    EventGatewayTriggerDiscarded {
+        instance_key: Key,
+        catch_element_instance_key: Key,
     },
 
     /// A token moved along a sequence flow from one element to another.
@@ -2137,6 +2169,15 @@ pub enum Event {
     /// envelope exactly like one that applied the enabling envelope live.
     /// Partition-level; names no instance.
     RemoteBufferedDeliveryActivated { partition: u64 },
+    /// The event-based gateway runtime of #2004 (`event-gateway-runtime-v1`)
+    /// was activated on this partition: from this log position on, an
+    /// event-based gateway waits on gateway-owned subscriptions and its
+    /// trigger activates only the winning catch. Before it, the legacy #1676
+    /// race path (arm every catch, withdraw the losing siblings) runs, so a
+    /// journal without this record replays under legacy semantics. Recorded
+    /// once, when the replicated envelope first enables the capability and no
+    /// legacy race state is left. Partition-level; names no instance.
+    EventGatewayRuntimeActivated { partition: u64 },
     /// A replicated envelope enabled `message-correlation-ack-v2` on this
     /// partition for the first time (#2037): every cluster member advertises
     /// v2, so from here on the ack output carries the resolved consumption
@@ -2437,6 +2478,7 @@ impl Event {
             | Event::GatewayRouteSelected { instance_key, .. }
             | Event::EventGatewaySubscriptionsOpened { instance_key, .. }
             | Event::EventGatewayTriggered { instance_key, .. }
+            | Event::EventGatewayTriggerDiscarded { instance_key, .. }
             | Event::SequenceFlowTaken { instance_key, .. }
             | Event::ParallelJoinOpened { instance_key, .. }
             | Event::ParallelJoinTokenArrived { instance_key, .. }
@@ -2540,6 +2582,7 @@ impl Event {
             | Event::MessageCorrelationSettled { .. }
             | Event::MessageCorrelationReceiptSettled { .. }
             | Event::RemoteBufferedDeliveryActivated { .. }
+            | Event::EventGatewayRuntimeActivated { .. }
             | Event::MessageCorrelationAckV2Activated { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
@@ -2736,6 +2779,7 @@ impl Event {
             | Event::MessageSubscriptionResumed { partition, .. }
             | Event::MessageCorrelationSettled { partition, .. }
             | Event::RemoteBufferedDeliveryActivated { partition }
+            | Event::EventGatewayRuntimeActivated { partition }
             | Event::MessageCorrelationAckV2Activated { partition } => *partition,
             // A message key is a PUBLICATION identity shared by every partition
             // the publish fans out to (#1434): it may have been minted on another
@@ -2858,6 +2902,22 @@ impl Event {
                 element_instance_key,
                 ..
             } => m = m.max(*element_instance_key),
+            Event::EventGatewaySubscriptionsOpened {
+                gateway_element_instance_key,
+                ..
+            } => m = m.max(*gateway_element_instance_key),
+            // The catch key is MINTED here (#2004): if the catch's activation
+            // never follows (scope terminated first), only this record
+            // carries it, so replay must still advance the allocator past it.
+            Event::EventGatewayTriggered {
+                gateway_element_instance_key,
+                catch_element_instance_key,
+                ..
+            } => {
+                m = m
+                    .max(*gateway_element_instance_key)
+                    .max(*catch_element_instance_key)
+            }
             Event::JobCreated {
                 job_key,
                 element_instance_key,

@@ -3478,3 +3478,46 @@ fn settled_orphan_episodes_project_equal_under_remint() {
         "a remint must not split equivalent tombstone episodes"
     );
 }
+
+/// The post-latch corpus (#2004, #2047 review): generated under the
+/// `event-gateway-runtime-v1` envelope with keys harvested from the latched
+/// engine, it latches the new runtime and runs a gateway-owned trigger, and a
+/// replay under the same envelope is reproducible and restart-invisible —
+/// so the same-release cells
+/// determinism-check the latched path, not only the pre-latch one.
+#[test]
+fn post_latch_corpus_exercises_the_runtime_and_replays_deterministically() {
+    let (entries, labels) = corpus::build_labeled_with(RANDOM, corpus::Runtime::PostLatch);
+    let jsonl = corpus::to_jsonl(&entries, &labels);
+    let opts = |stop_after, start_at| runner::RunOptions {
+        state_every: 16,
+        stop_after,
+        start_at,
+        event_gateway_runtime: true,
+        ..Default::default()
+    };
+    let full = run(&jsonl, &opts(None, 0), &mut Engine::new());
+    assert_eq!(full, run(&jsonl, &opts(None, 0), &mut Engine::new()));
+    for event in ["EventGatewayRuntimeActivated", "EventGatewayTriggered"] {
+        assert!(
+            full.contains(event),
+            "post-latch replay never emits {event}"
+        );
+    }
+    // The pre-latch replay of the default corpus never latches.
+    assert!(!full_run(&corpus_jsonl(), false).contains("EventGatewayRuntimeActivated"));
+
+    let total = jsonl.lines().count() as u64;
+    for split in [1, total / 3, total / 2 + 1] {
+        let mut first_engine = Engine::new();
+        let first = run(&jsonl, &opts(Some(split), 0), &mut first_engine);
+        let snap = runner::save_snapshot(&first_engine).unwrap();
+        let mut resumed = runner::load_snapshot(&snap).unwrap();
+        let second = run(&jsonl, &opts(None, split), &mut resumed);
+        assert_eq!(
+            full,
+            format!("{first}{second}"),
+            "restart at {split} diverged"
+        );
+    }
+}

@@ -854,7 +854,6 @@ impl Engine {
                     element_id: planned.element_id,
                     scope,
                     via: None,
-                    race: None,
                 });
             } else {
                 self.activate_with_local_variables(
@@ -1127,7 +1126,6 @@ impl Engine {
             element_id: element_id.clone(),
             scope,
             via: None,
-            race: None,
         };
         if self.step_targets_dead_scope(&step) {
             return;

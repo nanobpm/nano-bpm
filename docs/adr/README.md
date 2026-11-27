@@ -76,6 +76,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0064](0064-server-crate-decomposition.md) | Server crate decomposition (compile-time-driven workspace split) | Proposed | 2026-08-29 |
 | [0065](0065-deno-removal.md) | Deno removal: Node (≥ 22.6) is the sole JS/TS runtime | Accepted | 2026-10-13 |
 | [0066](0066-replication-model.md) | Replication model: event replication vs. command replication with enforced determinism | Accepted (option C) | 2026-11-18 |
+| [0067](0067-event-gateway-runtime-latch.md) | Event-based gateway runtime latch and replay contract | Accepted | 2026-11-27 |
 
 ## Reading paths
 

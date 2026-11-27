@@ -46,6 +46,30 @@ const T0: u64 = 1_700_000_000_000;
 /// harvested keys instead of only its hand-issued, no-op form.
 const NUM_PARTITIONS: u64 = 3;
 
+/// Which `event-gateway-runtime-v1` envelope (#2004) a corpus is generated
+/// and replayed under.
+///
+/// * [`Runtime::PreLatch`] — the envelope is off, so the engine runs exactly
+///   as the previous release (a mixed-version cluster). The previous-release
+///   comparison uses this corpus only.
+/// * [`Runtime::PostLatch`] — the envelope is on, so the first event-based
+///   gateway latches the new runtime and gateway-owned triggers run. Keys are
+///   harvested from that engine (the new runtime mints different keys), and
+///   the same-release cells (hash seed, restart, profile, platform) replay it
+///   too, so the latched path is determinism-checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runtime {
+    PreLatch,
+    PostLatch,
+}
+
+impl Runtime {
+    /// The envelope bit the generator and the runner set.
+    pub fn event_gateway_runtime(self) -> bool {
+        matches!(self, Runtime::PostLatch)
+    }
+}
+
 /// A built corpus: `(now, command)` entries in order.
 pub type Corpus = Vec<(u64, Command)>;
 
@@ -77,8 +101,17 @@ impl Default for Gen {
 
 impl Gen {
     pub fn new() -> Self {
+        Self::with_runtime(Runtime::PreLatch)
+    }
+
+    /// A generator whose engine runs under `runtime`'s envelope, exactly as
+    /// the runner replays that corpus, so every harvested key is the one the
+    /// replay mints.
+    pub fn with_runtime(runtime: Runtime) -> Self {
+        let mut engine = Engine::new();
+        engine.set_event_gateway_runtime(runtime.event_gateway_runtime());
         Self {
-            engine: Engine::new(),
+            engine,
             now: T0,
             entries: Vec::new(),
             rng: 0x9E37_79B9_7F4A_7C15,
@@ -289,6 +322,15 @@ const EXCLUDED: &str = "excluded from this corpus";
 /// this share of the unfiltered entries must survive the exclusions.
 pub const MIN_KEPT_PERCENT: usize = 90;
 
+/// [`build_labeled`] under `runtime`'s envelope (keys harvested from it).
+pub fn build_labeled_with(
+    random_instances: usize,
+    runtime: Runtime,
+) -> (Corpus, Vec<&'static str>) {
+    let (entries, _, labels) = generate_with(random_instances, BTreeSet::new(), runtime);
+    (entries, labels)
+}
+
 /// Builds the full corpus. `random_instances` sizes the randomized workload.
 pub fn build(random_instances: usize) -> Vec<(u64, Command)> {
     generate(random_instances, BTreeSet::new()).0
@@ -358,7 +400,11 @@ pub fn build_excluding(
 type Generated = (Vec<(u64, Command)>, Vec<Option<bool>>, Vec<&'static str>);
 
 fn generate(random_instances: usize, exclude: BTreeSet<u64>) -> Generated {
-    let mut g = Gen::new();
+    generate_with(random_instances, exclude, Runtime::PreLatch)
+}
+
+fn generate_with(random_instances: usize, exclude: BTreeSet<u64>, runtime: Runtime) -> Generated {
+    let mut g = Gen::with_runtime(runtime);
     g.exclude = exclude;
 
     // ---- Deployments -------------------------------------------------------

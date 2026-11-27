@@ -76,6 +76,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::GatewayRouteSelected { .. }
         | Event::EventGatewaySubscriptionsOpened { .. }
         | Event::EventGatewayTriggered { .. }
+        | Event::EventGatewayTriggerDiscarded { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::ParallelJoinOpened { .. }
         | Event::ParallelJoinTokenArrived { .. }
@@ -147,6 +148,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::MessageSubscriptionResumed { .. }
         | Event::MessageCorrelationReceiptSettled { .. }
         | Event::RemoteBufferedDeliveryActivated { .. }
+        | Event::EventGatewayRuntimeActivated { .. }
         | Event::MessageCorrelationAckV2Activated { .. }
         | Event::MessageStartSubscriptionCreated { .. }
         | Event::RoutedDeliveryRecorded { .. } => subscription::apply_subscription(state, event),

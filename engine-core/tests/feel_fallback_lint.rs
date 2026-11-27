@@ -90,6 +90,18 @@ const ALLOW: &[Allow] = &[
     },
     Allow {
         file: "mod.rs",
+        contains: "crate::feel::eval_bool(condition, vars)",
+        rule: Rule::DirectFeel,
+        count: 1,
+        why: Why::Zeebe(
+            "event-based gateway conditional target: an evaluation failure is \
+             not-yet-satisfied, no incident; an already-true condition triggers the \
+             gateway on activation (Zeebe CatchEventBehavior.tryEvaluateSubscription \
+             ignores the Failure)",
+        ),
+    },
+    Allow {
+        file: "mod.rs",
         contains: "crate::feel::eval_bool(condition, &variables)",
         rule: Rule::DirectFeel,
         count: 1,

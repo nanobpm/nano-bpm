@@ -154,6 +154,11 @@
     }
   },
   {
+    "EventGatewayRuntimeActivated": {
+      "partition": 1
+    }
+  },
+  {
     "MessageCorrelationAckV2Activated": {
       "partition": 1
     }
@@ -202,6 +207,15 @@
     }
   },
   {
+    "ElementActivating": {
+      "element_id": "m1",
+      "element_instance_key": 3,
+      "instance_key": 1,
+      "race": 2,
+      "scope": 0
+    }
+  },
+  {
     "EventGatewaySubscriptionsOpened": {
       "catch_element_ids": [
         "m1",
@@ -215,7 +229,19 @@
   {
     "EventGatewayTriggered": {
       "catch_element_id": "m1",
+      "catch_element_instance_key": 3,
       "gateway_element_instance_key": 2,
+      "instance_key": 1,
+      "variables": {
+        "payload": {
+          "Int": 21
+        }
+      }
+    }
+  },
+  {
+    "EventGatewayTriggerDiscarded": {
+      "catch_element_instance_key": 3,
       "instance_key": 1
     }
   },

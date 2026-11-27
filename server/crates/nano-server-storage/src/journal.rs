@@ -1409,6 +1409,9 @@ impl Journal {
         let legacy = self.legacy_lenient_completion;
         self.engine = Engine::from_snapshot(snapshot);
         self.engine.set_legacy_lenient_completion(legacy);
+        // A fresh engine starts with its default envelopes; on a replicated
+        // journal they are Raft-entry decisions only (#2047 review).
+        self.disarm_capability_envelopes();
         // If lean-snapshot mode is wired, re-enable dirty-var tracking on the
         // fresh engine and re-seed the dirty set so the next checkpoint rewrites
         // the full resident variable state into the authoritative store
@@ -1586,6 +1589,8 @@ impl Journal {
         self.engine = engine;
         self.engine
             .set_legacy_lenient_completion(self.legacy_lenient_completion);
+        // As in `restore_engine_from_snapshot` (#2047 review).
+        self.disarm_capability_envelopes();
         if self.varstore.is_some() {
             self.engine.set_track_dirty_vars(true);
             self.engine.mark_all_dirty();
@@ -1938,6 +1943,9 @@ impl Journal {
     /// one it is observed (log + metric) only.
     pub fn set_replicated_apply(&mut self, replicated: bool) {
         self.replicated_apply = replicated;
+        // A replicated journal arms its capability envelopes only inside a
+        // Raft entry (#2054, #2047 review): drop any engine default.
+        self.disarm_capability_envelopes();
     }
 
     /// Whether this journal is marked as applied under replicated (Raft)
@@ -4257,6 +4265,19 @@ impl Journal {
         self.engine.set_remote_buffered_delivery(enabled);
     }
 
+    /// Sets, for the NEXT applied command, whether every cluster member
+    /// advertises `event-gateway-runtime-v1` (#2004; see
+    /// [`Engine::set_event_gateway_runtime`]): the first event-based gateway
+    /// activation it enables records the replicated latch. The Raft apply loop
+    /// sets it from each replicated command's envelope before applying it.
+    /// Refused outside a Raft entry on a replicated-apply journal, like
+    /// [`set_remote_buffered_delivery`](Self::set_remote_buffered_delivery)
+    /// (#2047 review), and disarmed at the entry boundary.
+    pub fn set_event_gateway_runtime(&mut self, enabled: bool) {
+        let enabled = enabled && self.capability_envelope_armable();
+        self.engine.set_event_gateway_runtime(enabled);
+    }
+
     /// Sets, for the NEXT applied command, the replicated
     /// `message-correlation-ack-v2` envelope bit (#2037; see
     /// [`Engine::set_message_correlation_ack_v2`]). Refused outside a Raft
@@ -4280,6 +4301,7 @@ impl Journal {
         if self.replicated_apply || self.raft_entry.is_some() {
             self.engine.set_remote_buffered_delivery(false);
             self.engine.set_message_correlation_ack_v2(false);
+            self.engine.set_event_gateway_runtime(false);
         }
     }
 
@@ -11291,6 +11313,100 @@ mod tests {
             !records_a_capability_latch(&events),
             "an envelope leaked past its Raft entry: {events:?}"
         );
+    }
+
+    fn gateway_race() -> nanobpmn_engine_core::ProcessDefinition {
+        ProcessBuilder::new("evt")
+            .start_event("start")
+            .event_based_gateway("gw")
+            .message_intermediate_catch_event("onM1", "M1", "=key")
+            .message_intermediate_catch_event("onM2", "M2", "=key")
+            .end_event("end1")
+            .end_event("end2")
+            .connect("start", "gw")
+            .connect("gw", "onM1")
+            .connect("gw", "onM2")
+            .connect("onM1", "end1")
+            .connect("onM2", "end2")
+            .build()
+            .expect("valid gateway race")
+    }
+
+    fn create_race() -> Command {
+        Command::create_instance_with(
+            "evt",
+            std::collections::BTreeMap::from([(
+                "key".to_string(),
+                nanobpmn_engine_core::Value::Str("k".into()),
+            )]),
+        )
+    }
+
+    fn latches_gateway_runtime(events: &[Event]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, Event::EventGatewayRuntimeActivated { .. }))
+    }
+
+    /// #2047 review: the `event-gateway-runtime-v1` envelope bit is scoped to
+    /// the command that carries it. An entry whose command sets the bit but
+    /// does not latch (no gateway activates) must not leak it into the next
+    /// command, which carries no bit and activates a gateway before the latch.
+    #[test]
+    fn event_gateway_envelope_bit_does_not_leak_to_the_next_command() {
+        let mut journal = Journal::in_memory();
+        journal.set_replicated_apply(true);
+        // Entry 1: bit set, but the command activates no gateway.
+        journal.begin_raft_entry();
+        journal.set_event_gateway_runtime(true);
+        let (events, _) = journal
+            .apply_command(Command::DeployProcess(gateway_race()))
+            .expect("deploy");
+        assert!(!latches_gateway_runtime(&events));
+        let _ = journal.commit_raft_entry(1, String::new()).expect("commit");
+        // A local command outside any entry inherits nothing.
+        let (events, _) = journal.apply_command(create_race()).expect("create");
+        assert!(
+            !latches_gateway_runtime(&events),
+            "the envelope bit leaked past its Raft entry: {events:?}"
+        );
+        // Entry 2: a later item in the same entry without the bit.
+        journal.begin_raft_entry();
+        journal.set_event_gateway_runtime(true);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .expect("deploy demo");
+        journal.set_event_gateway_runtime(false);
+        let (events, _) = journal.apply_command(create_race()).expect("create");
+        assert!(
+            !latches_gateway_runtime(&events),
+            "the envelope bit leaked to the next item: {events:?}"
+        );
+        let _ = journal.commit_raft_entry(2, String::new()).expect("commit");
+        assert!(!journal.engine().event_gateway_runtime_latched());
+    }
+
+    /// #2047 review: a fresh engine defaults the gateway envelope ON (the
+    /// single-node behaviour). On a replicated journal, a swapped-in engine
+    /// (snapshot install, recovery) must not apply a local command under that
+    /// default outside a Raft entry.
+    #[test]
+    fn replicated_journal_disarms_the_gateway_envelope_of_a_swapped_engine() {
+        let mut journal = Journal::in_memory();
+        journal.set_replicated_apply(true);
+        let _ = journal
+            .apply_command(Command::DeployProcess(gateway_race()))
+            .expect("deploy");
+        let snapshot = journal.engine().snapshot();
+        journal.restore_engine_from_snapshot(snapshot);
+        let (events, _) = journal.apply_command(create_race()).expect("create");
+        assert!(!latches_gateway_runtime(&events), "{events:?}");
+        journal.replace_engine(nanobpmn_engine_core::Engine::new());
+        let _ = journal
+            .apply_command(Command::DeployProcess(gateway_race()))
+            .expect("deploy");
+        let (events, _) = journal.apply_command(create_race()).expect("create");
+        assert!(!latches_gateway_runtime(&events), "{events:?}");
     }
 
     /// A non-replicated (single-node / non-Raft) journal keeps arming the

@@ -653,8 +653,14 @@ pub fn read_streaming_engine_snapshot_from<RD: std::io::Read>(
             }
         },
     )?;
-    acc.into_inner()
-        .ok_or_else(|| invalid_data("streaming snapshot had no control frame"))
+    let engine = acc
+        .into_inner()
+        .ok_or_else(|| invalid_data("streaming snapshot had no control frame"))?;
+    // Raft boot / snapshot install read through here, headerless legacy
+    // snapshots included: refuse an in-flight legacy event-gateway race
+    // exactly as the local loader does (#2004).
+    crate::seglog::refuse_legacy_event_gateway_races([&engine]).map_err(std::io::Error::other)?;
+    Ok(engine)
 }
 
 /// The path-based counterpart of [`read_streaming_engine_snapshot_from`].
@@ -1498,6 +1504,66 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #2004 deferred item 2: Raft boot / snapshot install read through
+    /// [`read_streaming_engine_snapshot_from`], headerless legacy files
+    /// included, so an in-flight legacy event-gateway race (here a pre-#1676
+    /// one, with no `races` field) is refused there with the typed error.
+    #[test]
+    fn streaming_reader_refuses_a_legacy_event_gateway_race() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(
+                ProcessBuilder::new("evt")
+                    .start_event("start")
+                    .event_based_gateway("gw")
+                    .message_intermediate_catch_event("onM1", "M1", "=\"k\"")
+                    .message_intermediate_catch_event("onM2", "M2", "=\"k\"")
+                    .end_event("end")
+                    .connect("start", "gw")
+                    .connect("gw", "onM1")
+                    .connect("gw", "onM2")
+                    .connect("onM1", "end")
+                    .connect("onM2", "end")
+                    .build()
+                    .unwrap(),
+            ))
+            .unwrap();
+        let key = engine
+            .apply_command(Command::create_instance("evt"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        let waiting = serde_json::to_vec(&engine.snapshot()).unwrap();
+        assert!(read_streaming_engine_snapshot_from(&waiting[..]).is_ok());
+
+        let mut legacy = engine.snapshot();
+        let instance = legacy.state.instances.get_mut(&key).unwrap();
+        instance.active.clear();
+        instance.gateway_subscriptions.clear();
+        instance.active.insert(9101, "onM1".to_string());
+        instance.active.insert(9102, "onM2".to_string());
+        instance.races.insert(9101, 9100);
+        instance.races.insert(9102, 9100);
+        // Before the `event-gateway-runtime-v1` latch (#2004) the legacy
+        // runtime owns the race: it loads.
+        legacy.state.event_gateway_runtime_latched = false;
+        let pre_latch = serde_json::to_vec(&legacy).unwrap();
+        assert!(read_streaming_engine_snapshot_from(&pre_latch[..]).is_ok());
+        legacy.state.event_gateway_runtime_latched = true;
+        let body = serde_json::to_vec(&legacy).unwrap();
+        let err = read_streaming_engine_snapshot_from(&body[..]).expect_err("legacy race");
+        match err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<crate::seglog::SnapshotLoadError>())
+        {
+            Some(crate::seglog::SnapshotLoadError::LegacyEventGatewayRace { instance_keys }) => {
+                assert_eq!(instance_keys, &vec![key]);
+            }
+            other => panic!("expected LegacyEventGatewayRace, got {other:?}"),
+        }
     }
 
     // #1464 review (fail-closed spill resolution): when the authoritative var

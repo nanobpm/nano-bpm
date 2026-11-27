@@ -133,6 +133,7 @@ impl Engine {
             torn_down_scopes: std::collections::BTreeSet::new(),
             esp_start_payloads: std::collections::BTreeMap::new(),
             boundary_payloads: std::collections::BTreeMap::new(),
+            gateway_trigger_payloads: std::collections::BTreeMap::new(),
             pending_timer_fires: std::collections::VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: std::collections::VecDeque::new(),
@@ -140,6 +141,7 @@ impl Engine {
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
             remote_buffered_delivery_envelope: false,
+            event_gateway_runtime_envelope: true,
             message_correlation_ack_v2_envelope: false,
             buffer_candidates: std::collections::BTreeMap::new(),
             sweep_from: 0,
@@ -849,13 +851,28 @@ impl Engine {
     /// `resume_pending`) and so must stay resident until it is confirmed. The
     /// single predicate shared by spill eligibility and the snapshot safety
     /// check (#2012), so the two can never disagree.
+    ///
+    /// Also pins every legacy event-gateway cutover blocker (#2004, #2047
+    /// review; [`state::State::is_legacy_event_gateway_blocker`]): the
+    /// cutover decision sees resident instances only, so a cold-spilled
+    /// legacy race would let replicas with different spill histories decide
+    /// the latch differently. Unneeded once latched (no legacy state exists).
     fn resume_pinned_instances(&self) -> std::collections::BTreeSet<Key> {
-        self.state
+        let mut pinned: std::collections::BTreeSet<Key> = self
+            .state
             .message_subscriptions
             .values()
             .filter(|s| s.resume_pending)
             .map(|s| s.instance_key)
-            .collect()
+            .collect();
+        if !self.state.event_gateway_runtime_latched {
+            for (key, instance) in &self.state.instances {
+                if self.state.is_legacy_event_gateway_blocker(instance) {
+                    pinned.insert(*key);
+                }
+            }
+        }
+        pinned
     }
 
     /// Lifts an idle instance and every entity it owns (jobs, timers, message
@@ -877,7 +894,19 @@ impl Engine {
         // subscription scan (`pending_resume_handshakes`); cold-spilling it
         // would hide that recovery intent until a later rehydrate, stranding
         // the message partition's backlog. Keep it resident until confirmed.
-        if self.resume_pinned_instances().contains(&key) {
+        // A legacy event-gateway cutover blocker stays resident too (#2047
+        // review): checked per instance here, not via the O(N) pinned set.
+        if !self.state.event_gateway_runtime_latched
+            && self.state.is_legacy_event_gateway_blocker(instance)
+        {
+            return None;
+        }
+        if self
+            .state
+            .message_subscriptions
+            .values()
+            .any(|s| s.resume_pending && s.instance_key == key)
+        {
             return None;
         }
 

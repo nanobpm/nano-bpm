@@ -27,6 +27,7 @@ mod boundary;
 mod call_activity;
 pub(crate) mod completion_step;
 mod debug;
+mod event_gateway_trigger;
 mod event_subprocess;
 mod expression;
 mod flow_scope;
@@ -129,7 +130,8 @@ struct PendingCorrelationAck {
 /// additive, so v3 snapshots migrate unchanged — EXCEPT one holding an in-flight
 /// legacy event-gateway race (`State::legacy_event_gateway_race_instances`),
 /// which the loader refuses with a typed `LegacyEventGatewayRace` error naming
-/// the instances (settle or cancel them on the previous release first).
+/// the instances (settle or cancel them on the previous release first). See
+/// `docs/adr/0067-event-gateway-runtime-latch.md` for the replay contract.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
 /// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
 /// plus the scalar generator and clock metadata required to resume operation
@@ -326,6 +328,11 @@ pub struct Engine {
     /// would hand the whole payload to the first activation and leave the rest
     /// reading a missing (or, for output-mapped boundaries, stale) payload.
     boundary_payloads: BTreeMap<(Key, Key, String), VecDeque<BTreeMap<String, Value>>>,
+    /// A fired gateway-owned subscription's payload (#2047 review), keyed by
+    /// `(instance, gateway element instance)`, staged by `merge_event_payload`
+    /// and consumed by `trigger_event_gateway` later in the same drain, which
+    /// records it on `EventGatewayTriggered`.
+    gateway_trigger_payloads: BTreeMap<(Key, Key), BTreeMap<String, Value>>,
     /// The last Raft applied-entry record (#1405): `(raft log index, opaque
     /// replication state)` of the most recent [`Event::RaftEntryApplied`] this
     /// engine journaled or replayed. It is written in the SAME atomic journal
@@ -377,6 +384,13 @@ pub struct Engine {
     /// as last passed to [`Engine::set_remote_buffered_delivery`]. Drives the
     /// one-time [`Event::RemoteBufferedDeliveryActivated`] record.
     remote_buffered_delivery_envelope: bool,
+    /// The CURRENT replicated envelope's `event-gateway-runtime-v1` bit
+    /// (#2004), as last passed to [`Engine::set_event_gateway_runtime`].
+    /// `true` for a standalone engine (every member is this build); a Raft
+    /// host sets it from every entry, `false` while any member lacks the
+    /// capability. Drives the one-time [`Event::EventGatewayRuntimeActivated`]
+    /// latch; the RUNTIME decision reads only the durable latch.
+    event_gateway_runtime_envelope: bool,
     /// The CURRENT replicated envelope's `message-correlation-ack-v2` bit
     /// (#2037), as last passed to [`Engine::set_message_correlation_ack_v2`].
     /// Drives the one-time [`Event::MessageCorrelationAckV2Activated`]
@@ -473,11 +487,30 @@ enum Step {
         /// per flow (#1233). Build flow activations with
         /// [`Engine::take_flow`], never by hand.
         via: Option<IncomingFlow>,
-        /// The event-based gateway element instance whose deferred choice this
-        /// activation arms (#1676), or `None` for any other activation. Carried
-        /// onto [`Event::ElementActivating`] so a race winner withdraws exactly
-        /// the siblings armed by the SAME gateway activation.
-        race: Option<Key>,
+    },
+    /// Activate the catch an event-based gateway's trigger selected (#2004,
+    /// Zeebe `BpmnEventSubscriptionBehavior.activateTriggeredEvent`), directly
+    /// (no sequence flow) under the key journaled on
+    /// [`Event::EventGatewayTriggered`]. The catch finds its trigger recorded
+    /// and completes instead of subscribing again.
+    ActivateTriggeredCatch {
+        instance_key: Key,
+        element_id: ElementId,
+        scope: Key,
+        element_instance_key: Key,
+    },
+    /// LEGACY (#1676, before the `event-gateway-runtime-v1` latch, #2004):
+    /// activate a catch an event-based gateway armed by taking its outgoing
+    /// flow, tagged with the gateway element instance (`race`) on
+    /// [`Event::ElementActivating`], so the race winner withdraws exactly the
+    /// siblings armed by the SAME gateway activation. Built only by
+    /// [`Engine::take_completion_flows`] from a [`Step::Activate`].
+    ActivateLegacyRaceMember {
+        instance_key: Key,
+        element_id: ElementId,
+        scope: Key,
+        via: Option<IncomingFlow>,
+        race: Key,
     },
     /// Re-run ONLY the catch walk of an [`ErrorEndEvent`](ElementKind::ErrorEndEvent)
     /// parked by an `UNHANDLED_ERROR` incident (#1592). The element already
@@ -823,6 +856,7 @@ impl Engine {
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
+            gateway_trigger_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
@@ -830,6 +864,7 @@ impl Engine {
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
             remote_buffered_delivery_envelope: false,
+            event_gateway_runtime_envelope: true,
             message_correlation_ack_v2_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
@@ -909,6 +944,49 @@ impl Engine {
             let partition = self.partition_id;
             self.emit(log, Event::RemoteBufferedDeliveryActivated { partition });
         }
+    }
+
+    /// Sets the replicated envelope's `event-gateway-runtime-v1` bit (#2004).
+    /// A replicated host MUST set this from the replicated command envelope
+    /// before every apply (decided once by the proposing leader: `true` only
+    /// while every member advertises the capability), never from local
+    /// knowledge, so all replicas agree. It only ENABLES recording the
+    /// one-way latch ([`Event::EventGatewayRuntimeActivated`]); once latched,
+    /// a later `false` is ignored — the durable latch decides the runtime.
+    pub fn set_event_gateway_runtime(&mut self, enabled: bool) {
+        self.event_gateway_runtime_envelope = enabled;
+    }
+
+    /// Whether the `event-gateway-runtime-v1` latch (#2004) is recorded on
+    /// this partition: event-based gateways run the gateway-owned trigger
+    /// path, and the retained log/snapshot depends on the capability.
+    pub fn event_gateway_runtime_latched(&self) -> bool {
+        self.state.event_gateway_runtime_latched
+    }
+
+    /// Decides which event-based gateway runtime an activation uses (#2004)
+    /// and, on the first new-runtime activation, returns the latch record to
+    /// journal ahead of it. Latched → new path. Not latched → the new path
+    /// (latching now) only when the envelope enables the capability AND no
+    /// legacy race state is left on the partition and no other legacy gateway
+    /// is still in flight (it would arm a race on completion), so a latched
+    /// log never holds legacy race state (which a latched load refuses). Otherwise the
+    /// legacy #1676 race path, exactly as before the capability existed.
+    fn event_gateway_runtime_decision(&self, activating: Key) -> (bool, Option<Event>) {
+        if self.state.event_gateway_runtime_latched {
+            return (true, None);
+        }
+        if self.event_gateway_runtime_envelope
+            && self.state.legacy_event_gateway_race_instances().is_empty()
+            && !self.state.legacy_event_gateway_in_flight(activating)
+        {
+            let partition = self.partition_id;
+            return (
+                true,
+                Some(Event::EventGatewayRuntimeActivated { partition }),
+            );
+        }
+        (false, None)
     }
 
     /// Whether this partition's retained log/snapshot depends on
@@ -1123,6 +1201,7 @@ impl Engine {
             torn_down_scopes: BTreeSet::new(),
             esp_start_payloads: BTreeMap::new(),
             boundary_payloads: BTreeMap::new(),
+            gateway_trigger_payloads: BTreeMap::new(),
             pending_timer_fires: VecDeque::new(),
             buffer_scan_from: 0,
             buffer_requeue: VecDeque::new(),
@@ -1130,6 +1209,7 @@ impl Engine {
             remote_buffered_delivery: true,
             remote_backlog_scan_pending: false,
             remote_buffered_delivery_envelope: false,
+            event_gateway_runtime_envelope: true,
             message_correlation_ack_v2_envelope: false,
             buffer_candidates: BTreeMap::new(),
             sweep_from: 0,
@@ -1893,7 +1973,6 @@ impl Engine {
             element_id: start_event,
             scope: 0,
             via: None,
-            race: None,
         });
         instance_key
     }
@@ -2877,6 +2956,7 @@ impl Engine {
         self.torn_down_scopes.clear();
         self.esp_start_payloads.clear();
         self.boundary_payloads.clear();
+        self.gateway_trigger_payloads.clear();
         self.pending_timer_fires.clear();
         self.buffer_scan_from = 0;
         self.buffer_requeue.clear();
@@ -4262,7 +4342,6 @@ impl Engine {
                             element_id: boundary_id,
                             scope: boundary_scope,
                             via: None,
-                            race: None,
                         });
                     }
                     // Unhandled: the token parks on an incident.
@@ -5370,6 +5449,11 @@ impl Engine {
                     .map(|s| s.key)
                     .collect();
                 matched.sort_unstable();
+                // Gateway-owned subscriptions (#2004): one broadcast may match
+                // several catches of ONE waiting event-based gateway. The first
+                // (lowest subscription key) wins; the others stay open and are
+                // deleted by the gateway's trigger, never recorded as correlated.
+                let mut claimed_gateways: BTreeSet<(Key, Key)> = BTreeSet::new();
 
                 for subscription_key in matched {
                     // An earlier boundary correlation in this batch may have
@@ -5384,6 +5468,17 @@ impl Engine {
                     let element_instance_key = subscription.element_instance_key;
                     let element_id = subscription.element_id.clone();
                     let kind = subscription.kind.clone();
+                    if self
+                        .event_gateway_trigger_target(
+                            instance_key,
+                            element_instance_key,
+                            &element_id,
+                        )
+                        .is_some()
+                        && !claimed_gateways.insert((instance_key, element_instance_key))
+                    {
+                        continue;
+                    }
                     self.advance_signal_correlated_token(
                         &mut log,
                         &mut queue,
@@ -6390,29 +6485,40 @@ impl Engine {
                     &instance.compensable,
                 )?;
 
-                // 4b. Event-based gateway races (#1554): validate where mapped
-                //     catch events land and collect unmapped race members to
-                //     withdraw (exempt from the step-5 mapping requirement).
-                //     The check is keyed by element id, so it cannot tell two
-                //     activations of ONE gateway racing in one scope (#1676)
-                //     apart — it validates the shape; the withdrawal below
-                //     re-keys the persisted per-activation race membership
-                //     (`races`) onto the mapped target gateway, which is what
-                //     the runtime's sibling isolation actually consults.
-                let withdrawn = Self::check_migrated_event_gateway_races(
-                    instance_key,
-                    &source_def.definition,
-                    &target.definition,
-                    &mapped,
-                    &active_elements,
-                    |eik| self.scope_of(instance_key, eik),
-                    |eik| {
-                        self.state
-                            .instances
-                            .get(&instance_key)
-                            .and_then(|i| i.races.get(&eik).copied())
-                    },
-                )?;
+                // 4b. LEGACY event-based gateway races (#1554 / #1676): before
+                //     the `event-gateway-runtime-v1` latch (#2004) — or for a
+                //     legacy race still recorded in `races` — validate where
+                //     mapped catch events land and collect unmapped race
+                //     members to withdraw (exempt from the step-5 mapping
+                //     requirement). The check is keyed by element id; the
+                //     persisted per-activation membership (`races`) keeps twin
+                //     activations of one gateway independent. Once latched, a
+                //     gateway waits on its own subscriptions and is migrated
+                //     with them (`plan_migration`).
+                let legacy_races = !self.state.event_gateway_runtime_latched
+                    || !self
+                        .state
+                        .instances
+                        .get(&instance_key)
+                        .is_none_or(|i| i.races.is_empty());
+                let withdrawn = if legacy_races {
+                    Self::check_migrated_event_gateway_races(
+                        instance_key,
+                        &source_def.definition,
+                        &target.definition,
+                        &mapped,
+                        &active_elements,
+                        |eik| self.scope_of(instance_key, eik),
+                        |eik| {
+                            self.state
+                                .instances
+                                .get(&instance_key)
+                                .and_then(|i| i.races.get(&eik).copied())
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                };
                 active_elements.retain(|e| !withdrawn.contains(e));
                 active_ids.retain(|id| active_elements.iter().any(|(_, e)| e == id));
                 // 4c. Event sub-process triggers (#1555) rest on their host
@@ -6426,6 +6532,37 @@ impl Engine {
                         return Err(EngineError::UnmappedActiveElement {
                             instance_key,
                             element_id: eid.clone(),
+                        });
+                    }
+                }
+
+                // 5b'. A triggered event-based gateway that is still active
+                //      (an end listener or a completion incident holds it,
+                //      #2004) has RECORDED its winning catch but not yet
+                //      activated it: finishing the gateway activates that
+                //      catch under the target, so it must be mapped like an
+                //      active element. Mapping the gateway then keeps it a
+                //      target of the mapped gateway (step 5's catch check).
+                let pending_catches: Vec<String> = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| {
+                        i.gateway_triggers
+                            .iter()
+                            .filter(|(gw, t)| {
+                                i.active.contains_key(gw)
+                                    && !i.active.contains_key(&t.catch_element_instance_key)
+                            })
+                            .map(|(_, t)| t.catch_element_id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for catch in &pending_catches {
+                    if !mapped.contains_key(catch) {
+                        return Err(EngineError::UnmappedActiveElement {
+                            instance_key,
+                            element_id: catch.clone(),
                         });
                     }
                 }
@@ -6797,17 +6934,10 @@ impl Engine {
                     &target_definition,
                     &mapped,
                 )?;
-                // The persisted race membership (#1676) needs NO re-keying
-                // here: the gateway element instance that armed a catch
-                // completes as it arms, so the `races` value is an opaque
-                // per-activation identity, not a live `active` lookup — the
-                // runtime (`withdraw_event_gateway_siblings`) only compares
-                // two catches' identities for EQUALITY. Twin activations of
-                // one gateway keep their distinct identities across the
-                // mapping, so the migrated races stay independent. The
-                // withdrawn members' entries are dropped by their
-                // `ElementCompleted` reducers (`withdraw_catch_instance`
-                // below).
+                // The persisted race membership (#1676) needs NO re-keying: the
+                // `races` value is an opaque per-activation identity the legacy
+                // withdrawal only compares for EQUALITY. The withdrawn members'
+                // entries are dropped by their `ElementCompleted` reducers.
                 let withdrawals: Vec<Event> = withdrawn
                     .into_iter()
                     .flat_map(|(eik, eid)| self.withdraw_catch_instance(instance_key, eik, eid))
@@ -7308,7 +7438,6 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope,
                     via: None,
-                    race: None,
                 });
             }
             // Non-interrupting boundary timer: leave the activity (and
@@ -7323,7 +7452,6 @@ impl Engine {
                     element_id: boundary_element_id.clone(),
                     scope: self.scope_of(instance_key, element_instance_key),
                     via: None,
-                    race: None,
                 });
                 // A repeating cycle re-arms for the next interval; a
                 // bounded `Rn/…` cycle stops after its n-th fire
@@ -7829,6 +7957,11 @@ impl Engine {
             .map(|s| s.key)
             .collect();
         candidates.sort_unstable();
+        // Gateway-owned subscriptions (#2004): several conditions of ONE waiting
+        // event-based gateway may become true together. The first (lowest
+        // subscription key) wins; the others stay open and are deleted by the
+        // gateway's trigger, never recorded as triggered.
+        let mut claimed_gateways: BTreeSet<(Key, Key)> = BTreeSet::new();
 
         for key in candidates {
             // A prior fire in this batch may have interrupted the activity and
@@ -7849,6 +7982,13 @@ impl Engine {
             // root), never the root alone (#1335, Zeebe parity).
             let vars = self.variables_for_element(instance_key, element_instance_key);
             if !matches!(crate::feel::eval_bool(&condition, &vars), Ok(true)) {
+                continue;
+            }
+            if self
+                .event_gateway_trigger_target(instance_key, element_instance_key, &element_id)
+                .is_some()
+                && !claimed_gateways.insert((instance_key, element_instance_key))
+            {
                 continue;
             }
             self.emit(
@@ -7887,7 +8027,6 @@ impl Engine {
                         element_id: boundary_element_id,
                         scope,
                         via: None,
-                        race: None,
                     });
                 }
                 // Non-interrupting boundary: leave the activity running and spawn a
@@ -7902,7 +8041,6 @@ impl Engine {
                         element_id: boundary_element_id,
                         scope: self.scope_of(instance_key, element_instance_key),
                         via: None,
-                        race: None,
                     });
                 }
                 state::MessageSubscriptionKind::EventSubProcess {
@@ -8503,7 +8641,6 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope,
                     via: None,
-                    race: None,
                 });
             }
             // Non-interrupting boundary subscription: leave the activity (and its
@@ -8519,7 +8656,6 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope: self.scope_of(instance_key, element_instance_key),
                     via: None,
-                    race: None,
                 });
             }
             state::MessageSubscriptionKind::EventSubProcess {
@@ -8590,7 +8726,6 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope,
                     via: None,
-                    race: None,
                 });
             }
             state::MessageSubscriptionKind::NonInterruptingBoundary {
@@ -8601,7 +8736,6 @@ impl Engine {
                     element_id: boundary_element_id,
                     scope: self.scope_of(instance_key, element_instance_key),
                     via: None,
-                    race: None,
                 });
             }
             state::MessageSubscriptionKind::EventSubProcess {
@@ -8974,6 +9108,16 @@ impl Engine {
                 scope,
                 ..
             }
+            | Step::ActivateTriggeredCatch {
+                instance_key,
+                scope,
+                ..
+            }
+            | Step::ActivateLegacyRaceMember {
+                instance_key,
+                scope,
+                ..
+            }
             | Step::ActivateSeededJoin {
                 instance_key,
                 scope,
@@ -9179,6 +9323,28 @@ impl Engine {
     /// with its flow-scope instance. An open join instance in the dead scope is
     /// already reset by [`scope_teardown_events`](Self::scope_teardown_events).
     fn revoke_dropped_join_arrival(&self, step: &Step) -> Vec<Event> {
+        // A dropped gateway-triggered catch (#2004) discards its gateway's
+        // recorded trigger, journaled so it never lingers in state.
+        if let Step::ActivateTriggeredCatch {
+            instance_key,
+            element_instance_key,
+            ..
+        } = step
+        {
+            let recorded = self.state.instances.get(instance_key).is_some_and(|i| {
+                i.gateway_triggers
+                    .values()
+                    .any(|t| t.catch_element_instance_key == *element_instance_key)
+            });
+            return if recorded {
+                vec![Event::EventGatewayTriggerDiscarded {
+                    instance_key: *instance_key,
+                    catch_element_instance_key: *element_instance_key,
+                }]
+            } else {
+                Vec::new()
+            };
+        }
         let Step::Activate {
             instance_key,
             element_id,
@@ -9265,13 +9431,44 @@ impl Engine {
                 element_id,
                 scope,
                 via,
+            } => self.activate(instance_key, element_id, scope, via, pending),
+            Step::ActivateTriggeredCatch {
+                instance_key,
+                element_id,
+                scope,
+                element_instance_key,
+            } => self.activate_with_key(instance_key, element_id, scope, element_instance_key),
+            Step::ActivateLegacyRaceMember {
+                instance_key,
+                element_id,
+                scope,
+                via,
                 race,
-            } => self.activate(instance_key, element_id, scope, via, race, pending),
+            } => self.activate_legacy_race_member(
+                instance_key,
+                element_id,
+                scope,
+                via,
+                race,
+                pending,
+            ),
             Step::Complete {
                 instance_key,
                 element_instance_key,
                 element_id,
-            } => self.complete(instance_key, element_instance_key, element_id),
+            } => match self.event_gateway_trigger_target(
+                instance_key,
+                element_instance_key,
+                &element_id,
+            ) {
+                Some(gateway_id) => self.trigger_event_gateway(
+                    instance_key,
+                    element_instance_key,
+                    gateway_id,
+                    element_id,
+                ),
+                None => self.complete(instance_key, element_instance_key, element_id),
+            },
             Step::RetryErrorEndThrow {
                 instance_key,
                 element_instance_key,
@@ -9584,7 +9781,7 @@ impl Engine {
                 ..
             } => {
                 debug_assert!(false, "ActivateSeededJoin is dispatched by run_with");
-                self.activate(instance_key, element_id, scope, None, None, pending)
+                self.activate(instance_key, element_id, scope, None, pending)
             }
             Step::TriggerEventSubProcess { .. } => {
                 debug_assert!(false, "TriggerEventSubProcess is dispatched by run_with");
@@ -9692,13 +9889,36 @@ impl Engine {
         element_id: String,
         scope: Key,
         via: Option<IncomingFlow>,
-        race: Option<Key>,
         pending: &VecDeque<Step>,
     ) -> (Vec<Event>, Vec<Step>) {
         // A parallel or inclusive gateway with more than one incoming flow is a
         // join: its activation is guarded instead of running per arrival.
         let join = self.join_kind(instance_key, &element_id);
-        let tag_race = match completion_step::activation_route(join.is_some(), race.is_some()) {
+        if let completion_step::ActivationRoute::Join =
+            completion_step::activation_route(join.is_some(), false)
+        {
+            if let Some(join) = join {
+                return self.activate_join(instance_key, element_id, scope, via, join, pending);
+            }
+        }
+        let element_instance_key = self.mint_key();
+        self.activate_with_key(instance_key, element_id, scope, element_instance_key)
+    }
+
+    /// [`Engine::activate`] for a LEGACY race member ([`Step::ActivateLegacyRaceMember`],
+    /// #1676): tags the catch's [`Event::ElementActivating`] with the gateway
+    /// activation that armed it, exactly as the pre-#2004 runtime did.
+    fn activate_legacy_race_member(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        scope: Key,
+        via: Option<IncomingFlow>,
+        race: Key,
+        pending: &VecDeque<Step>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let join = self.join_kind(instance_key, &element_id);
+        let tag_race = match completion_step::activation_route(join.is_some(), true) {
             completion_step::ActivationRoute::Join => match join {
                 Some(join) => {
                     return self.activate_join(instance_key, element_id, scope, via, join, pending)
@@ -9720,7 +9940,7 @@ impl Engine {
                 } = event
                 {
                     if *eik == element_instance_key {
-                        *tagged = race;
+                        *tagged = Some(race);
                     }
                 }
             }
@@ -9845,12 +10065,29 @@ impl Engine {
             .boundary_payloads
             .get_mut(&(instance_key, scope, element_id.clone()))
             .and_then(VecDeque::pop_front);
-        let propagate_boundary_payload = boundary_payload.clone().filter(|_| {
-            !self
-                .process_of_instance(instance_key)
-                .and_then(|p| p.element(&element_id))
-                .is_some_and(|e| !e.io.outputs.is_empty())
-        });
+        // A catch activated by its event-based gateway's recorded trigger
+        // (#2004, #2047 review) receives the payload recorded at the trigger
+        // the same way: LOCAL to the catch, then propagated (no outputs) — so
+        // its listeners, workers and output mappings read the payload as
+        // correlated, never a newer value of the enclosing scope.
+        // Unlike a boundary, it propagates even with output mappings: the
+        // same catch reached without a gateway merges its payload into the
+        // flow scope at correlation regardless of outputs, and the gated
+        // catch must end with the identical scope.
+        let triggered_payload = self
+            .triggered_catch_payload(instance_key, element_instance_key)
+            .filter(|p| !p.is_empty())
+            .cloned();
+        let propagate_boundary_payload = match &triggered_payload {
+            Some(payload) => Some(payload.clone()),
+            None => boundary_payload.clone().filter(|_| {
+                !self
+                    .process_of_instance(instance_key)
+                    .and_then(|p| p.element(&element_id))
+                    .is_some_and(|e| !e.io.outputs.is_empty())
+            }),
+        };
+        let boundary_payload = boundary_payload.or(triggered_payload);
         if let Some(payload) = boundary_payload
             .or_else(|| self.held_esp_start_payload(instance_key, &element_id, scope))
         {
@@ -10911,7 +11148,13 @@ impl Engine {
                 | ElementKind::MessageIntermediateCatchEvent { .. }
                 | ElementKind::SignalIntermediateCatchEvent { .. },
             ) => {
-                if let Some(element) = self
+                if self.is_triggered_catch(instance_key, element_instance_key) {
+                    followups.push(Step::Complete {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                    });
+                } else if let Some(element) = self
                     .process_of_instance(instance_key)
                     .and_then(|p| p.element(&element_id))
                     .cloned()
@@ -10935,7 +11178,9 @@ impl Engine {
             Some(ElementKind::ConditionalIntermediateCatchEvent { condition }) => {
                 // The enclosing-scope view (#1335): a sub-process-local variable
                 // the condition reads is visible here, as in Zeebe.
-                if matches!(crate::feel::eval_bool(&condition, &element_vars), Ok(true)) {
+                if self.is_triggered_catch(instance_key, element_instance_key)
+                    || matches!(crate::feel::eval_bool(&condition, &element_vars), Ok(true))
+                {
                     followups.push(Step::Complete {
                         instance_key,
                         element_instance_key,
@@ -10982,7 +11227,6 @@ impl Engine {
                     element_id: start_event,
                     scope: element_instance_key,
                     via: None,
-                    race: None,
                 });
             }
             // A triggered event sub-process opens its own token scope and
@@ -11001,7 +11245,6 @@ impl Engine {
                     element_id: start_event,
                     scope: element_instance_key,
                     via: None,
-                    race: None,
                 });
             }
             // A call activity spawns a distinct **child process instance** of its
@@ -11166,6 +11409,40 @@ impl Engine {
                     element_instance_key,
                     element_id,
                 });
+            }
+            // An event-based gateway is a wait state (#1963 / #2004, Zeebe
+            // `EventBasedGatewayProcessor.onActivate`): it opens one
+            // subscription per outgoing catch target, owned by ITS element
+            // instance and tagged with the target catch element id, and rests.
+            // No flow is taken and no catch is activated until one fires.
+            // Before the `event-gateway-runtime-v1` latch the gateway is the
+            // LEGACY #1676 pass-through: it completes at once and arms every
+            // target catch as a race (`take_completion_flows`).
+            Some(ElementKind::EventBasedGateway)
+                if !self.event_gateway_runtime_decision(element_instance_key).0 =>
+            {
+                followups.push(Step::Complete {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                });
+            }
+            Some(ElementKind::EventBasedGateway) => {
+                events.extend(self.event_gateway_runtime_decision(element_instance_key).1);
+                let (opened, already_true) = self.open_event_gateway_subscriptions(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    &element_vars,
+                )?;
+                events.extend(opened);
+                if let Some(catch_id) = already_true {
+                    followups.push(Step::Complete {
+                        instance_key,
+                        element_instance_key,
+                        element_id: catch_id,
+                    });
+                }
             }
             // Pass-through elements (events, parallel split) complete
             // immediately; routing happens at completion.
@@ -12177,7 +12454,6 @@ impl Engine {
                     element_id: start_event,
                     scope: child_key,
                     via: None,
-                    race: None,
                 });
             }
             // A multi-instance child that is a CALL ACTIVITY parks its token on a
@@ -14481,7 +14757,6 @@ impl Engine {
                     element_id: start_event,
                     scope: child_key,
                     via: None,
-                    race: None,
                 });
             }
             // A `callActivity` tool (issue #1159): spawn a distinct CHILD PROCESS
@@ -16174,17 +16449,21 @@ impl Engine {
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_conditional_subscriptions_on(element_instance_key));
-        // Event-based gateway deferred choice: when this completing element is
-        // the catch event that won the race downstream of an event-based
-        // gateway, withdraw the losing sibling catch events (cancel their armed
-        // timers/subscriptions and consume their tokens) so only the winning
-        // branch continues. A no-op for any element not fed by such a gateway.
-        events.extend(self.withdraw_event_gateway_siblings(
-            instance_key,
-            element_instance_key,
-            &element_id,
-            scope,
-        ));
+        // LEGACY event-based gateway deferred choice (#1676, pre-latch #2004):
+        // when this completing element is a catch that won a legacy race
+        // downstream of an event-based gateway, withdraw the losing sibling
+        // catches (cancel their armed timers/subscriptions and consume their
+        // tokens) so only the winning branch continues. A no-op for any
+        // element not fed by such a gateway, and for a catch the
+        // gateway-owned trigger path activated (its siblings never armed).
+        if !self.is_triggered_catch(instance_key, element_instance_key) {
+            events.extend(self.withdraw_event_gateway_siblings(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                scope,
+            ));
+        }
         // A script task's (or business rule task's) result is merged before output
         // mappings so a `zeebe:output` can reference/remap it (Zeebe merges
         // `resultVariable` first, then applies output mappings). Like a job
@@ -16706,7 +16985,6 @@ impl Engine {
                         element_id: catch_id,
                         scope,
                         via: None,
-                        race: None,
                     });
                 }
                 (events, followups)
@@ -16736,12 +17014,16 @@ impl Engine {
             (route, _, _) => {
                 // `TakeFlows` (the only route whose payload the collector does
                 // not need to re-read; the others always match above).
-                let race = matches!(route, CompletionRoute::TakeFlows { race: true })
-                    .then_some(element_instance_key);
-                for (taken, mut step) in self.take_all_flows(instance_key, &element_id, scope) {
-                    if let Step::Activate { race: slot, .. } = &mut step {
-                        *slot = race;
-                    }
+                // An event-based gateway (`TakeFlows { race: true }`) is routed
+                // by `take_completion_flows`: the triggered catch after the
+                // #2004 latch, the legacy #1676 race before it.
+                let _ = route;
+                for (taken, step) in self.take_completion_flows(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    scope,
+                ) {
                     events.extend(taken);
                     followups.push(step);
                 }
@@ -16829,7 +17111,6 @@ impl Engine {
                     element_id: esp_id,
                     scope: scope_eik,
                     via: None,
-                    race: None,
                 });
             }
             (
@@ -16859,7 +17140,6 @@ impl Engine {
                     element_id: boundary_id,
                     scope: boundary_scope,
                     via: None,
-                    race: None,
                 });
             }
             (
@@ -16943,7 +17223,6 @@ impl Engine {
                     element_id: boundary_id,
                     scope: boundary_scope,
                     via: None,
-                    race: None,
                 });
             }
             // Uncaught: escalation is non-critical — no incident, the throw
@@ -17114,7 +17393,6 @@ impl Engine {
                     element_id: boundary_id,
                     scope: boundary_scope,
                     via: None,
-                    race: None,
                 });
             }
             // Unhandled: raise an `UNHANDLED_ERROR` incident on the end event's
@@ -17247,7 +17525,8 @@ impl Engine {
         (events, followups)
     }
 
-    /// Withdraws the losing siblings of an event-based gateway's deferred choice.
+    /// LEGACY (#1676, the pre-`event-gateway-runtime-v1` path, #2004):
+    /// withdraws the losing siblings of an event-based gateway's deferred choice.
     ///
     /// An event-based gateway routes into several intermediate catch events and
     /// arms them all at once (its completion takes every outgoing flow). The
@@ -17311,6 +17590,10 @@ impl Engine {
                     && sibling_ids.contains(&eid.as_str())
                     && self.scope_of(instance_key, **eik) == scope
                     && race.is_none_or(|r| instance.races.get(eik) == Some(&r))
+                    // Never withdraw a catch the new runtime activated from a
+                    // recorded gateway trigger (#2047 review): it is no member
+                    // of any legacy race.
+                    && !self.is_triggered_catch(instance_key, **eik)
             })
             .map(|(eik, eid)| (*eik, eid.clone()))
             .collect();
@@ -17354,6 +17637,152 @@ impl Engine {
         });
         events
     }
+
+    /// Opens an event-based gateway's owned subscriptions (#1963 / #2004,
+    /// Zeebe `EventBasedGatewayProcessor.onActivate` →
+    /// `BpmnEventSubscriptionBehavior.subscribeToEvents`): one per outgoing
+    /// catch target, in outgoing-flow (document) order, each resting on the
+    /// GATEWAY's element instance and tagged with the target catch element id.
+    /// Returns the events plus the first conditional target whose condition
+    /// already holds — that one triggers at once, exactly as a conditional
+    /// catch reached with a true condition passes straight through.
+    fn open_event_gateway_subscriptions(
+        &mut self,
+        instance_key: Key,
+        gateway_eik: Key,
+        gateway_id: &str,
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<(Vec<Event>, Option<ElementId>), expression::Failure> {
+        let targets: Vec<crate::model::Element> = self
+            .process_of_instance(instance_key)
+            .map(|def| {
+                def.event_gateway_targets(gateway_id)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut events = vec![Event::EventGatewaySubscriptionsOpened {
+            instance_key,
+            gateway_element_instance_key: gateway_eik,
+            gateway_element_id: gateway_id.to_string(),
+            catch_element_ids: targets.iter().map(|t| t.id.clone()).collect(),
+        }];
+        let mut already_true = None;
+        for target in &targets {
+            if let ElementKind::ConditionalIntermediateCatchEvent { condition } = &target.kind {
+                if already_true.is_none()
+                    && matches!(crate::feel::eval_bool(condition, vars), Ok(true))
+                {
+                    already_true = Some(target.id.clone());
+                }
+            }
+            events.extend(self.arm_catch_event(instance_key, gateway_eik, vars, target)?);
+        }
+        Ok((events, already_true))
+    }
+
+    /// Whether `element_instance_key` is a catch activated by its event-based
+    /// gateway's recorded trigger (#2004): its event already occurred, so it
+    /// completes instead of subscribing.
+    fn is_triggered_catch(&self, instance_key: Key, element_instance_key: Key) -> bool {
+        self.triggered_catch_payload(instance_key, element_instance_key)
+            .is_some()
+    }
+
+    /// The recorded trigger payload of a catch the gateway-owned trigger path
+    /// activated (#2004, #2047 review), or `None` for any other element.
+    fn triggered_catch_payload(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> Option<&BTreeMap<String, Value>> {
+        self.state.instances.get(&instance_key).and_then(|i| {
+            i.gateway_triggers
+                .values()
+                .find(|t| t.catch_element_instance_key == element_instance_key)
+                .map(|t| &t.variables)
+        })
+    }
+
+    /// The element id of `element_instance_key` when it is an ACTIVE
+    /// event-based gateway and `catch_id` names another element — i.e. a
+    /// `Step::Complete` carrying a fired gateway-owned subscription (its
+    /// element instance is the gateway, its element id the target catch).
+    fn event_gateway_trigger_target(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        catch_id: &str,
+    ) -> Option<ElementId> {
+        let gateway_id = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .active
+            .get(&element_instance_key)?;
+        (gateway_id != catch_id
+            && matches!(
+                self.element_kind(instance_key, gateway_id),
+                Some(ElementKind::EventBasedGateway)
+            ))
+        .then(|| gateway_id.clone())
+    }
+
+    /// A gateway-owned subscription fired (#2004, Zeebe
+    /// `EventBasedGatewayProcessor.onComplete`): record the trigger on the
+    /// gateway (first trigger wins — the [`event_gateway_trigger`] kernel),
+    /// delete every other subscription it owns, and complete the gateway. Its
+    /// completion activates the triggered catch directly
+    /// ([`Engine::take_completion_flows`]); no flow is taken between them.
+    fn trigger_event_gateway(
+        &mut self,
+        instance_key: Key,
+        gateway_eik: Key,
+        gateway_id: ElementId,
+        catch_id: ElementId,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return (Vec::new(), Vec::new());
+        };
+        let targets = instance
+            .gateway_subscriptions
+            .get(&gateway_eik)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let catch = targets.iter().position(|t| *t == catch_id);
+        let already = instance.gateway_triggers.contains_key(&gateway_eik);
+        if event_gateway_trigger::decide(targets.len(), catch, already)
+            == event_gateway_trigger::GatewayTrigger::Reject
+        {
+            return (Vec::new(), Vec::new());
+        }
+        let catch_element_instance_key = self.mint_key();
+        let variables = self
+            .gateway_trigger_payloads
+            .remove(&(instance_key, gateway_eik))
+            .unwrap_or_default();
+        let mut events = vec![Event::EventGatewayTriggered {
+            instance_key,
+            gateway_element_instance_key: gateway_eik,
+            catch_element_id: catch_id,
+            catch_element_instance_key,
+            variables,
+        }];
+        events.extend(self.cancel_all_timers_on(gateway_eik));
+        events.extend(self.cancel_all_subscriptions_on(gateway_eik));
+        events.extend(self.cancel_all_signal_subscriptions_on(gateway_eik));
+        events.extend(self.cancel_all_conditional_subscriptions_on(gateway_eik));
+        (
+            events,
+            vec![Step::Complete {
+                instance_key,
+                element_instance_key: gateway_eik,
+                element_id: gateway_id,
+            }],
+        )
+    }
+
     /// whose `end` execution-listener chain has drained (ADR 0037). Its boundary
     /// events disarmed and its output mappings projected when it parked (in the
     /// drained-sub-process sweep); this emits the parked `ElementCompleted` and
@@ -18791,9 +19220,77 @@ impl Engine {
                 element_id: to,
                 scope,
                 via: Some(flow),
-                race: None,
             },
         )
+    }
+
+    /// The outgoing flows a completing flow-node element instance takes
+    /// ([`Engine::take_all_flows`]) — the one implementation shared by
+    /// `complete` and `finalize_completion`. An event-based gateway takes NO
+    /// flow (#2004, Zeebe `BpmnEventSubscriptionBehavior.activateTriggeredEvent`):
+    /// its completion activates the catch whose event triggered it directly,
+    /// in the gateway's scope.
+    fn take_completion_flows(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        scope: Key,
+    ) -> Vec<(Vec<Event>, Step)> {
+        if matches!(
+            self.element_kind(instance_key, element_id),
+            Some(ElementKind::EventBasedGateway)
+        ) {
+            return self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.gateway_triggers.get(&element_instance_key))
+                .map(|trigger| {
+                    vec![(
+                        Vec::new(),
+                        Step::ActivateTriggeredCatch {
+                            instance_key,
+                            element_id: trigger.catch_element_id.clone(),
+                            scope,
+                            element_instance_key: trigger.catch_element_instance_key,
+                        },
+                    )]
+                })
+                .unwrap_or_else(|| {
+                    // LEGACY (#1676, before the `event-gateway-runtime-v1`
+                    // latch): a pass-through gateway arms every target catch
+                    // as ONE deferred-choice race identified by its element
+                    // instance, so a second activation of the same gateway in
+                    // the same scope races independently.
+                    self.take_all_flows(instance_key, element_id, scope)
+                        .into_iter()
+                        .map(|(events, step)| {
+                            (events, Self::legacy_race_member(step, element_instance_key))
+                        })
+                        .collect()
+                });
+        }
+        self.take_all_flows(instance_key, element_id, scope)
+    }
+
+    /// Re-tags a gateway flow activation as a LEGACY race member (#1676).
+    fn legacy_race_member(step: Step, race: Key) -> Step {
+        match step {
+            Step::Activate {
+                instance_key,
+                element_id,
+                scope,
+                via,
+            } => Step::ActivateLegacyRaceMember {
+                instance_key,
+                element_id,
+                scope,
+                via,
+                race,
+            },
+            other => other,
+        }
     }
 
     /// [`Engine::take_flow`] for every outgoing flow of `from`, in execution
@@ -19000,6 +19497,16 @@ impl Engine {
                 element_id,
                 scope: step_scope,
                 via: Some(_),
+                ..
+            } if *key == instance_key && *step_scope == scope && element_id != join => {
+                Some(element_id.as_str())
+            }
+            // A gateway-triggered catch (#2004) is in transit too: its gateway
+            // has already completed, so it is the only live path source.
+            Step::ActivateTriggeredCatch {
+                instance_key: key,
+                element_id,
+                scope: step_scope,
                 ..
             } if *key == instance_key && *step_scope == scope && element_id != join => {
                 Some(element_id.as_str())
@@ -20452,6 +20959,8 @@ mod decompose_scaling {
                 gateway_routes: BTreeMap::new(),
                 races: BTreeMap::new(),
                 gateway_subscriptions: BTreeMap::new(),
+                gateway_triggers: BTreeMap::new(),
+                latched_activations: Default::default(),
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),
@@ -21003,7 +21512,10 @@ fn has_conditional_start(definition: &ProcessDefinition) -> bool {
 
 /// Whether `element_id` is an intermediate catch event — the only element
 /// class that takes part in an event-based gateway's deferred choice.
-fn is_intermediate_catch(def: &crate::model::ProcessDefinition, element_id: &str) -> bool {
+pub(crate) fn is_intermediate_catch(
+    def: &crate::model::ProcessDefinition,
+    element_id: &str,
+) -> bool {
     matches!(
         def.elements.get(element_id).map(|e| &e.kind),
         Some(

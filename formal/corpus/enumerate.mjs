@@ -747,15 +747,18 @@ export class Reference {
    * (in document order it would be guarded BEFORE, and park forever).
    * engine-core's single source of the same order is
    * `Element::outgoing_in_execution_order`.
+   *
+   * `record: false` activates the targets WITHOUT taking the flows: an
+   * event-based gateway's trigger activates the winning catch directly
+   * (#2004, Zeebe `activateTriggeredEvent`), writing no SEQUENCE_FLOW_TAKEN.
    */
-  take (flows) {
+  take (flows, { record = true } = {}) {
     for (const e of executionOrder(this.graph, flows)) {
       this.queue.push(e.id)
       // The branch-sensitive milestone: which FLOWS were taken. An event-based
-      // gateway arms every catch (each completes, the losers withdrawn), so the
-      // catch's COMPLETION does not distinguish the selected branch — its taken
-      // outgoing flow does (only the winner's continuation is taken).
-      this.takenFlows[e.id] = (this.takenFlows[e.id] ?? 0) + 1
+      // gateway takes no flow (it activates only the winning catch directly,
+      // #2004); the winner's completion and continuation show the selection.
+      if (record) this.takenFlows[e.id] = (this.takenFlows[e.id] ?? 0) + 1
       if (this.isJoin(e.to)) this.joinTokens[e.to][e.id] += 1
     }
   }
@@ -783,19 +786,9 @@ export class Reference {
     if (cmd.op === 'cancel') {
       next.cancelled = true
       next.queue = []
-      // An event-based gateway the engine already passed (#1673): the engine
-      // completes the gateway and takes every outgoing flow the moment it arms
-      // its catches (the catches then rest), which a completing run only
-      // reveals at correlation (see `correlate` below). A cancellation exposes
-      // it: each armed gateway counts as completed with every flow taken,
-      // while its catches never complete.
-      for (const n of Object.keys(next.graph.nodes)) {
-        if (next.kind(n) !== 'evt') continue
-        for (let i = 0; i < next.waiting[n]; i++) {
-          next.complete(n)
-          for (const e of next.out[n]) next.takenFlows[e.id] = (next.takenFlows[e.id] ?? 0) + 1
-        }
-      }
+      // A waiting event-based gateway (#2004, Zeebe): the gateway itself
+      // holds the token on its own subscriptions, so a cancellation TERMINATES
+      // it — it never completes, takes no flow, and no catch was activated.
       for (const n of Object.keys(next.graph.nodes)) { next.waiting[n] = 0; next.joinOpen[n] = false }
       next.timers = Object.create(null)
       return next
@@ -837,12 +830,11 @@ export class Reference {
     }
     next.waiting[cmd.node] -= 1
     // Completing a task completes the task; correlating completes the gateway.
-    // The selected CATCH completes as a pass-through when its flow drains
-    // (settle records it). The engine arms EVERY catch of an event-based
-    // gateway at once and withdraws the losers when the winner fires
-    // (withdraw_event_gateway_siblings), recording each loser's completion too
-    // — so the branch-sensitive milestone is the catch's own OUTGOING
-    // continuation (only the winner's is taken), not the catch's completion.
+    // The event-based gateway waits on its own subscriptions (#2004, Zeebe
+    // `EventBasedGatewayProcessor`): the first trigger completes the gateway
+    // and activates only the winning catch directly — no gateway->catch flow
+    // is taken — which completes as a pass-through when its flow drains (settle
+    // records it). The losing catches are never activated nor completed.
     next.complete(cmd.node)
     if (cmd.op === 'complete') {
       // Completing a task withdraws its still-armed interrupting boundary timer
@@ -854,20 +846,8 @@ export class Reference {
         }
       }
     }
-    if (cmd.op === 'correlate') {
-      // The engine arms EVERY catch of an event-based gateway at once: the
-      // gateway's completion takes every outgoing flow (each catch completes,
-      // the losers then withdrawn). So every outgoing flow is taken, and each
-      // losing catch completes — but only the WINNER's own outgoing
-      // continuation is taken below.
-      for (const e of next.out[cmd.node]) {
-        if (e.id !== cmd.flow) {
-          next.takenFlows[e.id] = (next.takenFlows[e.id] ?? 0) + 1
-          next.complete(e.to)
-        }
-      }
-    }
-    next.take(cmd.op === 'complete' ? next.out[cmd.node] : next.out[cmd.node].filter((e) => e.id === cmd.flow))
+    if (cmd.op === 'complete') next.take(next.out[cmd.node])
+    else next.take(next.out[cmd.node].filter((e) => e.id === cmd.flow), { record: false })
     next.settle()
     return next
   }

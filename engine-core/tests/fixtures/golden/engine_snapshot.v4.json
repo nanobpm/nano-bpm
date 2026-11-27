@@ -1,6 +1,6 @@
 {
-  "next_local": 144,
-  "now": 1700000000029,
+  "next_local": 150,
+  "now": 1700000000032,
   "num_partitions": 1,
   "partition_id": 0,
   "raft_applied": null,
@@ -17,6 +17,12 @@
         [
           -50,
           127
+        ]
+      ],
+      "gw-end-audit": [
+        [
+          -50,
+          150
         ]
       ],
       "payment": [
@@ -84,6 +90,7 @@
       "dup": 1,
       "esp-held": 1,
       "order": 9,
+      "paused_gw": 1,
       "sync": 1,
       "trip": 1,
       "twins": 1,
@@ -596,6 +603,7 @@
         "version": 1
       }
     },
+    "event_gateway_runtime_latched": true,
     "form_versions": {},
     "forms": {},
     "incidents": {
@@ -675,6 +683,7 @@
       "esp-held": 1,
       "order": 6,
       "order-v2": 1,
+      "paused_gw": 1,
       "sync": 1,
       "trip": 1,
       "twins": 1,
@@ -841,10 +850,8 @@
       "130": {
         "activating": [],
         "active": {
-          "137": "onM2",
-          "139": "onM1",
-          "141": "onM2",
-          "143": "onM1"
+          "135": "gw",
+          "138": "gw"
         },
         "adhoc_instances": {},
         "agent_history": {},
@@ -855,23 +862,30 @@
         "created_at": 1700000000029,
         "esp_held_payloads": {},
         "gateway_routes": {},
+        "gateway_subscriptions": {
+          "135": [
+            "onM1",
+            "onM2"
+          ],
+          "138": [
+            "onM1",
+            "onM2"
+          ]
+        },
         "incidents": [],
         "join_counts": [],
         "join_flow_arrivals": [],
         "join_instances": [],
         "key": 130,
+        "latched_activations": [
+          138
+        ],
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
         "parked_joins": [],
         "process_definition_key": 129,
         "process_id": "twins",
-        "races": {
-          "137": 135,
-          "139": 135,
-          "141": 136,
-          "143": 136
-        },
         "scope_parents": {},
         "scope_variables": {},
         "scopes": {},
@@ -921,6 +935,58 @@
         "variables": {
           "amount": {
             "Int": 999
+          }
+        },
+        "variables_spilled": false
+      },
+      "143": {
+        "activating": [],
+        "active": {
+          "145": "gw"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000031,
+        "esp_held_payloads": {},
+        "gateway_routes": {},
+        "gateway_triggers": {
+          "145": {
+            "catch_element_id": "onM1",
+            "catch_element_instance_key": 149
+          }
+        },
+        "incidents": [],
+        "join_counts": [],
+        "join_flow_arrivals": [],
+        "join_instances": [],
+        "key": 143,
+        "latched_activations": [
+          145
+        ],
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 142,
+        "process_id": "paused_gw",
+        "scope_parents": {
+          "145": 0
+        },
+        "scope_variables": {
+          "145": {}
+        },
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "terminated_epoch": 0,
+        "variables": {
+          "key": {
+            "Str": "p"
           }
         },
         "variables_spilled": false
@@ -1560,6 +1626,32 @@
         "state": "Created",
         "worker": null
       },
+      "150": {
+        "activated": false,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000032,
+        "deadline": null,
+        "element_id": "gw",
+        "element_instance_key": 145,
+        "error_code": null,
+        "error_message": null,
+        "instance_key": 143,
+        "job_type": "gw-end-audit",
+        "key": 150,
+        "kind": {
+          "ExecutionListener": {
+            "event_type": "End",
+            "index": 0,
+            "scope": 0
+          }
+        },
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Created",
+        "worker": null
+      },
       "17": {
         "activated": false,
         "activated_at": null,
@@ -1719,6 +1811,9 @@
       "14": [
         17
       ],
+      "143": [
+        150
+      ],
       "27": [
         32
       ],
@@ -1766,49 +1861,71 @@
         "resume_generation": 0,
         "state": "Open"
       },
-      "138": {
+      "136": {
+        "correlation_key": "k",
+        "element_id": "onM1",
+        "element_instance_key": 135,
+        "instance_key": 130,
+        "key": 136,
+        "kind": "IntermediateCatch",
+        "message_name": "M1",
+        "resume_generation": 0,
+        "state": "Open"
+      },
+      "137": {
         "correlation_key": "k",
         "element_id": "onM2",
-        "element_instance_key": 137,
+        "element_instance_key": 135,
         "instance_key": 130,
-        "key": 138,
+        "key": 137,
         "kind": "IntermediateCatch",
         "message_name": "M2",
+        "resume_generation": 0,
+        "state": "Open"
+      },
+      "139": {
+        "correlation_key": "k",
+        "element_id": "onM1",
+        "element_instance_key": 138,
+        "instance_key": 130,
+        "key": 139,
+        "kind": "IntermediateCatch",
+        "message_name": "M1",
         "resume_generation": 0,
         "state": "Open"
       },
       "140": {
         "correlation_key": "k",
-        "element_id": "onM1",
-        "element_instance_key": 139,
+        "element_id": "onM2",
+        "element_instance_key": 138,
         "instance_key": 130,
         "key": 140,
-        "kind": "IntermediateCatch",
-        "message_name": "M1",
-        "resume_generation": 0,
-        "state": "Open"
-      },
-      "142": {
-        "correlation_key": "k",
-        "element_id": "onM2",
-        "element_instance_key": 141,
-        "instance_key": 130,
-        "key": 142,
         "kind": "IntermediateCatch",
         "message_name": "M2",
         "resume_generation": 0,
         "state": "Open"
       },
-      "144": {
-        "correlation_key": "k",
+      "146": {
+        "correlation_key": "p",
         "element_id": "onM1",
-        "element_instance_key": 143,
-        "instance_key": 130,
-        "key": 144,
+        "element_instance_key": 145,
+        "instance_key": 143,
+        "key": 146,
         "kind": "IntermediateCatch",
-        "message_name": "M1",
+        "message_name": "P1",
         "resume_generation": 0,
-        "state": "Open"
+        "state": "Correlated"
+      },
+      "147": {
+        "correlation_key": "p",
+        "element_id": "onM2",
+        "element_instance_key": 145,
+        "instance_key": 143,
+        "key": 147,
+        "kind": "IntermediateCatch",
+        "message_name": "P2",
+        "resume_generation": 0,
+        "state": "Canceled"
       }
     },
     "next_buffered_seq": 0,
@@ -2178,6 +2295,156 @@
         },
         "deployment_key": 128,
         "key": 129,
+        "version": 1
+      },
+      "142": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "end": {
+              "end_listeners": [],
+              "id": "end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "gw": {
+              "end_listeners": [
+                {
+                  "event_type": "End",
+                  "job_type": "gw-end-audit",
+                  "retries": null
+                }
+              ],
+              "id": "gw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EventBasedGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "onM1"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "onM2"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "onM1": {
+              "end_listeners": [],
+              "id": "onM1",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "MessageIntermediateCatchEvent": {
+                  "correlation_key": "=key",
+                  "message_name": "P1"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "onM2": {
+              "end_listeners": [],
+              "id": "onM2",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "MessageIntermediateCatchEvent": {
+                  "correlation_key": "=key",
+                  "message_name": "P2"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "start": {
+              "end_listeners": [],
+              "id": "start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "gw"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "paused_gw",
+          "name": null,
+          "start_event": "start",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "deployment_key": 141,
+        "key": 142,
         "version": 1
       },
       "19": {
@@ -4632,6 +4899,156 @@
         },
         "deployment_key": 92,
         "key": 93,
+        "version": 1
+      },
+      "paused_gw": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "end": {
+              "end_listeners": [],
+              "id": "end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "gw": {
+              "end_listeners": [
+                {
+                  "event_type": "End",
+                  "job_type": "gw-end-audit",
+                  "retries": null
+                }
+              ],
+              "id": "gw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EventBasedGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "onM1"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "onM2"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "onM1": {
+              "end_listeners": [],
+              "id": "onM1",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "MessageIntermediateCatchEvent": {
+                  "correlation_key": "=key",
+                  "message_name": "P1"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "onM2": {
+              "end_listeners": [],
+              "id": "onM2",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "MessageIntermediateCatchEvent": {
+                  "correlation_key": "=key",
+                  "message_name": "P2"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "start": {
+              "end_listeners": [],
+              "id": "start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "gw"
+                }
+              ],
+              "parent": null,
+              "properties": {},
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "paused_gw",
+          "name": null,
+          "start_event": "start",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "deployment_key": 141,
+        "key": 142,
         "version": 1
       },
       "review": {

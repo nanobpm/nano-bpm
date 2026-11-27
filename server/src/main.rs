@@ -4109,6 +4109,10 @@ impl ServerImpl {
             // entry, the non-Raft tick via `remote_buffered_delivery_gate`. A
             // single node has no other binary to disagree with.
             journal.set_remote_buffered_delivery(topology.is_single_node());
+            // Same gate shape for the event-gateway runtime latch (#2004): a
+            // multi-node node keeps the legacy #1676 race until every member
+            // is known to advertise `event-gateway-runtime-v1`.
+            journal.set_event_gateway_runtime(topology.is_single_node());
             // The same gate for the v2 ack output (#2037).
             journal.set_message_correlation_ack_v2(topology.is_single_node());
         }
@@ -22086,8 +22090,9 @@ impl ServerImpl {
     /// on `None`; best-effort syncs simply retry on the next tick.
     async fn required_cluster_features(&self) -> Option<Vec<&'static str>> {
         use nano_falcon_protocol::cluster_join::{
-            FEATURE_CLUSTER_VARIABLES as CV, FEATURE_MESSAGE_BUFFERING as MB,
-            FEATURE_MESSAGE_CORRELATION_ACK as MCA, FEATURE_MESSAGE_CORRELATION_ACK_V2 as MCA2,
+            FEATURE_CLUSTER_VARIABLES as CV, FEATURE_EVENT_GATEWAY_RUNTIME as EGR,
+            FEATURE_MESSAGE_BUFFERING as MB, FEATURE_MESSAGE_CORRELATION_ACK as MCA,
+            FEATURE_MESSAGE_CORRELATION_ACK_V2 as MCA2,
             FEATURE_REPLICATED_LENIENT_COMPLETION as LC,
         };
         // A single node never replicates its log to anyone, so its local state
@@ -22097,7 +22102,7 @@ impl ServerImpl {
         }
         // Every feature the recovered/replicated state can depend on, each
         // with its one-way state predicate (sticky once observed).
-        const FEATURES: [&str; 5] = [LC, CV, MB, MCA, MCA2];
+        const FEATURES: [&str; 6] = [LC, CV, MB, MCA, EGR, MCA2];
         let mut required: Vec<&'static str> = FEATURES
             .into_iter()
             .filter(|f| self.peers.requires_feature(f))
@@ -22123,6 +22128,7 @@ impl ServerImpl {
                         engine.cluster_variables_ever_used(),
                         engine.message_buffering_ever_used(),
                         engine.message_correlation_ack_required(),
+                        engine.event_gateway_runtime_latched(),
                         engine.message_correlation_ack_v2_required(),
                     ]
                 }),
@@ -23285,6 +23291,8 @@ impl ServerImpl {
                 nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
             )
             .await;
+            let gateway_runtime =
+                event_gateway_runtime_gate(self.engine.topology(), &self.peers).await;
             futures_util::future::join_all(self.engine.all().iter().map(|handle| {
                 handle.with(move |journal| {
                     // Without Raft this journal is the partition's only
@@ -23293,6 +23301,8 @@ impl ServerImpl {
                     // The cluster-wide #1949 / #2037 capability gates
                     // (ADR 0066).
                     journal.set_remote_buffered_delivery(remote_delivery);
+                    // The cluster-wide #2004 capability gate.
+                    journal.set_event_gateway_runtime(gateway_runtime);
                     journal.set_message_correlation_ack_v2(ack_v2);
                     let (fired, commit) = journal.trigger_timers(now);
                     // Fire-and-forget tick: nothing reads disk after it and
@@ -27771,10 +27781,23 @@ async fn remote_buffered_delivery_gate(
     .await
 }
 
+/// The non-Raft cluster-wide rolling-upgrade gate for the event-gateway
+/// runtime latch (#2004, ADR 0066, ADR 0067): on only when EVERY other cluster member is
+/// known to advertise `event-gateway-runtime-v1`. A single node is trivially
+/// on.
+async fn event_gateway_runtime_gate(topology: &cluster::Topology, peers: &peer::PeerSet) -> bool {
+    cluster_feature_gate(
+        topology,
+        peers,
+        nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME,
+    )
+    .await
+}
+
 /// The non-Raft cluster-wide rolling-upgrade gate for `feature` (ADR 0066):
 /// on only when EVERY other cluster member is known to advertise it (an
 /// unreachable or unknown member fails closed). A single node is trivially
-/// on. Shared by the #1949 and #2037 (`message-correlation-ack-v2`) gates.
+/// on. Shared by the #1949, #2004 and #2037 (`message-correlation-ack-v2`) gates.
 async fn cluster_feature_gate(
     topology: &cluster::Topology,
     peers: &peer::PeerSet,
@@ -34391,6 +34414,60 @@ mod clustered_startup_tests {
         assert_eq!(server.required_cluster_features().await, Some(vec![F]));
     }
 
+    /// #2047 review: a partition whose recovered (e.g. snapshot-only) state
+    /// carries the `event-gateway-runtime-v1` latch holds gateway-owned state
+    /// a legacy peer cannot run, so the shared scan must require the feature
+    /// before transport start — not only the AppendEntries capability check.
+    #[tokio::test]
+    async fn raft_start_requires_event_gateway_runtime_from_recovered_state() {
+        use nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME as F;
+        let mut journal = Journal::in_memory();
+        journal.set_event_gateway_runtime(true);
+        let def = ProcessBuilder::new("evt")
+            .start_event("start")
+            .event_based_gateway("gw")
+            .message_intermediate_catch_event("onM1", "M1", "=key")
+            .message_intermediate_catch_event("onM2", "M2", "=key")
+            .end_event("end")
+            .connect("start", "gw")
+            .connect("gw", "onM1")
+            .connect("gw", "onM2")
+            .connect("onM1", "end")
+            .connect("onM2", "end")
+            .build()
+            .expect("def");
+        journal
+            .apply_command_at(Command::DeployProcess(def), 1)
+            .expect("deploy")
+            .1
+            .blocking_wait();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("key".to_string(), Value::Str("k".into()));
+        journal
+            .apply_command_at(Command::create_instance_with("evt", vars), 2)
+            .expect("create")
+            .1
+            .blocking_wait();
+        assert!(
+            journal.engine().event_gateway_runtime_latched(),
+            "precondition"
+        );
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 1,
+            replication_factor: 2,
+        };
+        let server = build_server_in_memory(vec![journal], topology);
+        assert!(!server.peers.requires_feature(F), "precondition");
+        let _transport = server.raft_transport_for_start().await;
+        assert!(server.peers.requires_feature(F));
+        assert_eq!(server.required_cluster_features().await, Some(vec![F]));
+    }
+
     /// #1949 cluster-wide capability gate (ADR 0066), non-Raft path: a
     /// multi-node cluster keeps remote ack-paced delivery OFF while any member
     /// is not known to advertise `message-correlation-ack-v1` (here: both
@@ -34408,6 +34485,7 @@ mod clustered_startup_tests {
         };
         let peers = peer::PeerSet::new(multi.clone());
         assert!(!remote_buffered_delivery_gate(&multi, &peers).await);
+        assert!(!event_gateway_runtime_gate(&multi, &peers).await);
         let single = cluster::Topology {
             node_id: 0,
             peers: vec!["http://127.0.0.1:1".to_string()],
@@ -34416,6 +34494,7 @@ mod clustered_startup_tests {
         };
         let peers = peer::PeerSet::new(single.clone());
         assert!(remote_buffered_delivery_gate(&single, &peers).await);
+        assert!(event_gateway_runtime_gate(&single, &peers).await);
     }
 
     /// #1949: a node whose recovered state has EVER sent an ack-paced remote
@@ -46801,12 +46880,14 @@ mod clustered_startup_tests {
         // upgrade also opened the cluster-wide #1949 gate, so the entries
         // committed since carry ack-paced remote delivery and require that
         // capability too (one-way, like lenience) — and likewise latched the
-        // #2037 v2 ack output, so v2 is required as well.
+        // #2037 v2 ack output and the #2004 event-gateway runtime, so both
+        // are required as well.
         assert_eq!(
             n0.required_cluster_features().await,
             Some(vec![
                 F,
                 nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK,
+                nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME,
                 nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
             ])
         );

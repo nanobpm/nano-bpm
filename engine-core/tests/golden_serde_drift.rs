@@ -75,10 +75,11 @@ mod determinism_corpus;
 
 use nanobpmn_engine_core::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, Engine, EngineSnapshot, Event,
-    IoMapping, Mapping, MessageStartCorrelation, MigratedChildInstance,
-    MigratedCompensationSubscription, MigratedElementInstance, MigratedSubscription,
-    MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder, ProcessDefinition,
-    SubscriptionMigrationAction, Value, VariableInstruction, SNAPSHOT_FORMAT_VERSION,
+    ExecutionListener, IoMapping, ListenerEventType, Mapping, MessageStartCorrelation,
+    MigratedChildInstance, MigratedCompensationSubscription, MigratedElementInstance,
+    MigratedSubscription, MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder,
+    ProcessDefinition, SubscriptionMigrationAction, Value, VariableInstruction,
+    SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Directory holding the checked-in golden corpus, relative to the crate root.
@@ -1000,13 +1001,13 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("create cluster variable"),
     );
 
-    // Event-based-gateway race witness (#1676): two activations of ONE gateway
-    // (a fork both of whose branches pass the merge) arm two independent
-    // races, so the journal pins the additive `ElementActivating.race` field
-    // non-default and the snapshot pins the persisted `races` membership
-    // (catch element instance -> arming gateway activation) non-empty. Left
-    // waiting on its messages: no job, so the one-job-per-instance
-    // determinism contract holds.
+    // Event-based gateway witness (#1676, #2004): two activations of ONE
+    // gateway (a fork both of whose branches pass the merge) wait
+    // independently, so the snapshot pins the gateway-owned
+    // `gateway_subscriptions` (gateway element instance -> catch ids)
+    // non-empty. Left waiting on its messages: no job, so the
+    // one-job-per-instance determinism contract holds. The legacy
+    // `ElementActivating.race` shape is pinned by the event witnesses.
     let twins: ProcessDefinition = ProcessBuilder::new("twins")
         .start_event("start")
         .parallel_gateway("fork")
@@ -1035,20 +1036,13 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     let twin_created = engine
         .apply_command_at(Command::create_instance_with("twins", twin_vars), T0 + 29)
         .expect("create twins instance");
-    // The witness must actually arm two races (four catches, two per gateway
-    // activation) carrying a non-default `race` — otherwise the golden would
-    // pin an empty/default shape and the drift guard would stay green if the
-    // field were dropped or renamed.
+    // The witness must actually leave two gateways waiting — otherwise the
+    // golden would pin an empty/default shape and the drift guard would stay
+    // green if the field were dropped or renamed.
     let twin_inst = twin_created
         .iter()
         .find_map(|e| e.instance_key())
         .expect("twins instance key");
-    assert!(
-        twin_created
-            .iter()
-            .any(|e| matches!(e, Event::ElementActivating { race: Some(_), .. })),
-        "the twins scenario must journal a non-default ElementActivating.race"
-    );
     journal.extend(twin_created);
     assert_eq!(
         engine
@@ -1056,9 +1050,70 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .state
             .instances
             .get(&twin_inst)
-            .map(|i| i.races.len()),
-        Some(4),
-        "the twins snapshot must persist four armed race memberships"
+            .map(|i| i.gateway_subscriptions.len()),
+        Some(2),
+        "the twins snapshot must persist two gateways' subscriptions"
+    );
+
+    // Pending gateway trigger witness (#2004): the gateway's message fired, so
+    // `EventGatewayTriggered` recorded the winning catch on the gateway, but
+    // the gateway is parked on its `end` execution listener (one created,
+    // un-activated job), so the snapshot pins a non-empty `gateway_triggers`
+    // (gateway element instance -> catch id + journaled catch key).
+    let paused: ProcessDefinition = ProcessBuilder::new("paused_gw")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "P1", "=key")
+        .message_intermediate_catch_event("onM2", "P2", "=key")
+        .end_event("end")
+        .connect("start", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "end")
+        .connect("onM2", "end")
+        .with_listeners(
+            "gw",
+            Vec::new(),
+            vec![ExecutionListener {
+                event_type: ListenerEventType::End,
+                job_type: "gw-end-audit".to_string(),
+                retries: None,
+            }],
+        )
+        .build()
+        .expect("build paused gateway process");
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(paused), T0 + 30)
+            .expect("deploy paused gateway"),
+    );
+    let mut paused_vars = BTreeMap::new();
+    paused_vars.insert("key".to_string(), Value::Str("p".to_string()));
+    let paused_created = engine
+        .apply_command_at(
+            Command::create_instance_with("paused_gw", paused_vars),
+            T0 + 31,
+        )
+        .expect("create paused gateway instance");
+    let paused_inst = paused_created
+        .iter()
+        .find_map(|e| e.instance_key())
+        .expect("paused gateway instance key");
+    journal.extend(paused_created);
+    journal.extend(
+        engine
+            .apply_command_at(Command::correlate_message("P1", "p"), T0 + 32)
+            .expect("trigger the paused gateway"),
+    );
+    assert_eq!(
+        engine
+            .snapshot()
+            .state
+            .instances
+            .get(&paused_inst)
+            .map(|i| i.gateway_triggers.len()),
+        Some(1),
+        "the paused gateway snapshot must persist its pending trigger"
     );
 
     let snapshot = engine.snapshot();
@@ -1199,6 +1254,8 @@ fn build_event_witnesses() -> Vec<Event> {
         },
         // #1949 activation latch record (additive variant).
         Event::RemoteBufferedDeliveryActivated { partition: 1 },
+        // #2004 event-gateway-runtime-v1 latch record (additive variant).
+        Event::EventGatewayRuntimeActivated { partition: 1 },
         Event::MessageCorrelationAckV2Activated { partition: 1 },
         // #1949 receipt settlement (additive variants).
         Event::MessageCorrelationSettled {
@@ -1239,6 +1296,16 @@ fn build_event_witnesses() -> Vec<Event> {
         },
         // #2003 gateway-owned subscription frames (not yet emitted by execution,
         // so pinned here).
+        // A legacy (#1676) journal record: a catch armed by a completed
+        // gateway. Never emitted since #2004, but old journals carry it and
+        // must still decode (and are then refused as a legacy race).
+        Event::ElementActivating {
+            instance_key: 1,
+            element_instance_key: 3,
+            element_id: "m1".to_string(),
+            scope: 0,
+            race: Some(2),
+        },
         Event::EventGatewaySubscriptionsOpened {
             instance_key: 1,
             gateway_element_instance_key: 2,
@@ -1249,6 +1316,12 @@ fn build_event_witnesses() -> Vec<Event> {
             instance_key: 1,
             gateway_element_instance_key: 2,
             catch_element_id: "m1".to_string(),
+            catch_element_instance_key: 3,
+            variables: BTreeMap::from([("payload".to_string(), Value::Int(21))]),
+        },
+        Event::EventGatewayTriggerDiscarded {
+            instance_key: 1,
+            catch_element_instance_key: 3,
         },
         Event::ProcessInstanceModified {
             instance_key: 1,
@@ -1429,7 +1502,12 @@ fn determinism_corpus_shapes_are_pinned_to_version() {
         .iter()
         .map(|(_, c)| serde_json::to_value(c).expect("serialize command"))
         .collect();
+    // Replay pre-latch (#2004), exactly as the corpus is generated and as the
+    // determinism runner replays it: a latched engine takes the gateway-owned
+    // trigger path, mints different keys, and every later corpus command
+    // then addresses the wrong entity.
     let mut engine = Engine::new();
+    engine.set_event_gateway_runtime(false);
     let mut events = Vec::new();
     for (now, command) in corpus {
         if let Ok(emitted) = engine.apply_command_at(command, now) {
