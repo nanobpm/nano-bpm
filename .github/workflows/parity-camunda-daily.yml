@@ -100,9 +100,23 @@ jobs:
       - name: Resolve pinned JaCoCo version
         id: jacoco
         run: echo "version=$(sed -n 's/^JACOCO_VERSION="\(.*\)"$/\1/p' formal/parity/coverage/zeebe-coverage.sh)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      # Restore / fetch / save as separate steps (#2079): the combined
+      # actions/cache only saves when the whole job succeeds, so one red
+      # measurement left no cache and every later run hit Maven Central (429).
+      # Saving right after the fetch means the scheduled run on main seeds a
+      # cache every PR run can restore. SHA-256-verified on every use (#1770).
+      - name: Restore JaCoCo jars
+        id: jacoco-cache
+        uses: actions/cache/restore@v4
         with:
-          # SHA-256-verified by zeebe-coverage.sh on every use (#1770).
+          path: ~/.cache/nanobpm-jacoco
+          key: jacoco-${{ steps.jacoco.outputs.version }}
+      - name: Fetch JaCoCo jars (no-op on a verified cache hit)
+        run: JACOCO_FETCH_ONLY=1 formal/parity/coverage/zeebe-coverage.sh
+      - name: Save JaCoCo jars
+        if: steps.jacoco-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
           path: ~/.cache/nanobpm-jacoco
           key: jacoco-${{ steps.jacoco.outputs.version }}
       - name: Measure zeebe/engine coverage while the corpus runs

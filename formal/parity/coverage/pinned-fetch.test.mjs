@@ -3,10 +3,12 @@
 // minute and failed the zeebe-coverage job). Every `curl … -o <file>` download
 // in the workflows and CI scripts must retry on ALL errors (plain `--retry`
 // does not retry an HTTP 404), and the JaCoCo jars must be SHA-256 pinned.
+// fetch-pinned.sh is the one exception: it runs its own status-aware backoff
+// loop (Retry-After, 429/5xx, mirrors — #2079), pinned by fetch-pinned.test.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { basename, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repo = fileURLToPath(new URL('../../../', import.meta.url));
@@ -26,6 +28,7 @@ test('every curl file download retries on all errors', () => {
   const offenders = [];
   for (const root of roots) {
     for (const file of walk(join(repo, root))) {
+      if (basename(file) === 'fetch-pinned.sh') continue;
       // Join backslash continuations so a multi-line curl is one command.
       const text = readFileSync(file, 'utf8').replace(/\\\n/g, ' ');
       text.split('\n').forEach((line, i) => {
@@ -44,5 +47,6 @@ test('JaCoCo jars are SHA-256 pinned and verified', () => {
   assert.match(s, /^JACOCO_VERSION="[0-9.]+"$/m);
   assert.match(s, /^JACOCO_AGENT_SHA256="[0-9a-f]{64}"$/m);
   assert.match(s, /^JACOCO_CLI_SHA256="[0-9a-f]{64}"$/m);
-  assert.doesNotMatch(s, /curl[^\n]*-o "\$work/, 'jars must go through fetch_pinned, not straight into $work');
+  assert.doesNotMatch(s, /\bcurl\b/, 'jars must go through fetch_pinned (fetch-pinned.sh), never a bare curl');
+  assert.match(s, /source "\$here\/fetch-pinned\.sh"/);
 });
