@@ -14,3 +14,5 @@ See [Tools](tools.md#web-tools), the [guide](guides/deep.md), the [changelog](..
 ```sh
 nano-coder --help
 ```
+
+History: nano-coder was written in Rust before the D rewrite.
