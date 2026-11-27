@@ -474,6 +474,10 @@ jobs:
         # (introduced_in <= previous release) and the pruning job's wiring, so
         # a drift re-opens the every-release-turns-main-red window.
         run: node --test scripts/allowlist-version.test.mjs
+      - name: Determinism CI script fails closed (#2004)
+        # A failing emit/replay inside a `cell` command substitution must fail
+        # the cell, not be masked by the digest printf.
+        run: node --test scripts/determinism-ci.test.mjs
       - name: Rust toolchain pin (every workflow uses rust-toolchain.toml)
         # Fails if any workflow installs an unpinned/other Rust toolchain
         # (`@stable` let Rust 1.99 break clippy + the armv6 release link).

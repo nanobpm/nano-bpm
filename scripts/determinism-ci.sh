@@ -39,6 +39,8 @@ sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1;
 
 # build PROFILE — builds both examples in ENGINE (cwd-independent).
 build() {
+  # Test seam: DET_TEST_BIN points at stub examples, skipping cargo.
+  if [ -n "${DET_TEST_BIN:-}" ]; then BIN="$DET_TEST_BIN"; return 0; fi
   local flag=()
   [ "$1" = release ] && flag=(--release)
   (cd "$ENGINE" && cargo build --features serde ${flag[@]+"${flag[@]}"} --example determinism_corpus --example determinism_replay)
@@ -59,21 +61,21 @@ emit() { "$BIN/determinism_corpus" emit "$1" --random "$RANDOM_INSTANCES"; }
 # the latched engine) and replays it with `--event-gateway-runtime`, so the
 # gateway-owned trigger runtime is determinism-checked too.
 cell_mode() {
-  # Runs inside $(...) from cmd_cell: re-arm errexit explicitly so it holds
-  # even on a bash without inherit_errexit.
-  set -e
+  # Runs inside $(...) from cmd_cell. Errexit is NOT reliable here (it is
+  # ignored if a caller ever puts this call left of `||`/`&&` or in `if`), so
+  # every producer is checked explicitly with `|| exit 1`.
   local out="$1" emit_flags=() replay_flags=()
   if [ "${2:-}" = --post-latch ]; then
     emit_flags=(--post-latch); replay_flags=(--event-gateway-runtime)
   fi
   mkdir -p "$out"
-  "$BIN/determinism_corpus" emit "$out/corpus.jsonl" --random "$RANDOM_INSTANCES" ${emit_flags[@]+"${emit_flags[@]}"}
-  local total; total=$(grep -c . "$out/corpus.jsonl")
+  "$BIN/determinism_corpus" emit "$out/corpus.jsonl" --random "$RANDOM_INSTANCES" ${emit_flags[@]+"${emit_flags[@]}"} || exit 1
+  local total; total=$(grep -c . "$out/corpus.jsonl") || exit 1
   local ref=""
   for n in $(seq 1 "$RUNS"); do
     "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/run$n.jsonl" --state-every "$STATE_EVERY" \
-      ${replay_flags[@]+"${replay_flags[@]}"}
-    local d; d=$(sha "$out/run$n.jsonl")
+      ${replay_flags[@]+"${replay_flags[@]}"} || exit 1
+    local d; d=$(sha "$out/run$n.jsonl") || exit 1
     echo "$out run $n (fresh process / hash seed): $d" >&2
     if [ -z "$ref" ]; then ref="$d"; elif [ "$d" != "$ref" ]; then
       echo "::error::determinism ($out): run $n differs from run 1 (hash-seed / process non-determinism)" >&2
@@ -83,18 +85,19 @@ cell_mode() {
   done
   for split in 1 $((total / 3)) $((total / 2 + 1)); do
     "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/a.jsonl" --state-every "$STATE_EVERY" \
-      --stop-after "$split" --snapshot-out "$out/snap.json" ${replay_flags[@]+"${replay_flags[@]}"}
+      --stop-after "$split" --snapshot-out "$out/snap.json" ${replay_flags[@]+"${replay_flags[@]}"} || exit 1
     "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/b.jsonl" --state-every "$STATE_EVERY" \
-      --resume "$out/snap.json" --start-at "$split" ${replay_flags[@]+"${replay_flags[@]}"}
-    cat "$out/a.jsonl" "$out/b.jsonl" >"$out/restart.jsonl"
-    local d; d=$(sha "$out/restart.jsonl")
+      --resume "$out/snap.json" --start-at "$split" ${replay_flags[@]+"${replay_flags[@]}"} || exit 1
+    cat "$out/a.jsonl" "$out/b.jsonl" >"$out/restart.jsonl" || exit 1
+    local d; d=$(sha "$out/restart.jsonl") || exit 1
     echo "$out restart at $split: $d" >&2
     if [ "$d" != "$ref" ]; then
       echo "::error::determinism ($out): process restart at entry $split diverges from an uninterrupted run" >&2
       exit 1
     fi
   done
-  printf '%s %s' "$(sha "$out/corpus.jsonl")" "$ref"
+  local corpus_sha; corpus_sha=$(sha "$out/corpus.jsonl") || exit 1
+  printf '%s %s' "$corpus_sha" "$ref"
 }
 
 cmd_cell() {
@@ -104,8 +107,9 @@ cmd_cell() {
   # Pre-latch (the mixed-version / previous-release shape) and post-latch
   # (#2004) corpora; the cell digest covers both.
   local pre post
-  pre=$(cell_mode "$out/pre-latch") || exit 1
-  post=$(cell_mode "$out/post-latch" --post-latch) || exit 1
+  # Plain assignments: under set -e a failed substitution aborts here.
+  pre=$(cell_mode "$out/pre-latch")
+  post=$(cell_mode "$out/post-latch" --post-latch)
   printf '%s %s\n' "$pre" "$post" >"$out/digest.txt"
   echo "cell digest: $(cat "$out/digest.txt")"
 }
