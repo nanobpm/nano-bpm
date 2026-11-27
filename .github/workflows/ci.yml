@@ -860,7 +860,7 @@ jobs:
           # needs a Node with TypeScript type-stripping on by default (>= 23.6).
           node-version: '24'
       - name: Build publish site and test install copy controls
-        # Zero-dep build: fails if any tracked file still references the legacy
+        # Near-zero-dep build (only markdown-it, for /nano-coder/docs/): fails if any tracked file still references the legacy
         # schema domain, or if a published $id/uri no longer resolves to
         # nanobpm.io. This is the same build pages.yml deploys on merge, so a
         # green PR here guarantees the site publishes cleanly. The integration
@@ -868,7 +868,16 @@ jobs:
         # parallel test files never race on the shared, wiped-first _site; the
         # shared console *.gen.html artifacts are published atomically
         # (website/atomic-write.mjs) so concurrent builds never expose a partial file.
-        run: node --test website/*.test.mjs
+        run: |
+          npm ci --prefix website
+          node --test website/*.test.mjs
+      - name: Build publish site with live nano-coder docs
+        # The tests above build offline (NANO_CODER_DOCS_OFFLINE=1, fixture
+        # docs). This is the same live fetch pages.yml deploys with: CI=true
+        # makes a failed fetch of nano-coder's latest release docs/ fatal.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node website/build.mjs
       - name: Fail if the console landscape/videos artifacts are stale
         # website/build.mjs also renders the shared landscape table into
         # server/crates/nano-server-console/src/landscape.gen.html (single source of truth for both

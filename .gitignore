@@ -49,6 +49,8 @@ nohup.out
 
 # Generated nanobpm.io Pages site (built by website/build.mjs)
 website/_site/
+# website build deps (markdown-it for /nano-coder/docs/; `npm ci --prefix website`)
+website/node_modules/
 
 # Python bytecode caches from the codegen helper scripts (machine-local).
 __pycache__/

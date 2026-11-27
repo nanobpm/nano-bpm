@@ -1,0 +1,8 @@
+{
+  "name": "nanobpm-website",
+  "private": true,
+  "description": "nanobpm.io site build (website/build.mjs). Only runtime dep: markdown-it for /nano-coder/docs/, pinned to the console's version (drift-guarded by nano-coder-docs.test.mjs).",
+  "dependencies": {
+    "markdown-it": "^14.2.0"
+  }
+}

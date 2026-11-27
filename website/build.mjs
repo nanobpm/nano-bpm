@@ -33,6 +33,7 @@ import { writeFileAtomic } from "./atomic-write.mjs";
 import { nageFacts } from "./nage-facts.mjs";
 import { diagramThumbSvg } from "./bpmn-thumb.mjs";
 import { DEMO_FLOWS } from "./demo-flows.mjs";
+import { DOCS_ROUTE as NANO_CODER_DOCS_ROUTE, renderNanoCoderDocs, resolveNanoCoderDocs } from "./nano-coder-docs.mjs";
 
 const DOMAIN = "nanobpm.io";
 const ORIGIN = `https://${DOMAIN}`;
@@ -103,6 +104,38 @@ const docsPresent = existsSync(
 const whitepaperPresent = existsSync(
   join(repoRoot, "console", "public", "whitepaper", "index.html"),
 );
+
+// --- nano-coder usage docs -> /nano-coder/docs/ (website-only) ----------------
+// Rendered from nanobpm/nano-coder's docs/ at its latest release tag (live fetch,
+// vendored-snapshot fallback, fatal fetch failure in CI — see
+// website/nano-coder-docs.mjs). Resolved up-front, like `docsPresent`, so the
+// nav and the /nano-coder/ page only link the docs on builds that ship them.
+// Written straight into _site, never into console/public/docs (/docs/ is the
+// gateway-embedded Nano BPM manual).
+const nanoCoderDocsVersion = await (async () => {
+  const src = await resolveNanoCoderDocs();
+  if (!src) return null;
+  try {
+    let MarkdownIt;
+    try {
+      ({ default: MarkdownIt } = await import("markdown-it"));
+    } catch (e) {
+      const msg = `markdown-it not installed for the website build (run \`npm ci --prefix website\`): ${e.message}`;
+      if (process.env.CI === "true") throw new Error(msg);
+      console.warn(`warning: nano-coder docs: ${msg} — /nano-coder/docs/ omitted`);
+      return null;
+    }
+    const pages = renderNanoCoderDocs({ MarkdownIt, docsDir: src.docsDir, version: src.version, siteOut: outDir });
+    if (pages.length === 0) {
+      console.warn(`warning: nano-coder docs: ${src.version} docs/ has no pages — /nano-coder/docs/ omitted`);
+      return null;
+    }
+    console.log(`nano-coder docs ${src.version} (${src.source}) at ${NANO_CODER_DOCS_ROUTE} (${pages.length} pages)`);
+    return src.version;
+  } finally {
+    src.cleanup?.();
+  }
+})();
 
 const published = [];
 
@@ -997,6 +1030,7 @@ function siteNav() {
     <a href="/#install">Install</a>
     <a href="/#flows">Flows</a>
     <a href="/nano-coder/">nano-coder</a>
+    ${nanoCoderDocsVersion ? `<a href="${NANO_CODER_DOCS_ROUTE}">nano-coder docs</a>` : ""}
     <a href="/#distributed">Distributed</a>
     <a href="/architecture/">Architecture</a>
     <a href="/demo/">Demo</a>
@@ -1447,6 +1481,7 @@ ${blogStyle()}
   ${installCommand("Install nano-coder with Homebrew", F.brew)}
   <p class="install-note">Prebuilt binaries for ${esc(F.platforms)}, through npm or Homebrew. (<code>cargo install nano-coder</code> only installs the last Rust release, 0.69, which is no longer updated.)</p>
 ${cards}
+  ${nanoCoderDocsVersion ? `<p class="lede"><a class="nano-coder-docs-link" href="${NANO_CODER_DOCS_ROUTE}">Docs →</a> Full usage documentation for nano-coder ${esc(nanoCoderDocsVersion)}.</p>` : ""}
   <p class="lede">Why the worker's size matters: <a href="/blog/a-6mb-coding-agent/">A 6MB coding agent, and why fleets need one →</a></p>
   <div class="cta">
     <a class="btn primary" href="${F.repo}" rel="noopener noreferrer" target="_blank">nano-coder on GitHub →</a>

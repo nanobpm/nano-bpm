@@ -24,7 +24,7 @@ function walk(dir, out = []) {
 function buildSite() {
   const dir = mkdtempSync(join(tmpdir(), "nano-site-"));
   try {
-    execFileSync(process.execPath, [BUILD], { stdio: "pipe", env: { ...process.env, SITE_OUT_DIR: dir } });
+    execFileSync(process.execPath, [BUILD], { stdio: "pipe", env: { ...process.env, NANO_CODER_DOCS_OFFLINE: "1", SITE_OUT_DIR: dir } });
     const files = new Map();
     for (const f of walk(dir)) files.set(f, readFileSync(f, "utf8"));
     return { dir, files };
