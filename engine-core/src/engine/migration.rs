@@ -271,9 +271,10 @@ impl Engine {
     }
 
     /// Zeebe catch-event preconditions for one active element `source_id`
-    /// mapped onto `target_id`: every mapped boundary of the source must target
-    /// a boundary attached to `target_id` (stay attached), and no two may
-    /// target the same catch event (no merging).
+    /// mapped onto `target_id`: every mapped boundary of the source (or, for an
+    /// event-based gateway, every mapped catch event it subscribes to) must
+    /// target a boundary attached to `target_id` (a catch event of the target
+    /// gateway), and no two may target the same catch event (no merging).
     pub(crate) fn check_migrated_catch_events(
         instance_key: Key,
         source: &ProcessDefinition,
@@ -282,12 +283,17 @@ impl Engine {
         source_id: &str,
         target_id: &str,
     ) -> Result<(), EngineError> {
+        // An event-based gateway's catch events are its subscription targets
+        // (#2004, Zeebe migrates the gateway's subscriptions with it): each
+        // mapped one must stay a target of the target gateway.
         let mut boundaries: Vec<&Element> = source
             .elements
             .values()
             .filter(|e| e.kind.attached_to() == Some(source_id))
+            .chain(source.event_gateway_targets(source_id))
             .collect();
         boundaries.sort_by(|a, b| a.id.cmp(&b.id));
+        let target_gateway_targets = target.event_gateway_targets(target_id);
         let mut by_target: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for b in boundaries {
             let Some(tb) = mapped.get(&b.id) else {
@@ -296,7 +302,8 @@ impl Engine {
             let attached = target
                 .element(tb)
                 .and_then(|e| e.kind.attached_to())
-                .is_some_and(|a| a == target_id);
+                .is_some_and(|a| a == target_id)
+                || target_gateway_targets.iter().any(|t| t.id == *tb);
             if !attached {
                 return Err(EngineError::MigrationCatchEventDetached {
                     instance_key,
@@ -319,6 +326,8 @@ impl Engine {
         Ok(())
     }
 
+    /// LEGACY (#1676, the pre-`event-gateway-runtime-v1` path, #2004): run
+    /// only for an instance holding legacy race members.
     /// Event-based gateway race preconditions (#1554, Zeebe migrates an active
     /// event-based gateway together with its armed catch events). The engine
     /// models the gateway as a pass-through whose catch events are each an
@@ -524,9 +533,9 @@ impl Engine {
     ) -> BTreeMap<Key, Vec<ArmedTrigger>> {
         let mut by_host: BTreeMap<Key, Vec<ArmedTrigger>> = BTreeMap::new();
         for t in self.state.timers.values() {
-            let Some(host_element_id) = hosts.get(&t.element_instance_key) else {
+            if !hosts.contains_key(&t.element_instance_key) {
                 continue;
-            };
+            }
             if t.state != state::TimerState::Created {
                 continue;
             }
@@ -537,7 +546,10 @@ impl Engine {
                 state::TimerKind::NonInterruptingBoundary {
                     boundary_element_id,
                 } => (boundary_element_id.clone(), Some(false)),
-                state::TimerKind::IntermediateCatch => (host_element_id.clone(), None),
+                // An intermediate catch's trigger names its catch element: the
+                // host itself, or a catch an event-based gateway host
+                // subscribes to (#2004).
+                state::TimerKind::IntermediateCatch => (t.element_id.clone(), None),
                 // An event sub-process trigger rests on its scope, not on a
                 // token; it is not a per-element trigger to re-map here.
                 state::TimerKind::EventSubProcess { .. } => continue,
@@ -565,26 +577,26 @@ impl Engine {
                     }),
                 });
         }
-        let catch_of = |kind: &state::MessageSubscriptionKind, host_element_id: &ElementId| {
+        let catch_of = |kind: &state::MessageSubscriptionKind, catch_element_id: &ElementId| {
             match boundary_id_of(kind) {
                 Some((id, interrupting)) => Some((id, Some(interrupting))),
                 None if *kind == state::MessageSubscriptionKind::IntermediateCatch => {
-                    Some((host_element_id.clone(), None))
+                    Some((catch_element_id.clone(), None))
                 }
                 None => None,
             }
         };
         for s in self.state.message_subscriptions.values() {
-            let Some(host_element_id) = hosts.get(&s.element_instance_key) else {
+            if !hosts.contains_key(&s.element_instance_key) {
                 continue;
-            };
+            }
             if !matches!(
                 s.state,
                 state::MessageSubscriptionState::Open | state::MessageSubscriptionState::Opening
             ) {
                 continue;
             }
-            let Some((catch_id, interrupting)) = catch_of(&s.kind, host_element_id) else {
+            let Some((catch_id, interrupting)) = catch_of(&s.kind, &s.element_id) else {
                 continue;
             };
             by_host
@@ -607,13 +619,13 @@ impl Engine {
                 });
         }
         for s in self.state.signal_subscriptions.values() {
-            let Some(host_element_id) = hosts.get(&s.element_instance_key) else {
+            if !hosts.contains_key(&s.element_instance_key) {
                 continue;
-            };
+            }
             if s.state != state::MessageSubscriptionState::Open {
                 continue;
             }
-            let Some((catch_id, interrupting)) = catch_of(&s.kind, host_element_id) else {
+            let Some((catch_id, interrupting)) = catch_of(&s.kind, &s.element_id) else {
                 continue;
             };
             by_host
@@ -637,13 +649,13 @@ impl Engine {
                 });
         }
         for s in self.state.conditional_subscriptions.values() {
-            let Some(host_element_id) = hosts.get(&s.element_instance_key) else {
+            if !hosts.contains_key(&s.element_instance_key) {
                 continue;
-            };
+            }
             if s.state != state::MessageSubscriptionState::Open {
                 continue;
             }
-            let Some((catch_id, interrupting)) = catch_of(&s.kind, host_element_id) else {
+            let Some((catch_id, interrupting)) = catch_of(&s.kind, &s.element_id) else {
                 continue;
             };
             by_host
@@ -800,9 +812,10 @@ impl Engine {
         let active_snapshot = active.clone();
         for (eik, source_id) in active {
             let Some(target_id) = mapped.get(&source_id).cloned() else {
-                // An unmapped host still active here is a withdrawn race member
-                // (#1554; every other unmapped host was rejected): its withdrawal
-                // cancels the triggers, the migration fact reports them deleted.
+                // An unmapped host still active here is a withdrawn LEGACY race
+                // member (#1554 / #1676; every other unmapped host was
+                // rejected): its withdrawal cancels the triggers, the
+                // migration fact reports them deleted.
                 for armed in armed_by_host.remove(&eik).unwrap_or_default() {
                     if let Some(trigger) = armed.report {
                         plan.subscriptions.push(MigratedSubscription {
@@ -871,6 +884,12 @@ impl Engine {
             let mut covered: Vec<ElementId> = Self::armable_boundaries(source, &source_id)
                 .iter()
                 .filter_map(|b| mapped.get(&b.id).cloned())
+                .chain(
+                    source
+                        .event_gateway_targets(&source_id)
+                        .into_iter()
+                        .filter_map(|c| mapped.get(&c.id).cloned()),
+                )
                 .collect();
             for armed in armed_by_host.remove(&eik).unwrap_or_default() {
                 let vars = if armed.interrupting.is_some() {
@@ -957,6 +976,30 @@ impl Engine {
             // here would leave triggers outliving the host.
             if not_armable.contains(&eik) {
                 continue;
+            }
+            // An event-based gateway's target catch events with no mapped
+            // source catch are newly subscribed, on the gateway (#2004).
+            let new_catches: Vec<Element> = target
+                .event_gateway_targets(&target_id)
+                .into_iter()
+                .filter(|c| !covered.contains(&c.id))
+                .cloned()
+                .collect();
+            for catch in new_catches {
+                for event in self
+                    .arm_catch_event(instance_key, eik, &catch_vars, &catch)
+                    .map_err(fail)?
+                {
+                    if let Some(trigger) = Self::report_of(&event) {
+                        plan.subscriptions.push(MigratedSubscription {
+                            element_instance_key: eik,
+                            element_id: catch.id.clone(),
+                            action: SubscriptionMigrationAction::Created,
+                            trigger,
+                        });
+                    }
+                    plan.after.push(event);
+                }
             }
             // Target boundaries with no mapped source boundary are newly armed.
             for boundary in Self::armable_boundaries(target, &target_id) {

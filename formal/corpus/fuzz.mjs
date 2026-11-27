@@ -302,6 +302,9 @@ export function corpusProblems (cases) {
       const derived = rederive(c)
       if (!derived) problems.push(`committed fuzz case ${label}: its scenario is no longer a behaviour of the current Reference — re-derive it (rederive / rederivedScenarios) and re-judge the case`)
       else if (canonJson(derived.expect) !== canonJson(c.scenario.expect)) problems.push(`committed fuzz case ${label}: its frozen "expect" is stale against the current Reference — re-derive it and re-judge the case`)
+      // The frozen `run` feeds the spec oracle (`checkSpecOracle`), so a stale
+      // one makes a conforming backend "diverge" — guard it like `expect`.
+      else if (c.scenario.run && canonJson(derived.run) !== canonJson(c.scenario.run)) problems.push(`committed fuzz case ${label}: its frozen "run" is stale against the current Reference — re-derive it and re-judge the case`)
     }
   }
   return problems

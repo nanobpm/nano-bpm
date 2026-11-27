@@ -146,6 +146,8 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 gateway_routes: BTreeMap::new(),
                 races: BTreeMap::new(),
                 gateway_subscriptions: BTreeMap::new(),
+                gateway_triggers: BTreeMap::new(),
+                latched_activations: Default::default(),
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),
@@ -420,6 +422,8 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // #2003: gateway-owned subscriptions likewise outlive no
                 // whole-instance teardown.
                 instance.gateway_subscriptions.clear();
+                instance.gateway_triggers.clear();
+                instance.latched_activations.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();
@@ -522,7 +526,30 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             let target_def = state
                 .process_by_key(*target_process_definition_key)
                 .map(|d| d.definition.clone());
+            // #2047 review: an element migrated on an already-latched
+            // partition (e.g. a waiting catch mapped onto a gateway-owned
+            // catch) is new-runtime state, never pre-latch legacy — EXCEPT
+            // genuine legacy gateway state (a race may outlive the latch),
+            // classified on the source definition before the remap, so a
+            // latched load still refuses it.
+            let newly_latched: Vec<Key> = if state.event_gateway_runtime_latched {
+                state
+                    .instances
+                    .get(instance_key)
+                    .map(|i| {
+                        let legacy = state.legacy_event_gateway_keys(i);
+                        i.active
+                            .keys()
+                            .filter(|k| !legacy.contains(k))
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.latched_activations.extend(newly_latched);
                 for mi in instance.multi_instances.values_mut() {
                     remap_id(&mut mi.element_id);
                     if let Some(spec) = target_def
@@ -536,6 +563,33 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                         mi.completion_condition = spec.completion_condition.clone();
                         mi.cancel_remaining_instances = spec.cancel_remaining_instances;
                     }
+                }
+                // Event-based gateways (#2004): a triggered catch follows the
+                // mapping; a waiting gateway's subscription set is re-derived
+                // from the target gateway (the command handler has already
+                // deleted the unmapped catches' subscriptions and opened the
+                // new ones).
+                for trigger in instance.gateway_triggers.values_mut() {
+                    remap_id(&mut trigger.catch_element_id);
+                }
+                let gateway_ids: Vec<(Key, ElementId)> = instance
+                    .gateway_subscriptions
+                    .keys()
+                    .filter_map(|eik| instance.active.get(eik).map(|id| (*eik, id.clone())))
+                    .collect();
+                for (eik, gateway_id) in gateway_ids {
+                    let mut target_gateway_id = gateway_id;
+                    remap_id(&mut target_gateway_id);
+                    let catches: Vec<ElementId> = target_def
+                        .as_ref()
+                        .map(|d| {
+                            d.event_gateway_targets(&target_gateway_id)
+                                .into_iter()
+                                .map(|c| c.id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    instance.gateway_subscriptions.insert(eik, catches);
                 }
                 for adhoc in instance.adhoc_instances.values_mut() {
                     remap_id(&mut adhoc.element_id);
@@ -830,6 +884,8 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // #2003: gateway-owned subscriptions likewise outlive no
                 // whole-instance teardown.
                 instance.gateway_subscriptions.clear();
+                instance.gateway_triggers.clear();
+                instance.latched_activations.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();

@@ -7960,6 +7960,7 @@ fn project_event(
         // Gateway-owned subscription bookkeeping (#2003): not yet emitted.
         | Event::EventGatewaySubscriptionsOpened { .. }
         | Event::EventGatewayTriggered { .. }
+        | Event::EventGatewayTriggerDiscarded { .. }
         | Event::MessagePublished { .. }
         // Engine-internal message buffer (#1874): the correlation records
         // that follow carry everything the read model projects.
@@ -7979,6 +7980,8 @@ fn project_event(
         | Event::MessageCorrelationReceiptSettled { .. }
         // The activation latch (#1949) is partition bookkeeping.
         | Event::RemoteBufferedDeliveryActivated { .. }
+        // The event-gateway runtime latch (#2004) is partition bookkeeping.
+        | Event::EventGatewayRuntimeActivated { .. }
         | Event::MessageCorrelationAckV2Activated { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
@@ -9290,6 +9293,8 @@ mod writability_tests {
             gateway_routes: Default::default(),
             races: Default::default(),
             gateway_subscriptions: Default::default(),
+            gateway_triggers: Default::default(),
+            latched_activations: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),
@@ -9796,6 +9801,8 @@ mod definition_xml_tests {
             gateway_routes: Default::default(),
             races: Default::default(),
             gateway_subscriptions: Default::default(),
+            gateway_triggers: Default::default(),
+            latched_activations: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),
@@ -10065,6 +10072,8 @@ mod definition_xml_tests {
             gateway_routes: Default::default(),
             races: Default::default(),
             gateway_subscriptions: Default::default(),
+            gateway_triggers: Default::default(),
+            latched_activations: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),

@@ -25,8 +25,12 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 element_id,
                 *scope,
             );
+            let latched = state.event_gateway_runtime_latched;
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.activating.insert(*element_instance_key);
+                if latched {
+                    instance.latched_activations.insert(*element_instance_key);
+                }
                 if let Some(gateway) = race {
                     instance.races.insert(*element_instance_key, *gateway);
                 }
@@ -45,8 +49,12 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 element_id,
                 *scope,
             );
+            let latched = state.event_gateway_runtime_latched;
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.activating.remove(element_instance_key);
+                if latched {
+                    instance.latched_activations.insert(*element_instance_key);
+                }
             }
         }
 
@@ -66,6 +74,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.active.remove(element_instance_key);
                 instance.activating.remove(element_instance_key);
+                instance.latched_activations.remove(element_instance_key);
                 instance.scopes.remove(element_instance_key);
                 instance.parked_joins.remove(element_instance_key);
                 // Zeebe drops a scope's local variables (an activity's input
@@ -81,6 +90,13 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 instance.races.remove(element_instance_key);
                 // A gateway's owned subscriptions (#2003) die with it.
                 instance.gateway_subscriptions.remove(element_instance_key);
+                // A triggered catch consumed its gateway's trigger (#2004); a
+                // gateway terminated before activating its catch drops it.
+                let terminated = matches!(event, Event::ElementTerminated { .. });
+                instance.gateway_triggers.retain(|gateway, trigger| {
+                    trigger.catch_element_instance_key != *element_instance_key
+                        && !(terminated && gateway == element_instance_key)
+                });
                 // An event sub-process container's held start payload dies
                 // with the container (normal completion or interrupt teardown).
                 instance.esp_held_payloads.remove(element_instance_key);
@@ -120,12 +136,33 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
         Event::EventGatewayTriggered {
             instance_key,
             gateway_element_instance_key,
-            ..
+            catch_element_id,
+            catch_element_instance_key,
+            variables,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance
                     .gateway_subscriptions
                     .remove(gateway_element_instance_key);
+                instance.gateway_triggers.insert(
+                    *gateway_element_instance_key,
+                    GatewayTrigger {
+                        catch_element_id: catch_element_id.clone(),
+                        catch_element_instance_key: *catch_element_instance_key,
+                        variables: variables.clone(),
+                    },
+                );
+            }
+        }
+
+        Event::EventGatewayTriggerDiscarded {
+            instance_key,
+            catch_element_instance_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .gateway_triggers
+                    .retain(|_, t| t.catch_element_instance_key != *catch_element_instance_key);
             }
         }
 
@@ -218,6 +255,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                     instance.parked_joins.remove(&eik);
                     instance.active.remove(&eik);
                     instance.activating.remove(&eik);
+                    instance.latched_activations.remove(&eik);
                     instance.scopes.remove(&eik);
                     // A modification's seeded join activation opens a
                     // variable scope on the parked key before the guard

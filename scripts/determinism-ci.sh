@@ -4,7 +4,8 @@
 # Re-executes the command corpus (engine-core/examples/determinism/) and
 # compares the generated records + canonical state checkpoints across:
 #   * hash seeds and process restarts  — `cell` (several fresh processes, each
-#     with its own random std hash seed, plus snapshot-restart splits);
+#     with its own random std hash seed, plus snapshot-restart splits), over
+#     both the pre-latch corpus and the post-latch (#2004) corpus;
 #   * build profiles and platforms      — `cell` per matrix entry, then
 #     `compare` over the per-cell digests;
 #   * the previous release              — `prev-release`;
@@ -17,6 +18,10 @@
 #   scripts/determinism-ci.sh canary OUTDIR
 #   scripts/determinism-ci.sh prev-release OUTDIR [TAG]
 set -euo pipefail
+# Bash clears errexit inside $(...) by default, so a failing producer inside a
+# command substitution would be masked by a later successful command (e.g. the
+# digest printf). Make every substitution inherit errexit (bash >= 4.4).
+shopt -s inherit_errexit 2>/dev/null || true
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$ROOT/engine-core"
@@ -34,6 +39,8 @@ sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1;
 
 # build PROFILE — builds both examples in ENGINE (cwd-independent).
 build() {
+  # Test seam: DET_TEST_BIN points at stub examples, skipping cargo.
+  if [ -n "${DET_TEST_BIN:-}" ]; then BIN="$DET_TEST_BIN"; return 0; fi
   local flag=()
   [ "$1" = release ] && flag=(--release)
   (cd "$ENGINE" && cargo build --features serde ${flag[@]+"${flag[@]}"} --example determinism_corpus --example determinism_replay)
@@ -47,37 +54,63 @@ build() {
 
 emit() { "$BIN/determinism_corpus" emit "$1" --random "$RANDOM_INSTANCES"; }
 
-cmd_cell() {
-  local out="$1" profile="${2:-debug}"
+# cell_mode OUTDIR [--post-latch] — one corpus through every same-release
+# check (fresh processes / hash seeds, restart splits). Prints the corpus and
+# run digests as "CORPUS_SHA RUN_SHA". `--post-latch` (#2004) generates the
+# corpus under the `event-gateway-runtime-v1` envelope (keys harvested from
+# the latched engine) and replays it with `--event-gateway-runtime`, so the
+# gateway-owned trigger runtime is determinism-checked too.
+cell_mode() {
+  # Runs inside $(...) from cmd_cell. Errexit is NOT reliable here (it is
+  # ignored if a caller ever puts this call left of `||`/`&&` or in `if`), so
+  # every producer is checked explicitly with `|| exit 1`.
+  local out="$1" emit_flags=() replay_flags=()
+  if [ "${2:-}" = --post-latch ]; then
+    emit_flags=(--post-latch); replay_flags=(--event-gateway-runtime)
+  fi
   mkdir -p "$out"
-  build "$profile"
-  emit "$out/corpus.jsonl"
-  local total; total=$(grep -c . "$out/corpus.jsonl")
+  "$BIN/determinism_corpus" emit "$out/corpus.jsonl" --random "$RANDOM_INSTANCES" ${emit_flags[@]+"${emit_flags[@]}"} || exit 1
+  local total; total=$(grep -c . "$out/corpus.jsonl") || exit 1
   local ref=""
   for n in $(seq 1 "$RUNS"); do
-    "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/run$n.jsonl" --state-every "$STATE_EVERY"
-    local d; d=$(sha "$out/run$n.jsonl")
-    echo "run $n (fresh process / hash seed): $d"
+    "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/run$n.jsonl" --state-every "$STATE_EVERY" \
+      ${replay_flags[@]+"${replay_flags[@]}"} || exit 1
+    local d; d=$(sha "$out/run$n.jsonl") || exit 1
+    echo "$out run $n (fresh process / hash seed): $d" >&2
     if [ -z "$ref" ]; then ref="$d"; elif [ "$d" != "$ref" ]; then
-      echo "::error::determinism: run $n differs from run 1 (hash-seed / process non-determinism)"
-      diff <(head -c 200000 "$out/run1.jsonl") <(head -c 200000 "$out/run$n.jsonl") | head -20 || true
+      echo "::error::determinism ($out): run $n differs from run 1 (hash-seed / process non-determinism)" >&2
+      diff <(head -c 200000 "$out/run1.jsonl") <(head -c 200000 "$out/run$n.jsonl") | head -20 >&2 || true
       exit 1
     fi
   done
   for split in 1 $((total / 3)) $((total / 2 + 1)); do
     "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/a.jsonl" --state-every "$STATE_EVERY" \
-      --stop-after "$split" --snapshot-out "$out/snap.json"
+      --stop-after "$split" --snapshot-out "$out/snap.json" ${replay_flags[@]+"${replay_flags[@]}"} || exit 1
     "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/b.jsonl" --state-every "$STATE_EVERY" \
-      --resume "$out/snap.json" --start-at "$split"
-    cat "$out/a.jsonl" "$out/b.jsonl" >"$out/restart.jsonl"
-    local d; d=$(sha "$out/restart.jsonl")
-    echo "restart at $split: $d"
+      --resume "$out/snap.json" --start-at "$split" ${replay_flags[@]+"${replay_flags[@]}"} || exit 1
+    cat "$out/a.jsonl" "$out/b.jsonl" >"$out/restart.jsonl" || exit 1
+    local d; d=$(sha "$out/restart.jsonl") || exit 1
+    echo "$out restart at $split: $d" >&2
     if [ "$d" != "$ref" ]; then
-      echo "::error::determinism: process restart at entry $split diverges from an uninterrupted run"
+      echo "::error::determinism ($out): process restart at entry $split diverges from an uninterrupted run" >&2
       exit 1
     fi
   done
-  printf '%s %s\n' "$(sha "$out/corpus.jsonl")" "$ref" >"$out/digest.txt"
+  local corpus_sha; corpus_sha=$(sha "$out/corpus.jsonl") || exit 1
+  printf '%s %s' "$corpus_sha" "$ref"
+}
+
+cmd_cell() {
+  local out="$1" profile="${2:-debug}"
+  mkdir -p "$out"
+  build "$profile"
+  # Pre-latch (the mixed-version / previous-release shape) and post-latch
+  # (#2004) corpora; the cell digest covers both.
+  local pre post
+  # Plain assignments: under set -e a failed substitution aborts here.
+  pre=$(cell_mode "$out/pre-latch")
+  post=$(cell_mode "$out/post-latch" --post-latch)
+  printf '%s %s\n' "$pre" "$post" >"$out/digest.txt"
   echo "cell digest: $(cat "$out/digest.txt")"
 }
 
@@ -129,7 +162,10 @@ cmd_prev_release() {
   # against the previous release's engine.
   mkdir -p "$PREV_SRC/engine-core/examples/determinism"
   cp "$ENGINE/examples/determinism_replay.rs" "$PREV_SRC/engine-core/examples/"
-  cp "$ENGINE/examples/determinism/runner.rs" "$PREV_SRC/engine-core/examples/determinism/"
+  # Lines tagged `determinism:head-only` call head-only engine API (e.g. a
+  # feature-gate switch, #2004) the previous release does not have.
+  grep -v 'determinism:head-only' "$ENGINE/examples/determinism/runner.rs" \
+    >"$PREV_SRC/engine-core/examples/determinism/runner.rs"
   # Build the previous release into an ISOLATED target dir, never the shared
   # one: under an absolute CARGO_TARGET_DIR (#1716) HEAD and the previous
   # release would resolve to the SAME directory, so this build would overwrite

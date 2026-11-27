@@ -270,6 +270,7 @@ pub const STATE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("next_buffered_seq", FieldRule::Exact),
     ("message_correlation_ack_used", FieldRule::Exact),
     ("remote_buffered_delivery_latched", FieldRule::Exact),
+    ("event_gateway_runtime_latched", FieldRule::Exact),
     ("message_correlation_ack_v2_latched", FieldRule::Exact),
     ("signal_subscriptions", FieldRule::EntityMap),
     ("conditional_subscriptions", FieldRule::EntityMap),
@@ -322,6 +323,8 @@ pub const INSTANCE_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("gateway_routes", FieldRule::KeyedMap),
     ("races", FieldRule::KeyToKeyMap),
     ("gateway_subscriptions", FieldRule::KeyedMap),
+    ("gateway_triggers", FieldRule::KeyedMap),
+    ("latched_activations", FieldRule::KeySet),
     ("incidents", FieldRule::KeyList),
     ("variables_spilled", FieldRule::Exact),
     (

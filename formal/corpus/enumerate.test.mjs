@@ -198,16 +198,15 @@ test('scenarios: one per (route, command order) run, from the one graph source',
     { op: 'completeOneJob', jobType: 'T1' },
     { op: 'publishMessage', name: messageName(g.id, 'M1'), correlationKey: s.name }
   ])
-  // The oracle is branch-sensitive via the taken flows: the engine arms EVERY
-  // catch (M1 AND the losing M2 both complete — the loser is withdrawn), so the
-  // catch's completion does not distinguish the branch. The taken OUTGOING flow
-  // does: only the winner's continuation (M1->E) is taken, never M2->E.
+  // The oracle is branch-sensitive: the gateway activates only the winning
+  // catch directly (#2004, Zeebe) — no G1->M* flow is taken, the losing M2
+  // never completes, and only the winner's continuation (M1->E) is taken.
   assert.deepEqual(s.expect, {
     completed: true,
     jobsCreated: { T1: 1 },
     variables: s.variables,
-    completedElements: { S: 1, T1: 1, G1: 1, M1: 1, M2: 1, E: 1 },
-    sequenceFlows: { 'S->T1': 1, 'T1->G1': 1, 'G1->M1': 1, 'G1->M2': 1, 'M1->E': 1 }
+    completedElements: { S: 1, T1: 1, G1: 1, M1: 1, E: 1 },
+    sequenceFlows: { 'S->T1': 1, 'T1->G1': 1, 'M1->E': 1 }
   })
   const stuck = scenariosFor(graphOf(['xor', 'and'], [[0, 1, 'direct'], [1, 2, 'task'], [1, 2, 'direct'], [2, 3, 'direct']]))
   assert.ok(stuck.scenarios.every((sc) => sc.expect.completed === false && sc.backends?.join() === 'nano'))
@@ -401,16 +400,16 @@ test('a correlation creating a job at an ALREADY-WAITING type falls back to sett
 
 test('event-based gateway oracle: substituting the other catch FAILS the branch-sensitive expectation', () => {
   // The negative oracle guard (#1246 review): the two catches of an event-based
-  // gateway produce identical completion/variables AND identical completed
-  // elements (the engine arms both, withdrawing the loser). Only the taken
-  // OUTGOING flow distinguishes them — swapping the correlated catch takes the
-  // other catch's continuation and must mismatch the sequenceFlows oracle.
+  // gateway produce identical completion/variables. Only the winning catch
+  // completes (#2004) and only its continuation is taken — swapping the
+  // correlated catch must mismatch both oracles.
   const g = graphOf(['evt'], [[0, 1, 'task'], [1, 2, 'msg'], [1, 2, 'msg']])
   const { scenarios } = scenariosFor(g)
   const [m1, m2] = scenarios
-  // Both complete both catches (the loser is withdrawn)…
+  // Only the winning catch completes…
   assert.equal(m1.expect.completedElements.M1, 1)
-  assert.equal(m1.expect.completedElements.M2, 1)
+  assert.equal(m1.expect.completedElements.M2, undefined)
+  assert.equal(m2.expect.completedElements.M1, undefined)
   // …but only the SELECTED catch's outgoing flow is taken.
   assert.equal(m1.expect.sequenceFlows['M1->E'], 1)
   assert.equal(m1.expect.sequenceFlows['M2->E'], undefined)

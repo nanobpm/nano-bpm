@@ -1497,8 +1497,11 @@ fn event_based_gateway_message_wins_and_withdraws_the_timer_sibling() {
     assert!(engine.trigger_timers(6_000).is_empty());
 }
 
+/// A catch routed into by two gateways is still a subscription of the one
+/// gateway that is waiting (#2004): its trigger completes that gateway and
+/// deletes the gateway's other subscriptions, whatever else routes into it.
 #[test]
-fn event_based_gateway_ambiguous_owner_withdraws_nothing() {
+fn event_based_gateway_shared_catch_triggers_the_waiting_gateway() {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(ambiguous_event_gateway_race()))
@@ -1511,32 +1514,28 @@ fn event_based_gateway_ambiguous_owner_withdraws_nothing() {
         .unwrap();
     let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
 
-    // Only gw1's race is live (gw2 is never reached): its timer `onTimer1` and
-    // the shared message subscription are armed.
+    // Only gw1 waits (gw2 is never reached): its timer and the shared message
+    // subscription are open.
     assert_eq!(engine.timers().len(), 1);
     assert_eq!(engine.timers()[0].state, state::TimerState::Created);
     assert_eq!(engine.message_subscriptions().len(), 1);
 
-    // The shared catch event wins its message. Because two gateways statically
-    // route into it, the owning race is ambiguous, so the guard withdraws
-    // nothing: the timer sibling is left armed (not cancelled), and its lingering
-    // token keeps the instance live rather than completing it.
     let correlated = engine
         .apply_command_at(Command::correlate_message("reply", "A"), 2_000)
         .unwrap();
-    assert!(!correlated
-        .iter()
-        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
-    assert!(!engine.is_completed(instance_key));
+    assert!(correlated.contains(&Event::ProcessInstanceCompleted { instance_key }));
     assert_eq!(
         engine.timers()[0].state,
-        state::TimerState::Created,
-        "ambiguous owner must not cancel the sibling timer"
+        state::TimerState::Canceled,
+        "the trigger deletes the gateway's other subscriptions"
     );
 }
 
+/// A gateway subscribes only to its catch-event targets (Zeebe
+/// `ExecutableEventBasedGateway#getEvents`): a malformed non-catch target is
+/// never activated, so it can neither create a job nor be force-completed.
 #[test]
-fn event_based_gateway_never_force_completes_non_catch_sibling() {
+fn event_based_gateway_never_activates_non_catch_target() {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(
@@ -1550,36 +1549,27 @@ fn event_based_gateway_never_force_completes_non_catch_sibling() {
         .apply_command_at(Command::create_instance_with("malformed", vars), 1_000)
         .unwrap();
     let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(
+        !engine
+            .state()
+            .jobs
+            .values()
+            .any(|j| j.job_type == "do-work"),
+        "the service task is not a gateway subscription"
+    );
 
-    // The gateway armed both the message catch and the service task: a job exists.
-    let job_before = engine
-        .state()
-        .jobs
-        .values()
-        .find(|j| j.job_type == "do-work")
-        .expect("a do-work job was created");
-    let job_state_before = job_before.state;
-
-    // The message wins. The service-task sibling is a non-catch node, so it is
-    // left untouched: its job survives in the same state (never force-completed),
-    // and the lingering token keeps the instance live.
     let correlated = engine
         .apply_command_at(Command::correlate_message("reply", "A"), 2_000)
         .unwrap();
-    assert!(!correlated
+    assert!(correlated
         .iter()
-        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
-    assert!(!engine.is_completed(instance_key));
-    let job_after = engine
+        .any(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id == "gw")));
+    assert!(!engine
         .state()
         .jobs
         .values()
-        .find(|j| j.job_type == "do-work")
-        .expect("the do-work job must still exist");
-    assert_eq!(
-        job_after.state, job_state_before,
-        "a non-catch sibling must not be force-completed (its job must survive)"
-    );
+        .any(|j| j.job_type == "do-work"));
+    let _ = instance_key;
 }
 
 /// Regression (#1157): a link throw hands its token to the matching link catch;

@@ -3,6 +3,9 @@
 //! ```bash
 //! # write the command corpus (every Command variant + a seeded workload)
 //! cargo run --features serde --example determinism_corpus -- emit CORPUS [--random N]
+//! # the post-latch corpus (#2004), for the same-release cells; replay it with
+//! # `determinism_replay --event-gateway-runtime`
+//! cargo run --features serde --example determinism_corpus -- emit CORPUS --post-latch
 //! # regenerate it without the entries a previous release's probe run marked
 //! # undecodable (keys re-harvested; fails if a kept entry's outcome changes)
 //! cargo run --features serde --example determinism_corpus -- emit-compatible PROBE OUT [--random N]
@@ -72,7 +75,12 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("emit") => {
             let path = args.get(1).expect("emit PATH");
-            let (entries, labels) = corpus::build_labeled(random(&args));
+            let runtime = if args.iter().any(|a| a == "--post-latch") {
+                corpus::Runtime::PostLatch
+            } else {
+                corpus::Runtime::PreLatch
+            };
+            let (entries, labels) = corpus::build_labeled_with(random(&args), runtime);
             std::fs::write(path, corpus::to_jsonl(&entries, &labels)).expect("write corpus");
             eprintln!(
                 "determinism_corpus: {} entries, {} command kinds",
@@ -212,7 +220,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: determinism_corpus emit PATH [--random N] | command-shapes | \
+                "usage: determinism_corpus emit PATH [--random N] [--post-latch] | command-shapes | \
                  emit-compatible PROBE OUT --golden-head DIR --golden-prev DIR [--random N] | \
                  cross-release HEAD PREV --corpus COMPAT --allowlist FILE --prev-tag TAG \
                  --golden-head DIR --golden-prev DIR"

@@ -486,10 +486,10 @@ impl RaftTransport for PeerTransport {
 /// (#1661). Single canonical mapping from log content to wire requirement.
 pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
     use nano_falcon_protocol::cluster_join::{
-        FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES, FEATURE_MESSAGE_BUFFERING,
-        FEATURE_MESSAGE_CORRELATION_ACK, FEATURE_MESSAGE_CORRELATION_ACK_V2,
-        FEATURE_PROCESS_INSTANCE_HISTORY_DELETION, FEATURE_REPLICATED_LENIENT_COMPLETION,
-        FEATURE_TERMINAL_DEADLINES,
+        FEATURE_CANCEL_SUSPENDED_INSTANCE, FEATURE_CLUSTER_VARIABLES,
+        FEATURE_EVENT_GATEWAY_RUNTIME, FEATURE_MESSAGE_BUFFERING, FEATURE_MESSAGE_CORRELATION_ACK,
+        FEATURE_MESSAGE_CORRELATION_ACK_V2, FEATURE_PROCESS_INSTANCE_HISTORY_DELETION,
+        FEATURE_REPLICATED_LENIENT_COMPLETION, FEATURE_TERMINAL_DEADLINES,
     };
     use nanobpmn_engine_core::Command;
     let RaftRpcRequest::AppendEntries(r) = req else {
@@ -513,6 +513,11 @@ pub fn required_features_for(req: &RaftRpcRequest) -> Vec<&'static str> {
             if item.remote_buffered_delivery && !required.contains(&FEATURE_MESSAGE_CORRELATION_ACK)
             {
                 required.push(FEATURE_MESSAGE_CORRELATION_ACK);
+            }
+            // #2004: an entry that may latch the event-gateway runtime would
+            // run the legacy race on a pre-#2004 peer.
+            if item.event_gateway_runtime && !required.contains(&FEATURE_EVENT_GATEWAY_RUNTIME) {
+                required.push(FEATURE_EVENT_GATEWAY_RUNTIME);
             }
             // #2037: an entry that may record the v2 latch, or an ack
             // carrying the resolved element, is v2 output a v1 peer would
@@ -588,6 +593,7 @@ mod codec_tests {
                     operation_reference: None,
                     terminal_deadlines: std::collections::BTreeMap::new(),
                     remote_buffered_delivery: false,
+                    event_gateway_runtime: false,
                     message_correlation_ack_v2: false,
                 },
             ])),
@@ -711,6 +717,16 @@ mod codec_tests {
         assert_eq!(
             required_features_for(&req(vec![remote])),
             vec![nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK]
+        );
+        // #2004: an entry that may latch the event-gateway runtime never
+        // ships to a peer that would run the legacy race instead.
+        let mut gateway = entry(Command::cancel_instance(1));
+        if let EntryPayload::Normal(batch) = &mut gateway.payload {
+            batch.items[0].event_gateway_runtime = true;
+        }
+        assert_eq!(
+            required_features_for(&req(vec![gateway])),
+            vec![nano_falcon_protocol::cluster_join::FEATURE_EVENT_GATEWAY_RUNTIME]
         );
         // #2037: an entry that may record the v2 latch, or an ack carrying
         // the resolved element (v2 output), never ships to a v1 peer.

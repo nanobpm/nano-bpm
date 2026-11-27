@@ -5,7 +5,8 @@
 //! ```bash
 //! cargo run --features serde --example determinism_replay -- CORPUS --out RECORDS \
 //!     [--state-every N] [--stop-after K --snapshot-out SNAP] \
-//!     [--resume SNAP --start-at K] [--canary] [--skip-undecodable]
+//!     [--resume SNAP --start-at K] [--canary] [--skip-undecodable] \
+//!     [--event-gateway-runtime]
 //! ```
 //!
 //! Kept free of newer engine API: the previous-release cell builds this file
@@ -42,6 +43,7 @@ fn main() {
             "--start-at" => opts.start_at = val().parse().expect("--start-at"),
             "--canary" => opts.canary = true,
             "--skip-undecodable" => opts.skip_undecodable = true,
+            "--event-gateway-runtime" => opts.event_gateway_runtime = true,
             _ if corpus.is_none() => corpus = Some(arg),
             _ => panic!("unexpected argument {arg}"),
         }
