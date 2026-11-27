@@ -173,16 +173,40 @@ function escapesRoot(base, path) {
 
 // --- Rendering -------------------------------------------------------------------
 
-/** H2/H3 headings of a rendered token stream, for the on-page TOC. */
 // Strip HTML comments (generated-block markers, contributor notes) from prose
 // before rendering: the shared renderer runs with `html: false`, so a comment
 // would otherwise be published as visible text. Fenced code blocks and inline
 // code spans are left verbatim, so a literal `<!-- -->` in an example survives.
+// Indented code blocks (4+ spaces / tab after a blank line, outside a list) are
+// verbatim too; an indented line after a blank line within a list is a list
+// continuation paragraph, so it is still scanned.
+const LIST_ITEM = /^ {0,3}([-*+]|\d{1,9}[.)])(\s|$)/;
 export function stripDocComments(body) {
   const out = [];
   let fence = null; // { ch, len } of the open fence
   let inComment = false;
+  let prevBlank = true; // start of document behaves like after a blank line
+  let inList = false;
+  let inIndented = false;
   for (const line of body.split("\n")) {
+    const blank = line.trim() === "";
+    const indented = /^( {4}|\t)/.test(line);
+    if (!inComment && !fence) {
+      if (inIndented && (indented || blank)) {
+        out.push(line);
+        prevBlank = blank;
+        continue;
+      }
+      inIndented = false;
+      if (indented && prevBlank && !inList) {
+        inIndented = true;
+        out.push(line);
+        prevBlank = false;
+        continue;
+      }
+      if (!blank && !indented) inList = LIST_ITEM.test(line) || (inList && !prevBlank);
+    }
+    prevBlank = blank;
     if (!inComment) {
       const f = /^ {0,3}(`{3,}|~{3,})/.exec(line);
       if (fence) {
@@ -225,6 +249,7 @@ export function stripDocComments(body) {
   return out.join("\n");
 }
 
+/** H2/H3 headings of a rendered token stream, for the on-page TOC. */
 function tocFromTokens(tokens) {
   const toc = [];
   for (let i = 0; i < tokens.length; i++) {

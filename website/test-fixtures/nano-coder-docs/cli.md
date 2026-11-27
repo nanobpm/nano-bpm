@@ -21,3 +21,11 @@ Literal in inline code: `<!-- keep-inline -->`.
 ```html
 <!-- keep-fenced -->
 ```
+
+Indented code block:
+
+    <!-- keep-indented -->
+
+- list item
+
+    <!-- list continuation note -->

@@ -211,4 +211,6 @@ test("HTML comments are stripped from prose but kept in code (generated-block ma
   assert.match(content, /Use <code>--model<\/code> to pick a model\./);
   assert.match(content, /<code>&lt;!-- keep-inline --&gt;<\/code>/);
   assert.match(content, /&lt;!-- keep-fenced --&gt;/);
+  assert.match(content, /<pre><code>&lt;!-- keep-indented --&gt;/);
+  assert.doesNotMatch(content, /list continuation note/);
 });
