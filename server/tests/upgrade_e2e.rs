@@ -13,7 +13,13 @@
 //! 2. **rolling upgrade** — members are replaced one by one; the latch is
 //!    recorded only once every member runs the new binary;
 //! 3. **recovery** — a member restarted from snapshot + journal on either side
-//!    of the latch rejoins without divergence;
+//!    of the latch rejoins without divergence; after the latch EVERY member
+//!    (the last-upgraded one included) is restarted in turn and must rejoin
+//!    ACTIVE with its log matching the leader prefix and fresh digest claims
+//!    still verifying (#2058). Before each of those restarts the harness forces
+//!    a journal snapshot on every partition the member journals, grows a journal
+//!    tail past it, and asserts the restart restored exactly that snapshot and
+//!    replayed the tail;
 //! 4. **rollback refusal** — after the latch an old binary started on a
 //!    member's data is refused by the cluster with a clear error instead of
 //!    silently misapplying the post-latch log.
@@ -169,6 +175,12 @@ impl Cluster {
             .env("NANOBPMN_PARTITIONS", PARTITIONS.to_string())
             .env("NANOBPMN_RAFT", "1")
             .env("PORT", m.port.to_string())
+            // Journal snapshots only when the harness forces one through
+            // `POST /debug/journal-snapshot` (#2058), so the snapshot a restart
+            // recovers from is a recorded, deterministic checkpoint.
+            .env("NANOBPMN_SNAPSHOT_INTERVAL_MS", "3600000")
+            // The forced-snapshot endpoint is opt-in (off by default).
+            .env("NANOBPMN_DEBUG_JOURNAL_SNAPSHOT", "1")
             .stdin(Stdio::null())
             .stdout(file.try_clone().unwrap())
             .stderr(file);
@@ -528,6 +540,382 @@ fn assert_digest_cutover_agreed(c: &Cluster, barrier: &[u64]) {
     }
 }
 
+/// Per member, per partition: the highest Raft log index on disk.
+fn log_heads(c: &Cluster) -> Vec<Vec<u64>> {
+    c.members
+        .iter()
+        .map(|m| {
+            (0..PARTITIONS)
+                .map(|p| {
+                    raft_batches(&m.data, p)
+                        .last()
+                        .map(|(i, _)| *i)
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// One member's `/debug/raft` view: per partition, `(leader, applied)` —
+/// the member's current leader (-1 if unknown) and its locally applied index
+/// (-1 if none). `None` while the member does not answer.
+fn raft_status(c: &Cluster, id: usize) -> Option<Vec<(i128, i128)>> {
+    let (code, body) = request(c.port(id), "GET", "/debug/raft", None)?;
+    if code != 200 {
+        return None;
+    }
+    let mut out = vec![(-1i128, -1i128); PARTITIONS as usize];
+    for line in body.lines() {
+        let field = |k: &str| {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+                .and_then(|v| v.parse::<i128>().ok())
+        };
+        let (Some(p), Some(leader), Some(applied)) =
+            (field("partition"), field("leader"), field("applied"))
+        else {
+            continue;
+        };
+        if let Some(slot) = usize::try_from(p).ok().and_then(|p| out.get_mut(p)) {
+            *slot = (leader, applied);
+        }
+    }
+    Some(out)
+}
+
+/// Per partition, the lowest applied index over every member: every entry at
+/// or below it is committed (applied implies committed) and held, applied, by
+/// ALL members. `None` while any member does not answer.
+fn committed_floor(c: &Cluster) -> Option<Vec<i128>> {
+    let all: Option<Vec<Vec<(i128, i128)>>> = (0..NODES).map(|id| raft_status(c, id)).collect();
+    let all = all?;
+    Some(
+        (0..PARTITIONS as usize)
+            .map(|p| all.iter().map(|s| s[p].1).min().unwrap_or(-1))
+            .collect(),
+    )
+}
+
+/// Log message of a recovered journal partition (`seglog::RECOVERED_PARTITION`).
+const RECOVERED: &str = "journal partition recovered";
+
+/// Drops ANSI SGR escapes (`ESC [ ... m`) the tracing formatter may wrap field
+/// names in, so `key=value` pairs parse.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The `u64` value of `key=` in a whitespace-separated `key=value` line.
+fn kv(line: &str, key: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
+        .and_then(|v| v.parse().ok())
+}
+
+/// Forces a journal snapshot on EVERY partition whose engine journal member
+/// `id` holds (its owned partitions) and returns each `(partition, boundary)`
+/// the durable snapshot now covers — non-empty, every boundary > 0.
+fn force_journal_snapshot(c: &Cluster, id: usize) -> Vec<(usize, u64)> {
+    let (code, body) = request(c.port(id), "POST", "/debug/journal-snapshot", None)
+        .expect("node answers /debug/journal-snapshot");
+    assert_eq!(
+        code, 200,
+        "forced journal snapshot on node {id} failed: {body}"
+    );
+    let out: Vec<(usize, u64)> = body
+        .lines()
+        .filter_map(|line| {
+            let p = usize::try_from(kv(line, "partition")?).ok()?;
+            Some((p, kv(line, "snapshot_index")?))
+        })
+        .collect();
+    assert!(
+        !out.is_empty() && out.iter().all(|(p, i)| *p < PARTITIONS as usize && *i > 0),
+        "node {id}: the forced snapshot must cover a non-empty prefix of every owned partition, got {out:?}\n{body}"
+    );
+    out
+}
+
+/// Grows a journal tail after member `id`'s snapshot checkpoint: creates
+/// instances (bounded) until the member has locally applied a new `Normal`
+/// (command) entry on every checkpointed partition past
+/// `applied_at_checkpoint`, so each one's journal holds events the snapshot does not cover.
+fn grow_tail_past_checkpoint(
+    c: &Cluster,
+    id: usize,
+    checkpoint: &[(usize, u64)],
+    applied_at_checkpoint: &[(i128, i128)],
+    keys: &mut Vec<String>,
+) {
+    for _ in 0..30 {
+        let advanced = raft_status(c, id).is_some_and(|now| {
+            checkpoint.iter().all(|(p, _)| {
+                normal_applied_past(
+                    &c.members[id].data,
+                    *p,
+                    applied_at_checkpoint[*p].1,
+                    now[*p].1,
+                )
+            })
+        });
+        if advanced {
+            return;
+        }
+        keys.extend(create_instances(c, id, 1));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "node {id}: no journal tail on every partition after the snapshot checkpoint ({:?} -> {:?})\n{}",
+        applied_at_checkpoint,
+        raft_status(c, id),
+        tail(&c.all_logs())
+    );
+}
+
+/// Whether member data `data` holds, on partition `p`, a locally applied
+/// `Normal` Raft entry (an engine command batch, which journals events) in
+/// `(from, to]`. A bare applied-index increase is not enough: a `Blank`
+/// (election) entry advances `applied` without journaling anything.
+fn normal_applied_past(data: &Path, p: usize, from: i128, to: i128) -> bool {
+    raft_batches(data, p as u64).iter().any(|(i, b)| {
+        let i = i128::from(*i);
+        i > from && i <= to && !b.is_null()
+    })
+}
+
+/// The restart of member `id` went snapshot + journal: on every checkpointed
+/// partition the boot log reports recovery FROM exactly the recorded
+/// boundary and a non-empty replayed journal tail after it.
+fn assert_recovered_from_checkpoint(c: &Cluster, id: usize, checkpoint: &[(usize, u64)]) {
+    let log = strip_ansi(&c.log_of_boot(id, c.last_boot(id)));
+    let mut seen = vec![None; PARTITIONS as usize];
+    for line in log.lines().filter(|l| l.contains(RECOVERED)) {
+        if let (Some(p), Some(snap), Some(replayed)) = (
+            kv(line, "partition"),
+            kv(line, "snapshot_index"),
+            kv(line, "replayed_entries"),
+        ) && let Some(slot) = usize::try_from(p).ok().and_then(|p| seen.get_mut(p))
+        {
+            *slot = Some((snap, replayed));
+        }
+    }
+    for &(p, want) in checkpoint {
+        match seen[p] {
+            Some((snap, replayed)) => {
+                assert_eq!(
+                    snap,
+                    want,
+                    "node {id} partition {p}: recovery did not load the recorded snapshot checkpoint\n{}",
+                    tail(&log)
+                );
+                assert!(
+                    replayed > 0,
+                    "node {id} partition {p}: recovery replayed no journal tail after the snapshot\n{}",
+                    tail(&log)
+                );
+            }
+            None => panic!(
+                "node {id} partition {p}: no `{RECOVERED}` line in the restart log\n{}",
+                tail(&log)
+            ),
+        }
+    }
+}
+
+/// After a post-latch restart from snapshot + journal, member `id` must have
+/// caught up and agree with EVERY peer over the committed prefix. Per
+/// partition: the actual leader is resolved through `/debug/raft` (agreed by
+/// the restarted member and the leader itself) and its applied index captured
+/// as the target; the restarted member must locally APPLY up to that target,
+/// and its on-disk log must equal every peer's — whole `payload.Normal` per
+/// index (items plus `digest` / `digest_cutover`), compared BY LOG INDEX so a
+/// purged log prefix still aligns — at every index up to the committed floor
+/// (lowest applied index across members). Comparing against all peers (never
+/// a "longest log" pick, which could be the restarted member itself) and only
+/// over committed entries (an ex-leader's uncommitted tail is excluded by
+/// construction) makes the check neither vacuous nor timing-dependent; it is
+/// polled only to let replication and apply catch up.
+fn assert_restarted_matches_prefix(c: &Cluster, id: usize) {
+    use std::collections::BTreeMap;
+    for p in 0..PARTITIONS as usize {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut target: Option<i128> = None;
+        let mut last = String::from("no /debug/raft answer yet");
+        loop {
+            let done = (|| {
+                let mine = raft_status(c, id)?[p];
+                if target.is_none() {
+                    let leader = usize::try_from(mine.0).ok().filter(|l| *l < NODES)?;
+                    let theirs = raft_status(c, leader)?[p];
+                    if theirs.0 != mine.0 {
+                        last = format!("leader disagreement: {} vs {}", mine.0, theirs.0);
+                        return None;
+                    }
+                    target = Some(theirs.1);
+                }
+                let want = target?;
+                if mine.1 < want {
+                    last = format!("applied {} < leader's applied {want}", mine.1);
+                    return None;
+                }
+                let floor = committed_floor(c)?[p];
+                if floor < want {
+                    last = format!("committed floor {floor} < target {want}");
+                    return None;
+                }
+                let floor = u64::try_from(floor).ok()?;
+                let logs: Vec<BTreeMap<u64, serde_json::Value>> = c
+                    .members
+                    .iter()
+                    .map(|m| {
+                        raft_batches(&m.data, p as u64)
+                            .into_iter()
+                            .filter(|(i, _)| *i <= floor)
+                            .collect()
+                    })
+                    .collect();
+                for (other, theirs) in logs.iter().enumerate() {
+                    if other == id {
+                        continue;
+                    }
+                    // Require a NON-EMPTY shared committed interval: from the
+                    // later of the two retained-log starts (purge boundary) up
+                    // to the floor, both logs must cover the SAME indices with
+                    // equal payloads. Disjoint or empty logs keep polling.
+                    let (Some(a), Some(b)) = (logs[id].keys().next(), theirs.keys().next()) else {
+                        last = format!("node {id} or node {other} holds no committed batch");
+                        return None;
+                    };
+                    let lo = *a.max(b);
+                    let mine_iv: Vec<_> = logs[id].range(lo..).collect();
+                    let their_iv: Vec<_> = theirs.range(lo..).collect();
+                    if mine_iv.is_empty() {
+                        last = format!("no shared committed interval with node {other}");
+                        return None;
+                    }
+                    if mine_iv != their_iv {
+                        panic!(
+                            "partition {p}: restarted node {id} disagrees with node {other} over \
+                             committed interval [{lo}, {floor}]: {mine_iv:?} vs {their_iv:?}\n{}",
+                            tail(&c.all_logs())
+                        );
+                    }
+                }
+                Some(())
+            })();
+            if done.is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "partition {p}: restarted node {id} never caught up with the leader: {last}\n{}",
+                    tail(&c.all_logs())
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+/// Post-restart digest claims keep verifying, on every partition and member:
+/// each member holds a NEW `digest` claim beyond its pre-restart head
+/// `before` that it has locally APPLIED (index at or below its own
+/// `/debug/raft` applied index — a stored-but-unapplied claim proves
+/// nothing), and claims agree across members at every committed index.
+/// Creates may land on fewer than all partitions while leadership recovers,
+/// so coverage is polled, driving bounded extra traffic, before it fails; a
+/// disagreement fails at once.
+fn assert_fresh_digest_claims(
+    c: &Cluster,
+    before: &[Vec<u64>],
+    restarted: usize,
+    keys: &mut Vec<String>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut round = 0usize;
+    loop {
+        match fresh_digest_gap(c, before, restarted) {
+            None => return,
+            Some(gap) if Instant::now() >= deadline => panic!(
+                "after node {restarted}'s post-latch restart: {gap} (divergence check vacuous)\n{}",
+                tail(&c.all_logs())
+            ),
+            Some(_) => {
+                round += 1;
+                keys.extend(create_instances(
+                    c,
+                    (restarted + round) % NODES,
+                    PARTITIONS as usize,
+                ));
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+/// The first missing fresh, locally applied claim (`None` = full coverage).
+/// Panics on a claim disagreement at a committed index.
+fn fresh_digest_gap(c: &Cluster, before: &[Vec<u64>], restarted: usize) -> Option<String> {
+    let status: Vec<Vec<(i128, i128)>> = match (0..NODES).map(|id| raft_status(c, id)).collect() {
+        Some(s) => s,
+        None => return Some("a member did not answer /debug/raft".into()),
+    };
+    for p in 0..PARTITIONS as usize {
+        let applied: Vec<u64> = status
+            .iter()
+            .map(|s| u64::try_from(s[p].1).unwrap_or(0))
+            .collect();
+        let floor = applied.iter().copied().min().unwrap_or(0);
+        let claims: Vec<std::collections::BTreeMap<u64, serde_json::Value>> = c
+            .members
+            .iter()
+            .enumerate()
+            .map(|(id, m)| {
+                let head = before[id][p];
+                raft_batches(&m.data, p as u64)
+                    .into_iter()
+                    .filter(|(i, b)| *i > head && *i <= applied[id] && !b["digest"].is_null())
+                    .map(|(i, b)| (i, b["digest"].clone()))
+                    .collect()
+            })
+            .collect();
+        for (id, mine) in claims.iter().enumerate() {
+            for (other, theirs) in claims.iter().enumerate() {
+                for (i, d) in mine.range(..=floor) {
+                    if let Some(t) = theirs.get(i) {
+                        assert_eq!(
+                            d, t,
+                            "partition {p}: after node {restarted}'s restart, digest claims of \
+                             nodes {id} and {other} differ at index {i}"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(id) = claims.iter().position(|m| m.is_empty()) {
+            return Some(format!(
+                "partition {p}: node {id} has no locally applied digest claim past its \
+                 pre-restart head"
+            ));
+        }
+    }
+    None
+}
+
 /// The latch's ordering contract over every member's Raft log, per partition:
 /// no new-format item at or below `barrier[p]` — the partition's last Raft
 /// log index when the last old member stopped (all prior submissions had been
@@ -650,13 +1038,28 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     c.assert_no_divergence("after the latch");
     assert_digest_cutover_agreed(&c, &barrier);
 
-    // ---- Phase 3: recovery AFTER the latch, of every member (each node
-    // identity, including the last-upgraded one, recovers post-latch data).
+    // ---- Phase 3: recovery AFTER the latch, for EVERY member (#2058) —
+    // including the last-upgraded one, whose log history differs (it ran the
+    // old binary longest). Sequential, one member down at a time, so quorum
+    // holds and the runtime stays within the nightly budget.
     for id in 0..NODES {
+        // Deterministic snapshot checkpoint on every partition of this
+        // member, then a journal tail past it, so the restart must go
+        // snapshot + journal (not journal-only).
+        let checkpoint = force_journal_snapshot(&c, id);
+        // Read AFTER the snapshot: an entry applied past this is never covered.
+        let applied_at_checkpoint = raft_status(&c, id).expect("node answers /debug/raft");
+        grow_tail_past_checkpoint(&c, id, &checkpoint, &applied_at_checkpoint, &mut keys);
+        let before = log_heads(&c);
         c.kill(id);
         c.start(id, Bin::New);
         wait_ready(&c, id);
-        keys.extend(create_instances(&c, id, 3));
+        assert_recovered_from_checkpoint(&c, id, &checkpoint);
+        // Drive traffic; `assert_fresh_digest_claims` adds bounded extra
+        // creates until every partition and member holds a fresh claim.
+        keys.extend(create_instances(&c, (id + 1) % NODES, PARTITIONS as usize));
+        assert_restarted_matches_prefix(&c, id);
+        assert_fresh_digest_claims(&c, &before, id, &mut keys);
         assert_visible_everywhere(&mut c, &keys);
         c.assert_no_divergence(&format!("after post-latch recovery of node {id}"));
     }
