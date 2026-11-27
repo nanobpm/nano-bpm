@@ -586,9 +586,14 @@ pub enum Event {
         scope: Key,
         /// LEGACY (#1676, retired by #2004): the event-based gateway element
         /// instance whose deferred choice armed this (catch) element instance.
-        /// This build never emits it (`None`); it is kept so old journals
-        /// decode, and a replayed `Some` lands in `ProcessInstance::races`,
-        /// which the loader refuses as an in-flight legacy race.
+        /// Before the `event-gateway-runtime-v1` latch is set, this build
+        /// still emits `Some` (via `activate_legacy_race_member`), so a
+        /// mixed-version cluster keeps one race model; a replayed `Some`
+        /// lands in `ProcessInstance::races`, and those races load and settle
+        /// normally. Once the latch is set, new activations carry `None`
+        /// (gateway-owned triggers replace races), and the loader refuses an
+        /// instance still holding an in-flight legacy race
+        /// (`State::refused_legacy_event_gateway_race_instances`).
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
@@ -697,6 +702,17 @@ pub enum Event {
             serde(default, skip_serializing_if = "BTreeMap::is_empty")
         )]
         variables: BTreeMap<String, Value>,
+    },
+    /// A gateway's recorded trigger (#2004) was discarded without its catch
+    /// activating: the scope it would activate in was torn down (e.g. the
+    /// enclosing sub-process terminated) after the gateway completed but
+    /// before the queued triggered-catch activation ran. Drops the
+    /// `gateway_triggers` entry whose catch is `catch_element_instance_key`,
+    /// so abandoned triggers never accumulate in memory or snapshots.
+    /// Additive variant (old journals never contain it).
+    EventGatewayTriggerDiscarded {
+        instance_key: Key,
+        catch_element_instance_key: Key,
     },
 
     /// A token moved along a sequence flow from one element to another.
@@ -2462,6 +2478,7 @@ impl Event {
             | Event::GatewayRouteSelected { instance_key, .. }
             | Event::EventGatewaySubscriptionsOpened { instance_key, .. }
             | Event::EventGatewayTriggered { instance_key, .. }
+            | Event::EventGatewayTriggerDiscarded { instance_key, .. }
             | Event::SequenceFlowTaken { instance_key, .. }
             | Event::ParallelJoinOpened { instance_key, .. }
             | Event::ParallelJoinTokenArrived { instance_key, .. }

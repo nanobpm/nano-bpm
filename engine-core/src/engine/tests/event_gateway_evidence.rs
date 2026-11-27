@@ -652,3 +652,127 @@ fn winning_payload_is_local_to_the_triggered_catch() {
         }
     }
 }
+
+/// A gateway inside sub-process `sub` racing two messages, parked on an
+/// `end` listener once its trigger is recorded.
+fn gateway_in_sub_process() -> ProcessDefinition {
+    ProcessBuilder::new("sp")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .event_based_gateway("gw")
+        .contained_in("gw", "sub")
+        .message_intermediate_catch_event("onM1", "M1", "=key")
+        .contained_in("onM1", "sub")
+        .message_intermediate_catch_event("onM2", "M2", "=key")
+        .contained_in("onM2", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("end")
+        .connect("start", "sub")
+        .connect("sub_start", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "sub_end")
+        .connect("onM2", "sub_end")
+        .connect("sub", "end")
+        .with_listeners("gw", Vec::new(), vec![el(ListenerEventType::End, "audit")])
+        .build()
+        .unwrap()
+}
+
+/// The element instance of `element_id` in `inst`.
+fn eik_of(engine: &Engine, inst: Key, element_id: &str) -> Key {
+    *engine
+        .instance(inst)
+        .unwrap()
+        .active
+        .iter()
+        .find(|(_, id)| id.as_str() == element_id)
+        .unwrap()
+        .0
+}
+
+/// A triggered-catch activation dropped because its scope was torn down
+/// after the gateway completed (#2047 review) journals the discard of the
+/// gateway's trigger, so it never lingers in state or snapshots, and replay
+/// agrees.
+#[cfg(feature = "serde")]
+#[test]
+fn dropped_triggered_catch_discards_its_trigger() {
+    let mut run = Journaled::new(gateway_in_sub_process(), true);
+    let inst = run.create("sp", 1_000);
+    run.apply(publish("M1", "k", 1, 0), 2_000);
+    let sub = eik_of(&run.engine, inst, "sub");
+    let trigger = run
+        .engine
+        .instance(inst)
+        .unwrap()
+        .gateway_triggers
+        .values()
+        .next()
+        .cloned();
+    let trigger = trigger.expect("trigger pending on the gateway's end listener");
+
+    // The scope teardown was decided this drain; the queued catch activation
+    // is dropped.
+    run.engine.torn_down_scopes.insert(sub);
+    let step = Step::ActivateTriggeredCatch {
+        instance_key: inst,
+        element_id: trigger.catch_element_id.clone(),
+        scope: sub,
+        element_instance_key: trigger.catch_element_instance_key,
+    };
+    let (events, followups) = run.engine.process_step(step, &VecDeque::new());
+    run.engine.torn_down_scopes.clear();
+    assert!(followups.is_empty());
+    assert_eq!(
+        events,
+        vec![Event::EventGatewayTriggerDiscarded {
+            instance_key: inst,
+            catch_element_instance_key: trigger.catch_element_instance_key,
+        }]
+    );
+    let mut log = Vec::new();
+    for event in events {
+        run.engine.emit(&mut log, event);
+    }
+    run.journal.extend(log);
+    assert!(run
+        .engine
+        .instance(inst)
+        .unwrap()
+        .gateway_triggers
+        .is_empty());
+    let replayed = Engine::replay(run.journal.clone());
+    assert_eq!(replayed.state(), run.engine.state());
+}
+
+/// Scoped termination of the sub-process holding a gateway with a pending
+/// trigger clears the trigger.
+#[test]
+fn scoped_termination_clears_the_pending_trigger() {
+    let mut run = Journaled::new(gateway_in_sub_process(), true);
+    let inst = run.create("sp", 1_000);
+    run.apply(publish("M1", "k", 1, 0), 2_000);
+    assert_eq!(run.engine.instance(inst).unwrap().gateway_triggers.len(), 1);
+    let sub = eik_of(&run.engine, inst, "sub");
+    run.apply(
+        Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![crate::command::ActivateElementInstruction {
+                element_id: "end".into(),
+                ..Default::default()
+            }],
+            terminate_instructions: vec![sub],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
+        },
+        3_000,
+    );
+    let instance = run.engine.instance(inst).unwrap();
+    assert!(instance.gateway_triggers.is_empty());
+    // Nothing for the trigger to leak into after the scope is gone.
+    assert!(!instance.active.values().any(|id| id == "sub" || id == "gw"));
+}

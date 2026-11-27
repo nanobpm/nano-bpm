@@ -9323,6 +9323,28 @@ impl Engine {
     /// with its flow-scope instance. An open join instance in the dead scope is
     /// already reset by [`scope_teardown_events`](Self::scope_teardown_events).
     fn revoke_dropped_join_arrival(&self, step: &Step) -> Vec<Event> {
+        // A dropped gateway-triggered catch (#2004) discards its gateway's
+        // recorded trigger, journaled so it never lingers in state.
+        if let Step::ActivateTriggeredCatch {
+            instance_key,
+            element_instance_key,
+            ..
+        } = step
+        {
+            let recorded = self.state.instances.get(instance_key).is_some_and(|i| {
+                i.gateway_triggers
+                    .values()
+                    .any(|t| t.catch_element_instance_key == *element_instance_key)
+            });
+            return if recorded {
+                vec![Event::EventGatewayTriggerDiscarded {
+                    instance_key: *instance_key,
+                    catch_element_instance_key: *element_instance_key,
+                }]
+            } else {
+                Vec::new()
+            };
+        }
         let Step::Activate {
             instance_key,
             element_id,

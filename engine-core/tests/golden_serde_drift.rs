@@ -1319,6 +1319,10 @@ fn build_event_witnesses() -> Vec<Event> {
             catch_element_instance_key: 3,
             variables: BTreeMap::from([("payload".to_string(), Value::Int(21))]),
         },
+        Event::EventGatewayTriggerDiscarded {
+            instance_key: 1,
+            catch_element_instance_key: 3,
+        },
         Event::ProcessInstanceModified {
             instance_key: 1,
             activate_instructions: vec![ActivateElementInstruction {

@@ -240,6 +240,12 @@
     }
   },
   {
+    "EventGatewayTriggerDiscarded": {
+      "catch_element_instance_key": 3,
+      "instance_key": 1
+    }
+  },
+  {
     "ProcessInstanceModified": {
       "activate_instructions": [
         {

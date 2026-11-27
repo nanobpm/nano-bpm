@@ -155,6 +155,17 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             }
         }
 
+        Event::EventGatewayTriggerDiscarded {
+            instance_key,
+            catch_element_instance_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .gateway_triggers
+                    .retain(|_, t| t.catch_element_instance_key != *catch_element_instance_key);
+            }
+        }
+
         // Sequence flows are routing facts; token bookkeeping happens via the
         // activate/complete of the elements they connect.
         Event::SequenceFlowTaken { .. } => {}

@@ -4,7 +4,8 @@
 # Re-executes the command corpus (engine-core/examples/determinism/) and
 # compares the generated records + canonical state checkpoints across:
 #   * hash seeds and process restarts  — `cell` (several fresh processes, each
-#     with its own random std hash seed, plus snapshot-restart splits);
+#     with its own random std hash seed, plus snapshot-restart splits), over
+#     both the pre-latch corpus and the post-latch (#2004) corpus;
 #   * build profiles and platforms      — `cell` per matrix entry, then
 #     `compare` over the per-cell digests;
 #   * the previous release              — `prev-release`;
@@ -47,37 +48,58 @@ build() {
 
 emit() { "$BIN/determinism_corpus" emit "$1" --random "$RANDOM_INSTANCES"; }
 
-cmd_cell() {
-  local out="$1" profile="${2:-debug}"
+# cell_mode OUTDIR [--post-latch] — one corpus through every same-release
+# check (fresh processes / hash seeds, restart splits). Prints the corpus and
+# run digests as "CORPUS_SHA RUN_SHA". `--post-latch` (#2004) generates the
+# corpus under the `event-gateway-runtime-v1` envelope (keys harvested from
+# the latched engine) and replays it with `--event-gateway-runtime`, so the
+# gateway-owned trigger runtime is determinism-checked too.
+cell_mode() {
+  local out="$1" emit_flags=() replay_flags=()
+  if [ "${2:-}" = --post-latch ]; then
+    emit_flags=(--post-latch); replay_flags=(--event-gateway-runtime)
+  fi
   mkdir -p "$out"
-  build "$profile"
-  emit "$out/corpus.jsonl"
+  "$BIN/determinism_corpus" emit "$out/corpus.jsonl" --random "$RANDOM_INSTANCES" ${emit_flags[@]+"${emit_flags[@]}"}
   local total; total=$(grep -c . "$out/corpus.jsonl")
   local ref=""
   for n in $(seq 1 "$RUNS"); do
-    "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/run$n.jsonl" --state-every "$STATE_EVERY"
+    "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/run$n.jsonl" --state-every "$STATE_EVERY" \
+      ${replay_flags[@]+"${replay_flags[@]}"}
     local d; d=$(sha "$out/run$n.jsonl")
-    echo "run $n (fresh process / hash seed): $d"
+    echo "$out run $n (fresh process / hash seed): $d" >&2
     if [ -z "$ref" ]; then ref="$d"; elif [ "$d" != "$ref" ]; then
-      echo "::error::determinism: run $n differs from run 1 (hash-seed / process non-determinism)"
-      diff <(head -c 200000 "$out/run1.jsonl") <(head -c 200000 "$out/run$n.jsonl") | head -20 || true
+      echo "::error::determinism ($out): run $n differs from run 1 (hash-seed / process non-determinism)" >&2
+      diff <(head -c 200000 "$out/run1.jsonl") <(head -c 200000 "$out/run$n.jsonl") | head -20 >&2 || true
       exit 1
     fi
   done
   for split in 1 $((total / 3)) $((total / 2 + 1)); do
     "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/a.jsonl" --state-every "$STATE_EVERY" \
-      --stop-after "$split" --snapshot-out "$out/snap.json"
+      --stop-after "$split" --snapshot-out "$out/snap.json" ${replay_flags[@]+"${replay_flags[@]}"}
     "$BIN/determinism_replay" "$out/corpus.jsonl" --out "$out/b.jsonl" --state-every "$STATE_EVERY" \
-      --resume "$out/snap.json" --start-at "$split"
+      --resume "$out/snap.json" --start-at "$split" ${replay_flags[@]+"${replay_flags[@]}"}
     cat "$out/a.jsonl" "$out/b.jsonl" >"$out/restart.jsonl"
     local d; d=$(sha "$out/restart.jsonl")
-    echo "restart at $split: $d"
+    echo "$out restart at $split: $d" >&2
     if [ "$d" != "$ref" ]; then
-      echo "::error::determinism: process restart at entry $split diverges from an uninterrupted run"
+      echo "::error::determinism ($out): process restart at entry $split diverges from an uninterrupted run" >&2
       exit 1
     fi
   done
-  printf '%s %s\n' "$(sha "$out/corpus.jsonl")" "$ref" >"$out/digest.txt"
+  printf '%s %s' "$(sha "$out/corpus.jsonl")" "$ref"
+}
+
+cmd_cell() {
+  local out="$1" profile="${2:-debug}"
+  mkdir -p "$out"
+  build "$profile"
+  # Pre-latch (the mixed-version / previous-release shape) and post-latch
+  # (#2004) corpora; the cell digest covers both.
+  local pre post
+  pre=$(cell_mode "$out/pre-latch")
+  post=$(cell_mode "$out/post-latch" --post-latch)
+  printf '%s %s\n' "$pre" "$post" >"$out/digest.txt"
   echo "cell digest: $(cat "$out/digest.txt")"
 }
 

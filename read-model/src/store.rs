@@ -7960,6 +7960,7 @@ fn project_event(
         // Gateway-owned subscription bookkeeping (#2003): not yet emitted.
         | Event::EventGatewaySubscriptionsOpened { .. }
         | Event::EventGatewayTriggered { .. }
+        | Event::EventGatewayTriggerDiscarded { .. }
         | Event::MessagePublished { .. }
         // Engine-internal message buffer (#1874): the correlation records
         // that follow carry everything the read model projects.

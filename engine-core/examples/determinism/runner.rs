@@ -55,6 +55,11 @@ pub struct RunOptions {
     /// previous-release cell uses this once to learn which entries the old
     /// build cannot decode, then both builds replay the corpus without them.
     pub skip_undecodable: bool,
+    /// Replay under the `event-gateway-runtime-v1` envelope (#2004): the
+    /// post-latch corpus (generated with the same envelope) for the
+    /// same-release cells. Off by default — the pre-latch corpus, which is
+    /// the one compared against the previous release.
+    pub event_gateway_runtime: bool,
 }
 
 /// One decoded corpus entry. Undecodable lines are kept as their error so
@@ -164,12 +169,14 @@ pub fn run(
     opts: &RunOptions,
     out: &mut dyn Write,
 ) -> std::io::Result<u64> {
-    // The corpus replays PRE-LATCH (#2004): a feature-gated behaviour runs
-    // only once every member advertises it, so the previous-release
-    // comparison is a mixed-version cluster, where head must execute exactly
-    // as the previous release. The previous release has no such switch; the
-    // CI script strips `determinism:head-only` lines from its copy.
-    engine.set_event_gateway_runtime(false); // determinism:head-only
+    // The corpus replays PRE-LATCH by default (#2004): a feature-gated
+    // behaviour runs only once every member advertises it, so the
+    // previous-release comparison is a mixed-version cluster, where head must
+    // execute exactly as the previous release. `event_gateway_runtime`
+    // replays the post-latch corpus in the same-release cells. The previous
+    // release has no such switch; the CI script strips
+    // `determinism:head-only` lines from its copy.
+    engine.set_event_gateway_runtime(opts.event_gateway_runtime); // determinism:head-only
     if opts.canary {
         canary_permute(&mut entries);
     }
