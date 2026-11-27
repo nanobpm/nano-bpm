@@ -969,6 +969,34 @@ fn assert_latch_ordering(c: &Cluster, barrier: &[u64]) {
     }
 }
 
+/// Makes the pre-latch workload deterministic (#2065): while an old member
+/// is still present, keeps creating instances (through every member in turn,
+/// so routing and leadership timing cannot starve a partition) until EVERY
+/// member has at least one replicated item in its on-disk Raft log for EVERY
+/// partition. Bounded by a timeout; the vacuity guard in
+/// [`assert_latch_ordering`] stays as is and now holds by construction.
+fn ensure_pre_latch_coverage(c: &mut Cluster, keys: &mut Vec<String>) {
+    let covered = |c: &Cluster| {
+        c.members
+            .iter()
+            .all(|m| (0..PARTITIONS).all(|p| !raft_items(&m.data, p).is_empty()))
+    };
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut via = 0;
+    while !covered(c) {
+        assert!(
+            Instant::now() < deadline,
+            "pre-latch workload did not reach every partition on every member\n{}",
+            tail(&c.all_logs())
+        );
+        keys.extend(create_instances(c, via, 2));
+        via = (via + 1) % NODES;
+        // Wait until the new instances are applied everywhere, so the check
+        // reads every member's settled log rather than a lagging one.
+        assert_visible_everywhere(c, keys);
+    }
+}
+
 /// The whole latch contract in one rolling-upgrade lifecycle (bounded: three
 /// small batches of instances, one member swap at a time).
 #[test]
@@ -996,6 +1024,9 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     // old member was present. Log indices, not clock stamps, order this.
     let mut barrier = vec![0u64; PARTITIONS as usize];
     for id in 0..NODES {
+        if id + 1 == NODES {
+            ensure_pre_latch_coverage(&mut c, &mut keys);
+        }
         c.kill(id);
         if id + 1 == NODES {
             for (p, b) in barrier.iter_mut().enumerate() {
