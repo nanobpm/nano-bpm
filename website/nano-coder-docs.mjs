@@ -326,11 +326,16 @@ export async function fetchLatestDocs({ env = process.env, fetchImpl = fetch } =
   });
   if (!tar.ok) throw new Error(`tarball ${version}: HTTP ${tar.status}`);
   const work = mkdtempSync(join(tmpdir(), "nano-coder-docs-"));
-  const tgz = join(work, "src.tgz");
-  writeFileSync(tgz, Buffer.from(await tar.arrayBuffer()));
   const src = join(work, "src");
-  mkdirSync(src);
-  execFileSync("tar", ["-xzf", tgz, "-C", src, "--strip-components=1"], { stdio: "pipe" });
+  try {
+    const tgz = join(work, "src.tgz");
+    writeFileSync(tgz, Buffer.from(await tar.arrayBuffer()));
+    mkdirSync(src);
+    execFileSync("tar", ["-xzf", tgz, "-C", src, "--strip-components=1"], { stdio: "pipe" });
+  } catch (err) {
+    rmSync(work, { recursive: true, force: true }); // never leak the temp dir on a failed fetch/extract
+    throw err;
+  }
   const docsDir = join(src, "docs");
   return { version, docsDir: existsSync(docsDir) ? docsDir : null, cleanup: () => rmSync(work, { recursive: true, force: true }) };
 }

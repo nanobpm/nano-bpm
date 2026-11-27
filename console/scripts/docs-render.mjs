@@ -37,8 +37,9 @@ export function slugify(text) {
 
 // Resolve a relative link (optionally with `../`/`./` segments) against the
 // source file's directory `base` (repo-root-relative, "" for the root) into a
-// root-relative path. A `..` that climbs above the root is kept as a marker
-// segment so callers can detect a link escaping their tree.
+// root-relative path. A `..` that climbs above the root is CLAMPED (dropped), so
+// "../../x" from base "docs" resolves to "x"; callers that must detect a link
+// escaping their tree need to check that separately before resolving.
 export function repoRelative(base, path) {
   const baseParts = base ? base.split("/").filter(Boolean) : [];
   const out = [...baseParts];

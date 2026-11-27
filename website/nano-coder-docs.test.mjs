@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildSite } from "./test-build.mjs";
-import { parseFrontMatter, resolveNanoCoderDocs, rewriteDocsTarget, routeFor } from "./nano-coder-docs.mjs";
+import { fetchLatestDocs, parseFrontMatter, resolveNanoCoderDocs, rewriteDocsTarget, routeFor } from "./nano-coder-docs.mjs";
 
 const FIXTURE = fileURLToPath(new URL("./test-fixtures/nano-coder-docs/", import.meta.url));
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -179,4 +179,15 @@ test("website markdown-it is pinned to the console's (one renderer, one version)
   assert.equal(spec("website/package.json"), spec("console/package.json"));
   const locked = (p) => JSON.parse(readFileSync(join(repoRoot, p), "utf8")).packages["node_modules/markdown-it"].version;
   assert.equal(locked("website/package-lock.json"), locked("console/package-lock.json"));
+});
+
+test("fetchLatestDocs removes its temp dir when the tarball fails to extract", async () => {
+  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith("nano-coder-docs-")));
+  const fetchImpl = async (url) =>
+    url.endsWith("/releases/latest")
+      ? { ok: true, json: async () => ({ tag_name: "v9.9.9" }) }
+      : { ok: true, arrayBuffer: async () => new TextEncoder().encode("not a tarball").buffer };
+  await assert.rejects(fetchLatestDocs({ env: {}, fetchImpl }));
+  const leaked = readdirSync(tmpdir()).filter((n) => n.startsWith("nano-coder-docs-") && !before.has(n));
+  assert.deepEqual(leaked, []);
 });
