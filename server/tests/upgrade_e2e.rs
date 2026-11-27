@@ -973,19 +973,29 @@ fn assert_latch_ordering(c: &Cluster, barrier: &[u64]) {
 /// (through every member in turn, so routing and leadership timing cannot
 /// starve a partition) until `covered(member data dir, partition)` holds for
 /// EVERY member and EVERY partition, as read from the on-disk Raft logs.
-/// Bounded by a timeout. The vacuity guards in [`assert_latch_ordering`] and
+/// `covered` also receives that member's locally applied index for the
+/// partition (from `/debug/raft`): appending precedes applying, so a predicate
+/// must only count entries at or below it — log presence alone would let a
+/// follower pass before it has applied the item. A member that does not
+/// answer counts as not covered. Bounded by a timeout. The vacuity guards in [`assert_latch_ordering`] and
 /// [`assert_digest_cutover_agreed`] stay as they are and now hold by
 /// construction instead of by routing luck.
 fn drive_until_covered(
     c: &mut Cluster,
     keys: &mut Vec<String>,
     what: &str,
-    covered: impl Fn(&Path, u64) -> bool,
+    covered: impl Fn(&Path, u64, u64) -> bool,
 ) {
     let all = |c: &Cluster| {
-        c.members
-            .iter()
-            .all(|m| (0..PARTITIONS).all(|p| covered(&m.data, p)))
+        c.members.iter().enumerate().all(|(id, m)| {
+            let Some(status) = raft_status(c, id) else {
+                return false;
+            };
+            (0..PARTITIONS).all(|p| {
+                u64::try_from(status[p as usize].1)
+                    .is_ok_and(|applied| covered(&m.data, p, applied))
+            })
+        })
     };
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut via = 0;
@@ -1039,10 +1049,11 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     let mut barrier = vec![0u64; PARTITIONS as usize];
     for id in 0..NODES {
         if id + 1 == NODES {
-            // Pre-latch side: every member holds an item on every partition
-            // before the barrier is taken (so its index is <= the barrier).
-            drive_until_covered(&mut c, &mut keys, "the pre-latch workload", |d, p| {
-                !raft_items(d, p).is_empty()
+            // Pre-latch side: every member holds a locally
+            // APPLIED item on every partition before the barrier is taken
+            // (so its index is <= the barrier).
+            drive_until_covered(&mut c, &mut keys, "the pre-latch workload", |d, p, applied| {
+                raft_items(d, p).iter().any(|i| i.index <= applied)
             });
         }
         c.kill(id);
@@ -1086,12 +1097,12 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     assert_visible_everywhere(&mut c, &keys);
     // Post-latch side: every member holds, on every partition, a stamped
     // (latched) item and a post-barrier batch carrying a digest claim.
-    drive_until_covered(&mut c, &mut keys, "the post-latch workload", |d, p| {
+    drive_until_covered(&mut c, &mut keys, "the post-latch workload", |d, p, applied| {
         let after = barrier[p as usize];
-        raft_items(d, p).iter().any(|i| i.stamped)
+        raft_items(d, p).iter().any(|i| i.stamped && i.index <= applied)
             && raft_batches(d, p)
                 .iter()
-                .any(|(i, b)| *i > after && !b["digest"].is_null())
+                .any(|(i, b)| *i > after && *i <= applied && !b["digest"].is_null())
     });
     c.assert_no_divergence("after the latch");
     assert_digest_cutover_agreed(&c, &barrier);
