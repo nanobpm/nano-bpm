@@ -18,6 +18,10 @@
 #   scripts/determinism-ci.sh canary OUTDIR
 #   scripts/determinism-ci.sh prev-release OUTDIR [TAG]
 set -euo pipefail
+# Bash clears errexit inside $(...) by default, so a failing producer inside a
+# command substitution would be masked by a later successful command (e.g. the
+# digest printf). Make every substitution inherit errexit (bash >= 4.4).
+shopt -s inherit_errexit 2>/dev/null || true
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$ROOT/engine-core"
@@ -55,6 +59,9 @@ emit() { "$BIN/determinism_corpus" emit "$1" --random "$RANDOM_INSTANCES"; }
 # the latched engine) and replays it with `--event-gateway-runtime`, so the
 # gateway-owned trigger runtime is determinism-checked too.
 cell_mode() {
+  # Runs inside $(...) from cmd_cell: re-arm errexit explicitly so it holds
+  # even on a bash without inherit_errexit.
+  set -e
   local out="$1" emit_flags=() replay_flags=()
   if [ "${2:-}" = --post-latch ]; then
     emit_flags=(--post-latch); replay_flags=(--event-gateway-runtime)
@@ -97,8 +104,8 @@ cmd_cell() {
   # Pre-latch (the mixed-version / previous-release shape) and post-latch
   # (#2004) corpora; the cell digest covers both.
   local pre post
-  pre=$(cell_mode "$out/pre-latch")
-  post=$(cell_mode "$out/post-latch" --post-latch)
+  pre=$(cell_mode "$out/pre-latch") || exit 1
+  post=$(cell_mode "$out/post-latch" --post-latch) || exit 1
   printf '%s %s\n' "$pre" "$post" >"$out/digest.txt"
   echo "cell digest: $(cat "$out/digest.txt")"
 }
